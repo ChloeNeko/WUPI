@@ -3438,15 +3438,16 @@ const dropdownMenu = document.getElementById('dropdownMenu');
 // === FABLE APP WIRING (Phase 2, 2026-07-26) ============================
 // initFable builds the #fable app window, registers it with AppLifecycle
 // (onOpen/onClose/onPause/onResume), and bridges the OS window system to
-// the fog-gate launch. The hooks passed in:
+// the Fable launch. The hooks passed in:
 //   pauseAurora / resumeAurora — flip the canvas RAF `paused` flag so the
 //     OS aurora stops painting while the full-screen Fable stage is up
 //     (Fable has its own background; the OS canvas would waste cycles +
 //     compete for the GPU otherwise). Mirrors the visibilitychange/blur
 //     pause pattern at line 339.
 //   openHooks — the Map openWindow() consults; Fable registers its id →
-//     launchFable() (which runs the 2s fog-gate buildup before
-//     AppLifecycle.launchApp).
+//     launchFable() → AppLifecycle.launchApp('fable'). The 2s paused
+//     welcome (music + ripple + button reveal) lives inside boot.js now,
+//     not in a pre-launch fog gate.
 //   closeHooks — the Map closeWindow() consults; Fable routes to
 //     AppLifecycle.closeApp (full teardown).
 //   closeWindow — ref to the OS closeWindow so Fable's own close paths

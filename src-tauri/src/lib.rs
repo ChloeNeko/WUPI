@@ -2294,10 +2294,12 @@ async fn chat_send(
     // API path keeps a wider 12-message window (the cloud model has the
     // context budget + the local model is kept hot as a silent agent doing
     // schema/memory tracking, so the API can carry more narrative); the Local
-    // path stays at 6 (the sweet spot: 3 full user↔assistant turns, enough
-    // recency for continuity, small enough that truncation never fires).
+    // path is 4 (2 beats: the local chat backend is the silent agent at
+    // effective_local_ctx(Api)=2048 — short assistant replies only, no
+    // narration, no long payloads. 4 messages = 2 user↔assistant exchanges,
+    // plenty for a tracking assistant + small talk, fits the 2048 budget).
     let source = *state.model_source.lock().expect("model_source mutex");
-    let visible_window = if source == api::ModelSource::Api { 12 } else { 6 };
+    let visible_window = if source == api::ModelSource::Api { 12 } else { 4 };
 
     let system_prompt = prompts::build_system_content(
         &settings,
@@ -3881,6 +3883,10 @@ async fn enter_fable_session(
         .collect();
     let turn_count = messages.len();
     *state.fable_session.lock().await = prior_session;
+    // Clone the opening scene BEFORE the card is moved into active_fable_card
+    // — it's surfaced on FableLoadResult so the UI can render the first
+    // narrator beat on a fresh game without a second IPC round-trip.
+    let opening_scene = card.opening_scene.clone();
     *state.active_fable_card.lock().expect("active_fable_card mutex") = Some(card);
 
     // Phase 2: seat the GM persona (best-effort; None → OS catgirl fallback).
@@ -3904,6 +3910,7 @@ async fn enter_fable_session(
             turn_count,
         },
         messages,
+        opening_scene,
     })
 }
 
@@ -4134,15 +4141,15 @@ async fn fable_send(
     // persisted on fable_end so games resume across reboots.
     //
     // v0.6.3: window doubles when the API is the active chat source, matching
-    // chat_send's 6 → 12. The cloud model has the context budget and the local
+    // chat_send's 4 → 12. The cloud model has the context budget and the local
     // model stays hot as the silent agent doing schema tracking.
     //
-    // 2026-07-26: the local window was cut to 4 *messages* (NOT beats — the
-    // prior comment said "4 beats / 8 messages" but the slice math at line
-    // ~4161 treats the window as a raw message count; the code is the source
-    // of truth) to match the smaller FABLE_CTX=3072 budget. The narrator
-    // system prompt (~1000 tok) + 4 messages (~400 tok) + 1024-token gen
-    // reserve ≈ 2424, fitting 3072 with headroom.
+    // 2026-07-26 v2: the local window is 8 *messages* (4 beats — 4 user actions
+    // + 4 narrator replies). The slice math at line ~4174 treats the window as
+    // a raw message count (the code is the source of truth). Token math: the
+    // narrator system prompt (~1000 tok) + 8 messages (~1200 tok at ~150/msg)
+    // + 1024-token gen reserve ≈ 3224, fitting FABLE_CTX=3072 with ~270 tok
+    // headroom; if a beat runs long, truncate_to_fit drops oldest turns.
     //
     // v0.7: the API window was cut 16 → 12 (6 beats). 12 narrator messages
     // + the ~1000-tok narrator prompt + generation fits comfortably inside
@@ -4150,7 +4157,7 @@ async fn fable_send(
     // API window for a consistent "6 beats of recent history" feel across
     // both surfaces.
     let source = *state.model_source.lock().expect("model_source mutex");
-    let fable_visible_window = if source == api::ModelSource::Api { 12 } else { 4 };
+    let fable_visible_window = if source == api::ModelSource::Api { 12 } else { 8 };
     {
         let mut gs = state.fable_session.lock().await;
         gs.add_message(session::Role::User, text.clone());
@@ -4625,7 +4632,10 @@ async fn fable_load_save(
     *state.fable_session.lock().await = save.session;
     *state.fable_schema.lock().await = save.schema;
     tracing::info!(save_id = %meta.save_id, "game state loaded");
-    Ok(FableLoadResult { meta, messages })
+    // opening_scene is None on a save-load: resumed games render their feed
+    // from `messages`, not from the card's opening beat. Only fresh starts
+    // (enter_fable_session) surface the opening scene.
+    Ok(FableLoadResult { meta, messages, opening_scene: None })
 }
 
 /// Result of `fable_load_save`: the save meta + a flat list of the loaded
@@ -4634,6 +4644,14 @@ async fn fable_load_save(
 struct FableLoadResult {
     meta: fable_save::SaveMeta,
     messages: Vec<FableLoadMessage>,
+    /// The card's full `<opening_scene>` text (untruncated). Surfaced so the
+    /// UI can render the first narrator beat on a FRESH game (no resumed
+    /// messages yet) without a second IPC round-trip. `None` when the card
+    /// has no opening scene. NOTE: this is the FULL text — the per-card
+    /// `opening_scene_preview` on `FableCardMeta` (capped at 240 chars) is
+    /// only for the launcher card picker, NOT for the first beat.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    opening_scene: Option<String>,
 }
 
 /// One loaded message, role as a lowercase string (matches `session::Role`'s
