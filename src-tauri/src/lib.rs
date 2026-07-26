@@ -2,11 +2,14 @@ pub mod api;
 pub mod bracket_parser;
 pub mod chat_format;
 pub mod codex;
+pub mod context_swap;
 pub mod engine;
-pub mod game_command;
-pub mod game_engine;
+pub mod fable_command;
+pub mod fable_engine;
+pub mod fable_save;
 #[cfg(windows)]
 pub mod hardware;
+pub mod json_repair;
 pub mod kv_buffer;
 pub mod llm;
 pub mod memory;
@@ -15,6 +18,7 @@ pub mod memory_embedder_llama;
 pub mod memory_rrf;
 pub mod model_downloader;
 pub mod narrator_prompt;
+pub mod player_state;
 pub mod prompts;
 pub mod schema;
 pub mod schema_engine;
@@ -23,8 +27,8 @@ pub mod session;
 pub mod sim_card;
 pub mod stream_filter;
 pub mod system_menu;
-pub mod terminal;
 pub mod theme;
+pub mod layout;
 pub mod updater;
 pub mod user_profile;
 
@@ -129,6 +133,15 @@ pub struct AppState {
     /// app handle to resolve the portable data dir (not available in
     /// AppState::new()).
     pub theme_path: Arc<std::sync::OnceLock<std::path::PathBuf>>,
+    /// The dock + desktop icon arrangement (which apps are in the bottom
+    /// quick-menu + which are free-positioned on the desktop). Read by the
+    /// frontend to render the dock/desktop; written by `layout_set`. Held
+    /// under a std Mutex: never awaited across.
+    pub layout: Arc<std::sync::Mutex<layout::LayoutSettings>>,
+    /// The resolved path to `layout.json` in `<exe_dir>/data`. Filled once
+    /// in setup; `layout_set` saves to it. OnceLock for the same reason as
+    /// `theme_path`.
+    pub layout_path: Arc<std::sync::OnceLock<std::path::PathBuf>>,
     /// The API connection config (saved profiles + active source). Read by
     /// the `api_*` IPC commands; written by `api_profile_save`/`api_connect`/
     /// `api_disconnect`. Held under a std Mutex: short critical sections.
@@ -143,33 +156,42 @@ pub struct AppState {
     /// flip it atomically with the model teardown). Defaults to Local.
     pub model_source: Arc<std::sync::Mutex<api::ModelSource>>,
 
-    // The GameEngine (narrator) lives here, NOT eagerly spawned at boot: it
-    // spawns on `game_start` and shuts down on `game_end`. Costs VRAM only
+    // The FableEngine (narrator) lives here, NOT eagerly spawned at boot: it
+    // spawns on `fable_start` and shuts down on `fable_end`. Costs VRAM only
     // while a game is actually running. Same shape as `schema_engine` (Mutex
     // of Option of Arc). None = no game running.
-    pub game_engine: Arc<std::sync::Mutex<Option<Arc<game_engine::GameEngine>>>>,
+    pub fable_engine: Arc<std::sync::Mutex<Option<Arc<fable_engine::FableEngine>>>>,
     /// Per-game cancel token, parallel to `active_cancel`. Distinct slot so
     /// chat-stop and game-stop never cross-wire (Bug #7 pattern, §2C).
-    pub active_game_cancel: Arc<std::sync::Mutex<Option<llm::CancelToken>>>,
+    pub active_fable_cancel: Arc<std::sync::Mutex<Option<llm::CancelToken>>>,
     /// The game's scoped world-state schema (sibling to `schema`, which is
     /// Wupi-assistant's). Per-card: wiped/reloaded on card switch. Held
-    /// under tokio Mutex because `game_send` reads it + Wupi's game-manager
-    /// path writes it (via `game_command` deltas).
-    pub game_schema: Arc<tokio::sync::Mutex<schema::WorldSchema>>,
+    /// under tokio Mutex because `fable_send` reads it + Wupi's game-manager
+    /// path writes it (via `fable_command` deltas).
+    pub fable_schema: Arc<tokio::sync::Mutex<schema::WorldSchema>>,
     /// The game's scoped conversation (sibling to `session`, which is
-    /// Wupi-assistant's). Per-card: loaded on `game_start` from
-    /// `sessions/<card_id>.json`, saved on `game_end`. Held under tokio Mutex
-    /// because `game_send` reads + writes it (windowing the narrator prompt +
+    /// Wupi-assistant's). Per-card: loaded on `fable_start` from
+    /// `sessions/<card_id>.json`, saved on `fable_end`. Held under tokio Mutex
+    /// because `fable_send` reads + writes it (windowing the narrator prompt +
     /// appending each turn). Phase 3 per-card persistence (AGENTS.md §2AA).
-    pub game_session: Arc<tokio::sync::Mutex<session::Conversation>>,
+    pub fable_session: Arc<tokio::sync::Mutex<session::Conversation>>,
     /// The active roleplay card. `None` when no game is running. Set on
-    /// `game_start`, cleared on `game_end`. The narrator prompt builder
-    /// reads this each `game_send` turn.
-    pub active_game_card: Arc<std::sync::Mutex<Option<sim_card::SimCard>>>,
-    /// The card id BEFORE a game started, so `game_end` can restore it. The
+    /// `fable_start`, cleared on `fable_end`. The narrator prompt builder
+    /// reads this each `fable_send` turn.
+    pub active_fable_card: Arc<std::sync::Mutex<Option<sim_card::SimCard>>>,
+    /// The Game-Master persona spoken by the Fable drawer's chat_send.
+    /// Loaded from `data/gm.sim` on `fable_start` (mirrors the Wupi-assistant
+    /// `active_card` OnceLock, but held under a Mutex so it can be swapped in/
+    /// out with the game lifetime). When `fable_is_active`, the drawer's
+    /// chat_send renders THIS instead of `active_card` (the OS catgirl): the
+    /// drawer speaks in GM voice inside Fable, the OS chat stays the catgirl
+    /// outside. `None` when no game is running OR when gm.sim is missing/
+    /// malformed (graceful: drawer falls back to the OS catgirl persona).
+    pub fable_persona: Arc<std::sync::Mutex<Option<sim_card::SimCard>>>,
+    /// The card id BEFORE a game started, so `fable_end` can restore it. The
     /// system card (`__wupi__`) is the default; games swap to the
     /// roleplay card's id and restore on exit.
-    pub pre_game_card_id: Arc<std::sync::Mutex<String>>,
+    pub pre_fable_card_id: Arc<std::sync::Mutex<String>>,
     /// First-run GGUF download progress (see `model_downloader.rs`). Polled
     /// by `get_download_progress` and emitted as the `download-progress`
     /// event. Held under a std Mutex: short critical sections only, never
@@ -189,13 +211,14 @@ pub struct AppState {
     /// stays `None` if no GGUF was found (the frontend's first-run download
     /// overlay takes over and never calls `boot_load_model`).
     pub pending_model_path: Arc<std::sync::Mutex<Option<std::path::PathBuf>>>,
-    /// Live terminal session (the in-app drawer's cmd.exe shell). Single
-    /// slot: one session at a time. `None` when the drawer is closed (kill-
-    /// on-close semantics). The reader thread streams output via the typed
-    /// `Channel<TerminalData>` passed to `terminal_open`. Killed on app
-    /// shutdown via `terminal::kill_if_any` in `RunEvent::ExitRequested` —
-    /// the load-bearing zombie guardrail (see terminal.rs).
-    pub terminal: Arc<std::sync::Mutex<Option<terminal::TerminalSession>>>,
+
+    /// The VRAM swap-lock. Enforces "at most ONE `WUPI.gguf` `LlamaContext`
+    /// resident at a time" across chat/schema/fable (the embedder is exempt:
+    /// separate 36.8MB BERT model). Without this, the 4-context-coresident
+    /// design OOMs the FableEngine on a 12GB GPU (the 2026-07-26 freeze root
+    /// cause — see `context_swap.rs` module doc + AGENTS.md §7B correction).
+    /// Cheap to clone (just an `Arc`); shared by all three engines.
+    pub context_swap: context_swap::ContextSwap,
 }
 
 impl AppState {
@@ -219,21 +242,24 @@ impl AppState {
             codex_dir: Arc::new(std::sync::OnceLock::new()),
             theme: Arc::new(std::sync::Mutex::new(theme::ThemeSettings::default())),
             theme_path: Arc::new(std::sync::OnceLock::new()),
+            layout: Arc::new(std::sync::Mutex::new(layout::LayoutSettings::default())),
+            layout_path: Arc::new(std::sync::OnceLock::new()),
             api_config: Arc::new(std::sync::Mutex::new(api::ApiConfig::default())),
             api_config_path: Arc::new(std::sync::OnceLock::new()),
             model_source: Arc::new(std::sync::Mutex::new(api::ModelSource::default())),
-            game_engine: Arc::new(std::sync::Mutex::new(None)),
-            active_game_cancel: Arc::new(std::sync::Mutex::new(None)),
-            game_schema: Arc::new(tokio::sync::Mutex::new(schema::WorldSchema::default())),
-            game_session: Arc::new(tokio::sync::Mutex::new(session::Conversation::new())),
-            active_game_card: Arc::new(std::sync::Mutex::new(None)),
-            pre_game_card_id: Arc::new(std::sync::Mutex::new(memory::WUPI_CARD_ID.to_owned())),
+            fable_engine: Arc::new(std::sync::Mutex::new(None)),
+            active_fable_cancel: Arc::new(std::sync::Mutex::new(None)),
+            fable_schema: Arc::new(tokio::sync::Mutex::new(schema::WorldSchema::default())),
+            fable_session: Arc::new(tokio::sync::Mutex::new(session::Conversation::new())),
+            active_fable_card: Arc::new(std::sync::Mutex::new(None)),
+            fable_persona: Arc::new(std::sync::Mutex::new(None)),
+            pre_fable_card_id: Arc::new(std::sync::Mutex::new(memory::WUPI_CARD_ID.to_owned())),
             download_progress: Arc::new(std::sync::Mutex::new(
                 model_downloader::DownloadProgress::default(),
             )),
             download_cancel: Arc::new(std::sync::Mutex::new(None)),
             pending_model_path: Arc::new(std::sync::Mutex::new(None)),
-            terminal: Arc::new(std::sync::Mutex::new(None)),
+            context_swap: context_swap::ContextSwap::new(),
         }
     }
 }
@@ -264,9 +290,13 @@ pub fn run() {
         .manage(hardware::AudioRegistry)
         .setup(|app| {
             tracing::info!("setup hook entered");
-            // Best-effort cleanup of `wupi.exe.old` from a prior self-update.
-            // By the time the new exe runs, the old one's lock is gone.
-            updater::cleanup_old_exe(app.handle());
+            // Best-effort cleanup of `*.old` files from a prior self-update:
+            // both `wupi.exe.old` (the locked-exe swap dance) AND any DLL
+            // remnants (`msvcp140.dll.old`, `cublas64_13.dll.old`, …) left by
+            // `copy_file_robust` when an update had to rename a locked/loaded
+            // file out of the way. By the time this exe runs, the old
+            // process's locks are gone.
+            updater::cleanup_old_files(app.handle());
             // §8C portable layout: four top-level sibling dirs next to
             // wupi.exe hold all user state. Nothing leaves the install
             // folder. Created lazily here at boot so the rest of setup +
@@ -274,28 +304,34 @@ pub fn run() {
             let data_dir = resolve_data_dir(app.handle());
             let memory_dir = resolve_memory_dir(app.handle());
             let models_dir = resolve_models_dir(app.handle());
-            let games_dir = resolve_apps_dir(app.handle()).join("games");
+            let fable_dir = resolve_apps_dir(app.handle()).join("fable");
             std::fs::create_dir_all(&data_dir).ok();
             std::fs::create_dir_all(&memory_dir).ok();
             std::fs::create_dir_all(&models_dir).ok();
             // Per-card roleplay state (§8C): each subdir holds
             // `<card_id>.json` (or scenario `.sim`s) for the roleplay games
             // the user has played. `profiles/` is reserved for the future
-            // scene-profile editor; shipped empty.
-            std::fs::create_dir_all(games_dir.join("sessions")).ok();
-            std::fs::create_dir_all(games_dir.join("schemas")).ok();
-            std::fs::create_dir_all(games_dir.join("cards")).ok();
-            std::fs::create_dir_all(games_dir.join("profiles")).ok();
+            // scene-profile editor; shipped empty. `saves/` (v0.6.0+)
+            // holds named save slots under `<card_id>/<save_id>.json`.
+            std::fs::create_dir_all(fable_dir.join("sessions")).ok();
+            std::fs::create_dir_all(fable_dir.join("schemas")).ok();
+            std::fs::create_dir_all(fable_dir.join("cards")).ok();
+            std::fs::create_dir_all(fable_dir.join("saves")).ok();
+            std::fs::create_dir_all(fable_dir.join("profiles")).ok();
             // §8C v0.2.4 → v0.3.0 one-shot boot migration: a v0.2.4 install
             // has its user state scattered under data/ (memory.sqlite, models/,
             // sessions/, schemas/, Operator.xml). v0.3.0 promotes those to
-            // top-level dirs (memory/, models/, apps/games/{sessions,schemas}/,
+            // top-level dirs (memory/, models/, apps/fable/{sessions,schemas}/,
             // data/user.xml). The updater preserves data/ verbatim, so without
             // this migration the user's memory + GGUFs (would force a 10GB
             // re-download!) + roleplay state would be orphaned at their old
             // paths. Idempotent: only moves when source exists AND target
             // doesn't, so a v0.3.0+ boot is a complete no-op.
-            migrate_v0_2_4_to_v0_3_0(&data_dir, &memory_dir, &models_dir, &games_dir);
+            migrate_v0_2_4_to_v0_3_0(&data_dir, &memory_dir, &models_dir, &fable_dir);
+            // Fable rename (§7 → Fable): relocate any v0.6.x apps/games/
+            // roleplay state into the new apps/fable/ path. Idempotent; no-op
+            // on fresh installs + post-migration boots.
+            migrate_games_to_fable(&resolve_apps_dir(app.handle()));
             tracing::info!("portable data dir: {}", data_dir.display());
 
             let state: tauri::State<AppState> = app.state();
@@ -313,6 +349,22 @@ pub fn run() {
                 );
                 *state.theme.lock().expect("theme mutex") = loaded;
                 let _ = state.theme_path.set(theme_path);
+            }
+
+            // Same pattern as theme: resolve path → load → cache path on
+            // AppState so layout_get/layout_set don't need the app handle.
+            // The dock/desktop arrangement is UI state; a corrupt file just
+            // resets to the default quick-menu (never blocks launch).
+            {
+                let layout_path = layout::LayoutSettings::resolve_path(&data_dir);
+                let loaded = layout::LayoutSettings::load(&layout_path);
+                tracing::info!(
+                    dock_count = loaded.dock.len(),
+                    desktop_count = loaded.desktop.len(),
+                    "layout loaded"
+                );
+                *state.layout.lock().expect("layout mutex") = loaded;
+                let _ = state.layout_path.set(layout_path);
             }
 
             // Same pattern as theme: resolve path → load → cache path on
@@ -600,16 +652,24 @@ pub fn run() {
             download_models,
             get_download_progress,
             cancel_download,
-            game_cards_list,
-            game_start,
-            game_send,
-            game_stop,
-            game_end,
+            fable_cards_list,
+            fable_start,
+            fable_send,
+            fable_stop,
+            fable_end,
+            fable_list_saves,
+            fable_save_now,
+            fable_load_save,
+            fable_delete_save,
+            fable_continue_target,
+            player_state_get,
             system_menu::power_shutdown_cmd,
             system_menu::power_restart_cmd,
             system_menu::power_sleep_cmd,
             theme_get,
             theme_set,
+            layout_get,
+            layout_set,
             hardware::audio::audio_get_state,
             hardware::audio::audio_set_volume,
             hardware::audio::audio_list_outputs,
@@ -627,10 +687,6 @@ pub fn run() {
             updater_apply,
             updater_restart,
             boot_load_model,
-            terminal_open,
-            terminal_input,
-            terminal_stop,
-            terminal_close,
             system_menu::set_always_on_top,
         ])
         // Build the app, then run the event loop with a callback. Splitting
@@ -648,14 +704,6 @@ pub fn run() {
             // a future code path) so a ghost icon can never accumulate from
             // a graceful-exit route we didn't anticipate.
             if let tauri::RunEvent::ExitRequested { .. } = event {
-                // Kill any live terminal session. This is the load-bearing
-                // zombie guardrail for the in-app terminal (terminal.rs): the
-                // drawer's close hook covers normal exits, but alt-F4 / Task
-                // Manager / future programmatic exits bypass it. This catch-
-                // all ensures no cmd.exe survives WUPI shutdown — the failure
-                // mode of the old second-window terminal design.
-                let state: tauri::State<AppState> = app_handle.state();
-                terminal::kill_if_any(&state);
                 system_menu::destroy_tray(&app_handle);
             }
         });
@@ -724,6 +772,45 @@ fn theme_set(
     Ok(serde_json::json!({
         "theme": new_settings.theme,
         "colorCode": new_settings.color_code,
+    }))
+}
+
+/// Read the dock + desktop layout. The frontend renders the quick-menu and
+/// the free-positioned desktop icons from this on boot.
+#[tauri::command]
+fn layout_get(state: tauri::State<'_, AppState>) -> serde_json::Value {
+    let l = state.layout.lock().expect("layout mutex");
+    serde_json::json!({ "dock": l.dock, "desktop": l.desktop })
+}
+
+/// Persist a new dock + desktop arrangement and return the updated value.
+/// The frontend debounces saves (one per finished drag / context-menu
+/// mutation), so this is called sparingly — not on every mousemove. The
+/// `apps` launcher id is NOT stored in `dock` (the frontend appends it
+/// automatically as the locked final item); passing it here is a no-op for
+/// the save (it's filtered client-side before the call).
+#[tauri::command]
+fn layout_set(
+    dock: Vec<String>,
+    desktop: Vec<layout::DesktopIcon>,
+    state: tauri::State<'_, AppState>,
+) -> Result<serde_json::Value, String> {
+    let path = state
+        .layout_path
+        .get()
+        .ok_or_else(|| "layout path not initialized".to_string())?
+        .clone();
+    let new_settings = layout::LayoutSettings { dock, desktop };
+    new_settings.save(&path);
+    *state.layout.lock().expect("layout mutex") = new_settings.clone();
+    tracing::info!(
+        dock_count = new_settings.dock.len(),
+        desktop_count = new_settings.desktop.len(),
+        "layout updated"
+    );
+    Ok(serde_json::json!({
+        "dock": new_settings.dock,
+        "desktop": new_settings.desktop,
     }))
 }
 
@@ -826,7 +913,7 @@ fn migrate_v0_2_4_to_v0_3_0(
     data_dir: &std::path::Path,
     memory_dir: &std::path::Path,
     models_dir: &std::path::Path,
-    games_dir: &std::path::Path,
+    fable_dir: &std::path::Path,
 ) {
     // Helper: move a single file from src to dst if src exists AND dst is
     // absent. Idempotent. Returns true iff a move actually happened (for
@@ -926,7 +1013,7 @@ fn migrate_v0_2_4_to_v0_3_0(
                     Some(n) => n.to_owned(),
                     None => continue,
                 };
-                let dst = games_dir.join("sessions").join(&name);
+                let dst = fable_dir.join("sessions").join(&name);
                 moved += move_if(&src, &dst) as usize;
             }
         }
@@ -946,7 +1033,7 @@ fn migrate_v0_2_4_to_v0_3_0(
                     Some(n) => n.to_owned(),
                     None => continue,
                 };
-                let dst = games_dir.join("schemas").join(&name);
+                let dst = fable_dir.join("schemas").join(&name);
                 moved += move_if(&src, &dst) as usize;
             }
         }
@@ -962,6 +1049,107 @@ fn migrate_v0_2_4_to_v0_3_0(
 
     if moved > 0 {
         tracing::info!(moved, "§8C migration: v0.2.4 → v0.3.0 layout complete");
+    }
+}
+
+/// Phase 0 (Fable rename) one-shot boot migration: a v0.6.x install has its
+/// roleplay state under `apps/games/{cards,sessions,schemas,saves,profiles}/`.
+/// The Fable rename (§7 → Fable) moved the runtime path to `apps/fable/`. The
+/// updater preserves `apps/` verbatim (§8B preserve rule), so without this
+/// migration the user's scenario `.sim`s + save slots + per-card sessions/
+/// schemas would be orphaned at their old `apps/games/` paths.
+///
+/// Idempotent: only moves when source exists AND target is absent, so a
+/// post-migration boot (or a fresh install with no `apps/games/`) is a no-op.
+/// Walks each known subdir + moves every file; cross-volume renames fall back
+/// to copy+delete (EXDEV). Errors are logged-and-continued (a partial
+/// migration is bad, but a boot-killing one is worse — mirrors §8C policy).
+fn migrate_games_to_fable(apps_dir: &std::path::Path) {
+    let legacy = apps_dir.join("games");
+    if !legacy.is_dir() {
+        return; // Fresh install or already migrated — nothing to do.
+    }
+    let dest = apps_dir.join("fable");
+    // The dest subdirs are pre-created by setup() just before this runs, so we
+    // only need to move files into them.
+    let mut moved = 0usize;
+    for sub in &["cards", "sessions", "schemas", "saves", "profiles"] {
+        let src_sub = legacy.join(sub);
+        if !src_sub.is_dir() {
+            continue;
+        }
+        let dst_sub = dest.join(sub);
+        std::fs::create_dir_all(&dst_sub).ok();
+        if let Ok(entries) = std::fs::read_dir(&src_sub) {
+            // Recurse one level: saves/<card_id>/<save_id>.json is nested.
+            fn migrate_entry(
+                src: std::path::PathBuf,
+                dst_sub: &std::path::Path,
+                moved: &mut usize,
+            ) {
+                let name = match src.file_name().and_then(|n| n.to_str()) {
+                    Some(n) => n.to_owned(),
+                    None => return,
+                };
+                let dst = dst_sub.join(&name);
+                if src.is_dir() {
+                    // Nested subdir (e.g. saves/<card_id>/). Recurse into it.
+                    std::fs::create_dir_all(&dst).ok();
+                    if let Ok(inner) = std::fs::read_dir(&src) {
+                        for e in inner.flatten() {
+                            migrate_entry(e.path(), &dst, moved);
+                        }
+                    }
+                    // Best-effort cleanup of the now-empty legacy subdir.
+                    let _ = std::fs::remove_dir(&src);
+                    return;
+                }
+                if dst.exists() {
+                    return; // Idempotent: never overwrite.
+                }
+                match std::fs::rename(&src, &dst) {
+                    Ok(()) => {
+                        tracing::info!(
+                            "Fable migration: {} → {}",
+                            src.display(),
+                            dst.display()
+                        );
+                        *moved += 1;
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            ?e,
+                            src = %src.display(),
+                            "Fable migration: rename failed; trying copy+delete"
+                        );
+                        if std::fs::copy(&src, &dst).is_ok()
+                            && std::fs::remove_file(&src).is_ok()
+                        {
+                            tracing::info!(
+                                "Fable migration (copy): {} → {}",
+                                src.display(),
+                                dst.display()
+                            );
+                            *moved += 1;
+                        } else {
+                            tracing::warn!(
+                                src = %src.display(),
+                                "Fable migration: gave up on this file (manual move needed)"
+                            );
+                        }
+                    }
+                }
+            }
+            for entry in entries.flatten() {
+                migrate_entry(entry.path(), &dst_sub, &mut moved);
+            }
+        }
+    }
+    // Best-effort cleanup of the now-empty legacy apps/games/ dir. A leftover
+    // file (move failed) keeps it populated, which is correct — don't force.
+    let _ = std::fs::remove_dir(&legacy);
+    if moved > 0 {
+        tracing::info!(moved, "Fable migration: apps/games/ → apps/fable/ complete");
     }
 }
 
@@ -1249,7 +1437,7 @@ async fn updater_apply(
 /// in `@tauri-apps/plugin-process`, which we removed when we dropped the
 /// installer-only Tauri updater; the Rust side is core API). The swap has
 /// already placed the new `wupi.exe` on disk; restart loads it + drops the
-/// .old on the next boot's `cleanup_old_exe`.
+/// .old on the next boot's `cleanup_old_files`.
 #[tauri::command]
 fn updater_restart(app: tauri::AppHandle) {
     app.restart();
@@ -1319,10 +1507,9 @@ async fn boot_load_model(app: tauri::AppHandle, state: tauri::State<'_, AppState
                     .map(|g| g.is_some())
                     .unwrap_or(false);
                 if !already {
-                    let (engine, init_rx) = schema_engine::SchemaEngine::spawn_load(
-                        path.clone(),
-                        99,
-                    );
+                    // Schema engine borrows shared_model() (deduped, no own
+                    // weight copy). No path/n_gpu args anymore (2026-07-23).
+                    let (engine, init_rx) = schema_engine::SchemaEngine::spawn_load();
                     match init_rx.recv() {
                         Ok(Ok(())) => {
                             tracing::info!(
@@ -1356,16 +1543,11 @@ async fn boot_load_model(app: tauri::AppHandle, state: tauri::State<'_, AppState
                                         profile_id = %profile_id,
                                         "boot: restoring last-used API connection"
                                     );
-                                    // Tear down the freshly-loaded 12B
-                                    // chat backend (schema stays put).
-                                    let taken = app_state
-                                        .backend
-                                        .lock()
-                                        .expect("backend mutex")
-                                        .take();
-                                    if let Some(b) = taken {
-                                        b.shutdown();
-                                    }
+                                    // v0.6.3 local-always: do NOT tear down
+                                    // the freshly-loaded 12B. It stays resident
+                                    // as the silent agent + seamless fallback.
+                                    // Just flip model_source so chat_send routes
+                                    // to the API; the local engine remains hot.
                                     *app_state
                                         .model_source
                                         .lock()
@@ -1379,7 +1561,7 @@ async fn boot_load_model(app: tauri::AppHandle, state: tauri::State<'_, AppState
                                         }),
                                     );
                                     tracing::info!(
-                                        "boot: API connection restored"
+                                        "boot: API connection restored (local resident)"
                                     );
                                 } else {
                                     // model_source was Api but no active
@@ -1431,52 +1613,6 @@ async fn boot_load_model(app: tauri::AppHandle, state: tauri::State<'_, AppState
     Ok(())
 }
 
-// ── In-app Terminal IPC ────────────────────────────────────────────────────
-//
-// Four commands drive the right-side Terminal drawer (see terminal.rs for the
-// architecture + load-bearing kill-on-close guardrail). The frontend wires:
-//   - terminalBtn (paw menu) → openWindow('terminal') → windowOpenHooks
-//     → terminal_open(onData: Channel<TerminalData>)
-//   - input row + ▶ send button + Enter key → terminal_input({ text })
-//   - Stop button → terminal_stop
-//   - ✕ / Esc / paw-menu re-click / dock toggle → windowCloseHooks
-//     → terminal_close
-//
-// One session at a time (single slot in AppState). Shell dies on drawer close
-// so no zombie cmd.exe can accumulate (the failure mode of the old second-
-// window terminal design).
-
-/// Spawn a cmd.exe in a ConPTY + start streaming its output to `on_data`.
-/// Idempotent: no-op if a session is already live (the frontend can call this
-/// on every drawer-open without leaking shells).
-#[tauri::command]
-fn terminal_open(
-    state: tauri::State<'_, AppState>,
-    on_data: tauri::ipc::Channel<terminal::TerminalData>,
-) -> Result<(), String> {
-    terminal::open_session(&state.terminal, on_data)
-}
-
-/// Write `text + "\r\n"` to the shell's stdin. CRLF = Enter in ConPTY/cmd.exe.
-#[tauri::command]
-fn terminal_input(state: tauri::State<'_, AppState>, text: String) -> Result<(), String> {
-    terminal::write_input(&state.terminal, &text)
-}
-
-/// Send the Windows break sequence (raw Ctrl-C byte) to the shell. The Stop
-/// button's backend. Interrupts a running command. No-op if no session.
-#[tauri::command]
-fn terminal_stop(state: tauri::State<'_, AppState>) {
-    terminal::send_break(&state.terminal);
-}
-
-/// Kill the shell + drop the session. Idempotent. Called by the drawer's
-/// close hook (✕, Esc, paw-menu re-click, dock toggle) and from
-/// `RunEvent::ExitRequested` at app shutdown (via `terminal::kill_if_any`).
-#[tauri::command]
-fn terminal_close(state: tauri::State<'_, AppState>) {
-    terminal::close_session(&state.terminal);
-}
 
 /// Resolve Wupi's active persona card. Per §8C the active persona is a single
 /// copy at `<exe_dir>/data/wupi.sim` (lowercase w) — no template/live split.
@@ -1542,6 +1678,36 @@ fn resolve_wupi_sim_path(app: &tauri::AppHandle) -> Option<std::path::PathBuf> {
                     return Some(path);
                 }
             }
+        }
+    }
+    None
+}
+
+/// Resolve the Game-Master persona path (`data/gm.sim`). Mirrors
+/// `resolve_wupi_sim_path` but for the GM card spoken inside the Fable drawer.
+/// Only the primary portable path + its dev-repo mirror are consulted — the
+/// legacy `cards/` fallbacks are NOT (gm.sim is a Fable-v1 artifact with no
+/// pre-rename history). Returns None if absent (graceful: the drawer then
+/// falls back to the OS catgirl persona in chat_send).
+fn resolve_gm_sim_path(app: &tauri::AppHandle) -> Option<std::path::PathBuf> {
+    let mut candidates: Vec<std::path::PathBuf> = Vec::new();
+    // §8C portable layout: `<exe_dir>/data/gm.sim`.
+    candidates.push(resolve_data_dir(app).join("gm.sim"));
+    if let Some(exe) = std::env::current_exe().ok() {
+        if let Some(parent) = exe.parent() {
+            // Dev-repo path (exe lives in target/{release,debug}).
+            if let Some(grand) = parent.parent().and_then(|g| g.parent()) {
+                candidates.push(grand.join("data").join("gm.sim"));
+            }
+            if let Some(gg) = parent.parent().and_then(|g| g.parent()).and_then(|g| g.parent()) {
+                candidates.push(gg.join("data").join("gm.sim"));
+            }
+        }
+    }
+    for c in &candidates {
+        if c.is_file() {
+            tracing::info!("resolved gm card: {}", c.display());
+            return Some(c.clone());
         }
     }
     None
@@ -1634,22 +1800,125 @@ fn resolve_codex_dir(app: &tauri::AppHandle) -> Option<std::path::PathBuf> {
     None
 }
 
-// Three small functions: game_is_active checks whether a GameEngine is
-// running; route_to_game_manager handles the MutateWorldState intent
+// Three small functions: fable_is_active checks whether a FableEngine is
+// running; route_to_fable_manager handles the MutateWorldState intent
 // (translates the player's request to a SchemaDelta via the schema engine's
-// isolated context, applies it, streams a confirmation); route_to_game_query
+// isolated context, applies it, streams a confirmation); route_to_fable_query
 // handles QueryWorldState (returns a slice of the game's world-state schema).
 //
+/// Acquire the Schema VRAM lease + spawn-or-reuse the schema engine.
+///
+/// v0.6.4 VRAM swap-lock: the schema engine is NO LONGER eager-resident.
+/// It's spawned lazily here on the first schema request (delta or
+/// translation) and torn down when chat/fable next acquires (cross-role
+/// eviction). Between back-to-back schema requests it stays resident
+/// (same-role reuse, no re-spawn churn).
+///
+/// Returns `(engine, lease_guard)`. The caller MUST hold the guard for the
+/// duration of the schema request — dropping it marks the slot free (the
+/// resident engine persists until a different role evicts it).
+///
+/// The teardown callback tears down the schema engine on the next
+/// cross-role acquire. It clones the AppState Arc it needs so it can run
+/// independently of this task.
+async fn acquire_schema_engine(
+    state: &tauri::State<'_, AppState>,
+) -> Result<(Arc<schema_engine::SchemaEngine>, context_swap::LeaseGuard), String> {
+    acquire_schema_engine_from_arcs(
+        state.context_swap.clone(),
+        Arc::clone(&state.schema_engine),
+    )
+    .await
+}
+
+/// The Arcs-only inner of `acquire_schema_engine`. Exists so a detached
+/// `tokio::spawn` task (the chat_send delta-fire path) can acquire the
+/// schema engine without a `tauri::State<'_>` borrow — it owns its Arcs.
+async fn acquire_schema_engine_from_arcs(
+    context_swap: context_swap::ContextSwap,
+    schema_engine_slot: Arc<std::sync::Mutex<Option<Arc<schema_engine::SchemaEngine>>>>,
+) -> Result<(Arc<schema_engine::SchemaEngine>, context_swap::LeaseGuard), String> {
+    // Clone the slot Arc for the teardown closure (the closure moves it; we
+    // still need the original for the spawn-or-reuse below).
+    let teardown_slot = Arc::clone(&schema_engine_slot);
+    let lease = context_swap
+        .acquire(
+            context_swap::ContextRole::Schema,
+            Box::new(move || {
+                // Synchronous teardown: take the engine out of the slot +
+                // join its thread so VRAM is freed before the next context
+                // allocates. Mirrors the fable teardown path.
+                let engine = {
+                    let mut g = teardown_slot.lock().map_err(|e| e.to_string())?;
+                    g.take()
+                };
+                if let Some(engine) = engine {
+                    let engine = Arc::try_unwrap(engine).map_err(|_| {
+                        "schema teardown: other Arc refs still held".to_string()
+                    })?;
+                    engine.shutdown(); // synchronous .join
+                    tracing::info!("context-swap: schema engine torn down (VRAM freed)");
+                }
+                Ok(())
+            }),
+        )
+        .await;
+
+    // Spawn-or-reuse. Fast path: a prior schema request left it resident.
+    let engine = {
+        let existing = schema_engine_slot
+            .lock()
+            .map_err(|e| format!("schema_engine mutex: {e}"))?
+            .clone();
+        match existing {
+            Some(e) => {
+                tracing::debug!("context-swap: schema engine reused (resident)");
+                e
+            }
+            None => {
+                tracing::info!("context-swap: spawning schema engine on demand");
+                let (engine, init_rx) = schema_engine::SchemaEngine::spawn_load();
+                let ready = tokio::task::spawn_blocking(move || init_rx.recv())
+                    .await
+                    .map_err(|e| format!("schema engine init join: {e}"))?
+                    .map_err(|e| format!("schema engine init channel: {e}"))?;
+                match ready {
+                    Ok(()) => {
+                        let engine = Arc::new(engine);
+                        if let Ok(mut slot) = schema_engine_slot.lock() {
+                            *slot = Some(Arc::clone(&engine));
+                        }
+                        engine
+                    }
+                    Err(msg) => {
+                        return Err(format!("schema engine init failed: {msg}"));
+                    }
+                }
+            }
+        }
+    };
+    Ok((engine, lease))
+}
+
 // Both route helpers are invoked from the top of chat_send via an early
 // return, so the existing Wupi-assistant chat body is never entered when a
 // management intent is detected.
 
-/// True when a GameEngine is currently running (a game is active). Cheap:
+/// True when a FableEngine is currently running (a game is active). Cheap:
 /// locks the Mutex briefly, checks for Some, drops the guard. Used at the top
 /// of `chat_send` to decide whether to run the management-intent classifier.
-fn game_is_active(state: &tauri::State<'_, AppState>) -> bool {
+fn fable_is_active(state: &tauri::State<'_, AppState>) -> bool {
+    // v0.6.4: a game is "active" when a Fable card is seated
+    // (`active_fable_card.is_some()`), NOT when the FableEngine is resident.
+    // Under the VRAM swap-lock the engine is lazily spawned on the first
+    // `fable_send` and torn down when chat/schema needs VRAM — so the engine
+    // slot is regularly `None` mid-game (e.g. right after the user asks
+    // Wupi a question, which evicts fable to run the schema translation).
+    // The card, by contrast, is seated on `fable_start` and cleared on
+    // `fable_end`, which is the true game-lifetime signal the chat_send
+    // gate + persona selector need.
     state
-        .game_engine
+        .active_fable_card
         .lock()
         .map(|g| g.is_some())
         .unwrap_or(false)
@@ -1657,7 +1926,7 @@ fn game_is_active(state: &tauri::State<'_, AppState>) -> bool {
 
 /// Handle a `MutateWorldState` intent: translate the player's natural-language
 /// request into a `SchemaDelta` via the schema engine's isolated context,
-/// apply it to the active game's scoped `game_schema`, and stream a
+/// apply it to the active game's scoped `fable_schema`, and stream a
 /// confirmation back through the same `on_event` Channel Wupi's chat uses.
 ///
 /// The translation reuses `SchemaEngine::request_translation` (Phase E,
@@ -1669,23 +1938,22 @@ fn game_is_active(state: &tauri::State<'_, AppState>) -> bool {
 /// Errors surface as a single `error` Channel event + an `Err` return, so the
 /// UI can render them like any chat error. The active game's schema is left
 /// unchanged on any failure path.
-async fn route_to_game_manager(
+async fn route_to_fable_manager(
     text: String,
     on_event: tauri::ipc::Channel<serde_json::Value>,
     state: &tauri::State<'_, AppState>,
 ) -> Result<(), String> {
-    // 1. Pull the schema engine out under a brief lock. If it's not running
-    //    (rare: eager-spawned at boot), surface an error rather than crash.
-    let schema_engine = state
-        .schema_engine
-        .lock()
-        .map_err(|e| format!("schema_engine mutex: {e}"))?
-        .clone()
-        .ok_or_else(|| "schema engine not running: cannot translate request".to_string())?;
+    // 1. Acquire the Schema lease + spawn-or-reuse the schema engine under
+    //    the VRAM swap-lock (v0.6.4). This evicts any resident chat/fable
+    //    context BEFORE we generate — the load-bearing fix for the 2026-07-26
+    //    freeze. The lease guard is held for the duration of the translation;
+    //    dropping it at end of scope marks the slot free (the resident schema
+    //    engine persists until a chat/fable turn evicts it).
+    let (schema_engine, _schema_lease) = acquire_schema_engine(state).await?;
 
     // 2. Snapshot the current game schema (the delta diffs against this).
     //    Clone out + drop the guard before the awaited translation call.
-    let current_schema = state.game_schema.lock().await.clone();
+    let current_schema = state.fable_schema.lock().await.clone();
 
     // 2b. Drain the failed-translation queue (fail-proof contract §5 layer 3).
     //     Any prior player request that exhausted all 3 passes is folded into
@@ -1745,7 +2013,7 @@ async fn route_to_game_manager(
 
     let delta_applied = delta.has_changes();
     if delta_applied {
-        let mut s = state.game_schema.lock().await;
+        let mut s = state.fable_schema.lock().await;
         s.apply_delta(delta.clone());
     }
 
@@ -1768,7 +2036,7 @@ async fn route_to_game_manager(
             "type": "done",
             "final_text": confirmation,
             "reasoning": "",
-            "game_manager": true,
+            "fable_manager": true,
         }))
         .map_err(|e| e.to_string())?;
     tracing::info!(
@@ -1784,12 +2052,12 @@ async fn route_to_game_manager(
 /// "inventory") is matched against the schema's entity keys; if nothing
 /// matches, the whole schema is returned (so Wupi can still describe the
 /// state of the world generally).
-async fn route_to_game_query(
+async fn route_to_fable_query(
     focus: String,
     on_event: tauri::ipc::Channel<serde_json::Value>,
     state: &tauri::State<'_, AppState>,
 ) -> Result<(), String> {
-    let snapshot = state.game_schema.lock().await.clone();
+    let snapshot = state.fable_schema.lock().await.clone();
     let state_json = snapshot.to_json_pretty();
 
     // Best-effort focus match: look for entity keys containing the focus
@@ -1812,12 +2080,12 @@ async fn route_to_game_query(
         format!("Here's what I know about {focus}:\n{focused}")
     };
 
-    // Emit two messages: the structured `game_state_query` (machine-readable,
+    // Emit two messages: the structured `fable_state_query` (machine-readable,
     // for any future UI that wants to render state differently) + the
     // chunk/done pair Wupi's chat UI renders as a normal bubble.
     on_event
         .send(serde_json::json!({
-            "type": "game_state_query",
+            "type": "fable_state_query",
             "focus": focus,
             "state": state_json,
         }))
@@ -1830,7 +2098,7 @@ async fn route_to_game_query(
             "type": "done",
             "final_text": body,
             "reasoning": "",
-            "game_manager": true,
+            "fable_manager": true,
         }))
         .map_err(|e| e.to_string())?;
     tracing::info!(
@@ -1896,18 +2164,18 @@ async fn chat_send(
     // route to the dedicated handlers and RETURN EARLY: the existing chat
     // body is never entered, so Wupi-assistant chat behavior is unchanged
     // when no game is active OR when the message isn't management-shaped.
-    // See docs/games-app-design.md §1.4 + game_command.rs for the heuristic.
-    if game_is_active(&state) {
-        match game_command::classify(&text) {
-            game_command::GameCommand::MutateWorldState(_) => {
+    // See docs/games-app-design.md §1.4 + fable_command.rs for the heuristic.
+    if fable_is_active(&state) {
+        match fable_command::classify(&text) {
+            fable_command::FableCommand::MutateWorldState(_) => {
                 clear_active_cancel(&state);
-                return route_to_game_manager(text, on_event, &state).await;
+                return route_to_fable_manager(text, on_event, &state).await;
             }
-            game_command::GameCommand::QueryWorldState(focus) => {
+            fable_command::FableCommand::QueryWorldState(focus) => {
                 clear_active_cancel(&state);
-                return route_to_game_query(focus, on_event, &state).await;
+                return route_to_fable_query(focus, on_event, &state).await;
             }
-            game_command::GameCommand::NotACommand => {
+            fable_command::FableCommand::NotACommand => {
                 // Fall through to normal Wupi-assistant chat.
             }
         }
@@ -1994,15 +2262,34 @@ async fn chat_send(
         let rendered = s.render_for_prompt();
         if rendered.is_empty() { None } else { Some(rendered) }
     };
-    // Persona: rendered once per turn from the active Simulation Card. The
-    // card is immutable after setup, so the rendered string is byte-identical
-    // across turns → the persona block in the system prompt is stable and does
-    // NOT trigger the §2F cold-reset guard (only the inter-turn memory block
-    // does, by design). The fallback card renders to "" → section suppressed.
-    let persona = state
-        .active_card
-        .get()
-        .map(|c| c.render_for_prompt());
+    // Persona: rendered once per turn. The Wupi-assistant card (`active_card`)
+    // is immutable after setup → byte-identical across turns → the persona
+    // block is stable and does NOT trigger the §2F cold-reset guard (only the
+    // inter-turn memory block does, by design). The fallback card renders to
+    // "" → section suppressed.
+    //
+    // Phase 2 (gm.sim split): when a game is active, the drawer's chat_send
+    // (the `NotACommand` fallthrough) renders the Game-Master persona
+    // (`fable_persona`) instead of `active_card` (the OS catgirl). So the
+    // drawer speaks in GM voice inside Fable; OS chat outside Fable stays the
+    // catgirl. The narrator path (`fable_send`) reads `active_fable_card`
+    // independently and is unaffected. `fable_persona` is None when gm.sim is
+    // missing/malformed → graceful fallback to the OS catgirl (best-effort,
+    // mirrors the embedder's degradation contract).
+    let persona = if fable_is_active(&state) {
+        state
+            .fable_persona
+            .lock()
+            .ok()
+            .and_then(|guard| guard.clone())
+            .map(|c| c.render_for_prompt())
+            .or_else(|| state.active_card.get().map(|c| c.render_for_prompt()))
+    } else {
+        state
+            .active_card
+            .get()
+            .map(|c| c.render_for_prompt())
+    };
     // Operator profile: re-read FRESH from disk each turn (hot-reload). The
     // path is cached (stable); only the content refreshes: so a live edit to
     // user.xml (§8C-renamed from Operator.xml) takes effect on the very next
@@ -2021,16 +2308,20 @@ async fn chat_send(
     // the last VISIBLE_WINDOW messages regardless of token budget. Memory (M)
     // backfills evicted turns via retrieval. Truncation in the engine becomes
     // a safety net that effectively never fires (4 short turns ≪ ~3000 budget).
-    // 6 messages = 3 full user↔assistant turns. The sweet spot: enough
-    // recency that the model has natural conversational continuity, small
-    // enough that truncation never fires and the prompt stays cheap. Gemma
-    // 12B handles this with zero performance hit. Tunable.
-    const VISIBLE_WINDOW: usize = 6;
+    //
+    // Window is now source-dependent (the v0.6.3 local-always redesign): the
+    // API path keeps a wider 12-message window (the cloud model has the
+    // context budget + the local model is kept hot as a silent agent doing
+    // schema/memory tracking, so the API can carry more narrative); the Local
+    // path stays at 6 (the sweet spot: 3 full user↔assistant turns, enough
+    // recency for continuity, small enough that truncation never fires).
+    let source = *state.model_source.lock().expect("model_source mutex");
+    let visible_window = if source == api::ModelSource::Api { 12 } else { 6 };
 
     let messages = {
         let mut s = state.session.lock().await;
         s.add_message(session::Role::User, text.clone());
-        s.assemble_api_messages_windowed(&system_prompt, VISIBLE_WINDOW)
+        s.assemble_api_messages_windowed(&system_prompt, visible_window)
     };
 
     let on_chunk: llm::ChunkFn = Arc::new({
@@ -2040,17 +2331,133 @@ async fn chat_send(
         }
     });
 
-    let backend_opt = state.backend.lock().expect("backend mutex").clone();
-    // Model-source dispatch: API path constructs a fresh HttpBackend from the
-    // active profile; Local path uses the persistent LlamaCppBackend (or
-    // EchoBackend if no local model loaded). The memory_block + world_state
-    // are folded into the system message by the HttpBackend (APIs take a flat
-    // messages list, not the inter-turn splice the local backend uses).
-    let source = *state.model_source.lock().expect("model_source mutex");
+    // v0.6.4 VRAM swap-lock: the local backend is NO LONGER always-resident.
+    // It's the DEFAULT idle role (resident when nothing else needs VRAM) but
+    // yields to fable/schema when they acquire their leases (which evict the
+    // chat context via synchronous teardown). When this chat_send runs, if a
+    // fable/schema turn since the last chat evicted the backend, the slot is
+    // `None` and we re-spawn it from the shared model (no file read —
+    // `LlamaCppBackend::spawn_from_shared`, ~instant context creation on the
+    // leaked weights that never left VRAM).
+    //
+    // Acquire the Chat lease first (evicts any resident fable/schema context
+    // via synchronous teardown, freeing VRAM before we re-spawn). The lease
+    // guard is held for the duration of the turn; dropping it at end of scope
+    // marks the slot free (the resident backend persists until a fable/schema
+    // turn evicts it — back-to-back chat turns reuse it).
+    //
+    // The teardown callback tears down the chat backend on the next
+    // cross-role acquire. It calls `LlamaCppBackend::shutdown` (synchronous
+    // .join, frees the chat context's ~75-150MB Q8_0 KV — NOT the weights,
+    // which stay leaked for the process lifetime + reuse by the next
+    // spawn_from_shared).
+    let context_swap_clone = state.context_swap.clone();
+    let backend_slot = Arc::clone(&state.backend);
+    let chat_context_size = settings.context_size;
+    let _chat_lease = context_swap_clone
+        .acquire(
+            context_swap::ContextRole::Chat,
+            Box::new(move || {
+                // Synchronous teardown: take the backend out + shutdown
+                // (joins the engine thread, frees the KV context). The
+                // weights stay leaked (process-lifetime); only the context
+                // goes.
+                let backend = {
+                    let mut g = backend_slot.lock().map_err(|e| e.to_string())?;
+                    g.take()
+                };
+                if let Some(backend) = backend {
+                    // LlamaCppBackend::shutdown is &self and takes the
+                    // inner engine under its own lock + joins. Drop on a
+                    // spawn_blocking-equivalent: this closure runs on the
+                    // task thread that calls the next acquire, blocking it
+                    // until the join completes (correct — the next context
+                    // needs this VRAM).
+                    backend.shutdown();
+                    tracing::info!("context-swap: chat backend torn down (KV freed, weights retained)");
+                }
+                Ok(())
+            }),
+        )
+        .await;
+
+    // Spawn-or-reuse the chat backend. Fast path: a prior chat turn (or
+    // boot) left it resident. Slow path: re-spawn from shared model.
+    let backend_opt = {
+        let existing = state.backend.lock().expect("backend mutex").clone();
+        match existing {
+            Some(b) => {
+                tracing::debug!("context-swap: chat backend reused (resident)");
+                Some(b)
+            }
+            None => {
+                tracing::info!("context-swap: re-spawning chat backend from shared model");
+                // Block on readiness via a oneshot so we don't return
+                // before the context is live (chat_send needs the backend
+                // ready for stream() below). Mirrors boot_load_model's
+                // readiness-await pattern.
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                let backend = llm::LlamaCppBackend::spawn_from_shared(
+                    chat_context_size,
+                    Box::new(move |result| {
+                        let _ = tx.send(result);
+                    }),
+                );
+                match backend {
+                    Some(backend) => {
+                        // Stash optimistically; stream() will find it once
+                        // the watcher thread populates the internal slot.
+                        {
+                            let mut g = state.backend.lock().expect("backend mutex");
+                            *g = Some(Arc::clone(&backend));
+                        }
+                        // Await readiness.
+                        let ready = tokio::task::spawn_blocking(move || {
+                            // The watcher thread in spawn_from_shared calls
+                            // on_result (our tx) once init resolves. Wait
+                            // for it. oneshot::Receiver::blocking_recv
+                            // returns Result<T, RecvError> (sender dropped
+                            // → Err).
+                            rx.blocking_recv()
+                        })
+                        .await
+                        .map_err(|e| format!("chat re-spawn readiness join: {e}"))?;
+                        match ready {
+                            Ok(Ok(_)) => Some(backend),
+                            Ok(Err(e)) => {
+                                return Err(format!("chat backend re-spawn failed: {e}"));
+                            }
+                            Err(_) => {
+                                return Err("chat backend re-spawn readiness dropped".to_string());
+                            }
+                        }
+                    }
+                    None => {
+                        // shared_model() is None — boot never loaded the
+                        // chat model. This shouldn't happen (boot_load_model
+                        // runs before chat_send is callable) but defend.
+                        tracing::warn!("context-swap: shared_model() is None; chat backend unavailable (echo mode)");
+                        None
+                    }
+                }
+            }
+        }
+    };
+
+    // Dispatch with seamless per-turn fallback. The contract (per Chloe's
+    // spec): if the API is selected but fails on this turn (network, 4xx/5xx,
+    // stream error, or no profile), the turn transparently falls back to the
+    // local model with the 6-message window — the user sees a reply, not an
+    // error. `model_source` stays Api so the NEXT turn retries the API
+    // automatically (the moment it's healthy, chat returns to API + 12). This
+    // gives the seamless back-and-forth: every turn tries API, drops to local
+    // on failure, returns to API the instant it recovers. No manual reconnect.
+    //
+    // To make the fallback cache-coherent with the local engine's delta-prefill,
+    // the local path re-assembles the message window at 6 (the API may have
+    // assembled 12 above): the local engine's KV cache only ever saw the
+    // 6-window render, so feeding it the same shape keeps the delta path fast.
     let result = if source == api::ModelSource::Api {
-        // Active profile must exist (api_connect validates + sets it). If it's
-        // somehow missing (e.g. config edited mid-session), fall through to
-        // the local path rather than crashing.
         let profile_opt = {
             let cfg = state.api_config.lock().expect("api_config mutex");
             cfg.active_profile().cloned()
@@ -2059,59 +2466,99 @@ async fn chat_send(
             Some(profile) => {
                 let http = llm::HttpBackend::new(profile);
                 match http
-                    .stream(messages, memory_block, world_state, settings.context_size, on_chunk, cancel.clone())
+                    .stream(messages, memory_block.clone(), world_state.clone(), settings.context_size, on_chunk.clone(), cancel.clone())
                     .await
                 {
                     Ok(text) => text,
                     Err(e) => {
-                        clear_active_cancel(&state);
-                        rollback_last_user_message(&state, &app).await;
-                        on_event
-                            .send(serde_json::json!({ "type": "error", "message": format!("{e}") }))
-                            .map_err(|e| e.to_string())?;
-                        return Ok(());
+                        // Seamless fallback (the load-bearing path). Do NOT
+                        // surface the error or roll back the user message:
+                        // re-run the turn on the local model at the 6-window
+                        // so the user gets a reply and immersion is preserved.
+                        // Emit a low-key info event the UI can show as a small
+                        // "API unreachable — using local" chip (not an error
+                        // bubble: this must not feel like a failure).
+                        tracing::warn!(error = %e, "chat_send: API stream failed; falling back to local");
+                        let _ = on_event.send(serde_json::json!({
+                            "type": "fallback",
+                            "reason": "api_unreachable",
+                            "source": "local",
+                        }));
+                        match run_local_or_echo(
+                            &state,
+                            &on_event,
+                            &system_prompt,
+                            6,
+                            memory_block,
+                            world_state,
+                            settings.context_size,
+                            on_chunk.clone(),
+                            cancel.clone(),
+                            backend_opt.as_ref(),
+                        )
+                        .await
+                        {
+                            Ok(text) => text,
+                            Err(()) => {
+                                // Local backend also failed (final safety net
+                                // exhausted): helper emitted the error event +
+                                // cleared cancel. Roll back + bail.
+                                rollback_last_user_message(&state, &app).await;
+                                return Ok(());
+                            }
+                        }
                     }
                 }
             }
             None => {
-                // No active profile but source=Api: corrupted state. Surface
-                // it so the user knows to reconnect, then bail.
-                clear_active_cancel(&state);
-                rollback_last_user_message(&state, &app).await;
-                on_event
-                    .send(serde_json::json!({
-                        "type": "error",
-                        "message": "API source selected but no profile connected. Reconnect in the API panel."
-                    }))
-                    .map_err(|e| e.to_string())?;
-                return Ok(());
-            }
-        }
-    } else if let Some(backend) = backend_opt {
-        match backend
-            .stream(messages, memory_block, world_state, settings.context_size, on_chunk, cancel.clone())
-            .await
-        {
-            Ok(text) => text,
-            Err(e) => {
-                clear_active_cancel(&state);
-                rollback_last_user_message(&state, &app).await;
-                on_event
-                    .send(serde_json::json!({ "type": "error", "message": format!("{e}") }))
-                    .map_err(|e| e.to_string())?;
-                return Ok(());
+                // No active profile but source=Api (e.g. profile deleted
+                // mid-session). Same seamless fallback — don't break the turn.
+                tracing::warn!("chat_send: source=Api but no active profile; falling back to local");
+                let _ = on_event.send(serde_json::json!({
+                    "type": "fallback",
+                    "reason": "no_active_profile",
+                    "source": "local",
+                }));
+                match run_local_or_echo(
+                    &state,
+                    &on_event,
+                    &system_prompt,
+                    6,
+                    memory_block,
+                    world_state,
+                    settings.context_size,
+                    on_chunk.clone(),
+                    cancel.clone(),
+                    backend_opt.as_ref(),
+                )
+                .await
+                {
+                    Ok(text) => text,
+                    Err(()) => {
+                        rollback_last_user_message(&state, &app).await;
+                        return Ok(());
+                    }
+                }
             }
         }
     } else {
-        let echo = llm::EchoBackend;
-        match echo.stream(messages, None, None, settings.context_size, on_chunk, cancel.clone()).await {
-            Ok(t) => t,
-            Err(e) => {
-                clear_active_cancel(&state);
+        match run_local_or_echo(
+            &state,
+            &on_event,
+            &system_prompt,
+            visible_window,
+            memory_block,
+            world_state,
+            settings.context_size,
+            on_chunk.clone(),
+            cancel.clone(),
+            backend_opt.as_ref(),
+        )
+        .await
+        {
+            Ok(text) => text,
+            Err(()) => {
                 rollback_last_user_message(&state, &app).await;
-                on_event
-                    .send(serde_json::json!({ "type": "error", "message": format!("{e}") }))
-                    .map_err(|e| e.to_string())?;
                 return Ok(());
             }
         }
@@ -2190,71 +2637,97 @@ async fn chat_send(
     // post-generation work: post the request, await the reply via
     // spawn_blocking, apply the delta, persist. If the schema engine isn't
     // available (init failed, or chat proceeded in echo mode, or mid-swap),
-    // skip silently. Clone the Arc out of the Mutex and drop the guard
-    // before the spawned task (the task holds the clone across awaits).
-    let schema_engine_opt = state
-        .schema_engine
-        .lock()
-        .map(|g| g.clone())
-        .unwrap_or(None);
-    if let Some(schema_engine) = schema_engine_opt {
-        // Capture the exchange from the session (clean strings, same source
-        // as the memory archive: sidesteps the token-boundary-drift landmine
-        // the same way). Read inside a brief lock, clone out, then drop the
-        // guard before spawning so the task doesn't pin the session mutex.
-        let (user_text, asst_text) = {
-            let s = state.session.lock().await;
-            let user = s.messages.len().checked_sub(2).and_then(|i| s.messages.get(i)).map(|m| m.content.clone());
-            (user, result.content.clone())
+    // skip silently.
+    //
+    // v0.6.4 VRAM swap-lock: the schema engine is NO LONGER eager-resident.
+    // The delta task itself acquires the Schema lease + spawn-or-reuses the
+    // engine (see `acquire_schema_engine`). This means the delta waits for
+    // the chat turn's lease to drop (chat_send returning) before it can
+    // acquire Schema — which is correct and desirable: the delta already
+    // can't run until the chat decode finishes (both need the GPU), the
+    // lease just makes that dependency explicit + OOM-safe.
+    //
+    // Capture the exchange from the session (clean strings, same source as
+    // the memory archive: sidesteps the token-boundary-drift landmine the
+    // same way). Read inside a brief lock, clone out, then drop the guard
+    // before spawning so the task doesn't pin the session mutex.
+    let (user_text, asst_text) = {
+        let s = state.session.lock().await;
+        let user = s.messages.len().checked_sub(2).and_then(|i| s.messages.get(i)).map(|m| m.content.clone());
+        (user, result.content.clone())
+    };
+    // The delta pass is a full 12B forward pass. Skip it for clearly non-
+    // substantive turns (short filler like "ok"/"thanks", or empty replies)
+    //: see `should_fire_delta` for the conservative heuristic. 99% of real
+    // turns still fire; the user's typing time masks the generation cost.
+    // A skipped turn leaves pending_delta empty, so the next chat_send
+    // doesn't wait: zero latency hit for filler turns.
+    let user_text_for_gate = user_text.as_deref().unwrap_or("");
+    if !schema_engine::should_fire_delta(user_text_for_gate, &asst_text) {
+        tracing::debug!(
+            user_words = user_text_for_gate.split_whitespace().count(),
+            "schema delta skipped by content gate (non-substantive turn)"
+        );
+    } else {
+        let current_schema = state.schema.lock().await.clone();
+        // Drain the failed-delta queue (fail-proof contract §5 layer 3):
+        // prior turns' attempts that exhausted all 3 passes WITHOUT
+        // committing. Folded into this turn's delta prompt so the model
+        // gets a fresh shot with the new exchange as anchor. Take()
+        // empties the slot: if THIS turn also fails, the new failure is
+        // re-enqueued below.
+        let deferred = {
+            let mut q = state.failed_delta_queue.lock().await;
+            std::mem::take(&mut *q)
         };
-        // The delta pass is a full 12B forward pass. Skip it for clearly non-
-        // substantive turns (short filler like "ok"/"thanks", or empty replies)
-        //: see `should_fire_delta` for the conservative heuristic. 99% of real
-        // turns still fire; the user's typing time masks the generation cost.
-        // A skipped turn leaves pending_delta empty, so the next chat_send
-        // doesn't wait: zero latency hit for filler turns.
-        let user_text_for_gate = user_text.as_deref().unwrap_or("");
-        if !schema_engine::should_fire_delta(user_text_for_gate, &asst_text) {
-            tracing::debug!(
-                user_words = user_text_for_gate.split_whitespace().count(),
-                "schema delta skipped by content gate (non-substantive turn)"
+        if !deferred.is_empty() {
+            tracing::info!(
+                deferred = deferred.len(),
+                "delta attempt includes deferred re-attempts"
             );
-        } else {
-            let current_schema = state.schema.lock().await.clone();
-            // Drain the failed-delta queue (fail-proof contract §5 layer 3):
-            // prior turns' attempts that exhausted all 3 passes WITHOUT
-            // committing. Folded into this turn's delta prompt so the model
-            // gets a fresh shot with the new exchange as anchor. Take()
-            // empties the slot: if THIS turn also fails, the new failure is
-            // re-enqueued below.
-            let deferred = {
-                let mut q = state.failed_delta_queue.lock().await;
-                std::mem::take(&mut *q)
+        }
+        let schema_slot = state.schema.clone();
+        let failed_queue_slot = state.failed_delta_queue.clone();
+        // The delta task needs its own AppState handle to acquire the lease
+        // + spawn-or-reuse the schema engine. We can't pass the
+        // `tauri::State<'_, AppState>` borrow into the 'static spawned
+        // future, so we clone the Arc fields the task needs instead. The
+        // `acquire_schema_engine` helper reads from `state.schema_engine`
+        // + `state.context_swap`; clone both.
+        let context_swap = state.context_swap.clone();
+        let schema_engine_slot = Arc::clone(&state.schema_engine);
+        let handle = tokio::spawn(async move {
+            // Acquire the Schema lease inside the task. This blocks until
+            // any resident chat/fable context is torn down (the chat turn's
+            // lease drops when chat_send returns, which has already
+            // happened by the time this task is scheduled — but the lease
+            // makes the VRAM ordering explicit).
+            let (schema_engine, _lease) = match acquire_schema_engine_from_arcs(
+                context_swap,
+                schema_engine_slot,
+            )
+            .await
+            {
+                Ok(t) => t,
+                Err(e) => {
+                    tracing::warn!(error = %e, "schema delta: could not acquire schema engine; schema unchanged");
+                    return;
+                }
             };
-            if !deferred.is_empty() {
-                tracing::info!(
-                    deferred = deferred.len(),
-                    "delta attempt includes deferred re-attempts"
-                );
-            }
-            let schema_engine = Arc::clone(&schema_engine);
-            let schema_slot = state.schema.clone();
-            let failed_queue_slot = state.failed_delta_queue.clone();
-            let handle = tokio::spawn(async move {
-                // Post the delta request. The reply comes back on a std::mpsc
-                // channel (the schema thread is a bare std::thread), so we await
-                // it via spawn_blocking: same pattern as the chat engine reply.
-                let reply_rx = match schema_engine
-                    .request_delta(
-                        (user_text.unwrap_or_default(), asst_text),
-                        &current_schema,
-                        deferred,
-                    )
-                {
-                    Ok(rx) => rx,
-                    Err(e) => {
-                        tracing::warn!(error = %format!("{e:#}"), "schema delta request failed; schema unchanged");
-                        return;
+            // Post the delta request. The reply comes back on a std::mpsc
+            // channel (the schema thread is a bare std::thread), so we await
+            // it via spawn_blocking: same pattern as the chat engine reply.
+            let reply_rx = match schema_engine
+                .request_delta(
+                    (user_text.unwrap_or_default(), asst_text),
+                    &current_schema,
+                    deferred,
+                )
+            {
+                Ok(rx) => rx,
+                Err(e) => {
+                    tracing::warn!(error = %format!("{e:#}"), "schema delta request failed; schema unchanged");
+                    return;
                     }
                 };
                 let reply = match tokio::task::spawn_blocking(move || reply_rx.recv()).await {
@@ -2302,9 +2775,9 @@ async fn chat_send(
             });
             *state.pending_delta.lock().await = Some(handle);
         }
-    }
 
     clear_active_cancel(&state);
+
 
     on_event
         .send(serde_json::json!({
@@ -2323,6 +2796,76 @@ fn clear_active_cancel(state: &tauri::State<'_, AppState>) {
     *slot = None;
 }
 
+/// Run a chat turn on the local backend (or the EchoBackend last-resort when
+/// no local model is loaded). The local backend is ALWAYS resident under the
+/// v0.6.3 redesign: it's the silent agent doing schema/memory tracking AND the
+/// seamless fallback when the API is unhealthy.
+///
+/// `window` is the message-window size to re-assemble. The API path may have
+/// assembled 12 above; on fallback we re-assemble at 6 to match the local
+/// engine's KV-cache-coherent delta-prefill (the local engine only ever saw
+/// the 6-window render, so feeding it the same shape keeps the fast delta
+/// path). The local-only path passes `visible_window` (6) through unchanged.
+///
+/// Re-assembles from the live session (the user message was already appended
+/// by the caller) rather than re-slicing a stale `messages` vec, so the
+/// window cut is always taken against current state.
+///
+/// `on_event` is the same per-request Channel chat_send created, threaded in
+/// so this helper can emit `error` events on the local path's final failure
+/// (no further fallback below the local engine). The API-fallback call sites
+/// emit their own `fallback` event before calling this, so the user already
+/// knows we dropped to local.
+async fn run_local_or_echo(
+    state: &tauri::State<'_, AppState>,
+    on_event: &tauri::ipc::Channel<serde_json::Value>,
+    system_prompt: &str,
+    window: usize,
+    memory_block: Option<String>,
+    world_state: Option<String>,
+    context_size: u32,
+    on_chunk: llm::ChunkFn,
+    cancel: llm::CancelToken,
+    backend: Option<&Arc<llm::LlamaCppBackend>>,
+) -> Result<chat_format::ParsedOutput, ()> {
+    // Re-assemble the window from the live session (caller already appended
+    // the user message). This is the cache-coherent path: the local engine's
+    // KV cache expects the 6-window render.
+    let messages = {
+        let s = state.session.lock().await;
+        s.assemble_api_messages_windowed(system_prompt, window)
+    };
+    if let Some(backend) = backend {
+        match backend
+            .stream(messages, memory_block, world_state, context_size, on_chunk, cancel)
+            .await
+        {
+            Ok(text) => Ok(text),
+            Err(e) => {
+                clear_active_cancel(state);
+                let _ = on_event.send(serde_json::json!({
+                    "type": "error",
+                    "message": format!("{e}")
+                }));
+                Err(())
+            }
+        }
+    } else {
+        let echo = llm::EchoBackend;
+        match echo.stream(messages, None, None, context_size, on_chunk, cancel).await {
+            Ok(t) => Ok(t),
+            Err(e) => {
+                clear_active_cancel(state);
+                let _ = on_event.send(serde_json::json!({
+                    "type": "error",
+                    "message": format!("{e}")
+                }));
+                Err(())
+            }
+        }
+    }
+}
+
 /// Cap on accumulated deferred delta attempts per queue (fail-proof contract
 /// §5 layer 3). Each failed attempt folds into the next turn's prompt; if the
 /// model genuinely can't commit a particular change (rare: ambiguous player
@@ -2333,7 +2876,7 @@ fn clear_active_cancel(state: &tauri::State<'_, AppState>) {
 const MAX_FAILED_DELTA_ATTEMPTS: usize = 8;
 
 /// Push a failed translation attempt onto the game-manager queue. Called from
-/// `route_to_game_manager` when `SchemaReply::failed_attempt` is `Some` after
+/// `route_to_fable_manager` when `SchemaReply::failed_attempt` is `Some` after
 /// a `request_translation` call. Same cap + best-effort semantics as the
 /// auto-summarizer path (which inlines the same logic in its `chat_send`
 /// spawn — the spawn owns an Arc to the queue across awaits, which doesn't
@@ -2795,38 +3338,20 @@ async fn api_connect_inner(
         }
     }
 
-    tracing::info!("api_connect: beginning model swap (Local → API)");
-    // The original design swapped the schema/memory engine to Agent.gguf on
-    // API connect (to free VRAM for the API chat path). That required
-    // Agent.gguf to actually load: and the file we had (Gemma 4 E4B)
-    // returns NullResult in llama-cpp-2 0.1.151. Rather than block API mode
-    // on a separate sidekick model, the schema engine now stays on WUPI.gguf
-    // in both modes. Cost: ~1-2GB extra VRAM for the schema's isolated
-    // context on the 12B when in API mode. Benefit: API mode works without
-    // any external model dependency.
-    tracing::info!("api_connect: keeping schema engine on WUPI.gguf (no Agent.gguf swap)");
-
-    // Tear down the 12B CHAT engine (the schema engine stays put). Posts
-    // EngineMsg::Shutdown; the thread exits + drops its LlamaContext (freeing
-    // VRAM). shutdown() blocks on the JoinHandle so VRAM is actually released
-    // (load-bearing for subsequent loads: see the 2026-07-18 VRAM-overlap
-    // fix). Wrapped in spawn_blocking because the join is a synchronous
-    // block we don't want on a Tokio worker.
+    tracing::info!("api_connect: selecting API as chat source (local stays resident)");
+    // v0.6.3 local-always redesign: the local 12B is NEVER torn down. It runs
+    // all the time as the silent agent doing schema/memory tracking (the
+    // schema engine already kept its own WUPI.gguf copy in both modes — this
+    // just extends the same pattern to the chat backend). Keeping the chat
+    // backend resident costs ~75MB of idle Q8_0 KV cache (weights are shared
+    // via the leaked singleton), which is what makes the seamless per-turn
+    // fallback in chat_send zero-latency: there's no model to reload when the
+    // API drops, the local engine is already hot.
     //
-    // Scope the mutex guard in its own block so it drops BEFORE the .await -
-    // holding a std::sync::MutexGuard across an await makes the future !Send
-    // and Tauri commands require Send futures.
-    let backend_opt = {
-        let mut guard = state.backend.lock().expect("backend mutex");
-        guard.take()
-    };
-    if let Some(backend) = backend_opt {
-        tokio::task::spawn_blocking(move || backend.shutdown())
-            .await
-            .map_err(|e| format!("chat backend shutdown join: {e}"))?;
-    }
-    // 3. Flip model_source FIRST (before persisting) so chat_send routes to
-    //    the API path on the very next message. Then persist the config.
+    // So api_connect is now pure bookkeeping: set the active profile, flip
+    // model_source to Api, persist. The next chat_send routes to HttpBackend;
+    // if that fails, chat_send falls back to the still-resident local engine
+    // automatically (no error surfaced, immersion preserved).
     *state.model_source.lock().expect("model_source mutex") = api::ModelSource::Api;
     let cfg_snapshot = {
         let mut cfg = state.api_config.lock().expect("api_config mutex");
@@ -2837,12 +3362,10 @@ async fn api_connect_inner(
     tokio::task::spawn_blocking(move || cfg_snapshot.save(&path))
         .await
         .map_err(|e| format!("api_config save join: {e}"))?;
-    tracing::info!(profile_id = %profile_id, "api connected: chat via API, schema stays on WUPI.gguf");
-    // Emit model-status so the title indicator flips from "swapping" (red)
-    // to "idle" (steady white). api_disconnect's reload path already emits
-    // via the spawn_load callback; api_connect had no emit, so the title
-    // stayed red indefinitely after an ONLINE connect. The model name is
-    // the profile's model string (what the API will actually serve).
+    tracing::info!(profile_id = %profile_id, "api connected: chat via API, local resident as agent + fallback");
+    // Emit model-status so the title indicator flips to the API model name.
+    // The local backend is also still ready (never torn down) — the frontend
+    // reads `localReady` from model_source_get to show "local: active" too.
     let model_name = {
         let cfg = state.api_config.lock().expect("api_config mutex");
         cfg.active_profile().map(|p| p.model.clone()).unwrap_or_default()
@@ -2854,8 +3377,11 @@ async fn api_connect_inner(
     Ok(())
 }
 
-/// Disconnect the API: flip back to Local, perform the reverse model swap
-/// (API→Local). Reloads WUPI.gguf as the chat engine + schema engine.
+/// Disconnect the API: flip model_source back to Local. Under the v0.6.3
+/// local-always redesign there is NO model to reload — the local 12B stayed
+/// resident the whole time (it was the silent agent + fallback). So this is
+/// now pure bookkeeping: clear nothing, just flip the source + persist. The
+/// next chat_send routes to the local backend directly (no fallback needed).
 #[tauri::command]
 async fn api_disconnect(app: tauri::AppHandle, state: tauri::State<'_, AppState>) -> Result<(), String> {
     let path = state
@@ -2864,35 +3390,7 @@ async fn api_disconnect(app: tauri::AppHandle, state: tauri::State<'_, AppState>
         .cloned()
         .ok_or_else(|| "api_config path not initialized".to_string())?;
 
-    tracing::info!("api_disconnect: beginning chat-engine reload (API to Local)");
-    // The schema engine stayed on WUPI.gguf during API mode (no swap on
-    // connect, see api_connect), so there's no schema swap to reverse here.
-    // Just reload the 12B chat engine.
-    let model_path = resolve_model_path(&app)
-        .ok_or_else(|| "no WUPI.gguf found for reconnect".to_string())?;
-    let context_size = state.settings.lock().expect("settings mutex").context_size;
-    let app_handle = app.clone();
-    let backend = llm::LlamaCppBackend::spawn_load(
-        model_path,
-        99,
-        context_size,
-        Box::new(move |result| match &result {
-            Ok(name) => {
-                let _ = app_handle.emit(
-                    "model-status",
-                    serde_json::json!({ "status": "ready", "model": name }),
-                );
-            }
-            Err(msg) => {
-                let _ = app_handle.emit(
-                    "model-status",
-                    serde_json::json!({ "status": "error", "message": msg }),
-                );
-            }
-        }),
-    );
-    *state.backend.lock().expect("backend mutex") = Some(backend);
-    // 3. Flip model_source to Local + persist.
+    tracing::info!("api_disconnect: flipping chat source back to Local (local was resident)");
     *state.model_source.lock().expect("model_source mutex") = api::ModelSource::Local;
     let cfg_snapshot = {
         let mut cfg = state.api_config.lock().expect("api_config mutex");
@@ -2902,7 +3400,12 @@ async fn api_disconnect(app: tauri::AppHandle, state: tauri::State<'_, AppState>
     tokio::task::spawn_blocking(move || cfg_snapshot.save(&path))
         .await
         .map_err(|e| format!("api_config save join: {e}"))?;
-    tracing::info!("api disconnected: chat + schema back on WUPI.gguf (local)");
+    // Emit model-status: the local backend is what's serving now.
+    let _ = app.emit(
+        "model-status",
+        serde_json::json!({ "status": "ready", "model": "WUPI.gguf" }),
+    );
+    tracing::info!("api disconnected: chat back on local WUPI.gguf");
     Ok(())
 }
 
@@ -3044,7 +3547,7 @@ async fn get_settings(state: tauri::State<'_, AppState>) -> Result<serde_json::V
 // ===========================================================================
 // Games app IPC (Seam 1 + Seam 2, 2026-07-18): see docs/games-app-design.md
 // ===========================================================================
-// Five commands: enumerate roleplay cards, start a game (spawn GameEngine +
+// Five commands: enumerate roleplay cards, start a game (spawn FableEngine +
 // swap active_card_id), send a narrator turn (streaming), stop a turn, end
 // the game (shutdown engine + restore card id). The narrator system prompt
 // is built per-turn from the active roleplay card + the card's scoped
@@ -3053,30 +3556,41 @@ async fn get_settings(state: tauri::State<'_, AppState>) -> Result<serde_json::V
 // them. Memory archiving + schema delta reuse the existing paths: both
 // scope to the active card_id automatically.
 
-/// Lightweight metadata for one roleplay card, returned by `game_cards_list`.
+/// Lightweight metadata for one roleplay card, returned by `fable_cards_list`.
 /// Carries enough for a card-picker UI (name, id, short description) without
 /// loading the full persona body.
 #[derive(Debug, Clone, serde::Serialize)]
-struct GameCardMeta {
+struct FableCardMeta {
     id: String,
     name: String,
     card_type: String,
     setting_preview: String,
     tone: Option<String>,
+    /// First ~240 chars of `<scenario><opening_scene>`: the launcher card
+    /// uses this as the evocative "what's this about" blurb below the title.
+    /// None when the card doesn't declare one.
+    opening_scene_preview: Option<String>,
+    /// Declared protagonist name. The launcher shows this so the player
+    /// knows whose shoes they're stepping into before they start.
+    protagonist_name: Option<String>,
+    /// Whether the player has any saves for this card (autosave counts).
+    /// Lets the launcher show Continue vs New Game intelligently. Best-effort:
+    /// a directory-read error degrades to false (the user can still start).
+    has_saves: bool,
 }
 
 /// Enumerate every `.sim` file in `apps/games/cards/` (§8C; was
-/// `cards/game_cards/`) and return parsed metadata. The card-picker UI's data
+/// `cards/fable_cards/`) and return parsed metadata. The card-picker UI's data
 /// source. Returns an empty Vec when no cards dir exists (the common case
 /// until cards are authored or imported): graceful, not an error.
 #[tauri::command]
-fn game_cards_list(app: tauri::AppHandle) -> Result<Vec<GameCardMeta>, String> {
-    let dir = resolve_game_cards_dir(&app);
+fn fable_cards_list(app: tauri::AppHandle) -> Result<Vec<FableCardMeta>, String> {
+    let dir = resolve_fable_cards_dir(&app);
     let Some(dir) = dir else {
         return Ok(Vec::new());
     };
     let mut out = Vec::new();
-    let entries = std::fs::read_dir(&dir).map_err(|e| format!("read game_cards/: {e}"))?;
+    let entries = std::fs::read_dir(&dir).map_err(|e| format!("read fable_cards/: {e}"))?;
     for entry in entries.flatten() {
         let path = entry.path();
         if path.extension().and_then(|x| x.to_str()) != Some("sim") {
@@ -3095,175 +3609,267 @@ fn game_cards_list(app: tauri::AppHandle) -> Result<Vec<GameCardMeta>, String> {
         if card.card_type != "roleplay" {
             continue;
         }
-        let setting_preview = card
-            .setting
-            .as_deref()
-            .map(|s| s.chars().take(160).collect::<String>())
-            .unwrap_or_default();
-        out.push(GameCardMeta {
-            id: card.id.clone(),
-            name: card.name.clone(),
-            card_type: card.card_type.clone(),
-            setting_preview,
-            tone: card.tone.clone(),
-        });
+        // Best-effort: has the user got any saves for this card? A dir-read
+        // error degrades to false (the launcher still lets them start fresh).
+        let fable_root = resolve_apps_dir(&app).join("fable");
+        let has_saves = fable_save::list_saves(&fable_root, &card.id)
+            .map(|list| !list.is_empty())
+            .unwrap_or(false);
+        out.push(card_to_meta(&card, has_saves));
     }
     // Stable order: alphabetical by name so the picker doesn't jitter.
     out.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
     Ok(out)
 }
 
-/// Start a game: load the roleplay card, spawn the GameEngine (loads
+/// Build a `FableCardMeta` from a parsed card + a `has_saves` flag. Shared by
+/// `fable_cards_list` (the picker) today; future card-authoring flows will
+/// reuse it to return a freshly-written card's meta without a second round-trip.
+fn card_to_meta(card: &sim_card::SimCard, has_saves: bool) -> FableCardMeta {
+    let setting_preview = card
+        .setting
+        .as_deref()
+        .map(|s| s.chars().take(160).collect::<String>())
+        .unwrap_or_default();
+    let opening_scene_preview = card
+        .opening_scene
+        .as_deref()
+        .map(|s| s.chars().take(240).collect::<String>());
+    FableCardMeta {
+        id: card.id.clone(),
+        name: card.name.clone(),
+        card_type: card.card_type.clone(),
+        setting_preview,
+        tone: card.tone.clone(),
+        opening_scene_preview,
+        protagonist_name: card.protagonist_name.clone(),
+        has_saves,
+    }
+}
+
+/// Start a game: load the roleplay card, spawn the FableEngine (loads
 /// WUPI.gguf as its own isolated context), swap `active_card_id` to the
-/// card's id, and reset the game's scoped schema to empty (fresh scene).
-/// The `pre_game_card_id` is saved so `game_end` can restore it.
+/// card's id, and load the initial session/schema state. The
+/// `pre_fable_card_id` is saved so `fable_end` can restore it.
+///
+/// **Save loading (v0.6.0+):** when `save_id` is supplied, the session +
+/// schema are loaded from that named save slot (under
+/// `apps/games/saves/<card_id>/<save_id>.json`) instead of the card's
+/// default resume point. This is the "Load Game" path. When `save_id` is
+/// None, the card's last auto-persisted session/schema is loaded (the
+/// "Continue" path) — same as before v0.6.0. Pass `fresh = true` to
+/// explicitly start a brand-new run (clears any prior state); this is the
+/// "New Game" path.
 #[tauri::command]
-async fn game_start(
+async fn fable_start(
     card_id: String,
+    save_id: Option<String>,
+    fresh: Option<bool>,
     app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
-) -> Result<(), String> {
-    tracing::info!(card_id = %card_id, "game_start: spawning GameEngine");
+) -> Result<FableLoadResult, String> {
+    tracing::info!(card_id = %card_id, ?save_id, ?fresh, "fable_start: spawning FableEngine");
+    let card_id_arg = card_id.clone();
 
     // 1. Refuse if a game is already running (the UI shouldn't allow this,
     //    but defense-in-depth).
     {
-        let existing = state.game_engine.lock().expect("game_engine mutex");
+        let existing = state.fable_engine.lock().expect("fable_engine mutex");
         if existing.is_some() {
-            return Err("a game is already running: call game_end first".into());
+            return Err("a game is already running: call fable_end first".into());
         }
     }
 
     // 2. Resolve + load the roleplay card by id. The id comes from
-    //    `game_cards_list`, so it must exist in the registry.
+    //    `fable_cards_list`, so it must exist in the registry.
     let card = {
-        let dir = resolve_game_cards_dir(&app)
+        let dir = resolve_fable_cards_dir(&app)
             .ok_or_else(|| "no apps/games/cards/ dir resolved".to_string())?;
         find_card_by_id(&dir, &card_id)?
     };
 
     // 3. Resolve the model path (WUPI.gguf: same file the chat engine uses,
-    //    freshly leaked as the GameEngine's own &'static ref).
+    //    freshly leaked as the FableEngine's own &'static ref).
     let model_path = resolve_model_path(&app)
         .ok_or_else(|| "no WUPI.gguf found: cannot start game".to_string())?;
 
-    // 4. Spawn the GameEngine + block on readiness (the engine loads its
-    //    own model on a dedicated std::thread; recv() runs on the tokio
-    //    worker via spawn_blocking: same pattern as the schema engine).
-    let (engine, init_rx) = game_engine::GameEngine::spawn_load(model_path, 99);
-    let ready = tokio::task::spawn_blocking(move || init_rx.recv())
-        .await
-        .map_err(|e| format!("game engine init join: {e}"))?
-        .map_err(|e| format!("game engine init channel: {e}"))?;
-    match ready {
-        Ok(()) => {
-            if let Ok(mut slot) = state.game_engine.lock() {
-                *slot = Some(Arc::new(engine));
+    // 4. Hand off to the shared enter helper (also used by Quick Play, 4c).
+    enter_fable_session(card, save_id, fresh.unwrap_or(false), model_path, card_id_arg, &app, &state).await
+}
+
+/// The shared "spawn engine + swap id + load state + seat card + seat GM
+/// persona" tail of starting a game. `card` is already resolved (loaded from
+/// disk for fable_start). `card_id_for_meta` is the id to report in the
+/// returned meta (identical to card.id but kept explicit so logs are
+/// unambiguous).
+async fn enter_fable_session(
+    card: sim_card::SimCard,
+    save_id: Option<String>,
+    fresh: bool,
+    model_path: std::path::PathBuf,
+    card_id_for_meta: String,
+    app: &tauri::AppHandle,
+    state: &tauri::State<'_, AppState>,
+) -> Result<FableLoadResult, String> {
+    // NOTE: the FableEngine is NO LONGER eagerly spawned here. Under the
+    // v0.6.4 VRAM swap-lock (see `context_swap.rs` + AGENTS.md §7B
+    // correction), only ONE `WUPI.gguf` context may be resident at a time.
+    // Keeping a resident FableEngine while no turn is in flight would hold
+    // ~75-150MB of Q8_0 KV idle for the whole game session — VRAM the chat
+    // engine (Wupi-as-game-manager) needs when the user asks her a question.
+    //
+    // Instead the engine is spawned LAZILY on the first `fable_send` under
+    // the Fable lease (which evicts any resident chat/schema context
+    // first). Between turns the FableEngine stays resident (back-to-back
+    // same-role reuse — no re-spawn churn during play); it's only torn
+    // down when the user asks Wupi something (chat acquires → evicts
+    // fable) or on `fable_end`. The `model_path` arg is retained for the
+    // lazy spawn in `fable_send`; it's stashed on AppState below.
+    //
+    // The prior eager-spawn block (which OOM'd the 4th context on 12GB,
+    // the 2026-07-26 freeze root cause) is gone.
+    {
+        if let Ok(mut g) = state.pending_model_path.lock() {
+            // Stash for the lazy spawn. If a chat model path was already
+            // stashed (the normal case — boot resolved it), preserve it:
+            // the FableEngine reuses `shared_model()` anyway, so the path
+            // is only a defensive fallback for API-only-with-no-local.
+            if g.is_none() {
+                *g = Some(model_path);
             }
-        }
-        Err(msg) => {
-            return Err(format!("game engine init failed: {msg}"));
         }
     }
 
-    // 5. Swap active_card_id + save the pre-game value for restoration.
-    //    This scopes all memory retrieval + archiving to the roleplay card
-    //    automatically (§2M: already wired through chat_send + the debug
-    //    panel). Phase 3: instead of zeroing the schema/session, LOAD any
-    //    prior per-card state from disk so a game resumes where it left off.
-    //    First launch of a card → NotFound → default/empty (the loaders handle
-    //    this gracefully).
+    // Swap active_card_id + save the pre-game value for restoration. This
+    // scopes all memory retrieval + archiving to the roleplay card.
     {
-        let mut pre = state.pre_game_card_id.lock().expect("pre_game_card_id mutex");
+        let mut pre = state.pre_fable_card_id.lock().expect("pre_fable_card_id mutex");
         let mut active = state.active_card_id.lock().expect("active_card_id mutex");
         *pre = active.clone();
         *active = card.id.clone();
     }
-    // Load prior per-card state. Both fall back to default/empty when no save
-    // exists (the loaders' NotFound path returns Default::default()). This is
-    // what makes games resumable across reboots.
-    let prior_schema = load_schema(&app, &card.id).await
-        .unwrap_or_else(schema::WorldSchema::default);
-    let prior_session = load_session(&app, &card.id).await
-        .unwrap_or_else(session::Conversation::new);
-    *state.game_schema.lock().await = prior_schema;
-    *state.game_session.lock().await = prior_session;
-    *state.active_game_card.lock().expect("active_game_card mutex") = Some(card);
 
-    tracing::info!("game started: narrator engine live, memory scoped to card, per-card state loaded");
-    Ok(())
+    // Resolve initial state. Priority: explicit save_id → fresh → fallback.
+    let fable_root = resolve_apps_dir(app).join("fable");
+    let (prior_schema, prior_session, resumed_save_label) = if let Some(sid) = save_id.as_deref() {
+        let fable_root_clone = fable_root.clone();
+        let cid = card.id.clone();
+        let sid_owned = sid.to_owned();
+        let save = tokio::task::spawn_blocking(move || {
+            fable_save::load_save(&fable_root_clone, &cid, &sid_owned)
+        })
+        .await
+        .map_err(|e| format!("load save join: {e}"))?
+        .map_err(|e| format!("failed to load save '{sid}': {e}"))?;
+        (save.schema, save.session, Some(save.name))
+    } else if fresh {
+        (schema::WorldSchema::default(), session::Conversation::new(), None)
+    } else {
+        let s = load_schema(app, &card.id).await
+            .unwrap_or_else(schema::WorldSchema::default);
+        let c = load_session(app, &card.id).await
+            .unwrap_or_else(session::Conversation::new);
+        (s, c, None)
+    };
+    *state.fable_schema.lock().await = prior_schema;
+    let messages: Vec<FableLoadMessage> = prior_session
+        .messages
+        .iter()
+        .map(|m| FableLoadMessage {
+            role: match m.role {
+                session::Role::User => "user",
+                session::Role::Assistant => "assistant",
+                session::Role::System => "system",
+            },
+            content: m.content.clone(),
+        })
+        .collect();
+    let turn_count = messages.len();
+    *state.fable_session.lock().await = prior_session;
+    *state.active_fable_card.lock().expect("active_fable_card mutex") = Some(card);
+
+    // Phase 2: seat the GM persona (best-effort; None → OS catgirl fallback).
+    let gm_persona = resolve_gm_sim_path(app)
+        .map(|p| sim_card::load_or_fallback(&p))
+        .filter(|c| c.id != "__wupi_fallback__");
+    if gm_persona.is_none() {
+        tracing::info!("fable_start: no gm.sim found — drawer will use the OS catgirl persona");
+    }
+    *state.fable_persona.lock().expect("fable_persona mutex") = gm_persona;
+
+    tracing::info!(?resumed_save_label, "game started: narrator engine live, memory scoped to card, state loaded");
+    Ok(FableLoadResult {
+        meta: fable_save::SaveMeta {
+            save_id: resumed_save_label.clone().unwrap_or_default(),
+            card_id: card_id_for_meta,
+            name: resumed_save_label.unwrap_or_else(|| "Current".to_string()),
+            summary: String::new(),
+            timestamp: current_unix_ms_i64(),
+            is_autosave: false,
+            turn_count,
+        },
+        messages,
+    })
 }
 
-/// Send a narrator turn: render the narrator prompt from the active card +
-/// current game schema, post the request to the GameEngine, stream chunks
-/// to the Channel, parse bracket commands from the final raw output, and
-/// emit them as scene_event messages. After the turn, archive to memory
-/// (card-scoped) and fire the schema delta (card-scoped). Mirrors `chat_send`
-/// shape but routes to the GameEngine + uses the narrator system prompt.
+/// The title-screen CONTINUE button's resume target. Scans EVERY card's saves
+/// dir and returns the single most-recent MANUAL or QUICK save (autosaves are
+/// EXCLUDED by contract — the directive is "dim Continue unless the user has a
+/// manual or quick save to resume"). `None` (→ JSON null) when there are no
+/// qualifying saves, which is the signal for the frontend to disable the
+/// CONTINUE button.
+///
+/// Why a dedicated IPC instead of `fable_list_saves`: that one is per-card
+/// and the title sits BEFORE card selection, so CONTINUE must look across all
+/// cards for "your last manual save, anywhere."
+///
+/// Returns a `SaveMeta` (lightweight — no session/schema payload). The
+/// frontend loads it via `fable_load_save` only when the user actually clicks
+/// CONTINUE.
 #[tauri::command]
-async fn game_send(
-    text: String,
-    on_event: tauri::ipc::Channel<serde_json::Value>,
-    state: tauri::State<'_, AppState>,
-) -> Result<(), String> {
-    tracing::info!(?text, "game_send");
-
-    // Fresh cancel token for this turn (Bug #7 pattern, scoped to game).
-    let cancel: llm::CancelToken =
-        Arc::new(std::sync::atomic::AtomicBool::new(false));
-    {
-        let mut slot = state.active_game_cancel.lock().expect("active_game_cancel mutex");
-        *slot = Some(Arc::clone(&cancel));
+fn fable_continue_target(app: tauri::AppHandle) -> Result<Option<fable_save::SaveMeta>, String> {
+    let fable_root = resolve_apps_dir(&app).join("fable");
+    let saves_dir = fable_root.join("saves");
+    let Ok(entries) = std::fs::read_dir(&saves_dir) else {
+        return Ok(None);
+    };
+    let mut best: Option<fable_save::SaveMeta> = None;
+    for entry in entries.flatten() {
+        // Each card has its own subdir: saves/<card_id>/. Skip stray files.
+        if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+            continue;
+        }
+        let card_id = entry.file_name().to_string_lossy().to_string();
+        if let Ok(saves) = fable_save::list_saves(&fable_root, &card_id) {
+            for s in saves {
+                // Autosaves don't count toward the CONTINUE gate. The user must
+                // have an explicit manual/quick save to resume.
+                if s.is_autosave {
+                    continue;
+                }
+                // list_saves is newest-first per-card; track the global newest.
+                if best.as_ref().map_or(true, |b| s.timestamp > b.timestamp) {
+                    best = Some(s);
+                }
+            }
+        }
     }
+    Ok(best)
+}
 
-    // Pull the engine + card out under brief locks, then drop the guards
-    // before the .await (the locks are std::sync::Mutex: guards are !Send).
-    let engine = {
-        let guard = state.game_engine.lock().expect("game_engine mutex");
-        guard.clone().ok_or_else(|| "no game running: call game_start first".to_string())?
-    };
-    let card = {
-        let guard = state.active_game_card.lock().expect("active_game_card mutex");
-        guard.clone().ok_or_else(|| "no active game card".to_string())?
-    };
-
-    // Build the narrator system prompt from the card + current game schema.
-    let world_state = {
-        let s = state.game_schema.lock().await;
-        let rendered = s.render_for_prompt();
-        if rendered.is_empty() { None } else { Some(rendered) }
-    };
-    let system_prompt = narrator_prompt::build_narrator_system_prompt(&card, world_state.as_deref());
-
-    // Append the user turn to the per-card game conversation, then window the
-    // visible history. Same sliding-window strategy as chat_send's VISIBLE_WINDOW
-    // (§2I M2): old turns drop from the prompt (memory backfills via retrieval)
-    // so the prompt stays small (~5KB not ~80KB). The full conversation is
-    // persisted on game_end so games resume across reboots.
-    const GAME_VISIBLE_WINDOW: usize = 8; // narrator turns are shorter, so allow more than chat's 6
-    {
-        let mut gs = state.game_session.lock().await;
-        gs.add_message(session::Role::User, text.clone());
-    }
-
-    // Build a windowed prompt: system + last GAME_VISIBLE_WINDOW messages +
-    // generation cue. Same Gemma4 `<|turn>` protocol the chat path uses
-    // (assistant → "model"). We render inline (no ChatFormat trait dependency)
-    // because the narrator prompt is a single-shot prefill into the GameEngine
-    // (no KV-cache reuse across turns: the GameEngine clears KV every turn,
-    // see game_engine.rs:375). So cache-coherent re-render from raw_output
-    // isn't required here; cleaned content is fine.
-    let window: Vec<session::Message> = {
-        let gs = state.game_session.lock().await;
-        let msgs = &gs.messages;
-        let start = msgs.len().saturating_sub(GAME_VISIBLE_WINDOW);
-        msgs[start..].to_vec()
-    };
+/// Render the narrator prompt in the Gemma4 `<|turn>` protocol: system +
+/// windowed message turns + an open `<|turn>model\n` generation cue. Shared
+/// by the local FableEngine path and the API-fallback path so both render
+/// identical token sequences for a given window (cache-coherence for the
+/// local engine's KV, consistency for the API). The FableEngine clears KV
+/// every turn, so cache-coherent re-render from raw_output isn't required
+/// here; cleaned content is fine.
+fn build_narrator_prompt(system_prompt: &str, window: &[session::Message]) -> String {
     let mut prompt = String::with_capacity(4096);
     prompt.push_str("<|turn>system\n");
     prompt.push_str(system_prompt.trim());
     prompt.push_str("<turn|>\n");
-    for m in &window {
+    for m in window {
         let role = match m.role {
             session::Role::Assistant => "model",
             session::Role::User => "user",
@@ -3276,6 +3882,185 @@ async fn game_send(
         prompt.push_str("<turn|>\n");
     }
     prompt.push_str("<|turn>model\n");
+    prompt
+}
+
+/// Send a narrator turn: render the narrator prompt from the active card +
+/// current game schema, post the request to the FableEngine, stream chunks
+/// to the Channel, parse bracket commands from the final raw output, and
+/// emit them as scene_event messages. After the turn, archive to memory
+/// (card-scoped) and fire the schema delta (card-scoped). Mirrors `chat_send`
+/// shape but routes to the FableEngine + uses the narrator system prompt.
+#[tauri::command]
+async fn fable_send(
+    text: String,
+    on_event: tauri::ipc::Channel<serde_json::Value>,
+    state: tauri::State<'_, AppState>,
+    app: tauri::AppHandle,
+) -> Result<(), String> {
+    tracing::info!(?text, "fable_send");
+
+    // Fresh cancel token for this turn (Bug #7 pattern, scoped to game).
+    let cancel: llm::CancelToken =
+        Arc::new(std::sync::atomic::AtomicBool::new(false));
+    {
+        let mut slot = state.active_fable_cancel.lock().expect("active_fable_cancel mutex");
+        *slot = Some(Arc::clone(&cancel));
+    }
+
+    // Pull the card out under a brief lock, then drop the guard before any
+    // .await (std::sync::Mutex guards are !Send). The engine pull happens
+    // AFTER the lease acquire below (lazy spawn under the VRAM swap-lock).
+    let card = {
+        let guard = state.active_fable_card.lock().expect("active_fable_card mutex");
+        guard.clone().ok_or_else(|| "no active game card: call fable_start first".to_string())?
+    };
+
+    // v0.6.4 VRAM swap-lock: acquire the Fable lease. This evicts any
+    // resident chat/schema context (synchronous .join, VRAM freed) BEFORE
+    // we spawn-or-reuse the FableEngine — the load-bearing fix for the
+    // 2026-07-26 freeze (4 contexts couldn't co-reside on 12GB). The lease
+    // guard is held for the duration of the turn; dropping it at end of
+    // scope marks the slot free (the resident FableEngine persists until a
+    // chat/schema turn evicts it — back-to-back fable turns reuse it).
+    //
+    // The teardown callback tears down the FableEngine on the next
+    // cross-role acquire. It clones the AppState Arcs it needs (the slot
+    // + the engine itself) so it can run independently of this task.
+    let fable_slot = Arc::clone(&state.fable_engine);
+    let lease = state
+        .context_swap
+        .acquire(
+            context_swap::ContextRole::Fable,
+            Box::new(move || {
+                // Synchronous teardown: take the engine out of the slot +
+                // join its thread so VRAM is freed before the next context
+                // allocates (the 2026-07-18 VRAM-overlap lesson). Wrapped
+                // in spawn_blocking-equivalent inline work — this closure
+                // runs on whatever task thread calls the next acquire,
+                // blocking it until the join completes. That's correct:
+                // the next context's `new_context()` needs this VRAM.
+                let engine = {
+                    let mut g = fable_slot.lock().map_err(|e| e.to_string())?;
+                    g.take()
+                };
+                if let Some(engine) = engine {
+                    let engine = Arc::try_unwrap(engine).map_err(|_| {
+                        "fable teardown: other Arc refs still held".to_string()
+                    })?;
+                    engine.shutdown(); // synchronous .join
+                    tracing::info!("context-swap: fable engine torn down (VRAM freed)");
+                }
+                Ok(())
+            }),
+        )
+        .await;
+
+    // Spawn-or-reuse the FableEngine under the lease. If a prior fable turn
+    // left it resident (same-role reuse), this is a fast no-op. If the slot
+    // is empty (first turn, or evicted by a chat/schema turn since), spawn
+    // a fresh engine + block on readiness. The model path comes from
+    // `pending_model_path` (stashed by `enter_fable_session`); the engine
+    // prefers `shared_model()` and only uses the path as a fallback.
+    let engine = {
+        let existing = state.fable_engine.lock().expect("fable_engine mutex").clone();
+        match existing {
+            Some(e) => {
+                tracing::debug!("context-swap: fable engine reused (resident)");
+                e
+            }
+            None => {
+                tracing::info!("context-swap: spawning fable engine on demand");
+                let path = state
+                    .pending_model_path
+                    .lock()
+                    .expect("pending_model_path mutex")
+                    .clone()
+                    .ok_or_else(|| "no model path resolved for fable spawn".to_string())?;
+                let (engine, init_rx) = fable_engine::FableEngine::spawn_load(path, 99);
+                let ready = tokio::task::spawn_blocking(move || init_rx.recv())
+                    .await
+                    .map_err(|e| format!("game engine init join: {e}"))?
+                    .map_err(|e| format!("game engine init channel: {e}"))?;
+                match ready {
+                    Ok(()) => {
+                        let engine = Arc::new(engine);
+                        if let Ok(mut slot) = state.fable_engine.lock() {
+                            *slot = Some(Arc::clone(&engine));
+                        }
+                        engine
+                    }
+                    Err(msg) => {
+                        return Err(format!("game engine init failed: {msg}"));
+                    }
+                }
+            }
+        }
+    };
+    // The lease is now held for the duration of this turn. It will be
+    // released when `lease` drops at end of scope.
+    let _ = &lease;
+    // Context size for the API narrator path (the local FableEngine ignores it:
+    // it clears KV per turn on its own fixed context).
+    let context_size = state.settings.lock().expect("settings mutex").context_size;
+
+    // Build the narrator system prompt from the card + current game schema.
+    // The Rust Referee (Fable Seam #7) fires HERE, inside the schema lock,
+    // BEFORE the render: it scans the player's turn text for combat/exertion
+    // keywords, rolls the dice, and mutates the canonical PlayerState. The
+    // outcome then flows into the rendered `<world_state>` block as a hard
+    // semantic fact ("Left Bicep (Medium Injury); stamina: Winded") that the
+    // narrator reads as truth and writes prose to match. The LLM does ZERO
+    // math. See `player_state::referee_evaluate`.
+    //
+    // We hold the lock across evaluate+apply+render so the persisted state
+    // and the injected state are the SAME atomic snapshot — a concurrent
+    // autosave can't tear them apart.
+    let world_state = {
+        let mut s = state.fable_schema.lock().await;
+        if let Some(outcome) = player_state::referee_evaluate(&text, &s.player_state) {
+            tracing::info!(
+                part = outcome.part.id(),
+                state = ?outcome.new_state,
+                stamina = ?outcome.stamina_after,
+                "referee fired on combat/exertion keyword"
+            );
+            player_state::apply_outcome(&mut s.player_state, &outcome);
+        }
+        let rendered = s.render_for_prompt();
+        if rendered.is_empty() { None } else { Some(rendered) }
+    };
+    let system_prompt = narrator_prompt::build_narrator_system_prompt(&card, world_state.as_deref());
+
+    // Append the user turn to the per-card game conversation, then window the
+    // visible history. Same sliding-window strategy as chat_send's VISIBLE_WINDOW
+    // (§2I M2): old turns drop from the prompt (memory backfills via retrieval)
+    // so the prompt stays small (~5KB not ~80KB). The full conversation is
+    // persisted on fable_end so games resume across reboots.
+    //
+    // v0.6.3: window doubles when the API is the active chat source (8 → 16),
+    // matching chat_send's 6 → 12. The cloud model has the context budget and
+    // the local model stays hot as the silent agent doing schema tracking.
+    let source = *state.model_source.lock().expect("model_source mutex");
+    let fable_visible_window = if source == api::ModelSource::Api { 16 } else { 8 };
+    {
+        let mut gs = state.fable_session.lock().await;
+        gs.add_message(session::Role::User, text.clone());
+    }
+
+    // Build a windowed prompt: system + last fable_visible_window messages +
+    // generation cue. Same Gemma4 `<|turn>` protocol the chat path uses
+    // (assistant → "model"). We render inline (no ChatFormat trait dependency)
+    // because the narrator prompt is a single-shot prefill into the FableEngine
+    // (no KV-cache reuse across turns: the FableEngine clears KV every turn,
+    // see fable_engine.rs:375). So cache-coherent re-render from raw_output
+    // isn't required here; cleaned content is fine.
+    let window: Vec<session::Message> = {
+        let gs = state.fable_session.lock().await;
+        let msgs = &gs.messages;
+        let start = msgs.len().saturating_sub(fable_visible_window);
+        msgs[start..].to_vec()
+    };
 
     // Streaming callback wraps the Channel send.
     let on_chunk: llm::ChunkFn = Arc::new({
@@ -3285,19 +4070,120 @@ async fn game_send(
         }
     });
 
-    // Post the turn + await the reply off the tokio worker (the game thread
-    // is a bare std::thread; its mpsc::Receiver is blocking).
-    let reply_rx = engine
-        .request_turn(prompt, on_chunk, cancel.clone())
-        .map_err(|e| format!("{e:#}"))?;
-    let reply = tokio::task::spawn_blocking(move || reply_rx.recv())
-        .await
-        .map_err(|e| format!("game reply join: {e}"))?
-        .map_err(|e| format!("game reply channel: {e}"))?;
+    // v0.6.3 API routing for the narrator: when an API is selected, route the
+    // narrator turn through HttpBackend (the cloud model narrates; the local
+    // model stays the silent agent doing tracking, NOT the narration per the
+    // spec). On any API error, seamlessly fall back to the local FableEngine
+    // at the 8-window — immersion preserved, no error surfaced. The local
+    // FableEngine is always resident while a game is running (its KV is
+    // cleared per turn, so the fallback window matches its expected shape).
+    //
+    // The reply shape ({ content, reasoning, raw }) is normalized to the
+    // FableEngine's EngineReply ({ content, raw_output, error }) so the
+    // downstream bracket-parsing + archival path is identical for both.
+    let reply: fable_engine::FableReply = if source == api::ModelSource::Api {
+        let profile_opt = {
+            let cfg = state.api_config.lock().expect("api_config mutex");
+            cfg.active_profile().cloned()
+        };
+        let attempted_api = profile_opt.is_some();
+        let api_outcome: Option<chat_format::ParsedOutput> = if let Some(profile) = profile_opt {
+            // Re-render the windowed history as flat ApiMessages for the
+            // HTTP path (system + windowed turns; the API folds memory +
+            // world_state into the system message itself).
+            let mut api_msgs: Vec<session::ApiMessage> =
+                Vec::with_capacity(window.len() + 1);
+            api_msgs.push(session::ApiMessage {
+                role: "system".into(),
+                content: system_prompt.trim().to_string(),
+                raw_output: String::new(),
+            });
+            for m in &window {
+                let role = match m.role {
+                    session::Role::Assistant => "model",
+                    session::Role::User => "user",
+                    session::Role::System => "system",
+                };
+                api_msgs.push(session::ApiMessage {
+                    role: role.into(),
+                    content: m.content.clone(),
+                    raw_output: String::new(),
+                });
+            }
+            let http = llm::HttpBackend::new(profile);
+            match http
+                .stream(api_msgs, None, None, context_size, on_chunk.clone(), cancel.clone())
+                .await
+            {
+                Ok(out) => Some(out),
+                Err(e) => {
+                    tracing::warn!(error = %e, "fable_send: API narrator failed; falling back to local FableEngine");
+                    let _ = on_event.send(serde_json::json!({
+                        "type": "fallback",
+                        "reason": "api_unreachable",
+                        "source": "local_narrator",
+                    }));
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        match api_outcome {
+            Some(out) => fable_engine::FableReply {
+                // The API has no Gemma4 protocol markers, so raw_output is
+                // just the content. extract_reply_channel downstream is a
+                // no-op on marker-free text (rsplit_once finds no
+                // "<channel|>", returns the input unchanged).
+                raw_output: if out.raw.is_empty() { out.content } else { out.raw },
+                error: String::new(),
+                cancelled: false,
+            },
+            None => {
+                // Fallback (API failed OR no profile): run the local FableEngine.
+                // Re-render the prompt at the 8-window for cache-coherence
+                // (the local engine only ever saw the 8-window render).
+                if attempted_api {
+                    let gs = state.fable_session.lock().await;
+                    let msgs = &gs.messages;
+                    let start = msgs.len().saturating_sub(8);
+                    let fallback_window: Vec<session::Message> = msgs[start..].to_vec();
+                    drop(gs);
+                    let prompt = build_narrator_prompt(&system_prompt, &fallback_window);
+                    let reply_rx = engine
+                        .request_turn(prompt, on_chunk.clone(), cancel.clone())
+                        .map_err(|e| format!("{e:#}"))?;
+                    tokio::task::spawn_blocking(move || reply_rx.recv())
+                        .await
+                        .map_err(|e| format!("game reply join: {e}"))?
+                        .map_err(|e| format!("game reply channel: {e}"))?
+                } else {
+                    let prompt = build_narrator_prompt(&system_prompt, &window);
+                    let reply_rx = engine
+                        .request_turn(prompt, on_chunk.clone(), cancel.clone())
+                        .map_err(|e| format!("{e:#}"))?;
+                    tokio::task::spawn_blocking(move || reply_rx.recv())
+                        .await
+                        .map_err(|e| format!("game reply join: {e}"))?
+                        .map_err(|e| format!("game reply channel: {e}"))?
+                }
+            }
+        }
+    } else {
+        // Local-only path (the default): render the prompt + run the FableEngine.
+        let prompt = build_narrator_prompt(&system_prompt, &window);
+        let reply_rx = engine
+            .request_turn(prompt, on_chunk.clone(), cancel.clone())
+            .map_err(|e| format!("{e:#}"))?;
+        tokio::task::spawn_blocking(move || reply_rx.recv())
+            .await
+            .map_err(|e| format!("game reply join: {e}"))?
+            .map_err(|e| format!("game reply channel: {e}"))?
+    };
 
     // Clear the cancel slot now that the turn is done.
     {
-        let mut slot = state.active_game_cancel.lock().expect("active_game_cancel mutex");
+        let mut slot = state.active_fable_cancel.lock().expect("active_fable_cancel mutex");
         *slot = None;
     }
 
@@ -3353,13 +4239,50 @@ async fn game_send(
 
     // Phase 3: append the assistant turn to the per-card game conversation so
     // the next turn's windowed prompt includes it. We store the CLEANED prose
-    // (parsed.prose): the GameEngine clears its KV cache every turn (no delta-
+    // (parsed.prose): the FableEngine clears its KV cache every turn (no delta-
     // prefill), so cache-coherent raw_output re-render isn't required here
     // (unlike the chat path's Bug #3 fix). The reasoning channel is empty for
     // narrator turns (the bracket parser doesn't extract a thought channel).
     {
-        let mut gs = state.game_session.lock().await;
+        let mut gs = state.fable_session.lock().await;
         gs.add_assistant_turn(parsed.prose.clone(), String::new(), reply.raw_output.clone());
+    }
+
+    // Auto-save (best-effort, fire-and-forget). Every narrator turn writes
+    // the reserved `autosave` slot so the player never loses more than one
+    // turn to a crash / quit. The save is small JSON (a few KB) and runs on
+    // the blocking pool; errors are logged-and-dropped (autosave is
+    // best-effort by contract — never block the gameplay loop on it).
+    {
+        let app_clone = app.clone();
+        let state_active_card = state.active_fable_card.clone();
+        let state_session = state.fable_session.clone();
+        let state_schema = state.fable_schema.clone();
+        tokio::spawn(async move {
+            let card_opt = state_active_card.lock().expect("active_fable_card mutex").clone();
+            let Some(card) = card_opt else { return };
+            let session = state_session.lock().await.clone();
+            let schema = state_schema.lock().await.clone();
+            let fable_root = resolve_apps_dir(&app_clone).join("fable");
+            let fable_root_clone = fable_root.clone();
+            let card_clone = card.clone();
+            let result = tokio::task::spawn_blocking(move || {
+                fable_save::write_save(
+                    &fable_root_clone,
+                    &card_clone,
+                    fable_save::AUTOSAVE_ID,
+                    "Autosave",
+                    &session,
+                    &schema,
+                )
+            })
+            .await;
+            match result {
+                Ok(Ok(_)) => tracing::debug!("autosave: ok"),
+                Ok(Err(e)) => tracing::warn!(error = %format!("{e}"), "autosave write failed"),
+                Err(e) => tracing::warn!(error = %format!("{e}"), "autosave join failed"),
+            }
+        });
     }
 
     on_event
@@ -3376,32 +4299,32 @@ async fn game_send(
 /// the per-request token; the engine's decode loop checks it between tokens
 /// and breaks cleanly (§2C KV-consistency contract).
 #[tauri::command]
-async fn game_stop(state: tauri::State<'_, AppState>) -> Result<(), String> {
-    tracing::info!("game_stop requested");
-    let slot = state.active_game_cancel.lock().expect("active_game_cancel mutex");
+async fn fable_stop(state: tauri::State<'_, AppState>) -> Result<(), String> {
+    tracing::info!("fable_stop requested");
+    let slot = state.active_fable_cancel.lock().expect("active_fable_cancel mutex");
     if let Some(cancel) = slot.as_ref() {
         cancel.store(true, std::sync::atomic::Ordering::Relaxed);
     }
     Ok(())
 }
 
-/// End the game: shut down the GameEngine (frees VRAM), persist the per-card
+/// End the game: shut down the FableEngine (frees VRAM), persist the per-card
 /// session + schema (Phase 3: resumable across reboots), restore the
 /// pre-game `active_card_id`, clear the game state. After this, Wupi-assistant
 /// chat works exactly as before the game (memory retrieval + schema delta
 /// scope back to the system card).
 #[tauri::command]
-async fn game_end(
+async fn fable_end(
     app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
 ) -> Result<(), String> {
-    tracing::info!("game_end: shutting down GameEngine");
+    tracing::info!("fable_end: shutting down FableEngine");
 
-    // 1. Take the engine out of AppState (so concurrent game_send sees None
+    // 1. Take the engine out of AppState (so concurrent fable_send sees None
     //    and bails), then shut it down. shutdown() blocks on the JoinHandle
-    //    until VRAM is freed (load-bearing: see GameEngine::shutdown doc).
+    //    until VRAM is freed (load-bearing: see FableEngine::shutdown doc).
     let engine_opt = {
-        let mut guard = state.game_engine.lock().expect("game_engine mutex");
+        let mut guard = state.fable_engine.lock().expect("fable_engine mutex");
         guard.take()
     };
     if let Some(engine) = engine_opt {
@@ -3413,13 +4336,13 @@ async fn game_end(
     // 2. Phase 3 per-card persistence: capture the roleplay card id BEFORE
     //    the restore (step 3 swaps active_card_id back to the system value),
     //    then save the session + schema under the roleplay id. Both saves are
-    //    best-effort: a failure logs a warning but doesn't block game_end
+    //    best-effort: a failure logs a warning but doesn't block fable_end
     //    (the in-memory state is cleared regardless; the user just loses the
     //    resume point on a disk error, not the running game).
     let roleplay_card_id = state.active_card_id.lock().expect("active_card_id mutex").clone();
     if roleplay_card_id != memory::WUPI_CARD_ID {
-        let schema_snapshot = state.game_schema.lock().await.clone();
-        let session_snapshot = state.game_session.lock().await.clone();
+        let schema_snapshot = state.fable_schema.lock().await.clone();
+        let session_snapshot = state.fable_session.lock().await.clone();
         save_schema(&app, &roleplay_card_id, &schema_snapshot).await;
         save_session(&app, &roleplay_card_id, &session_snapshot).await;
         tracing::info!(card_id = %roleplay_card_id, "per-card state saved");
@@ -3427,51 +4350,256 @@ async fn game_end(
 
     // 3. Restore the pre-game card id + clear the game-scoped state.
     {
-        let pre = state.pre_game_card_id.lock().expect("pre_game_card_id mutex").clone();
+        let pre = state.pre_fable_card_id.lock().expect("pre_fable_card_id mutex").clone();
         *state.active_card_id.lock().expect("active_card_id mutex") = pre;
     }
-    *state.game_schema.lock().await = schema::WorldSchema::default();
-    *state.game_session.lock().await = session::Conversation::new();
-    *state.active_game_card.lock().expect("active_game_card mutex") = None;
+    *state.fable_schema.lock().await = schema::WorldSchema::default();
+    *state.fable_session.lock().await = session::Conversation::new();
+    *state.active_fable_card.lock().expect("active_fable_card mutex") = None;
+    // Phase 2: drop the GM persona so OS chat outside Fable stays the catgirl.
+    *state.fable_persona.lock().expect("fable_persona mutex") = None;
 
     // 4. Clear any leftover game cancel token.
-    *state.active_game_cancel.lock().expect("active_game_cancel mutex") = None;
+    *state.active_fable_cancel.lock().expect("active_fable_cancel mutex") = None;
 
     tracing::info!("game ended: narrator engine down, per-card state persisted, memory scope restored");
     Ok(())
 }
 
+/// List all save slots for a card. Used by the Load Game screen. Most-recent
+/// first (sorted in `fable_save::list_saves`). Returns an empty Vec when the
+/// card has no saves dir yet (fresh install / never saved).
+#[tauri::command]
+fn fable_list_saves(
+    card_id: String,
+    app: tauri::AppHandle,
+) -> Result<Vec<fable_save::SaveMeta>, String> {
+    let fable_root = resolve_apps_dir(&app).join("fable");
+    fable_save::list_saves(&fable_root, &card_id)
+        .map_err(|e| format!("list saves for '{card_id}': {e}"))
+}
+
+/// Read the canonical PlayerState for the active Fable game (Seam #7).
+/// Returns it as a JSON value the frontend's mannequin/stats panel renders
+/// directly: `{ body: { head: "Transparent", left_bicep: "Orange", ... },
+/// stamina: "Winded", wealth: 12, reputation: -3 }`. Body part keys are the
+/// 16 stable `id()` strings ("head", "left_bicep", …); values are the
+/// `BodyPartState` variants serialized as their PascalCase names.
+///
+/// Returns an error if no Fable game is active (the left stats panel only
+/// exists inside a running session). The lock is held briefly under
+/// `fable_schema` (tokio Mutex) — same field the narrator render reads, so
+/// the panel always sees the same state the last turn was narrated against.
+#[tauri::command]
+async fn player_state_get(
+    state: tauri::State<'_, AppState>,
+) -> Result<serde_json::Value, String> {
+    // Bail when no game is active — the stats panel shouldn't be queryable
+    // from the title screen. Cheap check under the std Mutex.
+    {
+        let guard = state.fable_engine.lock().expect("fable_engine mutex");
+        if guard.is_none() {
+            return Err("no fable game active: call fable_start first".to_string());
+        }
+    }
+    let s = state.fable_schema.lock().await;
+    Ok(serde_json::to_value(&s.player_state)
+        .map_err(|e| format!("serialize player state: {e}"))?)
+}
+
+/// Save the current game state into a named slot. `save_id` of "autosave"
+/// writes the reserved auto-save slot; any other id is a named slot. `name`
+/// is the human label (e.g. "Before the dragon" or "Autosave"). The UI
+/// typically calls this with `save_id = autosave` after each turn and with
+/// a fresh timestamped id when the user picks "Save" from the pause menu.
+#[tauri::command]
+async fn fable_save_now(
+    save_id: String,
+    name: String,
+    state: tauri::State<'_, AppState>,
+    app: tauri::AppHandle,
+) -> Result<fable_save::SaveMeta, String> {
+    let card = {
+        let guard = state.active_fable_card.lock().expect("active_fable_card mutex");
+        guard.clone().ok_or_else(|| "no active game: call fable_start first".to_string())?
+    };
+    let (session, schema) = {
+        let session = state.fable_session.lock().await.clone();
+        let schema = state.fable_schema.lock().await.clone();
+        (session, schema)
+    };
+    let fable_root = resolve_apps_dir(&app).join("fable");
+    let save_id_arg = save_id.clone();
+    let name_arg = name.clone();
+    let card_clone = card.clone();
+    let session_clone = session.clone();
+    let schema_clone = schema.clone();
+    let fable_root_clone = fable_root.clone();
+    let saved = tokio::task::spawn_blocking(move || {
+        fable_save::write_save(
+            &fable_root_clone,
+            &card_clone,
+            &save_id_arg,
+            &name_arg,
+            &session_clone,
+            &schema_clone,
+        )
+    })
+    .await
+    .map_err(|e| format!("save join: {e}"))?
+    .map_err(|e| format!("save write: {e}"))?;
+    tracing::info!(save_id = %saved.save_id, card_id = %saved.card_id, "game saved");
+    Ok(fable_save::SaveMeta {
+        save_id: saved.save_id,
+        card_id: saved.card_id,
+        name: saved.name,
+        summary: saved.summary,
+        timestamp: saved.timestamp,
+        is_autosave: saved.is_autosave,
+        turn_count: saved.session.messages.len(),
+    })
+}
+
+/// Load a named save into the running game. This OVERWRITES the current
+/// session/schema state in memory (any unsaved progress is lost — the UI
+/// should confirm). Doesn't restart the engine (it's already running);
+/// just swaps the in-memory state. The next `fable_send` will use the loaded
+/// history.
+///
+/// Returns the save meta PLUS the loaded messages as `{role, content}` pairs
+/// so the UI can re-render the dialogue feed without a second IPC. This is
+/// the pause-menu Load path: a game is already running on the stage, so
+/// `fable_start` is the wrong IPC (it hard-fails with "a game is already
+/// running"); use this hot-swap instead.
+#[tauri::command]
+async fn fable_load_save(
+    save_id: String,
+    state: tauri::State<'_, AppState>,
+    app: tauri::AppHandle,
+) -> Result<FableLoadResult, String> {
+    let card = {
+        let guard = state.active_fable_card.lock().expect("active_fable_card mutex");
+        guard.clone().ok_or_else(|| "no active game: call fable_start first".to_string())?
+    };
+    let fable_root = resolve_apps_dir(&app).join("fable");
+    let fable_root_clone = fable_root.clone();
+    let cid = card.id.clone();
+    let sid = save_id.clone();
+    let save = tokio::task::spawn_blocking(move || {
+        fable_save::load_save(&fable_root_clone, &cid, &sid)
+    })
+    .await
+    .map_err(|e| format!("load join: {e}"))?
+    .map_err(|e| format!("load read: {e}"))?;
+    let meta = fable_save::SaveMeta {
+        save_id: save.save_id,
+        card_id: save.card_id,
+        name: save.name,
+        summary: save.summary,
+        timestamp: save.timestamp,
+        is_autosave: save.is_autosave,
+        turn_count: save.session.messages.len(),
+    };
+    // Snapshot the messages for the UI BEFORE we move the session into state.
+    let messages: Vec<FableLoadMessage> = save
+        .session
+        .messages
+        .iter()
+        .map(|m| FableLoadMessage {
+            role: match m.role {
+                session::Role::User => "user",
+                session::Role::Assistant => "assistant",
+                session::Role::System => "system",
+            },
+            content: m.content.clone(),
+        })
+        .collect();
+    *state.fable_session.lock().await = save.session;
+    *state.fable_schema.lock().await = save.schema;
+    tracing::info!(save_id = %meta.save_id, "game state loaded");
+    Ok(FableLoadResult { meta, messages })
+}
+
+/// Result of `fable_load_save`: the save meta + a flat list of the loaded
+/// messages so the UI can re-render its dialogue feed in one round-trip.
+#[derive(Debug, Clone, serde::Serialize)]
+struct FableLoadResult {
+    meta: fable_save::SaveMeta,
+    messages: Vec<FableLoadMessage>,
+}
+
+/// One loaded message, role as a lowercase string (matches `session::Role`'s
+/// `rename_all = "lowercase"` serialization but trimmed to just role+content
+/// so we don't leak `raw_output`/`reasoning`/`id`/`timestamp` to the UI).
+#[derive(Debug, Clone, serde::Serialize)]
+struct FableLoadMessage {
+    role: &'static str,
+    content: String,
+}
+
+/// Delete a save slot. Idempotent (Ok if the save is already gone).
+#[tauri::command]
+fn fable_delete_save(
+    card_id: String,
+    save_id: String,
+    app: tauri::AppHandle,
+) -> Result<(), String> {
+    let fable_root = resolve_apps_dir(&app).join("fable");
+    fable_save::delete_save(&fable_root, &card_id, &save_id)
+        .map_err(|e| format!("delete save '{save_id}': {e}"))
+}
+
 /// Resolve the roleplay scenario cards dir. Per §8C scenario `.sim` files
 /// live at `<exe_dir>/apps/games/cards/`. Returns `None` if no such dir
 /// exists in any candidate location (graceful: the picker shows empty).
-fn resolve_game_cards_dir(app: &tauri::AppHandle) -> Option<std::path::PathBuf> {
+fn resolve_fable_cards_dir(app: &tauri::AppHandle) -> Option<std::path::PathBuf> {
     use tauri::Manager;
     let mut candidates: Vec<std::path::PathBuf> = Vec::new();
     // §8C layout FIRST: scenario cards are user-state, live under
-    // `<exe_dir>/apps/games/cards/` (shipped empty; populated by the future
+    // `<exe_dir>/apps/fable/cards/` (shipped empty; populated by the future
     // scenario-card authoring flow).
-    candidates.push(resolve_apps_dir(app).join("games").join("cards"));
-    // Legacy pre-§8C layout (`cards/game_cards/`) + dev-repo paths. Kept as
+    candidates.push(resolve_apps_dir(app).join("fable").join("cards"));
+    // DEV-REPO walk-up for the §8C path. `resolve_apps_dir` returns
+    // `<exe_dir>/apps`, which in `cargo run` / `tauri dev` is
+    // `target/{debug,release}/apps` — NOT the project-root `apps/` where
+    // scenario cards actually live during development. Walk up from the exe
+    // dir looking for `apps/fable/cards` so dev finds the source-tree cards
+    // (e.g. `C:\WUPI\apps\fable/cards`). Same climb pattern as the legacy
+    // `cards/fable_cards` walk-up below; in a shipped portable build the exe
+    // sits at the install root so `<exe_dir>/apps/fable/cards` already hit on
+    // candidate #1 and these never fire.
+    if let Some(exe) = std::env::current_exe().ok() {
+        if let Some(parent) = exe.parent() {
+            candidates.push(parent.join("apps").join("fable").join("cards"));
+            if let Some(grand) = parent.parent().and_then(|g| g.parent()) {
+                candidates.push(grand.join("apps").join("fable").join("cards"));
+            }
+            if let Some(gg) = parent.parent().and_then(|g| g.parent()).and_then(|g| g.parent()) {
+                candidates.push(gg.join("apps").join("fable").join("cards"));
+            }
+        }
+    }
+    // Legacy pre-§8C layout (`cards/fable_cards/`) + dev-repo paths. Kept as
     // fallbacks so a v0.2.4 → v0.3.0 in-place upgrade still finds any
     // pre-existing scenarios under the old path.
     if let Some(d) = app.path().resource_dir().ok() {
-        candidates.push(d.join("cards").join("game_cards"));
+        candidates.push(d.join("cards").join("fable_cards"));
     }
     if let Some(exe) = std::env::current_exe().ok() {
         if let Some(parent) = exe.parent() {
-            candidates.push(parent.join("cards").join("game_cards"));
+            candidates.push(parent.join("cards").join("fable_cards"));
             if let Some(grand) = parent.parent().and_then(|g| g.parent()) {
-                candidates.push(grand.join("cards").join("game_cards"));
+                candidates.push(grand.join("cards").join("fable_cards"));
             }
             if let Some(gg) = parent.parent().and_then(|g| g.parent()).and_then(|g| g.parent()) {
-                candidates.push(gg.join("cards").join("game_cards"));
+                candidates.push(gg.join("cards").join("fable_cards"));
             }
         }
     }
 
     for dir in &candidates {
         if dir.is_dir() {
-            tracing::info!("resolved game_cards dir: {}", dir.display());
+            tracing::info!("resolved fable_cards dir: {}", dir.display());
             return Some(dir.clone());
         }
     }
@@ -3481,7 +4609,7 @@ fn resolve_game_cards_dir(app: &tauri::AppHandle) -> Option<std::path::PathBuf> 
 /// Find a roleplay card by id within `apps/games/cards/` (§8C). Returns an
 /// error string (not a panic) if no card with that id exists.
 fn find_card_by_id(dir: &std::path::Path, target_id: &str) -> Result<sim_card::SimCard, String> {
-    let entries = std::fs::read_dir(dir).map_err(|e| format!("read game_cards/: {e}"))?;
+    let entries = std::fs::read_dir(dir).map_err(|e| format!("read fable_cards/: {e}"))?;
     for entry in entries.flatten() {
         let path = entry.path();
         if path.extension().and_then(|x| x.to_str()) != Some("sim") {
@@ -3493,6 +4621,18 @@ fn find_card_by_id(dir: &std::path::Path, target_id: &str) -> Result<sim_card::S
         }
     }
     Err(format!("no roleplay card with id '{target_id}' in {}", dir.display()))
+}
+
+/// Current time as unix milliseconds. Matches the timestamp convention
+/// used by `session::Message` + `fable_save::SaveFile`. Inline (not shared
+/// with `session::chrono_now_millis`, which is private) because this is a
+/// one-off display hint in the synthesized `SaveMeta`.
+fn current_unix_ms_i64() -> i64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
 }
 
 /// Persist the session off the Tokio worker pool.
@@ -3520,8 +4660,8 @@ async fn save_session(
     card_id: &str,
     conv: &session::Conversation,
 ) {
-    let games_root = resolve_apps_dir(app).join("games");
-    let path = resolve_session_path(&games_root, card_id);
+    let fable_root = resolve_apps_dir(app).join("fable");
+    let path = resolve_session_path(&fable_root, card_id);
     // Clone so the closure owns its data (spawn_blocking needs 'static). The
     // Conversation is a Vec of small messages: cheap to clone relative to a
     // disk fsync.
@@ -3541,8 +4681,8 @@ async fn load_session(
     app: &tauri::AppHandle,
     card_id: &str,
 ) -> Option<session::Conversation> {
-    let games_root = resolve_apps_dir(app).join("games");
-    let path = resolve_session_path(&games_root, card_id);
+    let fable_root = resolve_apps_dir(app).join("fable");
+    let path = resolve_session_path(&fable_root, card_id);
     let path_cloned = path.clone();
     tokio::task::spawn_blocking(move || session::Conversation::load(&path_cloned))
         .await
@@ -3561,8 +4701,8 @@ async fn save_schema(
     card_id: &str,
     schema: &schema::WorldSchema,
 ) {
-    let games_root = resolve_apps_dir(app).join("games");
-    let path = resolve_schema_path(&games_root, card_id);
+    let fable_root = resolve_apps_dir(app).join("fable");
+    let path = resolve_schema_path(&fable_root, card_id);
     let schema = schema.clone();
     let _ = tokio::task::spawn_blocking(move || {
         if let Err(e) = schema.save(&path) {
@@ -3579,8 +4719,8 @@ async fn load_schema(
     app: &tauri::AppHandle,
     card_id: &str,
 ) -> Option<schema::WorldSchema> {
-    let games_root = resolve_apps_dir(app).join("games");
-    let path = resolve_schema_path(&games_root, card_id);
+    let fable_root = resolve_apps_dir(app).join("fable");
+    let path = resolve_schema_path(&fable_root, card_id);
     let path_cloned = path.clone();
     tokio::task::spawn_blocking(move || schema::WorldSchema::load(&path_cloned))
         .await
@@ -3588,18 +4728,18 @@ async fn load_schema(
         .ok()
 }
 
-/// `<games_root>/sessions/<card_id>.json`. Per §8C roleplay sessions live
+/// `<fable_root>/sessions/<card_id>.json`. Per §8C roleplay sessions live
 /// under `apps/games/sessions/` (scoped under games/ because only roleplay
 /// game sessions persist today; Wupi-assistant chat stays ephemeral per §5).
 /// The `sessions/` subdir is created once in `setup()`. The card_id is the
 /// filename stem: roleplay card ids are filesystem-safe (lowercased,
 /// derived from `<metadata><id>` in `sim_card.rs`).
-fn resolve_session_path(games_root: &std::path::Path, card_id: &str) -> std::path::PathBuf {
-    games_root.join("sessions").join(format!("{card_id}.json"))
+fn resolve_session_path(fable_root: &std::path::Path, card_id: &str) -> std::path::PathBuf {
+    fable_root.join("sessions").join(format!("{card_id}.json"))
 }
 
-/// `<games_root>/schemas/<card_id>.json`. Sibling to `resolve_session_path`;
+/// `<fable_root>/schemas/<card_id>.json`. Sibling to `resolve_session_path`;
 /// same subdir convention + filesystem-safety assumption.
-fn resolve_schema_path(games_root: &std::path::Path, card_id: &str) -> std::path::PathBuf {
-    games_root.join("schemas").join(format!("{card_id}.json"))
+fn resolve_schema_path(fable_root: &std::path::Path, card_id: &str) -> std::path::PathBuf {
+    fable_root.join("schemas").join(format!("{card_id}.json"))
 }

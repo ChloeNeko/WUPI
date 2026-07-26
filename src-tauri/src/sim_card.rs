@@ -53,7 +53,7 @@ pub struct SimCard {
     /// narrator's voice. `None` for system cards.
     pub tone: Option<String>,
     /// Seed text for the first narrator turn (the opening scene). The
-    /// GameEngine uses this to prime the first generation if the conversation
+    /// FableEngine uses this to prime the first generation if the conversation
     /// is empty. `None` for system cards.
     pub opening_scene: Option<String>,
     /// Stable NPC ids present at scene start. Used by the Phase 2 NPC runtime
