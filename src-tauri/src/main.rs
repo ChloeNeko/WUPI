@@ -46,6 +46,35 @@ fn main() {
         }
     }
 
+    // WebView2 frontend-cache bust (v0.7.6+). MUST run before
+    // `wupi_lib::run()` initializes the WebView2 window — once WebView2
+    // starts it locks its cache files and they can't be deleted.
+    //
+    // Why: WebView2 persists compiled-JS + HTTP caches under
+    // `%LOCALAPPDATA%\com.wupi.desktop\EBWebView`, keyed by the app
+    // identifier (NOT by exe path or version). After an update the new exe
+    // is on disk, but WebView2 happily serves the OLD frontend from cache
+    // — producing the exact "ghost paw / no audio / missing themes / broken
+    // intro" symptom cluster the v0.7.5 release hit. The build-time
+    // `npm run clear:webview2` script only protects the dev box at build
+    // time and only if no run happens between the clear and the test; it
+    // does nothing for end users who update via the in-app updater.
+    //
+    // Fix: on every boot, compare the exe's compiled-in version against a
+    // dotfile marker `<exe_dir>/.cache-gen`. If they differ (or the marker
+    // is absent on first run), delete the EBWebView tree + write the new
+    // marker. Cheap on the steady-state path (one tiny file read + compare)
+    // and makes stale-frontend-after-update impossible across all three
+    // distribution paths (dev test, manual overwrite, in-app updater).
+    //
+    // The marker lives at the install root (NOT under preserved `data/`)
+    // so the updater's preserve rule never touches it — the new exe writes
+    // the new version on first boot. Errors are logged-and-continued: a
+    // failed cache clear is annoying (the user might see stale UI once) but
+    // must NEVER block boot.
+    #[cfg(windows)]
+    bust_webview2_cache_if_version_changed();
+
     wupi_lib::run()
 }
 
@@ -61,5 +90,95 @@ fn exe_bin_dir() -> Option<std::path::PathBuf> {
         Some(bin)
     } else {
         None
+    }
+}
+
+/// Boot-time WebView2 cache bust. See the long comment in `main()` for the
+/// full rationale. Compares the compiled-in crate version against a dotfile
+/// marker at the install root; on mismatch (or missing marker), deletes the
+/// WebView2 persistent cache tree + writes the new marker. No-op on the
+/// steady-state path (same version → same marker → skip). Windows-only: the
+/// cache path + identifier are Windows/WebView2-specific.
+#[cfg(windows)]
+fn bust_webview2_cache_if_version_changed() {
+    // Resolve the marker path: `<exe_dir>/.cache-gen`. Use the same
+    // current_exe() approach as exe_bin_dir so this works identically on
+    // portable installs (exe at install root) and dev runs (exe in
+    // target/debug). If current_exe fails we can't safely place the marker,
+    // so bail silently (boot must not fail here).
+    let exe = match std::env::current_exe() {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+    let install_root = match exe.parent() {
+        Some(p) => p,
+        None => return,
+    };
+    let marker = install_root.join(".cache-gen");
+    let current_version = env!("CARGO_PKG_VERSION");
+
+    // Read the marker. Three states:
+    //   - contents == current_version → steady state, skip the clear.
+    //   - contents != current_version → version changed (update), clear.
+    //   - file missing / unreadable   → first run or tampered, clear.
+    let steady_state = match std::fs::read_to_string(&marker) {
+        Ok(contents) => contents.trim() == current_version,
+        Err(_) => false,
+    };
+    if steady_state {
+        return;
+    }
+
+    // Locate the WebView2 cache tree. Tauri 2 places it under
+    // %LOCALAPPDATA%\<identifier>\EBWebView, where <identifier> is the
+    // tauri.conf.json `identifier` field (currently com.wupi.desktop per §8C).
+    // If the env var is unset (non-Windows, stripped env) there's nothing we
+    // can do; bail silently.
+    let local_app_data = match std::env::var_os("LOCALAPPDATA") {
+        Some(v) => v,
+        None => return,
+    };
+    let cache_dir = std::path::Path::new(&local_app_data)
+        .join("com.wupi.desktop")
+        .join("EBWebView");
+
+    if cache_dir.exists() {
+        // Best-effort delete. The most common reason this fails is a leftover
+        // WebView2 helper process holding a lock (msedgewebview2.exe can
+        // outlive a crashed wupi.exe). We do NOT kill processes here — the
+        // build-time `clear:webview2-cache.cjs` script already handles that
+        // for dev runs, and a normal shutdown leaves no lock. On failure we
+        // log + still write the marker: a single missed clear is recoverable
+        // on the next version bump, but blocking boot would be worse.
+        match std::fs::remove_dir_all(&cache_dir) {
+            Ok(()) => {
+                eprintln!(
+                    "[cache-bust] cleared WebView2 cache (version changed to {})",
+                    current_version
+                );
+            }
+            Err(e) => {
+                // Match the cache-clearer script's error classification so the
+                // log line is greppable alongside that script's output.
+                eprintln!(
+                    "[cache-bust] WARN: could not remove {} ({}); \
+                     frontend may be stale until next version bump",
+                    cache_dir.display(),
+                    e
+                );
+            }
+        }
+    }
+
+    // Write the new marker (best-effort). create+truncate; ignore write
+    // errors (a read-only install root just means we'll re-attempt the clear
+    // every boot, which is wasteful but correct).
+    if let Err(e) = std::fs::write(&marker, current_version) {
+        eprintln!(
+            "[cache-bust] WARN: could not write marker {} ({}); \
+             cache clear will re-run next boot",
+            marker.display(),
+            e
+        );
     }
 }

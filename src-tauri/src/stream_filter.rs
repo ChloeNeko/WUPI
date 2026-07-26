@@ -39,7 +39,20 @@ pub struct StreamFilter {
     /// truncated marker prefixes left in the trailing window by a cancelled
     /// generation (Bug #5). Every marker is ASCII, so byte-slicing is safe.
     markers: Vec<String>,
-    /// Length of the longest pattern (in bytes). Defines the trailing window.
+    /// Optional second regex for non-literal patterns (e.g. the Fable
+    /// narrator's bracket commands: `[OBJECT id=X state=Y]`,
+    /// `[CHARACTER_TURN:npc]`, `[FX name]`). These can't be expressed as
+    /// simple literals (variable content), so they get their own regex
+    /// applied in the same feed/flush passes. `None` for filters that only
+    /// strip literal markers (the chat engine).
+    bracket_re: Option<Regex>,
+    /// The trailing-window size reserved for bracket-command detection.
+    /// Sized to the longest realistic bracket (~96 bytes covers
+    /// `[OBJECT id=very_long_stable_id state=very_long_state]`). Only used
+    /// when `bracket_re` is `Some`.
+    bracket_window: usize,
+    /// Length of the longest literal pattern (in bytes). Defines the
+    /// trailing window for literal-marker holdback.
     max_pattern_len: usize,
     /// The rolling buffer of un-emitted text.
     buffer: String,
@@ -78,10 +91,71 @@ impl StreamFilter {
         StreamFilter {
             combined_re,
             markers,
+            bracket_re: None,
+            bracket_window: 0,
             max_pattern_len,
             buffer: String::with_capacity(256),
             cursor: 0,
         }
+    }
+
+    /// Enable bracket-command stripping for the Fable narrator path. The
+    /// narrator emits `[OBJECT id=X state=Y]`, `[CHARACTER_TURN:npc] ... [CHARACTER_TURN:end]`,
+    /// and `[FX name]` inline in prose. Without this, those bracket commands
+    /// stream live to the UI as raw text (the post-turn `bracket_parser` reads
+    /// `raw_output` separately, so stripping here doesn't break scene_event
+    /// extraction — the two paths are independent). The body of a
+    /// CHARACTER_TURN (the spoken line between open + close tags) is NOT
+    /// stripped: only the bracket tags themselves are.
+    ///
+    /// Only the narrator calls this; the chat engine's filter stays
+    /// bracket-less (its output has no brackets).
+    pub fn with_brackets(mut self) -> Self {
+        // Match any of the three bracket forms + the CHARACTER_TURN:end close
+        // tag. `[^\]]+` (not-followed-by-`]`) captures the variable id/state/
+        // effect body without spanning multiple brackets. The npc_id in
+        // CHARACTER_TURN is constrained to identifier chars (the narrator is
+        // told to use snake_case ids); OBJECT/FX bodies are looser.
+        let pattern = r"\[(?:CHARACTER_TURN:(?:end|[A-Za-z0-9_-]+)|OBJECT\s+[^\]]+|FX\s+[^\]]+)\]";
+        self.bracket_re = Some(Regex::new(pattern).expect("bracket regex always compiles"));
+        // Longest realistic bracket: `[OBJECT id=very_long_stable_id state=long_state]`
+        // ≈ 55 chars. 96 gives generous headroom for unusually long ids/states.
+        self.bracket_window = 96;
+        self
+    }
+
+    /// The trailing-window size: how many bytes from the buffer end we hold
+    /// back per feed, waiting for a partial marker/bracket to complete.
+    /// The max of the literal-marker window and the bracket window (if any).
+    fn trailing_window(&self) -> usize {
+        self.max_pattern_len.max(self.bracket_window)
+    }
+
+    /// Whether the slice contains any character that could start a strippable
+    /// pattern. `<` starts every literal marker; `[` starts every bracket.
+    /// The fast-path skips all regex work when neither is present (the
+    /// overwhelmingly common case for regular prose).
+    fn slice_needs_stripping(&self, slice: &str) -> bool {
+        if slice.contains('<') {
+            return true;
+        }
+        self.bracket_re.is_some() && slice.contains('[')
+    }
+
+    /// Strip all known patterns (literal markers + brackets) from a slice.
+    /// Runs the combined literal regex, then the bracket regex if enabled.
+    fn strip_all(&self, slice: &str) -> String {
+        let after_literals = if slice.contains('<') {
+            self.combined_re.replace_all(slice, "").into_owned()
+        } else {
+            slice.to_string()
+        };
+        if let Some(br) = &self.bracket_re {
+            if after_literals.contains('[') {
+                return br.replace_all(&after_literals, "").into_owned();
+            }
+        }
+        after_literals
     }
 
     /// Feed a new piece of the token stream. Returns text that is now safe to
@@ -91,12 +165,13 @@ impl StreamFilter {
         self.buffer.push_str(piece);
 
         // The safe emission boundary: we can emit up to here, but no further.
-        // Everything past this point is within `max_pattern_len` of the end
-        // and might be the start of a pattern that completes next chunk.
-        // We hold back the full `max_pattern_len` (not -1): a marker that
-        // STARTS exactly at `safe_end` needs all `max_pattern_len` bytes to
-        // complete, so any byte in `[safe_end, len)` could be part of one.
-        let mut safe_end = self.buffer.len().saturating_sub(self.max_pattern_len);
+        // Everything past this point is within `trailing_window()` of the end
+        // and might be the start of a pattern (literal marker or bracket
+        // command) that completes next chunk. We hold back the full window
+        // (not -1): a pattern that STARTS exactly at `safe_end` needs all
+        // `trailing_window` bytes to complete, so any byte in `[safe_end, len)`
+        // could be part of one.
+        let mut safe_end = self.buffer.len().saturating_sub(self.trailing_window());
 
         // CRITICAL: walk safe_end back to a valid UTF-8 char boundary. The
         // model emits multi-byte chars (em dash '-' is 3 bytes, emoji are 4).
@@ -115,14 +190,21 @@ impl StreamFilter {
         }
 
         // Before stripping: check if the RAW slice ends with a prefix of any
-        // marker. If a marker straddles `safe_end`, the regex can't see the
-        // full marker: only its partial start. Hold those raw bytes back so
-        // the next feed can resolve them. Find the longest suffix of the raw
-        // buffer (ending at safe_end) that is a proper prefix of some marker.
-        // We only need to check positions where '<' appears (the first byte
-        // of every marker), since only a suffix STARTING with '<' can be a
-        // marker prefix.
+        // strippable pattern. If a pattern straddles `safe_end`, the regex
+        // can't see the full pattern: only its partial start. Hold those raw
+        // bytes back so the next feed can resolve them.
+        //
+        // Two checks, both scanning from the right (longest candidate first):
+        //  (a) Literal markers: every one starts with '<'. A suffix starting
+        //      with '<' that is a proper prefix of some marker must be held.
+        //  (b) Bracket commands (if enabled): every one starts with '['. A
+        //      suffix starting with '[' that could be the start of a bracket
+        //      command must be held. We hold ANY '['-started suffix within the
+        //      bracket_window, since bracket content is variable-length and we
+        //      can't enumerate prefixes the way we do for literals — a partial
+        //      `[OBJE` could complete to `[OBJECT ...]` next chunk.
         let mut effective_end = safe_end;
+        // (a) literal-marker partial prefix
         for from in (self.cursor..safe_end).rev() {
             if self.buffer.as_bytes().get(from) != Some(&b'<') {
                 continue;
@@ -133,6 +215,27 @@ impl StreamFilter {
                 break; // first '<' match from the right = longest candidate
             }
         }
+        // (b) bracket partial prefix (only if brackets are enabled). Hold back
+        // the most recent '[' within the window — anything after it could be a
+        // partial bracket command. This is conservative (also holds an
+        // unrelated '[' that won't form a command), but stray '[' in narrative
+        // prose is rare and the hold is bounded by bracket_window.
+        if self.bracket_re.is_some() {
+            for from in (self.cursor..effective_end).rev() {
+                if self.buffer.as_bytes().get(from) != Some(&b'[') {
+                    continue;
+                }
+                // If this '[' already formed a COMPLETE bracket (regex matches
+                // up to a ']'), it's not a partial — the regex will strip it,
+                // so don't hold it back. Only hold if there's no ']' after it
+                // in the slice (i.e. the bracket is still open/incomplete).
+                let candidate = &self.buffer[from..safe_end];
+                if !candidate.contains(']') {
+                    effective_end = from;
+                    break;
+                }
+            }
+        }
 
         if effective_end <= self.cursor {
             // The held-back window ate everything: nothing safe to emit.
@@ -140,18 +243,18 @@ impl StreamFilter {
         }
 
         let slice = &self.buffer[self.cursor..effective_end];
-        // Fast path (Bug #4): every marker starts with '<'. If the slice
-        // contains none, skip the regex entirely: one alloc for the return,
-        // zero regex work. This covers the overwhelmingly common case
-        // (regular prose tokens contain no '<').
-        let cleaned = if !slice.contains('<') {
-            slice.to_string()
+        // Fast path: if the slice contains neither '<' nor '[', skip all regex
+        // work (one alloc, zero regex). Covers the overwhelmingly common case
+        // (regular prose tokens contain neither). Otherwise strip all known
+        // patterns (literals + brackets).
+        let cleaned = if self.slice_needs_stripping(slice) {
+            self.strip_all(slice)
         } else {
-            self.combined_re.replace_all(slice, "").into_owned()
+            slice.to_string()
         };
 
         // Advance the cursor past what we've processed (up to effective_end,
-        // which accounts for any partial-marker prefix held back).
+        // which accounts for any partial-pattern prefix held back).
         self.cursor = effective_end;
 
         // Compact the buffer: drop the emitted prefix so memory stays bounded.
@@ -166,16 +269,16 @@ impl StreamFilter {
 
     /// Called at end of generation. Emits any remaining held text, with a
     /// final defensive regex sweep to catch complete pattern remnants, then
-    /// strips any trailing partial-marker prefix (e.g. a truncated `<|cha`
-    /// left by an aborted generation) so it can't leak to the UI or into
-    /// `session.json` (Bug #5).
+    /// strips any trailing partial-pattern prefix (e.g. a truncated `<|cha`
+    /// or `[OBJE` left by an aborted generation) so it can't leak to the UI
+    /// or into `session.json` (Bug #5).
     pub fn flush(&mut self) -> String {
         if self.cursor >= self.buffer.len() {
             return String::new();
         }
         let mut remaining = self.buffer[self.cursor..].to_string();
-        // Strip complete markers.
-        remaining = self.combined_re.replace_all(&remaining, "").into_owned();
+        // Strip complete patterns (literals + brackets).
+        remaining = self.strip_all(&remaining);
 
         // Strip any trailing partial-marker prefix. All our markers are ASCII,
         // so byte-slicing is safe. Walk prefixes longest-first so we strip the
@@ -196,6 +299,27 @@ impl StreamFilter {
                 }
                 if changed {
                     break;
+                }
+            }
+        }
+
+        // Strip any trailing partial-bracket prefix (e.g. `[OBJE` left by an
+        // aborted generation). A partial bracket is any trailing suffix
+        // starting with '[' that contains no ']' (an unterminated bracket).
+        // Walk from the rightmost '[' inward; if everything from it to the end
+        // has no ']', drop it all. Loop in case stripping exposes an earlier
+        // partial bracket.
+        if self.bracket_re.is_some() {
+            let mut bracket_changed = true;
+            while bracket_changed {
+                bracket_changed = false;
+                if let Some(bracket_pos) = remaining.rfind('[') {
+                    let tail = &remaining[bracket_pos..];
+                    if !tail.contains(']') {
+                        // Unterminated bracket: drop it so it doesn't leak.
+                        remaining.truncate(bracket_pos);
+                        bracket_changed = true;
+                    }
                 }
             }
         }
@@ -413,5 +537,134 @@ mod tests {
         // Must not panic and must preserve the emoji.
         assert!(combined.contains("hello"));
         assert!(combined.contains("world"));
+    }
+
+    // === Bracket-command stripping tests (2026-07-26 leakage fix) ===========
+    // These use `.with_brackets()` to enable the narrator's bracket-command
+    // stripping. The three command forms: [OBJECT id=X state=Y],
+    // [CHARACTER_TURN:npc] ... [CHARACTER_TURN:end], [FX name].
+
+    #[test]
+    fn brackets_stripped_in_one_chunk_object() {
+        // A complete OBJECT bracket + surrounding prose in one feed. The
+        // bracket must be stripped; the prose must survive.
+        let mut f = StreamFilter::new(&["<|turn>"]).with_brackets();
+        let out = f.feed("Mara nods.[OBJECT id=door_state state=open]The fire crackles.");
+        let flushed = f.flush();
+        let combined = format!("{out}{flushed}");
+        assert!(combined.contains("Mara nods."), "prose before bracket lost: {:?}", combined);
+        assert!(combined.contains("The fire crackles."), "prose after bracket lost: {:?}", combined);
+        assert!(!combined.contains("[OBJECT"), "OBJECT bracket leaked: {:?}", combined);
+        assert!(!combined.contains("door_state"), "bracket content leaked: {:?}", combined);
+    }
+
+    #[test]
+    fn brackets_stripped_fx() {
+        let mut f = StreamFilter::new(&["<|turn>"]).with_brackets();
+        let out = f.feed("Thunder rolls.[FX thunder]Rain begins.");
+        let flushed = f.flush();
+        let combined = format!("{out}{flushed}");
+        assert!(combined.contains("Thunder rolls."));
+        assert!(combined.contains("Rain begins."));
+        assert!(!combined.contains("[FX"), "FX bracket leaked: {:?}", combined);
+    }
+
+    #[test]
+    fn character_turn_tags_stripped_body_survives() {
+        // CHARACTER_TURN is multi-region: [CHARACTER_TURN:npc] body [CHARACTER_TURN:end].
+        // BOTH bracket tags must be stripped, but the spoken body MUST survive
+        // (it's the NPC's dialogue — visible content). This is the key
+        // asymmetry vs OBJECT/FX (single-region, fully stripped).
+        let mut f = StreamFilter::new(&["<|turn>"]).with_brackets();
+        let out = f.feed(
+            "Mara looks up. [CHARACTER_TURN:mara_the_innkeep]Welcome, traveler.[CHARACTER_TURN:end] She smiles.",
+        );
+        let flushed = f.flush();
+        let combined = format!("{out}{flushed}");
+        assert!(combined.contains("Mara looks up."), "lead-in prose lost: {:?}", combined);
+        assert!(combined.contains("Welcome, traveler."), "CHARACTER_TURN body lost: {:?}", combined);
+        assert!(combined.contains("She smiles."), "trailing prose lost: {:?}", combined);
+        assert!(!combined.contains("[CHARACTER_TURN"), "CHARACTER_TURN tag leaked: {:?}", combined);
+        assert!(!combined.contains(":mara_the_innkeep]"), "npc id leaked: {:?}", combined);
+    }
+
+    #[test]
+    fn bracket_split_across_chunks() {
+        // The critical streaming test: an OBJECT bracket split exactly at a
+        // chunk boundary. The first chunk ends mid-bracket; the partial must
+        // be held back so [OBJE never leaks, then completed + stripped when
+        // the rest arrives.
+        let mut f = StreamFilter::new(&["<|turn>"]).with_brackets();
+        let out1 = f.feed("Prose here. [OBJE");
+        // The partial [OBJE must NOT have leaked.
+        assert!(
+            !out1.contains("[OBJE"),
+            "partial bracket leaked on first chunk: {:?}",
+            out1
+        );
+        let out2 = f.feed("CT id=chest state=open]More prose.");
+        let combined = format!("{out1}{out2}");
+        let flushed = f.flush();
+        let all = format!("{combined}{flushed}");
+        assert!(all.contains("Prose here."), "lead-in lost: {:?}", all);
+        assert!(all.contains("More prose."), "trailing lost: {:?}", all);
+        assert!(!all.contains("[OBJECT"), "full bracket not stripped: {:?}", all);
+        assert!(!all.contains("chest"), "bracket content leaked: {:?}", all);
+    }
+
+    #[test]
+    fn unterminated_bracket_stripped_on_flush() {
+        // A cancelled generation leaving a partial [OBJE in the buffer. flush
+        // must strip it so it doesn't leak to the UI or session.json.
+        let mut f = StreamFilter::new(&["<|turn>"]).with_brackets();
+        f.feed("Some prose. [OBJE");
+        let flushed = f.flush();
+        assert!(flushed.contains("Some prose."), "prose lost: {:?}", flushed);
+        assert!(!flushed.contains("["), "partial bracket leaked in flush: {:?}", flushed);
+        assert!(!flushed.contains("OBJE"), "partial bracket content leaked: {:?}", flushed);
+    }
+
+    #[test]
+    fn stray_bracket_in_prose_survives_via_flush() {
+        // A legitimate '[' in narrative prose (rare but possible — e.g. an
+        // aside like "[the old road]") that does NOT form a recognized
+        // command. The flush path holds it back during streaming (because the
+        // partial-prefix check holds any '[' with no following ']'), but
+        // flush() must emit it since it's not a complete bracket command.
+        // Verify the text survives through flush.
+        let mut f = StreamFilter::new(&["<|turn>"]).with_brackets();
+        f.feed("He took the [old] road home.");
+        let flushed = f.flush();
+        // The complete [old] is not a recognized command (not OBJECT/FX/
+        // CHARACTER_TURN), so it stays as literal prose.
+        assert!(flushed.contains("old"), "stray bracket content lost: {:?}", flushed);
+        assert!(flushed.contains("road"), "prose after stray bracket lost: {:?}", flushed);
+    }
+
+    #[test]
+    fn brackets_and_literal_markers_strip_together() {
+        // Both a Gemma4 protocol marker AND a bracket command in the same
+        // stream. Both must strip.
+        let mut f = StreamFilter::new(&["<|turn>", "<channel|>"]).with_brackets();
+        let out = f.feed("Reply<channel|>[FX rain]More text");
+        let flushed = f.flush();
+        let combined = format!("{out}{flushed}");
+        assert!(combined.contains("Reply"), "lead-in lost: {:?}", combined);
+        assert!(combined.contains("More text"), "trailing lost: {:?}", combined);
+        assert!(!combined.contains("<channel|>"), "literal marker leaked: {:?}", combined);
+        assert!(!combined.contains("[FX"), "bracket leaked: {:?}", combined);
+    }
+
+    #[test]
+    fn no_brackets_config_is_unaffected() {
+        // The chat engine's filter (no .with_brackets()) must NOT strip
+        // brackets — it has no bracket regex. A '[' in chat output (e.g. a
+        // code block) must survive. Regression guard against accidentally
+        // enabling brackets globally.
+        let mut f = StreamFilter::new(&["<|turn>"]);
+        let out = f.feed("Here is [some] text");
+        let flushed = f.flush();
+        let combined = format!("{out}{flushed}");
+        assert!(combined.contains("[some]"), "bracket wrongly stripped without with_brackets: {:?}", combined);
     }
 }

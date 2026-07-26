@@ -500,6 +500,10 @@ impl SchemaEngine {
         })?;
         tracing::info!("schema engine reuses shared chat model (VRAM-efficient, deduped)");
 
+        // SCHEMA_CTX (2048) is fixed for both Local and API modes: under API
+        // the schema engine only runs as a fallback / silent delta agent, and
+        // 2048 is already the right size for delta work (system instruction +
+        // current schema JSON + last exchange + generation room). See §5.
         let ctx_params = LlamaContextParams::default()
             .with_n_ctx(std::num::NonZeroU32::new(SCHEMA_CTX))
             .with_n_batch(SCHEMA_BATCH)

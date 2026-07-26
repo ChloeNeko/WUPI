@@ -208,6 +208,60 @@ struct ChatStreamDelta {
     content: Option<String>,
 }
 
+/// v0.7: enforce a soft char-budget on the API message payload by dropping the
+/// OLDEST non-system messages from the front. The system message (a message at
+/// index 0 with role == "system") is always preserved — it carries
+/// OS_DIRECTIVES + persona + memory/world_state.
+///
+/// This is a conservative safety net, not a tokenizer: the provider counts
+/// tokens server-side. We estimate at ~4 chars/token (rounded down — most
+/// English prose is 3-5 chars/token, so this slightly over-truncates, which
+/// is the safe direction). Mirrors the local engine's front-truncation guard
+/// (engine.rs::truncate_to_fit).
+///
+/// Invariants:
+/// - The system message (if present at index 0) is NEVER dropped, even if it
+///   alone exceeds the budget (it's load-bearing context).
+/// - Otherwise: drop oldest-first until total ≤ budget or only the system
+///   message + one most-recent message remain.
+fn truncate_to_budget(msgs: &mut Vec<ChatRequestMessage>, budget_chars: usize) {
+    let total: usize = msgs.iter().map(|m| m.content.chars().count()).sum();
+    if total <= budget_chars {
+        return;
+    }
+    // Find the system message index (only the FIRST message counts as system;
+    // some providers accept multiple system messages but we only protect [0]).
+    let system_idx = if msgs.first().map(|m| m.role == "system").unwrap_or(false) {
+        Some(0)
+    } else {
+        None
+    };
+
+    // Walk from index 1 (or 0 if no system), dropping oldest-first. `cursor`
+    // is never incremented: after `msgs.remove(cursor)`, the next message
+    // shifts down into the same index, so we keep removing at `cursor` until
+    // under budget or we hit the "keep system + last" floor.
+    let cursor = system_idx.map_or(0, |i| i + 1);
+    let mut current = total;
+    while current > budget_chars && cursor < msgs.len() {
+        // Always keep at least the system message + the last message.
+        if cursor >= msgs.len().saturating_sub(1) {
+            break;
+        }
+        let removed_len = msgs[cursor].content.chars().count();
+        current = current.saturating_sub(removed_len);
+        msgs.remove(cursor);
+        // cursor stays put: after remove, the next message shifts into cursor.
+    }
+    if current > budget_chars {
+        tracing::warn!(
+            total_chars = current,
+            budget_chars,
+            "API payload still over budget after truncation (system + last msg preserved)"
+        );
+    }
+}
+
 impl GenerationClient for HttpBackend {
     fn stream(
         &self,
@@ -221,6 +275,7 @@ impl GenerationClient for HttpBackend {
         let url = self.completions_url();
         let model = self.profile.model.clone();
         let temperature = self.profile.temperature;
+        let max_context = self.profile.max_context;
         let client = self.client.clone();
         Box::pin(async move {
             // Fold memory_block + world_state into the system message. They're
@@ -251,6 +306,19 @@ impl GenerationClient for HttpBackend {
                     content,
                 });
             }
+
+            // v0.7: enforce the profile's max_context (default 8192) as a soft
+            // input-token budget. We don't ship a real tokenizer to the API
+            // path (the provider does its own counting server-side), so this
+            // is a conservative safety net: estimate at ~4 chars/token and
+            // drop the OLDEST non-system messages from the front until under
+            // budget. The system message (index 0 if role=="system") is
+            // always preserved — it carries OS_DIRECTIVES + persona +
+            // memory/world_state. Mirrors the local engine's front-truncation
+            // guard (engine.rs).
+            let max_ctx = max_context.unwrap_or(8192);
+            let budget_chars = (max_ctx as usize).saturating_mul(4);
+            truncate_to_budget(&mut wire_messages, budget_chars);
 
             // Build the request body. `stream: true` requests SSE.
             // Sampler params mirror the locked local-engine config (AGENTS.md
@@ -634,4 +702,81 @@ impl LlamaCppBackend {
 /// hasn't loaded yet (callers should gate on backend readiness first).
 pub fn shared_model() -> Option<&'static LlamaModel> {
     SHARED_MODEL.get().copied()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn msg(role: &str, content: impl Into<String>) -> ChatRequestMessage {
+        ChatRequestMessage {
+            role: role.to_string(),
+            content: content.into(),
+        }
+    }
+
+    #[test]
+    fn truncate_noop_when_under_budget() {
+        let mut msgs = vec![msg("system", "sys"), msg("user", "hi"), msg("assistant", "hello")];
+        let total: usize = msgs.iter().map(|m| m.content.chars().count()).sum();
+        truncate_to_budget(&mut msgs, total + 100);
+        assert_eq!(msgs.len(), 3, "nothing should be dropped when under budget");
+    }
+
+    #[test]
+    fn truncate_drops_oldest_non_system_first() {
+        // system(3) + user(2) + assistant(5) + user(2) = 12 chars. Budget = 7.
+        // Should drop the first user (2) → 10, then the assistant (5) → 5 ≤ 7.
+        // Result: [system, user(last)].
+        let mut msgs = vec![
+            msg("system", "sys"),
+            msg("user", "hi"),
+            msg("assistant", "hello"),
+            msg("user", "yo"),
+        ];
+        truncate_to_budget(&mut msgs, 7);
+        assert_eq!(msgs.len(), 2);
+        assert_eq!(msgs[0].role, "system");
+        assert_eq!(msgs[0].content, "sys");
+        assert_eq!(msgs[1].role, "user");
+        assert_eq!(msgs[1].content, "yo", "the most-recent non-system message must survive");
+    }
+
+    #[test]
+    fn truncate_preserves_system_even_if_over_budget() {
+        // System alone exceeds budget: must NOT be dropped.
+        let mut msgs = vec![msg("system", "x".repeat(100))];
+        truncate_to_budget(&mut msgs, 10);
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].role, "system");
+    }
+
+    #[test]
+    fn truncate_keeps_at_least_system_plus_last() {
+        // Even if wildly over budget, never drop below system + last message.
+        let mut msgs = vec![
+            msg("system", "sys"),
+            msg("user", "x".repeat(50)),
+            msg("assistant", "y".repeat(50)),
+            msg("user", "z".repeat(50)),
+        ];
+        truncate_to_budget(&mut msgs, 5);
+        assert_eq!(msgs.len(), 2, "system + last must survive");
+        assert_eq!(msgs[0].role, "system");
+        assert_eq!(msgs[1].content, "z".repeat(50));
+    }
+
+    #[test]
+    fn truncate_no_system_message_works() {
+        // No system message at index 0: protect nothing special, but still
+        // keep at least the last message.
+        let mut msgs = vec![
+            msg("user", "x".repeat(50)),
+            msg("assistant", "y".repeat(50)),
+            msg("user", "z".repeat(50)),
+        ];
+        truncate_to_budget(&mut msgs, 55);
+        assert!(msgs.len() >= 1);
+        assert_eq!(msgs.last().unwrap().content, "z".repeat(50));
+    }
 }
