@@ -485,6 +485,77 @@ impl LlamaCppBackend {
             family,
         })
     }
+
+    /// v0.6.4 VRAM swap-lock: re-spawn the chat backend WITHOUT re-reading
+    /// the model file. Reuses the leaked `&'static LlamaModel` from
+    /// `shared_model()` (set once at boot, never cleared) +
+    /// `shared_backend()`. Only the engine thread + its KV context are
+    /// recreated — ~instant vs the ~5s a full `spawn_load` (file read)
+    /// would cost on every chat turn after a fable/schema eviction.
+    ///
+    /// Used by `chat_send` when the chat lease is acquired but the backend
+    /// slot is `None` (torn down by a prior fable/schema eviction). The
+    /// weights never left VRAM (the leak is process-lifetime), so this is
+    /// just a fresh `LlamaContext` allocation on the shared model.
+    ///
+    /// Mirrors `spawn_load`'s exact contract: returns a backend handle
+    /// immediately; `on_result` fires when the engine thread + context
+    /// are live (success) or failed (error). The caller (chat_send) does
+    /// NOT need to await — it stashes the backend in `AppState.backend`
+    /// right away, and `stream()` checks the internal slot (returns
+    /// "not ready yet" if called before init completes, which the caller
+    /// avoids by awaiting `on_result` via a oneshot). In practice
+    /// `chat_send` awaits readiness the same way `boot_load_model` does.
+    ///
+    /// Returns `None` if `shared_model()` is `None` (boot hasn't loaded
+    /// the chat model yet — should never happen by the time chat_send
+    /// runs, but defensive). `context_size` fixes the new context's n_ctx.
+    pub fn spawn_from_shared(
+        context_size: u32,
+        on_result: Box<dyn FnOnce(Result<String, String>) + Send>,
+    ) -> Option<Arc<Self>> {
+        let model_ref: &'static LlamaModel = shared_model()?;
+        let backend_ref: &'static LlamaBackend = shared_backend();
+        // The leaked model was already classified at first boot load; the
+        // chat model is always WUPI.gguf → Gemma4 (LOCKED per AGENTS.md §10).
+        let family = ModelFamily::Gemma4;
+
+        let engine_slot: Arc<std::sync::Mutex<Option<ChatEngine>>> =
+            Arc::new(std::sync::Mutex::new(None));
+        let slot_clone = Arc::clone(&engine_slot);
+
+        std::thread::spawn(move || {
+            let (engine, init_rx) =
+                ChatEngine::spawn(backend_ref, model_ref, family, context_size);
+            // Bug #6 pattern: await init confirmation BEFORE stashing +
+            // signaling. If init_runtime failed (CUDA context alloc error,
+            // etc.), report the error instead of falsely stashing a dead
+            // engine.
+            match init_rx.recv() {
+                Ok(Ok(())) => {
+                    {
+                        let mut g = slot_clone.lock().expect("engine mutex");
+                        *g = Some(engine);
+                    }
+                    tracing::info!("chat backend re-spawned from shared model (no file read)");
+                    on_result(Ok("WUPI.gguf (shared)".to_string()));
+                }
+                Ok(Err(e)) => {
+                    tracing::error!(error = %e, "chat backend re-spawn init failed");
+                    on_result(Err(e));
+                }
+                Err(_) => {
+                    let msg = "chat backend re-spawn init channel closed".to_string();
+                    tracing::error!(error = %msg);
+                    on_result(Err(msg));
+                }
+            }
+        });
+
+        Some(Arc::new(LlamaCppBackend {
+            engine: engine_slot,
+        }))
+    }
 }
 
 impl GenerationClient for LlamaCppBackend {

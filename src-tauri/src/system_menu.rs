@@ -173,12 +173,16 @@ pub fn power_sleep_cmd<R: Runtime>(app: tauri::AppHandle<R>) -> Result<(), Strin
     Ok(())
 }
 
-/// Toggle the main window's always-on-top state at runtime. The window boots
-/// with `alwaysOnTop: true` (tauri.conf.json) — the OS UX needs that so WUPI
-/// floats above other windows during normal use. The first-run download
-/// overlay turns it OFF so the user can alt-tab away while the ~10GB GGUF
-/// pull runs (several minutes). Restored to ON once the download completes
-/// + the user clicks LAUNCH.
+/// Toggle the main window's always-on-top state at runtime.
+///
+/// As of 2026-07-23 the window boots with `alwaysOnTop: false`
+/// (tauri.conf.json): WUPI is a normal OS window the user can alt-tab away
+/// from freely — the app-lifecycle onPause/onResume framework freezes Fable's
+/// GPU/audio on focus loss so there's no cost to leaving WUPI unfocused, and
+/// forcing on-top would block that alt-tab workflow. The command + IPC are
+/// RETAINED so the first-run download overlay (or a future "kiosk mode")
+/// can still flip on-top at runtime if a use case needs it. Today nothing
+/// in the steady-state boot path calls it.
 ///
 /// Custom `#[tauri::command]` (not the Tauri built-in window plugin command):
 /// `core:default` in capabilities/default.json auto-allows custom commands,

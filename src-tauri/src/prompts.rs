@@ -157,7 +157,13 @@ mod tests {
 
         let profile = "<user_profile>\nname: Operator\n</user_profile>";
         let with = build_system_content(&settings, None, Some(profile));
-        assert!(!with.contains("</user_profile>"));
+        // The closing tag must be PRESENT when a profile is passed (the
+        // opening-tag name also appears in OS_DIRECTIVES, so we discriminate
+        // on the closing tag like the None-branch above). The prior `!` here
+        // was a typo that asserted the opposite of correct behavior; it sat
+        // undetected because `cargo test` is the 30+ min CUDA path nobody
+        // runs (§13). Found when the v0.6.3 session finally ran the suite.
+        assert!(with.contains("</user_profile>"));
         assert!(with.contains("name: Operator"));
 
         // Ordering: when both persona + profile are present, persona comes first.

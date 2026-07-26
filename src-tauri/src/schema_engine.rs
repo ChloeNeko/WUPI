@@ -9,9 +9,12 @@
 //! # Why a separate context (the load-bearing isolation requirement)
 //!
 //! The schema pass MUST NOT pollute the chat engine's rolling KV cache. A
-//! second `LlamaContext` on the schema's own `&'static LlamaModel` achieves
-//! this: independent KV state, no cross-contamination. Same pattern as the
-//! embedder (§3B): proven architecture.
+//! second `LlamaContext` — borrowing the SHARED `&'static LlamaModel` (the
+//! same weights the chat engine uses, via `shared_model()`) — achieves this:
+//! independent KV state, no cross-contamination, with zero duplicate weight
+//! allocation. Same isolation pattern as the embedder (§3B). The schema
+//! engine shares weights but owns its own context (2026-07-23 dedupe: it
+//! previously loaded its own 9.8GB copy, a redundant ~9.8GB VRAM cost).
 //!
 //! # The micro-delta contract
 //!
@@ -44,17 +47,15 @@
 //!    prompt. `SchemaReply::failed_attempt` carries the data the caller
 //!    needs to enqueue.
 
-use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 
 use llama_cpp_2::context::params::{KvCacheType, LlamaContextParams};
 use llama_cpp_2::llama_batch::LlamaBatch;
 use llama_cpp_2::model::{AddBos, LlamaModel};
-use llama_cpp_2::model::params::LlamaModelParams;
 use llama_cpp_2::sampling::LlamaSampler;
 use llama_cpp_2::token::LlamaToken;
 
-use crate::llm::shared_backend;
+use crate::llm::{shared_backend, shared_model};
 use crate::schema::{SchemaDelta, WorldSchema};
 use crate::schema_validator;
 
@@ -197,12 +198,17 @@ enum SchemaMsg {
     /// command, not a just-finished chat exchange. Reuses the same JSON-delta
     /// parser + the schema engine's isolated context, no new infrastructure.
     RequestTranslation(Box<TranslationRequest>),
+    /// Shut the schema thread down cleanly (drop its `LlamaContext`, freeing
+    /// its KV cache, then join). Required by the VRAM-hibernate path so the
+    /// schema context's ~75MB is reclaimable without process restart. Mirrors
+    /// `ChatEngine::shutdown` / `FableEngine::shutdown`. (2026-07-23.)
+    Shutdown,
 }
 
 /// A request to translate a player's natural-language request ("make it
 /// stormy") into a `SchemaDelta` against the current game-world schema.
 /// Carries the raw player text + the current schema JSON. The handler uses
-/// `game_command::render_translation_prompt` to build the LLM prompt, then
+/// `fable_command::render_translation_prompt` to build the LLM prompt, then
 /// parses the reply via the same `SchemaDelta::from_model_output` the
 /// auto-summarizer uses.
 struct TranslationRequest {
@@ -223,11 +229,12 @@ struct TranslationRequest {
 // ---------------------------------------------------------------------------
 
 /// The handle callers hold. Fully `Send + Sync`: a channel sender to the
-/// dedicated schema thread. No `LlamaContext` crosses out. The thread lives
-/// for process lifetime (no hot-swap path now that the schema engine stays
-/// on WUPI.gguf in both Local and API modes, §2X).
+/// dedicated schema thread + the retained `JoinHandle` (needed for
+/// `shutdown()`'s synchronous join — the VRAM-hibernate path). No
+/// `LlamaContext` crosses out.
 pub struct SchemaEngine {
     tx: mpsc::Sender<SchemaMsg>,
+    join: std::sync::Mutex<Option<std::thread::JoinHandle<()>>>,
 }
 
 // SAFETY: mpsc::Sender<SchemaMsg> is Send (SchemaMsg owns only Send data).
@@ -236,29 +243,25 @@ unsafe impl Send for SchemaEngine {}
 unsafe impl Sync for SchemaEngine {}
 
 impl SchemaEngine {
-    /// Spawn the schema thread. The chat backend MUST be loaded first (we read
-    /// `shared_model()` to get the leaked `&'static LlamaModel`). Returns
-    /// `None` if no model is available: callers should treat the schema
-    /// engine as optional (chat proceeds without schema updates).
+    /// Spawn the schema thread. The chat backend MUST be loaded first: the
+    /// schema engine borrows the leaked shared model (`shared_model()`) — it
+    /// no longer loads its own copy (2026-07-23 schema-dedupe: the redundant
+    /// second 9.8GB WUPI.gguf allocation is gone; chat+schema+fable now share
+    /// ONE weight copy, matching AGENTS.md §2).
     ///
-    /// The readiness receiver yields `Ok(())` once the schema context is live
-    /// (or `Err` if init failed). The caller SHOULD `recv()` before treating
-    /// the engine as ready, same contract as `ChatEngine::spawn` (Bug #6).
-    ///
-    /// `path` is the model file this engine loads as ITS OWN model: no longer
-    /// `shared_model()`. In Local mode pass WUPI.gguf; in API mode pass
-    /// Agent.gguf. Mirrors `LlamaCppEmbedder::spawn_load`.
-    pub fn spawn_load(
-        path: PathBuf,
-        n_gpu_layers: u32,
-    ) -> (Self, mpsc::Receiver<Result<(), String>>) {
+    /// Returns `Err` via the readiness receiver if `shared_model()` is `None`
+    /// (model not loaded yet): callers should treat the schema engine as
+    /// optional (chat proceeds without schema updates). The caller SHOULD
+    /// `recv()` before treating the engine as ready, same contract as
+    /// `ChatEngine::spawn` (Bug #6).
+    pub fn spawn_load() -> (Self, mpsc::Receiver<Result<(), String>>) {
         let (tx, rx) = mpsc::channel::<SchemaMsg>();
         let (init_tx, init_rx) = mpsc::channel::<Result<(), String>>();
 
         let builder = std::thread::Builder::new().name("wupi-schema".into());
-        let _join = builder
+        let join = builder
             .spawn(move || {
-                let mut runtime = match Self::init_runtime(&path, n_gpu_layers) {
+                let mut runtime = match Self::init_runtime() {
                     Ok(rt) => {
                         let _ = init_tx.send(Ok(()));
                         rt
@@ -291,7 +294,7 @@ impl SchemaEngine {
                         Ok(SchemaMsg::RequestTranslation(req)) => {
                             // Phase E: same self-healing wrap, different runtime
                             // call. The translation prompt is built by
-                            // `game_command::render_translation_prompt`; the
+                            // `fable_command::render_translation_prompt`; the
                             // parser is the same `SchemaDelta::from_model_output`.
                             let outcome = std::panic::catch_unwind(
                                 std::panic::AssertUnwindSafe(|| {
@@ -302,6 +305,10 @@ impl SchemaEngine {
                         }
                         Err(mpsc::RecvError) => {
                             tracing::info!("wupi-schema: all senders dropped, exiting");
+                            break;
+                        }
+                        Ok(SchemaMsg::Shutdown) => {
+                            tracing::info!("wupi-schema shutting down");
                             break;
                         }
                     };
@@ -374,9 +381,27 @@ impl SchemaEngine {
         (
             SchemaEngine {
                 tx,
+                join: std::sync::Mutex::new(Some(join)),
             },
             init_rx,
         )
+    }
+
+    /// Shut the schema thread down cleanly. Posts `Shutdown`, then joins the
+    /// thread so the caller is guaranteed the `SchemaRuntime` (the
+    /// `LlamaContext` + its KV cache) has been dropped — that's what frees the
+    /// schema context's ~75MB on the VRAM-hibernate path. Idempotent across
+    /// repeated calls (the `JoinHandle` is taken under the mutex). Mirrors
+    /// `ChatEngine::shutdown` / `FableEngine::shutdown`. (2026-07-23.)
+    pub fn shutdown(&self) {
+        let _ = self.tx.send(SchemaMsg::Shutdown);
+        if let Ok(mut guard) = self.join.lock() {
+            if let Some(handle) = guard.take() {
+                if let Err(e) = handle.join() {
+                    tracing::warn!(error = ?e, "wupi-schema thread join failed during shutdown");
+                }
+            }
+        }
     }
 
     /// Post a delta request. The caller awaits the reply via the receiver
@@ -408,7 +433,7 @@ impl SchemaEngine {
 
     /// Post a TRANSLATION request (Phase E, 2026-07-18): translate a player's
     /// natural-language game-management request into a `SchemaDelta`. Used by
-    /// `route_to_game_manager` when Wupi intercepts a "make it stormy" /
+    /// `route_to_fable_manager` when Wupi intercepts a "make it stormy" /
     /// "give me a sword" / "travel to the dungeon" command. Same reply
     /// contract as `request_delta`: caller awaits via the returned receiver.
     ///
@@ -444,6 +469,9 @@ impl SchemaEngine {
             let reply_tx = match msg {
                 SchemaMsg::Request(r) => r.reply,
                 SchemaMsg::RequestTranslation(r) => r.reply,
+                // Shutdown during init-failure drain: nothing to reply to,
+                // just drop it (the engine never came up).
+                SchemaMsg::Shutdown => continue,
             };
             let _ = reply_tx.send(SchemaReply {
                 raw_output: String::new(),
@@ -454,21 +482,23 @@ impl SchemaEngine {
         }
     }
 
-    /// Initialize the schema runtime: load the model by path (this engine's
-    /// OWN model: no `shared_model()`), leak it to `&'static`, create an
-    /// isolated context. Mirrors `memory_embedder_llama.rs::init_runtime`.
+    /// Initialize the schema runtime: borrow the leaked shared chat model
+    /// (`shared_model()`) + create an isolated context on it. The schema
+    /// engine no longer loads its own copy (2026-07-23 schema-dedupe): the
+    /// redundant second 9.8GB WUPI.gguf allocation is gone — chat+schema+
+    /// fable now share ONE weight copy. The schema's isolated `LlamaContext`
+    /// still provides the load-bearing KV isolation (schema deltas never
+    /// pollute the chat cache); only the weights are shared.
+    ///
+    /// Returns `Err` if `shared_model()` is `None` (chat backend not loaded
+    /// yet) — the caller treats the schema engine as optional in that case.
     /// Runs on the schema thread.
-    fn init_runtime(path: &Path, n_gpu_layers: u32) -> anyhow::Result<SchemaRuntime> {
+    fn init_runtime() -> anyhow::Result<SchemaRuntime> {
         let backend = shared_backend();
-
-        let params = LlamaModelParams::default().with_n_gpu_layers(n_gpu_layers);
-        let model = LlamaModel::load_from_file(backend, path, &params)
-            .map_err(|e| anyhow::anyhow!("schema model load {}: {e:?}", path.display()))?;
-        tracing::info!(path = %path.display(), "schema model loaded");
-
-        // Leak the model to &'static so the context can borrow it for its
-        // whole life. Same rationale as llm.rs::into_static + the embedder.
-        let model_ref: &'static LlamaModel = Box::leak(Box::new(model));
+        let model_ref: &'static LlamaModel = shared_model().ok_or_else(|| {
+            anyhow::anyhow!("schema engine: shared_model() is None (chat backend not loaded)")
+        })?;
+        tracing::info!("schema engine reuses shared chat model (VRAM-efficient, deduped)");
 
         let ctx_params = LlamaContextParams::default()
             .with_n_ctx(std::num::NonZeroU32::new(SCHEMA_CTX))
@@ -480,7 +510,7 @@ impl SchemaEngine {
         let ctx = model_ref
             .new_context(backend, ctx_params)
             .map_err(|e| anyhow::anyhow!("schema context init: {e:?}"))?;
-        tracing::info!(n_ctx = SCHEMA_CTX, "schema context created (isolated)");
+        tracing::info!(n_ctx = SCHEMA_CTX, "schema context created (isolated, shared weights)");
 
         Ok(SchemaRuntime { ctx, model: model_ref })
     }
@@ -523,7 +553,7 @@ impl SchemaRuntime {
     /// Translate a player's natural-language game-management request into a
     /// `SchemaDelta` (Phase E, 2026-07-18). Same fail-proof contract as
     /// `generate_delta`: 3-pass + validator + failure queue. The initial
-    /// prompt is built by `game_command::render_translation_prompt` from the
+    /// prompt is built by `fable_command::render_translation_prompt` from the
     /// player's verbatim text + the current game-world schema. Used by
     /// Wupi-as-game-manager when she intercepts "make it stormy" / "give me
     /// a sword" via chat_send.
@@ -531,7 +561,7 @@ impl SchemaRuntime {
         &mut self,
         req: &TranslationRequest,
     ) -> Result<AttemptOutcome, anyhow::Error> {
-        let initial_prompt = crate::game_command::render_translation_prompt(
+        let initial_prompt = crate::fable_command::render_translation_prompt(
             &req.player_request,
             &req.current_schema_json,
             &req.deferred_attempts,

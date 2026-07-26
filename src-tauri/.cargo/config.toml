@@ -3,7 +3,23 @@ LLAMA_CMAKE_CUDA_ARCHITECTURES = "120"
 LIBCLANG_PATH = "C:\\Program Files\\LLVM\\bin"
 CUDA_PATH = "C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v13.3"
 CudaToolkitDir = "C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v13.3"
-CMAKE_BUILD_PARALLEL_LEVEL = "8"
+CMAKE_BUILD_PARALLEL_LEVEL = "24"
+# Vulkan SDK — required at BUILD time only (llama-cpp-sys-2 build.rs line ~860
+# reads this to find vulkan-1.lib + glslangValidator for CMake). The runtime
+# vulkan-1.dll loader ships with the GPU DRIVER, NOT this SDK — so this path
+# is never needed on a user machine, only on the dev box.
+VULKAN_SDK = "C:\\VulkanSDK\\1.4.350.0"
+# Build generator — Ninja instead of Visual Studio. The VS generator (the
+# cmake-rs default on Windows) has a parallel-build race in CMake's
+# ExternalProject_Add step: it ran vulkan-shaders-gen's install step before
+# configure finished writing cmake_install.cmake → "Not a file" → MSB8066 /
+# "system cannot find the batch label specified - VCEnd". Ninja serializes
+# ExternalProject steps correctly AND is materially faster for the
+# non-CUDA cmake targets (host tool compiles, ggml-cpu cxx, etc.). Ninja
+# itself is single-instance; CMAKE_BUILD_PARALLEL_LEVEL controls the
+# compile pool size. Requires ninja.exe on PATH at build time (chocolatey:
+# `choco install ninja`). See AGENTS.md §11.14.
+CMAKE_GENERATOR = "Ninja"
 
 # Delay-load 3 of the 4 PE static-import DLLs so they don't have to live at
 # the exe's own directory at process start (AGENTS.md §8B bin/ layout).

@@ -1,6 +1,6 @@
 {
   "name": "wupi",
-  "version": "0.3.6",
+  "version": "0.7.3",
   "private": true,
   "type": "module",
   "scripts": {
@@ -9,12 +9,11 @@
     "build": "npm run clear:webview2 && vite build",
     "preview": "vite preview",
     "tauri": "tauri",
+    "check": "node scripts/cargo-check.cjs",
     "release": "node scripts/release.cjs"
   },
   "dependencies": {
-    "@tauri-apps/api": "^2",
-    "@xterm/addon-fit": "^0.11.0",
-    "@xterm/xterm": "^6.0.0"
+    "@tauri-apps/api": "^2"
   },
   "devDependencies": {
     "@tauri-apps/cli": "^2",

@@ -1,6 +1,6 @@
-//! The GameEngine: the Narrator's dedicated generation thread (Games app Seam 2).
+//! The FableEngine: the Narrator's dedicated generation thread (Games app Seam 2).
 //!
-//! A dedicated `std::thread` ("wupi-game") owning an ISOLATED
+//! A dedicated `std::thread` ("wupi-fable") owning an ISOLATED
 //! `LlamaContext<'static>` on the same `WUPI.gguf` model the chat engine
 //! uses. The narrator's roleplay turns run here, fully isolated from the
 //! Wupi-assistant chat context (and from the schema/embedder contexts).
@@ -50,20 +50,20 @@ use crate::llm::{shared_backend, shared_model, CancelToken, ChunkFn};
 /// The game context's token budget. Matches the chat context (4000): the
 /// narrator's turns are the same shape as chat turns (system + history + new
 /// turn) and need the same headroom for long roleplay exchanges.
-const GAME_CTX: u32 = 4000;
-const GAME_BATCH: u32 = 512;
+const FABLE_CTX: u32 = 4000;
+const FABLE_BATCH: u32 = 512;
 /// Cap on generated tokens for a single narrator turn. 1024 is generous for
 /// a narrative beat (2-4 paragraphs); the narrator system prompt tells the
 /// model to keep prose tight. The clamp (engine.rs pattern) further bounds
 /// this by `n_ctx - n_cur` at decode time.
-const GAME_MAX_TOKENS: i32 = 1024;
+const FABLE_MAX_TOKENS: i32 = 1024;
 
 // ---------------------------------------------------------------------------
 // Control plane: channel types
 // ---------------------------------------------------------------------------
 
 /// A request to the game thread: stream a narrator turn for `prompt`.
-struct GameRequest {
+struct FableRequest {
     /// Fully-rendered prompt (system + visible history + new user turn +
     /// generation prompt). The engine tokenizes + prefills + decodes it.
     prompt: String,
@@ -77,14 +77,14 @@ struct GameRequest {
     cancel: CancelToken,
     /// One-shot reply channel. Sent exactly once when the turn completes
     /// (success, cancel, or error).
-    reply: mpsc::Sender<GameReply>,
+    reply: mpsc::Sender<FableReply>,
 }
 
 /// What the game thread sends back when a narrator turn completes. Carries
 /// the full cleaned text + raw model output + any bracket commands the
 /// parser extracted. On error, `error` is populated and the others are empty.
 #[derive(Debug, Clone, serde::Serialize)]
-pub struct GameReply {
+pub struct FableReply {
     /// The verbatim model output (post generation, pre-cleanup). Empty on
     /// generation failure.
     pub raw_output: String,
@@ -95,8 +95,8 @@ pub struct GameReply {
     pub cancelled: bool,
 }
 
-enum GameMsg {
-    Request(Box<GameRequest>),
+enum FableMsg {
+    Request(Box<FableRequest>),
     Shutdown,
 }
 
@@ -109,17 +109,17 @@ enum GameMsg {
 /// (same load-bearing concern as `SchemaEngine`: the next `game_start` must
 /// not race the previous `game_end`'s VRAM teardown). Mirrors `SchemaEngine`
 /// and `LlamaCppEmbedder`.
-pub struct GameEngine {
-    tx: mpsc::Sender<GameMsg>,
+pub struct FableEngine {
+    tx: mpsc::Sender<FableMsg>,
     join: std::sync::Mutex<Option<std::thread::JoinHandle<()>>>,
 }
 
-// SAFETY: mpsc::Sender<GameMsg> is Send (GameMsg owns only Send data).
+// SAFETY: mpsc::Sender<FableMsg> is Send (FableMsg owns only Send data).
 // Mutex<Option<JoinHandle<()>>> is Send+Sync. No `LlamaContext` crosses out.
-unsafe impl Send for GameEngine {}
-unsafe impl Sync for GameEngine {}
+unsafe impl Send for FableEngine {}
+unsafe impl Sync for FableEngine {}
 
-impl GameEngine {
+impl FableEngine {
     /// Spawn the game thread. Loads `WUPI.gguf` (or whatever path resolves)
     /// as this engine's OWN model: freshly leaked `&'static`, independent
     /// KV state. The readiness receiver yields `Ok(())` once the context is
@@ -129,10 +129,10 @@ impl GameEngine {
         path: PathBuf,
         n_gpu_layers: u32,
     ) -> (Self, mpsc::Receiver<Result<(), String>>) {
-        let (tx, rx) = mpsc::channel::<GameMsg>();
+        let (tx, rx) = mpsc::channel::<FableMsg>();
         let (init_tx, init_rx) = mpsc::channel::<Result<(), String>>();
 
-        let builder = std::thread::Builder::new().name("wupi-game".into());
+        let builder = std::thread::Builder::new().name("wupi-fable".into());
         let join = builder
             .spawn(move || {
                 let mut runtime = match Self::init_runtime(&path, n_gpu_layers) {
@@ -148,11 +148,11 @@ impl GameEngine {
                         return;
                     }
                 };
-                tracing::info!("wupi-game thread ready");
+                tracing::info!("wupi-fable thread ready");
 
                 loop {
                     match rx.recv() {
-                        Ok(GameMsg::Request(req)) => {
+                        Ok(FableMsg::Request(req)) => {
                             // Self-healing: isolate each turn so one panic
                             // doesn't kill the thread.
                             let outcome = std::panic::catch_unwind(
@@ -161,12 +161,12 @@ impl GameEngine {
                                 }),
                             );
                             let reply_msg = match outcome {
-                                Ok(Ok(raw)) => GameReply {
+                                Ok(Ok(raw)) => FableReply {
                                     raw_output: raw,
                                     error: String::new(),
                                     cancelled: false,
                                 },
-                                Ok(Err(GenerationOutcome::Cancelled(raw))) => GameReply {
+                                Ok(Err(GenerationOutcome::Cancelled(raw))) => FableReply {
                                     raw_output: raw,
                                     error: String::new(),
                                     cancelled: true,
@@ -174,7 +174,7 @@ impl GameEngine {
                                 Ok(Err(GenerationOutcome::GenerationErr(e))) => {
                                     tracing::warn!(error = %format!("{e:#}"), "game turn failed");
                                     runtime.ctx.clear_kv_cache();
-                                    GameReply {
+                                    FableReply {
                                         raw_output: String::new(),
                                         error: format!("{e:#}"),
                                         cancelled: false,
@@ -192,7 +192,7 @@ impl GameEngine {
                                         });
                                     tracing::error!(panic = %msg, "game turn panicked");
                                     runtime.ctx.clear_kv_cache();
-                                    GameReply {
+                                    FableReply {
                                         raw_output: String::new(),
                                         error: format!("game panic: {msg}"),
                                         cancelled: false,
@@ -201,21 +201,21 @@ impl GameEngine {
                             };
                             let _ = req.reply.send(reply_msg);
                         }
-                        Ok(GameMsg::Shutdown) => {
-                            tracing::info!("wupi-game shutting down");
+                        Ok(FableMsg::Shutdown) => {
+                            tracing::info!("wupi-fable shutting down");
                             break;
                         }
                         Err(mpsc::RecvError) => {
-                            tracing::info!("wupi-game: all senders dropped, exiting");
+                            tracing::info!("wupi-fable: all senders dropped, exiting");
                             break;
                         }
                     }
                 }
             })
-            .expect("failed to spawn wupi-game thread");
+            .expect("failed to spawn wupi-fable thread");
 
         (
-            GameEngine {
+            FableEngine {
                 tx,
                 join: std::sync::Mutex::new(Some(join)),
             },
@@ -227,11 +227,11 @@ impl GameEngine {
     /// load-bearing concern as `SchemaEngine::shutdown`: required so the
     /// next `game_start` doesn't race the teardown.
     pub fn shutdown(&self) {
-        let _ = self.tx.send(GameMsg::Shutdown);
+        let _ = self.tx.send(FableMsg::Shutdown);
         if let Ok(mut guard) = self.join.lock() {
             if let Some(handle) = guard.take() {
                 if let Err(e) = handle.join() {
-                    tracing::warn!(error = ?e, "wupi-game thread join failed during shutdown");
+                    tracing::warn!(error = ?e, "wupi-fable thread join failed during shutdown");
                 }
             }
         }
@@ -245,16 +245,16 @@ impl GameEngine {
         prompt: String,
         on_chunk: ChunkFn,
         cancel: CancelToken,
-    ) -> anyhow::Result<mpsc::Receiver<GameReply>> {
-        let (reply_tx, reply_rx) = mpsc::channel::<GameReply>();
-        let req = GameRequest {
+    ) -> anyhow::Result<mpsc::Receiver<FableReply>> {
+        let (reply_tx, reply_rx) = mpsc::channel::<FableReply>();
+        let req = FableRequest {
             prompt,
             on_chunk,
             cancel,
             reply: reply_tx,
         };
         self.tx
-            .send(GameMsg::Request(Box::new(req)))
+            .send(FableMsg::Request(Box::new(req)))
             .map_err(|_| anyhow::anyhow!("game engine thread closed"))?;
         Ok(reply_rx)
     }
@@ -262,10 +262,10 @@ impl GameEngine {
     /// Drain any queued requests after a failed init so callers don't block
     /// forever waiting on a reply from a dead thread. Mirrors
     /// `SchemaEngine::drain_failed`.
-    fn drain_failed(rx: &mpsc::Receiver<GameMsg>, why: String) {
+    fn drain_failed(rx: &mpsc::Receiver<FableMsg>, why: String) {
         while let Ok(msg) = rx.recv_timeout(std::time::Duration::from_millis(50)) {
-            if let GameMsg::Request(req) = msg {
-                let _ = req.reply.send(GameReply {
+            if let FableMsg::Request(req) = msg {
+                let _ = req.reply.send(FableReply {
                     raw_output: String::new(),
                     error: why.clone(),
                     cancelled: false,
@@ -281,7 +281,7 @@ impl GameEngine {
     /// (the 2026-07-18 `NullResult` lesson). The `path` arg is kept for
     /// forward-compat (a future dedicated narrator model); it's only used
     /// if `shared_model()` returns `None`.
-    fn init_runtime(path: &Path, n_gpu_layers: u32) -> anyhow::Result<GameRuntime> {
+    fn init_runtime(path: &Path, n_gpu_layers: u32) -> anyhow::Result<FableRuntime> {
         let backend = shared_backend();
 
         // Prefer the shared model (the load-bearing path: avoids VRAM OOM).
@@ -305,8 +305,8 @@ impl GameEngine {
         };
 
         let ctx_params = LlamaContextParams::default()
-            .with_n_ctx(std::num::NonZeroU32::new(GAME_CTX))
-            .with_n_batch(GAME_BATCH)
+            .with_n_ctx(std::num::NonZeroU32::new(FABLE_CTX))
+            .with_n_batch(FABLE_BATCH)
             .with_embeddings(false)
             // Match the chat engine's KV quantization exactly: the narrator
             // context is the same shape as a chat context.
@@ -315,9 +315,9 @@ impl GameEngine {
         let ctx = model_ref
             .new_context(backend, ctx_params)
             .map_err(|e| anyhow::anyhow!("game context init: {e:?}"))?;
-        tracing::info!(n_ctx = GAME_CTX, "game context created (isolated)");
+        tracing::info!(n_ctx = FABLE_CTX, "game context created (isolated)");
 
-        Ok(GameRuntime { ctx, model: model_ref })
+        Ok(FableRuntime { ctx, model: model_ref })
     }
 }
 
@@ -332,12 +332,12 @@ enum GenerationOutcome {
 // Runtime (owned by the game thread; never crosses thread boundaries)
 // ---------------------------------------------------------------------------
 
-struct GameRuntime {
+struct FableRuntime {
     ctx: llama_cpp_2::context::LlamaContext<'static>,
     model: &'static LlamaModel,
 }
 
-impl GameRuntime {
+impl FableRuntime {
     /// Generate one narrator turn: tokenize → prefill → sample-and-decode,
     /// streaming chunks via `req.on_chunk`. Checks `req.cancel` between
     /// tokens (Relaxed ordering, same correctness argument as the chat
@@ -351,7 +351,7 @@ impl GameRuntime {
     /// No delta-prefill optimization for v1: each turn does a full
     /// prefill. The accepted §2F cold-reset tax on memory-injected turns
     /// applies here too. Optimize later if TTFT becomes a constraint.
-    fn generate_turn(&mut self, req: &GameRequest) -> Result<String, GenerationOutcome> {
+    fn generate_turn(&mut self, req: &FableRequest) -> Result<String, GenerationOutcome> {
         let mut tokens = self
             .model
             .str_to_token(&req.prompt, AddBos::Always)
@@ -364,7 +364,7 @@ impl GameRuntime {
         // Truncate from the front if the prompt alone exceeds context (keep
         // the system prompt's tail + recent turns + generation cue). Mirror
         // of the schema engine's guard.
-        let max_prompt = (GAME_CTX as usize).saturating_sub(GAME_MAX_TOKENS as usize);
+        let max_prompt = (FABLE_CTX as usize).saturating_sub(FABLE_MAX_TOKENS as usize);
         if tokens.len() > max_prompt {
             let drop = tokens.len() - max_prompt;
             tokens.drain(0..drop);
@@ -375,10 +375,10 @@ impl GameRuntime {
         self.ctx.clear_kv_cache();
 
         let n_prompt = tokens.len() as i32;
-        let mut batch = LlamaBatch::new(GAME_BATCH as usize, 1);
+        let mut batch = LlamaBatch::new(FABLE_BATCH as usize, 1);
         let mut consumed = 0usize;
         while consumed < tokens.len() {
-            let take = std::cmp::min(GAME_BATCH as usize, tokens.len() - consumed);
+            let take = std::cmp::min(FABLE_BATCH as usize, tokens.len() - consumed);
             let is_last_chunk = consumed + take == tokens.len();
             batch.clear();
             for (i, tok) in tokens[consumed..consumed + take].iter().enumerate() {
@@ -408,8 +408,8 @@ impl GameRuntime {
         let mut n_cur = n_prompt;
         let mut step_batch = LlamaBatch::new(1, 1);
         let mut out = String::new();
-        let max_tokens = GAME_MAX_TOKENS
-            .min((GAME_CTX as i32 - n_prompt).max(64));
+        let max_tokens = FABLE_MAX_TOKENS
+            .min((FABLE_CTX as i32 - n_prompt).max(64));
 
         // Protocol marker filter. Same marker set as the chat engine
         // (engine.rs): strips `<|turn>`, `<|channel>thought`, `<channel|>`,
@@ -517,15 +517,15 @@ mod tests {
     /// just confirms the type compiles with the right trait bounds: it
     /// doesn't construct one (that requires a real model load).
     #[test]
-    fn game_engine_traits_compile() {
+    fn fable_engine_traits_compile() {
         fn assert_send_sync<T: Send + Sync>() {}
-        assert_send_sync::<GameEngine>();
+        assert_send_sync::<FableEngine>();
     }
 
     /// The reply struct serializes (it crosses the IPC boundary as JSON).
     #[test]
     fn game_reply_serializes() {
-        let reply = GameReply {
+        let reply = FableReply {
             raw_output: "scene text".into(),
             error: String::new(),
             cancelled: false,
@@ -538,8 +538,8 @@ mod tests {
     /// Constants are sane (compile-time sanity check).
     #[test]
     fn constants_are_sane() {
-        assert!(GAME_CTX >= 2048, "game context must be generous");
-        assert!(GAME_BATCH >= 256, "batch must fit a chunk");
-        assert!(GAME_MAX_TOKENS >= 256, "max tokens must allow a meaty beat");
+        assert!(FABLE_CTX >= 2048, "game context must be generous");
+        assert!(FABLE_BATCH >= 256, "batch must fit a chunk");
+        assert!(FABLE_MAX_TOKENS >= 256, "max tokens must allow a meaty beat");
     }
 }

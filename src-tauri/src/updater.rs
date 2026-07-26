@@ -44,10 +44,19 @@
 //! 4. For each file in the extract: apply the preserve rule (above).
 //!    - For `wupi.exe`: rename the current exe to `wupi.exe.old` (Windows
 //!      permits renaming a running binary), then move the new exe into place.
-//!      `wupi.exe.old` is deleted on the next boot (see `cleanup_old_exe`).
+//!      `wupi.exe.old` is deleted on the next boot (see `cleanup_old_files`).
+//!    - For every other file: [`copy_file_robust`] copies in place on the fast
+//!      path; if the destination is locked by the Windows loader (e.g.
+//!      `msvcp140.dll` at the install root, or the `bin/` CUDA DLLs once the
+//!      model is loaded) it renames the locked file to `<name>.old` and copies
+//!      the new one into the vacated path. The `.old` remnant is swept on the
+//!      next boot alongside `wupi.exe.old`. This is what fixed the v0.6.0
+//!      updater bug where an in-place DLL copy failed with
+//!      `ERROR_SHARING_VIOLATION`, aborting the whole apply.
 //! 5. Emit `update-applied`; the frontend prompts the user to restart. On
 //!    restart, `app.restart()` relaunches the new exe and the old process
-//!    exits (the OS releases its lock, allowing `wupi.exe.old` cleanup).
+//!    exits (the OS releases its lock, allowing `wupi.exe.old` + DLL `.old`
+//!    cleanup).
 //!
 //! ## Why not auto-restart
 //!
@@ -169,28 +178,89 @@ pub async fn perform_update(
     apply_extracted(&extracted, &exe_dir)?;
 
     // ── Phase 4: cleanup staging ──────────────────────────────────────────
-    // Keep the staging dir (cheap) but drop the bulky zip + extracted tree.
-    let _ = std::fs::remove_dir_all(&extracted);
-    let _ = std::fs::remove_file(&zip_final);
+    // Remove the ENTIRE staging dir (`data/_update/`) — the zip, the
+    // extracted tree, AND the dir itself. Nothing the update left behind
+    // should persist: no extra folders, no .old files, no zip cache. The dir
+    // is recreated on the next update's Phase 1 if needed.
+    let _ = std::fs::remove_dir_all(&staging);
 
     let _ = app_handle.emit("update-applied", &update);
     Ok(())
 }
 
-/// Delete a leftover `wupi.exe.old` from a prior update. Called from `setup()`
-/// on every boot — by the time the new exe runs, the old one's lock is gone.
-/// Best-effort: a failure (file in use, perms) is logged and the file is
-/// retried next boot.
-pub fn cleanup_old_exe(app_handle: &tauri::AppHandle) {
+/// Delete EVERY remnant from a prior self-update. Called from `setup()` on
+/// every boot — by the time the new process runs, the old one's locks are
+/// gone. This is the "leave nothing behind" sweep. It clears THREE classes
+/// of leftover:
+///
+/// 1. `wupi.exe.old` — the running-exe swap dance (`swap_running_exe`).
+/// 2. Any `<name>.old` DLL remnant — `copy_file_robust` renames a locked/
+///    loaded DLL (`msvcp140.dll.old`, `cublas64_13.dll.old`, …) out of the
+///    way to copy the new one in. By boot the lock is gone, so these delete
+///    cleanly.
+/// 3. The whole `data/_update/` staging dir — if an update was interrupted
+///    (crash, power loss, killed mid-download) the staging zip + extracted
+///    tree can be left behind. `perform_update` removes it on success; this
+///    is the defensive sweep for the failure case.
+///
+/// **The contract: after this runs, there are no `.old` files, no update
+/// folders, no backups, no staging cache — only the live install.** Per spec:
+/// "completely delete everything old that the update is meant to replace."
+///
+/// Best-effort: a delete failure (file transiently in use, perms) is logged
+/// and retried next boot. Scans `exe_dir` non-recursively + `bin/` (flat) —
+/// the only two places the rename dance ever writes `.old` files.
+pub fn cleanup_old_files(app_handle: &tauri::AppHandle) {
     let Some(exe_dir) = exe_dir(app_handle) else {
         return;
     };
-    let old = exe_dir.join("wupi.exe.old");
-    if old.exists() {
-        match std::fs::remove_file(&old) {
-            Ok(()) => tracing::info!("cleaned up wupi.exe.old from prior update"),
-            Err(e) => tracing::warn!(?e, "could not remove wupi.exe.old; will retry next boot"),
+    let mut swept = 0;
+    // ── .old file sweep: exe_dir root + bin/. Non-recursive (bin/ is flat,
+    //    and the rename dance only ever touches files at these two levels).
+    let mut scan_dirs = vec![exe_dir.clone()];
+    let bin_dir = exe_dir.join("bin");
+    if bin_dir.is_dir() {
+        scan_dirs.push(bin_dir);
+    }
+    for dir in scan_dirs {
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            // Match `<anything>.old` exactly (case-insensitive on Windows).
+            let is_old = path
+                .extension()
+                .map(|ext| ext.eq_ignore_ascii_case("old"))
+                .unwrap_or(false);
+            if !is_old {
+                continue;
+            }
+            match std::fs::remove_file(&path) {
+                Ok(()) => {
+                    swept += 1;
+                    tracing::info!(?path, "cleaned up .old remnant from prior update");
+                }
+                Err(e) => tracing::warn!(?path, ?e, "could not remove .old remnant; will retry next boot"),
+            }
         }
+    }
+    // ── Staging dir sweep: data/_update/ (interrupted-update remnants).
+    //    Removed wholesale — the zip, the extracted tree, and the dir itself.
+    //    Recreated on the next update's Phase 1 if needed.
+    let staging = exe_dir.join("data").join("_update");
+    if staging.is_dir() {
+        match std::fs::remove_dir_all(&staging) {
+            Ok(()) => {
+                swept += 1;
+                tracing::info!(?staging, "removed leftover update staging dir");
+            }
+            Err(e) => tracing::warn!(?staging, ?e, "could not remove staging dir; will retry next boot"),
+        }
+    }
+    if swept > 0 {
+        tracing::info!(swept, "cleaned up remnants from prior update");
     }
 }
 
@@ -362,7 +432,10 @@ fn extract_zip(zip_path: &Path, dest: &Path) -> Result<(), String> {
 /// - `memory/`, `models/`, `apps/` are fully preserved (defensive — the zip
 ///   shouldn't ship these, but the rule is total).
 /// - `wupi.exe` is swapped via the rename-and-relaunch dance.
-/// - Everything else is overwritten in place.
+/// - Everything else is overwritten in place via [`copy_file_robust`] — which
+///   transparently handles the locked-DLL case (a loaded `msvcp140.dll` or
+///   `bin/` CUDA DLL can't be overwritten in place, so it's renamed to `.old`
+///   and the new file copied into the vacated path; swept on next boot).
 fn apply_extracted(extracted: &Path, exe_dir: &Path) -> Result<(), String> {
     let entries = walk_files(extracted)?;
     let exe_name = exe_basename();
@@ -391,7 +464,7 @@ fn apply_extracted(extracted: &Path, exe_dir: &Path) -> Result<(), String> {
         if let Some(parent) = dst.parent() {
             std::fs::create_dir_all(parent).map_err(|e| format!("mkdir parent: {e}"))?;
         }
-        std::fs::copy(&src, &dst)
+        copy_file_robust(&src, &dst)
             .map_err(|e| format!("copy {} -> {}: {e}", src.display(), dst.display()))?;
         tracing::info!(?rel, "updated");
     }
@@ -427,19 +500,114 @@ fn exe_basename() -> String {
 ///
 /// Windows locks the running exe: it can be renamed but not overwritten while
 /// the process is alive. So:
-///   1. Rename `dst` (`wupi.exe`) → `wupi.exe.old`. Windows permits this.
-///   2. Move `src` (the extracted new exe) → `dst`.
-///   3. `wupi.exe.old` is deleted on the NEXT boot by [`cleanup_old_exe`]
+///   1. If a `wupi.exe.old` from a PRIOR update still exists (the last boot's
+///      `cleanup_old_files` didn't run or failed), delete it first. This is
+///      load-bearing: without it, the `rename` below would leave a STALE
+///      `.old` that predates this update — the kind of remnant that
+///      accumulates update-over-update and never clears. A pre-existing
+///      `.old` is never the live file (it's always a leftover), so deleting
+///      it here is safe.
+///   2. Rename `dst` (`wupi.exe`) → `wupi.exe.old`. Windows permits this.
+///   3. Move `src` (the extracted new exe) → `dst`.
+///   4. `wupi.exe.old` is deleted on the NEXT boot by [`cleanup_old_files`]
 ///      (the old process still holds its lock until exit; deletion here
 ///      would fail with "file in use" and serve no purpose).
 fn swap_running_exe(src: &Path, dst: &Path) -> Result<(), String> {
     let old = dst.with_extension("exe.old");
+    // Defensive: clear any stale `.old` from a prior update before we drop a
+    // fresh one. If it's somehow still locked (shouldn't be — it's not the
+    // live exe), ignore the error; the rename below will still succeed and
+    // `cleanup_old_files` will retry on the next boot.
+    if old.exists() {
+        match std::fs::remove_file(&old) {
+            Ok(()) => tracing::info!(?old, "removed stale .old before swap"),
+            Err(e) => tracing::warn!(?old, ?e, "could not remove stale .old; continuing"),
+        }
+    }
     std::fs::rename(dst, &old)
         .map_err(|e| format!("rename {} to {}: {e}", dst.display(), old.display()))?;
     std::fs::rename(src, dst)
         .map_err(|e| format!("move new exe into place: {e}"))?;
     tracing::info!("swapped running exe; .old will be cleaned up on next boot");
     Ok(())
+}
+
+/// Copy `src` → `dst`, transparently handling the case where `dst` is locked
+/// by the Windows loader (a loaded DLL) or by another open handle.
+///
+/// **The locked-DLL problem (the v0.6.0 updater bug):** the Windows loader
+/// maps static-import DLLs (`msvcp140.dll` at the install root) and
+/// LoadLibrary'd DLLs (the `bin/` CUDA set, once the model is running) with
+/// `FILE_SHARE_READ` but **not** `FILE_SHARE_WRITE`. `std::fs::copy` opens the
+/// destination with `GENERIC_WRITE`, which the loader rejects with
+/// `ERROR_SHARING_VIOLATION` (OS error 32). The same applies to any file held
+/// open by the running process.
+///
+/// **The fix (same principle as `swap_running_exe`):** Windows permits
+/// *renaming* a locked/loaded file even when it can't be overwritten. So on a
+/// sharing/permission error we:
+///   1. Rename `dst` → `dst.with_extension("<orig>.old")` (e.g.
+///      `msvcp140.dll` → `msvcp140.dll.old`).
+///   2. Copy `src` → `dst` into the now-vacated path.
+///   3. The `.old` remnant is swept on the next boot by [`cleanup_old_files`]
+///      (by then the process holding the lock has exited).
+///
+/// Fast path: for the vast majority of files (`wupi.html`, `assets/*`,
+/// `data/wupi.sim` — none of which are locked) `std::fs::copy` succeeds and
+/// we pay zero overhead. The rename fallback only fires on the rare locked
+/// file.
+fn copy_file_robust(src: &Path, dst: &Path) -> Result<(), std::io::Error> {
+    match std::fs::copy(src, dst) {
+        Ok(_) => Ok(()),
+        Err(e) if is_sharing_violation(&e) => {
+            // Locked by the loader / an open handle. Rename it out of the way
+            // (Windows allows this even when overwrite/delete is blocked) and
+            // copy the new file into the vacated path.
+            let backup = with_old_extension(dst);
+            // If a prior .old already exists (interrupted update), remove it
+            // first — it's a remnant from a previous attempt, not the live
+            // file, so deletion is safe once the old process is gone. If it's
+            // STILL locked (shouldn't be — it's a stale remnant), fall through
+            // to the error; the next boot's cleanup will retry.
+            let _ = std::fs::remove_file(&backup);
+            std::fs::rename(dst, &backup)?;
+            std::fs::copy(src, dst)?;
+            tracing::info!(
+                dst = %dst.display(),
+                "copied locked file via rename → .old (will be swept on next boot)"
+            );
+            Ok(())
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// Heuristic: does this io::Error look like a Windows sharing violation or a
+/// permission-denied lock? `ERROR_SHARING_VIOLATION` (32) surfaces via
+/// `raw_os_error`. We also catch `PermissionDenied` because some lock
+/// scenarios surface as EACCES rather than ERROR_SHARING_VIOLATION.
+fn is_sharing_violation(e: &std::io::Error) -> bool {
+    if let Some(code) = e.raw_os_error() {
+        // 32 = ERROR_SHARING_VIOLATION (Windows). 5 = ERROR_ACCESS_DENIED.
+        if code == 32 || code == 5 {
+            return true;
+        }
+    }
+    matches!(e.kind(), std::io::ErrorKind::PermissionDenied)
+}
+
+/// Build the `.old` backup path for a locked destination. We can't use
+/// `Path::with_extension("old")` because that *replaces* the extension (so
+/// `msvcp140.dll` → `msvcp140.old`, which loses the `.dll` and confuses the
+/// cleanup sweep). Instead append `.old` to the full filename:
+/// `msvcp140.dll` → `msvcp140.dll.old`.
+fn with_old_extension(path: &Path) -> PathBuf {
+    let mut name = path
+        .file_name()
+        .map(|s| s.to_os_string())
+        .unwrap_or_default();
+    name.push(".old");
+    path.with_file_name(name)
 }
 
 /// Recursively collect all files under `root` (depth-first). Used by

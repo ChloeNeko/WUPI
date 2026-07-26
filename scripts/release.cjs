@@ -268,6 +268,19 @@ const childEnv = {
   CMAKE_BUILD_PARALLEL_LEVEL: process.env.CMAKE_BUILD_PARALLEL_LEVEL || '8',
 };
 
+// ──────────────────────────────────────────────────────────────────────────
+// CARGO_TARGET_DIR: optional redirect of the cargo build output (used during
+// the dual CUDA+Vulkan backend work to dodge a Windows MAX_PATH race in the
+// vulkan-shaders-gen ExternalProject step — see AGENTS.md §11.14). When set,
+// the built exe lands at <CARGO_TARGET_DIR>/release/wupi.exe instead of
+// src-tauri/target/release/wupi.exe. The Ninja generator's relative paths
+// also benefit from a short target root. The release script follows wherever
+// cargo actually put the exe so this env var stays opt-in.
+// ──────────────────────────────────────────────────────────────────────────
+const cargoTargetDir = process.env.CARGO_TARGET_DIR
+  ? join(process.env.CARGO_TARGET_DIR)
+  : join(repoRoot, 'src-tauri', 'target');
+
 console.log(`[release] running: npx tauri build`);
 if (dryRun) {
   console.log('[release] (dry-run) skipping actual build');
@@ -336,11 +349,14 @@ if (dryRun) {
 // updater would write `<exe_dir>/WUPI/wupi.exe` (wrong). So this flat
 // layout is load-bearing for the updater too, not just for human extracts.
 // ──────────────────────────────────────────────────────────────────────────
-const builtExe = join(repoRoot, 'src-tauri', 'target', 'release', 'wupi.exe');
+const builtExe = join(cargoTargetDir, 'release', 'wupi.exe');
 if (!existsSync(builtExe)) {
   console.error(`[release] built exe not found at: ${builtExe}`);
   console.error('[release] did the build actually succeed? bundle.active=false in tauri.conf.json');
-  console.error('           should produce target/release/wupi.exe directly.');
+  console.error(`           should produce ${join(cargoTargetDir, 'release', 'wupi.exe')} directly.`);
+  if (process.env.CARGO_TARGET_DIR) {
+    console.error('[release] CARGO_TARGET_DIR is set — exe is expected there, not under src-tauri/target.');
+  }
   process.exit(1);
 }
 const distDir = join(repoRoot, 'dist');
@@ -369,11 +385,11 @@ if (!existsSync(join(srcDataDir, 'user.xml'))) {
   process.exit(1);
 }
 
-// Stage under src-tauri/target/ (already gitignored) so the zip never shows
-// up in `git status`. A top-level target/ would NOT be ignored by the current
-// .gitignore (which only lists src-tauri/target/), so we re-use the cargo
-// target dir for symmetry + zero new gitignore surface.
-const stageRoot = join(repoRoot, 'src-tauri', 'target', 'release-portable');
+// Stage under the cargo target dir (already gitignored under src-tauri/, and
+// a top-level target/ would NOT be ignored by the current .gitignore) so the
+// zip never shows up in `git status`. Follows CARGO_TARGET_DIR if set so the
+// staging dir lives alongside the actual build output.
+const stageRoot = join(cargoTargetDir, 'release-portable');
 const stageWupiDir = join(stageRoot, 'WUPI');
 if (!rmSyncRetry(stageRoot)) {
   console.error(`[release] could not clear ${stageRoot} after retries (OS lock).`);
@@ -402,6 +418,26 @@ for (const f of readdirSync(distDir)) {
 // data/ additions (theme.json, api_config.json, docs/) are created on first
 // run and preserved across updates by the updater's preserve rule (§8C).
 cpSync(srcDataDir, join(stageWupiDir, 'data'), { recursive: true });
+
+// apps/games/cards/: starter scenario .sim files. The released exe resolves
+// apps/ relative to its own dir, so without this staging the card picker
+// ships empty. Per-card sessions/schemas/saves are user data → created on
+// first run, NOT staged here (matches the §8C preserve rule).
+const srcCardsDir = join(repoRoot, 'apps', 'games', 'cards');
+if (existsSync(srcCardsDir)) {
+  const dstCardsDir = join(stageWupiDir, 'apps', 'games', 'cards');
+  mkdirSync(dstCardsDir, { recursive: true });
+  let staged = 0;
+  for (const f of readdirSync(srcCardsDir)) {
+    if (f.toLowerCase().endsWith('.sim')) {
+      copyFileSync(join(srcCardsDir, f), join(dstCardsDir, f));
+      staged++;
+    }
+  }
+  console.log(`[release] staged ${staged} scenario card(s) from apps/games/cards/`);
+} else {
+  console.warn('[release] WARNING: apps/games/cards/ not found — zip will ship with an empty card picker.');
+}
 
 // ──────────────────────────────────────────────────────────────────────────
 // CUDA + VC++ RUNTIME DLLs → `bin/` subdirectory (v0.3.7 layout).
@@ -626,7 +662,7 @@ if (dryRun) {
 // ──────────────────────────────────────────────────────────────────────────
 const repo = 'ChloeNeko/WUPI';
 const assetUrl = `https://github.com/${repo}/releases/download/${tag}/${zipName}`;
-const notes = `WUPI ${tag} (portable)\n\nExtract anywhere and run wupi.exe. Everything stays in the folder.`;
+const notes = `WUPI Version ${newVersion}`;
 
 console.log(`[release] creating GitHub Release ${tag}…`);
 // No shell:true here — on Git Bash for Windows, shell:true glob-expands the
@@ -669,7 +705,7 @@ for (let attempt = 1; attempt <= 3; attempt++) {
   ghRelease = spawnSync('gh', [
     'release', 'create', tag,
     '--repo', repo,
-    '--title', `WUPI ${tag}`,
+    '--title', `WUPI ${newVersion}`,
     '--notes', notes,
     '--target', 'ui-shell',
     zipPath,

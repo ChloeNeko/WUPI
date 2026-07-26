@@ -31,6 +31,11 @@
 use std::collections::HashMap;
 use std::path::Path;
 
+// Pull the player-state types in at the top of schema.rs so the new
+// `player_state` field + render can reference them unqualified. Sibling
+// module (declared in lib.rs); the structs themselves are pure data.
+use crate::player_state::PlayerState;
+
 /// The persistent world-state schema. The single source of truth for the
 /// simulated world's current state, maintained by the background delta pass.
 ///
@@ -62,6 +67,15 @@ pub struct WorldSchema {
     /// `Some(v)` means "set/overwrite."
     #[serde(default)]
     pub entities: HashMap<String, String>,
+
+    /// The protagonist's canonical state (Fable Seam #7, Player State).
+    /// Rust is the SOLE authority here — the schema-delta LLM pass never
+    /// writes to it; the Referee (`player_state::referee_evaluate`) does.
+    /// Nested inside WorldSchema so per-card persistence + autosave inherit
+    /// for free (no new file, no new AppState field). `#[serde(default)]`
+    /// keeps pre-PlayerState saves loadable as a fully-healthy body.
+    #[serde(default)]
+    pub player_state: PlayerState,
 }
 
 impl WorldSchema {
@@ -115,7 +129,8 @@ impl WorldSchema {
     pub fn render_for_prompt(&self) -> String {
         let empty = self.summary.trim().is_empty()
             && self.recent_events.is_empty()
-            && self.entities.is_empty();
+            && self.entities.is_empty()
+            && self.player_state.is_default();
         if empty {
             return String::new();
         }
@@ -147,6 +162,18 @@ impl WorldSchema {
                 out.push_str(key);
                 out.push_str(": ");
                 out.push_str(&self.entities[key]);
+                out.push('\n');
+            }
+        }
+        // Player state (the Rust Referee's canonical fact block). Rendered
+        // LAST in the world-state block so it's the loudest signal — the
+        // protagonist's injuries + fatigue are the most turn-relevant facts.
+        // Returns None when fully default, so a fresh game adds zero tokens.
+        if let Some(player_block) = self.player_state.render_for_prompt() {
+            out.push_str("player_state:\n");
+            for line in player_block.lines() {
+                out.push_str("  ");
+                out.push_str(line);
                 out.push('\n');
             }
         }
@@ -227,7 +254,14 @@ impl SchemaDelta {
     pub fn from_model_output(raw: &str) -> Result<Self, serde_json::Error> {
         let reply = extract_reply_channel(raw);
         let cleaned = strip_markdown_fences(&reply).trim();
-        serde_json::from_str(cleaned)
+        // Phase 3: microsecond-cost syntactic repair BEFORE the parse. Catches
+        // the common LLM JSON mistakes (trailing commas, smart quotes, unquoted
+        // keys, bare newlines in strings, truncated closers) so a delta that
+        // would have burned a 5-8s LLM repair pass instead parses first try.
+        // Keeps the locked §5 contract intact — this is syntactic only; semantic
+        // repair (wrong keys/types) still goes through the 3-pass loop.
+        let repaired = crate::json_repair::repair(cleaned);
+        serde_json::from_str(&repaired)
     }
 
     /// True if the delta carries ANY actual change (summary, events, or entity
@@ -338,6 +372,7 @@ mod tests {
                 ("iron_sword".to_string(), "acquired".to_string()),
                 ("loc.current".to_string(), "tavern".to_string()),
             ]),
+            ..Default::default()
         };
         // Drop the sword, move locations.
         let delta = SchemaDelta {
@@ -371,6 +406,7 @@ mod tests {
             summary: String::new(),
             recent_events: vec!["entered tavern".to_string()],
             entities: HashMap::new(),
+            ..Default::default()
         };
         let delta = SchemaDelta {
             summary: None,
@@ -390,6 +426,7 @@ mod tests {
             summary: "old summary".to_string(),
             recent_events: vec![],
             entities: HashMap::new(),
+            ..Default::default()
         };
         let delta = SchemaDelta {
             summary: Some("new summary".to_string()),
@@ -406,6 +443,7 @@ mod tests {
             summary: "kept".to_string(),
             recent_events: vec!["kept".to_string()],
             entities: HashMap::from([("k".to_string(), "v".to_string())]),
+            ..Default::default()
         };
         schema.apply_delta(SchemaDelta::default());
         assert_eq!(schema.summary, "kept");
@@ -544,12 +582,40 @@ mod tests {
             summary: String::new(),
             recent_events: (0..10).map(|i| format!("event{i}")).collect(),
             entities: HashMap::new(),
+            ..Default::default()
         };
         let rendered = schema.render_for_prompt();
         // Only the last 5 events should appear.
         assert!(rendered.contains("event5"));
         assert!(rendered.contains("event9"));
         assert!(!rendered.contains("event4"));
+    }
+
+    /// Player state (Seam #7) renders as a `player_state:` block at the
+    /// tail of the world-state render — the loudest fact cluster. Default
+    /// player state adds zero tokens (no block emitted).
+    #[test]
+    fn render_for_prompt_includes_player_state_when_injured() {
+        let mut schema = WorldSchema::default();
+        schema
+            .player_state
+            .body
+            .insert(crate::player_state::BodyPart::LeftBicep, crate::player_state::BodyPartState::Orange);
+        schema.player_state.stamina = crate::player_state::Stamina::Winded;
+        let rendered = schema.render_for_prompt();
+        assert!(rendered.contains("player_state:"), "player_state block must appear");
+        assert!(rendered.contains("stamina: Winded"));
+        assert!(rendered.contains("Left Bicep (Medium Injury)"));
+    }
+
+    /// A schema with ONLY a default player state + nothing else renders to
+    /// the empty string (so a brand-new game emits no `<world_state>` block).
+    #[test]
+    fn render_for_prompt_default_player_state_emits_no_block() {
+        let schema = WorldSchema::default();
+        let rendered = schema.render_for_prompt();
+        assert_eq!(rendered, "");
+        assert!(!rendered.contains("player_state:"));
     }
 
     #[test]
@@ -561,6 +627,7 @@ mod tests {
             summary: "test summary".to_string(),
             recent_events: vec!["e1".to_string()],
             entities: HashMap::from([("k".to_string(), "v".to_string())]),
+            ..Default::default()
         };
         schema.save(&path).unwrap();
         let loaded = WorldSchema::load(&path).unwrap();

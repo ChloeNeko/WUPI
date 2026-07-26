@@ -1,6 +1,6 @@
 [package]
 name = "wupi"
-version = "0.3.7"
+version = "0.7.3"
 edition = "2021"
 
 [lib]
@@ -36,11 +36,25 @@ regex = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tracing-appender = "0.2"
-# CUDA is a hard dependency of the architecture (local GPU inference for the
-# 12B chat model). The `cuda` feature gates llama.cpp's CUDA backend; do NOT
-# remove it — CPU-only inference collapses ~32-42 tok/s to single digits.
-# See AGENTS.md §0 (stack), §2 (deps), §2B (build rules).
-llama-cpp-2 = { version = "0.1.151", features = ["sampler", "cuda"] }
+# GPU backends (local inference for the 12B chat model). Both are compiled
+# in: llama.cpp tries CUDA first (NVIDIA), falls through to Vulkan (AMD /
+# Intel) if CUDA init fails, then to CPU. This is ADDITIVE — `cuda` and
+# `vulkan` coexist in one exe. CPU-only inference collapses ~32-42 tok/s
+# to single digits, so do NOT remove either backend.
+#
+# Runtime selection (no custom code):
+#   - NVIDIA + CUDA DLLs present → CUDA path (~32-42 tok/s)
+#   - AMD / Intel → Vulkan path via driver-bundled vulkan-1.dll (~25 tok/s)
+#   - No GPU → CPU fallback
+#
+# Vulkan's runtime loader (`vulkan-1.dll`) ships with the GPU DRIVER, not
+# the app — so no Vulkan DLLs need to be staged in WUPI.zip. AMD users get
+# Vulkan from their Adrenalin driver; NVIDIA from theirs. The VULKAN_SDK
+# env var in .cargo/config.toml is only needed at BUILD time (for
+# vulkan-1.lib + glslangValidator during CMake).
+#
+# See AGENTS.md §0 (stack), §2 (deps), §11.14 (AMD support).
+llama-cpp-2 = { version = "0.1.151", features = ["sampler", "cuda", "vulkan"] }
 encoding_rs = "0.8"
 # Memory engine (Phase 2). `bundled` compiles SQLite from the amalgamation →
 # FTS5 is guaranteed available on Windows without a system SQLite install.
@@ -62,11 +76,6 @@ rand = "0.9"
 # The updater downloads a portable.zip from the GitHub release and extracts it
 # in place, skipping the `data/` dir (user state). See src/updater.rs.
 zip = "2"
-# Pseudo-terminal (ConPTY on Windows) for the in-app Terminal drawer
-# (src/terminal.rs). xterm.js in the webview is the visible surface; the real
-# cmd.exe runs headless in a ConPTY this crate provides. The cross-platform
-# API means the same module compiles for non-Windows test builds too.
-portable-pty = "0.8"
 # Windows API bindings — official Microsoft crate (Win32 + WinRT). Used for
 # the hardware integrations: Core Audio (volume + output switching), WLAN
 # (Wi-Fi scan/connect), and Bluetooth (radio + device enumeration). Feature
@@ -92,3 +101,7 @@ windows = { version = "0.58", features = [
 # Direct dep so the windows::core::interface macro can resolve windows_core
 # (the macro expands to paths through the windows_core crate root).
 windows-core = "0.58"
+
+[dev-dependencies]
+# Temp dirs for unit tests (game_save, etc.). Dev-only — not shipped in the exe.
+tempfile = "3"
