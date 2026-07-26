@@ -155,188 +155,20 @@ body.fable-active.fable-chrome-peek .top-bar { transform: translateY(0); }
     text-align: center;
 }
 
-/* --- Fog gate: the OS-level fog buildup before Fable opens --- */
-/* (see screens/fog-gate.js). Mounted at document.body (z:5000, above
-   everything including #fable at z:4000) when the user clicks the Fable
-   tile. Over 2 seconds the opacity ramps 0 → 1, slowly obscuring the
-   desktop while wind noise fades in. At 2s the gate hands the node to
-   Fable — it STAYS at document.body through boot.js's HOLD (so it remains
-   above #fable while #fable completes its 420ms opacity fade), then
-   boot.js reparents it into #fable + converts it to the two-panel parting
-   fog in one frame at Phase 2. Same visual texture as the parting panels
-   so the handoff is seamless. */
-.fable-fog-gate {
-    position: fixed;
-    inset: 0;
-    z-index: 5000;
-    pointer-events: none;
-    opacity: 0;
-    background:
-        radial-gradient(ellipse 55% 38% at 28% 30%, rgba(238, 240, 244, 0.55), transparent 70%),
-        radial-gradient(ellipse 48% 32% at 68% 58%, rgba(230, 233, 238, 0.48), transparent 65%),
-        radial-gradient(ellipse 62% 42% at 45% 18%, rgba(242, 244, 248, 0.42), transparent 75%),
-        radial-gradient(ellipse 50% 35% at 55% 78%, rgba(225, 228, 234, 0.40), transparent 70%),
-        radial-gradient(ellipse 85% 65% at 40% 50%, rgba(150, 158, 172, 0.85), transparent 85%),
-        radial-gradient(ellipse 75% 60% at 65% 45%, rgba(140, 148, 162, 0.80), transparent 80%),
-        linear-gradient(180deg, #b8bec8 0%, #a8aeb8 50%, #989ea8 100%);
-}
-/* The .building class triggers the 2s opacity ramp. Uses a CSS animation
-   (not a transition) for reliable one-shot playback. ease-in so the fog
-   thickens gradually — starts thin, fills toward the end. */
-.fable-fog-gate.building {
-    animation: fableFogBuildup 2s ease-in forwards;
-}
-@keyframes fableFogBuildup {
-    from { opacity: 0; }
-    to   { opacity: 1; }
-}
+/* --- Boot transition: the 2s-paused welcome + magical ripple --- */
+/* The cinematic open sequence (see screens/boot.js). The prior fog roll
+   (gate + parting panels + wind) was removed wholesale in the 2026-07-26
+   fog-free rework — all that remains is the ripple aura + the button
+   stagger, which spawn 2s after the click. */
 
-
-/* --- Boot transition: fog roll + cloud part + magical ripple --- */
-/* The cinematic open sequence (see screens/boot.js). Mounts INSIDE #fable
-   (never at body level — that's the bug that got the prior fog removed
-   2026-07-23). All layers are children of .fable-app so they inherit its
-   lifecycle: closeFable → cancel() removes them, a crashed open hides
-   them with the app window. */
-
-/* The fog container: a full-screen layer above the title scene (z:10).
-   pointer-events none so it never blocks the (hidden) buttons.
-   Has its OWN fog background (same texture as the panels) so there's
-   NEVER a transparent frame during the handoff conversion — when the
-   gate fog is converted in place + its panels injected, the container's
-   own background fills any gap before the panels paint. This is the
-   load-bearing black-flicker fix: without it, clearing the gate fog's
-   background left a one-frame window where #fable's dark #050810 showed
-   through. */
-.fable-boot-fog {
-    /* position:fixed + z-index:5000 are pinned INLINE by boot.js's
-       convertToPartingFog (the node stays at document.body for its whole
-       lifetime — no reparent — so it must keep the gate's viewport-fixed
-       positioning + top-of-stack z to remain above #fable during the part).
-       The position:absolute + z-index:10 here are the CSS defaults that
-       apply if the node is ever mounted directly as .fable-boot-fog
-       (without the inline override) — e.g. in tests or a future bare-mount
-       path. The inline style wins in the live boot path. */
-    position: absolute;
-    inset: 0;
-    z-index: 5000;
-    pointer-events: none;
-    /* IDENTICAL background to .fable-fog-gate (same 4 highlight puffs + 2
-       mid-body layers + base). This is the handoff-seamlessness fix: the
-       fog the user watched fill the OS (gate) becomes the fog that parts
-       (boot), so the two backgrounds MUST be pixel-identical or there's a
-       visible pop at the class swap. Keep these in sync with
-       .fable-fog-gate above + .fable-fog-panel below (all three share the
-       same texture). */
-    background:
-        radial-gradient(ellipse 55% 38% at 28% 30%, rgba(238, 240, 244, 0.55), transparent 70%),
-        radial-gradient(ellipse 48% 32% at 68% 58%, rgba(230, 233, 238, 0.48), transparent 65%),
-        radial-gradient(ellipse 62% 42% at 45% 18%, rgba(242, 244, 248, 0.42), transparent 75%),
-        radial-gradient(ellipse 50% 35% at 55% 78%, rgba(225, 228, 234, 0.40), transparent 70%),
-        radial-gradient(ellipse 85% 65% at 40% 50%, rgba(150, 158, 172, 0.85), transparent 85%),
-        radial-gradient(ellipse 75% 60% at 65% 45%, rgba(140, 148, 162, 0.80), transparent 80%),
-        linear-gradient(180deg, #b8bec8 0%, #a8aeb8 50%, #989ea8 100%);
-}
-/* CRITICAL — the stuck-fog / flicker-reveal fix. The container background
-   above is the HOLD guard: it fills any gap before the two child panels
-   paint (so the handoff conversion never shows #fable's dark base). But
-   it MUST clear the instant the part begins, because the part keyframes
-   only translate the CHILD PANELS — if the container kept its solid fog
-   background through the part, the panels would slide away leaving the
-   static container fog in place → the user stares at motionless fog and
-   then the node gets yanked at cleanup → a hard flicker reveal instead
-   of a slow part. By going transparent on .parting, only the two panels
-   carry the fog and they genuinely recede to reveal the title. This rule
-   coalesces into the same paint as the .parting class add (boot.js adds
-   .parting one reflow after the container+panels are injected), so there
-   is no intermediate frame where the container is transparent but the
-   panels haven't started moving yet. */
-.fable-boot-fog.parting {
-    background: transparent;
-}
-
-/* Two parting cloud panels. Each is 75% of the viewport wide — wider
-   than the prior 60% — so the two OPAQUE zones overlap past center.
-   That closes the "title bleeds through during the fog hold" gap: at
-   rest the center 50% is covered by BOTH panels' opaque region, fully
-   blocking the scene underneath. The mask feathers only the OUTER ~15%
-   (the edge that leaves the screen on part), so the inner overlap stays
-   fully opaque until the part begins. Background is a LIGHT cool-gray
-   fog (not the prior near-black navy) — reads as daylight mist, not a
-   dark void. Layered radial gradients give it a soft cloud-puff body. */
-.fable-fog-panel {
-    position: absolute;
-    top: 0;
-    height: 100%;
-    width: 75%;
-    background:
-        /* bright puff highlights — soft white-gray billows at varied spots */
-        radial-gradient(ellipse 55% 38% at 28% 30%, rgba(238, 240, 244, 0.55), transparent 70%),
-        radial-gradient(ellipse 48% 32% at 68% 58%, rgba(230, 233, 238, 0.48), transparent 65%),
-        radial-gradient(ellipse 62% 42% at 45% 18%, rgba(242, 244, 248, 0.42), transparent 75%),
-        radial-gradient(ellipse 50% 35% at 55% 78%, rgba(225, 228, 234, 0.40), transparent 70%),
-        /* mid fog body — light blue-gray, the mist tone */
-        radial-gradient(ellipse 85% 65% at 40% 50%, rgba(150, 158, 172, 0.85), transparent 85%),
-        radial-gradient(ellipse 75% 60% at 65% 45%, rgba(140, 148, 162, 0.80), transparent 80%),
-        /* base — a soft daylight fog floor (NOT near-black) */
-        linear-gradient(180deg, #b8bec8 0%, #a8aeb8 50%, #989ea8 100%);
-    will-change: transform, opacity;
-}
-.fable-fog-panel.left {
-    left: 0;
-    /* Feather ONLY the outer (right) edge — the inner 80% stays fully
-       opaque so the center overlap with .right is solid fog, no bleed.
-       The 15% feather on the leaving edge keeps the part soft. */
-    -webkit-mask-image: linear-gradient(to right, #000 0%, #000 80%, transparent 100%);
-            mask-image: linear-gradient(to right, #000 0%, #000 80%, transparent 100%);
-}
-.fable-fog-panel.right {
-    right: 0;
-    -webkit-mask-image: linear-gradient(to left, #000 0%, #000 80%, transparent 100%);
-            mask-image: linear-gradient(to left, #000 0%, #000 80%, transparent 100%);
-}
-/* Parting state: a CSS @keyframes ANIMATION (not a transition). The prior
-   transition approach silently no-op'd in WebView2 — getComputedStyle
-   showed the transform frozen at translateX(0) for ~2.7s of a 3s window,
-   then the panel jumped off-screen at the very end. Animations are more
-   robust for one-shot motion: they start on the next frame after the
-   class is applied and tick reliably on the compositor.
-
-   PART MOTION IS BACK-LOADED (Chloe 2026-07-25). The prior linear
-   translateX(0→100%) across the whole part meant the two 75%-wide panels
-   lost their center overlap around 50% of the animation → a gap opened
-   in the MIDDLE of the screen revealing the title before the wind died.
-   Chloe wants the title revealed only as the wind fades. Fix: hold the
-   panels near their rest position for the first ~70% (the gap stays
-   closed, screen fully fog-covered), then accelerate the part in the last
-   30% so the reveal happens fast at the very end — coupled to the wind's
-   250ms fade (WIND_STOP_MS = HOLD + PART_DURATION - 150). The cubic-bezier
-   ease already front-loads deceleration; the explicit 70% keyframe pins
-   the position so the slow start is guaranteed rather than relying on the
-   curve alone. Duration is 5.5s (slowed progressively per Chloe's "part
-   slower" asks) — MUST stay in sync with PART_DURATION_MS in boot.js.
-   forwards keeps the end state (off-screen + invisible) until cleanup. */
-.fable-boot-fog.parting .left  { animation: fableFogPartLeft  5.5s cubic-bezier(0.22, 0.61, 0.36, 1) forwards; }
-.fable-boot-fog.parting .right { animation: fableFogPartRight 5.5s cubic-bezier(0.22, 0.61, 0.36, 1) forwards; }
-@keyframes fableFogPartLeft {
-    0%   { transform: translateX(0);     opacity: 1; }
-    70%  { transform: translateX(-12%);  opacity: 1; }
-    100% { transform: translateX(-100%); opacity: 0; }
-}
-@keyframes fableFogPartRight {
-    0%   { transform: translateX(0);    opacity: 1; }
-    70%  { transform: translateX(12%);  opacity: 1; }
-    100% { transform: translateX(100%); opacity: 0; }
-}
-
-/* --- Magical ripple aura (Phase 3) --- */
+/* --- Magical ripple aura --- */
 /* A MULTI-ELEMENT burst, not a single expanding circle. Spawned by JS at
-   the Continue button's center. Stack (all absolute, centered on the
+   the Quick Play button's center. Stack (all absolute, centered on the
    anchor point):
      .fable-ripple-bloom  — central radial-gradient flash, swells + fades
      .fable-ripple-ring   — 3 concentric rings, staggered start/scale
      .fable-ripple-spark  — 8 radiating sparkles on a ring, flung outward
-   z:50 so it sits above any residual parting fog. pointer-events none. */
+   pointer-events none. */
 .fable-ripple-aura {
     position: absolute;
     width: 0;
@@ -1908,13 +1740,11 @@ body.fable-active.fable-chrome-peek .top-bar { transform: translateY(0); }
     /* (The .fable-stage::after torchlight flicker was removed 2026-07-26 with
        the background overhaul — no overlay to gate here anymore. The static
        charcoal gradients on .fable-stage have no animation to suppress.) */
-    /* Boot transition: no fog, no ripple aura animations, no panel
-       transitions. The JS timeline (boot.js) also short-circuits on
-       reduced-motion so fog is never mounted + SFX never play; these
-       rules are the CSS belt-and-suspenders for any stray state. Force
-       buttons visible so a reduced-motion user never sees an invisible
-       menu. */
-    .fable-boot-fog, .fable-fog-panel,
+    /* Boot transition: no ripple aura animations. The JS timeline (boot.js)
+       also short-circuits on reduced-motion so the ripple SFX never plays +
+       buttons are force-revealed; these rules are the CSS belt-and-suspenders
+       for any stray state. Force buttons visible so a reduced-motion user
+       never sees an invisible menu. */
     .fable-ripple-aura, .fable-ripple-bloom,
     .fable-ripple-ring, .fable-ripple-spark {
         transition: none !important;
@@ -1929,12 +1759,12 @@ body.fable-active.fable-chrome-peek .top-bar { transform: translateY(0); }
 
 /* --- Magical transition overlay (New Game / Quick Play → stage) ------- */
 /* A full-screen opaque-black layer mounted on document.body (above #fable
-   z:4000 + the boot fog z:5000). Starts transparent; the .dimming class
-   transitions opacity 0→1 over 2s (title → black), then .clearing
-   transitions 1→0 over 2s (black → new scene). The scene swap happens at
-   peak darkness (opacity:1) so it's invisible. Self-cleaned by transition.js
-   on completion. pointer-events:none so it never blocks the underlying UI
-   even mid-transition (the dim is visual only). */
+   z:4000). Starts transparent; the .dimming class transitions opacity
+   0→1 over 2s (title → black), then .clearing transitions 1→0 over 2s
+   (black → new scene). The scene swap happens at peak darkness (opacity:1)
+   so it's invisible. Self-cleaned by transition.js on completion.
+   pointer-events:none so it never blocks the underlying UI even
+   mid-transition (the dim is visual only). */
 .fable-magical-overlay {
     position: fixed;
     inset: 0;

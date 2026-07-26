@@ -457,8 +457,10 @@
             </div>
             <!-- Games → Fable. Clicking launches the Fable app via
                  openWindow('fable'), which the openHook (registered by
-                 initFable in script.js) redirects to launchFable() → the
-                 2s fog-gate buildup → AppLifecycle.launchApp('fable').
+                 initFable in script.js) redirects to launchFable() →
+                 AppLifecycle.launchApp('fable'). The 2s paused welcome
+                 (music + ripple + button reveal) runs inside boot.js once
+                 the app is open.
                  Phase 2 wiring (2026-07-26): the full-screen immersion
                  shell + Simulation Narrative Engine are live; this tile
                  was the last inert gate. -->

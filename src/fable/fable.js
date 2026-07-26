@@ -37,7 +37,6 @@ import {
   startThemeMusic, stopThemeMusic, pauseThemeMusic, resumeThemeMusic,
 } from './screens/reveal.js';
 import { playBootTransition } from './screens/boot.js';
-import { openFogGate } from './screens/fog-gate.js';
 import { pauseFX, resumeFX } from './fx/effects.js';
 import { detachParallax, attachParallax } from './fx/atmosphere.js';
 import { activateChrome, deactivateChrome } from './engine/chrome.js';
@@ -146,23 +145,13 @@ async function enterStageMagically() {
       fresh: true,
     });
     engineStarted = true;
-    if (result && result.meta) {
-      // The card's opening scene is surfaced as `opening_scene_preview` on
-      // FableCardMeta, but fable_start returns FableLoadResult (meta + the
-      // resumed messages). The opening-scene preview isn't on SaveMeta, so we
-      // surface it via a one-off field if the backend ever adds it; for now
-      // we read it from the card-authoring seam below.
+    // The card's FULL opening scene comes back on FableLoadResult.opening_scene
+    // (untruncated — the per-card `opening_scene_preview` on FableCardMeta is
+    // capped at 240 chars and is only for the launcher picker). This is what
+    // renders as the first narrator beat on a fresh game.
+    if (result && result.opening_scene) {
+      openingScene = result.opening_scene;
     }
-    // Pull the opening scene preview from the card list (cheap: one IPC,
-    // returns the first ~240 chars of the card's <opening_scene>). This is
-    // what renders as the first narrator beat on a fresh game.
-    try {
-      const cards = await invoke('fable_cards_list');
-      const card = (cards || []).find((c) => c.id === STARTER_CARD_ID);
-      if (card && card.opening_scene_preview) {
-        openingScene = card.opening_scene_preview;
-      }
-    } catch (_) {}
     if (result && Array.isArray(result.messages) && result.messages.length) {
       loadMessages = result.messages;
     }
@@ -255,32 +244,19 @@ async function returnToTitle() {
 // alt-tab focus loss/return, onClose on EXIT.
 
 // onOpen: show the app, hand the screen to Fable, ignite the title, run
-// the cinematic boot transition (cloud part → ripple + button stagger).
+// the boot transition (2s paused welcome → ripple + button stagger).
 //
-// THE FOG GATE HANDOFF:
-// The user clicks the Fable tile → fogGate builds up fog over 2s in the OS
-// layer (over the desktop) while wind noise fades in. At 2s the gate calls
-// back, Fable opens underneath, and the gate's fog node is handed to boot.js
-// — which leaves it AT document.body for the HOLD period (so it stays above
-// #fable while #fable fades in), then reparents + converts + parts it in one
-// frame at Phase 2. See screens/boot.js for the flicker-fix rationale.
-//
-// openFable receives { fogNode, wind } from the gate (or null/null on a
-// bare launch with no gate, e.g. dev shortcuts). The fog node is passed
-// THROUGH to boot.js untouched — we do NOT adopt it into #fable here. The
-// prior version did, and that reparent-then-convert-later split was the
-// source of the handoff flicker.
+// NO FOG GATE (removed 2026-07-26): the prior design ran a 2s OS-layer
+// fog buildup + wind noise over the desktop before opening Fable, then a
+// 5.5s cloud-part handoff. That's all gone — Fable now opens immediately
+// on click. The boot transition is responsible for the deliberate 2s
+// pause (buttons hidden, title art visible) before the music + ripple +
+// button reveal. See screens/boot.js for the timeline.
 function openFable() {
   if (!fableRoot) return;
-  // Pull the fog handoff from launchFable's stash (set by the fog gate's
-  // onReady callback). Cleared after consumption so a bare launchApp (no
-  // gate) runs with nulls — boot.js handles that gracefully.
-  const handoff = pendingFogHandoff;
-  pendingFogHandoff = null;
-  const fogNode = handoff ? handoff.fogNode : null;
-  const wind = handoff ? handoff.wind : null;
   // Hide the title buttons BEFORE the screen shows so they never flash
-  // visible for one frame before the boot transition hides them.
+  // visible for one frame before the boot transition hides them. They stay
+  // hidden through boot's REVEAL_DELAY pause.
   if (screens.title) {
     screens.title.querySelectorAll('.fable-title-btn').forEach((b) => {
       b.classList.add('fable-title-btn--hidden');
@@ -291,13 +267,6 @@ function openFable() {
   activateChrome();
   if (hooks.pauseAurora) hooks.pauseAurora();
   showScreen('title');
-
-  // NOTE: the fog node is intentionally NOT adopted into #fable here. It
-  // stays at document.body (z:5000, above #fable's z:4000) so it continues
-  // to visually obscure the screen while #fable completes its 420ms opacity
-  // transition underneath. boot.js reparents it into #fable at Phase 2
-  // (after HOLD) in the same tick it converts + parts it — see boot.js's
-  // convertToPartingFog for the flicker-fix rationale.
 
   // The ripple aura anchors on the Quick Play button; buttons reveal in
   // order: Quick Play → New Game → Load → Continue → Exit.
@@ -315,26 +284,19 @@ function openFable() {
     rippleAnchorBtn: q('quickplay'),
     allButtons,
     revealOrder,
-    fogNode,
-    wind,
   });
 }
 
 // PUBLIC: the entry point the OS calls when the user clicks the Fable tile.
-// Opens the fog gate (2s buildup over the desktop + wind fade-in), then on
-// ready launches Fable through the lifecycle manager (which fires onOpen =
-// openFable) with the fog handoff. This is what script.js wires the home
-// tile + dock click to (replacing the direct openWindow('fable')).
+// Launches Fable directly through the lifecycle manager (which fires
+// onOpen = openFable). This is what script.js wires the home tile + dock
+// click to (replacing the direct openWindow('fable')).
 //
-// The fog node + wind are stashed module-level so openFable (called by the
-// lifecycle manager's launchApp → onOpen) can pick them up. This indirection
-// is necessary because launchApp calls onOpen with no args.
-let pendingFogHandoff = null;
+// No fog gate anymore (removed 2026-07-26): the prior version ran a 2s
+// OS-layer fog buildup + wind before calling launchApp. Now we launch
+// immediately; the boot transition owns the 2s paused-welcome beat.
 export function launchFable() {
-  openFogGate((fogNode, wind) => {
-    pendingFogHandoff = { fogNode, wind };
-    AppLifecycle.launchApp('fable');
-  });
+  AppLifecycle.launchApp('fable');
 }
 
 // onPause: the resource-freeze layer (alt-tab / focus-loss). Freezes the
@@ -385,10 +347,10 @@ function closeFable() {
   // (Boundary audit gap #2, 2026-07-23.)
   try {
     // Cancel the boot transition FIRST. If the user clicks EXIT during the
-    // ~3.4s cinematic (e.g. mid-fog at t=1s), this stops the whoosh/ripple
-    // SFX, removes the fog + ripple nodes, and force-reveals the title
-    // buttons — so the next open isn't stranded with invisible buttons or
-    // a duplicate fog layer from a half-finished prior transition.
+    // ~4s welcome (e.g. mid-pause at t=1s), this stops the ripple SFX,
+    // removes the aura node, and force-reveals the title buttons — so the
+    // next open isn't stranded with invisible buttons or a leftover aura
+    // from a half-finished prior transition.
     if (currentBoot) { try { currentBoot.cancel(); } catch (_) {} currentBoot = null; }
     teardownStage();
     // Stop the title ambient canvas systems (motes + grass) so their RAF +
@@ -471,12 +433,11 @@ export function initFable(extHooks = {}) {
     onResume: resumeFable,
   });
 
-  // Bridge the OS window system to the fog-gate launch. The home-grid
-  // Fable tile + the dev #fable shortcut call openWindow('fable'), which
-  // fires the openHook. We redirect it to launchFable() — which runs the
-  // 2s fog-gate buildup over the desktop FIRST, then calls
-  // AppLifecycle.launchApp('fable') → onOpen=openFable with the fog handoff.
-  // This is the load-bearing "2 second delay before launching" gate.
+  // Bridge the OS window system to launchFable. The home-grid Fable tile +
+  // the dev #fable shortcut call openWindow('fable'), which fires the
+  // openHook. We redirect it to launchFable() → AppLifecycle.launchApp
+  // → onOpen=openFable → boot transition (the 2s paused welcome lives in
+  // boot.js now, not in a pre-launch fog gate).
   if (hooks.openHooks) hooks.openHooks.set('fable', () => launchFable());
   if (hooks.closeHooks) {
     hooks.closeHooks.set('fable', () => {
