@@ -5,20 +5,22 @@
 // status (e.g. "explored", "current", "locked").
 // =============================================================
 
-// Atlas PNG imports removed in the Phase 0a asset wipe (decision 12). The
-// spatial/map subsystem is Phase 5/6 deferred, so the map panel renders with
-// a placeholder atlas ('' = empty img) until map assets are re-sourced. The
-// theme still routes through setMapTheme (called from stage.js wireStage) so
-// re-adding per-theme atlases later is a one-line restore per branch; today
-// every theme resolves to '' (empty img, no crash).
-let atlas = ''; // overridable via setTheme on game start; '' while deferred
+// Atlas PNG per theme. Restored from v0.6.5 (the Phase 0a asset wipe had
+// stubbed these to ''). The 3 atlas PNGs ship in public/ and are picked by
+// the card's tone via mapThemeForTone() in stage.js → setMapTheme(theme).
+// Relative URLs resolve under Tauri's custom protocol (base: "./").
+const ATLASES = {
+  fantasy: './map-fantasy-atlas.png',
+  futuristic: './map-futuristic-atlas.png',
+  modern: './map-modern-atlas.png',
+};
+let atlas = ATLASES.fantasy; // default; overridable via setMapTheme on game start
 
 export function setMapTheme(theme) {
-  // The per-theme atlas PNGs (fantasyAtlas / futuristicAtlas / modernAtlas)
-  // were deleted in the Phase 0a asset wipe. Every theme resolves to '' until
-  // map assets are re-sourced. Keeping the signature so stage.js + future
-  // asset restoration don't need changes.
-  atlas = '';
+  // Resolve the theme string to one of the 3 known atlases. Unknown themes
+  // fall back to fantasy (the most common card tone). Empty/null stays at
+  // the current atlas (defensive — stage.js always passes a real theme).
+  if (theme && ATLASES[theme]) atlas = ATLASES[theme];
 }
 
 function esc(s) {

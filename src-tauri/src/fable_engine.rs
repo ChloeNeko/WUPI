@@ -13,10 +13,12 @@
 //! are different personas with different system prompts and different KV
 //! state. A fourth isolated `LlamaContext` on the same leaked model
 //! accomplishes this. Mirrors the schema engine pattern (§2J) and the
-//! embedder pattern (§3B). Four contexts now coexist:
-//! **chat (4000) + embedder (512) + schema (2048) + game (4000)**: all
-//! sharing one leaked `&'static LlamaModel` + one `shared_backend()`.
-//! Total VRAM ~10GB → ~2GB headroom on 12GB (verified by design doc §3.1).
+//! embedder pattern (§3B). Under the v0.6.4 VRAM swap-lock (§2B), only ONE
+//! of {chat, schema, fable} is resident at a time; the embedder is exempt.
+//! **chat (4000) + embedder (512) + schema (2048) + game (3072)** share one
+//! leaked `&'static LlamaModel` + one `shared_backend()`. Weights (~9.8 GB)
+//! + embedder (~36 MB) + one resident context (~75-150 MB Q8_0 KV) ≈ ~10 GB
+//! → ~2 GB headroom on 12 GB (game context cut 4000 → 3072 on 2026-07-26).
 //!
 //! # Streaming, not one-shot
 //!
@@ -47,10 +49,15 @@ use llama_cpp_2::token::LlamaToken;
 
 use crate::llm::{shared_backend, shared_model, CancelToken, ChunkFn};
 
-/// The game context's token budget. Matches the chat context (4000): the
-/// narrator's turns are the same shape as chat turns (system + history + new
-/// turn) and need the same headroom for long roleplay exchanges.
-const FABLE_CTX: u32 = 4000;
+/// The game context's token budget. Cut from 4000 → 3072 (2026-07-26) to free
+/// VRAM headroom on 12 GB GPUs: the Q8_0 KV cache for a 12B at n_ctx=3072 is
+/// ~25% smaller than at 4000 (~300-400 MiB saved). The budget comfortably fits
+/// the narrator system prompt (~1000 tok) + the 4-beat local window (~800 tok)
+/// + the 1024-token generation reserve = ~2824, under 3072 with headroom. The
+/// API path uses a wider 16-message window (the cloud model has the budget).
+/// The front-truncation guard below protects against overflow on the rare turn
+/// where the prompt exceeds `FABLE_CTX - FABLE_MAX_TOKENS`.
+const FABLE_CTX: u32 = 3072;
 const FABLE_BATCH: u32 = 512;
 /// Cap on generated tokens for a single narrator turn. 1024 is generous for
 /// a narrative beat (2-4 paragraphs); the narrator system prompt tells the
@@ -411,11 +418,16 @@ impl FableRuntime {
         let max_tokens = FABLE_MAX_TOKENS
             .min((FABLE_CTX as i32 - n_prompt).max(64));
 
-        // Protocol marker filter. Same marker set as the chat engine
-        // (engine.rs): strips `<|turn>`, `<|channel>thought`, `<channel|>`,
-        // `<audio|>`, and the tool markers so they never stream to the UI.
-        // Without this the narrator would flicker `<|channel>thought\n...`
-        // live during generation (only stripped post-hoc in lib.rs).
+        // Protocol marker filter + bracket-command stripper. Same literal
+        // marker set as the chat engine (engine.rs): strips `<|turn>`,
+        // `<|channel>thought`, `<channel|>`, `<audio|>`, and the tool markers
+        // so they never stream to the UI. PLUS `.with_brackets()` enables
+        // stripping of the narrator's bracket commands (`[OBJECT...]`,
+        // `[CHARACTER_TURN:...]`, `[FX...]`) during streaming, so they don't
+        // render as raw text in the live UI feed (the 2026-07-26 leakage fix).
+        // The bracket parser in lib.rs reads `raw_output` (captured on this
+        // thread, never filtered), so stripping here doesn't break scene_event
+        // extraction — the two paths are independent.
         let mut marker_filter = crate::stream_filter::StreamFilter::new(&[
             "<|turn>",
             "<turn|>",
@@ -429,7 +441,8 @@ impl FableRuntime {
             "<tool_response|>",
             "<|tool>",
             "<tool|>",
-        ]);
+        ])
+        .with_brackets();
 
         for _ in 0..max_tokens {
             // Cancellation check at the TOP of the loop (between tokens,
@@ -538,7 +551,7 @@ mod tests {
     /// Constants are sane (compile-time sanity check).
     #[test]
     fn constants_are_sane() {
-        assert!(FABLE_CTX >= 2048, "game context must be generous");
+        assert!(FABLE_CTX >= 3072, "game context must fit system + 4-beat window + gen reserve");
         assert!(FABLE_BATCH >= 256, "batch must fit a chunk");
         assert!(FABLE_MAX_TOKENS >= 256, "max tokens must allow a meaty beat");
     }

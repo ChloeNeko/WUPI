@@ -55,11 +55,15 @@ conversation disagree, the live conversation always wins.";
 ///   immediately (hot-reload). Byte-identical across turns until edited → does
 ///   NOT trigger the §2F cold-reset guard (same cache-friendliness as the
 ///   persona).
-/// - `<current_context>`: the live `WupiSettings` readout.
+/// - `<current_context>`: the live `WupiSettings` readout (context_size
+///   overridden by `effective_ctx` so the model sees the ACTUAL resident
+///   context, not the user's setting — under API the local agent runs at
+///   1024, so reporting 4000 would lie and encourage over-emission).
 pub fn build_system_content(
     settings: &WupiSettings,
     persona: Option<&str>,
     user_profile: Option<&str>,
+    effective_ctx: u32,
 ) -> String {
     let mut sections = Vec::new();
 
@@ -78,7 +82,7 @@ pub fn build_system_content(
 
     sections.push(format!(
         "<current_context>\ncontext_size: {}\nconversation_budget: {}\n</current_context>",
-        settings.context_size, settings.conversation_budget
+        effective_ctx, settings.conversation_budget
     ));
 
     // Note (2026-07-13, §2F eager-prefill design): the retrieved-memory block
@@ -117,7 +121,7 @@ mod tests {
             conversation_budget: 8192,
         };
 
-        let content = build_system_content(&settings, None, None);
+        let content = build_system_content(&settings, None, None, 2048);
         assert!(content.contains("<os_directives>"));
         assert!(content.contains("context_size: 2048"));
         assert!(content.contains("conversation_budget: 8192"));
@@ -128,18 +132,18 @@ mod tests {
         let settings = WupiSettings::default();
 
         // No persona → no <persona> section.
-        let without = build_system_content(&settings, None, None);
+        let without = build_system_content(&settings, None, None, 4000);
         assert!(!without.contains("<persona>"));
 
         // With persona → section present.
-        let with = build_system_content(&settings, Some("<persona>\nWupi\n</persona>"), None);
+        let with = build_system_content(&settings, Some("<persona>\nWupi\n</persona>"), None, 4000);
         assert!(with.contains("<persona>"));
     }
 
     #[test]
     fn empty_persona_is_suppressed() {
         let settings = WupiSettings::default();
-        let content = build_system_content(&settings, Some("   "), None);
+        let content = build_system_content(&settings, Some("   "), None, 4000);
         assert!(!content.contains("<persona>"));
     }
 
@@ -152,11 +156,11 @@ mod tests {
         // the closing tag only ever exists in a rendered section.
         let settings = WupiSettings::default();
 
-        let without = build_system_content(&settings, None, None);
+        let without = build_system_content(&settings, None, None, 4000);
         assert!(!without.contains("</user_profile>"));
 
         let profile = "<user_profile>\nname: Operator\n</user_profile>";
-        let with = build_system_content(&settings, None, Some(profile));
+        let with = build_system_content(&settings, None, Some(profile), 4000);
         // The closing tag must be PRESENT when a profile is passed (the
         // opening-tag name also appears in OS_DIRECTIVES, so we discriminate
         // on the closing tag like the None-branch above). The prior `!` here
@@ -168,7 +172,7 @@ mod tests {
 
         // Ordering: when both persona + profile are present, persona comes first.
         let persona = "<persona>\nname: Wupi\n</persona>";
-        let both = build_system_content(&settings, Some(persona), Some(profile));
+        let both = build_system_content(&settings, Some(persona), Some(profile), 4000);
         let persona_pos = both.find("</persona>").unwrap();
         let profile_pos = both.find("</user_profile>").unwrap();
         let ctx_pos = both.find("<current_context>").unwrap();
@@ -179,8 +183,26 @@ mod tests {
     #[test]
     fn empty_user_profile_is_suppressed() {
         let settings = WupiSettings::default();
-        let content = build_system_content(&settings, None, Some("   "));
+        let content = build_system_content(&settings, None, Some("   "), 4000);
         // Closing tag only appears in a rendered section (see note above).
         assert!(!content.contains("</user_profile>"));
+    }
+
+    #[test]
+    fn effective_ctx_overrides_reported_context_size() {
+        // v0.7: the system prompt reports effective_ctx, NOT settings.context_size.
+        // Under API the local chat agent runs at 2048 even if settings.context_size
+        // is 4000 — the model must see the truth so it doesn't over-emit.
+        let settings = WupiSettings {
+            context_size: 4000,
+            conversation_budget: 16000,
+        };
+        let content = build_system_content(&settings, None, None, 2048);
+        assert!(content.contains("context_size: 2048"));
+        assert!(
+            !content.contains("context_size: 4000"),
+            "settings.context_size must NOT leak when effective_ctx differs"
+        );
+        assert!(content.contains("conversation_budget: 16000"));
     }
 }

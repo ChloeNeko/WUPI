@@ -46,6 +46,15 @@ pub struct ApiProfile {
     /// so the profile is the natural home for API-only sampling overrides.
     #[serde(default)]
     pub temperature: Option<f32>,
+    /// Optional per-profile max context window (in tokens) for the API model.
+    /// `None` falls back to the v0.7 default of 8192. Consumed by
+    /// `HttpBackend::stream` as a soft budget: when the assembled message
+    /// payload (system + history) exceeds it, oldest non-system messages are
+    /// truncated from the front to stay under the wall. Same `Option<T>` +
+    /// `#[serde(default)]` shape as `temperature`, so old `api_config.json`
+    /// files load with `None` (no migration needed).
+    #[serde(default)]
+    pub max_context: Option<u32>,
 }
 
 /// The active chat source. Persisted in `api_config.json` so the user's last
@@ -213,6 +222,7 @@ mod tests {
             model: "glm-4.6".into(),
             api_key: "k1".into(),
             temperature: None,
+            max_context: None,
         };
         assert_eq!(c.upsert(p1.clone()), 0);
         assert_eq!(c.profiles.len(), 1);
@@ -232,6 +242,7 @@ mod tests {
             model: "gpt-4o-mini".into(),
             api_key: "k3".into(),
             temperature: Some(0.7),
+            max_context: None,
         };
         assert_eq!(c.upsert(p2), 1);
         assert_eq!(c.profiles.len(), 2);
@@ -247,6 +258,7 @@ mod tests {
             model: "m".into(),
             api_key: "k".into(),
             temperature: None,
+            max_context: None,
         });
         c.active_profile_id = Some("zai".into());
         assert!(c.remove("zai"));
@@ -264,6 +276,7 @@ mod tests {
             model: "m".into(),
             api_key: "k".into(),
             temperature: None,
+            max_context: None,
         });
         c.upsert(ApiProfile {
             id: "b".into(),
@@ -272,6 +285,7 @@ mod tests {
             model: "m".into(),
             api_key: "k".into(),
             temperature: None,
+            max_context: None,
         });
         c.active_profile_id = Some("a".into());
         assert!(c.remove("b"));
@@ -288,6 +302,7 @@ mod tests {
             model: "m".into(),
             api_key: "k".into(),
             temperature: None,
+            max_context: None,
         });
         c.active_profile_id = Some("zai".into());
         assert_eq!(c.active_profile().map(|p| p.name.as_str()), Some("Z.AI"));
@@ -331,6 +346,7 @@ mod tests {
             model: "glm-4.6".into(),
             api_key: "secret".into(),
             temperature: Some(0.8),
+            max_context: None,
         });
         c.active_profile_id = Some("zai".into());
         c.model_source = ModelSource::Api;

@@ -54,11 +54,20 @@ function esc(s) {
     .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }
 
-// tone keyword → starter background. Pure. Returns '' while background
-// assets are deferred (Phase 0a wipe; decision 4). The keyword matching is
-// kept so re-adding backgrounds later is a one-line restore per tone.
+// tone keyword → starter background. Returns a relative URL into the Vite
+// public/ tree (./starting-*.png). The 6 art assets ship in public/ and are
+// picked by matching keywords in the card's tone/setting string. Default
+// fallback is the rainy-cafe art (covers tavern/frontier/gothic/dark moods,
+// which the starter rusty_tavern card triggers). Restored from v0.6.5.
 function pickBgForTone(tone = '') {
-  return '';
+  const t = tone.toLowerCase();
+  if (/rain|storm|tavern|frontier|gothic|dark|inn/.test(t)) return './starting-rainy-cafe.png';
+  if (/fantasy|guild|magic|moonlit/.test(t)) return './starting-moonlit-guild-hall.png';
+  if (/airship|sky|steampunk|dock/.test(t)) return './starting-frontier-airship-dock.png';
+  if (/school|academy|classroom|modern/.test(t)) return './starting-classroom-modern.png';
+  if (/apartment|home|domestic|slice.?of.?life/.test(t)) return './starting-apartment-studio.png';
+  if (/cyber|neon|futur|transit|sci/.test(t)) return './starting-neon-transit-platform.png';
+  return './starting-rainy-cafe.png';
 }
 
 // tone keyword → map atlas theme. Pure.

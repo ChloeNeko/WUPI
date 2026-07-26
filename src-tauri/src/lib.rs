@@ -1481,10 +1481,16 @@ async fn boot_load_model(app: tauri::AppHandle, state: tauri::State<'_, AppState
 
     let app_handle = app.clone();
     // context_size fixes the persistent context's n_ctx for the session.
-    // Changing it requires re-spawning the engine (a future P concern).
+    // v0.7: the size is source-dependent. Read model_source FIRST so the chat
+    // backend is born at the correct size — under API it's 2048 (silent-agent
+    // mode); under Local-only it's the user's tuned settings.context_size
+    // (4000). This avoids a wasteful re-spawn right after boot when an API
+    // profile was active at last shutdown (the restore branch below only
+    // flips the flag now — no re-spawn needed).
     let context_size = {
+        let source = *state.model_source.lock().expect("model_source mutex");
         let s = state.settings.lock().expect("settings mutex");
-        s.context_size
+        effective_local_ctx(source, &s)
     };
     let backend = llm::LlamaCppBackend::spawn_load(path.clone(), 99, context_size, Box::new(move |result| {
         match &result {
@@ -1494,110 +1500,88 @@ async fn boot_load_model(app: tauri::AppHandle, state: tauri::State<'_, AppState
                     serde_json::json!({ "status": "ready", "model": name }),
                 );
 
-                // The schema engine loads its OWN model now (no
-                // shared_model() coupling). In Local mode it reuses
-                // the same WUPI.gguf path the chat engine just
-                // loaded. Spawned here (after chat model ready) so
-                // the two loads don't compete for VRAM during boot;
-                // runs on the loader thread, blocking recv is fine.
+                // v0.6.4 VRAM swap-lock: the schema engine is NO LONGER
+                // eager-spawned at boot. Spawning it here would create a
+                // second resident WUPI.gguf context (chat + schema) BEFORE
+                // any ContextSwap lease is taken — defeating the swap-lock
+                // (the lease has no teardown registered for the eager
+                // context, so it can't evict it on a cross-role acquire).
+                // This was the root cause of the residual OOM window found
+                // 2026-07-26 in pre-launch stress testing: a game started
+                // right after boot hit chat+schema+fable co-resident the
+                // instant fable_send allocated its context.
+                //
+                // The schema engine is now spawned LAZILY on the first
+                // schema request (delta fire after a chat turn, or a
+                // game-manager translation) via `acquire_schema_engine`,
+                // which takes the ContextRole::Schema lease FIRST and
+                // registers its teardown — so cross-role eviction can
+                // actually free it. `spawn_load` uses `shared_model()`
+                // (populated by the chat load just above), so the lazy
+                // spawn works whenever it's first called.
+                //
+                // The API-restore logic below does NOT depend on the
+                // schema engine (it only flips model_source so chat_send
+                // routes to the API), so it stays here on the model-ready
+                // path — un-nested from the deleted schema spawn.
                 let app_state = app_handle.state::<AppState>();
-                let already = app_state
-                    .schema_engine
-                    .lock()
-                    .map(|g| g.is_some())
-                    .unwrap_or(false);
-                if !already {
-                    // Schema engine borrows shared_model() (deduped, no own
-                    // weight copy). No path/n_gpu args anymore (2026-07-23).
-                    let (engine, init_rx) = schema_engine::SchemaEngine::spawn_load();
-                    match init_rx.recv() {
-                        Ok(Ok(())) => {
-                            tracing::info!(
-                                "schema engine ready (eager spawn at model-ready)"
-                            );
-                            if let Ok(mut slot) = app_state.schema_engine.lock() {
-                                *slot = Some(Arc::new(engine));
-                            }
 
-                            // If the user was on an API profile at last
-                            // shutdown, boot brought the 12B up as a safe
-                            // default. Now that both engines are ready,
-                            // re-perform the API swap so Wupi comes back
-                            // up on the same connection the user last had.
-                            // The schema engine stays on WUPI.gguf either
-                            // way (no Agent.gguf dependency). On any error
-                            // we stay on local 12B: boot must never fail.
-                            let restore = {
-                                let cfg = app_state
-                                    .api_config
-                                    .lock()
-                                    .expect("api_config mutex");
-                                (
-                                    cfg.model_source,
-                                    cfg.active_profile_id.clone(),
-                                )
-                            };
-                            if matches!(restore.0, api::ModelSource::Api) {
-                                if let Some(profile_id) = restore.1 {
-                                    tracing::info!(
-                                        profile_id = %profile_id,
-                                        "boot: restoring last-used API connection"
-                                    );
-                                    // v0.6.3 local-always: do NOT tear down
-                                    // the freshly-loaded 12B. It stays resident
-                                    // as the silent agent + seamless fallback.
-                                    // Just flip model_source so chat_send routes
-                                    // to the API; the local engine remains hot.
-                                    *app_state
-                                        .model_source
-                                        .lock()
-                                        .expect("model_source mutex") =
-                                        api::ModelSource::Api;
-                                    let _ = app_handle.emit(
-                                        "model-status",
-                                        serde_json::json!({
-                                            "status": "ready",
-                                            "model": "api (restored)",
-                                        }),
-                                    );
-                                    tracing::info!(
-                                        "boot: API connection restored (local resident)"
-                                    );
-                                } else {
-                                    // model_source was Api but no active
-                                    // profile: downgrade to Local so
-                                    // chat_send doesn't route to a
-                                    // non-existent API path.
-                                    tracing::warn!(
-                                        "boot: model_source was Api but no \
-                                         active profile; downgrading to Local"
-                                    );
-                                    *app_state
-                                        .model_source
-                                        .lock()
-                                        .expect("model_source mutex") =
-                                        api::ModelSource::Local;
-                                    let mut cfg = app_state
-                                        .api_config
-                                        .lock()
-                                        .expect("api_config mutex");
-                                    cfg.model_source =
-                                        api::ModelSource::Local;
-                                }
-                            }
-                        }
-                        Ok(Err(msg)) => {
-                            tracing::warn!(
-                                error = %msg,
-                                "schema engine init failed; schema updates disabled"
-                            );
-                        }
-                        Err(_) => {
-                            tracing::warn!(
-                                "schema engine init channel closed; \
-                                 schema updates disabled"
-                            );
-                        }
+                // If the user was on an API profile at last shutdown, boot
+                // brought the 12B up as a safe default. Now that the chat
+                // model is ready, re-perform the API swap so Wupi comes
+                // back up on the same connection the user last had. On any
+                // error we stay on local 12B: boot must never fail.
+                let restore = {
+                    let cfg = app_state
+                        .api_config
+                        .lock()
+                        .expect("api_config mutex");
+                    (cfg.model_source, cfg.active_profile_id.clone())
+                };
+                if matches!(restore.0, api::ModelSource::Api) {
+                    if let Some(profile_id) = restore.1 {
+                        tracing::info!(
+                            profile_id = %profile_id,
+                            "boot: restoring last-used API connection"
+                        );
+                        // v0.6.3 local-always: do NOT tear down the
+                        // freshly-loaded 12B. It stays resident as the
+                        // silent agent + seamless fallback. Just flip
+                        // model_source so chat_send routes to the API; the
+                        // local engine remains hot.
+                        *app_state
+                            .model_source
+                            .lock()
+                            .expect("model_source mutex") =
+                            api::ModelSource::Api;
+                        let _ = app_handle.emit(
+                            "model-status",
+                            serde_json::json!({
+                                "status": "ready",
+                                "model": "api (restored)",
+                            }),
+                        );
+                        tracing::info!(
+                            "boot: API connection restored (local resident)"
+                        );
+                    } else {
+                        // model_source was Api but no active profile:
+                        // downgrade to Local so chat_send doesn't route
+                        // to a non-existent API path.
+                        tracing::warn!(
+                            "boot: model_source was Api but no \
+                             active profile; downgrading to Local"
+                        );
+                        *app_state
+                            .model_source
+                            .lock()
+                            .expect("model_source mutex") =
+                            api::ModelSource::Local;
+                        let mut cfg = app_state
+                            .api_config
+                            .lock()
+                            .expect("api_config mutex");
+                        cfg.model_source = api::ModelSource::Local;
                     }
                 }
             }
@@ -2301,15 +2285,12 @@ async fn chat_send(
         state.operator_path.get().and_then(std::option::Option::as_deref),
     )
     .map(|p| p.render_for_prompt());
-    let system_prompt =
-        prompts::build_system_content(&settings, persona.as_deref(), user_profile.as_deref());
-
     // §2F eager-prefill sliding window (2026-07-13): cap visible history to
     // the last VISIBLE_WINDOW messages regardless of token budget. Memory (M)
     // backfills evicted turns via retrieval. Truncation in the engine becomes
     // a safety net that effectively never fires (4 short turns ≪ ~3000 budget).
     //
-    // Window is now source-dependent (the v0.6.3 local-always redesign): the
+    // Window is source-dependent (the v0.6.3 local-always redesign): the
     // API path keeps a wider 12-message window (the cloud model has the
     // context budget + the local model is kept hot as a silent agent doing
     // schema/memory tracking, so the API can carry more narrative); the Local
@@ -2317,6 +2298,13 @@ async fn chat_send(
     // recency for continuity, small enough that truncation never fires).
     let source = *state.model_source.lock().expect("model_source mutex");
     let visible_window = if source == api::ModelSource::Api { 12 } else { 6 };
+
+    let system_prompt = prompts::build_system_content(
+        &settings,
+        persona.as_deref(),
+        user_profile.as_deref(),
+        effective_local_ctx(source, &settings),
+    );
 
     let messages = {
         let mut s = state.session.lock().await;
@@ -2353,7 +2341,14 @@ async fn chat_send(
     // spawn_from_shared).
     let context_swap_clone = state.context_swap.clone();
     let backend_slot = Arc::clone(&state.backend);
-    let chat_context_size = settings.context_size;
+    // v0.7: chat_context_size is now source-aware. Under API the local chat
+    // backend runs at 2048 (silent-agent mode); under Local-only at the user's
+    // tuned settings.context_size. This is the load-bearing fix for the
+    // eviction-revert landmine: if a fable/schema turn evicted the chat
+    // backend mid-API-session, the slow-path re-spawn below MUST re-spawn at
+    // 2048 (not settings.context_size = 4000) — otherwise the reduced context
+    // silently reverts the first time the chat backend gets evicted.
+    let chat_context_size = effective_local_ctx(source, &settings);
     let _chat_lease = context_swap_clone
         .acquire(
             context_swap::ContextRole::Chat,
@@ -3308,6 +3303,34 @@ async fn api_connect(
     }
 }
 
+/// The effective n_ctx for the LOCAL CHAT context given the active source.
+/// This is the v0.7 source-of-truth for "how big should the local chat
+/// context be?"
+///
+/// - **Local-only:** the user's tuned `settings.context_size` (default 4000).
+///   The local 12B is the primary chat + narrator model and needs the room.
+/// - **API connected:** 2048. The local 12B demotes to a silent tracking
+///   agent (memory tracking + small assistant replies) — no narration, no
+///   long payloads. 2048 is plenty for that and frees ~half the chat KV
+///   vs the 4000-tok Local-only mode.
+///
+/// **Schema is NOT affected** — it's a fixed `SCHEMA_CTX = 2048` in both
+/// modes (already the right size for delta work; no source-dependent sizing
+/// needed). **Fable is EXEMPT** — it stays at `FABLE_CTX = 3072` regardless
+/// (under API it only materializes as the fallback narrator, and a smaller
+/// context would leave zero room for the ~1000-tok narrator prompt).
+///
+/// **Why a single helper:** every chat spawn site (boot, chat_send slow
+/// path, api_connect/disconnect re-spawn) MUST read this — otherwise the
+/// swap-lock eviction slow path would silently re-spawn at
+/// `settings.context_size` mid-API-session (the eviction-revert landmine).
+fn effective_local_ctx(source: api::ModelSource, settings: &prompts::WupiSettings) -> u32 {
+    match source {
+        api::ModelSource::Api => 2048,
+        api::ModelSource::Local => settings.context_size,
+    }
+}
+
 async fn api_connect_inner(
     profile_id: String,
     app: tauri::AppHandle,
@@ -3363,6 +3386,47 @@ async fn api_connect_inner(
         .await
         .map_err(|e| format!("api_config save join: {e}"))?;
     tracing::info!(profile_id = %profile_id, "api connected: chat via API, local resident as agent + fallback");
+
+    // v0.7: shrink the local chat context to the API-mode size (2048). The
+    // local 12B is now just the silent tracking agent (memory + small replies),
+    // not the narrator — the API carries narration. Take + shutdown the
+    // resident 4000-ctx backend, re-spawn from shared weights at 2048.
+    //
+    // Weights stay leaked (shared_model singleton); only the KV context is
+    // reallocated. The swap-lock lease is NOT acquired here — we synchronize
+    // on state.backend directly (the same primitive the chat teardown closure
+    // uses at line ~2350). Acquiring the lease would just drop immediately
+    // and not protect the spawn window; the backend mutex does.
+    //
+    // Safe degradation: if spawn_from_shared returns None (shared_model not
+    // loaded — shouldn't happen post-boot), we leave the slot empty;
+    // chat_send's slow path will lazily re-spawn at effective_local_ctx(Api)
+    // = 2048 on the next turn.
+    {
+        let api_ctx = effective_local_ctx(api::ModelSource::Api, &{
+            let s = state.settings.lock().expect("settings mutex");
+            s.clone()
+        });
+        let mut g = state.backend.lock().expect("backend mutex");
+        if let Some(old) = g.take() {
+            old.shutdown();
+            tracing::info!("api_connect: chat backend torn down + re-spawning at smaller context");
+        }
+        let new_backend = llm::LlamaCppBackend::spawn_from_shared(
+            api_ctx,
+            Box::new(move |result| {
+                if let Err(e) = &result {
+                    tracing::warn!(error = %e, "api_connect: chat backend re-spawn reported error");
+                }
+            }),
+        );
+        if let Some(b) = new_backend {
+            *g = Some(b);
+            tracing::info!(n_ctx = api_ctx, "api_connect: chat backend re-spawned at API-mode context");
+        } else {
+            tracing::warn!("api_connect: spawn_from_shared returned None (shared_model not loaded); leaving slot empty");
+        }
+    }
     // Emit model-status so the title indicator flips to the API model name.
     // The local backend is also still ready (never torn down) — the frontend
     // reads `localReady` from model_source_get to show "local: active" too.
@@ -3400,6 +3464,37 @@ async fn api_disconnect(app: tauri::AppHandle, state: tauri::State<'_, AppState>
     tokio::task::spawn_blocking(move || cfg_snapshot.save(&path))
         .await
         .map_err(|e| format!("api_config save join: {e}"))?;
+
+    // v0.7: restore the local chat context to the Local-mode size (the user's
+    // tuned settings.context_size, default 4000). Symmetric to api_connect's
+    // shrink: take + shutdown the 2048-ctx backend, re-spawn at the full size
+    // since the local 12B is now the primary chat + narrator model again.
+    {
+        let local_ctx = effective_local_ctx(api::ModelSource::Local, &{
+            let s = state.settings.lock().expect("settings mutex");
+            s.clone()
+        });
+        let mut g = state.backend.lock().expect("backend mutex");
+        if let Some(old) = g.take() {
+            old.shutdown();
+            tracing::info!("api_disconnect: chat backend torn down + re-spawning at full context");
+        }
+        let new_backend = llm::LlamaCppBackend::spawn_from_shared(
+            local_ctx,
+            Box::new(move |result| {
+                if let Err(e) = &result {
+                    tracing::warn!(error = %e, "api_disconnect: chat backend re-spawn reported error");
+                }
+            }),
+        );
+        if let Some(b) = new_backend {
+            *g = Some(b);
+            tracing::info!(n_ctx = local_ctx, "api_disconnect: chat backend re-spawned at Local-mode context");
+        } else {
+            tracing::warn!("api_disconnect: spawn_from_shared returned None; leaving slot empty");
+        }
+    }
+
     // Emit model-status: the local backend is what's serving now.
     let _ = app.emit(
         "model-status",
@@ -3461,10 +3556,12 @@ async fn api_profile_test(
 /// chain multiple calls and watch the schema evolve. `apply: false` is a dry
 /// run: the schema is untouched, useful for prompt-tuning without side effects.
 ///
-/// The schema engine is spawned LAZILY on first call (gated on the chat model
-/// being loaded: `shared_model()` must be `Some`). Mirrors the Memory engine's
-/// OnceLock-once pattern; Component E will move this to an eager spawn at
-/// model-ready. Returns an error string if the chat model isn't loaded yet.
+/// The schema engine is spawned LAZILY via `acquire_schema_engine` on the
+/// first schema request (a chat turn's delta fire, or a game-manager
+/// translation) — under the ContextRole::Schema VRAM lease (v0.6.4 swap-lock).
+/// Returns an error string if the schema engine isn't resident yet (no chat
+/// turn has primed it). This is a debug-only surface (per AGENTS.md §9 it has
+/// no live UI); the production paths go through `acquire_schema_engine`.
 #[tauri::command]
 async fn debug_schema_delta(
     user_exchange: String,
@@ -3472,18 +3569,16 @@ async fn debug_schema_delta(
     apply: Option<bool>,
     state: tauri::State<'_, AppState>,
 ) -> Result<serde_json::Value, String> {
-    // The schema engine is eager-spawned at chat-model-ready in setup(). This
-    // debug command requires it to already be running: the lazy-spawn fallback
-    // was removed when the engine stopped using shared_model() (it now loads
-    // its own model by path, which needs the app handle for resolution: not
-    // worth threading through a debug-only path). If the eager spawn failed at
-    // boot, surface that here.
+    // The schema engine is spawned lazily under the VRAM swap-lock. This debug
+    // path reads the slot directly (NOT via acquire_schema_engine) so it can
+    // probe an engine that a prior chat turn already primed — but it will be
+    // `None` until that happens. Sending a chat turn first primes the slot.
     let engine = state
         .schema_engine
         .lock()
         .map_err(|e| format!("schema_engine mutex: {e}"))?
         .clone()
-        .ok_or_else(|| "schema engine not running (eager spawn failed at boot, or no model found)".to_string())?;
+        .ok_or_else(|| "schema engine not resident yet (lazy-spawned on the first chat turn via acquire_schema_delta; send a chat message first)".to_string())?;
 
     // Snapshot the current schema (the delta pass diffs against this).
     let current = state.schema.lock().await.clone();
@@ -4038,11 +4133,24 @@ async fn fable_send(
     // so the prompt stays small (~5KB not ~80KB). The full conversation is
     // persisted on fable_end so games resume across reboots.
     //
-    // v0.6.3: window doubles when the API is the active chat source (8 → 16),
-    // matching chat_send's 6 → 12. The cloud model has the context budget and
-    // the local model stays hot as the silent agent doing schema tracking.
+    // v0.6.3: window doubles when the API is the active chat source, matching
+    // chat_send's 6 → 12. The cloud model has the context budget and the local
+    // model stays hot as the silent agent doing schema tracking.
+    //
+    // 2026-07-26: the local window was cut to 4 *messages* (NOT beats — the
+    // prior comment said "4 beats / 8 messages" but the slice math at line
+    // ~4161 treats the window as a raw message count; the code is the source
+    // of truth) to match the smaller FABLE_CTX=3072 budget. The narrator
+    // system prompt (~1000 tok) + 4 messages (~400 tok) + 1024-token gen
+    // reserve ≈ 2424, fitting 3072 with headroom.
+    //
+    // v0.7: the API window was cut 16 → 12 (6 beats). 12 narrator messages
+    // + the ~1000-tok narrator prompt + generation fits comfortably inside
+    // the API profile's max_context (default 8192), and 12 matches the chat
+    // API window for a consistent "6 beats of recent history" feel across
+    // both surfaces.
     let source = *state.model_source.lock().expect("model_source mutex");
-    let fable_visible_window = if source == api::ModelSource::Api { 16 } else { 8 };
+    let fable_visible_window = if source == api::ModelSource::Api { 12 } else { 4 };
     {
         let mut gs = state.fable_session.lock().await;
         gs.add_message(session::Role::User, text.clone());
@@ -4742,4 +4850,47 @@ fn resolve_session_path(fable_root: &std::path::Path, card_id: &str) -> std::pat
 /// same subdir convention + filesystem-safety assumption.
 fn resolve_schema_path(fable_root: &std::path::Path, card_id: &str) -> std::path::PathBuf {
     fable_root.join("schemas").join(format!("{card_id}.json"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn effective_local_ctx_local_returns_settings() {
+        let settings = prompts::WupiSettings {
+            context_size: 4000,
+            conversation_budget: 16000,
+        };
+        assert_eq!(
+            effective_local_ctx(api::ModelSource::Local, &settings),
+            4000,
+            "Local mode must return the user's tuned settings.context_size"
+        );
+    }
+
+    #[test]
+    fn effective_local_ctx_api_returns_2048_regardless_of_settings() {
+        // Even if the user has a huge settings.context_size, under API the
+        // local chat backend demotes to 2048 (silent-agent mode). The settings
+        // value must NOT leak through.
+        let settings = prompts::WupiSettings {
+            context_size: 8192,
+            conversation_budget: 16000,
+        };
+        assert_eq!(
+            effective_local_ctx(api::ModelSource::Api, &settings),
+            2048,
+            "API mode must always return 2048 regardless of settings.context_size"
+        );
+    }
+
+    #[test]
+    fn effective_local_ctx_default_settings() {
+        // Default settings (context_size: 4000) under Local → 4000.
+        let settings = prompts::WupiSettings::default();
+        assert_eq!(effective_local_ctx(api::ModelSource::Local, &settings), 4000);
+        // Under Api → 2048 (the constant, not the default).
+        assert_eq!(effective_local_ctx(api::ModelSource::Api, &settings), 2048);
+    }
 }

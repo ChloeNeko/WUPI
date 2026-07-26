@@ -1,6 +1,7 @@
 import { invoke, Channel } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import { getVersion } from '@tauri-apps/api/app';
+import { initFable } from './fable/fable.js';
 
 const canvas = document.getElementById('aurora-canvas');
 const ctx = canvas.getContext('2d');
@@ -12,10 +13,63 @@ const ctx = canvas.getContext('2d');
 // "Vibrant" reproduces the original hardcoded values (the project default).
 // New color codes = add entries here + a matching swatch in styles.css.
 const COLOR_CODES = {
+  Red: {
+    skyGradient: ['#070204', '#100406', '#170608', '#1f0709', '#240a0c'],
+    mode: 'solid',
+    hueBase: 358,
+    hueRange: 40,
+    saturation: 80,
+    lightness: 58,
+    uiAccent: '#b8334a',
+  },
+  Green: {
+    skyGradient: ['#030503', '#070d07', '#0a130b', '#0d190e', '#102012'],
+    mode: 'solid',
+    hueBase: 138,
+    hueRange: 50,
+    saturation: 78,
+    lightness: 58,
+    uiAccent: '#3aa15a',
+  },
+  Blue: {
+    skyGradient: ['#020308', '#04081a', '#060b24', '#080e30', '#0a1138'],
+    mode: 'solid',
+    hueBase: 218,
+    hueRange: 45,
+    saturation: 82,
+    lightness: 60,
+    uiAccent: '#3d6fd6',
+  },
+  Neutral: {
+    skyGradient: ['#020203', '#050507', '#0a0a0d', '#0f0f13', '#000000'],
+    mode: 'solid',
+    hueBase: 0,
+    hueRange: 0,
+    saturation: 0,
+    lightness: 60,
+    grayCurtains: true,
+    uiAccent: '#3a3a42',
+  },
   Vibrant: {
     skyGradient: ['#02040a', '#060a17', '#150524', '#2b0b36', '#4a173d'],
+    mode: 'solid',
     hueBase: 305,
     hueRange: 45,
+    saturation: 100,
+    lightness: 65,
+    uiAccent: '#b534fa',
+  },
+  Rainbow: {
+    skyGradient: ['#040308', '#080612', '#0c0920', '#100c2c', '#14102e'],
+    mode: 'rainbow',
+    rainbowBands: [0, 50, 120, 210, 280],
+    saturation: 100,
+    lightness: 64,
+    uiAccent: '#8367d8',
+    horizonShift: true,
+    horizonSaturation: 35,
+    horizonLightness: 8,
+    horizonDriftSpeed: 1.5,
   },
 };
 
@@ -1125,6 +1179,21 @@ function spawnLaunchSparkles(parent, count = 18) {
       // loading screen ends.
       document.body.classList.remove('booting');
       document.body.classList.add('loading');
+      // Fade the boot paw out + remove it (v0.6.5 behavior). The fly-in set
+      // inline `opacity:1` + inline `transition` on the paw (lines above);
+      // both must be cleared so the `.fade-out` class's `opacity:0` (CSS)
+      // applies + a transition fires for the removal callback. The fallback
+      // setTimeout(remove, 350) guarantees the paw is gone even if
+      // transitionend never fires (interrupted transition / hidden tab) —
+      // without this the paw lingered as the "ghost paw" overlapping the
+      // running OS indefinitely. 1s dwell lets the landing sparkle read.
+      setTimeout(() => {
+        if (!bootPaw) return;
+        bootPaw.style.opacity = '';
+        bootPaw.style.transition = '';
+        bootPaw.classList.add('fade-out');
+        setTimeout(() => bootPaw.remove(), 350);
+      }, 1000);
       startLoadingScreen();
     };
     bootPaw.addEventListener('transitionend', onLand);
@@ -1462,7 +1531,10 @@ const dropdownMenu = document.getElementById('dropdownMenu');
   const calendarBtn = document.getElementById('calendarBtn');
   const calendarDropdownMenu = document.getElementById('calendarDropdownMenu');
   const dateDisplayEl = document.getElementById('dateDisplay');
-  const gridContainer = document.getElementById('calendarGrid');
+  // v0.6.5 text-tile calendar: month strip + day number (replaces the old
+  // SVG grid). Null-safe so a malformed DOM doesn't crash the clock loop.
+  const calMonthEl = document.getElementById('calMonth');
+  const calDayEl = document.getElementById('calDay');
   
   // New UI Elements
   const wifiBtn = document.getElementById('wifiBtn');
@@ -2101,31 +2173,11 @@ const dropdownMenu = document.getElementById('dropdownMenu');
     const options = { weekday: 'long', month: 'long', day: 'numeric', year: 'numeric' };
     dateDisplayEl.textContent = now.toLocaleDateString('en-US', options);
 
-    const dayOfWeek = now.getDay();
-    const week = Math.floor((now.getDate() - 1) / 7);
-    const activeIndex = (dayOfWeek + week * 7) % 28;
-
-    gridContainer.innerHTML = '';
-    for (let r = 0; r < 4; r++) {
-      for (let c = 0; c < 7; c++) {
-        const index = r * 7 + c;
-        const rect = document.createElementNS('http://www.w3.org/2000/svg', 'rect');
-        rect.setAttribute('x', 17 + c * 10);
-        rect.setAttribute('y', 40 + r * 12);
-        rect.setAttribute('width', 6);
-        rect.setAttribute('height', 6);
-        rect.setAttribute('rx', 1);
-        
-        if (index === activeIndex) {
-          rect.setAttribute('fill', '#b534fa');
-          rect.style.filter = 'drop-shadow(0 0 3px #ff66b2)';
-        } else {
-          rect.setAttribute('fill', '#ffffff');
-        }
-        
-        gridContainer.appendChild(rect);
-      }
-    }
+    // Text-tile calendar (v0.6.5): month abbreviation in the colored strip,
+    // day-of-month number in the body. Null-safe so a malformed DOM doesn't
+    // crash the clock loop.
+    if (calMonthEl) calMonthEl.textContent = now.toLocaleString('en-US', { month: 'short' }).toUpperCase();
+    if (calDayEl) calDayEl.textContent = String(now.getDate());
   }
 
   updateClocks();
@@ -3382,3 +3434,33 @@ const dropdownMenu = document.getElementById('dropdownMenu');
     windowOpenHooks.set('chat', loadIntro);
     loadIntro();
   })();
+
+// === FABLE APP WIRING (Phase 2, 2026-07-26) ============================
+// initFable builds the #fable app window, registers it with AppLifecycle
+// (onOpen/onClose/onPause/onResume), and bridges the OS window system to
+// the fog-gate launch. The hooks passed in:
+//   pauseAurora / resumeAurora — flip the canvas RAF `paused` flag so the
+//     OS aurora stops painting while the full-screen Fable stage is up
+//     (Fable has its own background; the OS canvas would waste cycles +
+//     compete for the GPU otherwise). Mirrors the visibilitychange/blur
+//     pause pattern at line 339.
+//   openHooks — the Map openWindow() consults; Fable registers its id →
+//     launchFable() (which runs the 2s fog-gate buildup before
+//     AppLifecycle.launchApp).
+//   closeHooks — the Map closeWindow() consults; Fable routes to
+//     AppLifecycle.closeApp (full teardown).
+//   closeWindow — ref to the OS closeWindow so Fable's own close paths
+//     (the title-screen EXIT button) keep the openWindows set in sync.
+//
+// This is the wiring the Fable UI shell has been waiting on: the source
+// under src/fable/ was complete but initFable() was never called, so the
+// Games home tile was an inert "coming soon" stub. With this call the
+// full-screen immersion stage + Simulation Narrative Engine become
+// reachable from the OS desktop for the first time.
+initFable({
+  pauseAurora: () => { paused = true; },
+  resumeAurora: () => { startLoop(); },
+  openHooks: windowOpenHooks,
+  closeHooks: windowCloseHooks,
+  closeWindow,
+});
