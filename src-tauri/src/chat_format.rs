@@ -201,11 +201,22 @@ impl ChatFormat for Gemma4Format {
                 // resident in the KV cache. Without this, the cleaned content
                 // diverges from the cache and forces a full re-prefill each turn.
                 // Legacy turns (no raw_output) fall back to strip_thinking.
+                // Tool-call turns (raw contains `<|tool_call>`) are included
+                // automatically — the markers are part of the verbatim raw.
                 if !m.raw_output.is_empty() {
                     out.push_str(&m.raw_output);
                 } else {
                     out.push_str(&strip_thinking(&m.content));
                 }
+            } else if let Some(rendered) = render_tool_response_marker(&m.content) {
+                // User-role turn carrying a tool response. The agent loop
+                // (lib.rs::run_agent_loop) inserts these as user messages with
+                // a JSON envelope `{"__tool_response__":true,...}`. We render
+                // them as the Gemma 4 `<|tool_response>` protocol token so the
+                // model sees the result in the channel it expects. Cache-
+                // coherent: the marker is deterministic from content, so the
+                // same input always renders the same tokens.
+                out.push_str(&rendered);
             } else {
                 out.push_str(m.content.trim());
             }
@@ -330,6 +341,46 @@ fn push_escaped(out: &mut String, s: &str) {
             _ => out.push(ch),
         }
     }
+}
+
+/// Detect the agent loop's tool-response content marker and render it as the
+/// Gemma 4 `<|tool_response>` protocol token. Returns `None` for ordinary
+/// user messages (the common case).
+///
+/// The agent loop inserts user-role messages with content shaped like:
+///   `{"__tool_response__":true,"name":"file_read","ok":true,"output":"..."}`
+///
+/// We render that as:
+///   `<|tool_response>response:file_read{"ok":true,"output":"..."}<tool_response|>`
+///
+/// (per the documented protocol token at line 146). The `name`, `ok`, and
+/// `output` fields are extracted and re-serialized compactly so the wire
+/// format is deterministic (cache-coherent: same input → same tokens).
+fn render_tool_response_marker(content: &str) -> Option<String> {
+    let trimmed = content.trim();
+    if !trimmed.starts_with("{\"__tool_response__\":") {
+        return None;
+    }
+    let v: serde_json::Value = serde_json::from_str(trimmed).ok()?;
+    if v.get("__tool_response__")?.as_bool() != Some(true) {
+        return None;
+    }
+    let name = v.get("name")?.as_str()?;
+    let ok = v.get("ok")?.as_bool().unwrap_or(false);
+    let output = v.get("output");
+    // Build the compact payload: {"ok":...,"output":...}. The output value is
+    // re-stringified to drop whitespace (deterministic tokens).
+    let payload = serde_json::json!({
+        "ok": ok,
+        "output": output.unwrap_or(&serde_json::Value::Null),
+    });
+    let payload_compact = serde_json::to_string(&payload).unwrap_or_else(|_| "{}".into());
+    Some(format!(
+        "<|tool_response>response:{}{}<tool_response|>",
+        name,
+        // The `{args}` slot is optional per Gemma's grammar; we always include it.
+        payload_compact
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -791,6 +842,99 @@ mod tests {
     fn gemma4_strip_thinking_removes_thought_blocks() {
         let cleaned = strip_thinking("<|channel>thought\nsecret\n<channel|>visible");
         assert_eq!(cleaned, "visible");
+    }
+
+    #[test]
+    fn gemma4_renders_assistant_tool_call_from_raw_output() {
+        // Tool-call turn: the model emitted <|tool_call> in its raw output.
+        // The formatter renders raw verbatim (cache-coherent) so the marker
+        // survives into the next turn's prefill. This is what
+        // run_agent_loop relies on when it commits the assistant tool-call turn.
+        let f = Gemma4Format;
+        let mut m = msg("assistant", "");
+        m.raw_output = "<|tool_call>call:file_read{\"path\":\"data/docs/x.md\"}<tool_call|>".into();
+        let out = f.render_prompt("", &[m], &[], None, None, false);
+        assert!(
+            out.contains("<|tool_call>call:file_read{\"path\":\"data/docs/x.md\"}<tool_call|>"),
+            "raw tool_call marker must render verbatim, got: {out}"
+        );
+    }
+
+    #[test]
+    fn gemma4_renders_tool_response_marker_for_user_turn() {
+        // The agent loop inserts user messages with the __tool_response__
+        // content envelope. The formatter must render those as the Gemma 4
+        // <|tool_response> protocol token, not as raw JSON prose.
+        let f = Gemma4Format;
+        let m = msg("user",
+            "{\"__tool_response__\":true,\"name\":\"file_read\",\"ok\":true,\"output\":\"hello\"}");
+        let out = f.render_prompt("", &[m], &[], None, None, false);
+        assert!(
+            out.contains("<|tool_response>response:file_read"),
+            "tool_response marker must render as protocol token, got: {out}"
+        );
+        assert!(
+            out.contains("<tool_response|>"),
+            "must close with <tool_response|>, got: {out}"
+        );
+        // The raw JSON envelope should NOT leak as literal text.
+        assert!(
+            !out.contains("__tool_response__"),
+            "raw marker envelope leaked into prompt: {out}"
+        );
+    }
+
+    #[test]
+    fn gemma4_ordinary_user_message_not_mistaken_for_tool_response() {
+        // A user message that doesn't carry the marker must render as plain
+        // content (the common chat case).
+        let f = Gemma4Format;
+        let m = msg("user", "what is the weather?");
+        let out = f.render_prompt("", &[m], &[], None, None, false);
+        assert!(out.contains("what is the weather?"));
+        assert!(!out.contains("<|tool_response>"));
+    }
+
+    #[test]
+    fn gemma4_renders_tool_declaration_in_system_turn() {
+        // Tool declarations live inside the system turn, wrapped in
+        // <|tool> ... <tool|>. Pinned so a future refactor of render_prompt
+        // can't silently drop tool support.
+        let f = Gemma4Format;
+        let tools = vec![ToolSpec {
+            name: "file_read".into(),
+            description: "Read a file.".into(),
+        }];
+        let out = f.render_prompt("You are Wupi.", &[], &tools, None, None, false);
+        assert!(out.contains("<|turn>system"));
+        assert!(out.contains("<|tool>declaration:file_read"));
+        assert!(out.contains("<tool|>"));
+        assert!(out.contains("<turn|>"));
+    }
+
+    #[test]
+    fn render_tool_response_marker_helper_round_trip() {
+        // The pure helper: detect + render the marker.
+        let rendered = render_tool_response_marker(
+            "{\"__tool_response__\":true,\"name\":\"file_read\",\"ok\":true,\"output\":\"hello\"}",
+        )
+        .unwrap();
+        assert!(rendered.starts_with("<|tool_response>response:file_read"));
+        assert!(rendered.ends_with("<tool_response|>"));
+        // Deterministic: same input → same output.
+        let again = render_tool_response_marker(
+            "{\"__tool_response__\":true,\"name\":\"file_read\",\"ok\":true,\"output\":\"hello\"}",
+        )
+        .unwrap();
+        assert_eq!(rendered, again);
+    }
+
+    #[test]
+    fn render_tool_response_marker_returns_none_for_plain_text() {
+        assert!(render_tool_response_marker("just chatting").is_none());
+        assert!(render_tool_response_marker("").is_none());
+        // Not a tool response envelope.
+        assert!(render_tool_response_marker("{\"name\":\"file_read\"}").is_none());
     }
 
     #[test]

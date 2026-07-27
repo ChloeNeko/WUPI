@@ -2455,31 +2455,92 @@ async fn chat_send(
     // the local path re-assembles the message window at 6 (the API may have
     // assembled 12 above): the local engine's KV cache only ever saw the
     // 6-window render, so feeding it the same shape keeps the delta path fast.
-    let result = if source == api::ModelSource::Api {
-        let profile_opt = {
-            let cfg = state.api_config.lock().expect("api_config mutex");
-            cfg.active_profile().cloned()
-        };
-        match profile_opt {
-            Some(profile) => {
-                let http = llm::HttpBackend::new(profile);
-                match http
-                    .stream(messages, memory_block.clone(), world_state.clone(), settings.context_size, on_chunk.clone(), cancel.clone())
-                    .await
-                {
-                    Ok(text) => text,
-                    Err(e) => {
-                        // Seamless fallback (the load-bearing path). Do NOT
-                        // surface the error or roll back the user message:
-                        // re-run the turn on the local model at the 6-window
-                        // so the user gets a reply and immersion is preserved.
-                        // Emit a low-key info event the UI can show as a small
-                        // "API unreachable — using local" chip (not an error
-                        // bubble: this must not feel like a failure).
-                        tracing::warn!(error = %e, "chat_send: API stream failed; falling back to local");
+    //
+    // TOOL ROUTING (v0.8): tool calling is ALWAYS local, even when the API is
+    // the active narrator. The local 12B stays resident as the silent agent
+    // (§8 v0.6.3), so we run the agent loop against it FIRST. If the model
+    // emits tool calls → execute locally, the local reply is final. If no
+    // tools fired AND source==Api → discard the local prose and hand the turn
+    // to the API for the narrative reply. `fable_send` (the narrator path)
+    // never enters this block — it has its own dispatch and never gets tools.
+    let chat_tools: Vec<chat_format::ToolSpec> = if backend_opt.is_some() {
+        tools::specs()
+    } else {
+        Vec::new()
+    };
+
+    let (result, tools_fired) = if source == api::ModelSource::Api {
+        // API mode: tool-routing pre-pass on local. If tools fire, we keep
+        // the local result; otherwise we hand off to the API for narration.
+        match run_agent_loop(
+            &state, &app, &on_event, &system_prompt, 6,
+            memory_block.clone(), world_state.clone(), chat_tools.clone(),
+            effective_local_ctx(api::ModelSource::Api, &settings),
+            on_chunk.clone(), cancel.clone(), backend_opt.clone(),
+        )
+        .await
+        {
+            Ok((local_result, true)) => {
+                // Tools fired → local agent handled it. Skip the API.
+                tracing::info!("chat_send: API mode but tools fired locally; using local reply");
+                (local_result, true)
+            }
+            Ok((_, false)) => {
+                // No tools fired → discard local prose, hand to the API for
+                // the narrative reply (the API is the better narrator).
+                let profile_opt = {
+                    let cfg = state.api_config.lock().expect("api_config mutex");
+                    cfg.active_profile().cloned()
+                };
+                let api_result = match profile_opt {
+                    Some(profile) => {
+                        let http = llm::HttpBackend::new(profile);
+                        match http
+                            .stream(messages, memory_block.clone(), world_state.clone(), Vec::new(), settings.context_size, on_chunk.clone(), cancel.clone())
+                            .await
+                        {
+                            Ok(text) => text,
+                            Err(e) => {
+                                // Seamless fallback (the load-bearing path). Do NOT
+                                // surface the error or roll back the user message:
+                                // re-run the turn on the local model at the 6-window
+                                // so the user gets a reply and immersion is preserved.
+                                tracing::warn!(error = %e, "chat_send: API stream failed; falling back to local");
+                                let _ = on_event.send(serde_json::json!({
+                                    "type": "fallback",
+                                    "reason": "api_unreachable",
+                                    "source": "local",
+                                }));
+                                match run_local_or_echo(
+                                    &state,
+                                    &on_event,
+                                    &system_prompt,
+                                    6,
+                                    memory_block,
+                                    world_state,
+                                    Vec::new(),
+                                    settings.context_size,
+                                    on_chunk.clone(),
+                                    cancel.clone(),
+                                    backend_opt.as_ref(),
+                                )
+                                .await
+                                {
+                                    Ok(text) => text,
+                                    Err(()) => {
+                                        rollback_last_user_message(&state, &app).await;
+                                        return Ok(());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    None => {
+                        // No active profile but source=Api. Same seamless fallback.
+                        tracing::warn!("chat_send: source=Api but no active profile; falling back to local");
                         let _ = on_event.send(serde_json::json!({
                             "type": "fallback",
-                            "reason": "api_unreachable",
+                            "reason": "no_active_profile",
                             "source": "local",
                         }));
                         match run_local_or_echo(
@@ -2489,6 +2550,7 @@ async fn chat_send(
                             6,
                             memory_block,
                             world_state,
+                            Vec::new(),
                             settings.context_size,
                             on_chunk.clone(),
                             cancel.clone(),
@@ -2498,69 +2560,40 @@ async fn chat_send(
                         {
                             Ok(text) => text,
                             Err(()) => {
-                                // Local backend also failed (final safety net
-                                // exhausted): helper emitted the error event +
-                                // cleared cancel. Roll back + bail.
                                 rollback_last_user_message(&state, &app).await;
                                 return Ok(());
                             }
                         }
                     }
-                }
+                };
+                (api_result, false)
             }
-            None => {
-                // No active profile but source=Api (e.g. profile deleted
-                // mid-session). Same seamless fallback — don't break the turn.
-                tracing::warn!("chat_send: source=Api but no active profile; falling back to local");
-                let _ = on_event.send(serde_json::json!({
-                    "type": "fallback",
-                    "reason": "no_active_profile",
-                    "source": "local",
-                }));
-                match run_local_or_echo(
-                    &state,
-                    &on_event,
-                    &system_prompt,
-                    6,
-                    memory_block,
-                    world_state,
-                    settings.context_size,
-                    on_chunk.clone(),
-                    cancel.clone(),
-                    backend_opt.as_ref(),
-                )
-                .await
-                {
-                    Ok(text) => text,
-                    Err(()) => {
-                        rollback_last_user_message(&state, &app).await;
-                        return Ok(());
-                    }
-                }
+            Err(()) => {
+                // Agent loop itself failed (local backend unavailable /
+                // errored mid-iteration). Roll back + bail.
+                rollback_last_user_message(&state, &app).await;
+                return Ok(());
             }
         }
     } else {
-        match run_local_or_echo(
-            &state,
-            &on_event,
-            &system_prompt,
-            visible_window,
-            memory_block,
-            world_state,
+        // Local mode: the agent loop IS the user-visible reply path.
+        match run_agent_loop(
+            &state, &app, &on_event, &system_prompt, visible_window,
+            memory_block, world_state, chat_tools,
             settings.context_size,
-            on_chunk.clone(),
-            cancel.clone(),
-            backend_opt.as_ref(),
+            on_chunk.clone(), cancel.clone(), backend_opt.clone(),
         )
         .await
         {
-            Ok(text) => text,
+            Ok((result, tools_fired)) => (result, tools_fired),
             Err(()) => {
                 rollback_last_user_message(&state, &app).await;
                 return Ok(());
             }
         }
     };
+    // tools_fired is read by the done event below to flag a tool-call turn.
+    let _ = &tools_fired;
 
     // Bug #3 Step 4: hold the raw model output alongside the cleaned content +
     // reasoning so the formatter can re-render cache-coherently next turn (no
@@ -2782,6 +2815,7 @@ async fn chat_send(
             "type": "done",
             "final_text": result.content,
             "reasoning": result.reasoning,
+            "tool_call": tools_fired,
         }))
         .map_err(|e| e.to_string())?;
     Ok(())
@@ -2821,6 +2855,7 @@ async fn run_local_or_echo(
     window: usize,
     memory_block: Option<String>,
     world_state: Option<String>,
+    tools: Vec<chat_format::ToolSpec>,
     context_size: u32,
     on_chunk: llm::ChunkFn,
     cancel: llm::CancelToken,
@@ -2835,7 +2870,7 @@ async fn run_local_or_echo(
     };
     if let Some(backend) = backend {
         match backend
-            .stream(messages, memory_block, world_state, context_size, on_chunk, cancel)
+            .stream(messages, memory_block, world_state, tools, context_size, on_chunk, cancel)
             .await
         {
             Ok(text) => Ok(text),
@@ -2850,7 +2885,7 @@ async fn run_local_or_echo(
         }
     } else {
         let echo = llm::EchoBackend;
-        match echo.stream(messages, None, None, context_size, on_chunk, cancel).await {
+        match echo.stream(messages, None, None, Vec::new(), context_size, on_chunk, cancel).await {
             Ok(t) => Ok(t),
             Err(e) => {
                 clear_active_cancel(state);
@@ -2862,6 +2897,171 @@ async fn run_local_or_echo(
             }
         }
     }
+}
+
+/// The tool-calling agent loop. Wraps `run_local_or_echo`: decodes locally
+/// with `tools` rendered into the system prompt, inspects the raw output for
+/// `<|tool_call>` markers, executes them, inserts `<|tool_response>` turns,
+/// and re-decodes. Up to `tools::MAX_TOOL_ITERATIONS` rounds per `chat_send`
+/// turn (mirrors the schema engine's 3-pass contract philosophy).
+///
+/// Returns `(final_parsed_output, tools_fired)`. The caller uses `tools_fired`
+/// to decide whether to skip the API path: if the local agent handled the
+/// request via tools, the API isn't consulted (the tool-response-driven final
+/// decode IS the user-visible reply).
+///
+/// # Event channel
+///
+/// Each iteration emits `tool_call` and `tool_result` events through `on_event`
+/// so the frontend can show chips ("🔧 calling file_read…", "✓ file_read").
+/// The final iteration's `chunk`s stream normally via `on_chunk` inside
+/// `run_local_or_echo`.
+///
+/// # Tool-turn insertion (cache-coherent)
+///
+/// When a tool fires, we insert TWO session messages *after* the assistant
+/// turn that emitted the call:
+///   1. The assistant's tool-call turn (re-emitted via `raw_output` so the
+///      formatter can re-render the `<|tool_call>` protocol token cache-
+///      coherently per Bug #3).
+///   2. The tool-response turn (a user-role message carrying the
+///      `<|tool_response>` content marker).
+///
+/// Both inserts go inside the session lock critical section. The existing
+/// archiver/delta logic uses `checked_sub(2)` indexing against the final
+/// message list, which still resolves correctly because the inserts land
+/// AFTER the user's original message and BEFORE the next prefill.
+async fn run_agent_loop(
+    state: &tauri::State<'_, AppState>,
+    app: &tauri::AppHandle,
+    on_event: &tauri::ipc::Channel<serde_json::Value>,
+    system_prompt: &str,
+    window: usize,
+    memory_block: Option<String>,
+    world_state: Option<String>,
+    tools: Vec<chat_format::ToolSpec>,
+    context_size: u32,
+    on_chunk: llm::ChunkFn,
+    cancel: llm::CancelToken,
+    backend_opt: Option<Arc<llm::LlamaCppBackend>>,
+) -> Result<(chat_format::ParsedOutput, bool), ()> {
+    use tools::ToolCtx;
+
+    // No tools → no loop; just decode once. This is the common chat case.
+    if tools.is_empty() {
+        let result = run_local_or_echo(
+            state, on_event, system_prompt, window,
+            memory_block, world_state, Vec::new(),
+            context_size, on_chunk, cancel, backend_opt.as_ref(),
+        )
+        .await?;
+        return Ok((result, false));
+    }
+
+    let install_root = resolve_install_root(app);
+    let ctx = ToolCtx::new(install_root);
+    let registry = tools::registry();
+
+    // Iterate. Each iteration: decode → parse tool calls → execute → insert
+    // response turns → re-decode. Break when the model emits no tool calls
+    // OR we hit the iteration cap (then we force a final no-tools prose decode
+    // so the user gets a reply rather than a dangling tool-call echo).
+    let mut tools_fired = false;
+    let mut iteration = 0usize;
+
+    while iteration < tools::MAX_TOOL_ITERATIONS {
+        iteration += 1;
+        let result = run_local_or_echo(
+            state, on_event, system_prompt, window,
+            memory_block.clone(), world_state.clone(),
+            tools.clone(),
+            context_size, on_chunk.clone(), cancel.clone(),
+            backend_opt.as_ref(),
+        )
+        .await?;
+
+        let calls = tools::parse_tool_calls(&result.raw);
+        if calls.is_empty() {
+            // No tool calls this round → the model produced a final reply.
+            return Ok((result, tools_fired));
+        }
+
+        // We have tool calls. Commit the assistant's tool-call turn first
+        // (so the session reflects what the model actually emitted; the
+        // formatter renders the <|tool_call> marker cache-coherently from
+        // raw_output next turn).
+        {
+            let mut s = state.session.lock().await;
+            s.add_assistant_turn(
+                result.content.clone(),
+                result.reasoning.clone(),
+                result.raw.clone(),
+            );
+        }
+
+        // Execute each call + insert the response turns. Errors per-call are
+        // surfaced to the model via the response payload (NOT dropped): the
+        // model gets to see why its call failed and try again on the next
+        // iteration (the same fail-proof contract as schema_engine).
+        for call in &calls {
+            let _ = on_event.send(serde_json::json!({
+                "type": "tool_call",
+                "iteration": iteration,
+                "name": call.name,
+                "args": call.args,
+            }));
+
+            let outcome = match registry.iter().find(|t| t.spec().name == call.name) {
+                Some(tool) => match tool.validate_args(&call.args) {
+                    Ok(()) => match tool.execute(&call.args, &ctx) {
+                        Ok(output) => (true, output),
+                        Err(e) => (false, format!("error: {e}")),
+                    },
+                    Err(e) => (false, format!("invalid args: {e}")),
+                },
+                None => (false, format!("unknown tool: {}", call.name)),
+            };
+
+            let _ = on_event.send(serde_json::json!({
+                "type": "tool_result",
+                "iteration": iteration,
+                "name": call.name,
+                "ok": outcome.0,
+                "output": outcome.1,
+            }));
+
+            // Insert the tool-response turn. We use a content marker the
+            // formatter recognizes (chat_format.rs renders `<|tool_response>`
+            // from it, cache-coherently). User-role so it reads as the
+            // system's reply to the model's tool_call.
+            let response_marker = format!(
+                "{{\"__tool_response__\":true,\"name\":{},\"ok\":{},\"output\":{}}}",
+                serde_json::to_string(&call.name).unwrap_or_else(|_| "\"\"".into()),
+                outcome.0,
+                serde_json::to_string(&outcome.1).unwrap_or_else(|_| "\"\"".into())
+            );
+            let mut s = state.session.lock().await;
+            s.add_message(session::Role::User, response_marker);
+        }
+
+        tools_fired = true;
+        // Loop continues → next iteration decodes with the extended session.
+    }
+
+    // Iteration cap hit. The last assistant turn we committed was a tool-call
+    // turn; do one final no-tools decode so the user gets a prose reply
+    // rather than a dangling tool-call echo.
+    tracing::warn!(
+        iterations = tools::MAX_TOOL_ITERATIONS,
+        "tool agent loop hit iteration cap; forcing a final prose decode"
+    );
+    let final_result = run_local_or_echo(
+        state, on_event, system_prompt, window,
+        memory_block, world_state, Vec::new(),
+        context_size, on_chunk, cancel, backend_opt.as_ref(),
+    )
+    .await?;
+    Ok((final_result, tools_fired))
 }
 
 /// Cap on accumulated deferred delta attempts per queue (fail-proof contract
@@ -4228,7 +4428,7 @@ async fn fable_send(
             }
             let http = llm::HttpBackend::new(profile);
             match http
-                .stream(api_msgs, None, None, context_size, on_chunk.clone(), cancel.clone())
+                .stream(api_msgs, None, None, Vec::new(), context_size, on_chunk.clone(), cancel.clone())
                 .await
             {
                 Ok(out) => Some(out),
