@@ -32,6 +32,7 @@ pub mod layout;
 pub mod updater;
 pub mod user_profile;
 pub mod tools;
+pub mod system_codex;
 
 use std::sync::Arc;
 use tauri::{Emitter, Manager};
@@ -585,6 +586,51 @@ pub fn run() {
                         }
                     } else {
                         tracing::info!("no data/docs/ dir found; skipping user codex seed");
+                    }
+
+                    // ── Hidden system-log codex (Phase 4): a periodic background
+                    // task snapshots runtime state into the WUPI_SYSTEM_CARD_ID
+                    // partition so Wupi retrieves it via search_wupi_visible.
+                    // User-invisible by construction: no IPC touches that
+                    // partition. Reuses the just-set memory engine. The task
+                    // detaches + lives for process lifetime; errors are logged-
+                    // and-continued (memory is best-effort, same contract as
+                    // the episodic archiver).
+                    if let Some(engine) = state.memory.get() {
+                        let state_clone = state.inner().clone();
+                        let engine_clone = Arc::clone(engine);
+                        tokio::spawn(async move {
+                            // Initial snapshot at boot so Wupi knows her own
+                            // setup from the first chat turn.
+                            let snap = snapshot_system_state(&state_clone);
+                            if let Err(e) = system_codex::seed(&engine_clone, &snap).await {
+                                tracing::warn!(
+                                    error = %format!("{e}"),
+                                    "system_codex: initial snapshot failed"
+                                );
+                            }
+                            // Then every 60s. The reconcile is hash-gated, so
+                            // steady state = zero writes (unchanged snapshots
+                            // short-circuit before any embedding work).
+                            let mut interval = tokio::time::interval(
+                                std::time::Duration::from_secs(60),
+                            );
+                            // Skip the immediate first tick (we already
+                            // snapshotted above); the first interval tick fires
+                            // at 60s.
+                            interval.tick().await;
+                            loop {
+                                interval.tick().await;
+                                let snap = snapshot_system_state(&state_clone);
+                                if let Err(e) = system_codex::seed(&engine_clone, &snap).await {
+                                    tracing::debug!(
+                                        error = %format!("{e}"),
+                                        "system_codex: periodic snapshot failed"
+                                    );
+                                }
+                            }
+                        });
+                        tracing::info!("system_codex: periodic snapshot task spawned (60s interval)");
                     }
                 }
                 Err(e) => {
@@ -2818,6 +2864,26 @@ async fn chat_send(
             "tool_call": tools_fired,
         }))
         .map_err(|e| e.to_string())?;
+
+    // Phase 4: refresh the hidden system codex after a chat turn so Wupi's
+    // next retrieval has fresh state (session length, world schema, etc.).
+    // Detached + best-effort: the reconcile is hash-gated, so an unchanged
+    // snapshot is a cheap no-op. Errors logged-and-dropped (memory is best-
+    // effort, same contract as the episodic archiver).
+    //
+    // Snapshot BEFORE the spawn (the spawn needs 'static data; the tauri::State
+    // borrow doesn't outlive chat_send). snapshot_system_state is cheap (a few
+    // mutex locks held <10ms each), so running it on the chat path is fine.
+    if let Some(engine) = state.memory.get() {
+        let snap = snapshot_system_state(state.inner());
+        let engine = Arc::clone(engine);
+        tokio::spawn(async move {
+            if let Err(e) = system_codex::seed(&engine, &snap).await {
+                tracing::debug!(error = %format!("{e}"), "system_codex: post-chat snapshot failed");
+            }
+        });
+    }
+
     Ok(())
 }
 
@@ -3531,6 +3597,79 @@ fn effective_local_ctx(source: api::ModelSource, settings: &prompts::WupiSetting
     match source {
         api::ModelSource::Api => 2048,
         api::ModelSource::Local => settings.context_size,
+    }
+}
+
+/// Snapshot the runtime state for the hidden system codex
+/// (`WUPI_SYSTEM_CARD_ID`). Each lock is held only long enough to clone the
+/// value out — no mutex crosses an await. Returns a plain-data
+/// `SystemSnapshot` the writer can hash + embed without contention.
+///
+/// Best-effort: any lock failure degrades gracefully to None/empty (the
+/// snapshot is informational, not load-bearing — a partial snapshot is better
+/// than blocking the chat path).
+fn snapshot_system_state(state: &AppState) -> system_codex::SystemSnapshot {
+    let model_source = state
+        .model_source
+        .lock()
+        .ok()
+        .map(|g| *g);
+    let active_profile = state
+        .api_config
+        .lock()
+        .ok()
+        .and_then(|cfg| {
+            cfg.active_profile().map(|p| (p.name.clone(), p.model.clone()))
+        });
+    let active_card_id = state
+        .active_card_id
+        .lock()
+        .ok()
+        .map(|g| g.clone())
+        .unwrap_or_default();
+    let fable_active = state
+        .fable_engine
+        .lock()
+        .ok()
+        .map(|g| g.is_some())
+        .unwrap_or(false);
+    let fable_card_name = state
+        .active_fable_card
+        .lock()
+        .ok()
+        .and_then(|g| g.as_ref().map(|c| c.name.clone()));
+    // Session + schema locks are tokio mutexes — we can't hold them here
+    // (this fn is sync). The snapshot captures lengths/renderings via
+    // try_lock; on failure they degrade to 0/empty. This is acceptable
+    // because the snapshot is periodic (60s) + on chat completion, so a
+    // missed lock just means the next cycle picks up the change.
+    let (session_message_count, schema_delta_in_flight, world_schema_json) =
+        match state.session.try_lock() {
+            Ok(s) => {
+                let count = s.messages.len();
+                let schema_json = state
+                    .schema
+                    .try_lock()
+                    .map(|s| s.to_json_pretty())
+                    .unwrap_or_default();
+                let in_flight = state
+                    .pending_delta
+                    .try_lock()
+                    .map(|g| g.is_some())
+                    .unwrap_or(false);
+                (count, in_flight, schema_json)
+            }
+            Err(_) => (0, false, String::new()),
+        };
+    system_codex::SystemSnapshot {
+        model_source,
+        active_profile,
+        active_card_id,
+        fable_active,
+        fable_card_name,
+        session_message_count,
+        schema_delta_in_flight,
+        world_schema_json,
     }
 }
 
