@@ -26,7 +26,7 @@
 //! buffer is reset to cold, and the next request starts fresh. One bad turn
 //! must not kill the engine.
 
-use crate::chat_format::{ChatFormat, ModelFamily, ParsedOutput, ToolSpec};
+use crate::chat_format::{ChatFormat, ModelFamily, ParsedOutput};
 use crate::kv_buffer::{scan_turn_boundaries, truncate_to_fit, KvBuffer};
 use crate::session::ApiMessage;
 use crate::llm::ChunkFn;
@@ -96,6 +96,14 @@ pub struct EngineRequest {
     /// non-turn annotation shape. `None`/empty = no schema this turn (first
     /// turn before any deltas have landed, or schema engine unavailable).
     pub world_state: Option<String>,
+    /// Tool declarations rendered into the system turn by `Gemma4Format::
+    /// render_prompt` (chat_format.rs:177-183). Empty for the narrator path
+    /// (`fable_send`) and for the API path (the cloud model doesn't get tools
+    /// — only the local Wupi-assistant agent does). When non-empty, the model
+    /// may emit `<|tool_call>call:name{args}<tool_call|>` markers in its raw
+    /// output, which `chat_send` parses via `tools::parse_tool_calls` and
+    /// routes to the agent loop.
+    pub tools: Vec<crate::chat_format::ToolSpec>,
     /// One-shot reply: the engine fills this with the generation result (or an
     /// error). Using a separate channel (not the Tauri Channel) keeps the
     /// engine decoupled from Tauri's IPC types and lets `stream()` await it.
@@ -187,13 +195,14 @@ impl ChatEngine {
                                 cancel,
                                 memory_block,
                                 world_state,
+                                tools,
                                 reply,
                             } = *req;
 
                             // Self-healing: isolate each generation so one
                             // panic doesn't kill the thread.
                             let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
-                                || engine.generate(messages, memory_block.as_deref(), world_state.as_deref(), &on_chunk, &cancel),
+                                || engine.generate(messages, &tools, memory_block.as_deref(), world_state.as_deref(), &on_chunk, &cancel),
                             ));
                             let reply_msg = match outcome {
                                 Ok(Ok(parsed)) => EngineReply::Ok(parsed),
@@ -482,6 +491,7 @@ impl EngineRuntime {
     fn generate(
         &mut self,
         messages: Vec<ApiMessage>,
+        tools: &[crate::chat_format::ToolSpec],
         memory_block: Option<&str>,
         world_state: Option<&str>,
         on_chunk: &ChunkFn,
@@ -497,7 +507,6 @@ impl EngineRuntime {
                 conv.push(m.clone());
             }
         }
-        let tools: Vec<ToolSpec> = Vec::new();
         let prompt = self
             .formatter
             .render_prompt(&system, &conv, &tools, memory_block, world_state, true);
