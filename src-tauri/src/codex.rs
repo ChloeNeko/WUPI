@@ -452,7 +452,7 @@ fn parse_front_matter(front: Option<&str>, fallback_stem: &str) -> (String, Vec<
 /// Build the `metadata_json` string for a Codex entry. Hand-rolled JSON
 /// construction (the structure is fixed and small; a serde round-trip would be
 /// overkill). All values are JSON-escaped via `escape_json_string`.
-fn build_metadata_json(title: &str, tags: &[String], hash: u64, namespace: &str) -> String {
+pub(crate) fn build_metadata_json(title: &str, tags: &[String], hash: u64, namespace: &str) -> String {
     let title_escaped = escape_json_string(title);
     let tags_array = tags
         .iter()
