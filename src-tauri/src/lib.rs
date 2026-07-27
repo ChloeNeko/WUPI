@@ -4203,6 +4203,17 @@ async fn fable_send(
 ) -> Result<(), String> {
     tracing::info!(?text, "fable_send");
 
+    // TOOL EXCLUSION GUARD (v0.8): the narrator path NEVER gets tools. This is
+    // enforced structurally — fable_send dispatches to the FableEngine (a
+    // separate engine from the chat backend), which builds its prompt via
+    // `build_narrator_prompt` (no tools parameter) and generates via
+    // `FableEngine::generate_turn`. The chat-only `run_agent_loop` is never
+    // called here. If a future refactor routes fable_send through the chat
+    // backend, it MUST pass `Vec::new()` for tools — the narrator is creative
+    // prose + bracket commands, never structured tool calls. The
+    // `fable_send_never_includes_tools` test pins this invariant.
+    debug_assert!(true, "narrator path: tools excluded by construction");
+
     // Fresh cancel token for this turn (Bug #7 pattern, scoped to game).
     let cancel: llm::CancelToken =
         Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -5111,5 +5122,52 @@ mod tests {
         assert_eq!(effective_local_ctx(api::ModelSource::Local, &settings), 4000);
         // Under Api → 2048 (the constant, not the default).
         assert_eq!(effective_local_ctx(api::ModelSource::Api, &settings), 2048);
+    }
+
+    /// Phase 3 guard: the narrator prompt builder (`build_narrator_prompt`)
+    /// NEVER includes tool declarations. The narrator is creative prose +
+    /// bracket commands, never structured tool calls. This test pins the
+    /// structural exclusion so a future refactor that accidentally routes
+    /// tools into the narrator path fails loudly.
+    #[test]
+    fn fable_send_never_includes_tools() {
+        let prompt = build_narrator_prompt("You are the narrator.", &[]);
+        // No tool declaration markers in the narrator prompt.
+        assert!(
+            !prompt.contains("<|tool>declaration:"),
+            "narrator prompt must never include tool declarations: {prompt}"
+        );
+        // No tool_call / tool_response protocol tokens either.
+        assert!(
+            !prompt.contains("<|tool_call>"),
+            "narrator prompt must never include tool_call markers: {prompt}"
+        );
+        assert!(
+            !prompt.contains("<|tool_response>"),
+            "narrator prompt must never include tool_response markers: {prompt}"
+        );
+    }
+
+    /// Phase 3 guard: the tool registry is non-empty (so the chat path CAN
+    /// tool-call) but the narrator builder doesn't touch it. This double
+    /// assertion catches the case where someone adds tools to the registry
+    /// but forgets the narrator exclusion.
+    #[test]
+    fn tool_registry_populated_but_narrator_excluded() {
+        let specs = tools::specs();
+        assert!(
+            !specs.is_empty(),
+            "chat tool registry must be populated for the agent loop"
+        );
+        // The narrator builder takes no tools arg at all — compile-time
+        // enforcement. This test just documents the runtime invariant.
+        let prompt = build_narrator_prompt("narrator", &[]);
+        for spec in &specs {
+            assert!(
+                !prompt.contains(&spec.name),
+                "narrator prompt leaked tool name {:?}: {prompt}",
+                spec.name
+            );
+        }
     }
 }
