@@ -321,21 +321,20 @@ impl GenerationClient for HttpBackend {
             truncate_to_budget(&mut wire_messages, budget_chars);
 
             // Build the request body. `stream: true` requests SSE.
-            // Sampler params mirror the locked local-engine config (AGENTS.md
-            // §0 Sampler config): temp 1.0, top_p 0.95, min_p 0.1, top_k 0.
-            // min_p + top_k are llama.cpp-native and non-standard for the
-            // OpenAI /chat/completions contract: providers that don't
-            // recognize them should ignore them, and the few that reject
-            // unknown fields will surface a 400 (acceptable per the explicit
-            // "full mirror" decision; aligns the API path with local).
+            // Sampler params: temp 0.85 + top_p 0.95 ONLY. These are the
+            // OpenAI /chat/completions standard fields; min_p + top_k are
+            // llama.cpp-native and at least one major provider (z.ai / GLM-5.2)
+            // rejects unknown fields with HTTP 400 code 1210 ("Invalid API
+            // parameter"), forcing a silent fallback to local — which
+            // defeats the whole point of the API path. Cloud providers
+            // handle their own sampler internals behind temperature/top_p,
+            // so the llama.cpp-specific knobs add no value here anyway.
             let body = serde_json::json!({
                 "model": model,
                 "messages": wire_messages,
                 "stream": true,
-                "temperature": temperature.unwrap_or(1.0),
+                "temperature": temperature.unwrap_or(0.85),
                 "top_p": 0.95,
-                "min_p": 0.1,
-                "top_k": 0,
             });
 
             let response = client

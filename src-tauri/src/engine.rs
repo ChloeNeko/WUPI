@@ -711,7 +711,7 @@ impl EngineRuntime {
         cancel: &Arc<AtomicBool>,
     ) -> anyhow::Result<DecodeTelemetry> {
         let mut sampler = LlamaSampler::chain_simple([
-            LlamaSampler::temp(1.0),
+            LlamaSampler::temp(0.85),
             LlamaSampler::top_p(0.95, 1),
             LlamaSampler::min_p(0.1, 1),
             LlamaSampler::greedy(),

@@ -70,6 +70,18 @@ const SCHEMA_BATCH: u32 = 512;
 /// stop rambling. If it hits this cap the output likely isn't valid JSON
 /// anyway and the repair path or error path handles it.
 const SCHEMA_MAX_TOKENS: i32 = 256;
+/// Schema-engine sampler temperature. TASK-based, not source-based: schema
+/// tracking is a NON-creative JSON task whether the API or the local model is
+/// the active narrator. 0.2 flattens the distribution to near-greedy so the
+/// model commits to the structurally-correct token instead of a "creative"
+/// alternative (which would corrupt the delta and force the 3-pass repair
+/// loop to fire). The chat/narrator engines use their own NARRATIVE_TEMP
+/// (0.85) for prose — same local model, different task, different temp.
+/// 0.2 was chosen over strict greedy (the prior config) because at temp 0
+/// the model occasionally picks the first plausible token even when a
+/// slightly-less-likely one is the structurally-correct JSON shape; 0.2
+/// lets it consider both while still strongly favoring the high-prob pick.
+const SCHEMA_TEMP: f32 = 0.2;
 
 /// Maximum number of generation passes per delta attempt (initial + 2
 /// repairs = 3 total). The 4th-and-beyond cliff is empirically steep for
@@ -750,10 +762,30 @@ impl SchemaRuntime {
             consumed += take;
         }
 
-        // Sample-and-decode loop. Greedy (argmax): JSON wants determinism,
-        // and there's no ThoughtGate/StreamFilter here (the output is JSON,
-        // not the Gemma4 channel protocol). n_cur = next position to decode.
-        let mut sampler = LlamaSampler::greedy();
+        // Sample-and-decode loop. Temp-shaped greedy: the temperature scales
+        // the logits before argmax. Schema deltas are strict JSON — a NON-
+        // creative task — so we want near-greedy determinism: SCHEMA_TEMP
+        // (0.2) flattens the distribution enough that the model commits to
+        // the structurally-correct token instead of picking a "creative"
+        // alternative (which corrupts the delta and forces the 3-pass
+        // repair loop to fire). This temp is TASK-based, not source-based:
+        // schema tracking is non-creative JSON whether the API or local
+        // model is the active narrator — both modes produce the same kind
+        // of structured output here, so both use SCHEMA_TEMP. The chat/
+        // narrator engines use their own NARRATIVE_TEMP (0.85) for prose.
+        //
+        // No top_p / min_p in this chain. The chat/narrator sampler knobs
+        // shape creative-token diversity, which is the opposite of what
+        // structured JSON wants. Temp + greedy is the right minimal shape
+        // (matches the schema engine's original greedy intent, just
+        // temp-controllable for the rare ambiguous-JSON case where strict
+        // greedy picked the wrong first-token). No ThoughtGate/StreamFilter
+        // here either (output is JSON, not the Gemma4 channel protocol).
+        // n_cur = next position to decode.
+        let mut sampler = LlamaSampler::chain_simple([
+            LlamaSampler::temp(SCHEMA_TEMP),
+            LlamaSampler::greedy(),
+        ]);
         let eos = self.model.token_eos();
         let mut n_cur = n_prompt;
         let mut step_batch = LlamaBatch::new(1, 1);
