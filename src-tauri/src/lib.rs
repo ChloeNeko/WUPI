@@ -31,6 +31,7 @@ pub mod theme;
 pub mod layout;
 pub mod updater;
 pub mod user_profile;
+pub mod tools;
 
 use std::sync::Arc;
 use tauri::{Emitter, Manager};
