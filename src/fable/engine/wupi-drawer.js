@@ -30,6 +30,7 @@ let messagesEl = null;
 let inputEl = null;
 let toggleBtn = null;      // ▶ send / ■ stop toggle
 let activeBubble = null;   // streaming wupi bubble
+let activeToolChip = null; // tool-call status chip (Phase 5), null between turns
 let generating = false;    // tracks whether a chat_send turn is in flight
 let open = false;
 let locked = false;        // LOCK state: when true, mouseleave does NOT auto-close
@@ -270,6 +271,7 @@ async function sendWupiTurn(text) {
   const channel = new Channel();
   channel.onmessage = (msg) => handleEvent(msg, text);
 
+  activeToolChip = null;  // reset per-turn (Phase 5)
   activeBubble = startWupiBubble();
   setGenerating(true);
   try {
@@ -288,6 +290,31 @@ function handleEvent(msg, originalText) {
     case 'chunk':
       appendToBubble(activeBubble, msg.text);
       break;
+    case 'tool_call':
+      // Tool-calling agent loop (Phase 5): show a chip above the active
+      // bubble indicating Wupi is executing a tool. The chip morphs on
+      // tool_result. Lazily created so non-tool turns see nothing.
+      if (!activeToolChip && messagesEl && activeBubble) {
+        activeToolChip = document.createElement('div');
+        activeToolChip.className = 'drawer-tool-chip running';
+        messagesEl.insertBefore(activeToolChip, activeBubble);
+      }
+      if (activeToolChip) {
+        activeToolChip.className = 'drawer-tool-chip running';
+        activeToolChip.textContent = `🔧 ${msg.name || 'tool'}…`;
+        messagesEl.scrollTop = messagesEl.scrollHeight;
+      }
+      break;
+    case 'tool_result':
+      if (activeToolChip) {
+        activeToolChip.className = 'drawer-tool-chip ' + (msg.ok ? 'ok' : 'fail');
+        const out = String(msg.output || '').slice(0, 120);
+        activeToolChip.textContent = msg.ok
+          ? `✓ ${msg.name || 'tool'}${out ? ': ' + out : ''}`
+          : `✗ ${msg.name || 'tool'}: ${msg.output || 'failed'}`;
+        messagesEl.scrollTop = messagesEl.scrollHeight;
+      }
+      break;
     case 'fable_state_query':
       onFableStateQuery(msg.focus, msg.state);
       break;
@@ -295,6 +322,7 @@ function handleEvent(msg, originalText) {
       finalizeBubble(activeBubble, null);
       addWupiError(msg.message || 'Something went wrong.');
       activeBubble = null;
+      activeToolChip = null;
       setGenerating(false);
       break;
     case 'done':
@@ -302,6 +330,7 @@ function handleEvent(msg, originalText) {
         finalizeBubble(activeBubble, msg.final_text);
         activeBubble = null;
       }
+      activeToolChip = null;
       setGenerating(false);
       break;
   }

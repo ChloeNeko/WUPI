@@ -1721,6 +1721,45 @@ input[type="password"]::-webkit-credentials-auto-fill-button {
     padding-left: 12px;
     border-left: 2px solid rgba(181, 52, 250, 0.25);
 }
+/* Tool-calling agent loop chips (Phase 5). Small monospace status badges
+   that appear above the Wupi bubble while tools execute, then settle to a
+   success/failure tint. Subtle by design: tool surface is invisible to the
+   user; they just see Wupi "doing things" with quiet confirmation. */
+.msg.tool-chip,
+.drawer-tool-chip {
+    align-self: flex-start;
+    font-family: ui-monospace, "Cascadia Code", "Fira Code", monospace;
+    font-size: 11.5px;
+    padding: 4px 10px;
+    margin-bottom: 4px;
+    border-radius: 6px;
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    background: rgba(255, 255, 255, 0.04);
+    color: rgba(255, 255, 255, 0.6);
+    max-width: 80%;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    transition: background 0.2s, color 0.2s, border-color 0.2s;
+}
+.msg.tool-chip.running,
+.drawer-tool-chip.running {
+    color: rgba(181, 52, 250, 0.9);
+    border-color: rgba(181, 52, 250, 0.35);
+    background: rgba(181, 52, 250, 0.08);
+}
+.msg.tool-chip.ok,
+.drawer-tool-chip.ok {
+    color: rgba(120, 220, 140, 0.85);
+    border-color: rgba(120, 220, 140, 0.3);
+    background: rgba(120, 220, 140, 0.06);
+}
+.msg.tool-chip.fail,
+.drawer-tool-chip.fail {
+    color: rgba(255, 140, 120, 0.9);
+    border-color: rgba(255, 140, 120, 0.3);
+    background: rgba(255, 140, 120, 0.07);
+}
 .msg-error {
     align-self: center;
     background: rgba(255, 60, 60, 0.12);
