@@ -3371,12 +3371,34 @@ const dropdownMenu = document.getElementById('dropdownMenu');
       // clean prose live. The .streaming class on the bubble drives the
       // blinking caret CSS until `done` finalizes it.
       const channel = new Channel();
+      let toolChip = null;  // tool-call status chip, created on first tool_call
       channel.onmessage = (e) => {
         if (!e) return;
         if (e.type === 'chunk') {
           streamed += e.text || '';
           bubble.textContent = streamed;
           scrollBottom();
+        } else if (e.type === 'tool_call') {
+          // Tool-calling agent loop (Phase 5): show a small chip indicating
+          // Wupi is executing a tool. The chip morphs on tool_result.
+          // Created lazily so non-tool turns (the common case) see no chip.
+          if (!toolChip) {
+            toolChip = document.createElement('div');
+            toolChip.className = 'msg tool-chip';
+            msgsEl.insertBefore(toolChip, bubble);
+          }
+          toolChip.className = 'msg tool-chip running';
+          toolChip.textContent = `🔧 ${e.name || 'tool'}…`;
+          scrollBottom();
+        } else if (e.type === 'tool_result') {
+          if (toolChip) {
+            toolChip.className = 'msg tool-chip ' + (e.ok ? 'ok' : 'fail');
+            const out = String(e.output || '').slice(0, 120);
+            toolChip.textContent = e.ok
+              ? `✓ ${e.name || 'tool'}${out ? ': ' + out : ''}`
+              : `✗ ${e.name || 'tool'}: ${e.output || 'failed'}`;
+            scrollBottom();
+          }
         } else if (e.type === 'error') {
           setGenerating(false);
           // Replace the partial bubble with an error notice.
