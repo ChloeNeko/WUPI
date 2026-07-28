@@ -34,7 +34,10 @@ use std::path::Path;
 // Pull the player-state types in at the top of schema.rs so the new
 // `player_state` field + render can reference them unqualified. Sibling
 // module (declared in lib.rs); the structs themselves are pure data.
+use crate::consequence::StatusTag;
+use crate::offscreen_task::OffScreenTask;
 use crate::player_state::PlayerState;
+use crate::relationship::RelationshipState;
 
 /// The in-world clock (Fable Seam #4, 2026-07-27). Pure data: two `i64`
 /// minute-counters since the fixed ancient epoch 0001-01-01 (the same trick
@@ -305,6 +308,51 @@ pub struct WorldSchema {
     /// turn re-classifies).
     #[serde(default)]
     pub scene_pacing: ScenePacing,
+
+    /// Active qualitative buff/debuff tags with WorldClock expiry (Fable
+    /// Phase 3 Slice 4 wiring, 2026-07-28). Each tag carries a diegetic label
+    /// ("Berserk Rage", "Feverish", "Blessed by the Sun Priest"), a polarity,
+    /// and the in-world minute at which it expires (same epoch-minutes units
+    /// as `world_clock.current_minutes`). Rust is the SOLE authority —
+    /// `apply_delta` does NOT touch this field (mirrors `player_state` /
+    /// `world_clock` / `scene_pacing`). The only writers are: (1) the
+    /// `[EFFECT ...]` bracket command (creates a tag with timed expiry), (2)
+    /// the World Progression tick (drops expired tags via
+    /// `consequence::expire_tags`). The body's read-time-derived `Condition`
+    /// consumes the active tag counts — see `consequence::derive_condition`.
+    /// `#[serde(default)]` keeps pre-Phase-3 saves loadable as an empty list.
+    #[serde(default)]
+    pub status_tags: Vec<StatusTag>,
+
+    /// Per-NPC relationship state (Fable Phase 3 Slice 5 wiring, 2026-07-28).
+    /// Keyed by NPC id (matching the entity-map convention — e.g.
+    /// `"npc.marcus"`). Each value is a `RelationshipState` (tier, entered-at
+    /// timestamp, recorded events, volatility). Rust is the SOLE authority —
+    /// `apply_delta` does NOT touch this field (same Rust-authoritative
+    /// pattern). The only writers are: (1) the `[MILESTONE ...]` bracket
+    /// command (records an event), (2) the inline silent-strip helper that
+    /// upserts a Stranger→Acquaintance transition when the LLM emits an
+    /// accepted `rel.<npc>=acquaintance` write. Hostility-triggered
+    /// transitions fire lazily on render via `evaluate_transition`. The LLM
+    /// CANNOT directly write a gated tier — `strip_invalid_relationship_writes`
+    /// drops the attempt silently (per the architect directive: gated
+    /// escalations are silent-dropped, not repaired). `#[serde(default)]`
+    /// keeps pre-Phase-3 saves loadable as an empty map.
+    #[serde(default)]
+    pub relationships: HashMap<String, RelationshipState>,
+
+    /// Pending off-screen task queue (Fable Phase 3 Slice 6 wiring,
+    /// 2026-07-28). Each `OffScreenTask` carries an NPC id, description,
+    /// difficulty, suitability, and ETA (the in-world minute at which it
+    /// resolves). Rust is the SOLE authority — `apply_delta` does NOT touch
+    /// this field. The only writers are: (1) the `[TASK ...]` bracket command
+    /// (queues a task), (2) the World Progression tick (resolves due tasks
+    /// via `offscreen_task::resolve_expired_tasks` + drops resolved ones).
+    /// Resolved tasks emit directives into `pending_tick_directives` on
+    /// AppState, consumed by the next `fable_send`'s `<directives>` block.
+    /// `#[serde(default)]` keeps pre-Phase-3 saves loadable as an empty queue.
+    #[serde(default)]
+    pub offscreen_tasks: Vec<OffScreenTask>,
 }
 
 impl WorldSchema {

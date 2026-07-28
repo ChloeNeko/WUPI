@@ -45,19 +45,39 @@ use llama_cpp_2::llama_batch::LlamaBatch;
 use llama_cpp_2::model::{AddBos, LlamaModel};
 use llama_cpp_2::model::params::LlamaModelParams;
 use llama_cpp_2::sampling::LlamaSampler;
+use llama_cpp_2::token::logit_bias::LlamaLogitBias;
 use llama_cpp_2::token::LlamaToken;
 
 use crate::llm::{shared_backend, shared_model, CancelToken, ChunkFn};
 
-/// The game context's token budget. Cut from 4000 → 3072 (2026-07-26) to free
-/// VRAM headroom on 12 GB GPUs: the Q8_0 KV cache for a 12B at n_ctx=3072 is
-/// ~25% smaller than at 4000 (~300-400 MiB saved). The budget comfortably fits
-/// the narrator system prompt (~1000 tok) + the 4-beat local window (~800 tok)
-/// + the 1024-token generation reserve = ~2824, under 3072 with headroom. The
-/// API path uses a wider 16-message window (the cloud model has the budget).
-/// The front-truncation guard below protects against overflow on the rare turn
-/// where the prompt exceeds `FABLE_CTX - FABLE_MAX_TOKENS`.
-const FABLE_CTX: u32 = 3072;
+/// The game context's token budget.
+///
+/// **History:** originally 4000; cut to 3072 on 2026-07-26 (§2C) to free VRAM
+/// headroom on 12 GB GPUs (~300-400 MiB saved). At the time the narrator
+/// system prompt was ~1000 tokens, so 3072 fit comfortably.
+///
+/// **Raised back to 4096 on 2026-07-28** after the Phase 3 wiring playtest
+/// found the narrator system prompt had grown to ~5000 tokens (narrator_core
+/// 7.7KB + BRACKET_PROTOCOL 4.2KB after the Phase 3 anti-Oblivion + threat-
+/// tiers + RP-conventions + 3-new-bracket-command additions). At FABLE_CTX=
+/// 3072 the front-truncation guard chopped ~2900 tokens off the front of the
+/// system prompt, breaking the model's attention and producing the
+/// "hyphen-for-space" prose degradation documented in §11.26 ("Hyphen-token-
+/// glitch"). Raising to 4096 gives ~3072 tokens of prompt budget (4096 −
+/// 1024 gen reserve), enough for the full narrator system prompt + an 8-turn
+/// window without truncation.
+///
+/// **VRAM cost:** the Q8_0 KV cache at n_ctx=4096 is ~510 MiB (vs ~510 MiB
+/// at 3072 — the SWA cache dominates; the difference is ~100-150 MiB in the
+/// non-SWA cache). Under the §2B swap-lock only ONE of {chat, schema, fable}
+/// is resident at a time, so the +150 MiB is bounded. Stable on 12 GB with
+/// ~2 GB headroom (matches the original 4000-config headroom the §2C cut
+/// was protecting).
+///
+/// The API path uses a wider 16-message window (the cloud model has the
+/// budget). The front-truncation guard below protects against overflow on
+/// the rare turn where the prompt exceeds `FABLE_CTX - FABLE_MAX_TOKENS`.
+const FABLE_CTX: u32 = 4096;
 const FABLE_BATCH: u32 = 512;
 /// Cap on generated tokens for a single narrator turn. 1024 is generous for
 /// a narrative beat (2-4 paragraphs); the narrator system prompt tells the
@@ -82,6 +102,18 @@ struct FableRequest {
     /// engine, §2C). Distinct slot from `active_cancel` so game/chat cancels
     /// never cross-wire.
     cancel: CancelToken,
+    /// §11.43.B (2026-07-28): when true, the engine uses the DETERMINISTIC
+    /// "tracker" sampler chain (temp 0.2, top_p 0.9, DRY allowed_length=1)
+    /// instead of the creative narrator chain (temp 0.85, top_p 0.95, DRY
+    /// allowed_length=2). The tracker is an AGENT — it emits rigid
+    /// bracket/JSON state deltas, never prose — so it gets no stylistic
+    /// leeway and a tighter DRY to kill single-token loops like the
+    /// `(player)(player)` pathology (which slips past the narrator's
+    /// allowed_length=2 because the loop spans only 1-2 tokens per repeat).
+    /// The §11.42 API-mode tracker call site sets this true; every other
+    /// caller (LOCAL-mode narrator, API-mode fallback narrator) leaves it
+    /// false → existing behavior unchanged.
+    tracker_mode: bool,
     /// One-shot reply channel. Sent exactly once when the turn completes
     /// (success, cancel, or error).
     reply: mpsc::Sender<FableReply>,
@@ -125,6 +157,52 @@ pub struct FableEngine {
 // Mutex<Option<JoinHandle<()>>> is Send+Sync. No `LlamaContext` crosses out.
 unsafe impl Send for FableEngine {}
 unsafe impl Sync for FableEngine {}
+
+/// The per-turn sampler parameters that differ between the tracker and the
+/// narrator. Extracted to a pure helper so the §11.43.B "LOCAL mode is
+/// unchanged" contract can be unit-tested without inspecting `LlamaSampler`
+/// (whose stage list the llama_cpp_2 crate doesn't expose).
+///
+/// The `false` branch MUST stay byte-identical to the pre-§11.43.B chain —
+/// that's the "LOCAL mode unchanged" contract. The `sampler_config_returns_
+/// narrator_defaults_for_local_mode` test pins it.
+#[derive(Debug, PartialEq)]
+struct SamplerConfig {
+    temp: f32,
+    top_p: f32,
+    dry_multiplier: f32,
+    dry_base: f32,
+    /// `allowed_length` for the DRY stage. The narrator keeps the §11.41
+    /// value of 2 (preserves rhetorical anaphora); the tracker tightens to
+    /// 1 (kills single-token loops like `(player)(player)`).
+    dry_allowed_length: i32,
+}
+
+/// Returns the sampler profile for the requested turn mode. See
+/// [`SamplerConfig`] + the `sampler_config_*` tests for the pinned values.
+fn sampler_config(tracker_mode: bool) -> SamplerConfig {
+    if tracker_mode {
+        SamplerConfig {
+            temp: 0.2,
+            top_p: 0.9,
+            dry_multiplier: 0.8,
+            dry_base: 1.75,
+            dry_allowed_length: 1,
+        }
+    } else {
+        // The narrator profile. These are the pre-§11.43.B values; the
+        // `sampler_config_returns_narrator_defaults_for_local_mode` test
+        // pins them so any drift is caught. If you change these, update
+        // the test + AGENTS.md §11.41 + §11.43.B docs together.
+        SamplerConfig {
+            temp: 0.85,
+            top_p: 0.95,
+            dry_multiplier: 0.8,
+            dry_base: 1.75,
+            dry_allowed_length: 2,
+        }
+    }
+}
 
 impl FableEngine {
     /// Spawn the game thread. Loads `WUPI.gguf` (or whatever path resolves)
@@ -247,17 +325,24 @@ impl FableEngine {
     /// Post a narrator turn request. The caller awaits the reply via the
     /// receiver it created. The streaming chunks arrive via `on_chunk` *as
     /// they decode*: the reply comes once when generation completes.
+    ///
+    /// `tracker_mode` (§11.43.B): when true, selects the deterministic
+    /// tracker sampler chain. See [`FableRequest::tracker_mode`] for the
+    /// full rationale. Callers that don't care should pass `false` to get
+    /// the default narrator behavior.
     pub fn request_turn(
         &self,
         prompt: String,
         on_chunk: ChunkFn,
         cancel: CancelToken,
+        tracker_mode: bool,
     ) -> anyhow::Result<mpsc::Receiver<FableReply>> {
         let (reply_tx, reply_rx) = mpsc::channel::<FableReply>();
         let req = FableRequest {
             prompt,
             on_chunk,
             cancel,
+            tracker_mode,
             reply: reply_tx,
         };
         self.tx
@@ -351,9 +436,9 @@ impl FableRuntime {
     /// engine, §2B). Returns the full raw model output (Gemma4 channel
     /// protocol included: the caller parses/extracts).
     ///
-    /// Uses the locked sampler config (temp 1.0 + top_p 0.95 + min_p 0.1 +
-    /// greedy argmax): same as the chat engine (AGENTS.md "Sampler config
-    /// LOCKED"). Creative but not unhinged.
+    /// Uses the locked sampler config (temp 0.85 + top_p 0.95 + min_p 0.1 +
+    /// dist(0), probabilistic multinomial sampling): same as the chat engine
+    /// (AGENTS.md "Sampler config LOCKED"). Creative but not unhinged.
     ///
     /// No delta-prefill optimization for v1: each turn does a full
     /// prefill. The accepted §2F cold-reset tax on memory-injected turns
@@ -405,15 +490,127 @@ impl FableRuntime {
         }
 
         // Locked sampler config (see module doc + AGENTS.md).
-        // temp 0.85 (was 1.0 — narrative creativity at 0.85 + top_p 0.95 +
-        // min_p 0.1 matches the chat engine; the small drop tightens prose
-        // focus without sacrificing creativity).
-        let mut sampler = LlamaSampler::chain_simple([
-            LlamaSampler::temp(0.85),
-            LlamaSampler::top_p(0.95, 1),
-            LlamaSampler::min_p(0.1, 1),
-            LlamaSampler::greedy(),
-        ]);
+        //
+        // Chain order (load-bearing — see comments per stage):
+        //   1. temp 0.85  — scales logits for creativity.
+        //   2. top_p 0.95 + min_p 0.1 — truncate the candidate set.
+        //   3. dry(...)   — DRY sampler (§11.40.E follow-up fix 2026-07-28).
+        //      Purpose-built for sequence repetition: penalizes repeated
+        //      multi-token sequences (the smuggler-loop / tail-repetition
+        //      failure mode). DOES NOT suffer the penalties() failure mode
+        //      (repetition_penalty suppresses common tokens `the`/`is`/
+        //      `player` progressively, causing the `(player) is (player)`
+        //      common-token loop — REVERTED 2026-07-28); DRY only fires on
+        //      a sequence ≥ allowed_length tokens, so common tokens alone
+        //      are never penalized. Fires after min_p (sees the truncated
+        //      candidate set), before logit_bias (general shaping first,
+        //      token-specific hyphen override second, sample last —
+        //      llama.cpp convention). Conservative starting values:
+        //      multiplier 0.8 / base 1.75 (upstream default) /
+        //      allowed_length 2 (lets short bigrams repeat naturally) /
+        //      penalty_last_n -1 (whole-context lookback for sequence
+        //      detection). seq_breakers ["\n"] is the load-bearing
+        //      false-positive guard: resets the DRY window at every newline
+        //      so deliberate paragraph-level rhetorical anaphora /
+        //      parallelism that crosses a paragraph break is NEVER
+        //      penalized — DRY operates only within a single paragraph,
+        //      exactly where mechanical looping happens. A second
+        //      firewall (`stream_filter::truncate_repetition`) runs
+        //      post-generation on `parsed.prose` in lib.rs::fable_send as
+        //      the deterministic backstop for longer 4+-word loops that
+        //      slip past the sampler; the two layers are complementary.
+        //   4. logit_bias — negative bias on the hyphen token(s) (Bug B fix
+        //      2026-07-28: the model natively generates `local-brewed-ale`-
+        //      style hyphenated tokens; a -10.0 bias on the bare `-` token
+        //      before sampling makes the model reach for a space instead).
+        //      Gemma's SentencePiece tokenizer may encode `-` as multiple
+        //      surface forms (bare `-`, space-prefixed ` -`); we resolve
+        //      and bias ALL of them. Resolution failure → empty bias slice
+        //      → no-op stage (the chain shape stays stable).
+        //   5. dist(0)    — terminal multinomial sample. NOT bare (leaving
+        //      the chain without a terminal sampler triggers
+        //      `GGML_ASSERT(cur_p.selected >= 0)` in llama-sampler.cpp on
+        //      the first decode).
+        //
+        // ANTI-REPETITION (smuggler-loop fix): TWO LAYERS. (1) DRY sampler
+        // above (handles short token-sequence repetition at generation
+        // time). (2) PROMPT-LEVEL "CRITICAL — DO NOT REPEAT" clause in
+        // BRACKET_PROTOCOL (§11.40.C). (3) Deterministic post-generation
+        // `stream_filter::truncate_repetition` firewall on finalized prose.
+        // A prior attempt added `penalties(-1, 1.1, 0.0, 0.0)` as the first
+        // chain stage; it was REVERTED the same day after live testing — on
+        // Gemma 12B, repetition_penalty 1.1 suppresses common tokens (`the`,
+        // `is`, `player`) progressively, causing the model to loop on
+        // whatever high-logit token remains (the `(player) is (player)`
+        // regression). DRY replaced it because DRY structurally can't cause
+        // that failure mode (it only penalizes repeated *sequences*, not
+        // individual common tokens).
+        //
+        // HISTORY: this chain previously ended in `greedy()` — pure argmax
+        // after temp scaling, which made temp/top_p/min_p all no-ops (greedy
+        // always picks the highest logit regardless of the filtered
+        // distribution). Removed 2026-07-28 after the Phase 3 playtest: the
+        // silent greedy collapse was producing low-creativity deterministic
+        // prose. The seed is fixed at 0; a future pass can use a per-turn
+        // time-based seed for nondeterminism across re-rolls of the same input.
+        let hyphen_biases: Vec<LlamaLogitBias> = ["-", " -"]
+            .iter()
+            .filter_map(|s| {
+                self.model
+                    .str_to_token(s, AddBos::Never)
+                    .ok()
+                    .and_then(|v| v.first().copied())
+                    .map(|t| LlamaLogitBias::new(t, -10.0))
+            })
+            .collect();
+        let n_vocab = self.model.n_vocab();
+        // §11.43.B (2026-07-28): two sampler profiles sharing the same chain
+        // shape (temp → top_p → min_p → dry → logit_bias → dist). The tracker
+        // is an AGENT emitting rigid JSON/brackets — it gets a deterministic
+        // profile (low temp, tight top_p, aggressive DRY). The narrator keeps
+        // the existing creative profile (high temp, wide top_p, lenient DRY).
+        // The hyphen logit bias + dist(0) terminal are shared (Bug B defense
+        // applies to both; the chain needs a terminal sampler either way).
+        //
+        // Why DRY allowed_length=1 for the tracker: the `(player)(player)`
+        // loop we saw in the §11.42 playtest repeated a 1-2 token sequence
+        // that slipped under the narrator's allowed_length=2. Tightening to
+        // 1 penalizes any 2-token-sequence repeat, which kills the loop
+        // without affecting legitimate JSON field repetition (each JSON
+        // field name appears at most a few times per turn, well under the
+        // 3-repeat threshold the post-gen truncator would catch anyway).
+        // Not 0 — DRY at allowed_length=0 would penalize ANY 2-token
+        // sequence, mangling legitimate repetitions like `{ "type": "task",
+        // "task": ... }`.
+        let cfg = sampler_config(req.tracker_mode);
+        let mut sampler = if req.tracker_mode {
+            tracing::info!("sampler: tracker profile (temp=0.2, top_p=0.9, DRY allowed_length=1)");
+            LlamaSampler::chain_simple([
+                LlamaSampler::temp(cfg.temp),
+                LlamaSampler::top_p(cfg.top_p, 1),
+                LlamaSampler::min_p(0.1, 1),
+                LlamaSampler::dry(self.model, cfg.dry_multiplier, cfg.dry_base, cfg.dry_allowed_length, -1, ["\n"]),
+                LlamaSampler::logit_bias(n_vocab, &hyphen_biases),
+                LlamaSampler::dist(0),
+            ])
+        } else {
+            LlamaSampler::chain_simple([
+                LlamaSampler::temp(cfg.temp),
+                LlamaSampler::top_p(cfg.top_p, 1),
+                LlamaSampler::min_p(0.1, 1),
+                LlamaSampler::dry(self.model, cfg.dry_multiplier, cfg.dry_base, cfg.dry_allowed_length, -1, ["\n"]),
+                LlamaSampler::logit_bias(n_vocab, &hyphen_biases),
+                LlamaSampler::dist(0),
+            ])
+        };
+        if !hyphen_biases.is_empty() {
+            tracing::info!(
+                biased = hyphen_biases.len(),
+                "sampler: hyphen logit bias active (Bug B fix)"
+            );
+        } else {
+            tracing::warn!("sampler: could not resolve hyphen token — logit bias disabled");
+        }
         let eos = self.model.token_eos();
         let mut n_cur = n_prompt;
         let mut step_batch = LlamaBatch::new(1, 1);
@@ -431,11 +628,28 @@ impl FableRuntime {
         // The bracket parser in lib.rs reads `raw_output` (captured on this
         // thread, never filtered), so stripping here doesn't break scene_event
         // extraction — the two paths are independent.
+        //
+        // Chloe 2026-07-28 — bare `<|channel>` added AFTER `<|channel>thought`.
+        // The Gemma 4 protocol has many channel openers (`<|channel>reply`,
+        // `<|channel>analysis`, bare `<|channel>`, etc.); the original list
+        // only had `<|channel>thought`, so any non-thought opener leaked to
+        // the UI during streaming (runtime-discovered on a local-only RP
+        // session: `<channel>` markers flashing in the live feed). The bare
+        // opener catches every variant. ORDER IS LOAD-BEARING: the regex is
+        // built by joining markers with `|` in array order, and Rust's regex
+        // alternation is first-match-wins (NOT longest), so `<|channel>thought`
+        // MUST come before `<|channel>` — otherwise `<|channel>` (10 bytes)
+        // would match first on a thought-channel opener and leave the
+        // `thought` suffix as literal prose. The partial-prefix holdback in
+        // stream_filter still works either way (it holds on the longer marker
+        // when the chunk cuts the boundary), but the flush/strip pass relies
+        // on the regex order to take the longest match.
         let mut marker_filter = crate::stream_filter::StreamFilter::new(&[
             "<|turn>",
             "<turn|>",
             "<|think|>",
             "<|channel>thought",
+            "<|channel>",
             "<channel|>",
             "<audio|>",
             "<|tool_call>",
@@ -557,5 +771,70 @@ mod tests {
         assert!(FABLE_CTX >= 3072, "game context must fit system + 4-beat window + gen reserve");
         assert!(FABLE_BATCH >= 256, "batch must fit a chunk");
         assert!(FABLE_MAX_TOKENS >= 256, "max tokens must allow a meaty beat");
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // §11.43.B — Sampler-config tests. These pin the "LOCAL mode is
+    // unchanged" contract + the tracker-profile selection. They test the
+    // PURE helper (no LlamaSampler construction, no model loading) so they
+    // run in milliseconds and don't depend on the CUDA backend.
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// THE §11.43.B INVARIANT: the narrator profile (tracker_mode=false)
+    /// must be byte-identical to the pre-§11.43.B values. This is the
+    /// "LOCAL mode is unchanged" contract — LOCAL mode is the `false`
+    /// branch. If this test fails, a change to the narrator sampler has
+    /// either regressed LOCAL's behavior or shifted its profile without
+    /// updating AGENTS.md §11.41 + §11.43.B.
+    #[test]
+    fn sampler_config_returns_narrator_defaults_for_local_mode() {
+        let cfg = sampler_config(false);
+        // The pre-§11.43.B values from §11.41. Pinned here so any drift
+        // breaks the test, not silently ships.
+        assert_eq!(cfg.temp, 0.85, "narrator temp is the §11.41 value (0.85)");
+        assert_eq!(cfg.top_p, 0.95, "narrator top_p is the §11.41 value (0.95)");
+        assert_eq!(cfg.dry_multiplier, 0.8, "DRY multiplier from §11.41");
+        assert_eq!(cfg.dry_base, 1.75, "DRY base from §11.41 (upstream default)");
+        assert_eq!(
+            cfg.dry_allowed_length, 2,
+            "narrator DRY allowed_length=2 (the §11.41 value — preserves \
+             rhetorical anaphora). NOT 1 (that's the tracker's tighter value)."
+        );
+    }
+
+    /// The tracker profile (§11.43.B): deterministic + tighter DRY.
+    #[test]
+    fn sampler_config_returns_deterministic_tracker_profile() {
+        let cfg = sampler_config(true);
+        // The §11.43.B tracker values — chosen for deterministic JSON/bracket
+        // emission + tighter repetition penalty than the narrator.
+        assert_eq!(cfg.temp, 0.2, "tracker temp is LOW for deterministic output");
+        assert_eq!(cfg.top_p, 0.9, "tracker top_p is TIGHT (focus on high-prob tokens)");
+        assert!(cfg.temp < 0.5, "tracker temp must be well below the narrator's 0.85");
+        assert!(cfg.top_p < 0.95, "tracker top_p must be tighter than the narrator's 0.95");
+        assert_eq!(cfg.dry_multiplier, 0.8, "DRY multiplier same as narrator");
+        assert_eq!(cfg.dry_base, 1.75, "DRY base same as narrator");
+        assert_eq!(
+            cfg.dry_allowed_length, 1,
+            "tracker DRY allowed_length=1 — tighter than narrator's 2 to kill \
+             single-token loops like `(player)(player)`. NOT 0 (would penalize \
+             any 2-token sequence, mangling legitimate JSON field repetition)."
+        );
+    }
+
+    /// The two profiles must be DISTINCT. If they ever collapse to the same
+    /// values, the §11.43.B sampler split is a no-op (a regression in
+    /// intent even if not in behavior).
+    #[test]
+    fn sampler_config_tracker_and_narrator_are_distinct() {
+        let tracker = sampler_config(true);
+        let narrator = sampler_config(false);
+        assert_ne!(tracker, narrator, "tracker and narrator profiles must differ");
+        // The temp + top_p + dry_allowed_length must all be tighter for the
+        // tracker. (Multiplier/base are intentionally shared — only the
+        // sequence-length threshold differs.)
+        assert!(tracker.temp < narrator.temp);
+        assert!(tracker.top_p < narrator.top_p);
+        assert!(tracker.dry_allowed_length < narrator.dry_allowed_length);
     }
 }

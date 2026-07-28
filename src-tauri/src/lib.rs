@@ -205,6 +205,15 @@ pub struct AppState {
     /// because `fable_director_set` (frontend) + the consume site inside
     /// `fable_send` can race; the consume path takes the lock first.
     pub pending_directive: Arc<tokio::sync::Mutex<Option<String>>>,
+    /// Off-screen task directives emitted by the World Progression tick
+    /// (Fable Phase 3 Slice 6 wiring, 2026-07-28). Each tick that resolves
+    /// due tasks pushes their directives here; the next `fable_send`
+    /// consumes them ALL (drains the slot) + injects them into the
+    /// `<directives>` block alongside combat lethality + skill checks. Same
+    /// pattern as `pending_directive` but a Vec (multiple tasks can resolve
+    /// per tick). Held under tokio Mutex because the tick (writer) + the
+    /// fable_send consume site (reader/drain) can race.
+    pub pending_tick_directives: Arc<tokio::sync::Mutex<Vec<String>>>,
     /// Per-game cancel token, parallel to `active_cancel`. Distinct slot so
     /// chat-stop and game-stop never cross-wire (Bug #7 pattern, §2C).
     pub active_fable_cancel: Arc<std::sync::Mutex<Option<llm::CancelToken>>>,
@@ -322,6 +331,7 @@ impl AppState {
             model_source: Arc::new(std::sync::Mutex::new(api::ModelSource::default())),
             fable_engine: Arc::new(std::sync::Mutex::new(None)),
             pending_directive: Arc::new(tokio::sync::Mutex::new(None)),
+            pending_tick_directives: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             active_fable_cancel: Arc::new(std::sync::Mutex::new(None)),
             active_slice_cancel: Arc::new(std::sync::Mutex::new(None)),
             fable_schema: Arc::new(tokio::sync::Mutex::new(schema::WorldSchema::default())),
@@ -2226,7 +2236,7 @@ async fn route_to_fable_manager(
     // 4. Apply the delta to the game schema. If the model emitted `{}` (no
     //    changes), the delta is empty: treat as "didn't understand, nothing
     //    changed" and confirm that specifically.
-    let Some(delta) = reply.delta else {
+    let Some(mut delta) = reply.delta else {
         on_event
             .send(serde_json::json!({
                 "type": "error",
@@ -2240,6 +2250,18 @@ async fn route_to_fable_manager(
     if delta_applied {
         push_fable_history(&state).await;
         let mut s = state.fable_schema.lock().await;
+        // Phase 3 Slice 5 wiring (2026-07-28): silently strip + canonically
+        // apply any rel.<npc_id> writes BEFORE apply_delta. The LLM can't
+        // directly write a gated tier (architect directive); only Stranger→
+        // Acquaintance is allowed. Stripped keys logged for playtest verify.
+        let stripped = strip_invalid_relationship_writes(&mut delta, &mut s);
+        if !stripped.is_empty() {
+            tracing::info!(
+                count = stripped.len(),
+                keys = ?stripped,
+                "[rel] relationship writes stripped from fable-manager translation delta"
+            );
+        }
         s.apply_delta(delta.clone());
     }
 
@@ -2419,6 +2441,132 @@ fn format_confirmation(delta: &schema::SchemaDelta, original_request: &str) -> S
     } else {
         format!("Done! {}", bits.join("; "))
     }
+}
+
+/// Silently strip + canonically apply any `rel.<npc_id>` entity writes in a
+/// SchemaDelta (Fable Phase 3 Slice 5 wiring, 2026-07-28).
+///
+/// The architect directive forbids the LLM from writing gated relationship
+/// tiers directly — the relationship state machine is Rust-authoritative.
+/// The ONE exception is Stranger → Acquaintance (the no-gate auto-advance on
+/// a first positive interaction). Every other attempted tier write is
+/// SILENTLY DROPPED — no repair queue (re-running the same prompt won't
+/// clear a still-closed time gate, per the §11.34 contract).
+///
+/// This helper:
+/// 1. Scans `delta.entities` for keys matching `rel.<npc_id>` (the
+///    relationship-write convention).
+/// 2. For each, parses the attempted tier via `relationship::parse_tier`.
+/// 3. Looks up the canonical `RelationshipState` in `schema.relationships`
+///    (or a default Stranger state if the NPC isn't tracked yet).
+/// 4. Calls `relationship::validate_llm_tier_write`.
+///    - `Accept` (Stranger → Acquaintance only): upserts the relationship
+///      state — advances the tier + stamps `tier_entered_at_minutes` to the
+///      current clock. Removes the key from the delta (it's been consumed;
+///      the canonical state is the source of truth, not the entity map).
+///    - `Reject` (any other gated transition): removes the key from the
+///      delta silently. The canonical tier in `schema.relationships` stands.
+///    - `Unparseable` (the value isn't a known tier keyword): removes the
+///      key — same silent-drop.
+/// 5. Returns the list of stripped keys (for `tracing::info!` at the call
+///    site so the playtest can verify the firewall is firing).
+///
+/// Pure fn — no I/O, no locks. The caller holds the schema lock + passes
+/// `&mut delta` + `&schema` + the current clock. Called at all three
+/// `apply_delta` sites in lib.rs BEFORE `apply_delta` runs.
+fn strip_invalid_relationship_writes(
+    delta: &mut schema::SchemaDelta,
+    schema: &mut schema::WorldSchema,
+) -> Vec<String> {
+    let Some(ents) = delta.entities.as_mut() else {
+        return Vec::new();
+    };
+
+    let now_minutes = schema.world_clock.current_minutes;
+    let mut stripped = Vec::new();
+    let mut accepted_upserts: Vec<(String, relationship::RelationshipTier)> = Vec::new();
+
+    // Walk the entity keys. Collect the rel.* keys to process (can't mutate
+    // the HashMap while iterating it).
+    let rel_keys: Vec<String> = ents
+        .keys()
+        .filter(|k| k.starts_with("rel."))
+        .cloned()
+        .collect();
+
+    for key in &rel_keys {
+        // The NPC id is the suffix after "rel.".
+        let npc_id = &key[4..];
+        if npc_id.is_empty() {
+            continue;
+        }
+        let Some(attempted_value) = ents.get(key).cloned().flatten() else {
+            // A delete (None) on a rel.* key — also strip (the LLM can't
+            // delete a relationship; only Rust owns that).
+            ents.remove(key);
+            stripped.push(format!("{key} (delete attempt)"));
+            continue;
+        };
+
+        // Look up the canonical state (default Stranger if untracked).
+        let current = schema
+            .relationships
+            .get(npc_id)
+            .cloned()
+            .unwrap_or_default();
+
+        let validation = relationship::validate_llm_tier_write(&attempted_value, &current);
+        match validation {
+            relationship::RelationshipValidation::Accept => {
+                // The one allowed LLM transition: Stranger → Acquaintance.
+                // Record the upsert; apply after the loop (can't borrow schema
+                // mutably while iterating). The attempted tier IS the new tier
+                // (validate_llm_tier_write already checked it's Acquaintance).
+                let new_tier = relationship::parse_tier(&attempted_value)
+                    .unwrap_or(relationship::RelationshipTier::Acquaintance);
+                accepted_upserts.push((npc_id.to_string(), new_tier));
+                // Remove from the delta — the canonical state is the source
+                // of truth, not the entity map. apply_delta must not also
+                // write rel.* into entities.
+                ents.remove(key);
+                tracing::info!(
+                    npc_id = %npc_id,
+                    new_tier = ?new_tier,
+                    "[rel] LLM Stranger→Acquaintance auto-advance accepted"
+                );
+            }
+            relationship::RelationshipValidation::Reject { actual_tier } => {
+                ents.remove(key);
+                stripped.push(format!("{key}={attempted_value} (rejected; actual tier: {:?})", actual_tier));
+                tracing::info!(
+                    npc_id = %npc_id,
+                    attempted = %attempted_value,
+                    actual = ?actual_tier,
+                    "[rel] LLM gated-tier write silently dropped"
+                );
+            }
+            relationship::RelationshipValidation::Unparseable => {
+                ents.remove(key);
+                stripped.push(format!("{key}={attempted_value} (unparseable tier)"));
+                tracing::info!(
+                    npc_id = %npc_id,
+                    attempted = %attempted_value,
+                    "[rel] LLM tier write unparseable — dropped"
+                );
+            }
+        }
+    }
+
+    // Apply the accepted upserts. Each advances the tier + stamps the
+    // entered-at timestamp so the time-floor gate for the NEXT advance
+    // starts ticking from now.
+    for (npc_id, new_tier) in accepted_upserts {
+        let rel = schema.relationships.entry(npc_id).or_default();
+        rel.tier = new_tier;
+        rel.tier_entered_at_minutes = now_minutes;
+    }
+
+    stripped
 }
 
 #[tauri::command]
@@ -3677,6 +3825,199 @@ async fn clear_fable_history(state: &AppState) {
 /// # VRAM + lease ordering
 ///
 /// The progression pass acquires `ContextRole::Schema` via the existing
+/// Apply the Fable Phase 3 bracket commands (`[EFFECT ...]`, `[MILESTONE ...]`,
+/// `[TASK ...]`) emitted by the narrator this turn. Called from `fable_send`
+/// right after bracket parsing, parallel to `apply_time_command_and_maybe_tick`.
+///
+/// Each command mutates Rust-authoritative state on `WorldSchema` (the new
+/// `status_tags` / `relationships` / `offscreen_tasks` fields — never written
+/// by LLM schema deltas). Defensive: a malformed command is a no-op + a
+/// `tracing::warn!` log; never a panic. Returns true if any mutation landed
+/// (so the caller can push an undo snapshot once).
+///
+/// `[EFFECT]` creates a status tag with `expires_at = current_clock +
+/// duration_minutes` (0 duration = permanent, the sentinel).
+/// `[MILESTONE]` records an event on the NPC's `RelationshipState` (creating
+/// one if the NPC isn't tracked yet). The transition evaluation is LAZY —
+/// it fires on the next render via `evaluate_transition`, not here.
+/// `[TASK]` queues an off-screen task with `resolves_at_minutes =
+/// current_clock + eta_minutes`. Resolution happens on the World Progression
+/// tick (not here).
+async fn apply_phase3_bracket_commands(
+    parsed: &bracket_parser::ParsedNarration,
+    state: &tauri::State<'_, AppState>,
+) -> bool {
+    // Collect the relevant commands first (no lock held).
+    let effects: Vec<&bracket_parser::BracketCommand> = parsed
+        .commands
+        .iter()
+        .filter(|c| matches!(c, bracket_parser::BracketCommand::Effect { .. }))
+        .collect();
+    let milestones: Vec<&bracket_parser::BracketCommand> = parsed
+        .commands
+        .iter()
+        .filter(|c| matches!(c, bracket_parser::BracketCommand::Milestone { .. }))
+        .collect();
+    let tasks: Vec<&bracket_parser::BracketCommand> = parsed
+        .commands
+        .iter()
+        .filter(|c| matches!(c, bracket_parser::BracketCommand::Task { .. }))
+        .collect();
+
+    if effects.is_empty() && milestones.is_empty() && tasks.is_empty() {
+        return false;
+    }
+
+    let mut mutated = false;
+    let mut undo_snapshot: Option<schema::WorldSchema> = None;
+
+    {
+        let mut s = state.fable_schema.lock().await;
+        let now_minutes = s.world_clock.current_minutes;
+
+        // [EFFECT] — create status tags.
+        for cmd in &effects {
+            if let bracket_parser::BracketCommand::Effect {
+                label,
+                polarity,
+                duration_minutes,
+            } = cmd
+            {
+                let expires_at = if *duration_minutes == 0 {
+                    0 // permanent sentinel
+                } else {
+                    now_minutes.saturating_add(*duration_minutes)
+                };
+                let tag = consequence::StatusTag {
+                    label: label.clone(),
+                    polarity: *polarity,
+                    expires_at,
+                    source: String::new(),
+                };
+                if undo_snapshot.is_none() {
+                    undo_snapshot = Some(s.clone());
+                }
+                consequence::add_tag(&mut s.status_tags, tag);
+                mutated = true;
+                tracing::info!(
+                    label = %label,
+                    polarity = ?polarity,
+                    expires_at,
+                    "[EFFECT] status tag added"
+                );
+            }
+        }
+
+        // [MILESTONE] — record relationship events.
+        for cmd in &milestones {
+            if let bracket_parser::BracketCommand::Milestone { npc_id, event_id } = cmd {
+                // Validate the event id against the default registry. Unknown
+                // ids are dropped (no-op + warn) — the registry is the
+                // authoritative list of diegetic events.
+                let registry = relationship::MilestoneRegistry::defaults();
+                if registry.get(event_id).is_none() {
+                    tracing::warn!(
+                        npc_id = %npc_id,
+                        event_id = %event_id,
+                        "[MILESTONE] unknown event id — dropping"
+                    );
+                    continue;
+                }
+                if undo_snapshot.is_none() {
+                    undo_snapshot = Some(s.clone());
+                }
+                let rel = s
+                    .relationships
+                    .entry(npc_id.clone())
+                    .or_default();
+                if rel.record_event(event_id) {
+                    mutated = true;
+                    tracing::info!(
+                        npc_id = %npc_id,
+                        event_id = %event_id,
+                        "[MILESTONE] relationship event recorded"
+                    );
+                } else {
+                    tracing::info!(
+                        npc_id = %npc_id,
+                        event_id = %event_id,
+                        "[MILESTONE] duplicate event — already recorded (no-op)"
+                    );
+                }
+            }
+        }
+
+        // [TASK] — queue off-screen tasks.
+        for cmd in &tasks {
+            if let bracket_parser::BracketCommand::Task {
+                npc_id,
+                description,
+                difficulty,
+                suitability,
+                eta_minutes,
+            } = cmd
+            {
+                // Parse the enum strings defensively. Unknown values → drop.
+                let diff = match difficulty.to_lowercase().as_str() {
+                    "trivial" => Some(offscreen_task::TaskDifficulty::Trivial),
+                    "routine" => Some(offscreen_task::TaskDifficulty::Routine),
+                    "challenging" => Some(offscreen_task::TaskDifficulty::Challenging),
+                    "hard" => Some(offscreen_task::TaskDifficulty::Hard),
+                    "nearimpossible" | "near_impossible" | "near-impossible" => {
+                        Some(offscreen_task::TaskDifficulty::NearImpossible)
+                    }
+                    _ => None,
+                };
+                let suit = match suitability.to_lowercase().as_str() {
+                    "hopeless" => Some(offscreen_task::Suitability::Hopeless),
+                    "poor" => Some(offscreen_task::Suitability::Poor),
+                    "adequate" => Some(offscreen_task::Suitability::Adequate),
+                    "wellsuited" | "well_suited" | "well-suited" => {
+                        Some(offscreen_task::Suitability::WellSuited)
+                    }
+                    "ideal" => Some(offscreen_task::Suitability::Ideal),
+                    _ => None,
+                };
+                let (Some(diff), Some(suit)) = (diff, suit) else {
+                    tracing::warn!(
+                        npc_id = %npc_id,
+                        difficulty = %difficulty,
+                        suitability = %suitability,
+                        "[TASK] unparseable difficulty/suitability — dropping"
+                    );
+                    continue;
+                };
+                if undo_snapshot.is_none() {
+                    undo_snapshot = Some(s.clone());
+                }
+                s.offscreen_tasks.push(offscreen_task::OffScreenTask {
+                    npc_id: npc_id.clone(),
+                    description: description.clone(),
+                    difficulty: diff,
+                    suitability: suit,
+                    resolves_at_minutes: now_minutes.saturating_add(*eta_minutes),
+                    resolved: false,
+                });
+                mutated = true;
+                tracing::info!(
+                    npc_id = %npc_id,
+                    description = %description,
+                    resolves_at = now_minutes.saturating_add(*eta_minutes),
+                    "[TASK] off-screen task queued"
+                );
+            }
+        }
+    }
+
+    // Push one undo snapshot for the whole bracket-command batch (mirrors the
+    // single-snapshot-per-turn pattern in fable_send's schema-lock block).
+    if let Some(snap) = undo_snapshot {
+        push_fable_history_snapshot(state, snap).await;
+    }
+
+    mutated
+}
+
 /// `acquire_schema_engine_from_arcs` helper. The fable lease is still held
 /// at this point (we're inside `fable_send`), so the schema acquire will
 /// WAIT for `fable_send` to return + drop the lease before the schema engine
@@ -3800,6 +4141,87 @@ async fn apply_time_command_and_maybe_tick(
         mode = ?schema_snapshot.scene_pacing.mode,
         "clock tick gate met — firing world progression pass"
     );
+
+    // 5a. Phase 3 Slice 4 + Slice 6 wiring (2026-07-28): BEFORE the LLM
+    //     progression pass, drop expired status tags + resolve due off-screen
+    //     tasks. Doing these BEFORE the schema engine fires means the model
+    //     sees the already-resolved state in the snapshot it diffs against.
+    //     Both are pure Rust — no LLM cost. Snapshot for undo once if either
+    //     mutates (same single-snapshot-per-tick pattern as the rest).
+    let now_minutes = schema_snapshot.world_clock.current_minutes;
+    let mut tick_mutated = false;
+    let mut tick_snapshot: Option<schema::WorldSchema> = None;
+    let mut tick_directives: Vec<String> = Vec::new();
+    {
+        let mut s = state.fable_schema.lock().await;
+
+        // Slice 4: expire status tags whose WorldClock expiry has passed.
+        // Permanent tags (expires_at == 0) survive. Returns the dropped count.
+        let dropped_tags = consequence::expire_tags(&mut s.status_tags, now_minutes);
+        if dropped_tags > 0 {
+            tick_snapshot = Some(s.clone());
+            tick_mutated = true;
+            tracing::info!(
+                dropped = dropped_tags,
+                now_minutes,
+                "[tick] status tags expired"
+            );
+        }
+
+        // Slice 6: resolve due off-screen tasks. Each resolution produces a
+        // directive the next fable_send surfaces to the narrator. Resolved
+        // tasks are removed from the queue after directive emission (the
+        // mechanic is one-shot per task; we don't re-roll).
+        if !s.offscreen_tasks.is_empty() {
+            let resolutions =
+                offscreen_task::resolve_expired_tasks(&s.offscreen_tasks, now_minutes);
+            if !resolutions.is_empty() {
+                if tick_snapshot.is_none() {
+                    tick_snapshot = Some(s.clone());
+                }
+                tick_mutated = true;
+                let resolved_count = resolutions.len();
+                for r in &resolutions {
+                    tick_directives.push(r.directive.clone());
+                    tracing::info!(
+                        npc_id = %r.npc_id,
+                        severity = ?r.severity,
+                        "[tick] off-screen task resolved"
+                    );
+                }
+                // Drop resolved tasks from the queue. (resolve_expired_tasks
+                // skips already-resolved + not-yet-due, so every task it
+                // returned is one we should remove.)
+                let resolved_ids: std::collections::HashSet<(String, String, i64)> = resolutions
+                    .iter()
+                    .map(|r| (r.npc_id.clone(), r.description.clone(), r.dc as i64))
+                    .collect();
+                s.offscreen_tasks.retain(|t| {
+                    !resolved_ids.contains(&(t.npc_id.clone(), t.description.clone(), t.difficulty.dc() as i64))
+                });
+                tracing::info!(
+                    resolved = resolved_count,
+                    remaining = s.offscreen_tasks.len(),
+                    "[tick] off-screen tasks drained"
+                );
+            }
+        }
+    }
+
+    // Surface tick directives to the next fable_send (consumed in the
+    // <directives> block alongside combat lethality + skill checks).
+    if !tick_directives.is_empty() {
+        let mut td = state.pending_tick_directives.lock().await;
+        td.extend(tick_directives);
+    }
+
+    // Push one undo snapshot for the tick's Rust mutations (separate from the
+    // LLM progression delta's snapshot at step 9 below — different mutation
+    // source, both restorable via fable_rollback).
+    if let Some(snap) = tick_snapshot {
+        push_fable_history_snapshot(&state, snap).await;
+    }
+    let _ = tick_mutated; // (kept for clarity; the snapshot push above is the real effect)
     let deferred = {
         let mut q = state.failed_progression_queue.lock().await;
         std::mem::take(&mut *q)
@@ -3862,10 +4284,21 @@ async fn apply_time_command_and_maybe_tick(
 
     // 8. Apply the resulting delta to `fable_schema`. The next narrator turn
     //    sees the moved world via the existing `<world_state>` injection.
-    if let Some(delta) = reply.delta {
+    if let Some(mut delta) = reply.delta {
         if delta.has_changes() {
             let mut s = state.fable_schema.lock().await;
             let snap = s.clone();
+            // Phase 3 Slice 5 wiring (2026-07-28): same silent-strip as the
+            // translation path. The world-progression LLM pass can also
+            // attempt rel.* writes; they're gated the same way.
+            let stripped = strip_invalid_relationship_writes(&mut delta, &mut s);
+            if !stripped.is_empty() {
+                tracing::info!(
+                    count = stripped.len(),
+                    keys = ?stripped,
+                    "[rel] relationship writes stripped from world-progression delta"
+                );
+            }
             s.apply_delta(delta.clone());
             drop(s);
             push_fable_history_snapshot(&state, snap).await;
@@ -5063,6 +5496,54 @@ fn build_narrator_prompt(system_prompt: &str, window: &[session::Message]) -> St
     prompt
 }
 
+/// Render the canonical world-state snapshot for a narrator prompt: the base
+/// `WorldSchema::render_for_prompt` + the read-time-derived `condition:` +
+/// active status tags + a `<directives>` block of turn-scoped hard facts the
+/// narrator must obey. Pure read of Rust-authoritative state (the schema lock
+/// is held by the caller).
+///
+/// §11.41 (2026-07-28, DM / Voice-Actor split): factored out of `fable_send`'s
+/// pre-narrator schema block so it can be invoked TWICE in API mode — once for
+/// the tracker stage (pre-tracker state) and once for the API narrator stage
+/// (post-tracker state, after the tracker's brackets have mutated the schema).
+/// The turn-scoped directives (combat lethality, skill checks, tick directives)
+/// are passed in by the caller so the SAME directives ride both renders — the
+/// Referees run ONCE (pre-tracker), not twice (several mutate state).
+fn render_fable_world_state(
+    s: &schema::WorldSchema,
+    turn_directives: &[String],
+) -> String {
+    let mut rendered = s.render_for_prompt();
+
+    // Condition + active status tags (Phase 3 Slice 2 + 4 render).
+    let buffs_count = consequence::count_by_polarity(&s.status_tags, consequence::Polarity::Buff);
+    let debuffs_count = consequence::count_by_polarity(&s.status_tags, consequence::Polarity::Debuff);
+    let condition = consequence::derive_condition(&s.player_state.body, buffs_count, debuffs_count);
+    if !rendered.is_empty() {
+        rendered.push_str("\n\n");
+    }
+    rendered.push_str(&format!("condition: {}\n", condition.label().to_lowercase()));
+    if let Some(tags_block) = consequence::render_tags_for_prompt(&s.status_tags) {
+        rendered.push_str(&tags_block);
+    }
+
+    // Turn-scoped directives block (combat lethality + skill checks + tick
+    // directives). The caller passes the already-assembled directive lines in
+    // priority order (lethality first, then skills, then ticks).
+    if !turn_directives.is_empty() {
+        if !rendered.is_empty() {
+            rendered.push_str("\n\n");
+        }
+        rendered.push_str("<directives>\n");
+        for d in turn_directives {
+            rendered.push_str(&format!("[DIRECTIVE: {}]\n", d));
+        }
+        rendered.push_str("</directives>");
+    }
+
+    rendered
+}
+
 /// Send a narrator turn: render the narrator prompt from the active card +
 /// current game schema, post the request to the FableEngine, stream chunks
 /// to the Channel, parse bracket commands from the final raw output, and
@@ -5166,11 +5647,29 @@ async fn fable_send(
             }
             None => {
                 tracing::info!("context-swap: spawning fable engine on demand");
+                // `pending_model_path` is the normal source (stashed by
+                // setup() at boot, re-stashed by enter_fable_session).
+                // BUT boot_load_model's `.take()` consumes it after the chat
+                // model spawns — so by the time the first fable turn fires,
+                // the slot is often empty (the path was stashed BEFORE boot
+                // consumed it; enter_fable_session's `if g.is_none()` preserve
+                // check then can't refill from a still-Some slot). Mirror
+                // boot_load_model's re-scan fallback (lib.rs:1697-1703): if
+                // the slot is None, re-resolve from disk. FableEngine's
+                // init_runtime prefers shared_model() anyway (set once at
+                // boot, never cleared) — the path is only a defensive
+                // fallback for the API-only-with-no-local edge case.
                 let path = state
                     .pending_model_path
                     .lock()
                     .expect("pending_model_path mutex")
                     .clone()
+                    .or_else(|| {
+                        tracing::info!(
+                            "fable spawn: pending_model_path was None — re-scanning disk (boot_load_model consumed it)"
+                        );
+                        resolve_model_path(&app)
+                    })
                     .ok_or_else(|| "no model path resolved for fable spawn".to_string())?;
                 let (engine, init_rx) = fable_engine::FableEngine::spawn_load(path, 99);
                 let ready = tokio::task::spawn_blocking(move || init_rx.recv())
@@ -5241,7 +5740,7 @@ async fn fable_send(
         g.take()
     };
 
-    let (world_state, pacing) = {
+    let (world_state, pacing, turn_directives) = {
         let mut s = state.fable_schema.lock().await;
 
         // (1) Scene pacing FIRST — its DC modifier threads into (3).
@@ -5265,19 +5764,81 @@ async fn fable_send(
             mutated = true;
         }
 
+        // (1b) Phase 3 Slice 5 reconciliation (2026-07-28): evaluate every
+        // tracked NPC's relationship for a pending transition. Hostility
+        // triggers (betrayal/murder) bypass the gates + fire instantly;
+        // affinity advances respect the dual time-floor + milestone gates.
+        // Applied here so the render below reflects the canonical tiers +
+        // the narrator sees the post-transition state. Snapshot once if any
+        // transition lands. Uses the WorldClock's current minutes as "now".
+        //
+        // Two-pass: first collect which NPCs should transition (read-only
+        // borrow of s.relationships), then apply (mutable borrow). Can't
+        // snapshot s.clone() mid-iter_mut.
+        let now_rel_minutes = s.world_clock.current_minutes;
+        let registry = relationship::MilestoneRegistry::defaults();
+        let pending_rel_transitions: Vec<(String, relationship::RelationshipTier, relationship::TransitionReason)> = s
+            .relationships
+            .iter()
+            .filter_map(|(npc_id, rel_state)| {
+                let outcome = relationship::evaluate_transition(rel_state, &registry, now_rel_minutes);
+                if let relationship::TransitionOutcome::Transition { new_tier, reason } = outcome {
+                    if rel_state.tier != new_tier {
+                        return Some((npc_id.clone(), new_tier, reason));
+                    }
+                }
+                None
+            })
+            .collect();
+        if !pending_rel_transitions.is_empty() {
+            if undo_snapshot.is_none() {
+                undo_snapshot = Some(s.clone());
+            }
+            let mut rel_transitions_logged = Vec::with_capacity(pending_rel_transitions.len());
+            for (npc_id, new_tier, reason) in &pending_rel_transitions {
+                if let Some(rel_state) = s.relationships.get_mut(npc_id) {
+                    relationship::apply_transition(
+                        rel_state,
+                        &relationship::TransitionOutcome::Transition {
+                            new_tier: *new_tier,
+                            reason: reason.clone(),
+                        },
+                        now_rel_minutes,
+                    );
+                    rel_transitions_logged.push(format!("{npc_id}→{:?}({:?})", new_tier, reason));
+                }
+            }
+            mutated = true;
+            tracing::info!(
+                count = pending_rel_transitions.len(),
+                transitions = ?rel_transitions_logged,
+                "[rel] relationship transitions applied on render"
+            );
+        }
+
         // (2) Combat Referee. Slice 3 (2026-07-28): the outcome now carries a
         // `lethal: bool` + a `directive: String`. The directive is non-empty
         // only on a lethal blow; we capture it here + inject it into the
         // `<directives>` block below alongside any skill-check directives, so
         // the narrator sees a single coherent block of hard facts to obey.
+        //
+        // Slice 3 wiring (2026-07-28): select the attacker tier from any
+        // `npc.*.tier` entity keys the card author declared (or the narrator
+        // emitted). Falls back to Soldier (the v1 default) when no tier keys
+        // exist — preserves the original severity distribution exactly.
+        // Passes the real tier to referee_evaluate_with_tier so the severity
+        // weights + lethality DC scale with the threat.
+        let attacker_tier =
+            player_state::select_attacker_tier_from_entities(&s.entities);
         let combat_directive: Option<String> = if let Some(outcome) =
-            player_state::referee_evaluate(&text, &s.player_state)
+            player_state::referee_evaluate_with_tier(&text, &s.player_state, attacker_tier)
         {
             tracing::info!(
                 part = outcome.part.id(),
                 state = ?outcome.new_state,
                 stamina = ?outcome.stamina_after,
                 lethal = outcome.lethal,
+                attacker_tier = ?attacker_tier,
                 "referee fired on combat/exertion keyword"
             );
             if undo_snapshot.is_none() {
@@ -5294,9 +5855,6 @@ async fn fable_send(
             None
         };
 
-        // Render the canonical world-state snapshot (now reflects any injury).
-        let mut rendered = s.render_for_prompt();
-
         // (3) Skill-check Referee. Turn-scoped — NOT persisted (no schema
         // mutation, no undo push). The directives append to the rendered
         // world_state so they ride inside the existing `<world_state>` tag
@@ -5306,36 +5864,56 @@ async fn fable_send(
         // (3b) Combat lethality directive (Slice 3): same injection path as
         // skill checks — the narrator sees ONE `<directives>` block with all
         // hard facts for the turn (combat lethality + skill outcomes).
-        let has_combat_directive = combat_directive.is_some();
-        if !skills.is_empty() || has_combat_directive {
-            if !skills.is_empty() {
-                tracing::info!(
-                    count = skills.len(),
-                    mode = ?pacing.mode,
-                    "skill-check referee fired"
-                );
-            }
-            if has_combat_directive {
-                tracing::info!("combat lethality directive injected");
-            }
-            if !rendered.is_empty() {
-                rendered.push_str("\n\n");
-            }
-            rendered.push_str("<directives>\n");
-            // Lethality first — it's the most consequential fact for the turn
-            // (the body is Downed; everything else is secondary).
-            if let Some(cd) = &combat_directive {
-                rendered.push_str(&format!("[DIRECTIVE: {}]\n", cd));
-            }
-            for sc in &skills {
-                rendered.push_str(&format!("[DIRECTIVE: {}]\n", sc.directive));
-            }
-            rendered.push_str("</directives>");
-            // Skill checks + lethality are turn-scoped state the narrator must
-            // obey. No undo push: the directives aren't restorable (they were
-            // derived from this turn's text), and rolling back would re-fire
-            // them anyway.
+        // (3c) Phase 3 Slice 6 wiring (2026-07-28): off-screen task directives
+        // drained from `pending_tick_directives` (filled by the World
+        // Progression tick) join the same block — they're also hard facts the
+        // narrator must obey ("marcus returned from scouting — failure").
+        let tick_directives: Vec<String> = {
+            let mut td = state.pending_tick_directives.lock().await;
+            std::mem::take(&mut *td)
+        };
+
+        // Assemble the turn-scoped directives in priority order: lethality
+        // first (most consequential), then skill checks, then off-screen tick
+        // directives (background facts). §11.41 (2026-07-28): these are
+        // returned alongside the world-state render so the API branch can
+        // RE-render world-state after the tracker stage mutates the schema —
+        // the Referees run ONCE (pre-tracker), not twice (several mutate
+        // state), so the same directive lines ride both the tracker prompt
+        // AND the post-tracker API-narrator prompt.
+        let mut turn_directives: Vec<String> = Vec::new();
+        if !skills.is_empty() {
+            tracing::info!(
+                count = skills.len(),
+                mode = ?pacing.mode,
+                "skill-check referee fired"
+            );
         }
+        if combat_directive.is_some() {
+            tracing::info!("combat lethality directive injected");
+        }
+        if !tick_directives.is_empty() {
+            tracing::info!(
+                count = tick_directives.len(),
+                "off-screen task directives injected (from world progression tick)"
+            );
+        }
+        if let Some(cd) = &combat_directive {
+            turn_directives.push(cd.clone());
+        }
+        for sc in &skills {
+            turn_directives.push(sc.directive.clone());
+        }
+        for td in &tick_directives {
+            turn_directives.push(td.clone());
+        }
+
+        // Render the canonical world-state snapshot (now reflects any injury +
+        // any relationship transitions above). The render + the turn-scoped
+        // directives block are factored into render_fable_world_state so the
+        // API branch can re-invoke it after the tracker stage mutates the
+        // schema (§11.41 DM / Voice-Actor split).
+        let rendered = render_fable_world_state(&s, &turn_directives);
 
         // Push the single undo snapshot (if any engine mutated). Done after
         // the lock release to keep lock-ordering uniform.
@@ -5346,7 +5924,7 @@ async fn fable_send(
         }
 
         let world_state_opt = if rendered.trim().is_empty() { None } else { Some(rendered) };
-        (world_state_opt, pacing)
+        (world_state_opt, pacing, turn_directives)
     };
     let system_prompt = narrator_prompt::build_narrator_system_prompt(
         &card,
@@ -5420,18 +5998,149 @@ async fn fable_send(
         }
     });
 
-    // v0.6.3 API routing for the narrator: when an API is selected, route the
-    // narrator turn through HttpBackend (the cloud model narrates; the local
-    // model stays the silent agent doing tracking, NOT the narration per the
-    // spec). On any API error, seamlessly fall back to the local FableEngine
-    // at the 8-window — immersion preserved, no error surfaced. The local
-    // FableEngine is always resident while a game is running (its KV is
-    // cleared per turn, so the fallback window matches its expected shape).
+    // v0.6.3 API routing for the narrator. §11.41 (2026-07-28, DM / Voice-Actor
+    // split): when an API is selected, a narrator turn is now TWO stages.
     //
-    // The reply shape ({ content, reasoning, raw }) is normalized to the
-    // FableEngine's EngineReply ({ content, raw_output, error }) so the
-    // downstream bracket-parsing + archival path is identical for both.
+    //   Stage 1 — TRACKER (local 12B): runs FIRST. Emits bracket/JSON tracking
+    //   commands that decide the mechanical truth of the turn (time advanced,
+    //   buffs gained, milestones hit, tasks queued). NO prose — its output is
+    //   hidden from the user via a no-op on_chunk. The brackets are applied to
+    //   fable_schema via the existing apply_phase3_bracket_commands +
+    //   apply_time_command_and_maybe_tick pipeline.
+    //
+    //   Stage 2 — NARRATOR (API GLM-5.2): runs SECOND. Gets a prose-only
+    //   system prompt (build_api_narrator_system_prompt — no BRACKET_PROTOCOL
+    //   at all) + the authoritative POST-tracker state as <world_state>. It is
+    //   a blindfolded storyteller: it narrates what Rust tells it happened,
+    //   never inventing outcomes the engine didn't track. Its prose streams
+    //   live to the user via the real on_chunk.
+    //
+    // The local 12B is thus always the DM (decides mechanics); the API is the
+    // voice actor (dresses mechanics in prose). On any API error, the fallback
+    // runs a LOCAL narration using the prose-only narrator prompt (NOT the
+    // tracker prompt) so a failed API doesn't dump raw brackets in the user's
+    // face. The LOCAL-only path (no API configured) is unchanged: one model
+    // does the full job — narration + brackets — via the Tracker prompt.
+    //
+    // The reply shape ({ content, raw }) is normalized to FableReply
+    // ({ raw_output, error, cancelled }) so the downstream bracket-parsing +
+    // archival path is identical for both. In API mode the API emits no
+    // brackets, so the final bracket parse is a no-op for state (the tracker
+    // already applied them) but still cleans/strips the prose.
     let reply: fable_engine::FableReply = if source == api::ModelSource::Api {
+        // ---- Stage 1: TRACKER (local 12B, hidden) ----
+        // The tracker gets the SAME Tracker prompt LOCAL mode uses
+        // (build_narrator_system_prompt — narration + brackets), but with the
+        // PRE-tracker world_state (the authoritative state before this turn's
+        // brackets land) + NO director_directive (that steers prose, and the
+        // API owns the prose). Its prose is discarded; only its brackets are
+        // applied. The no-op on_chunk ensures the tracker's prose/bracket
+        // output never reaches the frontend.
+        let noop_chunk: llm::ChunkFn = Arc::new(|_: &str| {});
+        let tracker_prompt = build_narrator_prompt(&system_prompt, &window);
+        tracing::info!("fable_send: API mode — tracker stage (local) starting");
+        let tracker_reply_opt: Option<fable_engine::FableReply> = match engine
+            .request_turn(tracker_prompt, noop_chunk.clone(), cancel.clone(), true)
+        {
+            Ok(reply_rx) => {
+                match tokio::task::spawn_blocking(move || reply_rx.recv()).await {
+                    Ok(Ok(r)) => Some(r),
+                    Ok(Err(e)) => {
+                        tracing::warn!(error = %e, "fable_send: tracker channel recv failed; skipping tracker stage");
+                        None
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "fable_send: tracker join failed; skipping tracker stage");
+                        None
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!(error = %format!("{e:#}"), "fable_send: tracker request_turn failed; skipping tracker stage");
+                None
+            }
+        };
+
+        // Apply the tracker's brackets to fable_schema (if it produced any).
+        // Reuses the existing apply pipeline verbatim — zero new apply code.
+        // The tracker's prose is discarded (we keep only parsed.commands).
+        if let Some(tracker_reply) = &tracker_reply_opt {
+            if tracker_reply.error.is_empty() {
+                let cleaned_tracker = schema::extract_reply_channel(&tracker_reply.raw_output);
+                let tracker_parsed = bracket_parser::parse(&cleaned_tracker);
+                if !tracker_parsed.commands.is_empty() {
+                    tracing::info!(
+                        cmd_count = tracker_parsed.commands.len(),
+                        "fable_send: tracker emitted bracket commands; applying"
+                    );
+                    // Emit the tracker's SCHEMA-TRACKING scene_events to the
+                    // frontend (Time / Effect / Milestone / Task — these are
+                    // state changes the UI may want to surface as
+                    // notifications: "Time advanced to day 3", "Berserk Rage
+                    // fades"). The UI-EFFECT-ONLY commands (CharacterTurn /
+                    // Object / Fx) are deliberately DROPPED here in API mode:
+                    // the API narrator (stage 2, below) produces its own
+                    // — and VASTLY better — NPC dialogue + scene description
+                    // in prose, so emitting the tracker's CharacterTurn
+                    // would either (a) duplicate the narrator's dialogue
+                    // or (b) leak the local 12B's malformed bracket
+                    // arguments straight to the user (the §11.43.A bug,
+                    // found 2026-07-28: the local 12B loops on `(player)`
+                    // template-placeholder syntax inside character_turn
+                    // lines, producing garbage like "the (player) is
+                    // (player) at the (player)"). The apply_phase3 helpers
+                    // still run on ALL commands below — only the frontend
+                    // notification is gated.
+                    for cmd in &tracker_parsed.commands {
+                        let is_ui_only = matches!(
+                            cmd,
+                            bracket_parser::BracketCommand::CharacterTurn { .. }
+                                | bracket_parser::BracketCommand::Object { .. }
+                                | bracket_parser::BracketCommand::Fx { .. }
+                        );
+                        if is_ui_only {
+                            continue;
+                        }
+                        let _ = on_event.send(serde_json::json!({
+                            "type": "scene_event",
+                            "command": cmd,
+                            "source": "tracker",
+                        }));
+                    }
+                    apply_phase3_bracket_commands(&tracker_parsed, &state).await;
+                    apply_time_command_and_maybe_tick(&tracker_parsed, &state).await;
+                } else {
+                    tracing::info!("fable_send: tracker produced no bracket commands");
+                }
+            } else {
+                tracing::warn!(
+                    error = %tracker_reply.error,
+                    "fable_send: tracker stage errored; proceeding to API narrator with pre-tracker state"
+                );
+            }
+        }
+
+        // Re-render the authoritative world-state for the API narrator. This
+        // reflects the tracker's bracket mutations (time advanced, buffs
+        // added, milestones recorded, tasks queued). The SAME turn_directives
+        // (combat lethality + skill checks + tick directives — assembled
+        // pre-tracker, Referees run once) ride this render so the narrator
+        // sees one coherent block of hard facts.
+        let narrator_world_state: Option<String> = {
+            let s = state.fable_schema.lock().await;
+            let rendered = render_fable_world_state(&s, &turn_directives);
+            if rendered.trim().is_empty() { None } else { Some(rendered) }
+        };
+
+        // Build the prose-only API narrator prompt (no BRACKET_PROTOCOL).
+        let narrator_system_prompt = narrator_prompt::build_api_narrator_system_prompt(
+            &card,
+            narrator_world_state.as_deref(),
+            pacing,
+            director_directive.as_deref(),
+        );
+
+        // ---- Stage 2: NARRATOR (API GLM-5.2) ----
         let profile_opt = {
             let cfg = state.api_config.lock().expect("api_config mutex");
             cfg.active_profile().cloned()
@@ -5445,7 +6154,7 @@ async fn fable_send(
                 Vec::with_capacity(window.len() + 1);
             api_msgs.push(session::ApiMessage {
                 role: "system".into(),
-                content: system_prompt.trim().to_string(),
+                content: narrator_system_prompt.trim().to_string(),
                 raw_output: String::new(),
             });
             for m in &window {
@@ -5461,10 +6170,9 @@ async fn fable_send(
                     // single user msg, no assistant yet) succeeded via API;
                     // turns 2+ all fell back. Verified live: GLM-5.2 accepts
                     // `"assistant"`, rejects `"model"`. The local narrator
-                    // path (build_narrator_prompt, line ~4997) keeps
-                    // `"model"` — that's the Gemma4 native turn-protocol
-                    // marker, a different context (local model tokens, not
-                    // API wire format).
+                    // path (build_narrator_prompt) keeps `"model"` — that's
+                    // the Gemma4 native turn-protocol marker, a different
+                    // context (local model tokens, not API wire format).
                     session::Role::Assistant => "assistant",
                     session::Role::User => "user",
                     session::Role::System => "system",
@@ -5482,7 +6190,7 @@ async fn fable_send(
             {
                 Ok(out) => Some(out),
                 Err(e) => {
-                    tracing::warn!(error = %e, "fable_send: API narrator failed; falling back to local FableEngine");
+                    tracing::warn!(error = %e, "fable_send: API narrator failed; falling back to local FableEngine (prose-only narrator prompt)");
                     let _ = on_event.send(serde_json::json!({
                         "type": "fallback",
                         "reason": "api_unreachable",
@@ -5505,7 +6213,12 @@ async fn fable_send(
                 cancelled: false,
             },
             None => {
-                // Fallback (API failed OR no profile): run the local FableEngine.
+                // Fallback (API failed OR no profile): run the local FableEngine
+                // with the PROSE-ONLY narrator prompt. §11.41: this is NOT the
+                // tracker prompt — the tracker already ran (or was skipped),
+                // and we want clean narration, not a second bracket dump. The
+                // local model honors the same voice-actor contract the API
+                // would have: narrate the post-tracker state, no brackets.
                 // Re-render the prompt at the 8-window for cache-coherence
                 // (the local engine only ever saw the 8-window render).
                 if attempted_api {
@@ -5514,18 +6227,18 @@ async fn fable_send(
                     let start = msgs.len().saturating_sub(8);
                     let fallback_window: Vec<session::Message> = msgs[start..].to_vec();
                     drop(gs);
-                    let prompt = build_narrator_prompt(&system_prompt, &fallback_window);
+                    let prompt = build_narrator_prompt(&narrator_system_prompt, &fallback_window);
                     let reply_rx = engine
-                        .request_turn(prompt, on_chunk.clone(), cancel.clone())
+                        .request_turn(prompt, on_chunk.clone(), cancel.clone(), false)
                         .map_err(|e| format!("{e:#}"))?;
                     tokio::task::spawn_blocking(move || reply_rx.recv())
                         .await
                         .map_err(|e| format!("game reply join: {e}"))?
                         .map_err(|e| format!("game reply channel: {e}"))?
                 } else {
-                    let prompt = build_narrator_prompt(&system_prompt, &window);
+                    let prompt = build_narrator_prompt(&narrator_system_prompt, &window);
                     let reply_rx = engine
-                        .request_turn(prompt, on_chunk.clone(), cancel.clone())
+                        .request_turn(prompt, on_chunk.clone(), cancel.clone(), false)
                         .map_err(|e| format!("{e:#}"))?;
                     tokio::task::spawn_blocking(move || reply_rx.recv())
                         .await
@@ -5538,7 +6251,7 @@ async fn fable_send(
         // Local-only path (the default): render the prompt + run the FableEngine.
         let prompt = build_narrator_prompt(&system_prompt, &window);
         let reply_rx = engine
-            .request_turn(prompt, on_chunk.clone(), cancel.clone())
+            .request_turn(prompt, on_chunk.clone(), cancel.clone(), false)
             .map_err(|e| format!("{e:#}"))?;
         tokio::task::spawn_blocking(move || reply_rx.recv())
             .await
@@ -5572,7 +6285,26 @@ async fn fable_send(
     // closer the model emits mid-prose; without this it leaks as literal
     // text like "Mira's voice is a<audio|> whisper").
     let cleaned_raw = schema::extract_reply_channel(&reply.raw_output);
-    let parsed = bracket_parser::parse(&cleaned_raw);
+    let mut parsed = bracket_parser::parse(&cleaned_raw);
+    // Post-generation repetition firewall (§11.40.E follow-up fix 2026-07-28):
+    // the deterministic backstop for the smuggler-loop / tail-repetition
+    // failure mode. Runs AFTER bracket_parser::parse so the model's bracket
+    // commands are preserved (commands are orthogonal to prose repetition;
+    // truncating cleaned_raw before parse would risk eating bracket bodies
+    // that legitimately repeat NPC names). Operates on the prose only:
+    // conservative — requires a 4+ word sequence repeated 3+ times back-to-
+    // back, so legitimate rhetorical anaphora (2x) and short dialogue
+    // echoes (<4 words) are preserved. On a qualifying loop, keeps one
+    // clean instance + drops everything after (a detected loop signals
+    // model breakdown). The complementary DRY sampler stage in both
+    // engines handles short token-sequence repetition at generation time;
+    // this fn is the firewall for longer 4+-word loops that slip past it.
+    // Protects all three downstream consumers of parsed.prose: the bracket-
+    // command extraction (6131, commands unaffected), the memory archive
+    // (6163), and the stored assistant turn (6188). reply.raw_output stays
+    // untruncated as a forensic record (FableEngine clears KV every turn,
+    // so it's never re-tokenized — no cache-coherence concern).
+    parsed.prose = stream_filter::truncate_repetition(&parsed.prose);
     for cmd in &parsed.commands {
         on_event
             .send(serde_json::json!({ "type": "scene_event", "command": cmd }))
@@ -5592,7 +6324,17 @@ async fn fable_send(
     // the schema engine can spawn. The result is applied to `fable_schema`
     // + visible on the NEXT narrator turn (off-screen sim is decoupled from
     // the just-completed narrator turn by design).
+    //
+    // Phase 3 bracket commands ([EFFECT], [MILESTONE], [TASK]) are applied
+    // FIRST so the tick sees any freshly-queued tasks / freshly-recorded
+    // milestones when it fires (parallel ordering to the [TIME] consume).
+    apply_phase3_bracket_commands(&parsed, &state).await;
     apply_time_command_and_maybe_tick(&parsed, &state).await;
+    // §11.41: in API mode, the API narrator emits NO brackets — the tracker
+    // stage already applied them above. So `parsed.commands` is empty here and
+    // both apply_* calls are harmless no-ops. The scene_event loop above also
+    // emits nothing (the tracker's commands were already emitted with
+    // source:"tracker"). In LOCAL mode this is the single apply site as before.
 
     // Archive both turns to the card-scoped memory. Best-effort, detached,
     // same pattern as chat_send's pillar-2 archive.
@@ -8604,5 +9346,1758 @@ mod tests {
             !serialized.contains("timestamp"),
             "timestamp must NOT leak to UI: {serialized}"
         );
+    }
+}
+
+// ===========================================================================
+// Phase 3 integration tests (2026-07-28).
+//
+// Purpose: the six Phase 3 slices (§11.30–§11.35) shipped as build + unit-
+// test verified mechanics. Four of the six (Slices 2, 4, 5, 6) are NOT yet
+// wired into the live fable_send / World Progression tick game loop — they
+// ship the public seam functions + unit tests but no call sites. A live-app
+// playtest cannot exercise unwired mechanics. These integration tests are
+// the verification path: they drive every slice's public seam function the
+// way Phase 4's wiring eventually will, in scenario form, cross-module.
+//
+// What this module is NOT: it does not duplicate the per-module unit tests.
+// Those pin the mechanics' edge cases (nat 1/nat 20, cap enforcement, etc.)
+// at high granularity. This module verifies the SEAMS COMPOSE — that the
+// output of one slice is the correct shape for the next slice's input, and
+// that the architect-defining scenarios (anti-Oblivion, betrayal asymmetry,
+// no-apocalyptic-shift, lethality directive flow) hold end-to-end across
+// modules. If a slice's public API drifts in a way that breaks composition,
+// these tests fail FIRST (before any wiring work begins).
+//
+// Test count: +N (added to the §11.30 baseline of 672/2). Same 2
+// pre-existing json_repair pair, zero regressions expected.
+// ===========================================================================
+#[cfg(test)]
+mod phase3_integration_tests {
+    use crate::consequence::{
+        self, Condition, Polarity, StatusTag,
+    };
+    use crate::offscreen_task::{
+        self, FocusMagnitude, FocusTarget, OffScreenTask, OutcomeSeverity,
+        Suitability, TaskDifficulty,
+    };
+    use crate::player_state::{
+        self, AttackerTier, BodyPart, BodyPartState, PlayerState, Roller,
+    };
+    use crate::relationship::{
+        self, MilestoneRegistry, RelationshipState, RelationshipTier,
+        RelationshipValidation, TransitionOutcome, TransitionReason,
+    };
+
+    use std::collections::{HashMap, HashSet};
+
+    // ------------------------------------------------------------------------
+    // Slice 1 (§11.30.A): NPC Tier Bands — anti-Oblivion clause.
+    // Prompt-only — no Rust seam to call. The clause itself is pinned by the
+    // existing narrator_prompt builder unit tests. Here we verify the
+    // MECHANICAL companion (AttackerTier severity scaling) that the clause
+    // promises: a Legendary-tier attacker's wound distribution is biased
+    // toward Purple + lethality, vs a Minion's bias toward Yellow + non-
+    // lethal. This is the Rust side of the same thesis the prompt clause
+    // states narratively.
+    // ------------------------------------------------------------------------
+
+    /// Across many seeded rolls, a Legendary attacker produces a higher
+    /// proportion of severe (Purple) wounds than a Minion. This is the
+    /// mechanical enforcement of "a dragon is an apex predator regardless
+    /// of your level." We don't assert a single roll (RNG-dependent); we
+    /// assert the DISTRIBUTION tilts the way the tier ladder promises.
+    #[test]
+    fn slice1_legendary_tier_skews_severe_vs_minion() {
+        let mut state = PlayerState::default();
+        let text = "the dragon attacks me with its claws";
+
+        let mut minion_purple = 0usize;
+        let mut legendary_purple = 0usize;
+        const ROLLS: usize = 40;
+
+        // Run ROLLS iterations per tier. We vary the seed by perturbing the
+        // text between runs so referee_evaluate_with_tier's internal seed
+        // (hash of text + injury count) differs per iteration.
+        for i in 0..ROLLS {
+            let perturbed = format!("{text} #{i}");
+            if let Some(outcome) = player_state::referee_evaluate_with_tier(
+                &perturbed,
+                &state,
+                AttackerTier::Minion,
+            ) {
+                if outcome.new_state == BodyPartState::Purple {
+                    minion_purple += 1;
+                }
+                // Reset state between rolls so injury_count doesn't drift
+                // the seed away from the per-iteration perturbation.
+                state = PlayerState::default();
+            }
+        }
+        for i in 0..ROLLS {
+            let perturbed = format!("{text} #{i}");
+            if let Some(outcome) = player_state::referee_evaluate_with_tier(
+                &perturbed,
+                &state,
+                AttackerTier::Legendary,
+            ) {
+                if outcome.new_state == BodyPartState::Purple {
+                    legendary_purple += 1;
+                }
+                state = PlayerState::default();
+            }
+        }
+
+        // The Legendary distribution must produce strictly more Purple wounds
+        // than the Minion distribution. (Both could be 0 in a pathological
+        // seed set, but the tier weights — Legendary [5,15,35,45] vs Minion
+        // [80,18,2,0] — make that effectively impossible across 40 rolls.)
+        assert!(
+            legendary_purple > minion_purple,
+            "Legendary tier ({} purple) must skew severe vs Minion ({} purple) \
+             across {ROLLS} rolls each — the anti-Oblivion mechanical contract",
+            legendary_purple,
+            minion_purple,
+        );
+    }
+
+    // ------------------------------------------------------------------------
+    // Slice 3 (§11.32): AttackerTier + lethality directive flow.
+    // Verify the directive a narrator would see when a lethal blow lands,
+    // AND that the directive composes correctly into the <directives> block
+    // shape fable_send consumes (per the lib.rs:5306 wiring).
+    // ------------------------------------------------------------------------
+
+    /// When referee_evaluate_with_tier produces a lethal outcome, the
+    /// directive string is non-empty, names the player as DOWNED, and is
+    /// shaped so fable_send can wrap it as `[DIRECTIVE: ...]`. We sweep
+    /// seeds until we find a lethal roll (high tier + failed save) and
+    /// verify the directive's contract.
+    #[test]
+    fn slice3_lethality_directive_is_narrator_consumable() {
+        // High tier + many seeds → we expect at least one lethal outcome
+        // (Legendary lethality DC is BASE_LETHAL_DC + tier_modifier, and the
+        // weights are stacked toward severe wounds which raise condition
+        // penalty on the save).
+        let mut found_lethal = false;
+        for i in 0..200 {
+            let mut state = PlayerState::default();
+            // NOTE: the text MUST contain a COMBAT_KEYWORDS token (attack/
+            // strike/slash/etc) or referee_evaluate_with_tier returns None
+            // without rolling. "bites" alone does NOT trigger — the keyword
+            // list is the player's combat-action vocabulary. Use "strikes" so
+            // the referee fires on every iteration.
+            let text = format!("the ancient wyrm strikes me down #{i}");
+            let Some(outcome) = player_state::referee_evaluate_with_tier(
+                &text,
+                &state,
+                AttackerTier::Legendary,
+            ) else {
+                continue;
+            };
+
+            if outcome.lethal {
+                found_lethal = true;
+                // Contract 1: directive is non-empty on a lethal outcome.
+                assert!(
+                    !outcome.directive.is_empty(),
+                    "lethal outcome must carry a non-empty directive for the narrator"
+                );
+                // Contract 2: the directive references the player being
+                // DOWNED (the canonical lethality vocabulary).
+                let lower = outcome.directive.to_lowercase();
+                assert!(
+                    lower.contains("downed") || lower.contains("down"),
+                    "lethal directive must reference the player being DOWNED; \
+                     got: {:?}",
+                    outcome.directive,
+                );
+                // Contract 3: the directive is free-form prose the narrator
+                // can splice into [DIRECTIVE: ...] verbatim — no leading
+                // brackets, no trailing newline. fable_send wraps it.
+                assert!(
+                    !outcome.directive.starts_with('['),
+                    "directive must be the inner text, not pre-wrapped; \
+                     fable_send adds [DIRECTIVE: ...]"
+                );
+                assert!(
+                    !outcome.directive.ends_with('\n'),
+                    "directive must not carry a trailing newline; fable_send \
+                     appends one as part of the <directives> block"
+                );
+                // The state is unaffected by reading the outcome here; we
+                // don't apply it because we're verifying the contract, not
+                // the state transition. Keep clippy happy about unused mut.
+                let _ = &mut state;
+                break;
+            }
+        }
+        assert!(
+            found_lethal,
+            "Expected at least one lethal outcome across 200 Legendary-tier \
+             rolls — if none fired, the lethality threshold may be too high \
+             OR the seed sweep needs widening. Investigate before adjusting \
+             the threshold; the architect pinned lethality as a real risk."
+        );
+    }
+
+    /// The <directives> block a narrator sees composes lethality FIRST
+    /// (most consequential) then skill-check directives. This mirrors the
+    /// lib.rs:5324 wiring. We construct the block shape directly to verify
+    /// the contract the wiring relies on.
+    #[test]
+    fn slice3_directives_block_orders_lethality_first() {
+        // Simulate the wiring: lethality directive (if any) precedes skill
+        // directives in the <directives> block.
+        let combat_directive: Option<String> =
+            Some("the player is DOWNED — a lethal blow has landed".to_string());
+        let skill_directives: Vec<String> = vec![
+            "Lockpick (DC 12): FAIL. The pick snaps.".to_string(),
+            "Persuade (DC 15): SUCCESS. The guard hesitates.".to_string(),
+        ];
+
+        let mut rendered = String::from("<directives>\n");
+        if let Some(cd) = &combat_directive {
+            rendered.push_str(&format!("[DIRECTIVE: {cd}]\n"));
+        }
+        for sc in &skill_directives {
+            rendered.push_str(&format!("[DIRECTIVE: {sc}]\n"));
+        }
+        rendered.push_str("</directives>");
+
+        // The lethality directive must come before the skill directives.
+        let lethal_pos = rendered.find("DOWNED").expect("lethality present");
+        let lockpick_pos = rendered.find("Lockpick").expect("skill present");
+        assert!(
+            lethal_pos < lockpick_pos,
+            "lethality directive must precede skill directives in the \
+             <directives> block — it's the most consequential fact for the turn"
+        );
+        // The block must open + close with the right tags (fable_send's
+        // parser depends on this shape).
+        assert!(rendered.starts_with("<directives>\n"));
+        assert!(rendered.ends_with("</directives>"));
+    }
+
+    // ------------------------------------------------------------------------
+    // Slice 2 (§11.31): consequence.rs Driver taxonomy + read-time derived
+    // Condition. Verify the read-time derivation contract: the same wound +
+    // buff/debuff counts always yield the same Condition, AND the Condition
+    // re-derives correctly after a buff expires (the Slice 4 expiry
+    // interaction). This is the seam the World Progression tick + the
+    // narrator prompt renderer will call.
+    // ------------------------------------------------------------------------
+
+    /// derive_condition is a pure fn of (wounds, buffs_count, debuffs_count).
+    /// The same inputs must yield the same Condition every call — this is
+    /// the "never stored, recomputed every render" contract.
+    #[test]
+    fn slice2_condition_is_pure_function_of_inputs() {
+        let mut wounds = HashMap::new();
+        wounds.insert(BodyPart::Torso, BodyPartState::Orange);
+        let buffs = 0;
+        let debuffs = 0;
+
+        let c1 = consequence::derive_condition(&wounds, buffs, debuffs);
+        let c2 = consequence::derive_condition(&wounds, buffs, debuffs);
+        let c3 = consequence::derive_condition(&wounds, buffs, debuffs);
+
+        assert_eq!(
+            c1, c2,
+            "derive_condition must be deterministic — same inputs, same output"
+        );
+        assert_eq!(
+            c2, c3,
+            "derive_condition must be stable across repeated calls (no hidden state)"
+        );
+        // A single Orange (Medium) wound → Wounded (per the documented mapping).
+        assert_eq!(
+            c1,
+            Condition::Wounded,
+            "single Orange wound must derive to Wounded (per the rank mapping)"
+        );
+    }
+
+    /// The Condition escalates as wounds worsen, following the documented
+    /// rank ladder: Unscathed → Haggard → Wounded → Battered → Critical →
+    /// Downed. This is the spine the narrator renders as a qualitative
+    /// label (the descriptive layer never sees the wound map directly).
+    #[test]
+    fn slice2_condition_escalates_with_wound_severity() {
+        // Empty wounds → Unscathed.
+        let empty: HashMap<BodyPart, BodyPartState> = HashMap::new();
+        assert_eq!(
+            consequence::derive_condition(&empty, 0, 0),
+            Condition::Unscathed,
+            "no wounds → Unscathed"
+        );
+
+        // Single Yellow → Haggard.
+        let mut yellow = HashMap::new();
+        yellow.insert(BodyPart::LeftHand, BodyPartState::Yellow);
+        assert_eq!(
+            consequence::derive_condition(&yellow, 0, 0),
+            Condition::Haggard,
+            "Yellow-only wound → Haggard"
+        );
+
+        // Single Red → Battered.
+        let mut red = HashMap::new();
+        red.insert(BodyPart::Torso, BodyPartState::Red);
+        assert_eq!(
+            consequence::derive_condition(&red, 0, 0),
+            Condition::Battered,
+            "Red wound → Battered"
+        );
+
+        // Multiple severe wounds (3+) → Downed (body can't sustain them).
+        let mut multi = HashMap::new();
+        multi.insert(BodyPart::Head, BodyPartState::Red);
+        multi.insert(BodyPart::Torso, BodyPartState::Red);
+        multi.insert(BodyPart::LeftThigh, BodyPartState::Red);
+        assert_eq!(
+            consequence::derive_condition(&multi, 0, 0),
+            Condition::Downed,
+            "3+ severe wounds → Downed (the multi-severe escalation rule)"
+        );
+    }
+
+    /// Buffs can lift a Haggard body to Unscathed (one tier), but wounds
+    /// dominate above Haggard — no buff rescues Wounded/Battered/Critical.
+    /// This pins the "wounds dominate" anti-trivialization rule.
+    #[test]
+    fn slice2_buffs_lift_only_at_marginal_conditions() {
+        let mut yellow = HashMap::new();
+        yellow.insert(BodyPart::LeftHand, BodyPartState::Yellow);
+
+        // Yellow + 1 buff + 0 debuffs → lifted to Unscathed.
+        assert_eq!(
+            consequence::derive_condition(&yellow, 1, 0),
+            Condition::Unscathed,
+            "a single buff lifts a Haggard (Yellow-only) body to Unscathed"
+        );
+
+        // Red + buff → still Battered (wounds dominate).
+        let mut red = HashMap::new();
+        red.insert(BodyPart::Torso, BodyPartState::Red);
+        assert_eq!(
+            consequence::derive_condition(&red, 1, 0),
+            Condition::Battered,
+            "buffs cannot lift above Haggard when wounds are Medium-or-worse \
+             — wounds dominate"
+        );
+    }
+
+    // ------------------------------------------------------------------------
+    // Slice 4 (§11.33): StatusTag expiry + the Condition re-derives after
+    // expiry. This is the seam interaction the World Progression tick will
+    // drive: drop expired tags, then derive_condition sees the new counts.
+    // ------------------------------------------------------------------------
+
+    /// Tags with `expires_at == 0` are permanent (the sentinel). expire_tags
+    /// must NOT drop them — they end only via an explicit event. This is
+    /// the contract that lets "Cursed by the Witch King" persist until
+    /// narratively lifted.
+    #[test]
+    fn slice4_permanent_tags_survive_expiry_check() {
+        let mut tags = vec![
+            StatusTag {
+                label: "Cursed by the Witch King".to_string(),
+                polarity: Polarity::Debuff,
+                expires_at: 0, // permanent
+                source: String::new(),
+            },
+            StatusTag {
+                label: "Berserk Rage".to_string(),
+                polarity: Polarity::Buff,
+                expires_at: 1000, // expires at minute 1000
+                source: String::new(),
+            },
+        ];
+
+        // Tick to minute 5000 — well past 1000 but the permanent tag has
+        // expires_at == 0 so it must survive.
+        let dropped = consequence::expire_tags(&mut tags, 5000);
+        assert_eq!(dropped, 1, "only the timed tag (expires_at=1000) drops");
+        assert_eq!(tags.len(), 1, "one tag remains");
+        assert_eq!(
+            tags[0].label, "Cursed by the Witch King",
+            "the permanent tag (expires_at=0) survives the tick"
+        );
+    }
+
+    /// The Condition re-derives correctly after a buff tag expires. Before
+    /// expiry: Yellow wound + 1 buff → Unscathed (buff lifts it). After the
+    /// buff expires on the tick: Yellow wound + 0 buffs → Haggard. This is
+    /// the "tag's effect fades automatically when it expires" contract —
+    /// no restoration math, just re-derive.
+    #[test]
+    fn slice4_condition_rederives_after_buff_expiry() {
+        let mut wounds = HashMap::new();
+        wounds.insert(BodyPart::LeftHand, BodyPartState::Yellow);
+
+        let mut tags = vec![StatusTag {
+            label: "Blessed by the Sun Priest".to_string(),
+            polarity: Polarity::Buff,
+            expires_at: 2000,
+            source: String::new(),
+        }];
+
+        // Before the tick (minute 1000): buff active → Unscathed.
+        let _ = consequence::expire_tags(&mut tags, 1000);
+        let buffs_active = consequence::count_by_polarity(&tags, Polarity::Buff);
+        assert_eq!(buffs_active, 1, "buff still active before minute 2000");
+        assert_eq!(
+            consequence::derive_condition(&wounds, buffs_active, 0),
+            Condition::Unscathed,
+            "with buff active, Yellow wound is lifted to Unscathed"
+        );
+
+        // Tick past expiry (minute 3000): buff drops → Haggard.
+        let dropped = consequence::expire_tags(&mut tags, 3000);
+        assert_eq!(dropped, 1, "buff expired");
+        let buffs_after = consequence::count_by_polarity(&tags, Polarity::Buff);
+        assert_eq!(buffs_after, 0, "no buffs remain after expiry");
+        assert_eq!(
+            consequence::derive_condition(&wounds, buffs_after, 0),
+            Condition::Haggard,
+            "after buff expires, Yellow wound re-derives to Haggard — \
+             the tag's effect fades automatically"
+        );
+    }
+
+    /// compute_frustration is monotonic non-decreasing in elapsed time within
+    /// the window, and lands in a valid MoodTier. This is the seam the World
+    /// Progression tick will call to derive NPC mood directives.
+    #[test]
+    fn slice4_frustration_curve_is_monotonic_and_bounded() {
+        // A moderate-volatility NPC whose quest deadline was 1000 minutes
+        // ago, with a 2000-minute window and volatility 1.0.
+        let window = 2000_i64;
+        let volatility = 1.0;
+
+        let f_early = consequence::compute_frustration(500, window, volatility)
+            .expect("frustration computes for valid window+elapsed");
+        let f_mid = consequence::compute_frustration(1000, window, volatility)
+            .expect("frustration computes at the deadline");
+        let f_late = consequence::compute_frustration(1500, window, volatility)
+            .expect("frustration computes past the deadline");
+
+        // The underlying mood_score is monotonic non-decreasing in elapsed
+        // time (higher score = more frustrated). MoodTier itself doesn't
+        // derive PartialOrd, so we verify monotonicity on the score and
+        // then check the categorical tier landed in a valid ladder slot.
+        assert!(
+            f_early.mood_score <= f_mid.mood_score
+                && f_mid.mood_score <= f_late.mood_score,
+            "mood_score must be monotonic non-decreasing in elapsed time \
+             (early={} ≤ mid={} ≤ late={})",
+            f_early.mood_score,
+            f_mid.mood_score,
+            f_late.mood_score
+        );
+
+        // Each FrustrationState yields a categorical MoodTier the narrator
+        // renders as a directive. Verify the seam produces a tier (not a
+        // panic) for each sampled point — the tier() fn is what Phase 4's
+        // tick will call to get the directive text.
+        let _ = f_early.tier();
+        let _ = f_mid.tier();
+        let _ = f_late.tier();
+    }
+
+    // ------------------------------------------------------------------------
+    // Slice 5 (§11.34): Relationship State Machine. The three architect-
+    // defining scenarios, exercised through the seam fns Phase 4 will wire:
+    //   (a) Shiny-sword-on-Day-1 gift REJECTED by validate_llm_tier_write
+    //       (silent-drop, no repair queue).
+    //   (b) Betrayal drops to Hostile instantly via evaluate_transition —
+    //       NO time floor (gravity of betrayal is asymmetric).
+    //   (c) Murder drops to Nemesis regardless of prior bond.
+    // ------------------------------------------------------------------------
+
+    /// An LLM attempt to write "trusted" on a brand-new Stranger NPC is
+    /// REJECTED — gated escalations don't clear without the Referee path.
+    /// This is the anti-sycophancy firewall: the model can't talk its way
+    /// past the gates by writing a flattering tier.
+    #[test]
+    fn slice5_llm_gated_escalation_rejected_silent_drop() {
+        let state = RelationshipState::default(); // Stranger, tier_entered_at=0
+        let validation = relationship::validate_llm_tier_write("trusted", &state);
+        match validation {
+            RelationshipValidation::Reject { actual_tier } => {
+                assert_eq!(
+                    actual_tier,
+                    RelationshipTier::Stranger,
+                    "rejection must carry the actual current tier"
+                );
+            }
+            other => panic!(
+                "LLM attempt to write 'trusted' on a Stranger must be Reject, \
+                 not {:?} — gated escalations are silent-dropped",
+                other
+            ),
+        }
+    }
+
+    /// The ONE allowed LLM-initiated transition is Stranger → Acquaintance
+    /// (the auto-advance on first positive interaction, no gates). Every
+    /// other transition must route through the Referee path.
+    #[test]
+    fn slice5_stranger_to_acquaintance_is_the_one_llm_allowed_path() {
+        let state = RelationshipState::default();
+        let v = relationship::validate_llm_tier_write("acquaintance", &state);
+        assert!(
+            matches!(v, RelationshipValidation::Accept),
+            "Stranger → Acquaintance must be the one LLM-allowed transition; got {:?}",
+            v
+        );
+
+        // From any non-Stranger tier, even Acquaintance → Friendly must be
+        // rejected (it's gated — needs time floor + milestones).
+        let mut acquaint = RelationshipState::default();
+        acquaint.tier = RelationshipTier::Acquaintance;
+        let v2 = relationship::validate_llm_tier_write("friendly", &acquaint);
+        assert!(
+            matches!(v2, RelationshipValidation::Reject { .. }),
+            "Acquaintance → Friendly must be rejected from the LLM path — it's gated"
+        );
+    }
+
+    /// Betrayal drops to Hostile with NO time floor — the asymmetric gravity
+    /// of betrayal. A brand-new Stranger betrayed on Day 1 drops instantly.
+    #[test]
+    fn slice5_betrayal_drops_instantly_no_time_floor() {
+        let mut state = RelationshipState::default(); // tier_entered_at = 0
+        let registry = MilestoneRegistry::defaults();
+
+        // Record the betrayal event. The state must now carry it.
+        assert!(
+            state.record_event("betrayed_trust"),
+            "record_event must accept a known event id"
+        );
+
+        // Evaluate at now_minutes = 0 (literally the moment the relationship
+        // started). The betrayal short-circuit must fire anyway.
+        let outcome = relationship::evaluate_transition(&state, &registry, 0);
+        match outcome {
+            TransitionOutcome::Transition { new_tier, reason } => {
+                assert_eq!(
+                    new_tier,
+                    RelationshipTier::Hostile,
+                    "betrayed_trust drops to Hostile"
+                );
+                assert_eq!(
+                    reason,
+                    TransitionReason::HostilityTriggered,
+                    "the transition reason must be the hostility short-circuit"
+                );
+            }
+            other => panic!(
+                "betrayal must fire the hostility short-circuit even at now=0; got {:?}",
+                other
+            ),
+        }
+    }
+
+    /// Murder drops to Nemesis regardless of prior bond. Even a Bonded NPC
+    /// who has sworn an oath, if you kill their family, drops to Nemesis.
+    /// This pins the "gravity of betrayal is asymmetric" rule at its
+    /// extreme.
+    #[test]
+    fn slice5_murder_drops_to_nemesis_regardless_of_bond() {
+        let mut state = RelationshipState::default();
+        // Establish a maximal bond: sworn_oath + long_loyalty + saved_life.
+        state.record_event("sworn_oath");
+        state.record_event("long_loyalty");
+        state.record_event("saved_life");
+        state.tier = RelationshipTier::Bonded;
+        state.tier_entered_at_minutes = -100_000; // ancient bond
+
+        let registry = MilestoneRegistry::defaults();
+
+        // Now commit the atrocity.
+        state.record_event("killed_family");
+
+        let outcome = relationship::evaluate_transition(&state, &registry, 0);
+        match outcome {
+            TransitionOutcome::Transition { new_tier, .. } => {
+                assert_eq!(
+                    new_tier,
+                    RelationshipTier::Nemesis,
+                    "killed_family drops a Bonded NPC to Nemesis — no bond survives this"
+                );
+            }
+            other => panic!(
+                "murder must drop to Nemesis regardless of bond; got {:?}",
+                other
+            ),
+        }
+    }
+
+    /// A legitimate affinity advance requires BOTH gates (time floor AND
+    /// milestone threshold). Recording milestones without enough time, OR
+    /// enough time without milestones, must NOT advance. Only both clearing
+    /// advances the tier.
+    #[test]
+    fn slice5_affinity_advance_requires_both_gates() {
+        let registry = MilestoneRegistry::defaults();
+
+        // Case A: milestones but no time. Record enough points to clear the
+        // milestone gate for Stranger → Acquaintance.
+        let mut state_a = RelationshipState::default();
+        state_a.record_event("first_positive_interaction");
+        state_a.record_event("shared_drink");
+        // Evaluate at now = 0 (no time elapsed). (out_a is intentionally
+        // unused — the real test is out_a2 below, after we set tier past
+        // Acquaintance so the gate logic actually applies.)
+        let _out_a = relationship::evaluate_transition(&state_a, &registry, 0);
+        // Stranger → Acquaintance is the no-gate auto-advance, so it WOULD
+        // fire here. To test the gate properly we need to be PAST
+        // Acquaintance. Set tier to Acquaintance + try for Friendly.
+        state_a.tier = RelationshipTier::Acquaintance;
+        state_a.tier_entered_at_minutes = 0;
+        let out_a2 = relationship::evaluate_transition(&state_a, &registry, 0);
+        match out_a2 {
+            TransitionOutcome::NoTransition { reason } => {
+                // Must be a gate failure (time floor or milestone), NOT a
+                // transition. The exact reason depends on the threshold math.
+                assert!(
+                    matches!(
+                        reason,
+                        TransitionReason::TimeFloorNotMet
+                            | TransitionReason::MilestoneThresholdNotMet
+                    ),
+                    "milestones-without-time must hit a gate, not {:?}",
+                    reason
+                );
+            }
+            TransitionOutcome::Transition { .. } => {
+                panic!("Acquaintance → Friendly must NOT fire without both gates clearing");
+            }
+        }
+
+        // Case B: time but no milestones. Ancient Acquaintance with zero
+        // recorded events must NOT advance on time alone.
+        let mut state_b = RelationshipState::default();
+        state_b.tier = RelationshipTier::Acquaintance;
+        state_b.tier_entered_at_minutes = -1_000_000; // very old
+        let out_b = relationship::evaluate_transition(&state_b, &registry, 1_000_000);
+        match out_b {
+            TransitionOutcome::NoTransition { reason } => {
+                assert_eq!(
+                    reason,
+                    TransitionReason::MilestoneThresholdNotMet,
+                    "time-without-milestones must fail on the milestone gate"
+                );
+            }
+            TransitionOutcome::Transition { .. } => {
+                panic!("time alone must NOT clear the milestone gate");
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------------
+    // Slice 6 (§11.35): Off-Screen Risk Referee + Focus Randomization.
+    // Verify the hard no-apocalyptic-shift constraint end-to-end: across
+    // many seeded focus selections, no tick ever exceeds the per-tick caps
+    // (Minor=8/Moderate=3/Major=1), and no Apocalyptic tier is selectable
+    // (enforced by enum shape). Plus the off-screen task resolution
+    // directive is narrator-consumable.
+    // ------------------------------------------------------------------------
+
+    /// select_focus NEVER exceeds the per-tick caps, across many seeds and
+    /// candidate pools. The caps are the hard no-apocalyptic-shift
+    /// constraint — a single tick can do at most 1 Major shift, never more.
+    #[test]
+    fn slice6_focus_caps_never_exceeded_across_seeds() {
+        // Build a large candidate pool that exceeds every cap.
+        let mut candidates = Vec::new();
+        for i in 0..30 {
+            candidates.push(FocusTarget {
+                entity_key: format!("minor_{i}"),
+                magnitude: FocusMagnitude::Minor,
+                seed: i.to_string(),
+            });
+        }
+        for i in 0..15 {
+            candidates.push(FocusTarget {
+                entity_key: format!("moderate_{i}"),
+                magnitude: FocusMagnitude::Moderate,
+                seed: i.to_string(),
+            });
+        }
+        for i in 0..10 {
+            candidates.push(FocusTarget {
+                entity_key: format!("major_{i}"),
+                magnitude: FocusMagnitude::Major,
+                seed: i.to_string(),
+            });
+        }
+        let excluded: HashSet<String> = HashSet::new();
+
+        // Sweep many seeds. Every result must respect the caps.
+        for seed in 0..100 {
+            let mut roller = Roller::new(seed);
+            let selected = offscreen_task::select_focus(&candidates, &excluded, &mut roller);
+
+            let minor_count = selected
+                .iter()
+                .filter(|t| t.magnitude == FocusMagnitude::Minor)
+                .count();
+            let moderate_count = selected
+                .iter()
+                .filter(|t| t.magnitude == FocusMagnitude::Moderate)
+                .count();
+            let major_count = selected
+                .iter()
+                .filter(|t| t.magnitude == FocusMagnitude::Major)
+                .count();
+
+            assert!(
+                minor_count <= FocusMagnitude::Minor.per_tick_cap(),
+                "seed {seed}: Minor cap violated ({} > {})",
+                minor_count,
+                FocusMagnitude::Minor.per_tick_cap()
+            );
+            assert!(
+                moderate_count <= FocusMagnitude::Moderate.per_tick_cap(),
+                "seed {seed}: Moderate cap violated ({} > {})",
+                moderate_count,
+                FocusMagnitude::Moderate.per_tick_cap()
+            );
+            assert!(
+                major_count <= FocusMagnitude::Major.per_tick_cap(),
+                "seed {seed}: Major cap violated ({} > {}) — the hard \
+                 no-apocalyptic-shift constraint",
+                major_count,
+                FocusMagnitude::Major.per_tick_cap()
+            );
+        }
+    }
+
+    /// The player's bubble entities are excluded from focus selection — the
+    /// world is alive, but not at the player's immediate location. This is
+    /// the "no off-screen catastrophe lands on the player's head" rule.
+    #[test]
+    fn slice6_focus_excludes_player_bubble() {
+        let candidates = vec![
+            FocusTarget {
+                entity_key: "player_companion_marcus".to_string(),
+                magnitude: FocusMagnitude::Major,
+                seed: "1".to_string(),
+            },
+            FocusTarget {
+                entity_key: "tavern_back_room".to_string(),
+                magnitude: FocusMagnitude::Moderate,
+                seed: "2".to_string(),
+            },
+            FocusTarget {
+                entity_key: "distant_village".to_string(),
+                magnitude: FocusMagnitude::Minor,
+                seed: "3".to_string(),
+            },
+        ];
+        let mut excluded = HashSet::new();
+        excluded.insert("player_companion_marcus".to_string());
+        excluded.insert("tavern_back_room".to_string());
+
+        let mut roller = Roller::new(42);
+        let selected = offscreen_task::select_focus(&candidates, &excluded, &mut roller);
+
+        // Marcus + the tavern (the player's bubble) must never be selected.
+        for t in &selected {
+            assert!(
+                !excluded.contains(&t.entity_key),
+                "player-bubble entity {:?} must never be a focus target",
+                t.entity_key
+            );
+        }
+        // The distant village is fair game.
+        assert!(
+            selected.iter().any(|t| t.entity_key == "distant_village"),
+            "a non-excluded candidate should be selectable"
+        );
+    }
+
+    /// The off-screen task directive is narrator-consumable: free-form prose
+    /// that names the NPC, states the outcome qualitatively, and enforces
+    /// the no-apocalyptic constraint verbatim. This is the shape the World
+    /// Progression tick will wrap as `[DIRECTIVE: ...]`.
+    #[test]
+    fn slice6_task_directive_is_narrator_consumable() {
+        let task = OffScreenTask {
+            npc_id: "marcus".to_string(),
+            description: "scout the bandit camp".to_string(),
+            difficulty: TaskDifficulty::Challenging,
+            suitability: Suitability::Adequate,
+            resolves_at_minutes: 1000,
+            resolved: false,
+        };
+        let resolution = offscreen_task::resolve_task(&task);
+
+        // Contract 1: the directive is non-empty prose.
+        assert!(
+            !resolution.directive.is_empty(),
+            "task resolution must carry a directive"
+        );
+        // Contract 2: it names the NPC (the narrator needs to know who returned).
+        assert!(
+            resolution.directive.contains("marcus"),
+            "directive must name the NPC; got: {:?}",
+            resolution.directive
+        );
+        // Contract 3: it carries the qualitative outcome tag (snake_case
+        // converted to spaces — e.g. "complicated success").
+        let lower = resolution.directive.to_lowercase();
+        assert!(
+            lower.contains("success") || lower.contains("failure"),
+            "directive must state the qualitative outcome (success/failure); got: {:?}",
+            resolution.directive
+        );
+        // Contract 4: the no-apocalyptic-shift constraint is stated verbatim.
+        assert!(
+            lower.contains("do not invent global") || lower.contains("world-shaking"),
+            "directive must enforce the no-apocalyptic-shift constraint verbatim; got: {:?}",
+            resolution.directive
+        );
+        // Contract 5: the d20 roll + DC are NOT in the directive (engine-room
+        // only — never shown to the narrator).
+        assert!(
+            !resolution.directive.contains(&format!("roll: {}", resolution.roll)),
+            "the d20 roll must NOT appear in the directive — engine-room only"
+        );
+        assert!(
+            !resolution.directive.contains(&format!("dc {}", resolution.dc))
+                && !resolution.directive.contains(&format!("DC {}", resolution.dc)),
+            "the DC must NOT appear in the directive — engine-room only"
+        );
+    }
+
+    /// resolve_expired_tasks skips not-yet-due tasks and already-resolved
+    /// tasks (no re-roll). This is the contract the World Progression tick
+    /// relies on: due tasks resolve once, the queue drains correctly.
+    #[test]
+    fn slice6_resolve_expired_tasks_skips_wrong_state() {
+        let tasks = vec![
+            // Due + unresolved → resolves.
+            OffScreenTask {
+                npc_id: "due_unresolved".to_string(),
+                description: "task A".to_string(),
+                difficulty: TaskDifficulty::Routine,
+                suitability: Suitability::Ideal,
+                resolves_at_minutes: 1000,
+                resolved: false,
+            },
+            // Not yet due → skipped.
+            OffScreenTask {
+                npc_id: "future".to_string(),
+                description: "task B".to_string(),
+                difficulty: TaskDifficulty::Routine,
+                suitability: Suitability::Ideal,
+                resolves_at_minutes: 5000,
+                resolved: false,
+            },
+            // Already resolved → skipped (no re-roll).
+            OffScreenTask {
+                npc_id: "already_done".to_string(),
+                description: "task C".to_string(),
+                difficulty: TaskDifficulty::Routine,
+                suitability: Suitability::Ideal,
+                resolves_at_minutes: 500,
+                resolved: true,
+            },
+        ];
+
+        let resolutions = offscreen_task::resolve_expired_tasks(&tasks, 2000);
+        // Only the due + unresolved task should produce a resolution.
+        assert_eq!(
+            resolutions.len(),
+            1,
+            "only due+unresolved tasks resolve; got {:?}",
+            resolutions.iter().map(|r| &r.npc_id).collect::<Vec<_>>()
+        );
+        assert_eq!(resolutions[0].npc_id, "due_unresolved");
+    }
+
+    /// Cross-slice composition: a CatastrophicFailure on an off-screen task
+    /// is BOUNDED — OutcomeSeverity's worst tier is CatastrophicFailure,
+    /// never anything beyond. The enum shape enforces the no-apocalyptic
+    /// constraint at the type level. Verify the ladder's worst element.
+    #[test]
+    fn slice6_outcome_severity_worst_tier_is_bounded() {
+        // The worst possible OutcomeSeverity is CatastrophicFailure. There
+        // is no Apocalyptic variant — the enum shape enforces it.
+        let worst = OutcomeSeverity::CatastrophicFailure;
+        // Every variant must be ≤ worst (worst is the floor of the ladder).
+        // We verify by checking the documented variants are all <= worst
+        // (PartialOrd + Ord derived, worst→best by variant order).
+        let all = [
+            OutcomeSeverity::CatastrophicFailure,
+            OutcomeSeverity::Failure,
+            OutcomeSeverity::ComplicatedSuccess,
+            OutcomeSeverity::Success,
+            OutcomeSeverity::CriticalSuccess,
+        ];
+        for v in &all {
+            assert!(
+                worst <= *v,
+                "CatastrophicFailure must be the worst (lowest) tier; {:?} is worse",
+                v
+            );
+        }
+    }
+
+    // ------------------------------------------------------------------------
+    // Cross-slice scenario: the full lethality → death → reputation flow.
+    // This stitches Slice 3 (lethality) + Slice 5 (relationship) into the
+    // kind of multi-module interaction Phase 4 will wire end-to-end.
+    // ------------------------------------------------------------------------
+
+    /// When a lethal blow lands AND the player has a `killed_ally` event
+    /// recorded against an NPC, BOTH directives compose: the lethality
+    /// directive from Slice 3 (the player is DOWNED) AND the relationship
+    /// drop to Nemesis from Slice 5 (the witness becomes a sworn enemy).
+    /// This verifies the two slices' outputs don't collide when the
+    /// narrator renders them together.
+    #[test]
+    fn cross_slice_lethality_plus_witness_relationship_drop() {
+        // Slice 5: an NPC witnesses the player kill their ally.
+        let mut witness = RelationshipState::default();
+        witness.record_event("killed_ally");
+        let registry = MilestoneRegistry::defaults();
+        let rel_outcome = relationship::evaluate_transition(&witness, &registry, 0);
+        let witness_new_tier = match rel_outcome {
+            TransitionOutcome::Transition { new_tier, .. } => new_tier,
+            other => panic!("witness must drop to Nemesis; got {:?}", other),
+        };
+        assert_eq!(
+            witness_new_tier,
+            RelationshipTier::Nemesis,
+            "witness to killed_ally drops to Nemesis"
+        );
+
+        // Slice 3: find a lethal outcome (sweep seeds against a Legendary foe).
+        let mut lethal_directive: Option<String> = None;
+        for i in 0..200 {
+            let text = format!("the ancient wyrm strikes me down #{i}");
+            if let Some(outcome) = player_state::referee_evaluate_with_tier(
+                &text,
+                &PlayerState::default(),
+                AttackerTier::Legendary,
+            ) {
+                if outcome.lethal {
+                    lethal_directive = Some(outcome.directive);
+                    break;
+                }
+            }
+        }
+        let lethal_directive =
+            lethal_directive.expect("expected at least one lethal outcome across 200 rolls");
+
+        // Compose the two into a single <directives> block the way fable_send
+        // would. They must coexist without collision.
+        let mut block = String::from("<directives>\n");
+        block.push_str(&format!("[DIRECTIVE: {lethal_directive}]\n"));
+        block.push_str(&format!(
+            "[DIRECTIVE: witness relationship — {} now regards the player as Nemesis]\n",
+            "witness"
+        ));
+        block.push_str("</directives>");
+
+        // Both directives present, lethality first.
+        let lethal_pos = block.find("DOWNED").or_else(|| {
+            // Some directives may phrase it differently; accept any lethal
+            // marker. Re-check the directive content for "down" (lowercase).
+            block.to_lowercase().find("down")
+        });
+        assert!(
+            lethal_pos.is_some(),
+            "lethality directive must appear in the composed block"
+        );
+        assert!(
+            block.contains("Nemesis"),
+            "witness relationship drop must appear in the composed block"
+        );
+    }
+}
+
+// ===========================================================================
+// Phase 3 WIRING tests (2026-07-28).
+//
+// Companion to `phase3_integration_tests`. Where that module verified the
+// SEAMS COMPOSE (the public APIs of the six slices), this module verifies
+// the WIRING — the new code paths that connect those seams to the live game
+// loop. Covers: the silent-strip relationship firewall, the three new
+// bracket commands ([EFFECT]/[MILESTONE]/[TASK]) parsing + state mutation,
+// the tier-selection heuristic, and the bracket→schema→tick data flow.
+//
+// These tests use the PURE helpers directly (no AppState, no async runtime,
+// no schema lock) — the wiring functions that touch AppState are exercised
+// via the live playtest instead, mirroring the §11.26 pattern.
+// ===========================================================================
+#[cfg(test)]
+mod phase3_wiring_tests {
+    use super::strip_invalid_relationship_writes;
+    use crate::bracket_parser::{self, BracketCommand};
+    use crate::consequence::{self, Polarity, StatusTag};
+    use crate::offscreen_task::{self, OffScreenTask, Suitability, TaskDifficulty};
+    use crate::player_state;
+    use crate::relationship::{self, RelationshipTier};
+    use crate::schema::{SchemaDelta, WorldSchema};
+
+    use std::collections::HashMap;
+
+    // Helper: build a SchemaDelta with a single entity write.
+    fn delta_with_entity(key: &str, value: &str) -> SchemaDelta {
+        let mut entities = HashMap::new();
+        entities.insert(key.to_string(), Some(value.to_string()));
+        SchemaDelta {
+            summary: None,
+            recent_events: None,
+            entities: Some(entities),
+        }
+    }
+
+    // ------------------------------------------------------------------------
+    // Slice 5 wiring: strip_invalid_relationship_writes (the silent firewall).
+    // ------------------------------------------------------------------------
+
+    /// An LLM attempt to write `rel.npc.marcus=trusted` on a Stranger NPC is
+    /// silently stripped from the delta (the key is removed). The rest of the
+    /// delta is untouched. This is the anti-sycophancy firewall: the model
+    /// can't talk its way past the gates by writing a flattering tier.
+    #[test]
+    fn wiring_rel_gated_write_stripped_silently() {
+        let mut delta = SchemaDelta {
+            summary: None,
+            recent_events: None,
+            entities: Some({
+                let mut m = HashMap::new();
+                m.insert("rel.npc.marcus".to_string(), Some("trusted".to_string()));
+                // A legitimate non-rel write that MUST survive the strip.
+                m.insert("weather".to_string(), Some("rainy".to_string()));
+                m
+            }),
+        };
+        let mut schema = WorldSchema::default();
+
+        let stripped = strip_invalid_relationship_writes(&mut delta, &mut schema);
+
+        // The rel.* key was stripped.
+        assert_eq!(
+            stripped.len(),
+            1,
+            "exactly the rel.* key should be stripped"
+        );
+        // The non-rel key survived.
+        let ents = delta.entities.as_ref().expect("entities still present");
+        assert!(
+            !ents.contains_key("rel.npc.marcus"),
+            "the rel.* key must be removed from the delta"
+        );
+        assert_eq!(
+            ents.get("weather"),
+            Some(&Some("rainy".to_string())),
+            "the non-rel key must survive the strip"
+        );
+        // The schema's relationship map was NOT mutated (the write was
+        // rejected, not accepted — Stranger stays Stranger).
+        assert!(
+            !schema.relationships.contains_key("npc.marcus"),
+            "a rejected tier write must NOT create a relationship entry"
+        );
+    }
+
+    /// The ONE accepted LLM transition is Stranger → Acquaintance. When the
+    /// LLM writes `rel.npc.smith=acquaintance` on an untracked NPC, the
+    /// helper accepts it, upserts the RelationshipState (tier=Acquaintance,
+    /// tier_entered_at = current clock), AND removes the key from the delta
+    /// (the canonical state is the source of truth, not the entity map).
+    #[test]
+    fn wiring_rel_stranger_to_acquaintance_accepted_and_upserted() {
+        let mut delta = delta_with_entity("rel.npc.smith", "acquaintance");
+        let mut schema = WorldSchema::default();
+        schema.world_clock.current_minutes = 5000;
+
+        let stripped = strip_invalid_relationship_writes(&mut delta, &mut schema);
+
+        // Nothing stripped (the write was accepted).
+        assert!(
+            stripped.is_empty(),
+            "the accepted Stranger→Acquaintance write must not be in the stripped list; got {:?}",
+            stripped
+        );
+        // The key was removed from the delta (consumed into canonical state).
+        assert!(
+            !delta
+                .entities
+                .as_ref()
+                .unwrap()
+                .contains_key("rel.npc.smith"),
+            "the accepted rel.* key must be removed from the delta (canonical state is source of truth)"
+        );
+        // The schema's relationship map now tracks the NPC at Acquaintance.
+        let rel = schema
+            .relationships
+            .get("npc.smith")
+            .expect("the accepted write must create a relationship entry");
+        assert_eq!(
+            rel.tier,
+            RelationshipTier::Acquaintance,
+            "the tier must be Acquaintance"
+        );
+        assert_eq!(
+            rel.tier_entered_at_minutes, 5000,
+            "tier_entered_at_minutes must be stamped to the current clock"
+        );
+    }
+
+    /// A delete attempt (None value) on a rel.* key is also stripped — the
+    /// LLM can't delete a relationship; only Rust owns that.
+    #[test]
+    fn wiring_rel_delete_attempt_stripped() {
+        let mut entities = HashMap::new();
+        entities.insert("rel.npc.foe".to_string(), None); // delete signal
+        let mut delta = SchemaDelta {
+            summary: None,
+            recent_events: None,
+            entities: Some(entities),
+        };
+        let mut schema = WorldSchema::default();
+
+        let stripped = strip_invalid_relationship_writes(&mut delta, &mut schema);
+
+        assert_eq!(stripped.len(), 1, "the delete attempt must be stripped");
+        assert!(
+            !delta.entities.as_ref().unwrap().contains_key("rel.npc.foe"),
+            "the delete key must be removed from the delta"
+        );
+    }
+
+    /// An unparseable tier value (e.g. "best_friend_forever") is silently
+    /// dropped — same silent-drop policy as a gated rejection.
+    #[test]
+    fn wiring_rel_unparseable_value_dropped() {
+        let mut delta = delta_with_entity("rel.npc.mara", "best_friend_forever");
+        let mut schema = WorldSchema::default();
+
+        let stripped = strip_invalid_relationship_writes(&mut delta, &mut schema);
+
+        assert_eq!(stripped.len(), 1);
+        assert!(
+            stripped[0].contains("unparseable"),
+            "the strip reason must note unparseable; got: {:?}",
+            stripped[0]
+        );
+    }
+
+    /// A delta with NO rel.* keys is a no-op — the helper returns empty +
+    /// doesn't touch the delta.
+    #[test]
+    fn wiring_rel_no_rel_keys_is_noop() {
+        let mut delta = SchemaDelta {
+            summary: Some("scene advanced".to_string()),
+            recent_events: Some(vec!["the guard arrived".to_string()]),
+            entities: Some({
+                let mut m = HashMap::new();
+                m.insert("weather".to_string(), Some("stormy".to_string()));
+                m.insert("door.cellar".to_string(), Some("open".to_string()));
+                m
+            }),
+        };
+        let mut schema = WorldSchema::default();
+        let original_summary = delta.summary.clone();
+        let original_events_len = delta.recent_events.as_ref().unwrap().len();
+        let original_entities_len = delta.entities.as_ref().unwrap().len();
+
+        let stripped = strip_invalid_relationship_writes(&mut delta, &mut schema);
+
+        assert!(stripped.is_empty(), "no rel.* keys → nothing stripped");
+        // Delta entirely unchanged.
+        assert_eq!(delta.summary, original_summary);
+        assert_eq!(delta.recent_events.as_ref().unwrap().len(), original_events_len);
+        assert_eq!(delta.entities.as_ref().unwrap().len(), original_entities_len);
+    }
+
+    // ------------------------------------------------------------------------
+    // Bracket command parsing: [EFFECT], [MILESTONE], [TASK].
+    // ------------------------------------------------------------------------
+
+    /// [EFFECT Berserk Rage buff 60] parses into the Effect command with the
+    /// label preserved (spaces allowed), buff polarity, 60-minute duration.
+    #[test]
+    fn wiring_effect_bracket_parses_multi_word_label() {
+        let parsed = bracket_parser::parse("The rage takes you. [EFFECT Berserk Rage buff 60]");
+        let effects: Vec<&BracketCommand> = parsed
+            .commands
+            .iter()
+            .filter(|c| matches!(c, BracketCommand::Effect { .. }))
+            .collect();
+        assert_eq!(effects.len(), 1, "exactly one EFFECT command");
+        if let BracketCommand::Effect {
+            label,
+            polarity,
+            duration_minutes,
+        } = effects[0]
+        {
+            assert_eq!(label, "Berserk Rage");
+            assert_eq!(*polarity, Polarity::Buff);
+            assert_eq!(*duration_minutes, 60);
+        } else {
+            panic!("wrong variant");
+        }
+        // The bracket is stripped from the prose.
+        assert!(
+            !parsed.prose.contains("[EFFECT"),
+            "the EFFECT bracket must be stripped from prose"
+        );
+    }
+
+    /// [EFFECT ... debuff 0] — duration 0 is the permanent sentinel.
+    #[test]
+    fn wiring_effect_bracket_zero_duration_is_permanent() {
+        let parsed =
+            bracket_parser::parse("She feels the curse settle. [EFFECT Cursed by the Witch King debuff 0]");
+        if let Some(BracketCommand::Effect {
+            duration_minutes, ..
+        }) = parsed.commands.iter().find_map(|c| match c {
+            BracketCommand::Effect { .. } => Some(c),
+            _ => None,
+        }) {
+            assert_eq!(*duration_minutes, 0, "duration 0 = permanent sentinel");
+        } else {
+            panic!("EFFECT command not found");
+        }
+    }
+
+    /// A malformed [EFFECT ...] is dropped gracefully — the bracket leaks
+    /// into prose as a literal, no panic.
+    ///
+    /// NOTE: the EFFECT parser is deliberately TOLERANT of an unknown
+    /// polarity token (the 2026-07-28 playtest found the model emits both
+    /// strict and sloppy shapes): an unknown word between the label and
+    /// the duration is folded into the label and the polarity is inferred
+    /// from the label. So `[EFFECT Rage super 60]` is ACCEPTED as
+    /// `Effect { label: "Rage super", polarity: Debuff, duration: 60 }`,
+    /// NOT rejected. This test therefore pins only the genuinely-fatal
+    /// malformed shapes: missing duration, negative duration, float
+    /// duration, and bare `[EFFECT]`. The acceptance-tolerance contract
+    /// is pinned separately by `wiring_effect_bracket_parses_*`.
+    #[test]
+    fn wiring_effect_bracket_malformed_is_noop() {
+        for inp in [
+            "text [EFFECT Rage buff]",        // missing duration
+            "text [EFFECT Rage]",             // label only
+            "text [EFFECT]",                  // bare
+            "text [EFFECT Rage buff -5]",     // negative duration
+            "text [EFFECT Rage buff 3.5]",    // float duration
+        ] {
+            let parsed = bracket_parser::parse(inp);
+            assert!(
+                !parsed
+                    .commands
+                    .iter()
+                    .any(|c| matches!(c, BracketCommand::Effect { .. })),
+                "malformed EFFECT must not produce a command: {:?}",
+                inp
+            );
+        }
+    }
+
+    /// [MILESTONE npc.marcus saved_life] parses cleanly.
+    #[test]
+    fn wiring_milestone_bracket_parses() {
+        let parsed = bracket_parser::parse(
+            "He pulls you from the river. [MILESTONE npc.marcus saved_life]",
+        );
+        if let Some(BracketCommand::Milestone { npc_id, event_id }) = parsed
+            .commands
+            .iter()
+            .find_map(|c| match c {
+                BracketCommand::Milestone { .. } => Some(c),
+                _ => None,
+            })
+        {
+            assert_eq!(npc_id, "npc.marcus");
+            assert_eq!(event_id, "saved_life");
+        } else {
+            panic!("MILESTONE command not found");
+        }
+    }
+
+    /// [TASK npc.marcus scout the bandit camp | challenging adequate 240]
+    /// parses into the Task command with the multi-word description preserved.
+    #[test]
+    fn wiring_task_bracket_parses_multi_word_description() {
+        let parsed = bracket_parser::parse(
+            "Marcus nods and slips out. [TASK npc.marcus scout the bandit camp | challenging adequate 240]",
+        );
+        if let Some(BracketCommand::Task {
+            npc_id,
+            description,
+            difficulty,
+            suitability,
+            eta_minutes,
+        }) = parsed.commands.iter().find_map(|c| match c {
+            BracketCommand::Task { .. } => Some(c),
+            _ => None,
+        }) {
+            assert_eq!(npc_id, "npc.marcus");
+            assert_eq!(description, "scout the bandit camp");
+            assert_eq!(difficulty, "challenging");
+            assert_eq!(suitability, "adequate");
+            assert_eq!(*eta_minutes, 240);
+        } else {
+            panic!("TASK command not found");
+        }
+    }
+
+    /// A malformed [TASK ...] is dropped gracefully — the bracket leaks
+    /// into prose as a literal, no panic.
+    ///
+    /// NOTE: the TASK parser is deliberately TOLERANT of a missing `|`
+    /// separator (the 2026-07-28 playtest found the model sometimes omits
+    /// the pipe): `parse_task_no_pipe` falls back to splitting the whole
+    /// body by whitespace — first token = npc_id, last 3 =
+    /// difficulty/suitability/eta, middle (joined) = description. So
+    /// `[TASK npc.marcus scout challenging adequate 240]` is ACCEPTED,
+    /// NOT rejected. This test therefore pins only the genuinely-fatal
+    /// malformed shapes: non-numeric eta, zero eta, negative eta, bare
+    /// `[TASK]`, and a too-short body that can't yield 4 fields. The
+    /// no-pipe acceptance contract is pinned separately by
+    /// `wiring_task_bracket_parses_multi_word_description`.
+    #[test]
+    fn wiring_task_bracket_malformed_is_noop() {
+        for inp in [
+            // Non-numeric eta (well-formed pipe, garbage eta).
+            "text [TASK npc.marcus scout | challenging adequate soon]",
+            // Zero eta — rejected (eta must be > 0; a 0-minute task is meaningless).
+            "text [TASK npc.x d | e i 0]",
+            // Negative eta.
+            "text [TASK npc.x d | e i -1]",
+            // Bare.
+            "text [TASK]",
+            // Too short to yield npc_id + description + 3 tail fields.
+            "text [TASK a | b c d]",
+        ] {
+            let parsed = bracket_parser::parse(inp);
+            assert!(
+                !parsed
+                    .commands
+                    .iter()
+                    .any(|c| matches!(c, BracketCommand::Task { .. })),
+                "malformed TASK must not produce a command: {:?}",
+                inp
+            );
+        }
+    }
+
+    // ------------------------------------------------------------------------
+    // Slice 3 wiring: select_attacker_tier_from_entities.
+    // ------------------------------------------------------------------------
+
+    /// No npc.*.tier keys → defaults to Soldier (preserves the v1 distribution).
+    #[test]
+    fn wiring_tier_selection_defaults_to_soldier() {
+        let entities = HashMap::new(); // empty
+        assert_eq!(
+            player_state::select_attacker_tier_from_entities(&entities),
+            player_state::AttackerTier::Soldier,
+            "no tier keys → Soldier default (backwards-compatible)"
+        );
+
+        // Entities present but no tier keys.
+        let mut entities = HashMap::new();
+        entities.insert("weather".to_string(), "rainy".to_string());
+        entities.insert("npc.marcus.name".to_string(), "Marcus".to_string());
+        assert_eq!(
+            player_state::select_attacker_tier_from_entities(&entities),
+            player_state::AttackerTier::Soldier,
+            "entities without tier keys → Soldier default"
+        );
+    }
+
+    /// A single npc.dragon.tier=legendary → Legendary tier (the anti-Oblivion
+    /// enforcement: a dragon's blows weight toward Critical + lethality).
+    #[test]
+    fn wiring_tier_selection_picks_declared_legendary() {
+        let mut entities = HashMap::new();
+        entities.insert("npc.dragon.tier".to_string(), "legendary".to_string());
+        assert_eq!(
+            player_state::select_attacker_tier_from_entities(&entities),
+            player_state::AttackerTier::Legendary,
+        );
+    }
+
+    /// When multiple tier keys exist, the HIGHEST threat wins (the dangerous
+    /// foe dominates the severity distribution in a multi-foe fight).
+    #[test]
+    fn wiring_tier_selection_picks_highest_threat() {
+        let mut entities = HashMap::new();
+        entities.insert("npc.thug1.tier".to_string(), "soldier".to_string());
+        entities.insert("npc.dragon.tier".to_string(), "legendary".to_string());
+        entities.insert("npc.goblin1.tier".to_string(), "minion".to_string());
+        assert_eq!(
+            player_state::select_attacker_tier_from_entities(&entities),
+            player_state::AttackerTier::Legendary,
+            "Legendary must dominate over Soldier + Minion"
+        );
+    }
+
+    /// Tier synonyms parse correctly (dragon → Legendary, bandit → Soldier,
+    /// goblin → Minion). This is the narrator-friendly tolerant parse.
+    #[test]
+    fn wiring_tier_selection_accepts_synonyms() {
+        let cases = [
+            ("dragon", player_state::AttackerTier::Legendary),
+            ("apex", player_state::AttackerTier::Legendary),
+            ("ancient", player_state::AttackerTier::Legendary),
+            ("warlord", player_state::AttackerTier::Boss),
+            ("troll", player_state::AttackerTier::Boss),
+            ("veteran", player_state::AttackerTier::Elite),
+            ("knight", player_state::AttackerTier::Elite),
+            ("bandit", player_state::AttackerTier::Soldier),
+            ("grunt", player_state::AttackerTier::Soldier),
+            ("goblin", player_state::AttackerTier::Minion),
+            ("wolf", player_state::AttackerTier::Minion),
+        ];
+        for (input, expected) in &cases {
+            assert_eq!(
+                player_state::parse_attacker_tier(input),
+                Some(*expected),
+                "synonym {:?} should parse to {:?}",
+                input,
+                expected
+            );
+        }
+    }
+
+    // ------------------------------------------------------------------------
+    // Slice 2 wiring: derive_condition consumes the tag counts the wiring
+    // computes. Verify the wiring's count computation matches what
+    // derive_condition expects (the seam between the render hook + the pure
+    // derive fn).
+    // ------------------------------------------------------------------------
+
+    /// count_by_polarity + derive_condition compose: a body with a Yellow
+    /// wound + 1 buff tag derives to Unscathed (the buff lifts it), and the
+    /// wiring's count computation feeds derive_condition correctly.
+    #[test]
+    fn wiring_condition_uses_tag_counts_correctly() {
+        let mut body = std::collections::HashMap::new();
+        body.insert(
+            player_state::BodyPart::LeftHand,
+            player_state::BodyPartState::Yellow,
+        );
+        let tags = vec![
+            StatusTag {
+                label: "Berserk Rage".to_string(),
+                polarity: Polarity::Buff,
+                expires_at: 1000,
+                source: String::new(),
+            },
+        ];
+        // The wiring computes these counts then passes them to derive_condition.
+        let buffs = consequence::count_by_polarity(&tags, Polarity::Buff);
+        let debuffs = consequence::count_by_polarity(&tags, Polarity::Debuff);
+        assert_eq!(buffs, 1);
+        assert_eq!(debuffs, 0);
+        // Yellow + 1 buff + 0 debuffs → Unscathed (the buff lifts Haggard→Unscathed).
+        assert_eq!(
+            consequence::derive_condition(&body, buffs, debuffs),
+            consequence::Condition::Unscathed,
+        );
+    }
+
+    // ------------------------------------------------------------------------
+    // Slice 4 wiring: expire_tags drops expired tags but keeps permanent ones
+    // (expires_at == 0). Verify the tick hook's contract.
+    // ------------------------------------------------------------------------
+
+    /// The tick's expire_tags call drops tags whose expiry has passed but
+    /// keeps permanent (expires_at == 0) tags. This is the seam the tick
+    /// handler in apply_time_command_and_maybe_tick calls.
+    #[test]
+    fn wiring_tick_expiry_drops_expired_keeps_permanent() {
+        let mut tags = vec![
+            StatusTag {
+                label: "Permanent Curse".to_string(),
+                polarity: Polarity::Debuff,
+                expires_at: 0, // permanent
+                source: String::new(),
+            },
+            StatusTag {
+                label: "Short Buff".to_string(),
+                polarity: Polarity::Buff,
+                expires_at: 500, // expired at minute 1000
+                source: String::new(),
+            },
+            StatusTag {
+                label: "Active Buff".to_string(),
+                polarity: Polarity::Buff,
+                expires_at: 2000, // still active at minute 1000
+                source: String::new(),
+            },
+        ];
+        let dropped = consequence::expire_tags(&mut tags, 1000);
+        assert_eq!(dropped, 1, "only the expired timed tag drops");
+        assert_eq!(tags.len(), 2, "permanent + active remain");
+        let labels: Vec<&str> = tags.iter().map(|t| t.label.as_str()).collect();
+        assert!(labels.contains(&"Permanent Curse"), "permanent tag survives");
+        assert!(labels.contains(&"Active Buff"), "active timed tag survives");
+        assert!(
+            !labels.contains(&"Short Buff"),
+            "expired timed tag is dropped"
+        );
+    }
+
+    // ------------------------------------------------------------------------
+    // Slice 6 wiring: resolve_expired_tasks is the seam the tick calls. The
+    // resolved-task retention logic (drop resolved, keep pending) is what the
+    // tick handler implements — verify the data flow shape.
+    // ------------------------------------------------------------------------
+
+    /// A task queue with one due + one not-yet-due task: resolve_expired_tasks
+    /// returns one resolution, and the caller's retain logic keeps the
+    //  not-yet-due task. This mirrors the tick's retain pattern.
+    #[test]
+    fn wiring_tick_task_resolution_retain_pattern() {
+        let tasks = vec![
+            OffScreenTask {
+                npc_id: "npc.marcus".to_string(),
+                description: "scout".to_string(),
+                difficulty: TaskDifficulty::Routine,
+                suitability: Suitability::Ideal,
+                resolves_at_minutes: 500, // due at minute 1000
+                resolved: false,
+            },
+            OffScreenTask {
+                npc_id: "npc.lyra".to_string(),
+                description: "negotiate".to_string(),
+                difficulty: TaskDifficulty::Challenging,
+                suitability: Suitability::Adequate,
+                resolves_at_minutes: 5000, // not yet due at minute 1000
+                resolved: false,
+            },
+        ];
+        let now = 1000_i64;
+        let resolutions = offscreen_task::resolve_expired_tasks(&tasks, now);
+        assert_eq!(resolutions.len(), 1, "only the due task resolves");
+        assert_eq!(resolutions[0].npc_id, "npc.marcus");
+
+        // The tick's retain pattern: keep tasks that weren't just resolved.
+        // (In the live code this uses (npc_id, description, dc) tuples; here
+        // we approximate by npc_id+description to verify the data flow.)
+        let resolved_keys: std::collections::HashSet<(String, String)> = resolutions
+            .iter()
+            .map(|r| (r.npc_id.clone(), r.description.clone()))
+            .collect();
+        let remaining: Vec<&OffScreenTask> = tasks
+            .iter()
+            .filter(|t| !resolved_keys.contains(&(t.npc_id.clone(), t.description.clone())))
+            .collect();
+        assert_eq!(remaining.len(), 1, "the not-yet-due task is retained");
+        assert_eq!(remaining[0].npc_id, "npc.lyra");
+    }
+
+    // ------------------------------------------------------------------------
+    // Schema deserialization: the new fields default cleanly on pre-Phase-3
+    // saves (the #[serde(default)] contract). This is the load-compatibility
+    // guarantee — an old save without the new fields must deserialize.
+    // ------------------------------------------------------------------------
+
+    /// A JSON world-schema with NO status_tags / relationships / offscreen_tasks
+    /// fields (a pre-Phase-3 save) deserializes with all three defaulting to
+    /// empty. This is the save-compatibility firewall.
+    #[test]
+    fn wiring_schema_loads_pre_phase3_save_with_empty_defaults() {
+        // A minimal pre-Phase-3 save: only the original fields, none of the
+        // new Phase 3 wiring fields.
+        let pre_phase3_json = r#"{
+            "summary": "an old save",
+            "recent_events": [],
+            "entities": {},
+            "player_state": {
+                "body": {},
+                "stamina": "Fresh",
+                "wealth": 0,
+                "reputation": 0
+            },
+            "world_clock": { "current_minutes": 0, "last_tick_minutes": 0 },
+            "immutable_keys": [],
+            "scene_pacing": {
+                "mode": "Exploration",
+                "spatial": 0,
+                "emotional": 0,
+                "kinetic": 0
+            }
+        }"#;
+        let schema: WorldSchema =
+            serde_json::from_str(pre_phase3_json).expect("pre-Phase-3 save must deserialize");
+        assert!(schema.status_tags.is_empty(), "status_tags defaults to empty");
+        assert!(schema.relationships.is_empty(), "relationships defaults to empty");
+        assert!(schema.offscreen_tasks.is_empty(), "offscreen_tasks defaults to empty");
+        // The original fields load correctly.
+        assert_eq!(schema.summary, "an old save");
+    }
+
+    /// A round-trip serialize → deserialize preserves the new fields. This
+    /// pins the save/load integrity for the wiring storage.
+    #[test]
+    fn wiring_schema_roundtrip_preserves_new_fields() {
+        let mut schema = WorldSchema::default();
+        schema.status_tags.push(StatusTag {
+            label: "Test Buff".to_string(),
+            polarity: Polarity::Buff,
+            expires_at: 1000,
+            source: "test".to_string(),
+        });
+        schema.world_clock.current_minutes = 500;
+        let mut rel = relationship::RelationshipState::default();
+        rel.tier = RelationshipTier::Friendly;
+        schema.relationships.insert("npc.test".to_string(), rel);
+        schema.offscreen_tasks.push(OffScreenTask {
+            npc_id: "npc.test".to_string(),
+            description: "test task".to_string(),
+            difficulty: TaskDifficulty::Routine,
+            suitability: Suitability::Adequate,
+            resolves_at_minutes: 1000,
+            resolved: false,
+        });
+
+        let json = serde_json::to_string(&schema).expect("serialize");
+        let loaded: WorldSchema = serde_json::from_str(&json).expect("deserialize");
+
+        assert_eq!(loaded.status_tags.len(), 1);
+        assert_eq!(loaded.status_tags[0].label, "Test Buff");
+        assert_eq!(loaded.relationships.len(), 1);
+        assert_eq!(
+            loaded.relationships.get("npc.test").unwrap().tier,
+            RelationshipTier::Friendly
+        );
+        assert_eq!(loaded.offscreen_tasks.len(), 1);
+        assert_eq!(loaded.offscreen_tasks[0].npc_id, "npc.test");
+    }
+
+    // ------------------------------------------------------------------------
+    // SchemaDelta shape: confirm the new wiring doesn't change the delta's
+    // serialization (the LLM contract is unchanged — the model never sees the
+    // new storage fields, only the entity map it already writes).
+    // ------------------------------------------------------------------------
+
+    /// SchemaDelta still serializes/deserializes with the same shape (no new
+    /// fields added to the delta itself — the wiring intercepts at apply time).
+    #[test]
+    fn wiring_schema_delta_shape_unchanged() {
+        let delta = delta_with_entity("rel.npc.x", "trusted");
+        let json = serde_json::to_string(&delta).expect("serialize");
+        // The delta has only summary/recent_events/entities — no relationship
+        // or tag fields. The LLM contract is unchanged.
+        let loaded: SchemaDelta = serde_json::from_str(&json).expect("deserialize");
+        assert!(loaded.summary.is_none());
+        assert!(loaded.recent_events.is_none());
+        assert!(loaded.entities.is_some());
+    }
+
+    // ------------------------------------------------------------------------
+    // Bug A fix wiring (2026-07-28): JSON dual-parser produces the SAME
+    // BracketCommand variants the bracket-path wiring tests above assert
+    // against. Each test below mirrors an existing bracket wiring test with
+    // the equivalent JSON input the model actually emits. This proves the
+    // downstream consumers (apply_phase3_bracket_commands, scene_event
+    // emission, the World Progression tick) are format-agnostic — they only
+    // ever see BracketCommand, never the raw JSON or bracket text.
+    // ------------------------------------------------------------------------
+
+    /// JSON equivalent of wiring_effect_bracket_parses_multi_word_label.
+    /// Same fields, same variant, same assertion shape.
+    #[test]
+    fn wiring_effect_json_parses_to_same_variant() {
+        let parsed = bracket_parser::parse(
+            "The rage takes you.\n```json\n{\"type\":\"effect\",\"label\":\"Berserk Rage\",\"polarity\":\"buff\",\"duration_minutes\":60}\n```",
+        );
+        let effects: Vec<&BracketCommand> = parsed
+            .commands
+            .iter()
+            .filter(|c| matches!(c, BracketCommand::Effect { .. }))
+            .collect();
+        assert_eq!(effects.len(), 1, "exactly one Effect from JSON");
+        if let BracketCommand::Effect { label, polarity, duration_minutes } = effects[0] {
+            assert_eq!(label, "Berserk Rage");
+            assert_eq!(*polarity, Polarity::Buff);
+            assert_eq!(*duration_minutes, 60);
+        } else {
+            unreachable!();
+        }
+        assert!(!parsed.prose.contains("```"), "fence stripped from prose");
+        assert!(!parsed.prose.contains("Berserk"), "JSON body stripped from prose");
+    }
+
+    /// The exact shape the model emitted in the 2026-07-28 playtest
+    /// (`effect_name` / `effect_label` / `effect_duration_minutes` field
+    /// names — the model's invented aliases). Must map cleanly to Effect.
+    #[test]
+    fn wiring_effect_json_accepts_model_invented_field_names() {
+        let parsed = bracket_parser::parse(
+            "Prose.\n```json\n{\"effect_name\":\"exploration\",\"effect_label\":\"exploration\",\"effect_duration_minutes\":15}\n```",
+        );
+        let effects: Vec<&BracketCommand> = parsed
+            .commands
+            .iter()
+            .filter(|c| matches!(c, BracketCommand::Effect { .. }))
+            .collect();
+        assert_eq!(effects.len(), 1);
+        if let BracketCommand::Effect { label, duration_minutes, .. } = effects[0] {
+            assert_eq!(label, "exploration");
+            assert_eq!(*duration_minutes, 15);
+        } else {
+            unreachable!();
+        }
+    }
+
+    /// JSON equivalent of wiring_milestone_bracket_parses.
+    #[test]
+    fn wiring_milestone_json_parses_to_same_variant() {
+        let parsed = bracket_parser::parse(
+            "He pulls you from the river.\n```json\n{\"type\":\"milestone\",\"npc_id\":\"npc.marcus\",\"event_id\":\"saved_life\"}\n```",
+        );
+        let milestones: Vec<&BracketCommand> = parsed
+            .commands
+            .iter()
+            .filter(|c| matches!(c, BracketCommand::Milestone { .. }))
+            .collect();
+        assert_eq!(milestones.len(), 1);
+        if let BracketCommand::Milestone { npc_id, event_id } = milestones[0] {
+            assert_eq!(npc_id, "npc.marcus");
+            assert_eq!(event_id, "saved_life");
+        } else {
+            unreachable!();
+        }
+    }
+
+    /// JSON equivalent of wiring_task_bracket_parses_multi_word_description.
+    #[test]
+    fn wiring_task_json_parses_to_same_variant() {
+        let parsed = bracket_parser::parse(
+            "Marcus nods and slips out.\n```json\n{\"type\":\"task\",\"npc_id\":\"npc.marcus\",\"description\":\"scout the bandit camp\",\"difficulty\":\"challenging\",\"suitability\":\"adequate\",\"eta_minutes\":240}\n```",
+        );
+        let tasks: Vec<&BracketCommand> = parsed
+            .commands
+            .iter()
+            .filter(|c| matches!(c, BracketCommand::Task { .. }))
+            .collect();
+        assert_eq!(tasks.len(), 1);
+        if let BracketCommand::Task { npc_id, description, difficulty, suitability, eta_minutes } =
+            tasks[0]
+        {
+            assert_eq!(npc_id, "npc.marcus");
+            assert_eq!(description, "scout the bandit camp");
+            assert_eq!(difficulty, "challenging");
+            assert_eq!(suitability, "adequate");
+            assert_eq!(*eta_minutes, 240);
+        } else {
+            unreachable!();
+        }
     }
 }

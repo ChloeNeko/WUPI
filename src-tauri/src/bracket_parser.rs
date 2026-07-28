@@ -27,6 +27,7 @@
 //! `[CHARACTER_TURN:` unterminated) are silently dropped, not fatal. The
 //! narrator is a 12B model; we tolerate noisy output.
 
+use crate::consequence::Polarity;
 use serde::Serialize;
 
 /// One bracket command extracted from narrator output.
@@ -46,6 +47,45 @@ pub enum BracketCommand {
     /// the debug panel). The Rust side owns the clock — this is the ONLY
     /// path that writes `WorldSchema::world_clock`.
     Time { minutes: i64, raw: String },
+    /// A buff/debuff status tag is created with a timed WorldClock expiry
+    /// (Fable Phase 3 Slice 4 wiring, 2026-07-28). `label` is the diegetic
+    /// phrase the narrator weaves into prose ("Berserk Rage", "Feverish",
+    /// "Blessed by the Sun Priest"). `polarity` is buff (positive) or
+    /// debuff (negative) — drives `consequence::derive_condition`'s ±1
+    /// nudge rules. `duration_minutes` is how long the tag lasts before
+    /// the World Progression tick drops it (the tag's `expires_at` =
+    /// current clock + duration). `0` duration means permanent (the
+    /// sentinel; only removed by an explicit event, not time).
+    Effect {
+        label: String,
+        polarity: Polarity,
+        duration_minutes: i64,
+    },
+    /// A relationship milestone event was recorded (Fable Phase 3 Slice 5
+    /// wiring, 2026-07-28). `npc_id` matches the entity-map convention
+    /// (e.g. "npc.marcus"). `event_id` is one of the known milestones in
+    /// `relationship::MilestoneRegistry::defaults()` (e.g. "saved_life",
+    /// "betrayed_trust", "shared_drink"). Rust records the event on the
+    /// NPC's `RelationshipState`; the next render evaluates any transition
+    /// the event triggers (hostility drops fire instantly; affinity
+    /// advances respect the dual gates).
+    Milestone { npc_id: String, event_id: String },
+    /// An off-screen task was queued (Fable Phase 3 Slice 6 wiring,
+    /// 2026-07-28). `npc_id` is the assigned NPC, `description` is the
+    /// short diegetic task ("scout the bandit camp"). `difficulty` +
+    /// `suitability` are enum-stringified (e.g. "challenging",
+    /// "adequate"). `eta_minutes` is how many in-world minutes until the
+    /// task resolves (added to the current clock to compute
+    /// `resolves_at_minutes`). The World Progression tick resolves due
+    /// tasks via `offscreen_task::resolve_expired_tasks` + emits
+    /// directives.
+    Task {
+        npc_id: String,
+        description: String,
+        difficulty: String,
+        suitability: String,
+        eta_minutes: i64,
+    },
 }
 
 /// The result of parsing narrator output: the bracket commands found + the
@@ -74,6 +114,15 @@ pub struct ParsedNarration {
 /// `OBJECT` and `FX` are single-region. This keeps the parser linear and
 /// the brackets-plus-prose invariant simple.
 pub fn parse(raw: &str) -> ParsedNarration {
+    // Bug A fix (2026-07-28): pre-extract fenced JSON blocks BEFORE the
+    // bracket scan. Modern instruct-tuned models reach for JSON when they
+    // see structured schema fields; we accept both shapes. Fences are
+    // lexically disjoint from brackets (no `[`/`]` in the opener/closer),
+    // so the bracket loop's `text_after` slicing contract for
+    // CHARACTER_TURN is preserved — it runs over the fence-stripped
+    // string and never sees fence bytes.
+    let (raw, json_bodies) = extract_fenced_json(raw);
+
     let bytes = raw.as_bytes();
     let mut commands = Vec::new();
     let mut prose = String::with_capacity(raw.len());
@@ -125,6 +174,18 @@ pub fn parse(raw: &str) -> ParsedNarration {
         }
     }
 
+    // Bug A fix (2026-07-28): parse each JSON body extracted in the pre-pass
+    // into a BracketCommand. Failed parses are dropped silently — same
+    // contract as a malformed bracket (the fence was a machine-channel; a
+    // body that doesn't yield a valid command is just noise). The bodies
+    // were already removed from `prose` by `extract_fenced_json`, so we
+    // never re-inject them on failure.
+    for body in &json_bodies {
+        if let Some(cmd) = parse_json_command(body) {
+            commands.push(cmd);
+        }
+    }
+
     // Chloe 2026-07-27 — extra-spaces fix. When a bracket command is
     // stripped, the spaces immediately before and after it survive in the
     // prose: `"Mara nods. [OBJECT id=door state=open] The fire crackles."`
@@ -136,6 +197,11 @@ pub fn parse(raw: &str) -> ParsedNarration {
     // verbatim in stored `content` (archived to session, re-rendered on
     // every feed rebuild) — and they're visible in the live stream too
     // (stream_filter strips brackets the same way, leaving the same gaps).
+    //
+    // The fence stripping above leaves the SAME gap pattern (a fence on its
+    // own line, removed, leaves the surrounding newlines + any inline
+    // spaces), so this normalize covers JSON removal too — no separate
+    // fence-whitespace pass needed.
     //
     // Normalize: collapse runs of 2+ spaces to one, and trim trailing
     // whitespace per line (preserves newlines as paragraph breaks). Pure
@@ -201,10 +267,417 @@ fn normalize_whitespace(s: &str) -> String {
 /// `text_after` is the raw text starting just after the closing `]` (used
 /// to find the `CHARACTER_TURN:end` terminator). Indices returned are
 /// relative to this slice.
+
+/// Infer a status tag's polarity (Buff vs Debuff) from its label when the
+/// narrator omits the explicit `buff`/`debuff` token (the model frequently
+/// does — see the 2026-07-28 playtest). The heuristic is conservative:
+/// only well-known debuff keywords map to Debuff; anything ambiguous
+/// defaults to Buff (the safer default — a false-Buff just means a tag
+/// that lifts condition rather than drags it, vs a false-Debuff that would
+/// penalize the player for what should have been a help).
+fn infer_polarity(label: &str) -> Polarity {
+    const DEBUFF_KEYWORDS: &[&str] = &[
+        "poison", "poisoned", "venom", "toxin", "toxic",
+        "curse", "cursed", "hex", "hexed", "bane",
+        "fever", "feverish", "sick", "illness", "nausea", "nauseous",
+        "bleed", "bleeding", "wound", "wounded",
+        "stun", "stunned", "daze", "dazed", "paralyze", "paralyzed",
+        "fear", "frightened", "terrified", "panic",
+        "exhaust", "exhausted", "fatigue", "fatigued", "tired",
+        "drunk", "intoxicated", "hangover",
+        "burn", "burning", "frostbite", "hypothermia",
+        "disease", "diseased", "plague", "infection", "infected",
+        "rage", "berserk", "frenzy",  // ambiguous but typically debuff in RPGs (loss of control)
+        "slow", "slowed", "weakness", "weakened", "vulnerable",
+        "blind", "blinded", "deaf", "deafened",
+        "corruption", "corrupted", "taint", "tainted",
+    ];
+    let lower = label.to_lowercase();
+    if DEBUFF_KEYWORDS.iter().any(|kw| lower.contains(kw)) {
+        Polarity::Debuff
+    } else {
+        Polarity::Buff
+    }
+}
+
+// ============================================================================
+// Fenced-JSON dual parser (Bug A fix, 2026-07-28).
+//
+// Modern instruct-tuned models (Gemma 12B in particular) reach for JSON when
+// they see structured schema-ish fields in the system prompt, ignoring the
+// bracket protocol and emitting `{"effect_name": "..."}` blocks instead.
+// Rather than fight the training (the rejected "Iron Fist" logit-bias plan),
+// we accept BOTH shapes: brackets remain the legacy path, fenced JSON is the
+// new canonical path. Both map to the same `BracketCommand` enum, so every
+// downstream consumer (apply_phase3_bracket_commands, scene_event emission,
+// the World Progression tick) is unchanged.
+//
+// The two-path-sync contract (stream_filter::with_brackets regex MUST mirror
+// parse_one's recognized prefixes — the documented 2026-07-28 drift-leak
+// lesson) extends to JSON too: a `fence_re` was added alongside the bracket
+// regex in the same commit. Both paths strip in stream_filter AND parse here.
+// ============================================================================
+
+/// The fenced-JSON opener the model emits (Markdown code fence + language
+/// tag). Kept as a single constant so the streaming-side regex + this
+/// extraction stay in sync by construction.
+const JSON_FENCE_OPENER: &str = "```json";
+const JSON_FENCE_CLOSER: &str = "```";
+
+/// Pre-pass: extract every ```` ```json ... ``` ```` fenced block from the
+/// raw narrator text. Returns `(prose_with_fences_stripped, json_bodies)`.
+///
+/// The fences (opener + body + closer + any single surrounding newline) are
+/// removed from the prose; the body of each fence is collected for parsing.
+/// Defensive on every malformed shape:
+///   - No opener in the input → returned unchanged, empty bodies vec.
+///   - Unterminated fence (opener but no closer) → body up to EOF is taken,
+///     opener + body removed from prose (treats the rest of the generation
+///     as the JSON body the model was mid-way through emitting).
+///   - Empty body (`opener` immediately followed by `closer`) → skipped
+///     (no command can come from `{}` or empty).
+///
+/// Pure byte-scanning + `find`, mirroring the discipline of `parse()` below
+/// (Prime Directive §1B.2: no regex backtracking, linear scan).
+pub(crate) fn extract_fenced_json(raw: &str) -> (String, Vec<String>) {
+    let bytes = raw.as_bytes();
+    let mut prose = String::with_capacity(raw.len());
+    let mut bodies = Vec::new();
+    let mut i = 0;
+
+    while i < bytes.len() {
+        // Find the next ```json opener from the current position.
+        let Some(rel) = raw[i..].find(JSON_FENCE_OPENER) else {
+            prose.push_str(&raw[i..]);
+            break;
+        };
+        let opener_start = i + rel;
+
+        // Emit any prose before the opener.
+        prose.push_str(&raw[i..opener_start]);
+
+        // Body starts after the opener. Skip a single trailing newline if
+        // present (the model always puts the JSON on its own line).
+        let body_start = opener_start + JSON_FENCE_OPENER.len();
+        let body_start = if bytes.get(body_start) == Some(&b'\r') {
+            body_start + 1
+        } else {
+            body_start
+        };
+        let body_start = if bytes.get(body_start) == Some(&b'\n') {
+            body_start + 1
+        } else {
+            body_start
+        };
+
+        // Find the closing fence. The closer is just ``` (no `json`), so we
+        // search the remainder for it.
+        let after_opener = &raw[body_start..];
+        match after_opener.find(JSON_FENCE_CLOSER) {
+            Some(closer_rel) => {
+                let body_end = body_start + closer_rel;
+                let body = &raw[body_start..body_end];
+                let closer_end = body_end + JSON_FENCE_CLOSER.len();
+                // Skip a single trailing newline after the closer (keeps the
+                // prose clean — otherwise the fence leaves a blank line).
+                let after_closer = if bytes.get(closer_end) == Some(&b'\r') {
+                    closer_end + 1
+                } else {
+                    closer_end
+                };
+                let after_closer = if bytes.get(after_closer) == Some(&b'\n') {
+                    after_closer + 1
+                } else {
+                    after_closer
+                };
+                if !body.trim().is_empty() {
+                    bodies.push(body.to_string());
+                }
+                i = after_closer;
+            }
+            None => {
+                // Unterminated fence: the model was mid-generation when the
+                // stream ended (cancel, max-tokens, or a stutter). Take the
+                // rest of the text as the body — best-effort, will likely
+                // fail JSON parse and be dropped, but a partial body that
+                // happens to be valid JSON still works.
+                let body = &raw[body_start..];
+                if !body.trim().is_empty() {
+                    bodies.push(body.to_string());
+                }
+                // Nothing left to scan.
+                break;
+            }
+        }
+    }
+
+    (prose, bodies)
+}
+
+/// Parse one JSON object body into a `BracketCommand`. Returns `None` on any
+/// failure (malformed JSON, unknown shape, missing required fields) — the
+/// caller drops silently, same contract as a malformed bracket.
+///
+/// Two-pass: try `serde_json::from_str` first (the fast path for well-formed
+/// output). On failure, run `json_repair::repair` (the same module the schema
+/// engine's 3-pass contract uses) and retry once. This reuses the existing
+/// failure-recovery pattern rather than inventing a new one.
+///
+/// Dispatch: prefers an explicit discriminator field (`"type"` / `"kind"` /
+/// `"command"`), else infers the variant from field-name prefixes
+/// (`effect_*` → Effect, `milestone_*` / `event_id` → Milestone, `task_*` /
+/// `eta_minutes` → Task, `clock` / `timestamp` → Time). Field-name aliases
+/// are accepted liberally — the model invents names like `effect_name` and
+/// `effect_duration_minutes`; we accept those alongside the canonical
+/// `label` / `duration_minutes`.
+pub(crate) fn parse_json_command(body: &str) -> Option<BracketCommand> {
+    let body = body.trim();
+    if body.is_empty() {
+        return None;
+    }
+
+    // Try strict parse, then repaired parse. Both go through the same
+    // downstream dispatcher so the repair path is just a recovery wrapper.
+    let parsed = serde_json::from_str::<serde_json::Value>(body).ok().or_else(|| {
+        let repaired = crate::json_repair::repair(body);
+        serde_json::from_str::<serde_json::Value>(&repaired).ok()
+    })?;
+
+    let obj = parsed.as_object()?;
+    json_value_to_command(obj)
+}
+
+/// Dispatch a parsed JSON object to the right `BracketCommand` variant. Pure
+/// shape matching; no validation beyond "the required fields are present and
+/// the right type" — same leniency as the bracket parsers.
+fn json_value_to_command(obj: &serde_json::Map<String, serde_json::Value>) -> Option<BracketCommand> {
+    // 1. Explicit discriminator field wins if present.
+    let disc = obj
+        .get("type")
+        .or_else(|| obj.get("kind"))
+        .or_else(|| obj.get("command"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_lowercase());
+
+    let kind = disc.or_else(|| infer_kind_from_fields(obj))?;
+
+    match kind.as_str() {
+        "effect" | "status" | "tag" | "buff" | "debuff" => json_to_effect(obj),
+        "time" | "clock" => json_to_time(obj),
+        "milestone" => json_to_milestone(obj),
+        "task" => json_to_task(obj),
+        "character_turn" | "character" | "dialogue" => json_to_character_turn(obj),
+        "object" => json_to_object(obj),
+        "fx" | "effect_fx" | "scene_fx" => json_to_fx(obj),
+        _ => None,
+    }
+}
+
+/// If no explicit discriminator, look at the field names to infer the kind.
+/// Accepts the same aliases as the per-variant parsers (e.g. `event` matches
+/// the same variant as `event_id`).
+fn infer_kind_from_fields(obj: &serde_json::Map<String, serde_json::Value>) -> Option<String> {
+    let keys: Vec<&str> = obj.keys().map(|s| s.as_str()).collect();
+    if keys.iter().any(|k| {
+        k.starts_with("effect_") || *k == "polarity" || *k == "buff_or_debuff"
+    }) {
+        return Some("effect".to_string());
+    }
+    // Milestone: event_id/event + npc_id/npc. Both aliases recognized so a
+    // body with only the short forms (`{npc, event}`) still dispatches.
+    if keys.iter().any(|k| k.starts_with("milestone_") || matches!(*k, "event_id" | "event")) {
+        return Some("milestone".to_string());
+    }
+    if keys.iter().any(|k| k.starts_with("task_") || *k == "eta_minutes" || *k == "eta") {
+        return Some("task".to_string());
+    }
+    if keys.iter().any(|k| matches!(*k, "clock" | "timestamp" | "minutes" | "day" | "hour")) {
+        return Some("time".to_string());
+    }
+    if keys.iter().any(|k| matches!(*k, "npc_id" | "npc")) && keys.iter().any(|k| *k == "line") {
+        return Some("character_turn".to_string());
+    }
+    if keys.iter().any(|k| *k == "state") {
+        return Some("object".to_string());
+    }
+    None
+}
+
+fn json_to_effect(obj: &serde_json::Map<String, serde_json::Value>) -> Option<BracketCommand> {
+    let label = obj
+        .get("label")
+        .or_else(|| obj.get("name"))
+        .or_else(|| obj.get("effect_name"))
+        .or_else(|| obj.get("effect_label"))
+        .and_then(|v| v.as_str())?
+        .to_string();
+    if label.trim().is_empty() {
+        return None;
+    }
+
+    let duration_minutes = obj
+        .get("duration_minutes")
+        .or_else(|| obj.get("duration"))
+        .or_else(|| obj.get("effect_duration_minutes"))
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0);
+    if duration_minutes < 0 {
+        return None;
+    }
+
+    let polarity = obj
+        .get("polarity")
+        .or_else(|| obj.get("buff_or_debuff"))
+        .and_then(|v| v.as_str())
+        .and_then(|s| match s.to_lowercase().as_str() {
+            "buff" | "positive" | "help" | "helps" => Some(Polarity::Buff),
+            "debuff" | "negative" | "hurt" | "hurts" => Some(Polarity::Debuff),
+            _ => None,
+        })
+        .unwrap_or_else(|| infer_polarity(&label));
+
+    Some(BracketCommand::Effect {
+        label,
+        polarity,
+        duration_minutes,
+    })
+}
+
+fn json_to_time(obj: &serde_json::Map<String, serde_json::Value>) -> Option<BracketCommand> {
+    // Prefer an explicit numeric minutes field (Rust-authoritative form).
+    if let Some(mins) = obj.get("minutes").and_then(|v| v.as_i64()) {
+        if mins >= 0 {
+            return Some(BracketCommand::Time {
+                minutes: mins,
+                raw: format!("{}", mins),
+            });
+        }
+    }
+    // Otherwise parse a raw timestamp string via the existing parser.
+    let raw = obj
+        .get("raw")
+        .or_else(|| obj.get("time"))
+        .or_else(|| obj.get("clock"))
+        .or_else(|| obj.get("timestamp"))
+        .and_then(|v| v.as_str())?;
+    let minutes = parse_in_world_time(raw)?;
+    Some(BracketCommand::Time {
+        minutes,
+        raw: raw.to_string(),
+    })
+}
+
+fn json_to_milestone(obj: &serde_json::Map<String, serde_json::Value>) -> Option<BracketCommand> {
+    let npc_id = obj
+        .get("npc_id")
+        .or_else(|| obj.get("npc"))
+        .and_then(|v| v.as_str())?
+        .to_string();
+    let event_id = obj
+        .get("event_id")
+        .or_else(|| obj.get("event"))
+        .and_then(|v| v.as_str())?
+        .to_string();
+    if npc_id.trim().is_empty() || event_id.trim().is_empty() {
+        return None;
+    }
+    Some(BracketCommand::Milestone { npc_id, event_id })
+}
+
+fn json_to_task(obj: &serde_json::Map<String, serde_json::Value>) -> Option<BracketCommand> {
+    let npc_id = obj
+        .get("npc_id")
+        .or_else(|| obj.get("npc"))
+        .and_then(|v| v.as_str())?
+        .to_string();
+    let description = obj
+        .get("description")
+        .or_else(|| obj.get("desc"))
+        .and_then(|v| v.as_str())?
+        .to_string();
+    let difficulty = obj
+        .get("difficulty")
+        .and_then(|v| v.as_str())
+        .unwrap_or("routine")
+        .to_string();
+    let suitability = obj
+        .get("suitability")
+        .and_then(|v| v.as_str())
+        .unwrap_or("adequate")
+        .to_string();
+    let eta_minutes = obj
+        .get("eta_minutes")
+        .or_else(|| obj.get("eta"))
+        .and_then(|v| v.as_i64())?;
+    if npc_id.trim().is_empty()
+        || description.trim().is_empty()
+        || eta_minutes <= 0
+    {
+        return None;
+    }
+    Some(BracketCommand::Task {
+        npc_id,
+        description,
+        difficulty,
+        suitability,
+        eta_minutes,
+    })
+}
+
+fn json_to_character_turn(obj: &serde_json::Map<String, serde_json::Value>) -> Option<BracketCommand> {
+    let npc_id = obj
+        .get("npc_id")
+        .or_else(|| obj.get("npc"))
+        .and_then(|v| v.as_str())?
+        .to_string();
+    let line = obj
+        .get("line")
+        .or_else(|| obj.get("text"))
+        .or_else(|| obj.get("speech"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    if npc_id.trim().is_empty() {
+        return None;
+    }
+    Some(BracketCommand::CharacterTurn { npc_id, line })
+}
+
+fn json_to_object(obj: &serde_json::Map<String, serde_json::Value>) -> Option<BracketCommand> {
+    let id = obj
+        .get("id")
+        .or_else(|| obj.get("object_id"))
+        .and_then(|v| v.as_str())?
+        .to_string();
+    let state = obj
+        .get("state")
+        .or_else(|| obj.get("new_state"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    if id.trim().is_empty() {
+        return None;
+    }
+    Some(BracketCommand::Object { id, state })
+}
+
+fn json_to_fx(obj: &serde_json::Map<String, serde_json::Value>) -> Option<BracketCommand> {
+    let effect = obj
+        .get("effect")
+        .or_else(|| obj.get("name"))
+        .or_else(|| obj.get("effect_name"))
+        .and_then(|v| v.as_str())?
+        .to_string();
+    if effect.trim().is_empty() {
+        return None;
+    }
+    Some(BracketCommand::Fx { effect })
+}
+
 fn parse_one(bracket: &str, text_after: &str) -> Option<(BracketCommand, usize)> {
     let bracket = bracket.trim();
 
-    if let Some(rest) = bracket.strip_prefix("CHARACTER_TURN:") {
+    if let Some(rest) = strip_prefix_ci(bracket, "CHARACTER_TURN:") {
         let npc_id = rest.trim().to_string();
         if npc_id == "end" || npc_id.is_empty() {
             // A stray close tag or empty open tag: drop it.
@@ -214,13 +687,25 @@ fn parse_one(bracket: &str, text_after: &str) -> Option<(BracketCommand, usize)>
             }, 0));
         }
         // Find the matching [CHARACTER_TURN:end] in `text_after`. The body
-        // between is the NPC's spoken line.
+        // between is the NPC's spoken line. Case-insensitive (§11.40.F fix):
+        // the model sometimes emits `[CHARACTER_Turn:end]` with a capital T;
+        // `find_ci` catches the variant the same as the canonical form. The
+        // consumed-length is the matched-close-tag's actual byte length (not
+        // a hardcoded const) so it's correct regardless of the case variant.
         let close = "[CHARACTER_TURN:end]";
-        if let Some(end_idx) = text_after.find(close) {
+        if let Some(end_idx) = find_ci(text_after, close) {
+            // Measure the actual close-tag length at the match site (case-
+            // insensitive match means the surface form may differ in length
+            // only if non-ASCII, which won't happen here — but measure
+            // defensively by scanning to the next `]`).
+            let tag_end = text_after[end_idx..]
+                .find(']')
+                .map(|r| end_idx + r + 1)
+                .unwrap_or(end_idx + close.len());
             let line = text_after[..end_idx].trim().to_string();
             return Some((
                 BracketCommand::CharacterTurn { npc_id, line },
-                end_idx + close.len(),
+                tag_end,
             ));
         }
         // No close tag: treat the rest of the output as the line (graceful).
@@ -231,7 +716,7 @@ fn parse_one(bracket: &str, text_after: &str) -> Option<(BracketCommand, usize)>
         ));
     }
 
-    if let Some(rest) = bracket.strip_prefix("OBJECT") {
+    if let Some(rest) = strip_prefix_ci(bracket, "OBJECT") {
         // Parse `id=x state=y` (whitespace-tolerant). This is the documented
         // contract format. Models usually follow it; the strict parse below
         // is the fast path.
@@ -274,7 +759,7 @@ fn parse_one(bracket: &str, text_after: &str) -> Option<(BracketCommand, usize)>
         return None;
     }
 
-    if let Some(rest) = bracket.strip_prefix("FX") {
+    if let Some(rest) = strip_prefix_ci(bracket, "FX") {
         let effect = rest.trim().to_string();
         if !effect.is_empty() {
             return Some((BracketCommand::Fx { effect }, 0));
@@ -286,7 +771,7 @@ fn parse_one(bracket: &str, text_after: &str) -> Option<(BracketCommand, usize)>
     // OBJECT/FX. The body is parsed by parse_in_world_time into minutes-since-
     // epoch; on failure the bracket is emitted as literal prose (better to
     // surface a malformed timestamp than silently drop it).
-    if let Some(rest) = bracket.strip_prefix("TIME") {
+    if let Some(rest) = strip_prefix_ci(bracket, "TIME") {
         let raw = rest.trim().to_string();
         if let Some(minutes) = parse_in_world_time(&raw) {
             return Some((BracketCommand::Time { minutes, raw }, 0));
@@ -294,6 +779,371 @@ fn parse_one(bracket: &str, text_after: &str) -> Option<(BracketCommand, usize)>
         return None;
     }
 
+    // [EFFECT ...] — Fable Phase 3 Slice 4 (2026-07-28). Single-region.
+    // Tolerant parse: accepts BOTH positional and key=value syntax (the model
+    // emits both shapes — see the 2026-07-28 playtest). Polarity is OPTIONAL:
+    // if absent, infer from the label (debuff-leaning words → Debuff, else
+    // Buff). Defensive: malformed → None (emitted as literal prose, no panic).
+    //
+    // Accepted shapes:
+    //   [EFFECT <label> <buff|debuff> <duration>]              (positional)
+    //   [EFFECT <label> <duration>]                            (positional, no polarity)
+    //   [EFFECT label=<label> polarity=<buff|debuff> duration=<n>]  (key=value)
+    //   [EFFECT label=<label> duration_minutes=<n>]            (key=value, no polarity)
+    //
+    // The label may contain spaces (positional) or be a quoted/escaped value
+    // (key=value — we strip a trailing `=` and join the rest).
+    if let Some(rest) = strip_prefix_ci(bracket, "EFFECT") {
+        let rest = rest.trim();
+        // Parse key=value pairs first (model's preferred shape).
+        let mut kv: std::collections::HashMap<&str, &str> = std::collections::HashMap::new();
+        let mut positional: Vec<&str> = Vec::new();
+        for tok in rest.split_whitespace() {
+            if let Some(eq) = tok.find('=') {
+                let k = tok[..eq].trim();
+                let v = tok[eq + 1..].trim();
+                if !k.is_empty() {
+                    kv.insert(k, v);
+                }
+            } else {
+                positional.push(tok);
+            }
+        }
+        // Try key=value extraction first.
+        if !kv.is_empty() {
+            let label = kv.get("label").copied().or_else(|| kv.get("name").copied());
+            let duration = kv
+                .get("duration_minutes")
+                .or_else(|| kv.get("duration"))
+                .copied()
+                .and_then(|s| s.parse::<i64>().ok());
+            let polarity = kv.get("polarity").copied().and_then(|s| match s.to_lowercase().as_str() {
+                "buff" => Some(Polarity::Buff),
+                "debuff" => Some(Polarity::Debuff),
+                _ => None,
+            });
+            if let (Some(label), Some(duration)) = (label, duration) {
+                if !label.is_empty() && duration >= 0 {
+                    let polarity = polarity.unwrap_or_else(|| infer_polarity(label));
+                    return Some((
+                        BracketCommand::Effect {
+                            label: label.to_string(),
+                            polarity,
+                            duration_minutes: duration,
+                        },
+                        0,
+                    ));
+                }
+            }
+        }
+        // Fall back to positional.
+        if positional.len() >= 2 {
+            let duration_idx = positional.len() - 1;
+            let duration_minutes = positional[duration_idx].parse::<i64>().ok();
+            if let Some(duration_minutes) = duration_minutes {
+                if duration_minutes >= 0 {
+                    // Check if the second-to-last token is a polarity.
+                    let polarity_idx = positional.len() - 2;
+                    let explicit_polarity = match positional[polarity_idx].to_lowercase().as_str() {
+                        "buff" => Some(Polarity::Buff),
+                        "debuff" => Some(Polarity::Debuff),
+                        _ => None,
+                    };
+                    let (label, polarity) = if let Some(p) = explicit_polarity {
+                        (positional[..polarity_idx].join(" "), p)
+                    } else {
+                        let label = positional[..duration_idx].join(" ");
+                        (label.clone(), infer_polarity(&label))
+                    };
+                    if !label.is_empty() {
+                        return Some((
+                            BracketCommand::Effect {
+                                label,
+                                polarity,
+                                duration_minutes,
+                            },
+                            0,
+                        ));
+                    }
+                }
+            }
+        }
+        return None;
+    }
+
+    // [MILESTONE <npc_id> <event_id>] — Fable Phase 3 Slice 5 (2026-07-28).
+    // Single-region. Records a relationship milestone event for an NPC.
+    // Tolerant: the model sometimes emits a literal `event_id`/`npc_id`
+    // placeholder token from the prompt doc (`[MILESTONE mara event_id
+    // first_positive_interaction]`). Filter those placeholders out before
+    // extracting the two real values. Also accepts key=value.
+    if let Some(rest) = strip_prefix_ci(bracket, "MILESTONE") {
+        let rest = rest.trim();
+        // Try key=value first.
+        let mut kv_npc = None;
+        let mut kv_event = None;
+        let mut positional: Vec<&str> = Vec::new();
+        for tok in rest.split_whitespace() {
+            if let Some(eq) = tok.find('=') {
+                let k = tok[..eq].trim();
+                let v = tok[eq + 1..].trim();
+                match k {
+                    "npc_id" | "npc" | "id" => kv_npc = Some(v),
+                    "event_id" | "event" => kv_event = Some(v),
+                    _ => {}
+                }
+            } else {
+                positional.push(tok);
+            }
+        }
+        // Placeholder words the model copies verbatim from the prompt doc.
+        const PLACEHOLDERS: &[&str] = &["event_id", "npc_id", "npc", "event", "id"];
+        let real_positional: Vec<&str> = positional
+            .iter()
+            .copied()
+            .filter(|t| !PLACEHOLDERS.contains(t))
+            .collect();
+        let npc_id = kv_npc
+            .or_else(|| real_positional.first().copied())
+            .map(|s| s.to_string());
+        let event_id = kv_event
+            .or_else(|| real_positional.get(1).copied())
+            .map(|s| s.to_string());
+        if let (Some(npc_id), Some(event_id)) = (npc_id, event_id) {
+            if !npc_id.is_empty() && !event_id.is_empty() {
+                return Some((BracketCommand::Milestone { npc_id, event_id }, 0));
+            }
+        }
+        return None;
+    }
+
+    // [TASK ...] — Fable Phase 3 Slice 6 (2026-07-28). Single-region. Queues
+    // an off-screen task. Tolerant parse: accepts BOTH positional AND key=value
+    // syntax (the model emits both — see the 2026-07-28 playtest). The `|`
+    // separator splits the head (npc_id + description) from the tail
+    // (difficulty suitability eta); the description may contain spaces.
+    // Defensive: malformed → None.
+    //
+    // Accepted shapes:
+    //   [TASK <npc_id> <description> | <difficulty> <suitability> <eta>]  (positional)
+    //   [TASK npc_id=<id> description=<desc> | difficulty=<d> suitability=<s> eta_minutes=<n>]  (key=value)
+    if let Some(rest) = strip_prefix_ci(bracket, "TASK") {
+        let rest = rest.trim();
+        // Split on the `|` separator.
+        let (head, tail) = if let Some(pipe_idx) = rest.find('|') {
+            (rest[..pipe_idx].trim(), rest[pipe_idx + 1..].trim())
+        } else {
+            // No pipe — fall back to splitting the whole thing by whitespace.
+            // The model sometimes omits the pipe. Take the first token as
+            // npc_id, last 3 as difficulty/suitability/eta, middle as desc.
+            return parse_task_no_pipe(rest);
+        };
+
+        // Parse head: extract key=value pairs, collect positional tokens.
+        let (kv_head, pos_head) = split_kv_positional(head);
+        let npc_id = kv_head
+            .get("npc_id")
+            .or_else(|| kv_head.get("npc"))
+            .or_else(|| kv_head.get("id"))
+            .copied()
+            .map(|s| s.to_string())
+            .or_else(|| pos_head.first().copied().map(|s| s.to_string()));
+        let description = kv_head
+            .get("description")
+            .or_else(|| kv_head.get("desc"))
+            .copied()
+            .map(|s| s.to_string())
+            .or_else(|| {
+                if pos_head.len() >= 2 {
+                    // First positional was npc_id; rest joined is description.
+                    Some(pos_head[1..].join(" "))
+                } else {
+                    None
+                }
+            });
+
+        // Parse tail: extract key=value pairs, collect positional tokens.
+        let (kv_tail, pos_tail) = split_kv_positional(tail);
+        let difficulty = kv_tail
+            .get("difficulty")
+            .copied()
+            .map(|s| s.to_string())
+            .or_else(|| pos_tail.first().copied().map(|s| s.to_string()));
+        let suitability = kv_tail
+            .get("suitability")
+            .copied()
+            .map(|s| s.to_string())
+            .or_else(|| pos_tail.get(1).copied().map(|s| s.to_string()));
+        let eta_minutes = kv_tail
+            .get("eta_minutes")
+            .or_else(|| kv_tail.get("eta"))
+            .copied()
+            .and_then(|s| s.parse::<i64>().ok())
+            .or_else(|| pos_tail.get(2).and_then(|s| s.parse::<i64>().ok()));
+
+        if let (Some(npc_id), Some(description), Some(difficulty), Some(suitability), Some(eta_minutes)) =
+            (npc_id, description, difficulty, suitability, eta_minutes)
+        {
+            if !npc_id.is_empty() && !description.is_empty() && eta_minutes > 0 {
+                return Some((
+                    BracketCommand::Task {
+                        npc_id,
+                        description,
+                        difficulty,
+                        suitability,
+                        eta_minutes,
+                    },
+                    0,
+                ));
+            }
+        }
+        return None;
+    }
+
+    None
+}
+
+/// Case-insensitive `strip_prefix`. Returns the slice of `haystack` after the
+/// matched `prefix` (compared ASCII-case-insensitively), or `None` if the
+/// prefix doesn't match. The returned slice is from the ORIGINAL `haystack`
+/// (not a lowercased copy) so any arguments following the verb retain their
+/// original case — only the command verb is folded for matching.
+///
+/// Why this exists (§11.40.F follow-up fix 2026-07-28): the live narrator
+/// model (Gemma 12B) sometimes emits `[CHARACTER_Turn:...]` with a capital T
+/// instead of the documented `CHARACTER_TURN`. The parser was case-sensitive
+/// on the prefix, so the variant leaked as literal prose. This helper makes
+/// all 7 command verbs case-insensitive at the match site, while preserving
+/// the original `bracket` string for the `None`-arm literal-prose emission
+/// (so legitimate text like `[The old road]` still emits verbatim, not
+/// lowercased) and the argument parsing (`rest` stays original-case).
+fn strip_prefix_ci<'a>(haystack: &'a str, prefix: &str) -> Option<&'a str> {
+    let hay_bytes = haystack.as_bytes();
+    let pfx_bytes = prefix.as_bytes();
+    if hay_bytes.len() < pfx_bytes.len() {
+        return None;
+    }
+    if hay_bytes[..pfx_bytes.len()]
+        .iter()
+        .zip(pfx_bytes)
+        .all(|(h, p)| h.eq_ignore_ascii_case(p))
+    {
+        // Safety: prefix matched ASCII-case-insensitively, so the first
+        // pfx_bytes.len() bytes are all ASCII (ASCII byte boundaries are
+        // always valid UTF-8 char boundaries). The slice at pfx_bytes.len()
+        // is therefore a valid char boundary.
+        Some(&haystack[pfx_bytes.len()..])
+    } else {
+        None
+    }
+}
+
+/// Case-insensitive search for a tag (e.g. `[CHARACTER_TURN:end]`) in `text`.
+/// Returns the byte index of the match start, or `None`. Used by the
+/// CHARACTER_TURN close-tag lookup so `[CHARACTER_Turn:end]` (capital T) is
+/// found the same as the canonical form — sibling of `strip_prefix_ci`.
+fn find_ci(text: &str, needle: &str) -> Option<usize> {
+    let n_bytes = needle.as_bytes();
+    if n_bytes.is_empty() {
+        return Some(0);
+    }
+    let t_bytes = text.as_bytes();
+    if t_bytes.len() < n_bytes.len() {
+        return None;
+    }
+    for i in 0..=(t_bytes.len() - n_bytes.len()) {
+        if t_bytes[i..i + n_bytes.len()]
+            .iter()
+            .zip(n_bytes)
+            .all(|(t, n)| t.eq_ignore_ascii_case(n))
+        {
+            // Verify we landed on a UTF-8 char boundary (ASCII needle bytes
+            // match ASCII text bytes, but the surrounding context could be
+            // multibyte — confirm the start index is a boundary).
+            if text.is_char_boundary(i) {
+                return Some(i);
+            }
+        }
+    }
+    None
+}
+
+/// Split a whitespace-separated string into (key=value pairs, positional tokens).
+/// Helper for the bracket parsers' tolerant key=value + positional parse. A
+/// token containing `=` (with a non-empty key) goes into the kv map; any other
+/// token goes into the positional vec. Pure, no allocations beyond the returns.
+fn split_kv_positional(s: &str) -> (std::collections::HashMap<&str, &str>, Vec<&str>) {
+    let mut kv = std::collections::HashMap::new();
+    let mut positional = Vec::new();
+    for tok in s.split_whitespace() {
+        if let Some(eq) = tok.find('=') {
+            let k = tok[..eq].trim();
+            let v = tok[eq + 1..].trim();
+            if !k.is_empty() {
+                kv.insert(k, v);
+                continue;
+            }
+        }
+        positional.push(tok);
+    }
+    (kv, positional)
+}
+
+/// Fallback for `[TASK ...]` without a `|` separator. Splits by whitespace:
+/// first token = npc_id, last 3 = difficulty/suitability/eta, middle (joined)
+/// = description. The model occasionally omits the pipe; this keeps the parse
+/// resilient.
+fn parse_task_no_pipe(rest: &str) -> Option<(BracketCommand, usize)> {
+    let (kv, pos) = split_kv_positional(rest);
+    // Try key=value first.
+    let npc_id = kv.get("npc_id").or_else(|| kv.get("npc")).copied();
+    let description = kv.get("description").or_else(|| kv.get("desc")).copied();
+    let difficulty = kv.get("difficulty").copied();
+    let suitability = kv.get("suitability").copied();
+    let eta = kv
+        .get("eta_minutes")
+        .or_else(|| kv.get("eta"))
+        .copied()
+        .and_then(|s| s.parse::<i64>().ok());
+    if let (Some(npc_id), Some(description), Some(difficulty), Some(suitability), Some(eta)) =
+        (npc_id, description, difficulty, suitability, eta)
+    {
+        if !npc_id.is_empty() && !description.is_empty() && eta > 0 {
+            return Some((
+                BracketCommand::Task {
+                    npc_id: npc_id.to_string(),
+                    description: description.to_string(),
+                    difficulty: difficulty.to_string(),
+                    suitability: suitability.to_string(),
+                    eta_minutes: eta,
+                },
+                0,
+            ));
+        }
+    }
+    // Positional: need at least 5 tokens (npc_id + ≥1 desc + 3 trailing).
+    if pos.len() >= 5 {
+        let npc_id = pos[0].to_string();
+        let trailing = &pos[pos.len() - 3..];
+        let description = pos[1..pos.len() - 3].join(" ");
+        let difficulty = trailing[0].to_string();
+        let suitability = trailing[1].to_string();
+        let eta_minutes = trailing[2].parse::<i64>().ok();
+        if let Some(eta_minutes) = eta_minutes {
+            if !npc_id.is_empty() && !description.is_empty() && eta_minutes > 0 {
+                return Some((
+                    BracketCommand::Task {
+                        npc_id,
+                        description,
+                        difficulty,
+                        suitability,
+                        eta_minutes,
+                    },
+                    0,
+                ));
+            }
+        }
+    }
     None
 }
 
@@ -869,5 +1719,375 @@ mod tests {
         let raw = "The  fire   crackles.";
         let parsed = parse(raw);
         assert_eq!(parsed.prose, "The fire crackles.");
+    }
+
+    // ========================================================================
+    // Bug A fix tests (2026-07-28): fenced-JSON dual parser.
+    // Every test mirrors an existing bracket test's intent, just with the
+    // JSON input shape the model actually emits.
+    // ========================================================================
+
+    #[test]
+    fn json_effect_basic_parses() {
+        // The exact shape the model emitted in the 2026-07-28 playtest.
+        let raw = "Prose before.\n```json\n{ \"effect_name\": \"exploration\", \"effect_label\": \"exploration\", \"effect_duration_minutes\": 15 }\n```\nProse after.";
+        let parsed = parse(raw);
+        assert_eq!(parsed.commands.len(), 1, "one effect command");
+        match &parsed.commands[0] {
+            BracketCommand::Effect { label, polarity, duration_minutes } => {
+                assert_eq!(label, "exploration");
+                assert_eq!(*duration_minutes, 15);
+                // "exploration" has no debuff keyword → inferred Buff.
+                assert_eq!(*polarity, Polarity::Buff);
+            }
+            other => panic!("expected Effect, got {:?}", other),
+        }
+        // The fence is gone from the prose; surrounding prose preserved.
+        assert!(!parsed.prose.contains("```"));
+        assert!(!parsed.prose.contains("effect_name"));
+        assert!(parsed.prose.contains("Prose before."));
+        assert!(parsed.prose.contains("Prose after."));
+    }
+
+    #[test]
+    fn json_effect_with_polarity_and_aliases() {
+        // Explicit polarity + the canonical field names + a debuff keyword.
+        let raw = "```json\n{ \"type\": \"effect\", \"label\": \"Berserk Rage\", \"polarity\": \"buff\", \"duration_minutes\": 60 }\n```";
+        let parsed = parse(raw);
+        assert_eq!(parsed.commands.len(), 1);
+        if let BracketCommand::Effect { label, polarity, duration_minutes } = &parsed.commands[0] {
+            assert_eq!(label, "Berserk Rage");
+            assert_eq!(*polarity, Polarity::Buff);
+            assert_eq!(*duration_minutes, 60);
+        } else {
+            panic!("wrong variant");
+        }
+    }
+
+    #[test]
+    fn json_effect_inferred_debuff_from_keyword() {
+        // No polarity field → engine infers from label. "Poisoned" is a
+        // debuff keyword → Debuff.
+        let raw = "```json\n{ \"type\": \"effect\", \"name\": \"Poisoned\", \"duration\": 120 }\n```";
+        let parsed = parse(raw);
+        assert_eq!(parsed.commands.len(), 1);
+        if let BracketCommand::Effect { label, polarity, .. } = &parsed.commands[0] {
+            assert_eq!(label, "Poisoned");
+            assert_eq!(*polarity, Polarity::Debuff);
+        } else {
+            panic!("wrong variant");
+        }
+    }
+
+    #[test]
+    fn json_effect_zero_duration_is_permanent() {
+        let raw = "```json\n{ \"type\": \"effect\", \"label\": \"Cursed\", \"polarity\": \"debuff\", \"duration_minutes\": 0 }\n```";
+        let parsed = parse(raw);
+        if let BracketCommand::Effect { duration_minutes, .. } = &parsed.commands[0] {
+            assert_eq!(*duration_minutes, 0, "zero = permanent sentinel");
+        } else {
+            panic!("wrong variant");
+        }
+    }
+
+    #[test]
+    fn json_milestone_parses() {
+        let raw = "He pulls you from the river.\n```json\n{ \"type\": \"milestone\", \"npc_id\": \"npc.marcus\", \"event_id\": \"saved_life\" }\n```";
+        let parsed = parse(raw);
+        assert_eq!(parsed.commands.len(), 1);
+        if let BracketCommand::Milestone { npc_id, event_id } = &parsed.commands[0] {
+            assert_eq!(npc_id, "npc.marcus");
+            assert_eq!(event_id, "saved_life");
+        } else {
+            panic!("wrong variant");
+        }
+    }
+
+    #[test]
+    fn json_milestone_infers_kind_from_fields() {
+        // No `type` discriminator — infer from `event_id` presence.
+        let raw = "```json\n{ \"npc\": \"npc.smuggler\", \"event\": \"betrayed_trust\" }\n```";
+        let parsed = parse(raw);
+        assert_eq!(parsed.commands.len(), 1);
+        if let BracketCommand::Milestone { npc_id, event_id } = &parsed.commands[0] {
+            assert_eq!(npc_id, "npc.smuggler");
+            assert_eq!(event_id, "betrayed_trust");
+        } else {
+            panic!("wrong variant");
+        }
+    }
+
+    #[test]
+    fn json_task_parses() {
+        let raw = "```json\n{ \"type\": \"task\", \"npc_id\": \"npc.marcus\", \"description\": \"scout the bandit camp\", \"difficulty\": \"challenging\", \"suitability\": \"adequate\", \"eta_minutes\": 240 }\n```";
+        let parsed = parse(raw);
+        assert_eq!(parsed.commands.len(), 1);
+        if let BracketCommand::Task { npc_id, description, difficulty, suitability, eta_minutes } =
+            &parsed.commands[0]
+        {
+            assert_eq!(npc_id, "npc.marcus");
+            assert_eq!(description, "scout the bandit camp");
+            assert_eq!(difficulty, "challenging");
+            assert_eq!(suitability, "adequate");
+            assert_eq!(*eta_minutes, 240);
+        } else {
+            panic!("wrong variant");
+        }
+    }
+
+    #[test]
+    fn json_task_rejects_zero_and_negative_eta() {
+        for body in [
+            r#"{ "type": "task", "npc_id": "x", "description": "d", "eta_minutes": 0 }"#,
+            r#"{ "type": "task", "npc_id": "x", "description": "d", "eta_minutes": -5 }"#,
+        ] {
+            let raw = format!("```json\n{}\n```", body);
+            let parsed = parse(&raw);
+            assert_eq!(parsed.commands.len(), 0, "rejected: {}", body);
+        }
+    }
+
+    #[test]
+    fn json_time_parses_raw_string() {
+        let raw = "```json\n{ \"type\": \"time\", \"raw\": \"Day 3, 14:00\" }\n```";
+        let parsed = parse(raw);
+        assert_eq!(parsed.commands.len(), 1);
+        if let BracketCommand::Time { raw: raw_str, .. } = &parsed.commands[0] {
+            assert_eq!(raw_str, "Day 3, 14:00");
+        } else {
+            panic!("wrong variant");
+        }
+    }
+
+    #[test]
+    fn json_time_accepts_explicit_minutes() {
+        let raw = "```json\n{ \"type\": \"time\", \"minutes\": 10080 }\n```";
+        let parsed = parse(raw);
+        if let BracketCommand::Time { minutes, .. } = &parsed.commands[0] {
+            assert_eq!(*minutes, 10080);
+        } else {
+            panic!("wrong variant");
+        }
+    }
+
+    #[test]
+    fn json_object_and_fx_and_character_turn() {
+        // Three commands in three separate fences — covers the less-common
+        // variants in one test.
+        let raw = "```json\n{ \"type\": \"object\", \"id\": \"door_cellar\", \"state\": \"open\" }\n```\nMiddle.\n```json\n{ \"type\": \"fx\", \"effect\": \"rain\" }\n```\nMore.\n```json\n{ \"type\": \"character_turn\", \"npc_id\": \"npc.mara\", \"line\": \"Hello.\" }\n```";
+        let parsed = parse(raw);
+        assert_eq!(parsed.commands.len(), 3);
+        assert!(matches!(parsed.commands[0], BracketCommand::Object { .. }));
+        assert!(matches!(parsed.commands[1], BracketCommand::Fx { .. }));
+        assert!(matches!(parsed.commands[2], BracketCommand::CharacterTurn { .. }));
+        assert!(parsed.prose.contains("Middle."));
+        assert!(parsed.prose.contains("More."));
+        assert!(!parsed.prose.contains("```"));
+    }
+
+    #[test]
+    fn json_malformed_is_noop_not_panic() {
+        // Garbage bodies: parser must drop silently, never panic.
+        let bodies = [
+            "```json\n{ this is not json }\n```",
+            "```json\n\n```",                       // empty
+            "```json\n[1, 2, 3]\n```",              // array, not object
+            "```json\n\"just a string\"\n```",      // scalar
+            "```json\n{ \"type\": \"unknown\" }\n```", // unknown kind
+            "```json\n{ \"type\": \"effect\" }\n```",  // missing required label
+        ];
+        for raw in bodies {
+            let parsed = parse(raw);
+            assert_eq!(parsed.commands.len(), 0, "rejected: {}", raw);
+            assert!(!parsed.prose.contains("```"), "fence stripped from prose: {}", raw);
+        }
+    }
+
+    #[test]
+    fn json_mixed_with_brackets_in_one_turn() {
+        // Both formats coexist — brackets and JSON in the same turn.
+        let raw = "Start.\n[FX thunder]\nMiddle.\n```json\n{ \"type\": \"effect\", \"label\": \"Shaken\", \"polarity\": \"debuff\", \"duration_minutes\": 30 }\n```\nEnd.";
+        let parsed = parse(raw);
+        assert_eq!(parsed.commands.len(), 2, "one bracket + one JSON command");
+        assert!(matches!(parsed.commands[0], BracketCommand::Fx { .. }));
+        assert!(matches!(parsed.commands[1], BracketCommand::Effect { .. }));
+        assert!(parsed.prose.contains("Start."));
+        assert!(parsed.prose.contains("Middle."));
+        assert!(parsed.prose.contains("End."));
+        assert!(!parsed.prose.contains("[FX"));
+        assert!(!parsed.prose.contains("```"));
+    }
+
+    #[test]
+    fn json_unterminated_fence_takes_rest_as_body() {
+        // No closing fence — body up to EOF. If it's valid JSON, it parses.
+        let raw = "Prose.\n```json\n{ \"type\": \"fx\", \"effect\": \"fog\" }";
+        let parsed = parse(raw);
+        assert_eq!(parsed.commands.len(), 1);
+        assert!(matches!(parsed.commands[0], BracketCommand::Fx { .. }));
+        assert!(parsed.prose.contains("Prose."));
+        assert!(!parsed.prose.contains("```"));
+    }
+
+    #[test]
+    fn json_fence_with_character_turn_bracket_mixed() {
+        // The load-bearing CHARACTER_TURN text_after contract must still work
+        // when a JSON fence precedes it — the fence is stripped from the
+        // raw BEFORE the bracket loop runs, so bracket indices are correct.
+        // Note: bracket commands are collected first (the while-loop), then
+        // JSON commands appended after — so CHARACTER_TURN is commands[0]
+        // and the JSON Fx is commands[1].
+        let raw = "```json\n{ \"type\": \"fx\", \"effect\": \"rain\" }\n```\n[CHARACTER_TURN:npc.mara]Hello there.[CHARACTER_TURN:end]";
+        let parsed = parse(raw);
+        assert_eq!(parsed.commands.len(), 2);
+        if let BracketCommand::CharacterTurn { npc_id, line } = &parsed.commands[0] {
+            assert_eq!(npc_id, "npc.mara");
+            assert_eq!(line, "Hello there.");
+        } else {
+            panic!("expected CharacterTurn at [0], got {:?}", parsed.commands[0]);
+        }
+        assert!(matches!(parsed.commands[1], BracketCommand::Fx { .. }));
+    }
+
+    #[test]
+    fn json_fence_followed_by_inline_bracket_no_text_corruption() {
+        // Regression guard: the fence-stripping must not corrupt bracket
+        // positions. The prose between a fence and a bracket must survive.
+        let raw = "```json\n{ \"type\": \"object\", \"id\": \"x\", \"state\": \"y\" }\n```\nThe door creaks. [FX vignette]";
+        let parsed = parse(raw);
+        assert_eq!(parsed.commands.len(), 2);
+        assert!(parsed.prose.contains("The door creaks."));
+    }
+
+    #[test]
+    fn extract_fenced_json_no_opener_returns_input_unchanged() {
+        let (prose, bodies) = extract_fenced_json("just prose, no fences");
+        assert_eq!(prose, "just prose, no fences");
+        assert!(bodies.is_empty());
+    }
+
+    // ========================================================================
+    // Case-insensitive command-verb matching (§11.40.F fix, 2026-07-28).
+    // The live narrator model (Gemma 12B) sometimes emits bracket commands
+    // with non-canonical casing — most observed: `[CHARACTER_Turn:...]`
+    // (capital T). Before the fix, the parser was case-sensitive on the
+    // verb prefix, so the variant leaked as literal prose. These tests pin
+    // the case-insensitive contract for all 7 verbs + the CHARACTER_TURN
+    // close-tag, AND guard that legitimate mixed-case prose (e.g. an aside
+    // like `[The old road]`) still passes through verbatim (the case-fold
+    // is for MATCHING ONLY; the None-arm emits the original bracket text).
+    // ========================================================================
+
+    #[test]
+    fn character_turn_capital_t_variant_parsed() {
+        // The canonical live bug: `[CHARACTER_Turn:...]` with a capital T.
+        // Must parse to a CharacterTurn command, NOT leak as literal prose.
+        let raw = "[CHARACTER_Turn:mara] Welcome, traveler. [CHARACTER_Turn:end] She smiles.";
+        let parsed = parse(raw);
+        assert_eq!(parsed.commands.len(), 1, "got: {:?}", parsed);
+        match &parsed.commands[0] {
+            BracketCommand::CharacterTurn { npc_id, line } => {
+                assert_eq!(npc_id, "mara", "npc_id preserved");
+                assert_eq!(line, "Welcome, traveler.", "body extracted");
+            }
+            _ => panic!("expected CharacterTurn, got: {:?}", parsed.commands[0]),
+        }
+        // Trailing prose survives; the body was consumed.
+        assert!(parsed.prose.contains("She smiles."));
+        assert!(!parsed.prose.contains("CHARACTER_Turn"));
+        assert!(!parsed.prose.contains("Welcome, traveler."));
+    }
+
+    #[test]
+    fn character_turn_mixed_case_close_tag_too() {
+        // The close tag is the same variant shape: `[CHARACTER_Turn:end]`.
+        // find_ci must match it the same as the canonical form. If only the
+        // open tag were case-insensitive, the close would leak as a second
+        // (empty) CharacterTurn — this test catches that regression.
+        let raw = "[CHARACTER_TURN:mara] Hello there. [CHARACTER_Turn:end] Bye.";
+        let parsed = parse(raw);
+        assert_eq!(parsed.commands.len(), 1, "expected exactly 1 command (close tag must not double-count): {:?}", parsed);
+        match &parsed.commands[0] {
+            BracketCommand::CharacterTurn { npc_id, line } => {
+                assert_eq!(npc_id, "mara");
+                assert_eq!(line, "Hello there.");
+            }
+            _ => panic!("expected CharacterTurn"),
+        }
+        assert!(parsed.prose.contains("Bye."));
+    }
+
+    #[test]
+    fn all_lowercase_command_verbs_parsed() {
+        // Defensive: all-lowercase variants of every command verb. The model
+        // is unlikely to emit these but the case-insensitive contract covers
+        // them; this test pins that coverage so a future "ASCII-only upper"
+        // regression is caught.
+        let raw = "[fx thunder] [object id=door state=open] [time Day 3, 14:00]";
+        let parsed = parse(raw);
+        assert_eq!(parsed.commands.len(), 3, "got: {:?}", parsed);
+        assert!(matches!(parsed.commands[0], BracketCommand::Fx { .. }));
+        assert!(matches!(parsed.commands[1], BracketCommand::Object { .. }));
+        assert!(matches!(parsed.commands[2], BracketCommand::Time { .. }));
+    }
+
+    #[test]
+    fn effect_milestone_task_case_variants_parsed() {
+        // The Phase 3 commands (EFFECT/MILESTONE/TASK) also case-fold. Pins
+        // all three so a future "only CHARACTER_TURN is ci" regression is
+        // caught.
+        let raw = "[Effect Berserk Rage buff 60][Milestone npc.mara shared_drink][Task npc.mara scout | challenging adequate 1440]";
+        let parsed = parse(raw);
+        assert_eq!(parsed.commands.len(), 3, "got: {:?}", parsed);
+        assert!(matches!(parsed.commands[0], BracketCommand::Effect { .. }));
+        assert!(matches!(parsed.commands[1], BracketCommand::Milestone { .. }));
+        assert!(matches!(parsed.commands[2], BracketCommand::Task { .. }));
+    }
+
+    #[test]
+    fn stray_bracket_with_mixed_case_prose_emitted_verbatim() {
+        // False-positive guard: a legitimate bracket in prose that is NOT a
+        // command (e.g. an aside like `[The old road]`) must emit VERBATIM
+        // with original casing — the case-fold is for MATCHING ONLY. If the
+        // fix naively lowercased the whole bracket, this would corrupt the
+        // text. The None-arm must use the original string.
+        let raw = "He took the [The old road] home and rested.";
+        let parsed = parse(raw);
+        assert_eq!(parsed.commands.len(), 0, "stray bracket should not parse as command");
+        assert!(
+            parsed.prose.contains("[The old road]"),
+            "stray bracket must emit verbatim with original casing, got: {:?}",
+            parsed.prose
+        );
+    }
+
+    #[test]
+    fn strip_prefix_ci_returns_original_case_rest() {
+        // Unit test for the helper itself: the returned slice must come from
+        // the ORIGINAL haystack (preserving argument case), not a lowercased
+        // copy. Only the prefix is folded for matching.
+        assert_eq!(strip_prefix_ci("CHARACTER_Turn:mara", "CHARACTER_TURN:"), Some("mara"));
+        assert_eq!(strip_prefix_ci("character_turn:mara", "CHARACTER_TURN:"), Some("mara"));
+        assert_eq!(strip_prefix_ci("FX rainstorm", "FX"), Some(" rainstorm"));
+        assert_eq!(strip_prefix_ci("fx rainstorm", "FX"), Some(" rainstorm"));
+        assert_eq!(strip_prefix_ci("OBJECT id=Door", "OBJECT"), Some(" id=Door"));
+        // Capital D in "Door" must survive (argument case preserved).
+        let rest = strip_prefix_ci("OBJECT id=Door", "OBJECT").unwrap();
+        assert!(rest.contains("Door"), "argument case must be preserved, got: {:?}", rest);
+        // No match → None.
+        assert_eq!(strip_prefix_ci("SOMETHING_ELSE", "OBJECT"), None);
+        // Shorter than prefix → None (no panic).
+        assert_eq!(strip_prefix_ci("FX", "CHARACTER_TURN:"), None);
+    }
+
+    #[test]
+    fn find_ci_matches_case_variants_and_respects_boundaries() {
+        // Unit test for the close-tag helper. Must find the canonical form
+        // AND case variants; must not match across a multibyte char boundary.
+        assert_eq!(find_ci("text [CHARACTER_TURN:end] more", "[CHARACTER_TURN:end]"), Some(5));
+        assert_eq!(find_ci("text [CHARACTER_Turn:end] more", "[CHARACTER_TURN:end]"), Some(5));
+        assert_eq!(find_ci("text [character_turn:end] more", "[CHARACTER_TURN:end]"), Some(5));
+        assert_eq!(find_ci("no match here", "[CHARACTER_TURN:end]"), None);
+        assert_eq!(find_ci("anything", ""), Some(0));
     }
 }
