@@ -46,9 +46,14 @@ pub struct UserProfile {
 
 impl UserProfile {
     /// Render the profile into a compact `<user_profile>` block for the system
-    /// prompt. Only non-blank fields are emitted; the block is skipped
-    /// entirely (empty return) when both fields are blank, so the caller's
-    /// `Option<&str>` gate suppresses the section cleanly.
+    /// prompt. Chloe 2026-07-27: a blank `name` field now defaults to the
+    /// literal "User" (per the anti-positivity-bias contract — the model
+    /// should never address the operator as some invented title, and "User"
+    /// is the neutral default). The block is still skipped entirely when
+    /// BOTH fields are blank (the common case for a fresh install where the
+    /// operator hasn't authored anything) so we don't add prompt weight for
+    /// no signal; but once EITHER field has content, an absent name resolves
+    /// to "User".
     ///
     /// XML-tagged fields match the prompt's existing aesthetic (Prime
     /// Directive §1B.3: rigid structure exploits instruction-tuned attention).
@@ -57,13 +62,30 @@ impl UserProfile {
     pub fn render_for_prompt(&self) -> String {
         let mut sections = Vec::new();
 
-        if !self.name.trim().is_empty() {
-            sections.push(format!("name: {}", self.name.trim()));
+        // Resolve the name: explicit value wins; blank → "User" ONLY if the
+        // description has content (otherwise we'd emit a name-only block for
+        // a totally empty profile, which the caller's empty-skip would have
+        // caught anyway — but being explicit keeps the contract clear).
+        let name_trim = self.name.trim();
+        let desc_trim = self.description.trim();
+        let resolved_name = if name_trim.is_empty() {
+            if desc_trim.is_empty() {
+                // Both blank → suppress entirely (return empty below).
+                String::new()
+            } else {
+                "User".to_owned()
+            }
+        } else {
+            name_trim.to_owned()
+        };
+
+        if !resolved_name.is_empty() {
+            sections.push(format!("name: {}", resolved_name));
         }
-        if !self.description.trim().is_empty() {
+        if !desc_trim.is_empty() {
             sections.push(format!(
                 "description:\n{}\n",
-                indent(self.description.trim())
+                indent(desc_trim)
             ));
         }
 

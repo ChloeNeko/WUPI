@@ -99,9 +99,17 @@ pub fn destroy_tray<R: Runtime>(app: &AppHandle<R>) {
 pub fn power_shutdown<R: Runtime>(app: &AppHandle<R>) {
     let _ = app.emit(EVT_CANVAS_PAUSE, ());
     destroy_tray(app);
-    // Flush the emit + destroy above before the hard kill so the frontend gets
-    // the pause event and the shell gets NIM_DELETE. (Both best-effort; if
-    // they don't land, the kill still happens.)
+    // Brief yield so explorer.exe can pump the NIM_DELETE notification
+    // before the process dies. `destroy_tray` sends the deletion correctly,
+    // but `std::process::exit` then kills this process so fast that the
+    // shell (a SEPARATE process hosting the tray) hasn't serviced the
+    // notification yet — leaving a phantom paw cached in the hidden-icons
+    // overflow popover until the user hovers over it (the well-known
+    // Windows shell caching quirk). ~200ms empirically lets Explorer clear
+    // the ghost on every exit path; short enough not to read as a hang.
+    // Lives HERE, not in destroy_tray, so non-exit callers (none today,
+    // defensive) don't pay the latency.
+    std::thread::sleep(std::time::Duration::from_millis(200));
     std::process::exit(0);
 }
 

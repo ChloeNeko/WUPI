@@ -32,6 +32,9 @@
 // =============================================================
 
 import { startThemeMusic } from './reveal.js';
+// Ripple SFX as a bundled asset (Vite resolves the import to a hashed URL
+// in assets/, NOT a publicDir file at the install root). See Issue 1.
+import RIPPLE_SRC from '../assets/fable_ripple.mp3';
 
 // --- Tunable timing (ms) --------------------------------------
 // The deliberate pause between the click and the welcome. The title
@@ -46,7 +49,7 @@ const AURA_REMOVE_MS      = REVEAL_DELAY_MS + RIPPLE_AURA_LIFE_MS;  // 3500
 const RIPPLE_SFX_FADE_MS  = 400;
 
 // --- SFX ------------------------------------------------------
-const RIPPLE_SRC  = '/fable_ripple.mp3';
+// RIPPLE_SRC is imported as a bundled asset above (no publicDir copy).
 const SFX_VOLUME  = 0.2;
 
 // --- Helpers --------------------------------------------------

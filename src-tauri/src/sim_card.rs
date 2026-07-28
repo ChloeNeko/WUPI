@@ -23,7 +23,13 @@ use rand::seq::IndexedRandom;
 
 /// One Simulation Card, parsed from a `.sim` file. Owned and immutable for the
 /// process lifetime after `setup()` loads it.
-#[derive(Debug, Clone)]
+///
+/// `Serialize` + `Deserialize` (added for Quick Play so a generated card can
+/// be bundled inside the quicksave file) — every field is a primitive
+/// `String`/`Option<String>`/`Vec<String>`, so serde handles the round trip
+/// with no custom impl. `#[serde(default)]` on the `Option` fields keeps older
+/// save JSON (written before a field existed) loading cleanly.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SimCard {
     pub id: String,
     pub name: String,
@@ -40,28 +46,38 @@ pub struct SimCard {
     pub technical_rules: String,
     /// One greeting string per line in `<introductions>`. Empty if the card
     /// omits the block. Used by [`random_intro`] for the boot flourish.
+    #[serde(default)]
     pub introductions: Vec<String>,
     // All `None` / empty for the system card (Wupi). A roleplay scenario card
     // carries a `<scenario>` block that populates these. The parser already
     // handles optional elements via `nested_text` returning `None` for absent
     // parents, so adding fields here is non-breaking: `Wupi.sim` parses as
     // before with every field below at its default.
+    //
+    // All `#[serde(default)]` so a Quick-Play card JSON built by the model
+    // (which may omit any of these) deserializes with the missing fields at
+    // their `None`/empty defaults instead of failing the load.
     /// The world/setting premise. Injected into the narrator's system prompt
     /// as the ground-truth scenario context. `None` for system cards.
+    #[serde(default)]
     pub setting: Option<String>,
     /// Narrative tone directive ("grim, atmospheric, slow-burn"). Guides the
     /// narrator's voice. `None` for system cards.
+    #[serde(default)]
     pub tone: Option<String>,
     /// Seed text for the first narrator turn (the opening scene). The
     /// FableEngine uses this to prime the first generation if the conversation
     /// is empty. `None` for system cards.
+    #[serde(default)]
     pub opening_scene: Option<String>,
     /// Stable NPC ids present at scene start. Used by the Phase 2 NPC runtime
     /// to spawn the initial cast. Empty for system cards.
+    #[serde(default)]
     pub start_npc_ids: Vec<String>,
     /// Activities this card activates (e.g. `["combat","crafting"]`). Phase
     /// 2+ hint: the engine registry will match these against available
     /// activity modules. Empty for system cards.
+    #[serde(default)]
     pub declared_activities: Vec<String>,
     /// The protagonist's name for roleplay cards (e.g. "Alex", "Kaelen").
     /// Used by the narrator prompt's `<active_reality>` tail block (Phase E,
@@ -70,6 +86,7 @@ pub struct SimCard {
     /// where the cyberpunk narrator used the dungeon protagonist's name).
     /// `None` for system cards; narrator hardening falls back to generic
     /// "the protagonist" phrasing.
+    #[serde(default)]
     pub protagonist_name: Option<String>,
 }
 
@@ -223,6 +240,18 @@ fn try_load(path: &Path) -> anyhow::Result<SimCard> {
     let text = std::fs::read_to_string(path)
         .map_err(|e| anyhow::anyhow!("reading card file: {e}"))?;
     parse(&text)
+}
+
+/// Parse a `.sim` card from its XML text. Public entry point for callers that
+/// have the XML in memory (not on disk): the Quick Play interview's
+/// `interview_finalize` step parses the model's `<sim_card>...</sim_card>`
+/// output this way without writing a temp file. Mirrors `try_load`'s parser
+/// exactly (delegates to the same private `parse`).
+///
+/// Returns `Err` on malformed XML or a missing `<sim_card>` root — the caller
+/// decides the fallback (Quick Play surfaces the error to the UI for a retry).
+pub fn parse_from_xml_str(xml: &str) -> anyhow::Result<SimCard> {
+    parse(xml)
 }
 
 /// Parse a `.sim` card from its XML text. Separated from `try_load` so the
@@ -612,5 +641,84 @@ ago. A locked iron chest sits under a table by the hearth.
         assert!(card.start_npc_ids.is_empty());
         assert!(card.declared_activities.is_empty());
         assert!(card.protagonist_name.is_none());
+    }
+
+    /// Quick Play bundles the generated card inside the quicksave file as
+    /// JSON. This pins the Serialize/Deserialize round trip so the bundle
+    /// survives write + read intact (the roleplay fields are the load-bearing
+    /// ones for the narrator prompt after resume).
+    #[test]
+    fn simcard_serializes_to_json_roundtrip() {
+        let original = SimCard {
+            id: "qp_test".into(),
+            name: "Test Sim".into(),
+            card_type: "roleplay".into(),
+            core_persona: "cp".into(),
+            traits: "t".into(),
+            appearance: "a".into(),
+            role_instruction: "ri".into(),
+            responsibilities: "r".into(),
+            conversational_rules: "cr".into(),
+            technical_rules: "tr".into(),
+            introductions: vec!["hi".into()],
+            setting: Some("A test place.".into()),
+            tone: Some("grim".into()),
+            opening_scene: Some("The scene opens.".into()),
+            start_npc_ids: vec!["npc_one".into(), "npc_two".into()],
+            declared_activities: vec!["combat".into()],
+            protagonist_name: Some("Hero".into()),
+        };
+        let json = serde_json::to_string(&original).expect("serialize");
+        let back: SimCard = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back.id, original.id);
+        assert_eq!(back.name, original.name);
+        assert_eq!(back.card_type, "roleplay");
+        assert_eq!(back.setting, original.setting);
+        assert_eq!(back.tone, original.tone);
+        assert_eq!(back.opening_scene, original.opening_scene);
+        assert_eq!(back.start_npc_ids, original.start_npc_ids);
+        assert_eq!(back.declared_activities, original.declared_activities);
+        assert_eq!(back.protagonist_name, original.protagonist_name);
+        assert_eq!(back.introductions, original.introductions);
+    }
+
+    /// `parse_from_xml_str` is the public entry the Quick Play `finalize`
+    /// step uses to parse the model's `<sim_card>` output. Pins that it
+    /// accepts the same shape as the on-disk parser.
+    #[test]
+    fn parse_from_xml_str_works() {
+        let xml = r#"<sim_card>
+  <metadata><id>test_id</id><type>roleplay</type></metadata>
+  <identity><name>Test Scenario</name></identity>
+  <scenario>
+    <setting>A place.</setting>
+    <tone>atmospheric</tone>
+    <protagonist>Hero</protagonist>
+    <opening_scene>The scene opens.</opening_scene>
+    <start_npcs>- npc_a</start_npcs>
+    <activities>- exploration</activities>
+  </scenario>
+</sim_card>"#;
+        let card = parse_from_xml_str(xml).expect("parses");
+        assert_eq!(card.id, "test_id");
+        assert_eq!(card.name, "Test Scenario");
+        assert_eq!(card.card_type, "roleplay");
+        assert_eq!(card.protagonist_name.as_deref(), Some("Hero"));
+        assert_eq!(card.start_npc_ids, vec!["npc_a".to_string()]);
+    }
+
+    /// A JSON object missing the roleplay fields (an older save, or a
+    /// minimal Quick Play card) must deserialize with those fields at their
+    /// defaults, NOT fail. `#[serde(default)]` is the load-bearing attribute.
+    #[test]
+    fn simcard_deserialize_partial_json_fills_defaults() {
+        let partial = r#"{"id":"x","name":"X","card_type":"roleplay","core_persona":"","traits":"","appearance":"","role_instruction":"","responsibilities":"","conversational_rules":"","technical_rules":""}"#;
+        let card: SimCard = serde_json::from_str(partial).expect("partial JSON loads");
+        assert_eq!(card.id, "x");
+        assert!(card.setting.is_none());
+        assert!(card.opening_scene.is_none());
+        assert!(card.start_npc_ids.is_empty());
+        assert!(card.protagonist_name.is_none());
+        assert!(card.introductions.is_empty());
     }
 }

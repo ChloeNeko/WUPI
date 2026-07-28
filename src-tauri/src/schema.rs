@@ -28,13 +28,199 @@
 //! Atomic save (temp + fsync + rename), same pattern as
 //! [`crate::session::Conversation::save`]. Loaded at startup into `AppState`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 // Pull the player-state types in at the top of schema.rs so the new
 // `player_state` field + render can reference them unqualified. Sibling
 // module (declared in lib.rs); the structs themselves are pure data.
 use crate::player_state::PlayerState;
+
+/// The in-world clock (Fable Seam #4, 2026-07-27). Pure data: two `i64`
+/// minute-counters since the fixed ancient epoch 0001-01-01 (the same trick
+/// Multihog's `parseInWorldTime` uses). All math is subtraction + comparison;
+/// no calendar library needed.
+///
+/// `WorldSchema::apply_delta` deliberately does NOT touch this struct — it
+/// lives outside the LLM delta path, same architectural line as `PlayerState`.
+/// The ONLY writer is the bracket-command applier in `fable_send`, which reads
+/// `[TIME ...]` emissions from the narrator + sets `current_minutes`. The
+/// World Progression tick gate then compares against `last_tick_minutes` to
+/// decide whether the off-screen simulation should fire.
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize, Default)]
+pub struct WorldClock {
+    /// Current in-world time, in minutes since 0001-01-01. `0` means unset
+    /// (no `[TIME ...]` has been emitted yet — the clock is dormant). Once
+    /// the first `[TIME]` lands this is monotonically non-decreasing: the
+    /// bracket applier guards against regressions (a narrator emitting
+    /// `[TIME Day 1]` after `[TIME Day 5]` is warned + ignored).
+    #[serde(default)]
+    pub current_minutes: i64,
+
+    /// The in-world time we last fired a World Progression tick for, in the
+    /// same epoch-minutes units. `0` means "never fired": the first parseable
+    /// `[TIME]` stamps this as a baseline (no fire — matches Multihog's
+    /// first-call behavior so a campaign doesn't immediately simulate a day
+    /// it hasn't established yet).
+    #[serde(default)]
+    pub last_tick_minutes: i64,
+}
+
+impl WorldClock {
+    /// True once the narrator has emitted at least one parseable `[TIME ...]`.
+    /// Until then the clock is dormant: the tick gate is a no-op, the render
+    /// emits no `clock:` block (zero tokens).
+    pub fn is_set(&self) -> bool {
+        self.current_minutes > 0
+    }
+
+    /// Minutes elapsed since the last World Progression tick (or since the
+    /// baseline if no tick has fired yet). Pure subtraction — the gate just
+    /// checks `>= interval_minutes`. Negative only if the clock was somehow
+    /// set backward (shouldn't happen: the applier's monotonic guard rejects
+    /// regressions).
+    pub fn minutes_since_last_tick(&self) -> i64 {
+        self.current_minutes - self.last_tick_minutes
+    }
+
+    /// Render the current clock as a compact prompt line. Returns `None`
+    /// when the clock is unset (so `render_for_prompt` can skip the block
+    /// entirely — zero tokens for a fresh game). The format is deliberately
+    /// human-readable ("Day 3, 14:00") so the narrator can emit coherent
+    /// `[TIME ...]` progressions: it sees the current time, advances it by
+    /// the scene's elapsed time, emits the new value.
+    ///
+    /// The conversion back from epoch-minutes to "Day N, HH:MM" mirrors the
+    /// forward parse in `bracket_parser::parse_in_world_time`: 1 day = 1440
+    /// minutes, day index = `minutes / 1440 + 1`, time-of-day = `minutes % 1440`.
+    pub fn render_clock_line(&self) -> Option<String> {
+        if !self.is_set() {
+            return None;
+        }
+        let day = self.current_minutes / 1440 + 1;
+        let rem = self.current_minutes % 1440;
+        let h24 = rem / 60;
+        let m = rem % 60;
+        Some(format!("Day {day}, {h24:02}:{m:02}"))
+    }
+}
+
+/// The scene pacing mode (Fable Seam #4 expansion, 2026-07-27): a
+/// Rust-computed per-turn classification of the scene's rhythm. Drives:
+/// (1) the narrator prose cadence via a `<scene_pacing>` prompt tag, (2) the
+/// World Progression tick interval (background sim speed), (3) the skill-check
+/// DC modifier (tension raises stakes). Pure enum, no data — derived state
+/// lives on the parent `ScenePacing` struct.
+///
+/// The three modes are NOT exhaustive buckets of "all possible scene types":
+/// they are the operationally meaningful buckets for the three hooks above.
+/// `Downtime` = "let the world breathe + easier checks"; `Exploration` =
+/// "balanced"; `Combat` = "fast clock + harder checks + terse prose."
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
+pub enum SceneMode {
+    /// Combat / high-stakes action. Terse present-tense prose, fast clock
+    /// (no background sim mid-fight), DC modifier +2 (tension).
+    Combat,
+    /// Default. Balanced prose, hourly tick (every 4h), DC modifier +0.
+    #[default]
+    Exploration,
+    /// Rest / travel / trade / long dialogue. Lush slow prose, fast background
+    /// sim (world moves while you recover), DC modifier −2 (relaxed, easier).
+    Downtime,
+}
+
+impl SceneMode {
+    /// Short lowercase tag for the prompt attribute: `<scene_pacing mode="combat">`.
+    pub fn tag(self) -> &'static str {
+        match self {
+            SceneMode::Combat => "combat",
+            SceneMode::Exploration => "exploration",
+            SceneMode::Downtime => "downtime",
+        }
+    }
+
+    /// Narrator-facing prose guidance for the `<scene_pacing>` tag. Each mode
+    /// gets a one-line instruction the narrator obeys when pacing its prose.
+    /// Tuned to be mode-specific (not just "be terse" vs "be lush" — the
+    /// combat line calls for short sentences and present-tense verbs, the
+    /// downtime line calls for sensory detail and slow beats).
+    pub fn prose_guidance(self) -> &'static str {
+        match self {
+            SceneMode::Combat => "Pace your prose for combat: short sentences, present-tense verbs, no interiority during the exchange — save reflection for after the dust settles. Each turn covers seconds, not minutes.",
+            SceneMode::Exploration => "Pace your prose for exploration: balanced beats, a mix of action and atmosphere. Each turn covers roughly a minute of in-world time.",
+            SceneMode::Downtime => "Pace your prose for downtime: linger on sensory detail, ambient sound, the texture of the place. Each turn can cover an hour or more — let time breathe.",
+        }
+    }
+
+    /// World Progression tick interval in hours, by mode. The off-screen
+    /// simulation fires when in-world elapsed time crosses this gate. `Combat`
+    /// returns 0 (a sentinel meaning "never fire mid-combat" — the applier
+    /// short-circuits before the schema-engine dispatch). Tunable later via
+    /// per-card overrides; today these are the v1 defaults.
+    pub fn progression_interval_hours(self) -> u32 {
+        match self {
+            // Combat: seconds-scale action. The background sim is suspended —
+            // the next non-combat turn resumes it. Returning 0 is a sentinel
+            // the applier reads as "skip this tick" (it must check for 0
+            // before dividing).
+            SceneMode::Combat => 0,
+            // Exploration: 4 hours. A long delve or journey spans enough
+            // in-world time for the world to shift while you're away.
+            SceneMode::Exploration => 4,
+            // Downtime: 1 hour. Resting/traveling lets the off-screen world
+            // move fast — by the time you finish your rest, news has arrived,
+            // NPCs have shifted.
+            SceneMode::Downtime => 1,
+        }
+    }
+
+    /// Additive DC modifier for skill checks, by mode. Higher = harder.
+    /// Combat scenes are tense (harder to persuade mid-fight); Downtime is
+    /// relaxed (easier to talk someone around when nobody's stressed).
+    pub fn dc_modifier(self) -> i32 {
+        match self {
+            SceneMode::Combat => 2,
+            SceneMode::Exploration => 0,
+            SceneMode::Downtime => -2,
+        }
+    }
+}
+
+/// Per-turn scene pacing state, computed by `scene_pacing::evaluate` from the
+/// player's turn text and persisted on `WorldSchema` (so the most recent
+/// mode survives across turns + autosave — the narrator's next turn inherits
+/// the prior scene's rhythm unless the new turn re-classifies it).
+///
+/// The three pillar scores (0..=2 = low/med/high) are kept for tracing and
+/// future tuning surface; the operationally meaningful field is `mode`. The
+/// mode is derived from the pillars via a simple mapping (kinetic==2 →
+/// Combat; kinetic==0 && emotional==0 → Downtime; else Exploration).
+///
+/// `WorldSchema::apply_delta` deliberately does NOT touch this struct — Rust
+/// is the SOLE authority (mirrors `world_clock` + `player_state`). The only
+/// writer is `fable_send`, which sets `schema.scene_pacing` each turn from
+/// the freshly-evaluated value before the prompt render.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
+pub struct ScenePacing {
+    /// The classified scene mode. This is the operationally consumed field.
+    #[serde(default)]
+    pub mode: SceneMode,
+    /// Spatial scale: 0 = enclosed (room/tavern), 1 = open-but-civilized
+    /// (street/market), 2 = wilderness (ocean/mountain/road). Kept for
+    /// tracing + future tuning; not directly consumed by any hook today.
+    #[serde(default)]
+    pub spatial: u8,
+    /// Emotional vector: 0 = calm (chat/rest/trade), 1 = tense (argument/
+    /// suspicion), 2 = alarmed (fight/flight/panic). Drives nothing directly
+    /// today; the mode mapping reads it.
+    #[serde(default)]
+    pub emotional: u8,
+    /// Kinetic scale: 0 = static (talking/looking), 1 = mobile (walking/
+    /// traveling), 2 = violent (reuses `player_state::COMBAT_KEYWORDS`).
+    /// The dominant pillar for mode classification.
+    #[serde(default)]
+    pub kinetic: u8,
+}
 
 /// The persistent world-state schema. The single source of truth for the
 /// simulated world's current state, maintained by the background delta pass.
@@ -76,6 +262,49 @@ pub struct WorldSchema {
     /// keeps pre-PlayerState saves loadable as a fully-healthy body.
     #[serde(default)]
     pub player_state: PlayerState,
+
+    /// The in-world clock (Fable Seam #4, 2026-07-27). Rust is the SOLE
+    /// authority — the schema-delta LLM pass never writes here (mirrors
+    /// `player_state`'s architectural line). Set by the `[TIME ...]`
+    /// bracket-command parser from the narrator's emissions. Drives the
+    /// World Progression tick gate: when in-world time advances past the
+    /// interval, an off-screen simulation pass fires against the schema's
+    /// entities (see `schema_engine::request_world_progression`).
+    ///
+    /// `current_minutes == 0` means "no [TIME] emitted yet" — the clock is
+    /// unset, the tick gate never fires. The first parseable [TIME] stamps
+    /// both `current_minutes` and `last_tick_minutes` (baseline; no fire),
+    /// matching Multihog's first-call behavior.
+    #[serde(default)]
+    pub world_clock: WorldClock,
+
+    /// Entity keys flagged immutable (the `[CORE]`-style lock; closes the §5
+    /// "deliberately permissive at v1" NPC-drift hole). A key in this set can
+    /// be SET once (on its first appearance in the schema) but never
+    /// overwritten or deleted by a subsequent delta. The schema validator
+    /// enforces this at §5 layer 1 (microsecond Rust check, zero LLM cost).
+    ///
+    /// Use case: an NPC's canonical identity (e.g. `"npc.marcus.core"`) is
+    /// flagged immutable on creation. The model can still append to
+    /// `"npc.marcus.chronicle"` to record character development — character
+    /// arc allowed, continuity error blocked. Today the set ships EMPTY: the
+    /// model isn't instructed to emit immutability flags yet. A follow-up
+    /// (Wupi-as-game-manager) populates this when she creates NPCs.
+    #[serde(default)]
+    pub immutable_keys: HashSet<String>,
+
+    /// Scene pacing state (Fable Seam #4 expansion, 2026-07-27): the most
+    /// recently classified scene rhythm + its pillar scores. Rust is the SOLE
+    /// authority — `apply_delta` does NOT touch it (mirrors `world_clock` +
+    /// `player_state`). The only writer is `fable_send`, which sets this each
+    /// turn from a fresh `scene_pacing::evaluate(text)` before the prompt
+    /// render. Nested inside `WorldSchema` so per-card persistence + autosave
+    /// inherit for free (no new file, no new AppState field). `#[serde(default)]`
+    /// keeps pre-ScenePacing saves loadable as `Exploration` (the neutral
+    /// default — a loaded save continues at balanced pacing until the next
+    /// turn re-classifies).
+    #[serde(default)]
+    pub scene_pacing: ScenePacing,
 }
 
 impl WorldSchema {
@@ -130,12 +359,22 @@ impl WorldSchema {
         let empty = self.summary.trim().is_empty()
             && self.recent_events.is_empty()
             && self.entities.is_empty()
-            && self.player_state.is_default();
+            && self.player_state.is_default()
+            && !self.world_clock.is_set();
         if empty {
             return String::new();
         }
 
         let mut out = String::with_capacity(512);
+        // Clock renders FIRST (before summary): the narrator needs the current
+        // time as its top-of-mind anchor so its [TIME ...] emissions advance
+        // it coherently. Without seeing the current time, the narrator would
+        // emit inconsistent timestamps. ~30 tokens; zero when unset.
+        if let Some(clock_line) = self.world_clock.render_clock_line() {
+            out.push_str("clock: ");
+            out.push_str(&clock_line);
+            out.push('\n');
+        }
         if !self.summary.trim().is_empty() {
             out.push_str("summary: ");
             out.push_str(self.summary.trim());
@@ -681,5 +920,109 @@ mod tests {
         // is still stripped.
         let raw = "A bell tolls<audio|> in the distance.";
         assert_eq!(extract_reply_channel(raw), "A bell tolls in the distance.");
+    }
+
+    // ---------- WorldClock (Seam #4) ----------
+
+    #[test]
+    fn world_clock_default_is_unset() {
+        let clock = WorldClock::default();
+        assert!(!clock.is_set());
+        assert_eq!(clock.minutes_since_last_tick(), 0);
+        assert_eq!(clock.render_clock_line(), None);
+    }
+
+    #[test]
+    fn world_clock_is_set_when_current_positive() {
+        let clock = WorldClock { current_minutes: 1440, last_tick_minutes: 0 };
+        assert!(clock.is_set());
+        // 1 day elapsed since the baseline.
+        assert_eq!(clock.minutes_since_last_tick(), 1440);
+    }
+
+    #[test]
+    fn world_clock_render_line_format() {
+        // Day 3, 14:30 → (3-1)*1440 + 14*60 + 30 = 3720 + 30 = 3750 minutes.
+        let clock = WorldClock { current_minutes: 3750, last_tick_minutes: 0 };
+        assert_eq!(clock.render_clock_line().as_deref(), Some("Day 3, 14:30"));
+    }
+
+    #[test]
+    fn world_clock_render_line_day_one_midnight() {
+        // Day 1, 00:00 → 0 minutes. But is_set() returns false for 0! The
+        // clock is only "set" once the narrator emits a nonzero time. Day 1
+        // midnight is the dormant state — no render, no tick.
+        let clock = WorldClock { current_minutes: 0, last_tick_minutes: 0 };
+        assert!(!clock.is_set());
+        assert_eq!(clock.render_clock_line(), None);
+    }
+
+    #[test]
+    fn render_for_prompt_includes_clock_when_set() {
+        let mut schema = WorldSchema::default();
+        // 2880 minutes = Day 3, 00:00 (Day 1 starts at minute 0).
+        schema.world_clock = WorldClock { current_minutes: 2880, last_tick_minutes: 0 };
+        let rendered = schema.render_for_prompt();
+        assert!(rendered.contains("clock: Day 3, 00:00"));
+    }
+
+    #[test]
+    fn render_for_prompt_omits_clock_when_unset() {
+        // A fresh game (no [TIME] emitted yet) → no clock block, zero tokens.
+        let schema = WorldSchema::default();
+        assert_eq!(schema.render_for_prompt(), "");
+        assert!(!schema.render_for_prompt().contains("clock:"));
+    }
+
+    #[test]
+    fn apply_delta_does_not_touch_world_clock() {
+        // Architectural invariant: world_clock is outside the LLM delta path.
+        // A delta carrying "world_clock" in its entities map must NOT mutate
+        // the typed field — it would just become a regular entity key (which
+        // the validator would later reject if flagged immutable, but at the
+        // apply layer it's a no-op on the typed struct).
+        let mut schema = WorldSchema::default();
+        schema.world_clock = WorldClock { current_minutes: 1000, last_tick_minutes: 500 };
+        let mut ents = HashMap::new();
+        // A naive/malicious delta trying to set "world_clock" as an entity.
+        ents.insert("world_clock".to_string(), Some("9999".to_string()));
+        let delta = SchemaDelta {
+            summary: None,
+            recent_events: None,
+            entities: Some(ents),
+        };
+        schema.apply_delta(delta);
+        // The typed world_clock is unchanged.
+        assert_eq!(schema.world_clock.current_minutes, 1000);
+        assert_eq!(schema.world_clock.last_tick_minutes, 500);
+        // The "world_clock" string landed in the entities map (it's just a
+        // regular key from apply_delta's perspective). Whether it stays there
+        // is the validator's call, not apply_delta's.
+        assert_eq!(schema.entities.get("world_clock").map(|s| s.as_str()), Some("9999"));
+    }
+
+    // ---------- immutable_keys (the [CORE]-style lock) ----------
+
+    #[test]
+    fn immutable_keys_default_empty() {
+        // Fresh schema has no locked keys — backwards-compatible with
+        // existing saves (which have no immutable_keys field).
+        let schema = WorldSchema::default();
+        assert!(schema.immutable_keys.is_empty());
+    }
+
+    #[test]
+    fn immutable_keys_serialize_roundtrip() {
+        // Save/load must preserve the set.
+        let mut schema = WorldSchema::default();
+        schema.immutable_keys.insert("npc.marcus.core".to_string());
+        schema.immutable_keys.insert("loc.tavern.canon".to_string());
+        let dir = std::env::temp_dir();
+        let path = dir.join("wupi_schema_immutable_test.json");
+        let _ = std::fs::remove_file(&path);
+        schema.save(&path).unwrap();
+        let loaded = WorldSchema::load(&path).unwrap();
+        assert_eq!(loaded.immutable_keys, schema.immutable_keys);
+        let _ = std::fs::remove_file(&path);
     }
 }

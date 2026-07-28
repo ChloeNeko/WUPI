@@ -56,11 +56,11 @@ pub struct ReconcileReport {
 /// One parsed Codex source file: title + tags from front-matter, body is the
 /// prose, hash is over the raw file bytes. Ephemeral; lives only for the
 /// reconcile pass.
-struct ParsedEntry {
-    title: String,
-    tags: Vec<String>,
-    body: String,
-    hash: u64,
+pub(crate) struct ParsedEntry {
+    pub(crate) title: String,
+    pub(crate) tags: Vec<String>,
+    pub(crate) body: String,
+    pub(crate) hash: u64,
 }
 
 /// Seed the Codex: parse every `.md` in `codex_dir`, reconcile against the
@@ -187,6 +187,227 @@ pub async fn seed_codex(
         }
     }
 
+    Ok(report)
+}
+
+/// Parse a *compound* codex file: a single `.md`-style file containing
+/// multiple concatenated front-matter + body entries, separated by blank
+/// lines. This is the format used by `data/wupi.codex` (Wupi's static
+/// playbook — engine-shipped reference knowledge seeded into the
+/// `__wupi_system__` partition at boot).
+///
+/// Each entry follows the exact same shape as a single-file `.md` codex
+/// entry (front-matter between `---` fences + body below). The compound
+/// format exists so engine-shipped playbook content stays in ONE file next
+/// to `wupi.sim` (the updater replaces it verbatim) rather than scattering
+/// across a directory the user might reasonably assume is theirs to edit.
+///
+/// A missing file is NOT an error: returns an empty Vec (graceful, mirrors
+/// `parse_dir`). A parse failure inside one entry is logged-and-skipped so a
+/// single malformed block doesn't kill the whole seed (same contract as
+/// `parse_dir`'s per-file handling).
+///
+/// Hash semantics match `parse_file`: the hash is over the entry's raw bytes
+/// (front-matter + body + fences), so whitespace-only edits to front-matter
+/// still register as a change. The split point is the next `---` fence at the
+/// start of a line preceded by a blank line.
+pub(crate) fn parse_compound_file(path: &Path) -> anyhow::Result<Vec<ParsedEntry>> {
+    let bytes = match std::fs::read(path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(anyhow::anyhow!("read compound codex {}: {e}", path.display())),
+    };
+    let text = String::from_utf8_lossy(&bytes).into_owned();
+    let stem = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("untitled")
+        .to_owned();
+
+    let mut out = Vec::new();
+    for chunk in split_compound(&text) {
+        // Hash each entry's raw text independently (deterministic per-entry
+        // identity for the reconcile diff). Hash the &str directly: `Hash` is
+        // implemented for `str`, and hashing through UTF-8 bytes matches the
+        // spirit of `parse_file`'s raw-bytes hash (a re-encoding to the same
+        // bytes produces the same hash).
+        let mut hasher = std::hash::DefaultHasher::new();
+        chunk.hash(&mut hasher);
+        let hash = hasher.finish();
+
+        let (front, body) = split_front_matter(chunk);
+        let (title, tags) = parse_front_matter(front, &stem);
+
+        // Skip empty bodies (e.g. an entry that was just front-matter + nothing
+        // after — usually a malformed block). Logging is overkill here: the
+        // reconcile just won't see it, same as parse_dir skipping an empty file.
+        if body.trim().is_empty() {
+            continue;
+        }
+
+        out.push(ParsedEntry {
+            title,
+            tags,
+            body: body.to_owned(),
+            hash,
+        });
+    }
+    Ok(out)
+}
+
+/// Split a compound codex file into its top-level entries. Each entry is the
+/// text from one `---\n` opener up to (but not including) the next `---\n`
+/// opener that begins a new entry (i.e. one preceded by a blank line, so
+/// `---` inside a body doesn't trigger a false split). The first entry may or
+/// may not begin with `---` (a leading body without front-matter is treated
+/// as a single title-less entry — but in practice every shipped entry has
+/// front-matter).
+fn split_compound(text: &str) -> Vec<&str> {
+    // Walk line by line. An "entry-start fence" is a line that is exactly
+    // `---` (after trimming) AND is preceded by either the start of the file
+    // or a blank line. This mirrors how the front-matter parser treats the
+    // opener and avoids splitting on `---` that appears mid-body.
+    let lines: Vec<&str> = text.lines().collect();
+    let mut starts: Vec<usize> = Vec::new();
+    for (i, line) in lines.iter().enumerate() {
+        if line.trim() == "---" {
+            let prev_blank = i == 0 || lines[i - 1].trim().is_empty();
+            if prev_blank {
+                starts.push(i);
+            }
+        }
+    }
+    if starts.is_empty() {
+        // No fences at all → whole file is one body-only entry (degenerate).
+        return if text.trim().is_empty() { Vec::new() } else { vec![text] };
+    }
+    let mut chunks = Vec::new();
+    for (idx, &start) in starts.iter().enumerate() {
+        let end = if idx + 1 < starts.len() {
+            // Up to the blank line preceding the next fence.
+            starts[idx + 1].saturating_sub(1)
+        } else {
+            lines.len()
+        };
+        let chunk: String = lines[start..end].join("\n");
+        if !chunk.trim().is_empty() {
+            chunks.push(chunk);
+        }
+    }
+    // Borrowing strings out of `chunk` (owned) requires leaking or re-slicing
+    // the original. Re-slice from `text` by computing byte offsets from the
+    // joined lines. Simpler: re-return `&str` slices into `text` by finding
+    // the byte ranges directly.
+    let mut out = Vec::new();
+    let mut cursor = 0usize;
+    for chunk_str in &chunks {
+        if let Some(pos) = text[cursor..].find(chunk_str.as_str()) {
+            let abs = cursor + pos;
+            out.push(&text[abs..abs + chunk_str.len()]);
+            cursor = abs + chunk_str.len();
+        }
+    }
+    out
+}
+
+/// Seed Wupi's static playbook (engine-shipped reference knowledge) into the
+/// `__wupi_system__` partition. Mirrors `seed_codex` but reads from a single
+/// compound file (parsed via `parse_compound_file`) instead of a directory,
+/// and hard-wires the namespace to `system_codex::SYSTEM_NAMESPACE`
+/// (`"wupi_system"`).
+///
+/// This fills the previously-empty static-seed side of `WUPI_SYSTEM_CARD_ID`
+/// (the runtime-snapshot writer in `system_codex.rs` is the other writer).
+/// The sentinel constant + `search_wupi_visible` read side + the per-class
+/// lower cosine floor (0.10) have all been live since §8C; this just turns on
+/// the seed path they were designed for. Wupi retrieves her playbook via
+/// `search_wupi_visible` on every chat turn — surface the design contract +
+/// file formats + worked examples the moment the user mentions `.sim` cards,
+/// codex authoring, or game-mechanic design.
+///
+/// Same reconcile contract as `seed_codex`: idempotent, hash-gated, deletes
+/// orphans (entries in the partition whose source block was removed from the
+/// compound file). Missing `path` → empty report (graceful).
+pub(crate) async fn seed_wupi_codex<E: Embedder>(
+    engine: &MemoryEngine<E>,
+    path: &Path,
+    card_id: &str,
+) -> anyhow::Result<ReconcileReport> {
+    let mut report = ReconcileReport::default();
+    let namespace = crate::system_codex::SYSTEM_NAMESPACE;
+
+    let sources = match parse_compound_file(path) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(
+                file = %path.display(),
+                error = %format!("{e}"),
+                namespace,
+                "wupi codex file unreadable; skipping seed"
+            );
+            return Ok(report);
+        }
+    };
+    if sources.is_empty() {
+        tracing::info!(file = %path.display(), namespace, "wupi codex file empty or missing; nothing to seed");
+        return Ok(report);
+    }
+
+    // Same reconcile diff as seed_codex: title-keyed, hash-detected.
+    let existing = engine.list_codex_entries(card_id).await?;
+    let mut existing_by_title: HashMap<String, (MemoryId, Option<String>)> = HashMap::new();
+    for (id, metadata_json) in existing {
+        let title = extract_metadata_field(metadata_json.as_deref(), "title").unwrap_or_default();
+        existing_by_title.insert(title, (id, extract_metadata_field(metadata_json.as_deref(), "hash")));
+    }
+    let mut consumed: std::collections::HashSet<&str> = std::collections::HashSet::new();
+
+    for src in &sources {
+        let stored_hash = existing_by_title
+            .get(&src.title)
+            .and_then(|(_, h)| h.clone());
+        let stored_hash_u64 = stored_hash.as_deref().and_then(|s| s.parse::<u64>().ok());
+        match stored_hash_u64 {
+            Some(h) if h == src.hash => {
+                report.unchanged += 1;
+                consumed.insert(&src.title);
+            }
+            Some(_) => {
+                if let Some(&(old_id, _)) = existing_by_title.get(&src.title) {
+                    if let Err(e) = engine.delete_memory(old_id).await {
+                        tracing::warn!(
+                            title = %src.title,
+                            error = %format!("{e}"),
+                            "wupi codex update: failed to delete old entry; skipping"
+                        );
+                        continue;
+                    }
+                }
+                match insert_entry(engine, src, card_id, namespace).await {
+                    Ok(()) => {
+                        report.updated += 1;
+                        consumed.insert(&src.title);
+                    }
+                    Err(e) => tracing::warn!(title = %src.title, error = %format!("{e}"), "wupi codex update insert failed"),
+                }
+            }
+            None => match insert_entry(engine, src, card_id, namespace).await {
+                Ok(()) => {
+                    report.seeded += 1;
+                    consumed.insert(&src.title);
+                }
+                Err(e) => tracing::warn!(title = %src.title, error = %format!("{e}"), "wupi codex seed insert failed"),
+            },
+        }
+    }
+    for (title, (id, _)) in &existing_by_title {
+        if !consumed.contains(title.as_str()) {
+            match engine.delete_memory(*id).await {
+                Ok(()) => report.purged += 1,
+                Err(e) => tracing::warn!(title = %title, error = %format!("{e}"), "wupi codex orphan purge failed"),
+            }
+        }
+    }
     Ok(report)
 }
 
@@ -631,5 +852,150 @@ mod tests {
         let json = r#"{"kind":"codex","title":"x"}"#;
         assert_eq!(extract_metadata_field(Some(json), "hash"), None);
         assert_eq!(extract_metadata_field(None, "title"), None);
+    }
+
+    // ── parse_compound_file (Wupi's playbook compound-file parser) ───────────
+    //
+    // The playbook lives at data/wupi.codex next to wupi.sim and contains
+    // multiple front-matter + body entries concatenated. These tests pin the
+    // parser's contract: it splits on top-level fences (NOT fences inside a
+    // body), hashes each entry independently for the reconcile diff, and
+    // degrades gracefully on missing/malformed input.
+
+    fn write_tmp_compound(content: &str) -> (std::path::PathBuf, tempfile::TempDir) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("wupi.codex");
+        std::fs::write(&path, content).expect("write tmp");
+        (path, dir)
+    }
+
+    #[test]
+    fn parse_compound_file_splits_multiple_entries() {
+        // Three top-level fences → three entries. The parser splits ONLY on a
+        // `---` line preceded by a blank line (or at start-of-file), so prose
+        // that uses `---` mid-line — em-dash substitutions, signature lines,
+        // etc. — does NOT fragment an entry.
+        let content = "---\ntitle: First\ntags: a, b\n---\nBody one.\n\n---\ntitle: Second\ntags: c\n---\nBody two has an em-dash phrase --- inline, mid-sentence.\n\n---\ntitle: Third\n---\nBody three.\n";
+        let (path, _dir) = write_tmp_compound(content);
+        let entries = parse_compound_file(&path).expect("parse");
+        assert_eq!(entries.len(), 3, "exactly three top-level entries");
+        assert_eq!(entries[0].title, "First");
+        assert_eq!(entries[0].tags, vec!["a".to_owned(), "b".to_owned()]);
+        assert!(entries[0].body.contains("Body one."));
+        assert_eq!(entries[1].title, "Second");
+        assert!(entries[1].body.contains("em-dash phrase --- inline"));
+        assert_eq!(entries[2].title, "Third");
+        assert!(entries[2].body.contains("Body three."));
+    }
+
+    #[test]
+    fn parse_compound_file_single_entry() {
+        // Degenerate case: a single fenced entry parses to one ParsedEntry.
+        let content = "---\ntitle: Solo\ntags: x\n---\nJust one body.\n";
+        let (path, _dir) = write_tmp_compound(content);
+        let entries = parse_compound_file(&path).expect("parse");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].title, "Solo");
+        assert!(entries[0].body.contains("Just one body."));
+    }
+
+    #[test]
+    fn parse_compound_file_missing_returns_empty() {
+        // A missing file is NOT an error — returns empty Vec so the boot seed
+        // is a no-op (mirrors parse_dir's graceful degradation).
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("does-not-exist.codex");
+        let entries = parse_compound_file(&path).expect("parse missing");
+        assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn parse_compound_file_skips_empty_body_entries() {
+        // An entry with front-matter but no body (whitespace only) is dropped,
+        // so a stray fence pair doesn't produce a phantom entry.
+        let content = "---\ntitle: Has Body\n---\nReal body.\n\n---\ntitle: Empty\n---\n   \n";
+        let (path, _dir) = write_tmp_compound(content);
+        let entries = parse_compound_file(&path).expect("parse");
+        assert_eq!(entries.len(), 1, "empty-body entry was skipped");
+        assert_eq!(entries[0].title, "Has Body");
+    }
+
+    #[test]
+    fn parse_compound_file_hashes_differ_per_entry() {
+        // The reconcile diff keys on hash; entries in the same file must hash
+        // differently (else all updates would look like no-ops).
+        let content = "---\ntitle: A\n---\nbody a\n\n---\ntitle: B\n---\nbody b\n";
+        let (path, _dir) = write_tmp_compound(content);
+        let entries = parse_compound_file(&path).expect("parse");
+        assert_eq!(entries.len(), 2);
+        assert_ne!(entries[0].hash, entries[1].hash, "distinct entries must hash differently");
+    }
+
+    #[test]
+    fn parse_compound_file_hash_stable_across_calls() {
+        // Idempotent re-seed relies on the hash being deterministic for the
+        // same input bytes across invocations (else unchanged entries would
+        // be re-embedded every boot — expensive).
+        let content = "---\ntitle: Same\n---\nidentical body\n";
+        let (path, _dir) = write_tmp_compound(content);
+        let h1 = parse_compound_file(&path).expect("parse")[0].hash;
+        let h2 = parse_compound_file(&path).expect("parse")[0].hash;
+        assert_eq!(h1, h2);
+    }
+
+    /// Pins the playbook's namespace discriminator. The compound-file seed
+    /// path hard-wires `system_codex::SYSTEM_NAMESPACE` so playbook entries
+    /// land in the `__wupi_system__` partition's namespace (distinct from
+    /// user-authored codex in `__codex__`). The `kind=codex` discriminator
+    /// stays shared so the render frame + per-class floor apply uniformly.
+    #[test]
+    fn wupi_codex_namespace_is_wupi_system() {
+        let json = build_metadata_json(
+            "Playbook Entry",
+            &["game-design".to_owned()],
+            999,
+            crate::system_codex::SYSTEM_NAMESPACE,
+        );
+        assert!(json.contains("\"namespace\":\"wupi_system\""));
+        assert!(json.contains("\"kind\":\"codex\""));
+        assert_eq!(extract_metadata_field(Some(&json), "namespace"), Some("wupi_system".to_owned()));
+    }
+
+    /// Smoke test against the shipped playbook: the data/wupi.codex file at
+    /// the repo root (sibling of this Cargo project's src-tauri/) must parse
+    /// into exactly the four authored entries, in order, with their expected
+    /// titles. Pins the file the boot seed actually reads so a typo'd fence
+    /// or a stray title: line in body prose doesn't silently fragment it.
+    #[test]
+    fn shipped_playbook_parses_to_four_entries() {
+        let candidates = [
+            // Cargo test cwd = src-tauri/, so the playbook is one level up.
+            std::path::PathBuf::from("../data/wupi.codex"),
+            // Standalone invocation from repo root.
+            std::path::PathBuf::from("data/wupi.codex"),
+        ];
+        let path = candidates.iter().find(|p| p.is_file());
+        let Some(path) = path else {
+            // Not running from the repo (e.g. CI on a bare crate). Skip
+            // rather than fail: this is a shipped-asset smoke test, not a
+            // parser-contract test (those live above).
+            eprintln!("shipped_playbook_parses_to_four_entries: data/wupi.codex not found; skipping");
+            return;
+        };
+        let entries = parse_compound_file(path).expect("shipped playbook parses");
+        assert_eq!(entries.len(), 4, "shipped playbook has exactly four entries");
+        assert_eq!(entries[0].title, "Game System Design");
+        assert_eq!(entries[1].title, "Authoring .sim Cards");
+        assert_eq!(entries[2].title, "Authoring Codex Entries");
+        assert_eq!(entries[3].title, "Director Tools");
+        // Each entry must stay under the bge-small chunk budget (~1400 chars).
+        for e in &entries {
+            assert!(
+                e.body.len() <= 1400,
+                "playbook entry '{}' body is {} chars (budget 1400); bge-small may truncate",
+                e.title,
+                e.body.len()
+            );
+        }
     }
 }

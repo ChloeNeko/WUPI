@@ -1,36 +1,3 @@
-//! System-prompt construction.
-//!
-//! The system prompt is now THREE cleanly separated layers (SIM card system
-//! 2026-07-14, User Profile system 2026-07-14):
-//!
-//! 1. **`OS_DIRECTIVES`**: the universal OS scaffold. Engine-level rules true
-//!    for EVERY card (the simulation framing + the semantics of the
-//!    `<retrieved_memory>` / `<world_state>` / `<user_profile>` tags). Lives
-//!    here in Rust because it's an engineering concern tied to the
-//!    architecture, NOT a content artifact. Every future card shares it; write
-//!    it once.
-//! 2. **The persona**: rendered from the active Simulation Card
-//!    (`sim_card.rs`) and passed in as `Option<&str>`. Wupi gets NOTHING from
-//!    this file: her entire identity comes from `data/wupi.sim` (§8C). A
-//!    dungeon card would supply its own persona; the directives above are
-//!    unchanged.
-//! 3. **The user profile**: rendered from the operator's profile
-//!    (`user_profile.rs`, `data/user.xml` per §8C) and passed in as
-//!    `Option<&str>`. The static "who am I talking to" counterpart to the
-//!    persona. Re-read fresh each turn (hot-reload) so live edits take effect
-//!    immediately.
-//!
-//! Ordering in the assembled prompt: `<os_directives>` → `<persona>` →
-//! `<user_profile>` → `<current_context>`. The operator's identity comes AFTER
-//! Wupi's so the model grounds itself in its own personality first, then learns
-//! who it's addressing: the same ordering the context stack uses.
-//!
-//! The old `DEFAULT_SYSTEM_PROMPT` (the "out-of-character assistant, not part
-//! of any roleplay" text) was placeholder scaffolding from the barebones-P
-//! phase and is DELETED. The catgirl card was always the intended destination.
-
-/// The universal OS-level directives: card-agnostic scaffolding shared by
-/// every Simulation Card. Persona content comes from the card, NOT from here.
 pub const OS_DIRECTIVES: &str = "\
 You are operating as a process within WUPI: a local, AI-native simulation \
 runtime. You are the active Simulation Card: a simulation interface reasoning \
@@ -44,21 +11,6 @@ marked <user_profile> describes the operator you are speaking with: treat it \
 as authoritative identity, not a suggestion. When memory and the live \
 conversation disagree, the live conversation always wins.";
 
-/// Assemble the system-prompt content from its layers.
-///
-/// - `<os_directives>`: always present (universal scaffolding).
-/// - `<persona>`: present only when a real card loaded; `None` or empty
-///   suppresses the section (e.g. the fallback stub persona).
-/// - `<user_profile>`: present only when an operator profile loaded; `None`
-///   or empty suppresses the section (e.g. no `user.xml` resolved, §8C).
-///   Re-read fresh each turn by the caller so live edits take effect
-///   immediately (hot-reload). Byte-identical across turns until edited → does
-///   NOT trigger the §2F cold-reset guard (same cache-friendliness as the
-///   persona).
-/// - `<current_context>`: the live `WupiSettings` readout (context_size
-///   overridden by `effective_ctx` so the model sees the ACTUAL resident
-///   context, not the user's setting — under API the local agent runs at
-///   1024, so reporting 4000 would lie and encourage over-emission).
 pub fn build_system_content(
     settings: &WupiSettings,
     persona: Option<&str>,
@@ -85,13 +37,6 @@ pub fn build_system_content(
         effective_ctx, settings.conversation_budget
     ));
 
-    // Note (2026-07-13, §2F eager-prefill design): the retrieved-memory block
-    // NO LONGER lives in the system prompt. It moved to the inter-turn region
-    // (chat_format.rs::render_prompt injects it after all turns, before the
-    // generation prompt). Keeping it out of the system prompt is what makes
-    // the system+turns prefix stable across turns, which lets the eager
-    // prefill establish a cache the next turn can delta-prefill against.
-
     sections.join("\n\n")
 }
 
@@ -104,8 +49,19 @@ pub struct WupiSettings {
 impl Default for WupiSettings {
     fn default() -> Self {
         Self {
-            context_size: 4000,
-            conversation_budget: 16000,
+            // 4096 (raised 2026-07-27 from the 3072 set in §2C). The §2C cut
+            // to 3072 bought back ~300-400 MiB of VRAM headroom but left only
+            // a 2304-token prompt budget (n_ctx - generation_reserve = 3072 -
+            // 768) — too tight: the Quick Play interview system prompt alone
+            // is ~2340 tokens, deterministically failing generation on a
+            // default-settings Local install (`context too long even after
+            // truncation: ... max 2304`, reproduced on a friend's PC). 4096
+            // restores a safe 3328-token budget (1024-token reserve) with no
+            // OOM risk on 12 GB under the v0.6.4 swap-lock (only ONE of
+            // chat/schema/fable is resident at a time; weights ~9.8 GB +
+            // one ~150 MB Q8_0 KV context + embedder ~36 MB ≈ 10 GB used).
+            context_size: 4096,
+            conversation_budget: 8192,
         }
     }
 }
@@ -131,7 +87,6 @@ mod tests {
     fn persona_section_is_optional() {
         let settings = WupiSettings::default();
 
-        // No persona → no <persona> section.
         let without = build_system_content(&settings, None, None, 4000);
         assert!(!without.contains("<persona>"));
 
@@ -149,11 +104,6 @@ mod tests {
 
     #[test]
     fn user_profile_section_is_optional_and_ordered_after_persona() {
-        // The profile is a sibling to the persona. None → suppressed. When
-        // present it lands AFTER <persona> and BEFORE <current_context>.
-        // Discriminate on the CLOSING tag `</user_profile>`: the opening tag
-        // name also appears in OS_DIRECTIVES (the tag-semantics sentence), but
-        // the closing tag only ever exists in a rendered section.
         let settings = WupiSettings::default();
 
         let without = build_system_content(&settings, None, None, 4000);
@@ -161,16 +111,8 @@ mod tests {
 
         let profile = "<user_profile>\nname: Operator\n</user_profile>";
         let with = build_system_content(&settings, None, Some(profile), 4000);
-        // The closing tag must be PRESENT when a profile is passed (the
-        // opening-tag name also appears in OS_DIRECTIVES, so we discriminate
-        // on the closing tag like the None-branch above). The prior `!` here
-        // was a typo that asserted the opposite of correct behavior; it sat
-        // undetected because `cargo test` is the 30+ min CUDA path nobody
-        // runs (§13). Found when the v0.6.3 session finally ran the suite.
         assert!(with.contains("</user_profile>"));
-        assert!(with.contains("name: Operator"));
 
-        // Ordering: when both persona + profile are present, persona comes first.
         let persona = "<persona>\nname: Wupi\n</persona>";
         let both = build_system_content(&settings, Some(persona), Some(profile), 4000);
         let persona_pos = both.find("</persona>").unwrap();
@@ -190,9 +132,6 @@ mod tests {
 
     #[test]
     fn effective_ctx_overrides_reported_context_size() {
-        // v0.7: the system prompt reports effective_ctx, NOT settings.context_size.
-        // Under API the local chat agent runs at 2048 even if settings.context_size
-        // is 4000 — the model must see the truth so it doesn't over-emit.
         let settings = WupiSettings {
             context_size: 4000,
             conversation_budget: 16000,

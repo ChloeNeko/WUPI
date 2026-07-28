@@ -1,26 +1,25 @@
 // =============================================================
-// PANEL: MAP — atlas PNG + location pins from loc_ entities.
-// The card's tone picks the atlas (fantasy/futuristic/modern).
-// Pins are loc_* entities; the state string is the location's
-// status (e.g. "explored", "current", "locked").
+// PANEL: MAP — location pins from loc_ entities, on a CSS backdrop.
+// Pins are loc_* entities; the state string is the location's status
+// (e.g. "explored", "current", "locked").
+//
+// ATLAS HISTORY: this panel used to render one of three atlas PNGs
+// (map-{fantasy,futuristic,modern}-atlas.png) as the backdrop, picked by
+// the card's tone. Those 3 PNGs were deleted 2026-07-27 (they were the
+// only references to themselves and shipped ~7.5MB of dead weight). The
+// panel now renders pins over a pure-CSS parchment backdrop (see
+// .panel-map-bg in fable.css). setMapTheme() is retained as a no-op so
+// stage.js's existing call site doesn't need to change — a future atlas
+// (e.g. procedurally drawn, or a single themed PNG under assets/) can
+// re-light it without touching the call site.
 // =============================================================
 
-// Atlas PNG per theme. Restored from v0.6.5 (the Phase 0a asset wipe had
-// stubbed these to ''). The 3 atlas PNGs ship in public/ and are picked by
-// the card's tone via mapThemeForTone() in stage.js → setMapTheme(theme).
-// Relative URLs resolve under Tauri's custom protocol (base: "./").
-const ATLASES = {
-  fantasy: './map-fantasy-atlas.png',
-  futuristic: './map-futuristic-atlas.png',
-  modern: './map-modern-atlas.png',
-};
-let atlas = ATLASES.fantasy; // default; overridable via setMapTheme on game start
-
+// Retained for API compatibility (stage.js calls setMapTheme('fantasy') at
+// init). Currently a no-op — no atlas PNG to switch. If a future atlas
+// returns, store the theme here and consume it in renderMap.
+let _theme = 'fantasy';
 export function setMapTheme(theme) {
-  // Resolve the theme string to one of the 3 known atlases. Unknown themes
-  // fall back to fantasy (the most common card tone). Empty/null stays at
-  // the current atlas (defensive — stage.js always passes a real theme).
-  if (theme && ATLASES[theme]) atlas = ATLASES[theme];
+  if (typeof theme === 'string' && theme) _theme = theme;
 }
 
 function esc(s) {
@@ -38,7 +37,7 @@ export function renderMap(entities, schema) {
   if (!locs.length) {
     return head +
       `<div class="panel-map-empty">
-         <img src="${atlas}" alt="" class="panel-map-bg" />
+         <div class="panel-map-bg" data-theme="${esc(_theme)}"></div>
          <div class="panel-empty">
            <p>No locations charted yet.</p>
            <p class="panel-empty-hint">Travel somewhere and ask Wupi to chart it.</p>
@@ -48,7 +47,7 @@ export function renderMap(entities, schema) {
   const pins = locs.map(([id, state], i) => pin(id, state, i, locs.length)).join('');
   return head +
     `<div class="panel-map">
-       <img src="${atlas}" alt="" class="panel-map-bg" />
+       <div class="panel-map-bg" data-theme="${esc(_theme)}"></div>
        <div class="panel-map-pins">${pins}</div>
      </div>`;
 }

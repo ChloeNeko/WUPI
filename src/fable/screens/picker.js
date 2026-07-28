@@ -67,7 +67,7 @@ export async function renderCards(root, mode, onSelect, onAuthorNew) {
       ${card.tone ? `<div class="fable-card-tone">${esc(card.tone)}</div>` : ''}
       <div class="fable-card-preview">${esc(card.opening_scene_preview || card.setting_preview || '')}</div>
       <div class="fable-card-foot">
-        <span>${card.protagonist_name ? esc(card.protagonist_name) : 'Unnamed'}</span>
+        <span>${card.protagonist_name ? esc(card.protagonist_name) : 'User'}</span>
         ${card.has_saves ? '<span class="fable-card-continue-badge">● saved</span>' : ''}
       </div>
     `;

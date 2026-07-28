@@ -107,6 +107,15 @@ struct SchemaRequest {
     /// "previously deferred state changes — re-attempt with the new exchange
     /// as context." Empty in the common case (no prior failures).
     deferred_attempts: Vec<FailedAttempt>,
+    /// Entity keys flagged immutable in the current schema (the `[CORE]`-style
+    /// lock, 2026-07-27). Threaded through so the validator's repair loop can
+    /// reject overwrite/delete of canon. Empty in the common case (no keys
+    /// flagged immutable yet — the model isn't instructed to emit flags).
+    immutable_keys: std::collections::HashSet<String>,
+    /// The set of entity keys currently in the schema (i.e. the keys of
+    /// `WorldSchema::entities`). Required for the immutability check to
+    /// distinguish first-set (allowed) from overwrite (rejected).
+    existing_keys: std::collections::HashSet<String>,
     /// One-shot reply channel.
     reply: mpsc::Sender<SchemaReply>,
 }
@@ -174,15 +183,20 @@ pub struct FailedAttempt {
     pub passes_used: u8,
 }
 
-/// Type alias distinguishing the two kinds of triggering context an attempt
+/// Type alias distinguishing the three kinds of triggering context an attempt
 /// carries. Internal to the engine; `FailedAttempt` exposes them as
-/// Option<(exchange)> / Option<request> for the IPC boundary.
+/// `Option<(exchange)>` / `Option<request>` / `Option<interval>` for the IPC
+/// boundary.
 #[derive(Clone)]
 enum AttemptSource {
     /// Auto-summarizer: triggered by a chat exchange.
     Auto { exchange: (String, String) },
     /// Game-manager translation: triggered by an explicit player request.
     Translation { request: String },
+    /// World progression tick (Seam #4): triggered by in-world clock advance.
+    /// Carries the elapsed interval hours so a failed tick can be re-attempted
+    /// with the same magnitude on the next tick.
+    WorldProgression { interval_hours: u32 },
 }
 
 /// The outcome of a delta-or-translation attempt. The engine's internal
@@ -210,6 +224,11 @@ enum SchemaMsg {
     /// command, not a just-finished chat exchange. Reuses the same JSON-delta
     /// parser + the schema engine's isolated context, no new infrastructure.
     RequestTranslation(Box<TranslationRequest>),
+    /// Advance the off-screen world (Fable Seam #4, 2026-07-27). Fires when
+    /// the in-world clock advances past the interval. Reuses the same engine
+    /// + parser + validator; only the prompt differs. The returned delta is
+    /// applied to `game_schema` by the caller.
+    RequestWorldProgression(Box<WorldProgressionRequest>),
     /// Shut the schema thread down cleanly (drop its `LlamaContext`, freeing
     /// its KV cache, then join). Required by the VRAM-hibernate path so the
     /// schema context's ~75MB is reclaimable without process restart. Mirrors
@@ -232,6 +251,33 @@ struct TranslationRequest {
     /// engine couldn't commit. Folded into this request's prompt so the
     /// model gets another shot with new context. Empty in the common case.
     deferred_attempts: Vec<FailedAttempt>,
+    /// Immutable + existing key sets (same role as in `SchemaRequest`).
+    immutable_keys: std::collections::HashSet<String>,
+    existing_keys: std::collections::HashSet<String>,
+    /// One-shot reply channel.
+    reply: mpsc::Sender<SchemaReply>,
+}
+
+/// A request to advance the off-screen world (Fable Seam #4, 2026-07-27).
+/// Fires when the in-world clock (`WorldSchema::world_clock`) advances past
+/// the configured interval. Reuses the schema engine's isolated context +
+/// the same 3-pass repair loop + the immutability validator — no new
+/// infrastructure, just a different prompt. The result is a `SchemaDelta`
+/// the caller applies to `game_schema`, so the next narrator turn sees a
+/// world that has moved off-screen.
+struct WorldProgressionRequest {
+    /// The current game-world schema as pretty JSON. The model reads the
+    /// entities to know what off-screen state exists.
+    current_schema_json: String,
+    /// The interval (in hours) that just elapsed. Surfaces to the model as
+    /// "advance the off-screen state by ~N hours of activity."
+    interval_hours: u32,
+    /// Deferred progression attempts from prior ticks. Same fail-proof
+    /// contract as the delta + translation paths.
+    deferred_attempts: Vec<FailedAttempt>,
+    /// Immutable + existing key sets (same role as in `SchemaRequest`).
+    immutable_keys: std::collections::HashSet<String>,
+    existing_keys: std::collections::HashSet<String>,
     /// One-shot reply channel.
     reply: mpsc::Sender<SchemaReply>,
 }
@@ -311,6 +357,17 @@ impl SchemaEngine {
                             let outcome = std::panic::catch_unwind(
                                 std::panic::AssertUnwindSafe(|| {
                                     runtime.generate_translation(&req)
+                                }),
+                            );
+                            Some((outcome, req.reply))
+                        }
+                        Ok(SchemaMsg::RequestWorldProgression(req)) => {
+                            // Seam #4 (2026-07-27): off-screen world simulation.
+                            // Same self-healing wrap, the world-progression
+                            // prompt is built by `render_world_progression_prompt`.
+                            let outcome = std::panic::catch_unwind(
+                                std::panic::AssertUnwindSafe(|| {
+                                    runtime.generate_world_progression(&req)
                                 }),
                             );
                             Some((outcome, req.reply))
@@ -424,6 +481,10 @@ impl SchemaEngine {
     /// the prompt so the model gets another shot with fresh context). Pass
     /// an empty vec in the common case; the caller is responsible for
     /// draining the failure queue.
+    ///
+    /// `immutable_keys` + `existing_keys` thread the schema's `[CORE]`-style
+    /// immutability set + its current entity keys into the validator. Pass
+    /// empty sets in the common case (no keys locked yet). 2026-07-27.
     pub fn request_delta(
         &self,
         last_exchange: (String, String),
@@ -435,6 +496,8 @@ impl SchemaEngine {
             last_exchange,
             current_schema_json: current_schema.to_json_pretty(),
             deferred_attempts,
+            immutable_keys: current_schema.immutable_keys.clone(),
+            existing_keys: current_schema.entities.keys().cloned().collect(),
             reply: reply_tx,
         };
         self.tx
@@ -462,10 +525,45 @@ impl SchemaEngine {
             player_request,
             current_schema_json: current_schema.to_json_pretty(),
             deferred_attempts,
+            immutable_keys: current_schema.immutable_keys.clone(),
+            existing_keys: current_schema.entities.keys().cloned().collect(),
             reply: reply_tx,
         };
         self.tx
             .send(SchemaMsg::RequestTranslation(Box::new(req)))
+            .map_err(|_| anyhow::anyhow!("schema engine thread closed"))?;
+        Ok(reply_rx)
+    }
+
+    /// Post a WORLD PROGRESSION request (Fable Seam #4, 2026-07-27): advance
+    /// the off-screen world by one interval of in-world time. Fires from
+    /// `fable_send`'s tick gate when the clock crosses the configured
+    /// interval. Reuses the schema engine's isolated context + the same
+    /// fail-proof 3-pass contract; only the prompt differs. The returned
+    /// delta is applied to `game_schema` by the caller, so the next narrator
+    /// turn reflects the moved world.
+    ///
+    /// `interval_hours` surfaces to the model as the magnitude of time to
+    /// advance ("~N hours of off-screen activity"). `deferred_attempts`
+    /// carries failed progression attempts from prior ticks. Same shape +
+    /// semantics as the delta/translation paths.
+    pub fn request_world_progression(
+        &self,
+        current_schema: &WorldSchema,
+        interval_hours: u32,
+        deferred_attempts: Vec<FailedAttempt>,
+    ) -> anyhow::Result<mpsc::Receiver<SchemaReply>> {
+        let (reply_tx, reply_rx) = mpsc::channel::<SchemaReply>();
+        let req = WorldProgressionRequest {
+            current_schema_json: current_schema.to_json_pretty(),
+            interval_hours,
+            deferred_attempts,
+            immutable_keys: current_schema.immutable_keys.clone(),
+            existing_keys: current_schema.entities.keys().cloned().collect(),
+            reply: reply_tx,
+        };
+        self.tx
+            .send(SchemaMsg::RequestWorldProgression(Box::new(req)))
             .map_err(|_| anyhow::anyhow!("schema engine thread closed"))?;
         Ok(reply_rx)
     }
@@ -481,6 +579,7 @@ impl SchemaEngine {
             let reply_tx = match msg {
                 SchemaMsg::Request(r) => r.reply,
                 SchemaMsg::RequestTranslation(r) => r.reply,
+                SchemaMsg::RequestWorldProgression(r) => r.reply,
                 // Shutdown during init-failure drain: nothing to reply to,
                 // just drop it (the engine never came up).
                 SchemaMsg::Shutdown => continue,
@@ -562,6 +661,8 @@ impl SchemaRuntime {
                 exchange: req.last_exchange.clone(),
             },
             &req.deferred_attempts,
+            &req.immutable_keys,
+            &req.existing_keys,
             "schema delta",
         )
     }
@@ -588,7 +689,41 @@ impl SchemaRuntime {
                 request: req.player_request.clone(),
             },
             &req.deferred_attempts,
+            &req.immutable_keys,
+            &req.existing_keys,
             "schema translation",
+        )
+    }
+
+    /// Advance the off-screen world (Fable Seam #4, 2026-07-27). Same fail-
+    /// proof contract as the delta + translation paths. The prompt asks the
+    /// model to advance a subset of entities by `interval_hours` of off-screen
+    /// activity, emitting only the changed keys. The result delta is applied
+    /// to `game_schema` by the caller. Fires from `fable_send`'s tick gate.
+    ///
+    /// The `interval_hours` field surfaces to the model as the magnitude of
+    /// time that elapsed; the model decides which entities meaningfully
+    /// advanced in that window (a faction relocated, an NPC's mood shifted,
+    /// a deadline approached). The validator's immutability check protects
+    /// against the progression pass trying to retcon canon entities.
+    fn generate_world_progression(
+        &mut self,
+        req: &WorldProgressionRequest,
+    ) -> Result<AttemptOutcome, anyhow::Error> {
+        let initial_prompt = render_world_progression_prompt(
+            &req.current_schema_json,
+            req.interval_hours,
+            &req.deferred_attempts,
+        );
+        self.generate_with_repair(
+            &initial_prompt,
+            AttemptSource::WorldProgression {
+                interval_hours: req.interval_hours,
+            },
+            &req.deferred_attempts,
+            &req.immutable_keys,
+            &req.existing_keys,
+            "world progression",
         )
     }
 
@@ -613,9 +748,20 @@ impl SchemaRuntime {
         initial_prompt: &str,
         source: AttemptSource,
         prior_deferred: &[FailedAttempt],
+        immutable_keys: &std::collections::HashSet<String>,
+        existing_keys: &std::collections::HashSet<String>,
         label: &'static str,
     ) -> Result<AttemptOutcome, anyhow::Error> {
-        let validation_ctx = schema_validator::ValidationContext::default();
+        // The validation context now carries the immutability + existing-key
+        // sets (2026-07-27). When the schema has flagged any keys immutable,
+        // the validator rejects overwrite/delete of those keys — the cheap
+        // structural defense against NPC drift. Empty sets in the common case
+        // (no keys locked yet) → check is a no-op.
+        let validation_ctx = schema_validator::ValidationContext {
+            known_nodes: None,
+            immutable_keys: Some(immutable_keys),
+            existing_keys: Some(existing_keys),
+        };
 
         // Track every failure across all passes so we can (a) accumulate them
         // into the repair prompt and (b) carry them on the FailedAttempt if
@@ -682,12 +828,19 @@ impl SchemaRuntime {
 
         // All passes exhausted. Build the failure-queue carrier so the caller
         // can enqueue this for re-attempt on the next turn. The carrier
-        // carries the SOURCE (exchange or request) + the accumulated errors;
-        // it does NOT carry the broken raw outputs (re-running those through
-        // the model rarely helps; fresh context does).
+        // carries the SOURCE (exchange, request, or progression interval) +
+        // the accumulated errors; it does NOT carry the broken raw outputs
+        // (re-running those through the model rarely helps; fresh context
+        // does). For WorldProgression the trigger is a synthetic string
+        // carrying the interval so the next tick's prompt can re-attempt at
+        // the same magnitude.
         let (exchange_opt, trigger_opt) = match &source {
             AttemptSource::Auto { exchange } => (Some(exchange.clone()), None),
             AttemptSource::Translation { request } => (None, Some(request.clone())),
+            AttemptSource::WorldProgression { interval_hours } => (
+                None,
+                Some(format!("world progression (~{interval_hours}h elapsed)")),
+            ),
         };
         tracing::warn!(
             label,
@@ -882,6 +1035,64 @@ fn render_delta_prompt(
     out
 }
 
+/// Render the World Progression prompt (Fable Seam #4, 2026-07-27). Fires
+/// when the in-world clock advances past the configured interval — the model
+/// is asked to advance a subset of the off-screen entities by ~N hours of
+/// activity, emitting only the changed keys as a delta.
+///
+/// The prompt deliberately does NOT show recent narrator output (unlike the
+/// delta pass): World Progression is OFF-SCREEN simulation, decoupled from
+/// the player's immediate bubble. The model reads the current entities +
+/// advances whichever ones would plausibly move in that window (a faction
+/// relocates, an NPC's mood shifts, a deadline approaches). The result delta
+/// is applied to `game_schema`; the next narrator turn reflects the moved
+/// world via the existing `<world_state>` injection.
+///
+/// The fail-proof contract applies: `deferred_attempts` from prior failed
+/// ticks fold in so the model gets a fresh shot at the same interval. The
+/// validator's immutability check protects against the progression pass
+/// trying to retcon canon entities (locked identity keys).
+fn render_world_progression_prompt(
+    current_schema_json: &str,
+    interval_hours: u32,
+    deferred_attempts: &[FailedAttempt],
+) -> String {
+    let mut out = String::with_capacity(2048);
+    out.push_str("<|turn>system\n");
+    out.push_str(WORLD_PROGRESSION_SYSTEM_INSTRUCTION);
+    out.push_str("<turn|>\n");
+    out.push_str("<|turn>user\n");
+    out.push_str("Current world state:\n");
+    out.push_str(current_schema_json);
+    out.push_str(&format!(
+        "\n\nApproximately {interval_hours} hours of in-world time have elapsed off-screen. \
+         Advance the simulation: pick a SUBSET of entities that would plausibly have moved \
+         in that window (a faction relocates, an NPC's mood shifts, a deadline approaches, \
+         a rumor spreads, a rival makes a move) and emit ONLY their changed keys."
+    ));
+    if !deferred_attempts.is_empty() {
+        out.push_str(
+            "\n\n[Previously deferred progression attempts — re-attempt with the above as context:]\n",
+        );
+        for (i, attempt) in deferred_attempts.iter().enumerate() {
+            let trigger = attempt
+                .trigger
+                .as_deref()
+                .or_else(|| attempt.exchange.as_ref().map(|(u, _)| u.as_str()))
+                .unwrap_or("(no trigger recorded)");
+            out.push_str(&format!(
+                "  {}. prior: {:?}\n      prior errors: {}\n",
+                i + 1,
+                trigger.chars().take(200).collect::<String>(),
+                attempt.errors
+            ));
+        }
+    }
+    out.push_str("\n<turn|>\n");
+    out.push_str("<|turn>model\n");
+    out
+}
+
 /// Accumulating repair prompt. Shows the model EVERY prior pass's raw output
 /// + every prior error, so it can correct the *specific* issue rather than
 /// regenerate blindly. This is the §1B-aligned repair: structured feedback
@@ -992,6 +1203,39 @@ Rules:
 - summary: only emit when the narrative arc meaningfully shifts, not every turn.
 - recent_events: append only genuinely new salient events.\n";
 
+/// System instruction for the World Progression pass (Seam #4, 2026-07-27).
+/// Distinct from the delta pass: this fires on a TIME tick, not a chat
+/// exchange, so the instruction is about advancing OFF-SCREEN state rather
+/// than recording the just-completed turn. The output shape is identical
+/// (a `SchemaDelta`) so the same parser + validator + apply path is reused.
+const WORLD_PROGRESSION_SYSTEM_INSTRUCTION: &str = "\
+You are a world simulation engine. In-world time has elapsed off-screen, and \
+you advance the simulation: pick a small subset of entities that would \
+plausibly have moved in the elapsed window (a faction relocates, an NPC's \
+mood shifts, a deadline approaches, a rumor spreads, a rival makes a move) \
+and emit ONLY their changed keys as a JSON delta. The world moves \
+independently of the player's bubble.
+
+Output format (raw JSON only: no markdown fences, no prose):
+{
+  \"summary\": \"<one-line updated arc summary, or omit if unchanged>\",
+  \"recent_events\": [\"<new off-screen event>\", ...],
+  \"entities\": {\"<key>\": \"<new value>\", \"<key_to_delete>\": null}
+}
+
+Rules:
+- Emit ONLY changed keys. Omit unchanged sections entirely. If nothing \
+plausibly moved, emit {}.
+- entities: a null value means DELETE the key. A non-null string means SET.
+- Pick 1-4 entities to advance per tick — the world moves in small ripples, \
+not wholesale rewrites. Avoid touching the player's direct possessions \
+or immediate scene state (those are the player's bubble).
+- Some entity keys may be flagged immutable (the canonical identity of an NPC, \
+the foundational facts of a location). NEVER overwrite or delete those — \
+record changes under NEW keys instead (e.g. append to a chronicle field).
+- summary: only update when the macro state of the world meaningfully shifts.
+- recent_events: append a brief note about each off-screen development.\n";
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1031,6 +1275,61 @@ mod tests {
         assert!(prompt.contains("pass 1 JSON parse"));
         // The new exchange is still the primary anchor.
         assert!(prompt.contains("new user text"));
+    }
+
+    // ---------- World Progression prompt (Seam #4) ----------
+
+    #[test]
+    fn world_progression_prompt_contains_interval_and_state() {
+        // The model needs to see (a) the current entities, (b) the elapsed
+        // interval, (c) the system instruction framing the off-screen task.
+        let prompt = render_world_progression_prompt(
+            "{\"entities\":{\"faction.cult.position\":\"east_ridge\"}}",
+            24,
+            &[],
+        );
+        assert!(prompt.contains("world simulation engine"));
+        assert!(prompt.contains("24 hours"));
+        assert!(prompt.contains("faction.cult.position"));
+        assert!(prompt.contains("east_ridge"));
+        assert!(prompt.starts_with("<|turn>system\n"));
+        assert!(prompt.ends_with("<|turn>model\n"));
+    }
+
+    #[test]
+    fn world_progression_prompt_instructs_off_screen_subset() {
+        // Critical framing: the model must advance a SUBSET, not rewrite the
+        // world wholesale, and must NOT touch the player's bubble.
+        let prompt = render_world_progression_prompt("{}", 12, &[]);
+        assert!(prompt.contains("SUBSET"));
+        assert!(prompt.contains("off-screen"));
+        assert!(prompt.contains("the player's direct possessions"));
+    }
+
+    #[test]
+    fn world_progression_prompt_mentions_immutability_rule() {
+        // The system instruction must warn about immutable keys so the model
+        // doesn't try to overwrite canon (the validator catches it, but the
+        // instruction prevents wasted passes).
+        let prompt = render_world_progression_prompt("{}", 24, &[]);
+        assert!(prompt.contains("immutable"));
+        assert!(prompt.contains("NEW keys"));
+    }
+
+    #[test]
+    fn world_progression_prompt_folds_deferred_attempts() {
+        // Fail-proof contract: a prior failed tick must surface in the next
+        // tick's prompt so the model gets a fresh shot at the same interval.
+        let deferred = vec![FailedAttempt {
+            exchange: None,
+            trigger: Some("world progression (~24h elapsed)".to_string()),
+            errors: "pass 1 JSON parse: ... | pass 2 validation: ImmutableKeyOverwrite ...".to_string(),
+            passes_used: MAX_DELTA_PASSES,
+        }];
+        let prompt = render_world_progression_prompt("{}", 24, &deferred);
+        assert!(prompt.contains("Previously deferred"));
+        assert!(prompt.contains("world progression"));
+        assert!(prompt.contains("ImmutableKeyOverwrite"));
     }
 
     #[test]

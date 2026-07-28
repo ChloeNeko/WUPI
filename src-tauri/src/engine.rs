@@ -50,8 +50,8 @@ use std::time::Duration;
 
 /// Fraction of `n_ctx` reserved against prompt growth + generation when
 /// deciding whether to truncate the prompt before prefill (engine.rs
-/// `generate`). With the floor below, this yields a ~1000-token reserve at
-/// the default 4000-token context: enough headroom for a long reply plus
+/// `generate`). With the floor below, this yields a ~1024-token reserve at
+/// the default 4096-token context: enough headroom for a long reply plus
 /// the next turn's user message without NoKvCacheSlot.
 const GENERATION_RESERVE_FLOOR_TOKENS: usize = 512;
 
