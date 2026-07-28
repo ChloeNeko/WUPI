@@ -12,16 +12,20 @@
 // exit/relaunch cycles. Every open starts clean.
 // =============================================================
 
+// Theme music as a bundled asset (Vite resolves the import to a hashed
+// URL in assets/, NOT a publicDir file at the install root). See Issue 1.
+import THEME_MUSIC_SRC from '../assets/fable_theme.mp3';
+
 const MUSIC_ID = 'fable-theme-music';      // the <audio> element id
 
 // ── Theme music ──────────────────────────────────────────────
-// fable_theme.mp3 from public/. 30% volume (lowered substantially per
-// Chloe 2026-07-23 — 0.8 → 0.6 → 0.3; it was far too loud), looped.
-// The <audio> element is created fresh per Fable session and removed on
-// teardown — never a module-level singleton, so it can't leak or
-// double-up across exit/relaunch cycles. Audio playback is subject to
-// the autoplay gesture policy; if blocked, startThemeMusic retries on
-// the first user interaction.
+// fable_theme.mp3 — bundled asset (Issue 1). 30% volume (lowered
+// substantially per Chloe 2026-07-23 — 0.8 → 0.6 → 0.3; it was far too
+// loud), looped. The <audio> element is created fresh per Fable session
+// and removed on teardown — never a module-level singleton, so it can't
+// leak or double-up across exit/relaunch cycles. Audio playback is
+// subject to the autoplay gesture policy; if blocked, startThemeMusic
+// retries on the first user interaction.
 //
 // opts.fadeIn (bool): ramp volume 0 → TARGET over ~1.5s instead of
 // starting at full volume. Used by the boot transition so the music
@@ -37,7 +41,7 @@ export function startThemeMusic(host, opts = {}) {
   if (host.querySelector('#' + MUSIC_ID)) return;
   const audio = document.createElement('audio');
   audio.id = MUSIC_ID;
-  audio.src = '/fable_theme.mp3';
+  audio.src = THEME_MUSIC_SRC;
   audio.loop = true;
   // Fade-in path starts at 0 and ramps up; otherwise full volume.
   audio.volume = opts.fadeIn ? 0 : MUSIC_VOLUME;

@@ -51,15 +51,17 @@ function getFableAudioCtx() {
 // 1. TRIANGLE waves (not sine). Triangle carries odd harmonics → a glassy,
 //    bell-like timbre. Pure sines sound electronic/clinical (the "Windows
 //    ding" problem); triangle reads as a struck bell or crystal.
-// 2. A RISING ARPEGGIO gesture. The notes ascend (C5 → E5 → G5 → C6 → E6),
+// 2. A RISING ARPEGGIO gesture. The notes ascend (C5 → E5 → G5 → C6),
 //    staggered ~80ms apart — the classic "magic wand sweep upward." This
 //    melodic motion is what distinguishes a spell from a status ping.
+//    (Previously a 5th E6 note capped it; trimmed to 4 beats per Chloe
+//    2026-07-27 — stops one note short of the sparkle landing.)
 // 3. A SOFT PAD underneath. A quiet, slow-attack triangle sustained chord
 //    (Cmaj) holds beneath the arpeggio, giving the sound body + length
 //    without making it louder — a "glow" rather than a "hit."
 //
 // VOLUME: master bus at 0.55 (clearly audible, not blaring). Per-voice
-// peaks scale with the master: pad ~0.022, arpeggio ~0.030, echo ~0.018.
+// peaks scale with the master: pad ~0.022, arpeggio ~0.030.
 // The triangle timbre carries the "magical" read at moderate volume.
 function playMagicalChime() {
   const ctx = getFableAudioCtx();
@@ -102,17 +104,21 @@ function playMagicalChime() {
     osc.stop(now + 1.9);
   });
 
-  // --- Rising arpeggio: the magic-wand gesture. C5 → E5 → G5 → C6 → E6,
+  // --- Rising arpeggio: the magic-wand gesture. C5 → E5 → G5 → C6,
   // staggered 80ms apart, each a short triangle bell with fast decay. The
   // ascending major arpeggio is the universal "sparkle ascending" motif.
   // Peaks slightly louder than the pad (0.010) so the gesture reads clearly
   // over the glow.
+  //
+  // NOTE: previously a fifth note (E6) capped the climb with a "sparkle
+  // landing," followed by an E6 echo at ~0.95s. Per Chloe 2026-07-27 the
+  // gesture was trimmed to 4 beats (drop the top E6 + its echo) — cleaner,
+  // stops one note short of the sparkle.
   const arp = [
     { f: 523.25, t: 0.10 },  // C5
     { f: 659.25, t: 0.18 },  // E5
     { f: 783.99, t: 0.26 },  // G5
-    { f: 1046.50, t: 0.34 }, // C6
-    { f: 1318.51, t: 0.42 }, // E6 (the top — the "sparkle" landing)
+    { f: 1046.50, t: 0.34 }, // C6 (the top — 4 beats, no sparkle landing)
   ];
   arp.forEach(({ f, t }) => {
     const osc = ctx.createOscillator();
@@ -130,21 +136,8 @@ function playMagicalChime() {
     osc.stop(now + t + 0.7);
   });
 
-  // --- Echo of the top note: a single quiet E6 repeat at ~0.9s, the "ring
-  // off" after the gesture. Gives the chime a tail without a long sustain.
-  const echo = { f: 1318.51, t: 0.95 };
-  {
-    const osc = ctx.createOscillator();
-    const gain = ctx.createGain();
-    osc.type = 'triangle';
-    osc.frequency.value = echo.f;
-    gain.gain.setValueAtTime(0, now + echo.t);
-    gain.gain.linearRampToValueAtTime(0.018, now + echo.t + 0.03);
-    gain.gain.exponentialRampToValueAtTime(0.0001, now + echo.t + 0.8);
-    osc.connect(gain).connect(tone);
-    osc.start(now + echo.t);
-    osc.stop(now + echo.t + 0.9);
-  }
+  // (The trailing E6 echo that lived here was removed with the top E6 note —
+  // see the arpeggio note above. 4 beats, no ring-off tail.)
 }
 
 // --- The visual transition ---------------------------------------

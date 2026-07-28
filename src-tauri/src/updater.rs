@@ -12,15 +12,16 @@
 //! ## The preserve rule
 //!
 //! The portable zip ships engine content + the empty `data/` seed (wupi.sim +
-//! user.xml only). It never ships `memory/`, `models/`, or `apps/` (release.cjs
-//! excludes them — fresh extracts have no runtime state). So the rule is:
+//! wupi.codex + user.xml only). It never ships `memory/`, `models/`, or `apps/`
+//! (release.cjs excludes them — fresh extracts have no runtime state). So the rule is:
 //!
 //! ```text
 //! for each file in the zip:
 //!     // Preserved user data (the four top-level dirs). Within data/, only
-//!     // wupi.sim is engine content and gets overwritten on update; user.xml
-//!     // is preserved so the user's identity survives.
-//!     if rel starts with "data/" AND rel != "data/wupi.sim": skip
+//!     // wupi.sim + wupi.codex are engine content and get overwritten on
+//!     // update; user.xml is preserved so the user's identity survives.
+//!     if rel starts with "data/" AND rel != "data/wupi.sim"
+//!                              AND rel != "data/wupi.codex": skip
 //!     if rel starts with "memory/": skip (defensive; zip shouldn't have it)
 //!     if rel starts with "models/": skip (defensive; zip shouldn't have it)
 //!     if rel starts with "apps/":   skip (defensive; zip shouldn't have it)
@@ -264,6 +265,97 @@ pub fn cleanup_old_files(app_handle: &tauri::AppHandle) {
     }
 }
 
+/// Delete deprecated assets left at the install root by older versions.
+///
+/// Historically every file in `public/` was copied flat to the install root
+/// by Vite + `release.cjs`. Several of those assets turned out to be dead
+/// (never referenced by the running app) or were relocated/renamed:
+///
+/// - The 4-track soundtrack library (soundtrack.js is not wired in):
+///   `Across_the_Verdant_Ridge.mp3`, `Iron_and_Silk.mp3`,
+///   `Promises_in_the_Pavilion.mp3`, `Thunder_and_Salt.mp3`.
+/// - The map atlases (panels/map.js is not wired in): `map-fantasy-atlas.png`,
+///   `map-futuristic-atlas.png`, `map-modern-atlas.png`.
+/// - The starting-scene PNGs (zero references anywhere): the 6
+///   `starting-*.png` files.
+/// - `fable_title.png` — relocated into `src/fable/assets/` (Vite now hashes
+///   it into `assets/`); the old flat-root copy is stale.
+/// - `fable_whoosh.mp3` — renamed to `wind.mp3` (2026-07-27); the old name
+///   is stale.
+/// - `wind.mp3` — the renamed successor of `fable_whoosh.mp3`, intended for a
+///   future intro cue. Removed (2026-07-27): nothing in the app references it
+///   and it was leaking flat to the install root on every build. It lives in
+///   the build workstation archive for later reintroduction.
+///
+/// New builds no longer ship any of these to the root. This sweep clears
+/// them from installs that received them via a prior update, so the root
+/// converges on the §8C layout (just `wupi.exe`, `wupi.html`, `assets/`,
+/// `bin/`, `data/`, `msvcp140.dll`). Called from `setup()` on every boot,
+/// alongside [`cleanup_old_files`].
+///
+/// Non-recursive (scans `exe_dir` only): every deprecated asset lived flat
+/// at the root. Best-effort: a delete failure is logged + retried next boot.
+/// The list is exact lowercase basenames; Windows FS is case-insensitive so
+/// the case-matching is forgiving in practice, but the names below are the
+/// ones Vite emitted.
+pub fn cleanup_deprecated_assets(app_handle: &tauri::AppHandle) {
+    let Some(exe_dir) = exe_dir(app_handle) else { return; };
+    let _ = cleanup_deprecated_in_dir(&exe_dir);
+}
+
+/// The testable core: walks `DEPRECATED_ASSETS` against `dir` and removes
+/// any that exist. Returns the count removed. Best-effort — a delete failure
+/// is logged and the loop continues (the file gets a retry next boot).
+fn cleanup_deprecated_in_dir(dir: &Path) -> usize {
+    let mut swept = 0;
+    for name in DEPRECATED_ASSETS {
+        let path = dir.join(name);
+        if !path.exists() {
+            continue;
+        }
+        match std::fs::remove_file(&path) {
+            Ok(()) => {
+                swept += 1;
+                tracing::info!(?path, "removed deprecated asset from prior version");
+            }
+            Err(e) => tracing::warn!(?path, ?e, "could not remove deprecated asset; will retry next boot"),
+        }
+    }
+    if swept > 0 {
+        tracing::info!(swept, "cleaned up deprecated assets from prior version");
+    }
+    swept
+}
+
+/// The exact basenames of assets older versions shipped flat to the install
+/// root that this version no longer ships. See [`cleanup_deprecated_assets`]
+/// for the per-entry rationale. Module-scope `const` so the unit test can
+/// assert against it without going through `AppHandle`.
+const DEPRECATED_ASSETS: &[&str] = &[
+    // Dead soundtrack library (soundtrack.js not wired in).
+    "Across_the_Verdant_Ridge.mp3",
+    "Iron_and_Silk.mp3",
+    "Promises_in_the_Pavilion.mp3",
+    "Thunder_and_Salt.mp3",
+    // Dead map atlases (panels/map.js not wired in).
+    "map-fantasy-atlas.png",
+    "map-futuristic-atlas.png",
+    "map-modern-atlas.png",
+    // Dead starting-scene PNGs (zero references).
+    "starting-apartment-studio.png",
+    "starting-classroom-modern.png",
+    "starting-frontier-airship-dock.png",
+    "starting-moonlit-guild-hall.png",
+    "starting-neon-transit-platform.png",
+    "starting-rainy-cafe.png",
+    // Relocated/renamed: old flat-root copies are stale.
+    "fable_title.png",  // → src/fable/assets/ (Vite-hashed into assets/)
+    "fable_whoosh.mp3", // → renamed wind.mp3 (2026-07-27)
+    // Dead: never wired in; lives in the build-workstation archive for later
+    // reintroduction. New builds no longer ship it to the root.
+    "wind.mp3",         // removed from public/ 2026-07-27 (dead mp3)
+];
+
 // ── Internals ──────────────────────────────────────────────────────────────
 
 /// Resolve `<exe_dir>` — the directory containing `wupi.exe`.
@@ -426,9 +518,9 @@ fn extract_zip(zip_path: &Path, dest: &Path) -> Result<(), String> {
 
 /// Walk `extracted/` and copy files into `exe_dir` with the preserve rule
 /// (§8C). Carve-outs:
-/// - `data/` is preserved EXCEPT `data/wupi.sim` (engine content; persona
-///   updates ship in the zip and overwrite the local copy on update — Chloe's
-///   call on the §8C internal contradiction).
+/// - `data/` is preserved EXCEPT `data/wupi.sim` + `data/wupi.codex` (engine
+///   content; persona + playbook updates ship in the zip and overwrite the
+///   local copy on update — Chloe's call on the §8C internal contradiction).
 /// - `memory/`, `models/`, `apps/` are fully preserved (defensive — the zip
 ///   shouldn't ship these, but the rule is total).
 /// - `wupi.exe` is swapped via the rename-and-relaunch dance.
@@ -446,8 +538,8 @@ fn apply_extracted(extracted: &Path, exe_dir: &Path) -> Result<(), String> {
             Err(_) => continue,
         };
         // The preserve rule (§8C): the four user-data top-level dirs are
-        // preserved. Within data/, wupi.sim is engine content and gets
-        // overwritten; everything else in data/ (user.xml, theme.json,
+        // preserved. Within data/, wupi.sim + wupi.codex are engine content
+        // and get overwritten; everything else in data/ (user.xml, theme.json,
         // api_config.json, docs/) is preserved.
         if is_preserved(rel) {
             tracing::info!(?rel, "preserve: user-data entry skipped");
@@ -472,15 +564,16 @@ fn apply_extracted(extracted: &Path, exe_dir: &Path) -> Result<(), String> {
 }
 
 /// The §8C preserve rule as a predicate. Returns true for paths that must NOT
-/// be overwritten by an update (user data). `data/wupi.sim` is the single
-/// exception: it's engine content shipped in the zip and replaced on update.
+/// be overwritten by an update (user data). `data/wupi.sim` and `data/wupi.codex`
+/// are the two exceptions: both are engine content shipped in the zip and
+/// replaced verbatim on update (Wupi's persona + her static playbook).
 ///
 /// `rel` is the file's path relative to the extract root (e.g. `data/user.xml`,
 /// `memory/memory.sqlite`, `wupi.exe`).
 fn is_preserved(rel: &Path) -> bool {
-    // data/: preserved EXCEPT data/wupi.sim (engine content).
+    // data/: preserved EXCEPT data/wupi.sim + data/wupi.codex (engine content).
     if rel.starts_with("data") {
-        return rel != Path::new("data/wupi.sim");
+        return rel != Path::new("data/wupi.sim") && rel != Path::new("data/wupi.codex");
     }
     // memory/, models/, apps/: fully preserved.
     rel.starts_with("memory") || rel.starts_with("models") || rel.starts_with("apps")
@@ -631,4 +724,94 @@ fn walk_files(root: &Path) -> Result<Vec<PathBuf>, String> {
         }
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn deprecated_list_is_nonempty_and_unique() {
+        // Sanity: the list is the contract — every entry must be a real
+        // filename we stopped shipping. Empty or duplicate entries would
+        // indicate a copy-paste error in the cleanup definition.
+        assert!(!DEPRECATED_ASSETS.is_empty(), "deprecated list must not be empty");
+        let mut sorted = DEPRECATED_ASSETS.to_vec();
+        sorted.sort_unstable();
+        let before = sorted.len();
+        sorted.dedup();
+        assert_eq!(before, sorted.len(), "deprecated list must have no duplicates");
+        // Every entry has an extension (sanity: these are all asset files).
+        for name in DEPRECATED_ASSETS {
+            assert!(Path::new(name).extension().is_some(), "{name} has no extension");
+        }
+    }
+
+    #[test]
+    fn cleanup_removes_only_deprecated_assets() {
+        // Stage a fake install root with: one deprecated asset, one legit
+        // engine file (must survive), one user-data file (must survive),
+        // and one nested file under a subdir (must survive — sweep is
+        // non-recursive at the install root).
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+
+        std::fs::write(root.join("fable_whoosh.mp3"), b"old wind").unwrap(); // deprecated
+        std::fs::write(root.join("wupi.exe"), b"engine").unwrap();           // legit engine
+        std::fs::write(root.join("paw.png"), b"mascot").unwrap();            // legit engine asset
+        std::fs::write(root.join("data").join("user.xml"), b"user").unwrap_or_else(|_| {
+            std::fs::create_dir_all(root.join("data")).unwrap();
+            std::fs::write(root.join("data").join("user.xml"), b"user").unwrap()
+        });
+        // A deprecated filename placed UNDER a subdir must NOT be swept — the
+        // real sweep is non-recursive at the exe_dir root.
+        std::fs::create_dir_all(root.join("assets")).unwrap();
+        std::fs::write(root.join("assets").join("fable_title.png"), b"hashed").unwrap();
+
+        let swept = cleanup_deprecated_in_dir(root);
+        assert_eq!(swept, 1, "exactly one deprecated file at root should be swept");
+
+        // The deprecated flat-root files are gone.
+        assert!(!root.join("fable_whoosh.mp3").exists(), "deprecated file should be removed");
+        // Legit engine + mascot asset + user data survive.
+        assert!(root.join("wupi.exe").exists(), "engine file must survive");
+        assert!(root.join("paw.png").exists(), "legit engine asset must survive");
+        assert!(root.join("data").join("user.xml").exists(), "user data must survive");
+        // The nested same-named file under assets/ survives (non-recursive).
+        assert!(
+            root.join("assets").join("fable_title.png").exists(),
+            "nested file under a subdir must survive (sweep is root-only)"
+        );
+    }
+
+    #[test]
+    fn cleanup_is_noop_on_clean_install() {
+        // A fresh install that never received the deprecated files: the
+        // sweep removes nothing and errors on nothing.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(tmp.path().join("wupi.exe"), b"engine").unwrap();
+        let swept = cleanup_deprecated_in_dir(tmp.path());
+        assert_eq!(swept, 0, "clean install should sweep nothing");
+        assert!(tmp.path().join("wupi.exe").exists());
+    }
+
+    #[test]
+    fn cleanup_sweeps_every_deprecated_entry_when_present() {
+        // The strongest contract test: if EVERY deprecated file is present at
+        // the root, ALL of them get removed in one pass.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        for name in DEPRECATED_ASSETS {
+            std::fs::write(root.join(name), b"x").unwrap();
+        }
+        let swept = cleanup_deprecated_in_dir(root);
+        assert_eq!(
+            swept,
+            DEPRECATED_ASSETS.len(),
+            "every deprecated file present should be swept"
+        );
+        for name in DEPRECATED_ASSETS {
+            assert!(!root.join(name).exists(), "{name} should be gone");
+        }
+    }
 }

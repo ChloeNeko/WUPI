@@ -326,8 +326,58 @@ impl StreamFilter {
 
         self.buffer.clear();
         self.cursor = 0;
+
+        // Chloe 2026-07-27 — extra-spaces fix (defensive, terminal pass).
+        // Bracket stripping above (strip_all + the partial-prefix loops)
+        // leaves the spaces immediately before + after each removed bracket
+        // un-collapsed, producing transient double-spaces in the LIVE stream
+        // (the user sees these during generation before the finalized
+        // `parsed.prose` from bracket_parser replaces them on `done`). This
+        // is the terminal emission — no more chunks will arrive — so it's
+        // safe to normalize here without disturbing the trailing-window /
+        // partial-prefix logic above (which already ran). Collapse runs of
+        // 2+ spaces to one and strip trailing space before newlines/EOF.
+        // Same contract as bracket_parser::normalize_whitespace.
+        if remaining.contains("  ") {
+            remaining = normalize_spaces(&remaining);
+        }
         remaining
     }
+}
+
+/// Collapse runs of 2+ ASCII spaces into one; strip trailing space before
+/// each newline and before EOF. Leaves newlines (paragraph breaks) and
+/// leading per-line whitespace intact. Terminal-pass helper for `flush`
+/// (2026-07-27 extra-spaces fix). Kept local to this module to avoid a
+/// cross-module dependency; bracket_parser has its own equivalent.
+fn normalize_spaces(s: &str) -> String {
+    if s.is_empty() {
+        return String::new();
+    }
+    let mut out = String::with_capacity(s.len());
+    let mut prev_was_space = false;
+    for ch in s.chars() {
+        if ch == ' ' {
+            if prev_was_space {
+                continue;
+            }
+            out.push(' ');
+            prev_was_space = true;
+        } else if ch == '\n' {
+            if out.ends_with(' ') {
+                out.pop();
+            }
+            out.push('\n');
+            prev_was_space = false;
+        } else {
+            out.push(ch);
+            prev_was_space = false;
+        }
+    }
+    if out.ends_with(' ') {
+        out.pop();
+    }
+    out
 }
 
 #[cfg(test)]

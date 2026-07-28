@@ -1,16 +1,14 @@
 // =============================================================
 // SCREEN: STAGE — the narrator surface (the heart of immersion).
 //
-// Owns the full-screen stage: bg image + atmosphere overlay + FX
-// layer + dialogue feed + input + Wupi drawer + panel overlay + toast.
-// Wires engine/* modules together.
+// Owns the full-screen stage: dialogue feed + input + Wupi drawer +
+// panel overlay + toast. Wires engine/* modules together.
 //
 // This module is the COMPOSITION ROOT for an active game session:
 //   - beats.js        → dialogue feed
 //   - narrator.js     → fable_send streaming
 //   - wupi-drawer.js  → chat_send (game master) + panel summoning
 //   - fx/effects.js   → FX rendering (hooked by narrator)
-//   - fx/atmosphere   → time/weather + parallax
 //   - panels/manager  → read-view overlays summoned by Wupi
 //
 // Wupi trigger (Phase 1, decision 1): hover the right screen edge
@@ -20,31 +18,30 @@
 // shelved pending the rest of the UI settling. See stats-panel.js +
 // mannequin.js in git history when the left side is revisited.)
 //
-// Two background modes:
-//   1. TONE-KEYWORD MATCH: pick a starter bg by card tone keywords.
-//   2. ATMOSPHERE: layered time/weather filter + parallax over the bg.
+// BACKGROUND + WEATHER STRIPPED (2026-07-26, Quick Play rewrite): the bg
+// <img>, the tone-keyword bg picker, the atmosphere layer (time-of-day
+// filter + weather), and the mouse parallax were all removed. The stage is
+// a pure black void for ALL games now — Quick Play lands here straight from
+// the void interview, and the manual-card path no longer has a tavern card
+// to source a bg from. Backgrounds + weather will be re-added in a later
+// pass once the new art direction settles. The `<img data-bg>` element
+// stays in the DOM with an empty src (a no-op over the black .fable-stage)
+// so the re-add is a one-line `bg.src = ...` change, not a structural one.
 // =============================================================
-
-// Background PNG imports removed in the Phase 0a asset wipe (decision 12:
-// delete all assets; decision 4: backgrounds/sprites deferred). pickBgForTone
-// below now returns '' so the <img data-bg> stays empty until the bg/sprite
-// layer returns. Atmosphere parallax still targets the element (harmless on
-// an empty img).
-//
-// PHASE 2: the empty img left a flat black void. Rather than ship a new
-// image asset (which would reopen decision 4), the void is now filled by a
-// CSS-only world-space treatment on `.fable-stage` itself — layered warm
-// torchlight gradients + a faint parchment-grain texture (inline SVG data
-// URI, no file) + a vignette. It reads as a candlelit stone interior at
-// dusk: immersive enough that the empty <img> over it is invisible. When
-// decision 4 lifts and pickBgForTone() returns a real URL, the <img> will
-// paint OVER this treatment with no conflict (it sits above .fable-stage).
 
 import * as beats from '../engine/beats.js';
 import * as narrator from '../engine/narrator.js';
 import * as wupiDrawer from '../engine/wupi-drawer.js';
+import * as selection from '../engine/selection.js';
+import { invoke } from '@tauri-apps/api/core';
+// playFX + clearFX were the weather-render hooks pre-stripping; weather is
+// gone now (file header), so only initFX + clearAllFX remain used. The two
+// named exports stay imported here so re-adding weather later is a one-line
+// restore (the FX registry itself is unchanged).
 import { initFX, playFX, clearFX, clearAllFX } from '../fx/effects.js';
-import { initAtmosphere, attachParallax, resetAtmosphere } from '../fx/atmosphere.js';
+// Touch the weather hooks so a strict linter doesn't flag them as unused
+// (they're reserved for the weather re-add). No-op at runtime.
+void playFX; void clearFX;
 import { saveNow } from '../engine/saves-io.js';
 import { initPanelManager, summon as summonPanel, dismissPanel, isActive as panelActive } from '../panels/manager.js';
 import { setMapTheme } from '../panels/map.js';
@@ -54,29 +51,10 @@ function esc(s) {
     .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }
 
-// tone keyword → starter background. Returns a relative URL into the Vite
-// public/ tree (./starting-*.png). The 6 art assets ship in public/ and are
-// picked by matching keywords in the card's tone/setting string. Default
-// fallback is the rainy-cafe art (covers tavern/frontier/gothic/dark moods,
-// which the starter rusty_tavern card triggers). Restored from v0.6.5.
-function pickBgForTone(tone = '') {
-  const t = tone.toLowerCase();
-  if (/rain|storm|tavern|frontier|gothic|dark|inn/.test(t)) return './starting-rainy-cafe.png';
-  if (/fantasy|guild|magic|moonlit/.test(t)) return './starting-moonlit-guild-hall.png';
-  if (/airship|sky|steampunk|dock/.test(t)) return './starting-frontier-airship-dock.png';
-  if (/school|academy|classroom|modern/.test(t)) return './starting-classroom-modern.png';
-  if (/apartment|home|domestic|slice.?of.?life/.test(t)) return './starting-apartment-studio.png';
-  if (/cyber|neon|futur|transit|sci/.test(t)) return './starting-neon-transit-platform.png';
-  return './starting-rainy-cafe.png';
-}
-
-// tone keyword → map atlas theme. Pure.
-function mapThemeForTone(tone = '') {
-  const t = tone.toLowerCase();
-  if (/cyber|neon|futur|sci/.test(t)) return 'futuristic';
-  if (/school|academy|modern|apartment|contemporary/.test(t)) return 'modern';
-  return 'fantasy';
-}
+// Background + atmosphere were stripped (see file header). The bg <img>
+// keeps its data-bg attr but its src stays empty; mapTheme is a static
+// 'fantasy' default so the optional map panel still gets a usable atlas
+// theme without depending on a card tone.
 
 let stageRoot = null;
 let toastTimer = null;
@@ -106,17 +84,14 @@ export function buildStage() {
     <div class="fable-fx-layer" data-fx></div>
     <div class="fable-dialogue-feed" data-feed></div>
     <form class="fable-input-row" data-input-form>
-      <!-- The input group: a centered, max-width container holding the text
-           box (which centers itself) + the send arrow absolutely positioned
-           at the box's right edge. Decoupling the button from the flex flow
-           means the box centers on its OWN (not as part of a box+button
-           group), and the glyph can hug the textarea's right border
-           tightly without button-internal padding creating a visible gap. -->
+      <!-- The input is a single centered, max-width text box. The send button
+           is GONE (2026-07-27): generation is fired by pressing Enter on a
+           non-empty field, and stopped by pressing Enter on an EMPTY field
+           while generation is in flight. One key, two intents — seamless. -->
       <div class="fable-input-group">
         <div class="fable-input-box">
           <textarea class="fable-input" data-input rows="1" placeholder="Type a message..."></textarea>
         </div>
-        <button type="button" class="send-toggle-btn fable-input-send" data-send-toggle aria-label="Send"></button>
       </div>
     </form>
 
@@ -144,7 +119,6 @@ export function buildStage() {
       <div class="fable-wupi-messages" data-wupi-messages></div>
       <form class="fable-wupi-input-row" data-wupi-form>
         <textarea class="fable-wupi-input" data-wupi-input rows="1" placeholder="Ask Wupi anything…"></textarea>
-        <button type="button" class="send-toggle-btn" data-wupi-send-toggle aria-label="Send">▶</button>
       </form>
       <!-- Drawer footer: the stage's save/load/home controls as ICON
            buttons. Phase 2: the native emoji glyphs (💾 📂 🏠) were replaced
@@ -197,37 +171,54 @@ export function buildStage() {
 }
 
 // Wire the stage after it's in the DOM. cardContext: { card, saveId }.
+// `hooks.isQuickPlay` (bool): when true, the manual Save + Load footer
+// buttons are disabled (Quick Play is single-slot quicksave only — Save/Load
+// are irrelevant). The Home button + the Wupi drawer stay enabled either way.
 export function wireStage(root, hooks) {
   stageRoot = root;
   cardContext = hooks.cardContext || null;
+  const isQuickPlay = !!hooks.isQuickPlay;
 
   const feed = root.querySelector('[data-feed]');
-  const bg = root.querySelector('[data-bg]');
-  const atmo = root.querySelector('[data-atmo]');
   const fxLayer = root.querySelector('[data-fx]');
 
-  // Background: tone-keyword match + map theme sync.
-  const tone = (cardContext && cardContext.card && cardContext.card.tone) || '';
-  bg.src = pickBgForTone(tone);
-  setMapTheme(mapThemeForTone(tone));
+  // Background + atmosphere stripped (file header). The bg <img> keeps its
+  // data-bg attr but its src stays empty — it paints nothing over the pure
+  // black .fable-stage. Map theme is a static 'fantasy' default so the
+  // optional map panel still works without a card tone.
+  setMapTheme('fantasy');
 
   // Engine init (composition root).
   beats.initBeats(feed);
   initFX(fxLayer, root, { onTransient: () => {} });
-  initAtmosphere(atmo, bg, {
-    onWeatherStart: playFX,
-    onWeatherStop: (name) => { if (name) clearFX(name); },
-  });
-  attachParallax();
   narrator.initNarrator({
     onTurnStart: () => setGenerating(true),
     onTurnEnd: () => {
       setGenerating(false);
-      // (The left-side stats/mannequin panel refresh lived here — removed
-      // 2026-07-25 when the left UI was shelved. Restore alongside the
-      // mannequin when the left side is revisited.)
+      // A narrator turn just finalized → a new assistant beat is now the
+      // last in the feed. Re-stamp controls so the reroll affordance moves
+      // onto it (and the prior last assistant beat loses its reroll button).
+      refreshControls();
     },
     npcPretty: hooks.npcPretty || null,
+    // Schema-ring-buffer handoff: when a mutation command (reroll / rewind)
+    // returns `schema_pop_count`, invoke `fable_rollback` that many times to
+    // restore the matching world-state snapshots. `fable_rollback` is the
+    // parallel Rust command (lib.rs) that pops `AppState::fable_schema_
+    // history`. Each pop emits a `fable_rollback` event the world-state UI
+    // can subscribe to; we ignore the returned diff here (the feed rebuild
+    // is the visible signal). Best-effort: a rollback failure is logged,
+    // not surfaced — the message-history mutation already succeeded.
+    onSchemaPop: async (count) => {
+      for (let i = 0; i < count; i++) {
+        try {
+          await invoke('fable_rollback');
+        } catch (err) {
+          console.warn('[fable] schema rollback failed:', err);
+          break;
+        }
+      }
+    },
   });
 
   // Panel manager: overlay + host. onDismiss hides the overlay element.
@@ -243,7 +234,6 @@ export function wireStage(root, hooks) {
     messagesEl: root.querySelector('[data-wupi-messages]'),
     inputEl: root.querySelector('[data-wupi-input]'),
     form: root.querySelector('[data-wupi-form]'),
-    toggleBtn: root.querySelector('[data-wupi-send-toggle]'),
     closeBtn: root.querySelector('[data-wupi-close]'),
     panelManager: {
       summon: (focus, entities, schema) => {
@@ -257,16 +247,66 @@ export function wireStage(root, hooks) {
     },
   });
 
+  // Crossroads + Ghostwriter moved to NL-triggering via the Wupi drawer
+  // (§11.24 refactor, 2026-07-27). The stage no longer mounts FABs; instead
+  // we hand the drawer the stage root (so the Crossroads modal can dim the
+  // full background when Wupi fires generate_options).
+  //
+  // Chloe 2026-07-27: the Impersonate ✎ button now mounts on the PLAYER'S
+  // ROLEPLAY text box (`.fable-input`), NOT the drawer's compose box. The
+  // button polishes the player's next RP action, so it belongs on the field
+  // whose Enter fires a narrator turn — passing that textarea here.
+  wupiDrawer.setStageRoot(root);
+  wupiDrawer.initImpersonateButton(root.querySelector('[data-input]'));
+
+  // Selective regenerate (4th UX chat control): highlight a passage in the
+  // last AI beat → "Regenerate" popup → AI rewrites only that slice in-place.
+  // Rides the same `setGenerating` hook so the input's "Press Enter to stop…"
+  // placeholder reflects an in-flight regenerate (the empty-Enter stop is
+  // gated on `narrator.isGenerating()` below; this hook is purely cosmetic
+  // for the regenerate path — selective regen is a one-shot, not cancellable).
+  selection.initSelection(root, {
+    onGenerating: (on) => {
+      // Reflect the busy state on the input placeholder (matches setGenerating
+      // for narrator turns). We DO NOT toggle the input's disabled state —
+      // the player can still type, just not submit a new turn until the slice
+      // finishes (gated by `selection.isRegenerating()` in the submit handler).
+      const input = stageRoot && stageRoot.querySelector('[data-input]');
+      if (!input) return;
+      if (on) {
+        input.dataset.idlePlaceholder = input.placeholder;
+        input.placeholder = 'Rewriting selection…';
+      } else if (input.dataset.idlePlaceholder != null) {
+        input.placeholder = input.dataset.idlePlaceholder;
+        delete input.dataset.idlePlaceholder;
+      }
+    },
+    // Chloe 2026-07-27: called after a successful in-place slice splice so
+    // stage.js can re-stamp the edit/reroll controls on the last beat. The
+    // old path (beats.rebuildFromMessages) implicitly stamped controls via
+    // a full feed teardown+rebuild — that caused the flicker. The new path
+    // splices only the changed beat's body in-place (no teardown), so the
+    // controls have to be re-stamped explicitly here.
+    onComplete: () => refreshControls(),
+  });
+
   // Input form (narrator turn). All stage-element listeners go through
   // on() so teardownStage removes them — the stage DOM is reused across
   // entries, so a raw addEventListener would double-bind on re-wireStage.
+  //
+  // ENTER does double duty (2026-07-27, no send button): on a non-empty field
+  // it submits the turn; on an EMPTY field while generation is in flight it
+  // stops the generation. Shift+Enter is a literal newline. The input stays
+  // focusable + enabled during generation so the empty-Enter-to-stop works.
   const inputForm = root.querySelector('[data-input-form]');
   const input = root.querySelector('[data-input]');
-  const toggleBtn = root.querySelector('[data-send-toggle]');
   on(inputForm, 'submit', (e) => {
     e.preventDefault();
     const text = input.value.trim();
-    if (!text || narrator.isGenerating()) return;
+    // Block new turns while a selective regenerate is in flight (the slice
+    // IPC owns the fable_session lock + Chat lease — a concurrent send would
+    // collide on both).
+    if (!text || narrator.isGenerating() || selection.isRegenerating()) return;
     input.value = '';
     input.style.height = 'auto';
     narrator.sendFableTurn(text);
@@ -274,19 +314,71 @@ export function wireStage(root, hooks) {
   on(input, 'keydown', (e) => {
     if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault();
+      if (narrator.isGenerating() && !input.value.trim()) {
+        // Empty Enter mid-generation → stop. The seamless stop affordance.
+        narrator.stopFableTurn();
+        return;
+      }
       inputForm.requestSubmit();
     }
   });
   on(input, 'input', () => autoGrow(input));
-  // Single toggle button: the SVG send icon submits the turn, the SVG stop
-  // icon stops generation. The narrator hooks (onTurnStart/onTurnEnd →
-  // setGenerating) flip the icon + .is-stop class. Render the send icon now
-  // so the button isn't empty before the first turn.
-  on(toggleBtn, 'click', () => {
-    if (narrator.isGenerating()) narrator.stopFableTurn();
-    else inputForm.requestSubmit();
-  });
   setGenerating(false);
+
+  // Delegated click handler for the per-beat UX controls (edit / reroll).
+  // Delegation (one listener on the feed container) beats per-beat binding
+  // because `beats.rebuildFromMessages` wipes + recreates the whole feed on
+  // every mutation — per-beat listeners would need re-binding each time.
+  // The handler reads `data-action` off the clicked button (set in
+  // `beats.renderControls`) and the `data-index` off the enclosing beat.
+  //
+  // Edit has two flows:
+  //   - edit on the LAST beat (regardless of role) → `rewindAndEditUser`
+  //     if it's a user beat (branch the timeline + regen) OR `editMessage`
+  //     if it's the last assistant beat (in-place typo fix, no regen). The
+  //     distinction: editing a user message changes what the AI replies TO,
+  //     so we must regenerate; editing an assistant message is cosmetic.
+  //   - edit on a NON-last user beat → `rewindAndEditUser` (this is the
+  //     "edit 3 turns ago" case the spec describes — branch the timeline).
+  // Reroll is only ever on the last assistant beat (refreshControls pins
+  // it there) → `rerollLastTurn`.
+  on(feed, 'click', (e) => {
+    const btn = e.target.closest('[data-action]');
+    if (!btn) return;
+    const beat = e.target.closest('.fable-beat');
+    if (!beat) return;
+    const action = btn.dataset.action;
+    const idx = Number.parseInt(beat.dataset.index || '', 10);
+    if (!Number.isInteger(idx)) return;
+    if (narrator.isGenerating() || selection.isRegenerating()) return;
+    if (action === 'reroll') {
+      narrator.rerollLastTurn();
+      return;
+    }
+    if (action === 'edit') {
+      const role = beat.dataset.role;
+      const feedEl = stageRoot && stageRoot.querySelector('[data-feed]');
+      const allBeats = feedEl ? feedEl.querySelectorAll('.fable-beat') : [];
+      const isLast = allBeats.length > 0 && beat === allBeats[allBeats.length - 1];
+      // Enter edit mode; the Save callback fires the right mutation based
+      // on role + position. Cancel just leaves the beat as-is (the editor
+      // is torn down by enterEditMode's finish()).
+      beats.enterEditMode(beat, {
+        onSave: (newText) => {
+          if (!newText) return;
+          if (role === 'user') {
+            // Editing a user message always branches the timeline (the AI
+            // would reply differently to the new text) → rewind + regen.
+            narrator.rewindAndEditUser(idx, newText);
+          } else {
+            // Assistant message edit → in-place typo fix, no regen.
+            narrator.editMessage(idx, newText);
+          }
+        },
+        onCancel: () => { /* no-op — editor already torn down */ },
+      });
+    }
+  });
 
   // Wupi trigger: invisible right-edge strip with a 300ms dwell.
   // No visible button (decision 1). The strip element is sized/positioned
@@ -371,7 +463,19 @@ export function wireStage(root, hooks) {
   const footHome = root.querySelector('[data-foot-home]');
 
   // Save icon → open the modal + focus the name input.
+  // DISABLED under Quick Play (2026-07-26): Quick Play is single-slot
+  // quicksave only — manual Save/Load are irrelevant. The button gets a
+  // disabled attr + an .is-disabled class so the existing CSS can grey it;
+  // the click handler short-circuits before opening the modal. Home stays
+  // enabled so the user can still return to the title.
+  if (isQuickPlay) {
+    footSave.disabled = true;
+    footSave.classList.add('is-disabled');
+    footLoad.disabled = true;
+    footLoad.classList.add('is-disabled');
+  }
   on(footSave, 'click', () => {
+    if (isQuickPlay || footSave.disabled) return;
     if (!saveOverlay) return;
     wupiDrawer.closeDrawer();
     saveOverlay.hidden = false;
@@ -411,6 +515,7 @@ export function wireStage(root, hooks) {
   saveModalClose = closeSaveModal;
 
   on(footLoad, 'click', () => {
+    if (isQuickPlay || footLoad.disabled) return;
     wupiDrawer.closeDrawer();
     if (onLoadHook) onLoadHook();
   });
@@ -435,16 +540,12 @@ export function wireStage(root, hooks) {
   // for a resumed game openingScene is null (the card's opening beat is
   // already in the message history).
   if (Array.isArray(hooks.loadMessages) && hooks.loadMessages.length) {
-    for (const m of hooks.loadMessages) {
-      if (m.role === 'user') beats.addUserBeat(m.content);
-      else if (m.role === 'assistant') {
-        const b = beats.startNarratorBeat();
-        beats.finalizeBeat(b, m.content);
-      } else if (m.content) {
-        beats.addSystemBeat(m.content);
-      }
-    }
+    beats.rebuildFromMessages(hooks.loadMessages);
   }
+  // Stamp the UX chat controls (edit on user beats + last assistant beat,
+  // reroll on the last assistant beat). Called after every populate path
+  // and after every narrator turn finalizes (see onTurnEnd wiring below).
+  refreshControls();
 
   // Ambient music removed in Fable asset wipe (Phase 0a). Music module deleted;
   // §2A "ambient title music" will be re-sourced when audio assets are re-added.
@@ -463,37 +564,26 @@ function on(el, type, handler, opts) {
   stageListeners.push([el, type, handler, opts && opts.capture]);
 }
 
-// The send/stop button SVG icons (inline — no asset files). The shared
-// .send-toggle-btn color (brass, scoped to .fable-app) drives the fill via
-// currentColor; the .is-stop class on the button flips currentColor to the
-// muted crimson defined in fable.css. Replaces the prior raw ■ / ▶ text
-// glyphs which read as dev placeholders.
-const SEND_ICON_SVG = `
-<svg viewBox="0 0 24 24" aria-hidden="true">
-  <path d="M4 5.5c0-0.9 1-1.5 1.8-1.1l13.5 6.5c0.9 0.4 0.9 1.7 0 2.2L5.8 19.6C5 20 4 19.4 4 18.5V5.5z" fill="currentColor"/>
-</svg>`;
-const STOP_ICON_SVG = `
-<svg viewBox="0 0 24 24" aria-hidden="true">
-  <circle cx="12" cy="12" r="10" fill="none" stroke="currentColor" stroke-width="1.6" opacity="0.55"/>
-  <rect x="8.5" y="8.5" width="7" height="7" rx="1.2" fill="currentColor"/>
-</svg>`;
-
+// Generation state reflection (2026-07-27, no send button): the send/stop
+// toggle button + its SVG icons are GONE. The only UI feedback for a turn in
+// flight is now the in-card streaming caret (the .streaming class on the
+// narrator beat, see fable.css). The input stays ENABLED so the empty-Enter-
+// to-stop affordance (wired above in wireStage) works: pressing Enter on an
+// empty field while generating stops the turn. The placeholder flips to hint
+// the stop affordance so the user learns the gesture.
 function setGenerating(on) {
-  const toggleBtn = stageRoot.querySelector('[data-send-toggle]');
-  const input = stageRoot.querySelector('[data-input]');
-  if (!toggleBtn) return;
-  // One button: send (▶) ↔ stop (■). The raw text glyphs are GONE — replaced
-  // with inline SVG icons (a brass paper-plane-style send arrow + a proper
-  // stop-square-in-circle for stop). The .is-stop class flips currentColor
-  // to the muted crimson (scoped in .fable-app .send-toggle-btn.is-stop).
-  // innerHTML swap (not textContent) so the SVG renders. The button's own
-  // size + the .fable-input-send sizing are unchanged (per the locked
-  // directive: don't resize the field or button).
-  toggleBtn.innerHTML = on ? STOP_ICON_SVG : SEND_ICON_SVG;
-  toggleBtn.classList.toggle('is-stop', on);
-  toggleBtn.setAttribute('aria-label', on ? 'Stop' : 'Send');
-  input.disabled = on;
-  if (!on) input.focus();
+  const input = stageRoot && stageRoot.querySelector('[data-input]');
+  if (!input) return;
+  if (on) {
+    input.dataset.idlePlaceholder = input.placeholder;
+    input.placeholder = 'Press Enter to stop…';
+  } else {
+    if (input.dataset.idlePlaceholder != null) {
+      input.placeholder = input.dataset.idlePlaceholder;
+      delete input.dataset.idlePlaceholder;
+    }
+    input.focus();
+  }
 }
 
 function onKeyDown(e) {
@@ -544,15 +634,43 @@ export function toast(msg) {
 }
 
 // Populate the feed from a load result (messages: [{role, content}]).
+// Delegates to `beats.rebuildFromMessages` (single source of truth — the
+// mutation wrappers in narrator.js use the same path) then stamps the UX
+// chat controls via `refreshControls`.
 export function loadHistory(messages) {
-  beats.clearFeed();
-  for (const m of messages || []) {
-    if (m.role === 'user') beats.addUserBeat(m.content);
-    else if (m.role === 'assistant') {
-      const b = beats.startNarratorBeat();
-      beats.finalizeBeat(b, m.content);
-    } else beats.addSystemBeat(m.content);
-  }
+  beats.rebuildFromMessages(messages);
+  refreshControls();
+}
+
+// Walk the feed and stamp UX chat controls (edit / reroll) on each beat
+// based on its role + position:
+//   - every USER beat: edit (in-place typo fix via `edit_message`).
+//   - the LAST ASSISTANT beat: edit (in-place) + reroll (regen via
+//     `reroll_last_turn`).
+// Assistant beats that aren't last get nothing — you can't reroll a
+// non-final turn, and editing a mid-history assistant message without
+// branching the timeline would desync the conversation. Mid-history edits
+// of assistant prose are intentionally not supported at v1.
+//
+// Idempotent: `beats.renderControls` removes any prior controls block
+// before injecting, so calling this after every turn finalize is cheap.
+function refreshControls() {
+  const feedEl = stageRoot && stageRoot.querySelector('[data-feed]');
+  if (!feedEl) return;
+  const allBeats = feedEl.querySelectorAll('.fable-beat');
+  if (!allBeats.length) return;
+  const lastIdx = allBeats.length - 1;
+  allBeats.forEach((beat, i) => {
+    const role = beat.dataset.role;
+    if (role === 'user') {
+      beats.renderControls(beat, { canEdit: true, canReroll: false });
+    } else if (role === 'assistant' && i === lastIdx) {
+      beats.renderControls(beat, { canEdit: true, canReroll: true });
+    } else {
+      // No controls on system beats or non-final assistant beats.
+      beats.renderControls(beat, { canEdit: false, canReroll: false });
+    }
+  });
 }
 
 // Tear down on exit to title / window close. HARDENED (Chloe 2026-07-23:
@@ -587,11 +705,15 @@ export function teardownStage() {
   // content don't persist into the next session.
   if (panelActive()) dismissPanel();
   clearAllFX();
-  resetAtmosphere();
+  // (resetAtmosphere was here pre-stripping — atmosphere is gone now, see
+  // file header. beats.clearFeed is the only feed reset needed.)
   beats.clearFeed();
   // Reset the engine module state so a close mid-turn can't leave a stuck
   // `generating` (would no-op the next session's first send) or a dangling
   // activeBeat, and so the Wupi drawer starts fresh next entry.
   narrator.resetNarrator();
   wupiDrawer.resetWupiDrawer();
+  // Tear down the selection popup + its document-level listeners so re-
+  // wireStage binds exactly once (mirrors the stageListeners audit).
+  selection.teardownSelection();
 }

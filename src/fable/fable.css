@@ -126,7 +126,7 @@ body.fable-active.fable-chrome-peek .top-bar { transform: translateY(0); }
 /* The FABLE main menu. The layer stack (bottom→top), each its own node
    so layers sit cleanly BEHIND the dim (per Chloe's redesign 2026-07-23:
    leaves + grass must look part of the background, NOT foreground):
-     screen bg  : fable_background.jpg (base image) + fallback color
+     screen bg  : fable_background.jpg (bundled asset, base image) + fallback color
      .leaves    : drifting leaf field (behind dim)
      .grass     : short swaying grass at the bottom (behind dim)
      .dim       : the darkening + ember-glow overlay (THE DIM)
@@ -147,9 +147,12 @@ body.fable-active.fable-chrome-peek .top-bar { transform: translateY(0); }
     padding-top: 6vh;
     overflow: hidden;
     /* BASE image only — NO dim here. The dim is its own .fable-title-dim
-       node above the leaves + grass so they live "behind the dim". */
+       node above the leaves + grass so they live "behind the dim". The
+       relative url() routes through Vite's bundler (emitted into assets/
+       with a content hash) — NOT a publicDir passthrough, so it does not
+       land at the install root next to wupi.exe. */
     background:
-        url('/fable_background.jpg') center center / cover no-repeat,
+        url('./assets/fable_background.jpg') center center / cover no-repeat,
         #0a0604;
     background-color: #0a0604;
     text-align: center;
@@ -501,7 +504,9 @@ body.fable-active.fable-chrome-peek .top-bar { transform: translateY(0); }
    settle-in finished. The host relies on translateX(-50%) for horizontal
    centering (left:50%), so the keyframes MUST preserve it. */
 
-/* The FABLE wordmark — a single PNG (public/fable_title.png). The entire
+/* The FABLE wordmark — a single PNG (src/fable/assets/fable_title.png,
+   Vite-hashed into dist/assets/ at build; imported in screens/title.js).
+   The entire
    CSS-text approach (Cinzel/Uncial/Almendra per-letter spans + every
    fill/border/glow/gradient/stroke/::before/animation experiment) was scrapped
    in favor of a hand-polished image. The PNG carries its own visual treatment
@@ -862,42 +867,35 @@ body.fable-active.fable-chrome-peek .top-bar { transform: translateY(0); }
 .fable-stage {
     position: absolute;
     inset: 0;
-    /* 2026-07-26 background overhaul: the two upper-corner "torchlight"
-       radial pools (18% 8% + 84% 12%) read as blurry yellow headlights at
-       the top of the screen — killed. The torchlight flicker ::after
-       overlay below is gone too (it only animated those pools). What's
-       left is a SMOOTH, deep, uniform charcoal/brass gradient: the
-       --fable-void floor, a faint parchment grain for depth (no asset),
-       a cool depth wash rising from the bottom (so the space reads as a
-       room, not a flat panel), a single very-subtle central ember wash
-       so the dialogue column is warmly seated, and the vignette that
-       focuses the eye. No spotlights, no headlights. */
-    background-color: var(--fable-void);
-    background-image:
-        /* vignette — transparent center, umber edges (focuses the eye) */
-        radial-gradient(ellipse 90% 80% at 50% 45%, transparent 40%, rgba(10, 6, 4, 0.85) 100%),
-        /* parchment grain — inline SVG turbulence, no asset file (kills the
-           plastic-flat CSS look without adding a visible texture layer) */
-        url("data:image/svg+xml;charset=utf8,%3Csvg xmlns='http://www.w3.org/2000/svg' width='160' height='160'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='2' stitchTiles='stitch'/%3E%3CfeColorMatrix values='0 0 0 0 0.55  0 0 0 0 0.42  0 0 0 0 0.22  0 0 0 0.06 0'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E"),
-        /* cool depth wash rising from the floor (reads as the floor receding) */
-        linear-gradient(180deg, transparent 55%, rgba(8, 10, 16, 0.55) 100%),
-        /* ONE soft central ember seat — a very low-opacity warm wash so the
-           dialogue column is warmly lit without any localized hotspot.
-           Replaces the prior pair of corner headlights. */
-        radial-gradient(ellipse 80% 70% at 50% 42%, rgba(120, 70, 30, 0.08), transparent 70%);
-    background-blend-mode: normal, multiply, normal, normal;
+    /* 2026-07-27 background strip (Quick Play rewrite): the candlelit
+       charcoal/brass gradient + parchment grain + ember wash + vignette are
+       GONE. The stage is now a PURE BLACK VOID for all games — Quick Play
+       lands here straight from the void interview (no tavern card to source
+       a bg from anymore), and the manual-card path has no bg either.
+       Backgrounds + atmosphere will be re-added in a later pass once the
+       new art direction settles. Re-adding = restore the background-image
+       stack here (one edit, no structural change). */
+    background-color: #000;
+    background-image: none;
 }
 .fable-stage-bg {
     position: absolute;
     inset: 0;
     overflow: hidden;
+    /* The <img data-bg> element stays in the DOM (its src is empty after the
+       strip, so it paints nothing over the black stage). Restoring a bg =
+       setting the img src in stage.js + un-hiding this layer. Hidden now so
+       a stray img doesn't flash before the bg layer returns. */
+    display: none;
 }
 .fable-stage-bg img {
     width: 100%;
     height: 100%;
     object-fit: cover;
-    filter: brightness(0.65) saturate(0.9);
-    /* Parallax (from atmosphere.js) + a slow breathing drift compose here. */
+    /* The breathe keyframe is retained so a returning bg animates immediately
+       without a CSS re-add. The parallax vars come from atmosphere.js (which
+       is also stripped from the stage wiring but the CSS vars are harmless
+       at their 0 default). */
     transform: translate(var(--parallax-x, 0), var(--parallax-y, 0)) scale(1.05);
     animation: fableBreathe 24s ease-in-out infinite alternate;
     transition: transform 80ms linear;
@@ -906,11 +904,10 @@ body.fable-active.fable-chrome-peek .top-bar { transform: translateY(0); }
     from { transform: translate(var(--parallax-x,0), var(--parallax-y,0)) scale(1.05); }
     to   { transform: translate(var(--parallax-x,0), var(--parallax-y,0)) scale(1.09); }
 }
-/* (The .fable-stage::after torchlight flicker overlay was REMOVED 2026-07-26.
-     It animated the two upper-corner headlight gradients that were also
-     removed — with those gone, the flicker had nothing to flicker over + was
-     pure wasted compositor work. The smooth charcoal background above is the
-     whole stage treatment now.) */
+/* .fable-atmo-layer is retained in the DOM (the buildStage template still
+   emits it) but with the atmosphere system stripped it's an empty
+   no-op layer. Kept here so re-adding atmosphere = wiring initAtmosphere
+   in stage.js, not a CSS change. */
 .fable-atmo-layer {
     position: absolute;
     inset: 0;
@@ -940,41 +937,24 @@ body.fable-active.fable-chrome-peek .top-bar { transform: translateY(0); }
 .fable-dialogue-feed::-webkit-scrollbar { width: 0; height: 0; }
 .fable-dialogue-feed::-webkit-scrollbar-thumb { background: transparent; }
 
-/* A beat ROW. The row is a flex container that seats the avatar + the
-   content card; alignment (left vs right) is set per beat-type below via
-   flex-direction. The beat's own max-width caps the CARD width at 72% of the
-   feed so neither side stretches across the whole screen (the prior full-width
-   purple gradient is gone). animation + pointer-events carry over. */
+/* A beat = the card directly (no avatar row, post-2026-07-27 sleek rework).
+   max-width caps the card at 60% of the feed so neither side stretches
+   across the whole screen. The DEFAULT alignment is "slightly left of
+   center" (narrator/AI/character/error): margin 0 0 0 auto would push
+   fully right; instead a 22% right margin anchors the left-of-center
+   resting spot so the bubble reads as the AI's voice without hugging the
+   left edge. The .user variant below mirrors that to the right. */
 .fable-beat {
-    max-width: 72%;
-    margin: 0 auto 18px;
+    max-width: 60%;
+    margin: 0 22% 18px auto;
     animation: fableBeatIn 360ms ease both;
     pointer-events: auto;
 }
 @keyframes fableBeatIn { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
 
-/* Beat content = avatar + card. The card itself is .fable-beat-card; the
-   avatar sits beside it. gap keeps them from kissing; align-items: flex-start
-   seats the avatar at the top of the card (matches chat-app convention). */
-.fable-beat-content {
-    display: flex;
-    align-items: flex-start;
-    gap: 12px;
-}
-/* Default (narrator/AI/character) = avatar on the LEFT. User beats flip this
-   to row-reverse (avatar on the right) — see .fable-beat.user below. */
-.fable-beat.narrator .fable-beat-content,
-.fable-beat.character .fable-beat-content,
-.fable-beat.error .fable-beat-content {
-    flex-direction: row;
-}
-
 /* The card face — the actual bubble holding the prose. Shared base across
-   narrator / character / user; per-type rules below recolor + re-shape.
-   flex: 1 so the card takes the remaining width after the avatar. */
+   narrator / character / user; per-type rules below recolor + re-shape. */
 .fable-beat-card {
-    flex: 1;
-    min-width: 0;  /* allow the card to shrink so long words wrap, not overflow */
     padding: 14px 18px;
     border-radius: 14px;
     font-size: 16.5px;
@@ -982,11 +962,10 @@ body.fable-active.fable-chrome-peek .top-bar { transform: translateY(0); }
     box-shadow: 0 6px 18px rgba(0,0,0,0.45);
 }
 
-/* NARRATOR (AI / Game Master) — left-aligned, slightly warmer dark tone for
-   contrast against the user bubble. Replaces the prior parchment-cream card
-   (the new aesthetic is dark charcoal + brass across the whole chat column).
-   A faint warm tint + a left brass accent edge keep it reading as the
-   narrator's voice, distinct from the cooler user bubble. */
+/* NARRATOR (AI / Game Master) — sits slightly LEFT of center, slightly warmer
+   dark tone for contrast against the user bubble. A faint warm tint + a left
+   brass accent edge keep it reading as the narrator's voice, distinct from
+   the cooler user bubble. */
 .fable-beat.narrator .fable-beat-card {
     background: #26221d;
     border: 1px solid rgba(181, 166, 66, 0.32);
@@ -1020,21 +999,14 @@ body.fable-active.fable-chrome-peek .top-bar { transform: translateY(0); }
 }
 @keyframes fableBlink { 50% { opacity: 0; } }
 
-/* USER — right-aligned, sleek dark charcoal bubble with a subtle brass border.
-   row-reverse seats the avatar on the RIGHT; margin-left:auto + margin-right:0
-   pushes the whole beat to the right edge of the feed. (BOTH margins must be
-   set explicitly: the base .fable-beat rule uses `margin: 0 auto` which sets
-   BOTH side margins to auto → centers the block. Overriding only margin-left
-   leaves margin-right auto too, so the block stays centered. Setting
-   margin-right:0 collapses the right auto + the block pushes right.)
+/* USER — sits slightly RIGHT of center (the mirror of the narrator's
+   left-of-center). margin auto 0 0 auto collapses the left + keeps the right
+   flush at 22%, anchoring the right-of-center resting spot. The beat's
+   max-width (60%) still caps the bubble width.
    The prior neon-purple gradient (#c026d3→#7c3aed) is GONE — that was the
    off-brand aesthetic to kill. */
 .fable-beat.user {
-    margin-left: auto;
-    margin-right: 0;
-}
-.fable-beat.user .fable-beat-content {
-    flex-direction: row-reverse;
+    margin: 0 auto 18px 22%;
 }
 .fable-beat.user .fable-beat-card {
     background: #1f1c19;
@@ -1044,10 +1016,11 @@ body.fable-active.fable-chrome-peek .top-bar { transform: translateY(0); }
 }
 
 /* SYSTEM — centered, de-emphasized italic line (object state changes, saves).
-   No avatar (the .fable-beat-card is replaced by a plain centered text node
-   via beats.js; system beats skip the avatar row entirely). */
+   No card (system beats render a plain text node, no .fable-beat-card). */
 .fable-beat.system {
     max-width: 560px;
+    margin-left: auto;
+    margin-right: auto;
     text-align: center;
     color: var(--fable-text-faint);
     font-size: 13.5px;
@@ -1066,40 +1039,193 @@ body.fable-active.fable-chrome-peek .top-bar { transform: translateY(0); }
 }
 .fable-beat-body br { content: ""; display: block; }
 
-/* --- Profile-picture avatars (the chat looks empty without them) --- */
-/* Circular 40px avatar with a brass ring + soft outer glow. The SVG glyph
-   inside is drawn in beats.js + colored via currentColor so the brass
-   treatment lives here. User avatar = person bust; AI/narrator = paw mark
-   (the Wupi motif). Hidden on system beats (no avatar row).
-   flex: 0 0 auto so the avatar holds its size while the card flexes. */
-.fable-beat-avatar {
-    flex: 0 0 auto;
-    width: 40px;
-    height: 40px;
-    border-radius: 50%;
-    background: #1a1714;
-    border: 2px solid var(--fable-brass);
-    box-shadow: 0 0 10px rgba(197, 179, 88, 0.35), inset 0 0 4px rgba(0,0,0,0.6);
+/* =============================================================
+   UX CHAT CONTROLS — hover-revealed edit / reroll buttons on beats
+   (2026-07-27). Pure CSS affordance: the controls block is injected by
+   `beats.renderControls` inside `.fable-beat-card`; we hide it by default
+   + reveal on `.fable-beat:hover`. Pointer-events work because the feed
+   container is `pointer-events: none` but each `.fable-beat` re-enables
+   `auto` — buttons inside a beat are clickable. Disabled while the
+   `.editing` or `.streaming` modifier is on the beat (mid-edit or
+   mid-stream, no controls).
+   ============================================================= */
+.fable-beat-controls {
     display: flex;
+    gap: 4px;
+    margin-top: 6px;
+    opacity: 0;
+    transition: opacity 120ms ease;
+    pointer-events: none;            /* don't steal hover when invisible */
+}
+.fable-beat:hover:not(.streaming):not(.editing) .fable-beat-controls {
+    opacity: 0.85;
+    pointer-events: auto;
+}
+.fable-beat-btn {
+    display: inline-flex;
     align-items: center;
     justify-content: center;
-    color: var(--fable-brass-bright);
-    overflow: hidden;
+    width: 26px;
+    height: 26px;
+    padding: 0;
+    background: transparent;
+    border: 1px solid transparent;
+    border-radius: 6px;
+    color: var(--fable-text-faint);
+    cursor: pointer;
+    transition: color 120ms ease, border-color 120ms ease, background 120ms ease;
 }
-.fable-beat-avatar svg {
-    width: 22px;
-    height: 22px;
-    display: block;
+.fable-beat-btn:hover {
+    color: var(--fable-brass);
+    border-color: var(--fable-brass-dim);
+    background: rgba(232, 201, 138, 0.06);
 }
-/* Subtle pulse on the AI avatar while it's streaming — a "thinking" tell
-   that doubles as a generation indicator alongside the in-card caret. */
-.fable-beat.streaming .fable-beat-avatar {
-    animation: fableAvatarPulse 1.4s ease-in-out infinite;
+.fable-beat-btn:focus-visible {
+    outline: 1.5px solid var(--fable-brass);
+    outline-offset: 1px;
 }
-@keyframes fableAvatarPulse {
-    0%, 100% { box-shadow: 0 0 10px rgba(197, 179, 88, 0.35), inset 0 0 4px rgba(0,0,0,0.6); }
-    50%      { box-shadow: 0 0 18px rgba(230, 213, 138, 0.6), inset 0 0 4px rgba(0,0,0,0.6); }
+.fable-beat-btn svg { display: block; }
+
+/* --- Inline edit mode (beats.enterEditMode) --- */
+/* The editor textarea + Save/Cancel footer swap in for the read-only body.
+   `beats.enterEditMode` hides the original `.fable-beat-body` via inline
+   `display:none` and adds `.editing` to the beat; we hide the controls
+   block too so the editor is the sole focus. */
+.fable-beat.editing .fable-beat-controls { display: none; }
+.fable-beat-editor {
+    width: 100%;
+    box-sizing: border-box;
+    resize: vertical;
+    min-height: 3em;
+    margin-top: 4px;
+    padding: 10px 12px;
+    background: var(--fable-inset);
+    color: var(--fable-text);
+    border: 1px solid var(--fable-brass-dim);
+    border-radius: 8px;
+    font-size: 15px;
+    font-family: inherit;
+    line-height: 1.45;
+    box-shadow:
+        inset 0 1px 0 rgba(232, 201, 138, 0.14),
+        inset 0 0 0 1px rgba(0, 0, 0, 0.25);
 }
+.fable-beat-editor:focus {
+    outline: none;
+    border-color: var(--fable-brass);
+}
+.fable-beat-editor-footer {
+    display: flex;
+    justify-content: flex-end;
+    gap: 8px;
+    margin-top: 6px;
+}
+.fable-beat-editor-btn {
+    padding: 5px 14px;
+    background: transparent;
+    color: var(--fable-text);
+    border: 1px solid var(--fable-brass-dim);
+    border-radius: 6px;
+    font-size: 13px;
+    font-family: inherit;
+    cursor: pointer;
+    transition: border-color 120ms ease, color 120ms ease, background 120ms ease;
+}
+.fable-beat-editor-btn:hover {
+    border-color: var(--fable-brass);
+    color: var(--fable-brass);
+}
+.fable-beat-editor-btn.primary {
+    background: var(--fable-brass);
+    color: #1a1714;
+    border-color: var(--fable-brass);
+    font-weight: 600;
+}
+.fable-beat-editor-btn.primary:hover {
+    color: #1a1714;
+    filter: brightness(1.08);
+}
+
+/* --- Selective regenerate popup (engine/selection.js) --- */
+/* A floating "Regenerate" chip that appears next to a text selection inside
+   the LAST assistant beat. Clicking it asks the model to rewrite ONLY the
+   highlighted passage in-place. Lives at stage root (NOT a beat descendant)
+   because .fable-dialogue-feed has pointer-events:none — only .fable-beat
+   children re-enable it, and a floating popup needs to survive the
+   selection collapsing on hover. Styled to match the .fable-beat-btn brass-
+   accent glass so it reads as a sibling of the edit/reroll controls. */
+.fable-selection-popup {
+    position: absolute;
+    z-index: 50;
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    padding: 5px 10px 5px 8px;
+    background: rgba(38, 26, 16, 0.96);
+    color: var(--fable-brass);
+    border: 1px solid var(--fable-brass-dim);
+    border-radius: 999px;
+    font-size: 12.5px;
+    font-weight: 600;
+    font-family: inherit;
+    letter-spacing: 0.02em;
+    cursor: pointer;
+    user-select: none;
+    box-shadow:
+        0 4px 14px rgba(0, 0, 0, 0.55),
+        inset 0 1px 0 rgba(232, 201, 138, 0.12);
+    backdrop-filter: blur(6px);
+    -webkit-backdrop-filter: blur(6px);
+    transition: color 120ms ease, border-color 120ms ease, background 120ms ease, transform 120ms ease;
+    animation: fableSelectionPopIn 140ms ease both;
+}
+.fable-selection-popup:hover {
+    color: var(--fable-brass-bright, #f4d896);
+    border-color: var(--fable-brass);
+    background: rgba(58, 40, 24, 0.98);
+    transform: translateY(-1px);
+}
+.fable-selection-popup:focus-visible {
+    outline: 1.5px solid var(--fable-brass);
+    outline-offset: 2px;
+}
+.fable-selection-popup[hidden] { display: none; }
+.fable-selection-popup-icon {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    color: var(--fable-brass);
+}
+.fable-selection-popup-icon svg { display: block; }
+.fable-selection-popup-label { line-height: 1; }
+@keyframes fableSelectionPopIn {
+    from { opacity: 0; transform: translateY(4px) scale(0.96); }
+    to   { opacity: 1; transform: translateY(0) scale(1); }
+}
+
+/* The "regenerating" preview state: the beat body shows before + a live-
+   filling slot + after, all read-only. Dim the anchors slightly so the eye
+   tracks the filling gap. The caret inside the empty slot mirrors the
+   streaming narrator beat's .streaming caret. */
+.fable-beat.regenerating .fable-beat-body {
+    opacity: 0.96;
+}
+.fable-beat.regenerating .fable-slice-slot {
+    color: var(--fable-brass-bright, #f4d896);
+    background: rgba(232, 201, 138, 0.07);
+    border-radius: 3px;
+    padding: 0 2px;
+}
+.fable-slice-caret {
+    display: inline-block;
+    width: 2px;
+    height: 1.05em;
+    margin-left: 1px;
+    vertical-align: text-bottom;
+    background: var(--fable-brass);
+    animation: fableSliceBlink 1s steps(2, start) infinite;
+}
+@keyframes fableSliceBlink { to { background: transparent; } }
 
 /* --- Input row --- */
 /* PHASE 2: the input is now a parchment-edged console — a recessed dark
@@ -1121,29 +1247,34 @@ body.fable-active.fable-chrome-peek .top-bar { transform: translateY(0); }
     background: linear-gradient(180deg, transparent, rgba(10, 6, 4, 0.88) 38%);
     z-index: 25;
 }
-/* The input GROUP: a centered, max-width container. It centers the textarea
-   ALONE (not as a box+button group), so the textarea's visual center sits
-   at the screen's horizontal center. The send button is absolutely
-   positioned against THIS group's right edge — so it tracks the box's right
-   edge wherever the group lands. Relative-positioned so the button's
-   `position:absolute` resolves against it. */
+/* The input GROUP: a centered, max-width container holding the single text
+   box. The send button is GONE (2026-07-27) — generation is Enter-driven.
+   Kept as a relative-positioned wrapper so future absolutely-positioned
+   affordances resolve against it. */
 .fable-input-group {
     position: relative;
     width: 100%;
     max-width: 720px;
 }
-/* The text box: holds the textarea, centered inside the group. */
+/* The text box: holds the textarea, centered inside the group. Chloe
+   2026-07-27: position: relative so the Impersonate ✎ button can anchor
+   to its right edge via absolute positioning. */
 .fable-input-box {
     width: 100%;
+    position: relative;
 }
 .fable-input {
     width: 100%;
     box-sizing: border-box;
     resize: none;
-    /* Right padding reserves room for the send button (Chloe 2026-07-26:
-       30px button + 6px right offset + a few px breathing room = 40px). */
+    /* Explicit height (Chloe 2026-07-26): pins the field's box so the
+       rendering is stable. Chloe 2026-07-27: right padding bumped 18→44px
+       to reserve room for the Impersonate ✎ button that now floats inside
+       the right edge of the box (see .fable-impersonate-btn). The BOX SIZE
+       IS UNCHANGED (still 54px tall) — only the inner right padding moves,
+       so the field does not resize (per Chloe's standing instruction). */
     height: 54px;
-    padding: 13px 40px 13px 18px;
+    padding: 13px 44px 13px 18px;
     /* Recessed well: dark umber floor, NOT cold navy. */
     background: var(--fable-inset);
     color: var(--fable-text);
@@ -1174,96 +1305,6 @@ body.fable-active.fable-chrome-peek .top-bar { transform: translateY(0); }
         inset 0 1px 0 rgba(230, 213, 138, 0.22),
         inset 0 0 0 1px rgba(0, 0, 0, 0.25),
         0 0 0 1px var(--fable-brass-dim);
-}
-.fable-input {
-    width: 100%;
-    box-sizing: border-box;
-    resize: none;
-    /* Explicit height (Chloe 2026-07-26): pins the field's box so the send
-       button (which matches this height below) lines up perfectly. No more
-       ambiguity from stretch + padding interactions. */
-    height: 54px;
-    padding: 13px 18px;
-    /* Recessed well: dark umber floor, NOT cold navy. */
-    background: var(--fable-inset);
-    color: var(--fable-text);
-    /* Brass frame: a 1px aged-brass border + an inset highlight that reads
-       as the engraved tray's inner lip. */
-    border: 1px solid var(--fable-brass-dim);
-    border-radius: 10px;
-    font-size: 17px;
-    font-family: inherit;
-    line-height: 1.5;
-    max-height: 160px;
-    backdrop-filter: blur(8px);
-    box-shadow:
-        inset 0 1px 0 rgba(232, 201, 138, 0.14),   /* top inner sheen */
-        inset 0 0 0 1px rgba(0, 0, 0, 0.25);       /* crisp inner edge */
-    transition: border-color 160ms ease, box-shadow 160ms ease;
-}
-/* Placeholder: centered (Chloe 2026-07-26) + italic brass-tinted. */
-.fable-input::placeholder {
-    color: var(--fable-text-faint);
-    font-style: italic;
-    text-align: center;
-}
-.fable-input:focus {
-    outline: none;
-    border-color: var(--fable-brass);
-    box-shadow:
-        inset 0 1px 0 rgba(230, 213, 138, 0.22),
-        inset 0 0 0 1px rgba(0, 0, 0, 0.25),
-        0 0 0 1px var(--fable-brass-dim);
-}
-/* The send/stop arrow: absolutely positioned at the group's right edge,
-   OVERLAPPING the textarea (Chloe 2026-07-26). Taking the button OUT of
-   the flex flow + sizing it tightly to the glyph means no internal padding
-   creates a perceived gap — the arrow character sits as close to the
-   textarea's right border as the glyph's own bearings allow.
-   - position:absolute against .fable-input-group (the relative parent).
-   - right: 4px → 4px inset from the textarea's right edge.
-   - width: 44px / height: 44px → centered vertically in the 54px field.
-   - padding: 0 → no internal whitespace pushing the glyph off-center.
-   - text-align: center + line-height match → glyph vertically centered.
-   The shared .send-toggle-btn (styles.css) provides the brass color
-   (scoped via .fable-app). */
-.fable-input-send {
-    position: absolute;
-    right: 6px;              /* 6px inset from the textarea's right border */
-    top: 50%;
-    transform: translateY(-50%);
-    /* Shrink the button to just bigger than the icon (Chloe 2026-07-26). A
-       wide button left empty space between the textarea's right border + the
-       glyph. 30px wide holds the SVG icon snugly → the icon hugs the
-       textarea's right edge. Height unchanged (44px) — do NOT resize the
-       field or button (locked directive). */
-    width: 30px;
-    height: 44px;
-    padding: 0;
-    border: none;
-    background: transparent;
-    border-radius: 8px;
-    /* 2026-07-26: the button now hosts an inline SVG (send arrow / stop
-       square), not a text glyph. display:flex centers the SVG both axes;
-       line-height is reset so the old text-glyph baseline doesn't shove
-       the icon off-center. */
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    line-height: 1;
-    cursor: pointer;
-}
-/* The SVG icon inside the send/stop button. Sized to ~20px so it reads as a
-   crisp game-UI icon, not a tiny dev-placeholder glyph. Fills via
-   currentColor so the brass (send) → crimson (stop) flip lives in the
-   .send-toggle-btn rules above. */
-.fable-input-send svg {
-    width: 20px;
-    height: 20px;
-    display: block;
-}
-.fable-input-send:hover {
-    background: rgba(181, 166, 66, 0.15);
 }
 
 /* --- Wupi trigger: invisible right-edge hover strip (Phase 1, decision 1).
@@ -1343,20 +1384,30 @@ body.fable-active.fable-chrome-peek .top-bar { transform: translateY(0); }
 }
 .fable-wupi-messages::-webkit-scrollbar { width: 0; height: 0; }
 .fable-wupi-messages::-webkit-scrollbar-thumb { background: transparent; }
+/* Sleek chat-bubble layout (2026-07-27 rework): profile pictures + the send
+   button are gone. The drawer is a centered column; each bubble sits
+   slightly off-center — wupi (AI) to the LEFT, user to the RIGHT — to give
+   the conversational rhythm without avatars. The bubbles use inline-block
+   bodies (so each wraps to its content width) anchored via the parent's
+   text-align, with a max-width cap so long replies still wrap. */
 .fable-wupi-msg { margin-bottom: 14px; }
 .fable-wupi-msg-body { font-size: 16.5px; line-height: 1.55; }
+/* Wupi (AI): bubble hugs the LEFT side of the column. */
+.fable-wupi-msg.wupi { text-align: left; }
+.fable-wupi-msg.wupi .fable-wupi-msg-body {
+    display: inline-block; padding: 10px 14px;
+    background: rgba(40, 28, 18, 0.85); color: var(--fable-text);
+    border: 1px solid var(--fable-brass-dim); border-radius: 14px 14px 14px 4px; max-width: 88%; text-align: left;
+}
+.fable-wupi-msg.wupi.streaming .fable-wupi-msg-body::after { content: "▌"; color: var(--fable-brass); animation: fableBlink 1s steps(2) infinite; }
+/* User: bubble hugs the RIGHT side of the column. */
 .fable-wupi-msg.user { text-align: right; }
 .fable-wupi-msg.user .fable-wupi-msg-body {
     display: inline-block; padding: 10px 14px;
     background: linear-gradient(135deg, #c026d3, #7c3aed); color: #fff;
     border-radius: 14px 14px 4px 14px; max-width: 88%; text-align: left;
 }
-.fable-wupi-msg.wupi .fable-wupi-msg-body {
-    display: inline-block; padding: 10px 14px;
-    background: rgba(40, 28, 18, 0.85); color: var(--fable-text);
-    border: 1px solid var(--fable-brass-dim); border-radius: 14px 14px 14px 4px; max-width: 88%;
-}
-.fable-wupi-msg.wupi.streaming .fable-wupi-msg-body::after { content: "▌"; color: var(--fable-brass); animation: fableBlink 1s steps(2) infinite; }
+.fable-wupi-msg.error { text-align: left; }
 .fable-wupi-msg.error .fable-wupi-msg-body { background: rgba(120,30,30,0.5); color: #f4c4c4; border-color: rgba(244,114,114,0.4); }
 .fable-wupi-input-row { display: flex; align-items: center; gap: 8px; padding: 12px 14px; border-top: 1px solid var(--fable-glass-line); }
 .fable-wupi-input {
@@ -1366,6 +1417,46 @@ body.fable-active.fable-chrome-peek .top-bar { transform: translateY(0); }
     font-size: 16px; font-family: inherit; line-height: 1.4;
 }
 .fable-wupi-input:focus { outline: none; border-color: var(--fable-brass); box-shadow: 0 0 0 1px var(--fable-brass-dim); }
+
+/* Impersonate ✎ button — floats inside the RIGHT edge of the player's
+ * roleplay text box (.fable-input-box). Chloe 2026-07-27: MOVED here from
+ * the drawer compose row (it polishes the player's next RP action, so it
+ * belongs on the field whose Enter fires a narrator turn, NOT the Wupi-
+ * chat drawer). BORDERLESS + transparent bg per Chloe's instruction: the
+ * pencil glyph floats directly on the textarea's inset background.
+ *
+ * Position: absolute, pinned right + vertically centered inside the box.
+ * The textarea's right padding (44px) reserves the room so typed text
+ * never runs under the glyph. The box itself does not resize.
+ */
+.fable-impersonate-btn {
+    position: absolute;
+    right: 10px;
+    top: 50%;
+    transform: translateY(-50%);
+    z-index: 4;
+    width: 30px; height: 30px;
+    display: inline-flex; align-items: center; justify-content: center;
+    background: transparent;
+    color: var(--fable-brass);
+    border: none;
+    border-radius: 6px;
+    cursor: pointer;
+    padding: 0;
+    transition: color 160ms ease, transform 100ms ease;
+}
+.fable-impersonate-btn:hover { color: var(--fable-text); }
+.fable-impersonate-btn:active { transform: translateY(-50%) scale(0.94); }
+.fable-impersonate-btn:focus-visible { outline: none; box-shadow: 0 0 0 2px var(--fable-brass-dim); }
+.fable-impersonate-btn .fable-impersonate-glyph { font-size: 17px; line-height: 1; }
+.fable-impersonate-btn.busy { opacity: 0.6; pointer-events: none; }
+.fable-impersonate-btn.shake { animation: fable-fab-shake 320ms ease; }
+/* Director-armed chip in the drawer message list (set_directive tool fired). */
+.drawer-tool-chip.director-armed {
+    background: var(--fable-inset);
+    border-color: var(--fable-brass);
+    color: var(--fable-text);
+}
 .fable-wupi-input::placeholder { color: var(--fable-text-faint); }
 /* The drawer's send/stop toggle uses the shared .send-toggle-btn style
    (defined in styles.css). No per-surface button style needed here. */
@@ -1514,7 +1605,18 @@ body.fable-active.fable-chrome-peek .top-bar { transform: translateY(0); }
 
 /* Map */
 .panel-map, .panel-map-empty { position: relative; border-radius: 10px; overflow: hidden; border: 1px solid var(--fable-brass-dim); }
-.panel-map-bg { width: 100%; display: block; opacity: 0.85; }
+/* The backdrop is a CSS-only parchment (the 3 atlas PNGs were deleted
+   2026-07-27 — see panels/map.js header). Sized as a fixed canvas so the
+   absolute-positioned pins have a stage; theme-agnostic for now. */
+.panel-map-bg {
+  width: 100%;
+  height: 340px;
+  display: block;
+  opacity: 0.85;
+  background:
+    radial-gradient(ellipse at 50% 40%, rgba(120, 90, 50, 0.18), transparent 70%),
+    linear-gradient(180deg, #1a140d 0%, #221a10 60%, #1a140d 100%);
+}
 .panel-map-pins { position: absolute; inset: 0; }
 .panel-pin { position: absolute; transform: translate(-50%, -50%); text-align: center; pointer-events: none; }
 .panel-pin-marker { display: block; font-size: 20px; text-shadow: 0 0 8px rgba(0,0,0,0.8); }
@@ -1608,6 +1710,21 @@ body.fable-active.fable-chrome-peek .top-bar { transform: translateY(0); }
     outline: none;
     border-color: var(--fable-brass-bright);
     box-shadow: 0 0 0 2px var(--fable-brass-dim);
+}
+/* DISABLED state for the footer Save/Load icons under Quick Play (single-
+   slot quicksave only — manual Save/Load are irrelevant). Mirrors the
+   title-button disabled contract: fade + desaturate + no hover/cursor. */
+.fable-foot-icon.is-disabled,
+.fable-foot-icon:disabled {
+    opacity: 0.32;
+    cursor: not-allowed;
+    filter: grayscale(0.6);
+}
+.fable-foot-icon.is-disabled:hover,
+.fable-foot-icon:disabled:hover {
+    color: var(--fable-brass-dim);
+    border-color: var(--fable-brass-dim);
+    transform: none;
 }
 
 /* --- Save modal (centered card over a backdrop) --- */
@@ -1814,3 +1931,715 @@ body.fable-active.fable-chrome-peek .top-bar { transform: translateY(0); }
 .fable-app .send-toggle-btn.is-stop { color: #ff5050; }
 .fable-app .send-toggle-btn.is-stop:hover { color: #ff7a7a; }
 
+
+/* =========================================================================
+   QUICK PLAY — VOID INTERVIEW SCREEN (cinematic rewrite 2026-07-27)
+   =========================================================================
+   The Quick Play interview surface: a pure-black infinite void with subtle
+   drifting particles. The user is greeted by fading large centered text,
+   then asked four fixed questions one at a time (each fading in/out like
+   magic). The user types + hits Enter (no send button — Enter only, per
+   Chloe's directive); the answer pins under the question, then both fade
+   out together. After the last answer the UI disappears and the user sits
+   in the void while the backend weaves the simulation. Distinct aesthetic
+   from the stage (no brass, no tavern warmth): cool, minimal, ethereal —
+   the space between worlds.
+   ========================================================================= */
+
+.fable-void-screen {
+    position: absolute;
+    inset: 0;
+    background: #000;
+    overflow: hidden;
+    /* The stage column centers vertically + horizontally — one big text
+       block in the middle of the void. */
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+}
+
+/* The particle canvas host fills the screen behind the content. Pointer-
+   events none so the canvas never steals clicks from the input. */
+.fable-void-particles {
+    position: absolute;
+    inset: 0;
+    pointer-events: none;
+    z-index: 1;
+}
+.fable-void-particles-canvas {
+    display: block;
+    width: 100%;
+    height: 100%;
+}
+
+/* The stage: a centered column holding the line + answer + input. z above
+   the particles. Width is narrow so the text reads as a focused beat, not
+   a paragraph block. */
+.fable-void-stage {
+    position: relative;
+    z-index: 2;
+    width: 100%;
+    max-width: 560px;
+    padding: 0 28px;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    text-align: center;
+}
+
+/* The big centered text — intro lines + questions. Large serif, soft glow,
+   fades in/out via the .is-visible toggle (driven by JS class flips that
+   restart the CSS transition cleanly via forced reflow). */
+.fable-void-line {
+    margin: 0 0 18px;
+    color: rgba(225, 235, 255, 0.92);
+    font-family: 'Georgia', 'Times New Roman', serif;
+    font-size: clamp(26px, 4.2vw, 38px);
+    font-weight: 500;
+    line-height: 1.32;
+    letter-spacing: 0.015em;
+    text-shadow:
+        0 0 18px rgba(140, 170, 220, 0.35),
+        0 0 36px rgba(100, 130, 180, 0.18);
+    opacity: 0;
+    transform: translateY(8px);
+    transition:
+        opacity var(--fable-void-fade, 1400ms) ease,
+        transform var(--fable-void-fade, 1400ms) ease;
+    max-width: 18ch;
+}
+.fable-void-line.is-visible {
+    opacity: 1;
+    transform: translateY(0);
+}
+
+/* The user's pinned answer — renders under the question after Enter. Smaller
+   + dimmer than the question so it reads as "acknowledged," fading out WITH
+   the question (not before — the load-bearing fix for the "message
+   disappears when you enter" bug). */
+.fable-void-answer {
+    margin: 0 0 28px;
+    color: rgba(180, 195, 225, 0.78);
+    font-family: 'Georgia', 'Times New Roman', serif;
+    font-size: clamp(15px, 2vw, 17px);
+    font-weight: 400;
+    font-style: italic;
+    line-height: 1.55;
+    white-space: pre-wrap;
+    word-wrap: break-word;
+    max-width: 32ch;
+    opacity: 0;
+    transition: opacity 900ms ease;
+}
+.fable-void-answer.is-visible {
+    opacity: 1;
+}
+
+/* The input wrap: holds the textarea. Fades in alongside each question,
+   fades out when the user submits. No button, no row chrome — Enter is
+   the only submit path (per Chloe's directive). */
+.fable-void-input-wrap {
+    width: 100%;
+    max-width: 460px;
+    margin-top: 8px;
+    opacity: 0;
+    transform: translateY(6px);
+    transition:
+        opacity var(--fable-void-fade, 1400ms) ease,
+        transform var(--fable-void-fade, 1400ms) ease;
+}
+.fable-void-input-wrap.is-visible {
+    opacity: 1;
+    transform: translateY(0);
+}
+.fable-void-input {
+    width: 100%;
+    background: transparent;
+    border: none;
+    border-bottom: 1px solid rgba(120, 145, 190, 0.35);
+    outline: none;
+    resize: none;
+    color: rgba(225, 235, 255, 0.95);
+    font-family: 'Georgia', 'Times New Roman', serif;
+    font-size: clamp(16px, 2.1vw, 18px);
+    line-height: 1.5;
+    padding: 10px 4px 8px;
+    text-align: center;
+    max-height: 160px;
+    /* The underline brightens when the field is the active focus, then
+       quietly dims when blurred — the only chrome on the field. */
+    transition: border-color 220ms ease;
+}
+.fable-void-input:focus {
+    border-bottom-color: rgba(170, 200, 240, 0.75);
+}
+.fable-void-input::placeholder {
+    color: rgba(150, 165, 195, 0.32);
+    font-style: italic;
+}
+.fable-void-input:disabled {
+    opacity: 0.4;
+    cursor: not-allowed;
+}
+
+/* Error line (generation failure). Dim red, full-width. Surfaces when
+   interview_generate returns an error so the user knows to retry. */
+.fable-void-error {
+    margin: 18px 0 0;
+    color: rgba(220, 140, 140, 0.82);
+    font-family: 'Georgia', 'Times New Roman', serif;
+    font-size: 14px;
+    font-style: italic;
+    text-align: center;
+    line-height: 1.5;
+}
+
+/* --- Void exit overlay (the fade-to-black on success) ---
+   Mirrors .fable-magical-overlay's technique: a full-screen black node that
+   starts transparent, dims to opaque over ~1.5s, holds at peak while the
+   stage swap happens underneath, then undims to reveal the stage. Mounted
+   on document.body so it sits above #fable. z:6500 (above the magical
+   transition's 6000 so the two never stack). */
+.fable-void-overlay {
+    position: fixed;
+    inset: 0;
+    z-index: 6500;
+    background: #000;
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity 1.5s ease-in;
+}
+.fable-void-overlay.dimming {
+    opacity: 1;
+    transition: opacity 1.5s ease-in;
+}
+.fable-void-overlay.clearing {
+    opacity: 0;
+    transition: opacity 1.5s ease-out;
+}
+
+/* Legacy classes removed (chat-style interview, 2026-07-27):
+   .fable-void-content, .fable-void-prompt, .fable-void-prompt-sub,
+   .fable-void-chat, .fable-void-bubble (+ .user/.gm/.streaming/-body),
+   .fable-void-begin-wrap, .fable-void-begin-btn, .fable-void-input-row,
+   .fable-void-send, @keyframes fableVoidBubbleIn. The new cinematic flow
+   uses .fable-void-line + .fable-void-answer + .fable-void-input-wrap. */
+
+/* =========================================================================
+   QUICK PLAY — INLINE CHOICE OVERLAY (Resume / Start New)
+   =========================================================================
+   A small centered modal on the title screen shown when the user clicks
+   Quick Play AND a quicksave already exists. Two buttons: Resume (load the
+   quicksave) or Start New (wipe + interview). Mirrors the .fable-save-overlay
+   pattern: backdrop + centered card + Esc/backdrop dismiss.
+   ========================================================================= */
+
+.fable-quick-choice {
+    position: absolute;
+    inset: 0;
+    z-index: 100;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}
+.fable-quick-choice-backdrop {
+    position: absolute;
+    inset: 0;
+    background: rgba(0, 0, 0, 0.6);
+    backdrop-filter: blur(2px);
+}
+.fable-quick-choice-modal {
+    position: relative;
+    width: min(440px, 90vw);
+    padding: 28px 28px 24px;
+    background: rgba(18, 22, 32, 0.95);
+    border: 1px solid rgba(120, 145, 190, 0.4);
+    border-radius: 14px;
+    box-shadow: 0 12px 48px rgba(0, 0, 0, 0.7);
+    color: rgba(220, 230, 245, 0.95);
+    font-family: 'Georgia', 'Times New Roman', serif;
+    animation: fableVoidBubbleIn 240ms ease-out;
+}
+.fable-quick-choice-title {
+    margin: 0 0 8px;
+    font-size: 19px;
+    font-weight: 600;
+    color: rgba(230, 240, 255, 0.98);
+}
+.fable-quick-choice-sub {
+    margin: 0 0 22px;
+    font-size: 14px;
+    line-height: 1.5;
+    color: rgba(180, 195, 220, 0.75);
+}
+.fable-quick-choice-actions {
+    display: flex;
+    gap: 10px;
+    justify-content: flex-end;
+}
+.fable-quick-choice-btn {
+    appearance: none;
+    cursor: pointer;
+    padding: 9px 18px;
+    font-family: 'Georgia', 'Times New Roman', serif;
+    font-size: 14px;
+    font-weight: 600;
+    letter-spacing: 0.02em;
+    border-radius: 8px;
+    border: 1px solid transparent;
+    transition: background 180ms ease, border-color 180ms ease, transform 120ms ease;
+}
+.fable-quick-choice-btn.primary {
+    color: rgba(20, 25, 40, 0.95);
+    background: linear-gradient(180deg, rgba(180, 205, 245, 0.9), rgba(140, 170, 220, 0.85));
+    border-color: rgba(200, 220, 250, 0.6);
+}
+.fable-quick-choice-btn.primary:hover {
+    background: linear-gradient(180deg, rgba(200, 220, 250, 1), rgba(160, 190, 235, 0.95));
+}
+.fable-quick-choice-btn.ghost {
+    color: rgba(200, 215, 240, 0.9);
+    background: transparent;
+    border-color: rgba(120, 145, 190, 0.5);
+}
+.fable-quick-choice-btn.ghost:hover {
+    background: rgba(60, 75, 110, 0.3);
+    border-color: rgba(150, 175, 220, 0.7);
+}
+.fable-quick-choice-btn:active { transform: translateY(1px); }
+.fable-quick-choice-close {
+    position: absolute;
+    top: 10px;
+    right: 12px;
+    appearance: none;
+    background: transparent;
+    border: none;
+    cursor: pointer;
+    color: rgba(180, 195, 220, 0.55);
+    font-size: 18px;
+    line-height: 1;
+    padding: 4px 8px;
+    border-radius: 4px;
+}
+.fable-quick-choice-close:hover {
+    color: rgba(220, 230, 245, 0.95);
+    background: rgba(80, 95, 130, 0.3);
+}
+/* =========================================================== */
+/* CROSSROADS + GHOSTWRITER FAB cluster (§11.24, 2026-07-27)   */
+/* =========================================================== */
+/* Two floating action buttons anchored bottom-right of the    */
+/* stage, ABOVE the input row. Sits OUTSIDE the input box per  */
+/* the locked-feedback-memory rule (input dimensions are never */
+/* affected). Brass-SVG aesthetic matches .fable-foot-icon.    */
+
+.fable-fab-cluster {
+    position: absolute;
+    right: 28px;
+    /* Above the input row. The input row's height is ~64-90px; the FABs
+       sit just above it, clear of the corner-trigger + drawer. */
+    bottom: 108px;
+    z-index: 35;
+    display: flex;
+    flex-direction: column;
+    align-items: flex-end;
+    gap: 10px;
+    pointer-events: none;  /* the cluster itself is invisible to clicks; children re-enable */
+}
+.fable-fab-cluster > * { pointer-events: auto; }
+
+/* The two FAB buttons (✦ Crossroads, ✎ Ghostwriter). Round, brass-edged. */
+.fable-fab {
+    position: relative;
+    width: 46px;
+    height: 46px;
+    border-radius: 50%;
+    background: var(--fable-glass-deep);
+    color: var(--fable-brass);
+    border: 1px solid var(--fable-brass-dim);
+    cursor: pointer;
+    padding: 0;
+    line-height: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    transition: background 160ms ease, border-color 160ms ease, color 160ms ease,
+                transform 160ms ease, box-shadow 160ms ease;
+    box-shadow: 0 4px 12px rgba(0,0,0,0.4), var(--fable-emboss);
+    user-select: none;
+}
+.fable-fab-glyph {
+    font-size: 20px;
+    line-height: 1;
+    /* Disable text-selection caret on the glyph (it's an icon, not text). */
+    pointer-events: none;
+}
+.fable-fab:hover {
+    background: rgba(48, 32, 16, 0.85);
+    color: var(--fable-brass-bright);
+    border-color: var(--fable-brass);
+    transform: translateY(-1px);
+    box-shadow: 0 6px 16px rgba(0,0,0,0.5), 0 0 14px var(--fable-brass-glow);
+}
+.fable-fab:active { transform: translateY(0); }
+.fable-fab:focus-visible {
+    outline: none;
+    border-color: var(--fable-brass-bright);
+    box-shadow: 0 0 0 2px var(--fable-brass-dim), var(--fable-emboss);
+}
+.fable-fab.busy {
+    opacity: 0.7;
+    cursor: progress;
+    animation: fable-fab-pulse 1.4s ease-in-out infinite;
+}
+@keyframes fable-fab-pulse {
+    0%, 100% { box-shadow: 0 4px 12px rgba(0,0,0,0.4), 0 0 6px var(--fable-brass-glow); }
+    50%      { box-shadow: 0 4px 12px rgba(0,0,0,0.4), 0 0 18px var(--fable-brass-glow); }
+}
+.fable-fab.shake { animation: fable-fab-shake 320ms ease; }
+@keyframes fable-fab-shake {
+    0%, 100% { transform: translateX(0); }
+    20%, 60% { transform: translateX(-4px); }
+    40%, 80% { transform: translateX(4px); }
+}
+
+/* Director-armed badge on the Ghostwriter FAB. Small dot at top-right. */
+.fable-fab-badge {
+    position: absolute;
+    top: -2px;
+    right: -2px;
+    min-width: 18px;
+    height: 18px;
+    padding: 0 4px;
+    border-radius: 9px;
+    background: var(--fable-brass-bright);
+    color: #1a120a;
+    font-size: 11px;
+    font-weight: 700;
+    line-height: 18px;
+    text-align: center;
+    box-shadow: 0 0 8px var(--fable-brass-glow);
+}
+.fable-fab-badge[hidden] { display: none; }
+
+/* --- Crossroads popover ("Choose a Director") --- */
+.fable-fab-popover {
+    position: absolute;
+    /* Sits to the LEFT of the FAB column so it doesn't overflow the right
+       screen edge. Anchored to the cluster's top-right (the FAB column's
+       upper end). */
+    right: 56px;
+    top: 0;
+    width: 280px;
+    background: linear-gradient(180deg, rgba(38, 26, 16, 0.97), rgba(20, 14, 9, 0.97));
+    border: 1px solid var(--fable-brass-dim);
+    border-radius: 12px;
+    padding: 14px;
+    box-shadow: 0 16px 40px rgba(0,0,0,0.55), var(--fable-emboss);
+    z-index: 36;
+    color: var(--fable-text);
+    font-family: var(--fable-font-body);
+}
+.fable-fab-popover[hidden] { display: none; }
+.fable-fab-popover-title {
+    font-size: 14px;
+    font-weight: 700;
+    color: var(--fable-brass-bright);
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    margin-bottom: 10px;
+    text-align: center;
+}
+.fable-fab-lens-grid {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    margin-bottom: 10px;
+}
+.fable-fab-lens {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 8px 10px;
+    background: var(--fable-inset);
+    border: 1px solid var(--fable-glass-line);
+    border-radius: 8px;
+    color: var(--fable-text);
+    cursor: pointer;
+    text-align: left;
+    transition: background 140ms ease, border-color 140ms ease, transform 140ms ease;
+}
+.fable-fab-lens:hover {
+    background: rgba(48, 32, 16, 0.7);
+    border-color: var(--fable-brass);
+    transform: translateX(-2px);
+}
+.fable-fab-lens-glyph {
+    font-size: 20px;
+    color: var(--fable-brass-bright);
+    line-height: 1;
+    flex-shrink: 0;
+}
+.fable-fab-lens-body {
+    display: flex;
+    flex-direction: column;
+    gap: 1px;
+}
+.fable-fab-lens-name {
+    font-size: 14px;
+    font-weight: 600;
+}
+.fable-fab-lens-hint {
+    font-size: 11px;
+    color: var(--fable-text-dim);
+    line-height: 1.25;
+}
+.fable-fab-seed-row { display: flex; }
+.fable-fab-seed-input {
+    flex: 1;
+    width: 100%;
+    padding: 7px 10px;
+    background: var(--fable-inset);
+    border: 1px solid var(--fable-glass-line);
+    border-radius: 6px;
+    color: var(--fable-text);
+    font-family: var(--fable-font-body);
+    font-size: 13px;
+}
+.fable-fab-seed-input::placeholder { color: var(--fable-text-faint); }
+.fable-fab-seed-input:focus {
+    outline: none;
+    border-color: var(--fable-brass);
+    box-shadow: 0 0 0 2px var(--fable-brass-dim);
+}
+
+/* --- Ghostwriter Director inline bar (the long-press expansion) --- */
+.fable-director-bar {
+    position: absolute;
+    right: 56px;
+    /* Anchors BELOW the ✎ FAB (the second FAB in the column). The cluster
+       is column-layout; this bar sits to the left of the bottom FAB. */
+    bottom: 0;
+    width: 320px;
+    display: flex;
+    gap: 6px;
+    align-items: center;
+    background: linear-gradient(180deg, rgba(38, 26, 16, 0.97), rgba(20, 14, 9, 0.97));
+    border: 1px solid var(--fable-brass-dim);
+    border-radius: 10px;
+    padding: 8px;
+    box-shadow: 0 12px 30px rgba(0,0,0,0.5), var(--fable-emboss);
+    z-index: 36;
+}
+.fable-director-bar[hidden] { display: none; }
+.fable-director-input {
+    flex: 1;
+    padding: 6px 9px;
+    background: var(--fable-inset);
+    border: 1px solid var(--fable-glass-line);
+    border-radius: 6px;
+    color: var(--fable-text);
+    font-family: var(--fable-font-body);
+    font-size: 13px;
+}
+.fable-director-input::placeholder { color: var(--fable-text-faint); }
+.fable-director-input:focus {
+    outline: none;
+    border-color: var(--fable-brass);
+}
+.fable-director-arm,
+.fable-director-cancel {
+    padding: 6px 12px;
+    background: var(--fable-brass);
+    color: #1a120a;
+    border: none;
+    border-radius: 6px;
+    cursor: pointer;
+    font-family: var(--fable-font-body);
+    font-size: 13px;
+    font-weight: 600;
+    transition: background 140ms ease, transform 140ms ease;
+}
+.fable-director-arm:hover { background: var(--fable-brass-bright); }
+.fable-director-cancel {
+    background: transparent;
+    color: var(--fable-text-dim);
+    padding: 6px 8px;
+}
+.fable-director-cancel:hover { color: var(--fable-text); }
+
+/* --- Crossroads result modal (full-stage overlay with 6 cards) --- */
+.fable-crossroads-overlay {
+    position: absolute;
+    inset: 0;
+    z-index: 50;  /* above panel-overlay (45) + drawer */
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}
+.fable-crossroads-backdrop {
+    position: absolute;
+    inset: 0;
+    background: rgba(2, 4, 10, 0.78);
+    backdrop-filter: blur(7px);
+}
+.fable-crossroads-modal {
+    position: relative;
+    z-index: 2;
+    width: min(920px, 94vw);
+    max-height: 88vh;
+    overflow-y: auto;
+    padding: 24px 28px;
+    background: linear-gradient(180deg, rgba(38, 26, 16, 0.97), rgba(20, 14, 9, 0.97));
+    border: 1px solid var(--fable-brass-dim);
+    border-radius: 14px;
+    box-shadow: 0 24px 60px rgba(0,0,0,0.6), var(--fable-emboss);
+    scrollbar-width: thin;
+    scrollbar-color: var(--fable-brass-dim) transparent;
+    font-family: var(--fable-font-body);
+}
+.fable-crossroads-modal::-webkit-scrollbar { width: 8px; }
+.fable-crossroads-modal::-webkit-scrollbar-thumb { background: rgba(203,163,92,0.25); border-radius: 4px; }
+.fable-crossroads-head {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 18px;
+    padding-bottom: 12px;
+    border-bottom: 1px solid var(--fable-glass-line);
+}
+.fable-crossroads-head-title {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    font-size: 22px;
+    font-weight: 700;
+    color: var(--fable-text);
+    letter-spacing: 0.03em;
+}
+.fable-crossroads-head-glyph {
+    font-size: 26px;
+    color: var(--fable-brass-bright);
+    line-height: 1;
+}
+.fable-crossroads-close {
+    width: 32px;
+    height: 32px;
+    border-radius: 50%;
+    background: transparent;
+    border: 1px solid var(--fable-glass-line);
+    color: var(--fable-text-dim);
+    cursor: pointer;
+    font-size: 16px;
+    line-height: 1;
+    transition: background 140ms ease, color 140ms ease, border-color 140ms ease;
+}
+.fable-crossroads-close:hover {
+    background: rgba(80, 60, 30, 0.3);
+    color: var(--fable-text);
+    border-color: var(--fable-brass);
+}
+.fable-crossroads-body {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+    gap: 14px;
+}
+
+/* A single option card. */
+.fable-crossroads-card {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    padding: 14px;
+    background: var(--fable-inset);
+    border: 1px solid var(--fable-glass-line);
+    border-radius: 10px;
+    transition: border-color 160ms ease, transform 160ms ease, box-shadow 160ms ease;
+}
+.fable-crossroads-card:hover {
+    border-color: var(--fable-brass);
+    transform: translateY(-2px);
+    box-shadow: 0 6px 18px rgba(0,0,0,0.4), 0 0 12px var(--fable-brass-glow);
+}
+.fable-crossroads-card-head {
+    display: flex;
+    align-items: baseline;
+    gap: 8px;
+}
+.fable-crossroads-card-icon {
+    font-size: 20px;
+    line-height: 1;
+    flex-shrink: 0;
+}
+.fable-crossroads-card-title {
+    font-size: 15px;
+    font-weight: 700;
+    color: var(--fable-text);
+    line-height: 1.25;
+}
+.fable-crossroads-card-body {
+    font-size: 13.5px;
+    line-height: 1.5;
+    color: var(--fable-text-dim);
+    flex: 1;
+}
+.fable-crossroads-card-actions {
+    display: flex;
+    gap: 6px;
+    margin-top: 4px;
+}
+.fable-crossroads-card-btn {
+    flex: 1;
+    padding: 6px 8px;
+    background: var(--fable-inset);
+    color: var(--fable-text);
+    border: 1px solid var(--fable-glass-line);
+    border-radius: 6px;
+    cursor: pointer;
+    font-family: var(--fable-font-body);
+    font-size: 12.5px;
+    font-weight: 600;
+    transition: background 140ms ease, border-color 140ms ease, color 140ms ease;
+}
+.fable-crossroads-card-btn:hover {
+    background: rgba(48, 32, 16, 0.7);
+    border-color: var(--fable-brass);
+    color: var(--fable-brass-bright);
+}
+.fable-crossroads-card-btn.primary {
+    background: var(--fable-brass);
+    color: #1a120a;
+    border-color: var(--fable-brass);
+}
+.fable-crossroads-card-btn.primary:hover {
+    background: var(--fable-brass-bright);
+    color: #1a120a;
+}
+.fable-crossroads-card-btn.ghost {
+    background: transparent;
+    color: var(--fable-text-dim);
+}
+
+/* Loading skeleton (6 cards pulsing while generation streams). */
+.fable-crossroads-card.skeleton {
+    min-height: 130px;
+    background: linear-gradient(100deg, rgba(48, 36, 22, 0.4) 30%, rgba(80, 60, 30, 0.5) 50%, rgba(48, 36, 22, 0.4) 70%);
+    background-size: 200% 100%;
+    animation: fable-crossroads-shimmer 1.6s ease-in-out infinite;
+    border-color: var(--fable-glass-line);
+}
+@keyframes fable-crossroads-shimmer {
+    0%   { background-position: 200% 0; }
+    100% { background-position: -200% 0; }
+}
+
+/* Error state inside the modal body. */
+.fable-crossroads-error {
+    grid-column: 1 / -1;
+    text-align: center;
+    padding: 40px 20px;
+    color: var(--fable-text-dim);
+    font-style: italic;
+    line-height: 1.5;
+}

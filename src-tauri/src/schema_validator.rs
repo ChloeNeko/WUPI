@@ -36,6 +36,14 @@
 //!   `None` today).
 //! - `secret.*` exposure-status vocabulary (Phase 3 secrets).
 //!
+//! What v1 DOES enforce beyond the original contract (added 2026-07-27):
+//! - **Immutability lock** (the `[CORE]`-style defense). When
+//!   `ValidationContext::immutable_keys` is `Some` AND `existing_keys` is
+//!   `Some`, an entity key in the immutable set that ALREADY exists in the
+//!   schema may not be overwritten or deleted by a delta. First-set is always
+//!   allowed (the canonical creation). This closes the §5 "deliberately
+//!   permissive at v1" NPC-drift hole at microsecond cost.
+//!
 //! The `ValidationContext` struct is the extension point: future phases add
 //! fields here (typed entity specs, spatial graph, etc.) without touching the
 //! validator's public API.
@@ -69,12 +77,33 @@ const MAX_VALUE_LEN: usize = 4_000;
 /// be checked against the spatial graph. Phase 3 adds typed entity specs so
 /// `char.*.trust` can be range-checked. Each addition is a new field here,
 /// not an API break.
+///
+/// 2026-07-27: `immutable_keys` + `existing_keys` added for the NPC-drift
+/// defense (closes the §5 "deliberately permissive at v1" hole). Both must
+/// be `Some` for the check to fire — immutability is meaningless without
+/// knowing what's already in the schema (first-set is always allowed).
 #[derive(Debug, Clone, Default)]
 pub struct ValidationContext<'a> {
     /// Known spatial node ids. When `Some`, `loc.*` values (and `loc.*`-shaped
     /// keys) must reference a node in this set. `None` today (Phase 2 fills it).
     #[allow(dead_code)]
     pub known_nodes: Option<&'a std::collections::HashSet<String>>,
+
+    /// Entity keys flagged immutable (the `[CORE]`-style lock). When `Some`
+    /// AND `existing_keys` is `Some`, a delta that OVERWRITES or DELETES a
+    /// key in this set (where the key already exists in the schema) is
+    /// rejected. First-set (key not in `existing_keys`) always passes — that's
+    /// the canonical creation. `None` today except in the schema engine's
+    /// repair loop, which threads `&WorldSchema::immutable_keys` + the
+    /// schema's current entity keys through.
+    pub immutable_keys: Option<&'a std::collections::HashSet<String>>,
+
+    /// The set of entity keys currently in the schema (i.e. the keys of
+    /// `WorldSchema::entities`). Required for the immutability check to
+    /// distinguish "first-set of an immutable key" (allowed) from "overwrite
+    /// of an immutable key" (rejected). `None` today except in the schema
+    /// engine's repair loop. Cheaper than threading the whole `WorldSchema`.
+    pub existing_keys: Option<&'a std::collections::HashSet<String>>,
 }
 
 /// Why a delta was rejected. Carries enough detail that the schema engine can
@@ -102,6 +131,12 @@ pub enum ValidationFailure {
     SummaryTooLong { len: usize },
     /// The delta carried more entity keys than the per-delta cap.
     TooManyEntityKeys { count: usize },
+    /// The delta tried to OVERWRITE or DELETE an entity key flagged immutable
+    /// that already exists in the schema. First-set is allowed (the canonical
+    /// creation); subsequent mutation is rejected. The Display message tells
+    /// the model how to comply on repair: use a NEW key (e.g.
+    /// `"npc.marcus.chronicle"`) to record a change, don't overwrite canon.
+    ImmutableKeyOverwrite { key: String },
 }
 
 impl std::fmt::Display for ValidationFailure {
@@ -131,6 +166,13 @@ impl std::fmt::Display for ValidationFailure {
                 f,
                 "delta emitted {count} entity keys; max {MAX_ENTITY_KEYS_PER_DELTA} (emit only changed keys)"
             ),
+            Self::ImmutableKeyOverwrite { key } => write!(
+                f,
+                "entity key {key:?} is flagged immutable and was already set. \
+                 To record a change, use a NEW key (e.g. \"{key}.chronicle\" or \
+                 a dated variant) instead of overwriting the canonical value. \
+                 The original identity is locked to prevent drift."
+            ),
         }
     }
 }
@@ -142,7 +184,7 @@ impl std::fmt::Display for ValidationFailure {
 ///
 /// `ctx` is the extension point for future-phase typed validation (spatial
 /// nodes, entity spec ranges). Pass `ValidationContext::default()` today.
-pub fn validate(delta: &SchemaDelta, _ctx: &ValidationContext<'_>) -> Result<(), ValidationFailure> {
+pub fn validate(delta: &SchemaDelta, ctx: &ValidationContext<'_>) -> Result<(), ValidationFailure> {
     // Summary: cap runaway length.
     if let Some(summary) = &delta.summary {
         let len = summary.chars().count();
@@ -216,6 +258,26 @@ pub fn validate(delta: &SchemaDelta, _ctx: &ValidationContext<'_>) -> Result<(),
                         key: key.clone(),
                         reason: "contains control characters (newlines are allowed; strip other control chars)".to_string(),
                     });
+                }
+            }
+
+            // Immutability lock (the [CORE]-style defense, 2026-07-27). Fires
+            // only when the context carries BOTH the immutable set AND the
+            // existing-keys set — immutability is meaningless without knowing
+            // what's already in the schema. The check rejects overwrite OR
+            // delete of a key that (a) is in the immutable set AND (b) already
+            // exists. First-set (key not in existing_keys) always passes —
+            // that's the canonical creation event the lock is designed to
+            // protect FROM subsequent mutation.
+            //
+            // The Display message tells the model how to comply: append under
+            // a NEW key (e.g. "npc.marcus.chronicle") instead of overwriting.
+            // This is the cheap structural defense against NPC drift: the
+            // model can record character development, it just can't retcon
+            // the canon. ~50 LOC, zero LLM cost (pure Rust check).
+            if let (Some(immutable), Some(existing)) = (ctx.immutable_keys, ctx.existing_keys) {
+                if immutable.contains(key) && existing.contains(key) {
+                    return Err(ValidationFailure::ImmutableKeyOverwrite { key: key.clone() });
                 }
             }
 
@@ -483,5 +545,172 @@ mod tests {
         let msg = format!("{fail}");
         assert!(msg.contains("4321"));
         assert!(msg.contains(&MAX_SUMMARY_LEN.to_string()));
+    }
+
+    // ---------- Immutability lock (the [CORE]-style defense) ----------
+
+    // Helper: build a context with the immutable + existing-key sets populated.
+    // The schema engine's repair loop passes this shape; tests verify the
+    // check fires correctly when both sets are present.
+    fn ctx_with_immutables<'a>(
+        immutable: &'a std::collections::HashSet<String>,
+        existing: &'a std::collections::HashSet<String>,
+    ) -> ValidationContext<'a> {
+        ValidationContext {
+            known_nodes: None,
+            immutable_keys: Some(immutable),
+            existing_keys: Some(existing),
+        }
+    }
+
+    #[test]
+    fn immutability_rejects_overwrite_of_existing_key() {
+        // Marcus's core identity is immutable AND already exists in the
+        // schema. A delta trying to overwrite it must be rejected.
+        let immutable: std::collections::HashSet<String> =
+            ["npc.marcus.core".to_string()].into_iter().collect();
+        let existing: std::collections::HashSet<String> =
+            ["npc.marcus.core".to_string()].into_iter().collect();
+        let mut ents = HashMap::new();
+        ents.insert(
+            "npc.marcus.core".to_string(),
+            Some("a totally different identity".to_string()),
+        );
+        let delta = SchemaDelta {
+            summary: None,
+            recent_events: None,
+            entities: Some(ents),
+        };
+        let err = validate(&delta, &ctx_with_immutables(&immutable, &existing)).unwrap_err();
+        assert!(matches!(err, ValidationFailure::ImmutableKeyOverwrite { key } if key == "npc.marcus.core"));
+    }
+
+    #[test]
+    fn immutability_rejects_delete_of_existing_key() {
+        // Deleting an immutable key is also rejected — you can't remove canon.
+        let immutable: std::collections::HashSet<String> =
+            ["npc.marcus.core".to_string()].into_iter().collect();
+        let existing: std::collections::HashSet<String> =
+            ["npc.marcus.core".to_string()].into_iter().collect();
+        let mut ents = HashMap::new();
+        ents.insert("npc.marcus.core".to_string(), None); // delete signal
+        let delta = SchemaDelta {
+            summary: None,
+            recent_events: None,
+            entities: Some(ents),
+        };
+        assert!(matches!(
+            validate(&delta, &ctx_with_immutables(&immutable, &existing)),
+            Err(ValidationFailure::ImmutableKeyOverwrite { .. })
+        ));
+    }
+
+    #[test]
+    fn immutability_allows_first_set_of_immutable_key() {
+        // The canonical creation: an immutable key NOT yet in the schema.
+        // This is the only path that sets canon — once set, it's locked.
+        let immutable: std::collections::HashSet<String> =
+            ["npc.marcus.core".to_string()].into_iter().collect();
+        let existing: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut ents = HashMap::new();
+        ents.insert(
+            "npc.marcus.core".to_string(),
+            Some("gruff ex-soldier, scarred, Cult informant".to_string()),
+        );
+        let delta = SchemaDelta {
+            summary: None,
+            recent_events: None,
+            entities: Some(ents),
+        };
+        assert!(validate(&delta, &ctx_with_immutables(&immutable, &existing)).is_ok());
+    }
+
+    #[test]
+    fn immutability_allows_append_to_sibling_key() {
+        // The intended escape hatch: append to a NEW key (e.g. a chronicle).
+        // The model can record character development without touching canon.
+        let immutable: std::collections::HashSet<String> =
+            ["npc.marcus.core".to_string()].into_iter().collect();
+        let existing: std::collections::HashSet<String> =
+            ["npc.marcus.core".to_string()].into_iter().collect();
+        let mut ents = HashMap::new();
+        // A new key, not in the immutable set — append to chronicle.
+        ents.insert(
+            "npc.marcus.chronicle".to_string(),
+            Some("saved the player in the alley".to_string()),
+        );
+        let delta = SchemaDelta {
+            summary: None,
+            recent_events: None,
+            entities: Some(ents),
+        };
+        assert!(validate(&delta, &ctx_with_immutables(&immutable, &existing)).is_ok());
+    }
+
+    #[test]
+    fn immutability_noop_without_context_sets() {
+        // Default context (no immutable/existing sets) → check never fires.
+        // Existing callers that pass ValidationContext::default() get the old
+        // permissive behavior. Backwards-compatible by construction.
+        let mut ents = HashMap::new();
+        ents.insert(
+            "npc.marcus.core".to_string(),
+            Some("overwrite attempt".to_string()),
+        );
+        let delta = SchemaDelta {
+            summary: None,
+            recent_events: None,
+            entities: Some(ents),
+        };
+        assert!(validate(&delta, &ValidationContext::default()).is_ok());
+    }
+
+    #[test]
+    fn immutability_noop_with_only_one_set() {
+        // Only immutable set, no existing set → can't tell first-set from
+        // overwrite → check is a no-op (don't over-reject when we lack the
+        // info to decide). Same for the reverse (existing but no immutable).
+        let immutable: std::collections::HashSet<String> =
+            ["npc.marcus.core".to_string()].into_iter().collect();
+        let existing: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut ents = HashMap::new();
+        ents.insert(
+            "npc.marcus.core".to_string(),
+            Some("overwrite attempt".to_string()),
+        );
+        let delta = SchemaDelta {
+            summary: None,
+            recent_events: None,
+            entities: Some(ents),
+        };
+        // Only immutable, no existing.
+        let ctx_immutable_only = ValidationContext {
+            known_nodes: None,
+            immutable_keys: Some(&immutable),
+            existing_keys: None,
+        };
+        assert!(validate(&delta, &ctx_immutable_only).is_ok());
+        // Only existing, no immutable.
+        let ctx_existing_only = ValidationContext {
+            known_nodes: None,
+            immutable_keys: None,
+            existing_keys: Some(&existing),
+        };
+        assert!(validate(&delta, &ctx_existing_only).is_ok());
+    }
+
+    #[test]
+    fn immutability_display_message_guides_compliance() {
+        // The Display impl is what the model sees in the repair prompt.
+        // It must (a) name the offending key and (b) tell the model HOW to
+        // comply (use a new key, don't overwrite canon). Without the guidance
+        // the model would just retry the same overwrite on the next pass.
+        let fail = ValidationFailure::ImmutableKeyOverwrite {
+            key: "npc.marcus.core".to_string(),
+        };
+        let msg = format!("{fail}");
+        assert!(msg.contains("\"npc.marcus.core\""));
+        assert!(msg.contains("NEW key"));
+        assert!(msg.contains("chronicle"));
     }
 }

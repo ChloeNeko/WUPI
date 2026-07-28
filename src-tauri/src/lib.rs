@@ -2,13 +2,17 @@ pub mod api;
 pub mod bracket_parser;
 pub mod chat_format;
 pub mod codex;
+pub mod consequence;
 pub mod context_swap;
+pub mod crossroads_prompt;
 pub mod engine;
 pub mod fable_command;
 pub mod fable_engine;
 pub mod fable_save;
+pub mod guided_prompt;
 #[cfg(windows)]
 pub mod hardware;
+pub mod interview_prompt;
 pub mod json_repair;
 pub mod kv_buffer;
 pub mod llm;
@@ -18,11 +22,15 @@ pub mod memory_embedder_llama;
 pub mod memory_rrf;
 pub mod model_downloader;
 pub mod narrator_prompt;
+pub mod offscreen_task;
 pub mod player_state;
 pub mod prompts;
+pub mod regenerate_slice_prompt;
 pub mod schema;
 pub mod schema_engine;
 pub mod schema_validator;
+pub mod relationship;
+pub mod scene_pacing;
 pub mod session;
 pub mod sim_card;
 pub mod stream_filter;
@@ -74,6 +82,19 @@ pub struct AppState {
     /// generation starts. None = no pass running, proceed immediately.
     /// Always `Some(JoinHandle)` between turn-finalize and the next chat_send.
     pub pending_delta: Arc<tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>>,
+    /// Codex-create-during-chat dirty flag. Set by `tools.rs` when the
+    /// `codex_create`/`codex_delete` tools fire (they write/delete files in
+    /// `data/docs/` directly via `codex::save_file`/`delete_file`, bypassing
+    /// the IPC re-seed that `codex_save`/`codex_delete` commands perform).
+    /// Drained at the bottom of `chat_send`'s finalize block — re-seeds the
+    /// CODEX_CARD_ID partition so the narrator sees tool-authored lore on the
+    /// NEXT turn (mid-turn visibility would require an async engine handle
+    /// inside the sync `Tool::execute`, which the agent-loop model doesn't
+    /// support). `Arc`-wrapped so it can be cloned into the `ToolCtx` the
+    /// agent loop hands each tool. `Relaxed` ordering is correct: single bit,
+    /// no dependent data, the spawn provides its own synchronization — same
+    /// reasoning as §3's cancel-flag Ordering::Relaxed justification.
+    pub codex_dirty: Arc<std::sync::atomic::AtomicBool>,
     /// The schema delta engine. Wrapped in `OnceLock` because spawning it
     /// requires the chat model to have loaded first (`shared_model()` is the
     /// leaked `&'static LlamaModel` the schema context is created from). For
@@ -98,6 +119,13 @@ pub struct AppState {
     /// passes WITHOUT committing. Drained on the next translation request and
     /// folded into its prompt.
     pub failed_translation_queue: Arc<tokio::sync::Mutex<Vec<schema_engine::FailedAttempt>>>,
+    /// Fail-proof delta contract (§5 layer 3) — World Progression tick path
+    /// (Fable Seam #4, 2026-07-27). Tick attempts that exhausted all 3
+    /// passes WITHOUT committing. Drained on the next tick fire + folded
+    /// into its prompt so the model gets another shot with the new interval
+    /// as anchor. Same cap (`MAX_FAILED_DELTA_ATTEMPTS`) + FIFO eviction as
+    /// the delta + translation siblings.
+    pub failed_progression_queue: Arc<tokio::sync::Mutex<Vec<schema_engine::FailedAttempt>>>,
     /// The active simulation card's id: the partition key for Memory
     /// retrieval and archiving (AGENTS.md §2M). Defaults to
     /// [`memory::WUPI_CARD_ID`] (the Wupi-as-assistant namespace) until
@@ -163,14 +191,45 @@ pub struct AppState {
     // while a game is actually running. Same shape as `schema_engine` (Mutex
     // of Option of Arc). None = no game running.
     pub fable_engine: Arc<std::sync::Mutex<Option<Arc<fable_engine::FableEngine>>>>,
+    /// Ghostwriter Director one-shot directive (§11.24, 2026-07-27). The
+    /// player arms this via the `fable_director_set` IPC (typically after
+    /// Ghostwriter rewrites their free-text steer into a clean
+    /// `<director_directive>` block). `fable_send` consumes it at the top of
+    /// its schema-lock block — takes + clears, ONE turn only — and threads
+    /// the text into the narrator prompt as a new `<director_directive>`
+    /// block placed between `<world_state>` and `<scene_pacing>`. The
+    /// narrator sees it (visible in its Rust-authored prompt — NOT a silent
+    /// context injection, §7) and obeys for that single turn. None = no
+    /// directive armed; the next `fable_send` emits no block (mirrors the
+    /// world_state-omitted-when-empty pattern). Held under tokio Mutex
+    /// because `fable_director_set` (frontend) + the consume site inside
+    /// `fable_send` can race; the consume path takes the lock first.
+    pub pending_directive: Arc<tokio::sync::Mutex<Option<String>>>,
     /// Per-game cancel token, parallel to `active_cancel`. Distinct slot so
     /// chat-stop and game-stop never cross-wire (Bug #7 pattern, §2C).
     pub active_fable_cancel: Arc<std::sync::Mutex<Option<llm::CancelToken>>>,
+    /// Per-selective-regenerate cancel token, parallel to `active_cancel` +
+    /// `active_fable_cancel`. Distinct slot so a future direct-`chat_stop`
+    /// caller (or a fable_stop) can't cancel a slice regen mid-stream — same
+    /// Bug #7 cross-wire lesson as `active_fable_cancel` (§2C). Currently
+    /// unreachable from the UI (no stop gesture is wired for slice regen),
+    /// but the symmetric slot removes the latent footgun.
+    pub active_slice_cancel: Arc<std::sync::Mutex<Option<llm::CancelToken>>>,
     /// The game's scoped world-state schema (sibling to `schema`, which is
     /// Wupi-assistant's). Per-card: wiped/reloaded on card switch. Held
     /// under tokio Mutex because `fable_send` reads it + Wupi's game-manager
     /// path writes it (via `fable_command` deltas).
     pub fable_schema: Arc<tokio::sync::Mutex<schema::WorldSchema>>,
+    /// Schema history ring buffer (1-click undo, 2026-07-27): the last
+    /// `FABLE_HISTORY_CAP` WorldSchema snapshots, pushed BEFORE each mutation
+    /// to `fable_schema` (so `pop()` restores the prior state). CLEARED on
+    /// every wholesale overwrite (`fable_start`, `fable_end`, `fable_load_save`,
+    /// `fable_quick_start`): those are session boundaries, not mutations to
+    /// undo. Held under tokio Mutex: `fable_rollback` awaits while restoring.
+    /// Mirrors `fable_load_save`'s precedent of bypassing the immutability
+    /// lock on user-initiated restore (the §5 contract applies to LLM deltas,
+    /// not user undo). See `push_fable_history` / `clear_fable_history`.
+    pub fable_schema_history: Arc<tokio::sync::Mutex<std::collections::VecDeque<schema::WorldSchema>>>,
     /// The game's scoped conversation (sibling to `session`, which is
     /// Wupi-assistant's). Per-card: loaded on `fable_start` from
     /// `sessions/<card_id>.json`, saved on `fable_end`. Held under tokio Mutex
@@ -194,6 +253,16 @@ pub struct AppState {
     /// system card (`__wupi__`) is the default; games swap to the
     /// roleplay card's id and restore on exit.
     pub pre_fable_card_id: Arc<std::sync::Mutex<String>>,
+    /// Quick Play flag: true while the active game is a Quick Play session
+    /// (started via `fable_quick_start` or resumed via `fable_quick_resume`).
+    /// Drives two behaviors:
+    ///   1. The per-turn autosave in `fable_send` writes the bundled-card
+    ///      `quicksave` slot (instead of `AUTOSAVE_ID`) so the in-memory card
+    ///      survives across sessions without a `.sim` file on disk.
+    ///   2. The frontend queries `is_quick_play` to disable the manual
+    ///      Save/Load footer buttons (Quick Play is single-slot quicksave only).
+    /// Reset to `false` in `fable_end`.
+    pub is_quick_play: Arc<std::sync::Mutex<bool>>,
     /// First-run GGUF download progress (see `model_downloader.rs`). Polled
     /// by `get_download_progress` and emitted as the `download-progress`
     /// event. Held under a std Mutex: short critical sections only, never
@@ -233,8 +302,10 @@ impl AppState {
             memory: Arc::new(std::sync::OnceLock::new()),
             schema: Arc::new(tokio::sync::Mutex::new(schema::WorldSchema::default())),
             pending_delta: Arc::new(tokio::sync::Mutex::new(None)),
+            codex_dirty: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             failed_delta_queue: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             failed_translation_queue: Arc::new(tokio::sync::Mutex::new(Vec::new())),
+            failed_progression_queue: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             schema_engine: Arc::new(std::sync::Mutex::new(None)),
             active_card_id: Arc::new(std::sync::Mutex::new(
                 memory::WUPI_CARD_ID.to_owned(),
@@ -250,12 +321,18 @@ impl AppState {
             api_config_path: Arc::new(std::sync::OnceLock::new()),
             model_source: Arc::new(std::sync::Mutex::new(api::ModelSource::default())),
             fable_engine: Arc::new(std::sync::Mutex::new(None)),
+            pending_directive: Arc::new(tokio::sync::Mutex::new(None)),
             active_fable_cancel: Arc::new(std::sync::Mutex::new(None)),
+            active_slice_cancel: Arc::new(std::sync::Mutex::new(None)),
             fable_schema: Arc::new(tokio::sync::Mutex::new(schema::WorldSchema::default())),
+            fable_schema_history: Arc::new(tokio::sync::Mutex::new(
+                std::collections::VecDeque::new(),
+            )),
             fable_session: Arc::new(tokio::sync::Mutex::new(session::Conversation::new())),
             active_fable_card: Arc::new(std::sync::Mutex::new(None)),
             fable_persona: Arc::new(std::sync::Mutex::new(None)),
             pre_fable_card_id: Arc::new(std::sync::Mutex::new(memory::WUPI_CARD_ID.to_owned())),
+            is_quick_play: Arc::new(std::sync::Mutex::new(false)),
             download_progress: Arc::new(std::sync::Mutex::new(
                 model_downloader::DownloadProgress::default(),
             )),
@@ -299,6 +376,11 @@ pub fn run() {
             // file out of the way. By the time this exe runs, the old
             // process's locks are gone.
             updater::cleanup_old_files(app.handle());
+            // Sweep deprecated assets that older versions shipped flat to the
+            // install root (dead soundtrack/map/starting files + the old
+            // fable_title.png and fable_whoosh.mp3 names after their
+            // relocate/rename). No-op on installs that never had them.
+            updater::cleanup_deprecated_assets(app.handle());
             // §8C portable layout: four top-level sibling dirs next to
             // wupi.exe hold all user state. Nothing leaves the install
             // folder. Created lazily here at boot so the rest of setup +
@@ -588,6 +670,41 @@ pub fn run() {
                         tracing::info!("no data/docs/ dir found; skipping user codex seed");
                     }
 
+                    // ── Wupi's playbook: static engine-shipped reference
+                    // knowledge seeded into the WUPI_SYSTEM_CARD_ID partition
+                    // (the partition search_wupi_visible reads on every chat
+                    // turn — Wupi retrieves her playbook the moment the user
+                    // mentions .sim cards, codex authoring, or game-mechanic
+                    // design). This fills the previously-empty static-seed
+                    // side of __wupi_system__: the runtime-snapshot writer in
+                    // system_codex.rs is the other writer, and has been the
+                    // only one since §8C removed the cards/wupi_knowledge/
+                    // boot seed. Both writers reuse the same partition; the
+                    // playbook entries are tagged namespace=wupi_system and
+                    // share the codex render frame ("internalize as your own
+                    // knowledge") + the per-class lower cosine floor (0.10).
+                    if let Some(wupi_codex_path) = resolve_wupi_codex_path(app.handle()) {
+                        if let Some(engine) = state.memory.get() {
+                            match tauri::async_runtime::block_on(
+                                codex::seed_wupi_codex(engine, &wupi_codex_path, memory::WUPI_SYSTEM_CARD_ID),
+                            ) {
+                                Ok(report) => tracing::info!(
+                                    seeded = report.seeded,
+                                    updated = report.updated,
+                                    purged = report.purged,
+                                    unchanged = report.unchanged,
+                                    "wupi playbook codex seeded"
+                                ),
+                                Err(e) => tracing::warn!(
+                                    error = %format!("{e:#}"),
+                                    "wupi playbook seed failed; continuing without playbook"
+                                ),
+                            }
+                        }
+                    } else {
+                        tracing::info!("no data/wupi.codex file found; skipping playbook seed");
+                    }
+
                     // ── Hidden system-log codex (Phase 4): a periodic background
                     // task snapshots runtime state into the WUPI_SYSTEM_CARD_ID
                     // partition so Wupi retrieves it via search_wupi_visible.
@@ -599,7 +716,17 @@ pub fn run() {
                     if let Some(engine) = state.memory.get() {
                         let state_clone = state.inner().clone();
                         let engine_clone = Arc::clone(engine);
-                        tokio::spawn(async move {
+                        // NOTE: `tauri::async_runtime::spawn`, NOT bare
+                        // `tokio::spawn`. This runs inside the synchronous
+                        // Tauri `setup` hook, which executes on the event-loop
+                        // thread with NO Tokio reactor entered — bare
+                        // `tokio::spawn` panics here ("there is no reactor
+                        // running"). Tauri's managed runtime is valid from the
+                        // setup closure (same runtime the `block_on` a few
+                        // lines above uses for `seed_codex`). The task body's
+                        // `tokio::time::interval` is fine once the future is
+                        // actually polled on that runtime.
+                        tauri::async_runtime::spawn(async move {
                             // Initial snapshot at boot so Wupi knows her own
                             // setup from the first chat turn.
                             let snap = snapshot_system_state(&state_clone);
@@ -708,8 +835,39 @@ pub fn run() {
             fable_save_now,
             fable_load_save,
             fable_delete_save,
+            // UX chat controls (edit / reroll / rewind-and-edit). Pure session
+            // mutators; the schema ring buffer is owned by fable_rollback
+            // above, driven by each command's `schema_pop_count` return.
+            edit_message,
+            reroll_last_turn,
+            rewind_and_edit_user,
+            // Selective regenerate (4th UX chat control): highlight a slice of
+            // the last AI beat, regenerate it in-place via a memoryless
+            // one-shot. Streams the replacement live, then splices it back.
+            regenerate_slice,
             fable_continue_target,
+            // Quick Play IPCs (single-shot generation → in-memory card →
+            // bundled-card quicksave single-slot persistence).
+            interview_generate,
+            // Crossroads + Ghostwriter (§11.24, 2026-07-27): memoryless
+            // one-shot generators that ride the same interview_generate
+            // shape. Crossroads = "Choose a Director" option generator;
+            // Ghostwriter = Impersonate + Director authoring. Director
+            // state IPCs arm/clear/peek the one-shot directive slot that
+            // fable_send consumes at the top of its schema-lock block.
+            crossroads_generate,
+            ghostwriter_generate,
+            fable_director_set,
+            fable_director_clear,
+            fable_director_peek,
+            fable_quick_exists,
+            fable_quick_start,
+            fable_quick_resume,
+            fable_quick_reset,
+            is_quick_play,
             player_state_get,
+            fable_rollback,
+            fable_history_depth,
             system_menu::power_shutdown_cmd,
             system_menu::power_restart_cmd,
             system_menu::power_sleep_cmd,
@@ -1514,8 +1672,27 @@ async fn boot_load_model(app: tauri::AppHandle, state: tauri::State<'_, AppState
         let mut g = state.pending_model_path.lock().expect("pending_model_path mutex");
         g.take()
     };
+    // If setup() couldn't resolve a GGUF at boot (fresh install), re-scan
+    // disk now. The post-first-download reload path (script.js's LAUNCH
+    // button → location.reload) reloads the WEB PAGE only — the Rust
+    // process is the same one that started with no GGUF on disk, so
+    // pending_model_path is still None. Without this re-scan, that reload
+    // emits model-status:missing (red flash at the top) even though
+    // WUPI.gguf is now physically present, forcing the user to restart a
+    // SECOND time (a fresh process re-runs setup → resolves the path).
+    // Reuses setup()'s resolver (DRY — single source of truth for the
+    // search dirs + pick_main_model logic). Still None ⇒ genuinely missing.
+    let path = match path {
+        Some(p) => Some(p),
+        None => {
+            tracing::info!(
+                "boot_load_model: pending_model_path was None — re-scanning disk (post-download reload path)"
+            );
+            resolve_model_path(&app)
+        }
+    };
     let Some(path) = path else {
-        // Defensive: setup() couldn't resolve a GGUF. Surface as missing so
+        // Genuinely missing: no GGUF found even after re-scan. Surface so
         // the frontend can prompt for the first-run download (which the JS
         // gate normally handles BEFORE calling boot_load_model).
         let _ = app.emit(
@@ -1531,9 +1708,9 @@ async fn boot_load_model(app: tauri::AppHandle, state: tauri::State<'_, AppState
     // v0.7: the size is source-dependent. Read model_source FIRST so the chat
     // backend is born at the correct size — under API it's 2048 (silent-agent
     // mode); under Local-only it's the user's tuned settings.context_size
-    // (4000). This avoids a wasteful re-spawn right after boot when an API
-    // profile was active at last shutdown (the restore branch below only
-    // flips the flag now — no re-spawn needed).
+    // (default 4096). This avoids a wasteful re-spawn right after boot when
+    // an API profile was active at last shutdown (the restore branch below
+    // only flips the flag now — no re-spawn needed).
     let context_size = {
         let source = *state.model_source.lock().expect("model_source mutex");
         let s = state.settings.lock().expect("settings mutex");
@@ -1831,6 +2008,22 @@ fn resolve_codex_dir(app: &tauri::AppHandle) -> Option<std::path::PathBuf> {
     None
 }
 
+/// Resolve `data/wupi.codex` — Wupi's static playbook (engine-shipped
+/// reference knowledge, the compound front-matter file parsed by
+/// `codex::parse_compound_file`). Sits next to `wupi.sim` under the §8C
+/// `<exe_dir>/data/` layout and is replaced verbatim on update (the updater's
+/// preserve rule carves it out alongside `data/wupi.sim`). Missing file →
+/// `None` (the playbook seed is a no-op; Wupi just doesn't get her docs).
+fn resolve_wupi_codex_path(app: &tauri::AppHandle) -> Option<std::path::PathBuf> {
+    let candidate = resolve_data_dir(app).join("wupi.codex");
+    if candidate.is_file() {
+        tracing::info!("resolved wupi.codex: {}", candidate.display());
+        Some(candidate)
+    } else {
+        None
+    }
+}
+
 // Three small functions: fable_is_active checks whether a FableEngine is
 // running; route_to_fable_manager handles the MutateWorldState intent
 // (translates the player's request to a SchemaDelta via the schema engine's
@@ -1972,6 +2165,7 @@ fn fable_is_active(state: &tauri::State<'_, AppState>) -> bool {
 async fn route_to_fable_manager(
     text: String,
     on_event: tauri::ipc::Channel<serde_json::Value>,
+    app: &tauri::AppHandle,
     state: &tauri::State<'_, AppState>,
 ) -> Result<(), String> {
     // 1. Acquire the Schema lease + spawn-or-reuse the schema engine under
@@ -2044,6 +2238,7 @@ async fn route_to_fable_manager(
 
     let delta_applied = delta.has_changes();
     if delta_applied {
+        push_fable_history(&state).await;
         let mut s = state.fable_schema.lock().await;
         s.apply_delta(delta.clone());
     }
@@ -2075,6 +2270,62 @@ async fn route_to_fable_manager(
         applied = delta_applied,
         "game-manager: mutation request handled"
     );
+
+    // 6. Auto-save (best-effort, fire-and-forget) when the delta actually
+    //    mutated state. Mirrors the `fable_send` autosave block (lib.rs ~5423).
+    //    **2026-07-27 Bug #3 fix:** without this, a manager mutation (e.g.
+    //    "give me 50 gold") updated `fable_schema` in memory but never hit
+    //    disk until the NEXT narrator turn's autosave — a crash between the
+    //    two lost the mutation. Now both manager + narrator paths persist
+    //    atomically. Skipped on empty deltas (nothing changed → nothing to
+    //    save → no disk churn). The save runs detached on the blocking pool;
+    //    errors are logged-and-dropped (autosave is best-effort by contract).
+    if delta_applied {
+        let app_clone = app.clone();
+        let state_active_card = state.active_fable_card.clone();
+        let state_session = state.fable_session.clone();
+        let state_schema = state.fable_schema.clone();
+        let is_quick = {
+            let g = state.is_quick_play.lock().expect("is_quick_play mutex");
+            *g
+        };
+        tokio::spawn(async move {
+            let card_opt = state_active_card
+                .lock()
+                .expect("active_fable_card mutex")
+                .clone();
+            let Some(card) = card_opt else {
+                return;
+            };
+            let session = state_session.lock().await.clone();
+            let schema = state_schema.lock().await.clone();
+            let fable_root = resolve_apps_dir(&app_clone).join("fable");
+            let fable_root_clone = fable_root.clone();
+            let card_clone = card.clone();
+            let result = tokio::task::spawn_blocking(move || {
+                if is_quick {
+                    fable_save::write_quick_save(&fable_root_clone, &card_clone, &session, &schema)
+                } else {
+                    fable_save::write_save(
+                        &fable_root_clone,
+                        &card_clone,
+                        fable_save::AUTOSAVE_ID,
+                        "Autosave",
+                        &session,
+                        &schema,
+                    )
+                }
+            })
+            .await;
+            match result {
+                Ok(Ok(_)) => tracing::debug!("game-manager autosave: ok"),
+                Ok(Err(e)) => {
+                    tracing::warn!(error = %format!("{e}"), "game-manager autosave write failed")
+                }
+                Err(e) => tracing::warn!(error = %format!("{e}"), "game-manager autosave join failed"),
+            }
+        });
+    }
     Ok(())
 }
 
@@ -2200,7 +2451,7 @@ async fn chat_send(
         match fable_command::classify(&text) {
             fable_command::FableCommand::MutateWorldState(_) => {
                 clear_active_cancel(&state);
-                return route_to_fable_manager(text, on_event, &state).await;
+                return route_to_fable_manager(text, on_event, &app, &state).await;
             }
             fable_command::FableCommand::QueryWorldState(focus) => {
                 clear_active_cancel(&state);
@@ -2331,7 +2582,18 @@ async fn chat_send(
     let user_profile = user_profile::load(
         state.operator_path.get().and_then(std::option::Option::as_deref),
     )
-    .map(|p| p.render_for_prompt());
+    .map(|p| p.render_for_prompt())
+    // Chloe 2026-07-27: anti-positivity-bias default. When the profile is
+    // missing, malformed, OR totally blank (the shipped data/user.xml is
+    // empty), `render_for_prompt` returns "" and `.filter` below drops it.
+    // The model would then see NO name at all — and might invent one or
+    // address the operator by an inferred title. Per the standing contract,
+    // the operator is always their profile name or the literal "User".
+    // Fall back to a minimal name-only block so the model always has a
+    // neutral handle. (The Fable narrator path uses the SIM card's
+    // <protagonist> name with the same "User" default — separate path.)
+    .filter(|s| !s.trim().is_empty())
+    .or_else(|| Some("<user_profile>\nname: User\n</user_profile>".to_owned()));
     // §2F eager-prefill sliding window (2026-07-13): cap visible history to
     // the last VISIBLE_WINDOW messages regardless of token budget. Memory (M)
     // backfills evicted turns via retrieval. Truncation in the engine becomes
@@ -2395,7 +2657,7 @@ async fn chat_send(
     // tuned settings.context_size. This is the load-bearing fix for the
     // eviction-revert landmine: if a fable/schema turn evicted the chat
     // backend mid-API-session, the slow-path re-spawn below MUST re-spawn at
-    // 2048 (not settings.context_size = 4000) — otherwise the reduced context
+    // 2048 (not settings.context_size = 4096) — otherwise the reduced context
     // silently reverts the first time the chat backend gets evicted.
     let chat_context_size = effective_local_ctx(source, &settings);
     let _chat_lease = context_swap_clone
@@ -2427,6 +2689,49 @@ async fn chat_send(
 
     // Spawn-or-reuse the chat backend. Fast path: a prior chat turn (or
     // boot) left it resident. Slow path: re-spawn from shared model.
+    //
+    // **2026-07-27 Bug #2 fix (force_full_ctx under API):** under API mode
+    // the resident backend is at the 2048 silent-agent ctx maintained by
+    // api_connect/boot_load_model — far too small for the Wupi system prompt
+    // (~1542 tokens) + tools declarations + history. Tool-calling requests
+    // errored instantly with "context too long even after truncation: 2501
+    // tokens, max 1536". The §11.18 fix applied this pattern to
+    // `interview_generate` (`run_interview_local`'s `force_full_ctx`); we
+    // apply it to `chat_send` here. The teardown takes the resident backend
+    // out of the slot + shuts it down (joins the engine thread, frees the
+    // 2048 KV context — the weights stay leaked + shared). Then the spawn-
+    // await logic below re-spawns fresh from `shared_model()` at
+    // `spawn_ctx` (which is `settings.context_size` = 4096 under API after
+    // teardown — NOT the 2048 `chat_context_size`, which is the silent-agent
+    // ctx we just tore down). Under Local mode no teardown happens (the
+    // resident is already at `settings.context_size`), so `spawn_ctx` falls
+    // back to `chat_context_size` and the reuse path takes over.
+    if source == api::ModelSource::Api {
+        let old = {
+            let mut g = state.backend.lock().expect("backend mutex");
+            g.take()
+        };
+        if let Some(old) = old {
+            old.shutdown();
+            tracing::info!(
+                "chat_send: API mode — torn down 2048 silent-agent backend; \
+                 re-spawning at full local ctx (settings.context_size={})",
+                settings.context_size
+            );
+        }
+    }
+    // The ctx to spawn at: under API (post-teardown) we want the full
+    // `settings.context_size` (4096) so tools + system prompt fit. Under
+    // Local the resident is already at `settings.context_size`, so when the
+    // reuse path fires (no spawn needed) the value is unused; when the slow
+    // path spawns (rare under Local) `chat_context_size` already equals
+    // `settings.context_size`. So: API → settings.context_size, Local →
+    // chat_context_size (same thing).
+    let spawn_ctx = if source == api::ModelSource::Api {
+        settings.context_size
+    } else {
+        chat_context_size
+    };
     let backend_opt = {
         let existing = state.backend.lock().expect("backend mutex").clone();
         match existing {
@@ -2442,7 +2747,7 @@ async fn chat_send(
                 // readiness-await pattern.
                 let (tx, rx) = tokio::sync::oneshot::channel();
                 let backend = llm::LlamaCppBackend::spawn_from_shared(
-                    chat_context_size,
+                    spawn_ctx,
                     Box::new(move |result| {
                         let _ = tx.send(result);
                     }),
@@ -2510,19 +2815,49 @@ async fn chat_send(
     // to the API for the narrative reply. `fable_send` (the narrator path)
     // never enters this block — it has its own dispatch and never gets tools.
     let chat_tools: Vec<chat_format::ToolSpec> = if backend_opt.is_some() {
-        tools::specs()
+        // Always-on tools (file ops, codex, sim cards, user profile).
+        let mut s = tools::specs();
+        // Fable-only Director tools (generate_options + set_directive). Attached
+        // ONLY when a Fable session is active — invisible to the model in plain
+        // Wupi-assistant chat, which is the false-tool-call guardrail at the
+        // prompt level (chat_send gates; validate_args is the second gate).
+        if fable_is_active(&state) {
+            s.extend(tools::fable_specs());
+        }
+        s
     } else {
         Vec::new()
     };
 
+    // Per-turn Director directive slot. Minted fresh each chat_send call; the
+    // `set_directive` tool (Fable-only) writes here when the model steers the
+    // world. Drained to `state.pending_directive` after the agent loop returns
+    // (below), so fable_send consumes it on the next narrator turn. std::sync
+    // Mutex because Tool::execute is sync — never held across an await. The Arc
+    // is shared between chat_send (drains post-loop) and the ToolCtx (writes
+    // during execute), so no return-value plumbing is needed.
+    let directive_slot: Arc<std::sync::Mutex<Option<String>>> =
+        Arc::new(std::sync::Mutex::new(None));
+
     let (result, tools_fired) = if source == api::ModelSource::Api {
         // API mode: tool-routing pre-pass on local. If tools fire, we keep
         // the local result; otherwise we hand off to the API for narration.
+        //
+        // **ctx (2026-07-27 Bug #2 fix):** the teardown + re-spawn to the
+        // full local ctx (`settings.context_size`, default 4096) happens in
+        // the `backend_opt` block above — the agent loop receives an
+        // already-fresh backend via `backend_opt`. The ctx arg here is just
+        // for `run_local_or_echo`'s info; the actual context the engine
+        // runs at is whatever the backend was spawned at (4096 after the
+        // teardown). Without the upstream fix, every tool-calling request
+        // under API mode errored instantly with "context too long even
+        // after truncation: 2501 tokens, max 1536".
         match run_agent_loop(
             &state, &app, &on_event, &system_prompt, 6,
             memory_block.clone(), world_state.clone(), chat_tools.clone(),
-            effective_local_ctx(api::ModelSource::Api, &settings),
+            settings.context_size,
             on_chunk.clone(), cancel.clone(), backend_opt.clone(),
+            Some(directive_slot.clone()),
         )
         .await
         {
@@ -2623,11 +2958,15 @@ async fn chat_send(
         }
     } else {
         // Local mode: the agent loop IS the user-visible reply path.
+        // The resident backend is already at `settings.context_size`
+        // (Local mode never torn down to 2048), so the fast reuse path
+        // in `backend_opt` above applies — no teardown needed.
         match run_agent_loop(
             &state, &app, &on_event, &system_prompt, visible_window,
             memory_block, world_state, chat_tools,
             settings.context_size,
             on_chunk.clone(), cancel.clone(), backend_opt.clone(),
+            Some(directive_slot.clone()),
         )
         .await
         {
@@ -2640,6 +2979,23 @@ async fn chat_send(
     };
     // tools_fired is read by the done event below to flag a tool-call turn.
     let _ = &tools_fired;
+
+    // Drain the per-turn Director directive slot → `state.pending_directive`.
+    // If the `set_directive` tool fired this turn, the slot holds the validated
+    // directive text; fable_send will consume it on the NEXT narrator turn
+    // (lib.rs:5005) and thread it into the narrator prompt as a
+    // <director_directive> block. No-op when the slot is empty (the common
+    // case — most chat turns don't steer the world). Errors are logged + dropped
+    // (a poisoned slot shouldn't crash the chat turn).
+    let armed = directive_slot
+        .lock()
+        .map(|mut g| g.take())
+        .unwrap_or(None);
+    if let Some(text) = armed {
+        let mut g = state.pending_directive.lock().await;
+        *g = Some(text);
+        tracing::info!("chat_send: director directive armed via set_directive tool (fires on next fable_send)");
+    }
 
     // Bug #3 Step 4: hold the raw model output alongside the cleaned content +
     // reasoning so the formatter can re-render cache-coherently next turn (no
@@ -2884,6 +3240,31 @@ async fn chat_send(
         });
     }
 
+    // ── Codex hot-load drain (closes the codex_create/codex_delete seam gap).
+    //
+    // Tools (codex_create/codex_delete) write/delete files in data/docs/
+    // directly via codex::save_file/delete_file — they have no engine handle
+    // to re-seed the retrieval index mid-turn. They set `codex_dirty` instead;
+    // this block drains the flag (swap to false, atomically) + re-seeds the
+    // CODEX_CARD_ID partition so the next narrator/chat turn sees tool-authored
+    // lore. Early-out when the flag is clear: zero cost on turns where no codex
+    // tool fired (the common case). Mirrors the codex_save IPC's inline re-seed
+    // (lib.rs:codex_save) but deferred to the chat-path finalize.
+    if state.codex_dirty.swap(false, std::sync::atomic::Ordering::Relaxed) {
+        if let (Some(engine), Some(dir)) = (
+            state.memory.get(),
+            state.codex_dir.get().and_then(|o| o.as_ref()),
+        ) {
+            let engine = Arc::clone(engine);
+            let dir = dir.clone();
+            tokio::spawn(async move {
+                if let Err(e) = codex::seed_codex(&engine, &dir, memory::CODEX_CARD_ID, "codex").await {
+                    tracing::warn!(error = %format!("{e}"), "codex dirty-flag re-seed failed");
+                }
+            });
+        }
+    }
+
     Ok(())
 }
 
@@ -2891,6 +3272,15 @@ async fn chat_send(
 /// (success + both error branches) so a stale token is never left behind.
 fn clear_active_cancel(state: &tauri::State<'_, AppState>) {
     let mut slot = state.active_cancel.lock().expect("active_cancel mutex");
+    *slot = None;
+}
+
+/// Clear the active slice-cancel slot. Parallel to `clear_active_cancel` for
+/// the `active_slice_cancel` field — called at every exit path of
+/// `regenerate_slice` so a stale token is never left behind (a future direct
+/// `chat_stop` could otherwise cancel a slice regen that already finished).
+fn clear_active_slice_cancel(state: &tauri::State<'_, AppState>) {
+    let mut slot = state.active_slice_cancel.lock().expect("active_slice_cancel mutex");
     *slot = None;
 }
 
@@ -3010,8 +3400,22 @@ async fn run_agent_loop(
     on_chunk: llm::ChunkFn,
     cancel: llm::CancelToken,
     backend_opt: Option<Arc<llm::LlamaCppBackend>>,
+    // Per-turn Director directive slot. `Some` only when a Fable session is
+    // active (chat_send gates this). The `set_directive` tool writes here;
+    // chat_send drains the Arc after this fn returns. `None` for standalone
+    // tests / no-Fable turns — the set_directive tool errors cleanly if the
+    // model emits it without a slot attached.
+    directive_slot: Option<Arc<std::sync::Mutex<Option<String>>>>,
 ) -> Result<(chat_format::ParsedOutput, bool), ()> {
     use tools::ToolCtx;
+
+    // NOTE: the API-mode `force_full_ctx` teardown used to live here but was
+    // moved UP into `chat_send` (before the `backend_opt` computation). The
+    // agent loop receives an already-fresh backend via `backend_opt`, so it
+    // doesn't need its own teardown — putting it here would race with
+    // `run_local_or_echo`'s use of the (stale) passed-in backend Arc,
+    // producing "model not loaded yet" errors. See chat_send's
+    // `force_full_ctx` block (~line 2646) for the full Bug #2 history.
 
     // No tools → no loop; just decode once. This is the common chat case.
     if tools.is_empty() {
@@ -3025,8 +3429,22 @@ async fn run_agent_loop(
     }
 
     let install_root = resolve_install_root(app);
-    let ctx = ToolCtx::new(install_root);
-    let registry = tools::registry();
+    let ctx = ToolCtx::new(install_root).with_codex_dirty(Arc::clone(&state.codex_dirty));
+    let ctx = if let Some(slot) = directive_slot {
+        ctx.with_directive_slot(slot)
+    } else {
+        ctx
+    };
+    // The lookup registry must include the Fable-only Director tools whenever
+    // the slot is attached (i.e. when chat_send detected an active Fable session
+    // and attached fable_specs to the prompt). Otherwise a model emitting
+    // `generate_options` / `set_directive` would hit the "unknown tool" branch
+    // even though the prompt advertised the tool. The slot's presence is the
+    // single signal that fable tools are in play.
+    let mut registry = tools::registry();
+    if ctx.directive_slot.is_some() {
+        registry.extend(tools::fable_registry());
+    }
 
     // Iterate. Each iteration: decode → parse tool calls → execute → insert
     // response turns → re-decode. Break when the model emits no tool calls
@@ -3158,6 +3576,323 @@ async fn enqueue_failed_translation(
         );
     }
     q.push(attempt);
+}
+
+/// Push a failed World Progression attempt onto the tick queue (Fable Seam
+/// #4, 2026-07-27). Mirrors `enqueue_failed_translation` for the clock-tick
+/// path. Drained on the next tick fire + folded into the next progression
+/// prompt so the model gets another shot with the new interval.
+async fn enqueue_failed_progression(
+    state: &tauri::State<'_, AppState>,
+    attempt: schema_engine::FailedAttempt,
+) {
+    let mut q = state.failed_progression_queue.lock().await;
+    if q.len() >= MAX_FAILED_DELTA_ATTEMPTS {
+        q.remove(0);
+        tracing::warn!(
+            queue_len = q.len(),
+            "failed_progression_queue overflow; evicted oldest entry"
+        );
+    }
+    q.push(attempt);
+}
+
+/// World Progression tick interval (Fable Seam #4, 2026-07-27). How much
+/// in-world time must elapse before an off-screen simulation pass fires.
+/// Default 24h matches Multihog's default + the natural "daily report"
+/// cadence. Configurable via settings is deferred (v1 hardcoded; a future
+/// settings knob + per-card override is straightforward once the UI exists).
+///
+/// The check is `world_clock.minutes_since_last_tick() >= INTERVAL * 60`.
+/// Pure arithmetic on the typed `i64` — no calendar library, no fuzzy
+/// comparison, no model discretion. Rust owns the gate; the model can't
+/// talk itself out of generating an off-screen update.
+/// Legacy World Progression tick interval (Fable Seam #4, 2026-07-27).
+/// Superseded 2026-07-27 by the ScenePacing-driven interval
+/// (`SceneMode::progression_interval_hours`) — Combat/Downtime/Exploration
+/// each get their own interval. Retained for any future "fixed-interval"
+/// debug mode + as documentation of the original 24h default.
+#[allow(dead_code)]
+const WORLD_PROGRESSION_INTERVAL_HOURS: u32 = 24;
+
+/// Ring-buffer cap for `AppState::fable_schema_history` (1-click undo,
+/// 2026-07-27). 5 snapshots = the last 5 world-state mutations are undoable.
+/// Bounded to cap memory growth (each clone holds the full `entities`
+/// HashMap + `recent_events` Vec — moderate cost, dominated by entity count).
+const FABLE_HISTORY_CAP: usize = 5;
+
+/// Snapshot the current `fable_schema` into the history ring buffer before a
+/// mutation. Pushes a clone of the LIVE (pre-mutation) state so a later
+/// `fable_rollback` can restore it. Caps at `FABLE_HISTORY_CAP` (FIFO eviction
+/// of the oldest). One brief lock on each side — no `await` while held.
+async fn push_fable_history(state: &AppState) {
+    let snapshot = state.fable_schema.lock().await.clone();
+    push_fable_history_snapshot(state, snapshot).await;
+}
+
+/// Same as `push_fable_history` but accepts a pre-cloned snapshot, so callers
+/// already holding the `fable_schema` lock can snapshot-and-mutate atomically
+/// without re-acquiring it (avoids the drop-and-relock race). Use this inside
+/// any `fable_schema.lock().await` critical section where the pre-mutation
+/// state is already in hand.
+async fn push_fable_history_snapshot(state: &AppState, snapshot: schema::WorldSchema) {
+    let mut hist = state.fable_schema_history.lock().await;
+    if hist.len() >= FABLE_HISTORY_CAP {
+        hist.pop_front();
+    }
+    hist.push_back(snapshot);
+}
+
+/// Clear the history ring buffer. Called at every session boundary
+/// (`fable_start`, `fable_end`, `fable_load_save`, `fable_quick_start`):
+/// those wholesale-overwrite `fable_schema`, so the prior history is no
+/// longer meaningful to undo INTO (it belongs to a different game session).
+async fn clear_fable_history(state: &AppState) {
+    state.fable_schema_history.lock().await.clear();
+}
+
+/// Apply any `[TIME ...]` bracket command from the narrator's output, then
+/// check whether the in-world clock has advanced past the World Progression
+/// interval. If so, fire the off-screen simulation pass against `fable_schema`
+/// (Fable Seam #4, 2026-07-27).
+///
+/// Called from `fable_send` right after bracket parsing (after `scene_event`
+/// emits, before memory archival). The insertion point is load-bearing: the
+/// narrator's `[TIME ...]` emissions are already extracted into
+/// `parsed.commands`, so we can scan them here without re-parsing.
+///
+/// # Monotonic guard
+///
+/// The clock only moves FORWARD. A narrator emitting `[TIME Day 1]` after
+/// `[TIME Day 5]` (a regression) is warned + ignored — the simulation
+/// depends on monotonic time for the tick gate to be meaningful.
+///
+/// # First-call baseline
+///
+/// The FIRST `[TIME]` ever emitted stamps `last_tick_minutes = current_minutes`
+/// without firing (matches Multihog's first-call behavior: a campaign doesn't
+/// simulate a day it hasn't established yet). Subsequent advances fire when
+/// the elapsed delta crosses the interval.
+///
+/// # VRAM + lease ordering
+///
+/// The progression pass acquires `ContextRole::Schema` via the existing
+/// `acquire_schema_engine_from_arcs` helper. The fable lease is still held
+/// at this point (we're inside `fable_send`), so the schema acquire will
+/// WAIT for `fable_send` to return + drop the lease before the schema engine
+/// can spawn. That's correct: the tick is OFF-SCREEN simulation, decoupled
+/// from the just-completed narrator turn — running it after the turn completes
+/// (visible on the NEXT turn) is the right semantics, not a bug.
+///
+/// # Best-effort
+///
+/// Errors are logged + dropped: a failed tick must never block the gameplay
+/// loop. The fail-queue contract still applies — a retryable failure
+/// (parse/validation) lands in `failed_progression_queue` and is folded into
+/// the next tick's prompt. Infrastructure failures (tokenize/prefill/decode)
+/// are just logged.
+async fn apply_time_command_and_maybe_tick(
+    parsed: &bracket_parser::ParsedNarration,
+    state: &tauri::State<'_, AppState>,
+) {
+    // 1. Extract the last `[TIME ...]` command (if any). Multiple in one turn
+    //    is unusual but legal (the narrator might emit time mid-turn then
+    //    again at the end); the LAST one is the most recent + authoritative.
+    let last_time_cmd: Option<i64> = parsed
+        .commands
+        .iter()
+        .rev()
+        .find_map(|cmd| match cmd {
+            bracket_parser::BracketCommand::Time { minutes, .. } => Some(*minutes),
+            _ => None,
+        });
+
+    let Some(new_minutes) = last_time_cmd else {
+        return; // no [TIME] this turn — clock unchanged, no tick.
+    };
+
+    // 2. Apply the clock advance under the schema lock. Monotonic guard:
+    //    reject regressions (a buggy narrator going backward in time).
+    //    Determine whether this is the first-ever [TIME] so we can stamp the
+    //    baseline instead of firing.
+    let (was_first_set, prev_minutes, schema_snapshot) = {
+        let mut s = state.fable_schema.lock().await;
+        let was_first = !s.world_clock.is_set();
+        let prev = s.world_clock.current_minutes;
+        if !was_first && new_minutes < prev {
+            tracing::warn!(
+                new_minutes,
+                prev_minutes = prev,
+                "ignoring [TIME] regression: clock only moves forward"
+            );
+            return;
+        }
+        // Snapshot for undo BEFORE the mutation. On the first-set the
+        // baseline stamp below captures the same transition (clock was 0→N,
+        // not a meaningful "undo" target); skip the snapshot to keep the
+        // ring clean. The clone is dropped into the history push after we
+        // release this lock.
+        let undo_snapshot = if !was_first && new_minutes != prev {
+            Some(s.clone())
+        } else {
+            None
+        };
+        s.world_clock.current_minutes = new_minutes;
+        let live_snapshot = s.clone();
+        if let Some(snap) = undo_snapshot {
+            drop(s);
+            push_fable_history_snapshot(&state, snap).await;
+        }
+        (was_first, prev, live_snapshot)
+    };
+    tracing::info!(
+        new_minutes,
+        prev_minutes,
+        first_set = was_first_set,
+        "clock advanced via [TIME] bracket"
+    );
+
+    // 3. First-call baseline: stamp `last_tick_minutes` and bail (no fire).
+    //    A campaign doesn't simulate a day it hasn't established yet.
+    if was_first_set {
+        let mut s = state.fable_schema.lock().await;
+        let snap = s.clone();
+        s.world_clock.last_tick_minutes = new_minutes;
+        drop(s);
+        push_fable_history_snapshot(&state, snap).await;
+        tracing::info!(baseline = new_minutes, "clock baseline stamped (no tick this turn)");
+        return;
+    }
+
+    // 4. Tick gate: has enough in-world time elapsed since the last tick?
+    //    The interval is now ScenePacing-driven (Fable Seam #4 expansion,
+    //    2026-07-27): Combat → 0 (never fire mid-fight), Downtime → 1h (world
+    //    moves fast while you rest), Exploration → 4h (balanced). The legacy
+    //    const WORLD_PROGRESSION_INTERVAL_HOURS (24h) is retained as the
+    //    fallback for any future "fixed-interval" mode but no longer used by
+    //    the live gate.
+    let interval_hours = schema_snapshot.scene_pacing.mode.progression_interval_hours();
+    if interval_hours == 0 {
+        tracing::debug!(
+            mode = ?schema_snapshot.scene_pacing.mode,
+            "world progression tick skipped: scene mode suspends background sim (combat)"
+        );
+        return;
+    }
+    let interval_minutes = (interval_hours as i64) * 60;
+    let elapsed = schema_snapshot.world_clock.minutes_since_last_tick();
+    if elapsed < interval_minutes {
+        tracing::debug!(
+            elapsed_hours = elapsed / 60,
+            interval_hours,
+            mode = ?schema_snapshot.scene_pacing.mode,
+            "clock tick gate not met (no fire)"
+        );
+        return;
+    }
+
+    // 5. Gate met — fire the off-screen simulation pass. Acquire the schema
+    //    engine + the Schema lease (will wait for the fable lease to drop on
+    //    fable_send return). Drain the failed-progression queue first.
+    tracing::info!(
+        elapsed_hours = elapsed / 60,
+        interval_hours,
+        mode = ?schema_snapshot.scene_pacing.mode,
+        "clock tick gate met — firing world progression pass"
+    );
+    let deferred = {
+        let mut q = state.failed_progression_queue.lock().await;
+        std::mem::take(&mut *q)
+    };
+    if !deferred.is_empty() {
+        tracing::info!(deferred = deferred.len(), "progression tick includes deferred re-attempts");
+    }
+
+    let context_swap = state.context_swap.clone();
+    let schema_engine_slot = Arc::clone(&state.schema_engine);
+    let (schema_engine, _schema_lease) = match acquire_schema_engine_from_arcs(
+        context_swap,
+        schema_engine_slot,
+    )
+    .await
+    {
+        Ok(t) => t,
+        Err(e) => {
+            tracing::warn!(error = %e, "world progression: could not acquire schema engine; tick skipped");
+            return;
+        }
+    };
+
+    // 6. Post the progression request + await the reply off the tokio worker
+    //    (the schema thread is a bare std::thread; its mpsc::Receiver blocks).
+    let reply_rx = match schema_engine.request_world_progression(
+        &schema_snapshot,
+        interval_hours,
+        deferred,
+    ) {
+        Ok(rx) => rx,
+        Err(e) => {
+            tracing::warn!(error = %format!("{e:#}"), "world progression request failed; tick skipped");
+            return;
+        }
+    };
+    let reply = match tokio::task::spawn_blocking(move || reply_rx.recv()).await {
+        Ok(Ok(r)) => r,
+        Ok(Err(e)) => {
+            tracing::warn!(error = %format!("{e}"), "world progression reply channel closed");
+            return;
+        }
+        Err(e) => {
+            tracing::warn!(error = %format!("{e}"), "world progression reply join failed");
+            return;
+        }
+    };
+
+    // 7. Fail-proof contract: enqueue retryable failures for the next tick.
+    if let Some(failed) = reply.failed_attempt.clone() {
+        enqueue_failed_progression(state, failed).await;
+    }
+    if !reply.error.is_empty() {
+        tracing::warn!(
+            error = %reply.error,
+            "world progression pass failed (queued for retry on next tick)"
+        );
+        return;
+    }
+
+    // 8. Apply the resulting delta to `fable_schema`. The next narrator turn
+    //    sees the moved world via the existing `<world_state>` injection.
+    if let Some(delta) = reply.delta {
+        if delta.has_changes() {
+            let mut s = state.fable_schema.lock().await;
+            let snap = s.clone();
+            s.apply_delta(delta.clone());
+            drop(s);
+            push_fable_history_snapshot(&state, snap).await;
+            tracing::info!(
+                keys_changed = delta
+                    .entities
+                    .as_ref()
+                    .map(|m| m.len())
+                    .unwrap_or(0),
+                "world progression delta applied to game_schema"
+            );
+        } else {
+            tracing::debug!("world progression pass emitted empty delta (nothing moved)");
+        }
+    }
+
+    // 9. Stamp the tick baseline so the next fire waits for another full
+    //    interval. Done LAST so a mid-application crash doesn't advance the
+    //    baseline without recording the result (if apply_delta failed above,
+    //    we return early before this stamp).
+    {
+        let mut s = state.fable_schema.lock().await;
+        let snap = s.clone();
+        s.world_clock.last_tick_minutes = s.world_clock.current_minutes;
+        drop(s);
+        push_fable_history_snapshot(&state, snap).await;
+    }
 }
 
 async fn rollback_last_user_message(state: &tauri::State<'_, AppState>, _app: &tauri::AppHandle) {
@@ -3576,12 +4311,12 @@ async fn api_connect(
 /// This is the v0.7 source-of-truth for "how big should the local chat
 /// context be?"
 ///
-/// - **Local-only:** the user's tuned `settings.context_size` (default 4000).
+/// - **Local-only:** the user's tuned `settings.context_size` (default 4096).
 ///   The local 12B is the primary chat + narrator model and needs the room.
 /// - **API connected:** 2048. The local 12B demotes to a silent tracking
 ///   agent (memory tracking + small assistant replies) — no narration, no
 ///   long payloads. 2048 is plenty for that and frees ~half the chat KV
-///   vs the 4000-tok Local-only mode.
+///   vs the 4096-tok Local-only mode.
 ///
 /// **Schema is NOT affected** — it's a fixed `SCHEMA_CTX = 2048` in both
 /// modes (already the right size for delta work; no source-dependent sizing
@@ -3808,7 +4543,7 @@ async fn api_disconnect(app: tauri::AppHandle, state: tauri::State<'_, AppState>
         .map_err(|e| format!("api_config save join: {e}"))?;
 
     // v0.7: restore the local chat context to the Local-mode size (the user's
-    // tuned settings.context_size, default 4000). Symmetric to api_connect's
+    // tuned settings.context_size, default 4096). Symmetric to api_connect's
     // shrink: take + shutdown the 2048-ctx backend, re-spawn at the full size
     // since the local 12B is now the primary chat + narrator model again.
     {
@@ -4209,6 +4944,7 @@ async fn enter_fable_session(
         (s, c, None)
     };
     *state.fable_schema.lock().await = prior_schema;
+    clear_fable_history(&state).await;
     let messages: Vec<FableLoadMessage> = prior_session
         .messages
         .iter()
@@ -4339,8 +5075,14 @@ async fn fable_send(
     on_event: tauri::ipc::Channel<serde_json::Value>,
     state: tauri::State<'_, AppState>,
     app: tauri::AppHandle,
+    regenerate: Option<bool>,
 ) -> Result<(), String> {
-    tracing::info!(?text, "fable_send");
+    tracing::info!(?text, regenerate, "fable_send");
+    // `regenerate: Some(true)` is set by the frontend after a reroll /
+    // rewind-and-edit mutation: the user turn to reply to is already the
+    // last message in `fable_session` (the mutation commands left it
+    // there), so we SKIP pushing a fresh user message and generate from
+    // the existing tail. The window slice below picks it up unchanged.
 
     // TOOL EXCLUSION GUARD (v0.8): the narrator path NEVER gets tools. This is
     // enforced structurally — fable_send dispatches to the FableEngine (a
@@ -4458,32 +5200,160 @@ async fn fable_send(
     let context_size = state.settings.lock().expect("settings mutex").context_size;
 
     // Build the narrator system prompt from the card + current game schema.
-    // The Rust Referee (Fable Seam #7) fires HERE, inside the schema lock,
-    // BEFORE the render: it scans the player's turn text for combat/exertion
-    // keywords, rolls the dice, and mutates the canonical PlayerState. The
-    // outcome then flows into the rendered `<world_state>` block as a hard
-    // semantic fact ("Left Bicep (Medium Injury); stamina: Winded") that the
-    // narrator reads as truth and writes prose to match. The LLM does ZERO
-    // math. See `player_state::referee_evaluate`.
     //
-    // We hold the lock across evaluate+apply+render so the persisted state
+    // THREE Rust-authoritative engines fire HERE, inside the schema lock,
+    // BEFORE the render (all pure-eval, then apply, then render — atomic):
+    //
+    // 1. Scene Pacing (Fable Seam #4 expansion, 2026-07-27): `scene_pacing::
+    //    evaluate(text)` classifies the turn into Downtime/Exploration/Combat
+    //    from three keyword-driven pillars (Spatial/Emotional/Kinetic). The
+    //    mode drives narrator prose cadence (via the `<scene_pacing>` tag),
+    //    the World Progression tick interval, AND the skill-check DC modifier.
+    //    Computed FIRST so its DC modifier threads into the skill Referee.
+    //
+    // 2. Combat Referee (Fable Seam #7): `player_state::referee_evaluate`
+    //    scans for combat/exertion keywords, rolls dice, mutates the canonical
+    //    PlayerState. The injury flows into `<world_state>` as a hard fact.
+    //
+    // 3. Skill-Check Referee (anti-sycophancy core, 2026-07-27):
+    //    `player_state::referee_evaluate_skill_checks` scans for non-combat
+    //    risky actions (lockpick/sneak/persuade/...), rolls d20 vs DC
+    //    (modified by the scene-pacing DC modifier from #1), and injects
+    //    `[DIRECTIVE: ...]` lines into `<world_state>` that the narrator MUST
+    //    obey. This is the sycophancy-killer: Rust decides the outcome, the
+    //    LLM has no choice but to write prose that matches.
+    //
+    // We hold the lock across all three + the render so the persisted state
     // and the injected state are the SAME atomic snapshot — a concurrent
-    // autosave can't tear them apart.
-    let world_state = {
+    // autosave can't tear them apart. The LLM does ZERO math.
+    //
+    // (0) Ghostwriter Director directive (§11.24, 2026-07-27): consume the
+    // one-shot player-armed steer HERE — takes + clears the slot, ONE turn
+    // only. The directive is taken BEFORE the schema lock so the consume +
+    // the world_state render are atomic from the narrator's POV (the
+    // directive applies to THIS turn's prompt, paired with THIS turn's
+    // world_state). Threaded into the narrator prompt between <world_state>
+    // and <scene_pacing> by build_narrator_system_prompt below. Visible to
+    // the narrator in its Rust-authored prompt (NOT a silent context
+    // injection — §7 honored).
+    let director_directive = {
+        let mut g = state.pending_directive.lock().await;
+        g.take()
+    };
+
+    let (world_state, pacing) = {
         let mut s = state.fable_schema.lock().await;
-        if let Some(outcome) = player_state::referee_evaluate(&text, &s.player_state) {
+
+        // (1) Scene pacing FIRST — its DC modifier threads into (3).
+        let pacing = scene_pacing::evaluate(&text);
+
+        // Track whether anything mutated so we snapshot once for undo. All
+        // three engines share a single history push (the snapshot captures
+        // the pre-mutation state; one push per turn is the right granularity
+        // for "undo this turn's world changes").
+        let mut mutated = false;
+        let mut undo_snapshot: Option<schema::WorldSchema> = None;
+
+        // Persist the freshly-computed pacing so the narrator's NEXT turn
+        // inherits it (soft memory; next non-neutral turn re-classifies).
+        // This is a real mutation → snapshot.
+        if s.scene_pacing != pacing {
+            if undo_snapshot.is_none() {
+                undo_snapshot = Some(s.clone());
+            }
+            s.scene_pacing = pacing;
+            mutated = true;
+        }
+
+        // (2) Combat Referee. Slice 3 (2026-07-28): the outcome now carries a
+        // `lethal: bool` + a `directive: String`. The directive is non-empty
+        // only on a lethal blow; we capture it here + inject it into the
+        // `<directives>` block below alongside any skill-check directives, so
+        // the narrator sees a single coherent block of hard facts to obey.
+        let combat_directive: Option<String> = if let Some(outcome) =
+            player_state::referee_evaluate(&text, &s.player_state)
+        {
             tracing::info!(
                 part = outcome.part.id(),
                 state = ?outcome.new_state,
                 stamina = ?outcome.stamina_after,
+                lethal = outcome.lethal,
                 "referee fired on combat/exertion keyword"
             );
+            if undo_snapshot.is_none() {
+                undo_snapshot = Some(s.clone());
+            }
             player_state::apply_outcome(&mut s.player_state, &outcome);
+            mutated = true;
+            if outcome.lethal && !outcome.directive.is_empty() {
+                Some(outcome.directive)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        // Render the canonical world-state snapshot (now reflects any injury).
+        let mut rendered = s.render_for_prompt();
+
+        // (3) Skill-check Referee. Turn-scoped — NOT persisted (no schema
+        // mutation, no undo push). The directives append to the rendered
+        // world_state so they ride inside the existing `<world_state>` tag
+        // the narrator already treats as hard fact.
+        let skills = player_state::referee_evaluate_skill_checks(&text, pacing.mode.dc_modifier());
+
+        // (3b) Combat lethality directive (Slice 3): same injection path as
+        // skill checks — the narrator sees ONE `<directives>` block with all
+        // hard facts for the turn (combat lethality + skill outcomes).
+        let has_combat_directive = combat_directive.is_some();
+        if !skills.is_empty() || has_combat_directive {
+            if !skills.is_empty() {
+                tracing::info!(
+                    count = skills.len(),
+                    mode = ?pacing.mode,
+                    "skill-check referee fired"
+                );
+            }
+            if has_combat_directive {
+                tracing::info!("combat lethality directive injected");
+            }
+            if !rendered.is_empty() {
+                rendered.push_str("\n\n");
+            }
+            rendered.push_str("<directives>\n");
+            // Lethality first — it's the most consequential fact for the turn
+            // (the body is Downed; everything else is secondary).
+            if let Some(cd) = &combat_directive {
+                rendered.push_str(&format!("[DIRECTIVE: {}]\n", cd));
+            }
+            for sc in &skills {
+                rendered.push_str(&format!("[DIRECTIVE: {}]\n", sc.directive));
+            }
+            rendered.push_str("</directives>");
+            // Skill checks + lethality are turn-scoped state the narrator must
+            // obey. No undo push: the directives aren't restorable (they were
+            // derived from this turn's text), and rolling back would re-fire
+            // them anyway.
         }
-        let rendered = s.render_for_prompt();
-        if rendered.is_empty() { None } else { Some(rendered) }
+
+        // Push the single undo snapshot (if any engine mutated). Done after
+        // the lock release to keep lock-ordering uniform.
+        let _ = mutated; // (kept for clarity; undo_snapshot.is_some() is the real gate)
+        if let Some(snap) = undo_snapshot {
+            drop(s);
+            push_fable_history_snapshot(&state, snap).await;
+        }
+
+        let world_state_opt = if rendered.trim().is_empty() { None } else { Some(rendered) };
+        (world_state_opt, pacing)
     };
-    let system_prompt = narrator_prompt::build_narrator_system_prompt(&card, world_state.as_deref());
+    let system_prompt = narrator_prompt::build_narrator_system_prompt(
+        &card,
+        world_state.as_deref(),
+        pacing,
+        director_directive.as_deref(),
+    );
 
     // Append the user turn to the per-card game conversation, then window the
     // visible history. Same sliding-window strategy as chat_send's VISIBLE_WINDOW
@@ -4509,9 +5379,23 @@ async fn fable_send(
     // both surfaces.
     let source = *state.model_source.lock().expect("model_source mutex");
     let fable_visible_window = if source == api::ModelSource::Api { 12 } else { 8 };
+    let regenerate = regenerate.unwrap_or(false);
     {
         let mut gs = state.fable_session.lock().await;
-        gs.add_message(session::Role::User, text.clone());
+        if regenerate {
+            // Re-generation path: the user turn to reply to is already the
+            // last message (a mutation command — reroll_last_turn or
+            // rewind_and_edit_user — left it there). Bail if the contract
+            // is violated so we don't generate from a stale or assistant
+            // tail silently.
+            if !gs.last_message_is_user() {
+                return Err(
+                    "fable_send: regenerate=true but the last message is not a user turn".into(),
+                );
+            }
+        } else {
+            gs.add_message(session::Role::User, text.clone());
+        }
     }
 
     // Build a windowed prompt: system + last fable_visible_window messages +
@@ -4566,7 +5450,22 @@ async fn fable_send(
             });
             for m in &window {
                 let role = match m.role {
-                    session::Role::Assistant => "model",
+                    // **2026-07-27 Bug #4 fix:** the OpenAI /chat/completions
+                    // standard role for assistant turns is `"assistant"`, NOT
+                    // `"model"`. The prior `"model"` mapping (a Gemini/Google
+                    // convention) was rejected by z.ai / GLM-5.2 with HTTP
+                    // error code 1214 "Incorrect role information" — silently
+                    // forcing fallback to local on every narrator turn that
+                    // included an assistant reply in its window (i.e. every
+                    // turn after the first). Only the first turn (system +
+                    // single user msg, no assistant yet) succeeded via API;
+                    // turns 2+ all fell back. Verified live: GLM-5.2 accepts
+                    // `"assistant"`, rejects `"model"`. The local narrator
+                    // path (build_narrator_prompt, line ~4997) keeps
+                    // `"model"` — that's the Gemma4 native turn-protocol
+                    // marker, a different context (local model tokens, not
+                    // API wire format).
+                    session::Role::Assistant => "assistant",
                     session::Role::User => "user",
                     session::Role::System => "system",
                 };
@@ -4680,6 +5579,21 @@ async fn fable_send(
             .map_err(|e| e.to_string())?;
     }
 
+    // Apply any [TIME ...] bracket command + check the World Progression tick
+    // gate (Fable Seam #4, 2026-07-27). If the narrator advanced the in-world
+    // clock past the configured interval, fire an off-screen simulation pass
+    // against `fable_schema` so the world moves independently of the player's
+    // bubble. Best-effort: errors logged + dropped (the gameplay loop never
+    // blocks on a tick). The fail-queue contract still applies — retryable
+    // failures land in `failed_progression_queue` for the next tick.
+    //
+    // The progression pass acquires `ContextRole::Schema` via the swap-lock,
+    // which will wait for THIS fable lease to drop on fable_send return before
+    // the schema engine can spawn. The result is applied to `fable_schema`
+    // + visible on the NEXT narrator turn (off-screen sim is decoupled from
+    // the just-completed narrator turn by design).
+    apply_time_command_and_maybe_tick(&parsed, &state).await;
+
     // Archive both turns to the card-scoped memory. Best-effort, detached,
     // same pattern as chat_send's pillar-2 archive.
     let card_id = state.active_card_id.lock().expect("active_card_id mutex").clone();
@@ -4719,11 +5633,22 @@ async fn fable_send(
     // turn to a crash / quit. The save is small JSON (a few KB) and runs on
     // the blocking pool; errors are logged-and-dropped (autosave is
     // best-effort by contract — never block the gameplay loop on it).
+    //
+    // Quick Play branch (the `is_quick_play` gate): instead of the
+    // `AUTOSAVE_ID` slot, write the bundled-card `quicksave` slot via
+    // `write_quick_save`. That's the single Quick Play slot — the in-memory
+    // card (no `.sim` on disk) survives inside the save file, so resume can
+    // rebuild the narrator prompt. Mirrors the manual/autosave atomicity +
+    // best-effort error handling; only the slot + the bundled `card` differ.
     {
         let app_clone = app.clone();
         let state_active_card = state.active_fable_card.clone();
         let state_session = state.fable_session.clone();
         let state_schema = state.fable_schema.clone();
+        let is_quick = {
+            let g = state.is_quick_play.lock().expect("is_quick_play mutex");
+            *g
+        };
         tokio::spawn(async move {
             let card_opt = state_active_card.lock().expect("active_fable_card mutex").clone();
             let Some(card) = card_opt else { return };
@@ -4733,14 +5658,18 @@ async fn fable_send(
             let fable_root_clone = fable_root.clone();
             let card_clone = card.clone();
             let result = tokio::task::spawn_blocking(move || {
-                fable_save::write_save(
-                    &fable_root_clone,
-                    &card_clone,
-                    fable_save::AUTOSAVE_ID,
-                    "Autosave",
-                    &session,
-                    &schema,
-                )
+                if is_quick {
+                    fable_save::write_quick_save(&fable_root_clone, &card_clone, &session, &schema)
+                } else {
+                    fable_save::write_save(
+                        &fable_root_clone,
+                        &card_clone,
+                        fable_save::AUTOSAVE_ID,
+                        "Autosave",
+                        &session,
+                        &schema,
+                    )
+                }
             })
             .await;
             match result {
@@ -4820,16 +5749,1172 @@ async fn fable_end(
         *state.active_card_id.lock().expect("active_card_id mutex") = pre;
     }
     *state.fable_schema.lock().await = schema::WorldSchema::default();
+    clear_fable_history(&state).await;
     *state.fable_session.lock().await = session::Conversation::new();
     *state.active_fable_card.lock().expect("active_fable_card mutex") = None;
     // Phase 2: drop the GM persona so OS chat outside Fable stays the catgirl.
     *state.fable_persona.lock().expect("fable_persona mutex") = None;
+    // Reset the Quick Play flag: the next game (manual card or new Quick Play)
+    // starts from a non-quick state. The quicksave itself persists on disk —
+    // this only clears the in-memory session-scoped flag.
+    *state.is_quick_play.lock().expect("is_quick_play mutex") = false;
 
     // 4. Clear any leftover game cancel token.
     *state.active_fable_cancel.lock().expect("active_fable_cancel mutex") = None;
 
     tracing::info!("game ended: narrator engine down, per-card state persisted, memory scope restored");
     Ok(())
+}
+
+// ============================================================================
+// QUICK PLAY IPCs
+//
+// Quick Play is the title-screen flow: the user answers four hardcoded
+// questions in the void (character / setting / plot / extra), then sits in
+// silence while the model weaves a complete simulation from those answers
+// in ONE pass. The model emits three tagged blocks — <sim_card>,
+// <world_schema>, <player_state> — which this code parses independently and
+// hands to `fable_quick_start`. The card is bundled inside the quicksave
+// file (no .sim on disk) and the simulation runs on the standard stage.
+//
+// The interview is MEMORYLESS: nothing is ever archived to memory.sqlite,
+// so the "erase the interview" requirement is satisfied by construction
+// (there's nothing to erase). The four answers are held CLIENT-SIDE and
+// supplied to the single `interview_generate` call.
+//
+// Five IPCs drive the Quick Play lifecycle: `interview_generate` (the
+// single one-shot generation call), `fable_quick_exists`, `fable_quick_start`,
+// `fable_quick_resume`, `fable_quick_reset`. Plus `is_quick_play` (the flag
+// query the stage uses to disable Save/Load).
+// ============================================================================
+
+/// The single Quick Play generation call. Given the four answers the user
+/// typed in the void (character / setting / plot / extra), run ONE model
+/// pass that emits three tagged blocks — `<sim_card>`, `<world_schema>`,
+/// `<player_state>` — parse each independently, and return all three on the
+/// channel. The frontend hands the result to `fable_quick_start`, which seeds
+/// the in-memory schema + player state before seating the card.
+///
+/// Memoryless: no archival, no tools, no schema-delta spawn. The four answers
+/// are supplied by the caller; nothing about this call ever touches disk or
+/// memory.sqlite. Voice is sterile + structural (NOT the GM voice — see
+/// `interview_prompt::build_generation_system_prompt`).
+///
+/// Emits `{type:"chunk", text:""}` heartbeats during generation (the UI is in
+/// its "void waiting" state — the body must NOT flicker as half-parsed XML;
+/// the heartbeat just signals liveness) and terminal `{type:"done", card,
+/// world_schema, player_state}` on success or `{type:"error", message}` on
+/// any failure (stream error, JSON repair failure, card parse failure).
+
+/// Local-backend execution for the Quick Play interview generator. Encapsulates
+/// the reuse-or-spawn + stream + echo-fallback pattern that `interview_generate`
+/// uses whenever it runs the local model (Local mode, or API-fallback under
+/// API mode).
+///
+/// `force_full_ctx`: when `true`, the resident chat backend is taken + shut
+/// down before streaming, forcing a fresh spawn at `local_ctx`. This is the
+/// API-fallback case: the resident backend under API is at the 2048
+/// silent-agent ctx (`effective_local_ctx(Api)`), which is too small for the
+/// ~2340-token interview prompt — so it MUST be re-spawned at the full local
+/// ctx (`settings.context_size`, default 4096). Under Local mode the resident
+/// is already at `settings.context_size`, so `force_full_ctx = false` and the
+/// fast reuse path applies.
+///
+/// Mirrors the spawn-from-shared + readiness-await pattern inline in the
+/// original `interview_generate`. Returns the `ParsedOutput` (or echo
+/// fallback) the same way the chat path does.
+async fn run_interview_local(
+    state: &tauri::State<'_, AppState>,
+    messages: Vec<session::ApiMessage>,
+    local_ctx: u32,
+    on_chunk: llm::ChunkFn,
+    cancel: llm::CancelToken,
+    force_full_ctx: bool,
+) -> Result<chat_format::ParsedOutput, anyhow::Error> {
+    // API-fallback: the resident backend is at 2048 (the silent-agent ctx
+    // maintained by api_connect/boot_load_model) and can't fit the prompt.
+    // Tear it down so the spawn branch below produces a fresh one at
+    // `local_ctx`. Mirrors api_disconnect's pattern (lib.rs ~3849-3873).
+    if force_full_ctx {
+        let old = {
+            let mut g = state.backend.lock().expect("backend mutex");
+            g.take()
+        };
+        if let Some(old) = old {
+            old.shutdown();
+            tracing::info!("interview_generate: torn down 2048 silent-agent backend; re-spawning at full local ctx");
+        }
+    }
+
+    // Reuse the resident backend if one is live (the fast path under Local
+    // mode); otherwise spawn fresh from the shared model at `local_ctx`.
+    let backend_opt = {
+        let existing = state.backend.lock().expect("backend mutex").clone();
+        match existing {
+            Some(b) => Some(b),
+            None => {
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                let backend = llm::LlamaCppBackend::spawn_from_shared(
+                    local_ctx,
+                    Box::new(move |result| {
+                        let _ = tx.send(result);
+                    }),
+                );
+                match backend {
+                    Some(backend) => {
+                        {
+                            let mut g = state.backend.lock().expect("backend mutex");
+                            *g = Some(Arc::clone(&backend));
+                        }
+                        let ready = tokio::task::spawn_blocking(move || rx.blocking_recv())
+                            .await
+                            .map_err(|e| anyhow::anyhow!("interview_generate backend readiness join: {e}"))?;
+                        match ready {
+                            Ok(Ok(_)) => Some(backend),
+                            Ok(Err(e)) => return Err(anyhow::anyhow!("interview_generate backend spawn failed: {e}")),
+                            Err(_) => return Err(anyhow::anyhow!("interview_generate backend readiness dropped")),
+                        }
+                    }
+                    None => None,
+                }
+            }
+        }
+    };
+
+    // If local is unavailable (no model loaded), fall back to EchoBackend so
+    // the UI shows something instead of hanging.
+    if let Some(backend) = backend_opt.as_ref() {
+        backend
+            .stream(messages, None, None, Vec::new(), local_ctx, on_chunk, cancel)
+            .await
+    } else {
+        let echo = llm::EchoBackend;
+        // EchoBackend ignores the messages but takes them by signature.
+        echo.stream(
+            vec![session::ApiMessage {
+                role: "system".into(),
+                content: String::new(),
+                raw_output: String::new(),
+            }],
+            None,
+            None,
+            Vec::new(),
+            local_ctx,
+            Arc::new(|_| {}),
+            cancel,
+        )
+        .await
+    }
+}
+
+#[tauri::command]
+async fn interview_generate(
+    character: String,
+    setting: String,
+    plot: String,
+    extra: String,
+    on_event: tauri::ipc::Channel<serde_json::Value>,
+    // `app` is required by Tauri's command resolution (reserved param) but
+    // unused here — the generation path doesn't touch the filesystem, only
+    // the model + the channel.
+    _app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+) -> Result<(), String> {
+    let answers = interview_prompt::QuickAnswers { character, setting, plot, extra };
+    tracing::info!(
+        has_char = !answers.character.is_empty(),
+        has_setting = !answers.setting.is_empty(),
+        has_plot = !answers.plot.is_empty(),
+        has_extra = !answers.extra.is_empty(),
+        "interview_generate: single-shot Quick Play generation",
+    );
+
+    let cancel: llm::CancelToken = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    {
+        let mut g = state.active_cancel.lock().expect("active_cancel mutex");
+        *g = Some(cancel.clone());
+    }
+
+    let system_prompt = interview_prompt::build_generation_system_prompt(&answers);
+
+    let mut messages: Vec<session::ApiMessage> = Vec::with_capacity(2);
+    messages.push(session::ApiMessage {
+        role: "system".into(),
+        content: system_prompt,
+        raw_output: String::new(),
+    });
+    // Minimal user cue. The system prompt + the folded <user_answers> block
+    // carry all the substance; this just kicks off generation.
+    messages.push(session::ApiMessage {
+        role: "user".into(),
+        content: "Weave the simulation now. Emit the three blocks.".into(),
+        raw_output: String::new(),
+    });
+
+    // Capture the raw output (NOT streamed as content — the three blocks
+    // shouldn't flicker in the UI as half-parsed XML/JSON; the frontend's
+    // void is the progress indicator). We still send a `chunk` heartbeat so
+    // the UI knows generation is alive, but the chunks carry empty text. This
+    // also sidesteps the StreamFilter (which would strip the `<` of every
+    // block-opening tag as a marker prefix) — we read the verbatim raw output.
+    let raw_accumulator: Arc<std::sync::Mutex<String>> = Arc::new(std::sync::Mutex::new(String::new()));
+    let on_chunk: llm::ChunkFn = {
+        let on_event = on_event.clone();
+        let acc = Arc::clone(&raw_accumulator);
+        Arc::new(move |piece: &str| {
+            if let Ok(mut g) = acc.lock() {
+                g.push_str(piece);
+            }
+            let _ = on_event.send(serde_json::json!({ "type": "chunk", "text": "" }));
+        })
+    };
+
+    // Same Chat-lease + spawn/reuse pattern as chat_send. The teardown tears
+    // down the chat backend on the next cross-role acquire (fable/schema).
+    // No tools — generation is a one-shot structured emit, not an agent loop.
+    let context_swap_clone = state.context_swap.clone();
+    let backend_slot = Arc::clone(&state.backend);
+    let source = {
+        let g = state.model_source.lock().expect("model_source mutex");
+        *g
+    };
+    let settings = {
+        let g = state.settings.lock().expect("settings mutex");
+        g.clone()
+    };
+    // The interview system prompt is ~2340 tokens (the three-block
+    // <sim_card>/<world_schema>/<player_state> output contract + format specs
+    // + shape example, measured against the Gemma tokenizer at ~3.45 c/tok).
+    // Under API mode the silent-agent demotion
+    // (`effective_local_ctx(Api) = 2048`) gives only 1536 usable tokens after
+    // the generation reserve → the prompt alone blows the budget (the fix for
+    // the 2026-07-27 "context too long even after truncation" Quick Play
+    // error). So the interview always uses the FULL local ctx
+    // (`settings.context_size`, default 4096 → 3072 usable after the 1024-token
+    // reserve) when it runs locally, AND under API mode it dispatches to the
+    // cloud model first (8192 budget via the active profile) — mirroring
+    // `chat_send`'s API-first + seamless-local-fallback contract. The interview
+    // was previously the only generation path with no API dispatch.
+    //
+    // HISTORY (the regression this comment exists to prevent): the §11.18 fix
+    // assumed `settings.context_size` was still 4000 (→ 3488 usable). The §2C
+    // VRAM-headroom cut had silently lowered the default to 3072 (→ 2304 usable
+    // after the 768 reserve), which is 36 tokens SHORT of the ~2340-token
+    // prompt. The interview deterministically failed on every default-settings
+    // Local install — the §11.18 fix only "worked" on dev machines that either
+    // tested under API mode or carried a pre-§2C 4000 in their settings.json.
+    // The default was raised back to 4096 on 2026-07-27; do NOT lower it again
+    // without first confirming the interview prompt still fits the budget with
+    // margin (recompute: prompt_tokens ≤ ctx - max(ctx/4, 512)).
+    let local_ctx = settings.context_size;
+    let _chat_lease = context_swap_clone
+        .acquire(
+            context_swap::ContextRole::Chat,
+            Box::new(move || {
+                let backend = {
+                    let mut g = backend_slot.lock().map_err(|e| e.to_string())?;
+                    g.take()
+                };
+                if let Some(backend) = backend {
+                    backend.shutdown();
+                    tracing::info!("context-swap: chat backend torn down (interview_generate)");
+                }
+                Ok(())
+            }),
+        )
+        .await;
+
+    // API-first dispatch (mirrors chat_send). Under API mode the cloud model
+    // — which the user selected — handles the interview at its full 8192
+    // budget; the local 12B is untouched (stays at its 2048 silent-agent ctx
+    // for subsequent chat turns). On any API failure or missing profile,
+    // emit the same fallback chip chat_send does and fall through to the
+    // local path below.
+    let stream_result = if source == api::ModelSource::Api {
+        let profile_opt = {
+            let cfg = state.api_config.lock().expect("api_config mutex");
+            cfg.active_profile().cloned()
+        };
+        match profile_opt {
+            Some(profile) => {
+                let http = llm::HttpBackend::new(profile);
+                match http
+                    .stream(messages.clone(), None, None, Vec::new(), settings.context_size, on_chunk.clone(), cancel.clone())
+                    .await
+                {
+                    Ok(text) => Ok(text),
+                    Err(e) => {
+                        tracing::warn!(error = %e, "interview_generate: API stream failed; falling back to local");
+                        let _ = on_event.send(serde_json::json!({
+                            "type": "fallback",
+                            "reason": "api_unreachable",
+                            "source": "local",
+                        }));
+                        // Fall through to the local path. The resident backend
+                        // under API is at the 2048 silent-agent ctx (too small
+                        // for the ~2300-token prompt); the local-path block
+                        // below detects this fallback case and re-spawns at
+                        // `local_ctx` before streaming.
+                        run_interview_local(
+                            &state, messages, local_ctx, on_chunk.clone(), cancel.clone(),
+                            /* force_full_ctx */ true,
+                        )
+                        .await
+                    }
+                }
+            }
+            None => {
+                // No active profile but source=Api. Same seamless fallback.
+                tracing::warn!("interview_generate: source=Api but no active profile; falling back to local");
+                let _ = on_event.send(serde_json::json!({
+                    "type": "fallback",
+                    "reason": "no_active_profile",
+                    "source": "local",
+                }));
+                run_interview_local(
+                    &state, messages, local_ctx, on_chunk.clone(), cancel.clone(),
+                    /* force_full_ctx */ true,
+                )
+                .await
+            }
+        }
+    } else {
+        // Local mode: the resident backend is already at `settings.context_size`
+        // (the Local-mode value of `effective_local_ctx`), so reuse-or-spawn as
+        // normal — no forced re-spawn needed.
+        run_interview_local(
+            &state, messages, local_ctx, on_chunk.clone(), cancel.clone(),
+            /* force_full_ctx */ false,
+        )
+        .await
+    };
+
+    clear_active_cancel(&state);
+
+    let parsed = match stream_result {
+        Ok(p) => p,
+        Err(e) => {
+            let _ = on_event.send(serde_json::json!({
+                "type": "error",
+                "message": format!("generation failed: {e}"),
+            }));
+            return Ok(());
+        }
+    };
+
+    // Prefer the accumulated raw (verbatim, unfiltered) over parsed.raw — the
+    // accumulator captured every piece before any StreamFilter could touch it.
+    let raw_full = {
+        let acc = raw_accumulator.lock().expect("raw accumulator mutex").clone();
+        if acc.trim().is_empty() { parsed.raw } else { acc }
+    };
+
+    match parse_generation_output(&raw_full) {
+        Ok((card, world_schema, player_state)) => {
+            on_event
+                .send(serde_json::json!({
+                    "type": "done",
+                    "card": card,
+                    "world_schema": world_schema,
+                    "player_state": player_state,
+                }))
+                .map_err(|e| e.to_string())?;
+            Ok(())
+        }
+        Err(e) => {
+            tracing::warn!(error = %format!("{e}"), "interview_generate: parse failed");
+            let _ = on_event.send(serde_json::json!({
+                "type": "error",
+                "message": e,
+            }));
+            Ok(())
+        }
+    }
+}
+
+// ===========================================================================
+// Crossroads — "Choose a Director" option generator (§11.24, 2026-07-27).
+//
+// Memoryless one-shot generation (mirrors interview_generate exactly): no
+// session push, no memory archive, Chat-lease acquired, API-first with
+// seamless local fallback. The five lenses (Action / Plot / Character /
+// Explicit / World) each generate exactly 6 options; the parser is defensive
+// + multi-strategy. The result rides the Channel as a single `done` event
+// carrying the parsed options array.
+//
+// CONTEXT FOLDING (the difference from interview_generate): Crossroads gets
+// the LIVE world, not 4 free-text answers. We fold `WorldSchema::render_for_
+// prompt()` (the same snapshot the narrator reads) + the last 6 narrator
+// beats from `fable_session` into the USER message — this is what makes
+// options feel grounded vs. Pathweaver's more generic output. Both locks are
+// held only long enough to snapshot; released before the Chat-lease acquire.
+// ===========================================================================
+
+#[tauri::command]
+async fn crossroads_generate(
+    category: String,
+    player_seed: String,
+    count: Option<u8>,
+    on_event: tauri::ipc::Channel<serde_json::Value>,
+    _app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+) -> Result<(), String> {
+    let cat = crossroads_prompt::CrossroadsCategory::from_id(&category)
+        .ok_or_else(|| format!("crossroads_generate: unknown category {category:?}"))?;
+    // Clamp count defensively: default 6, range 1..=12. The `GenerateOptions`
+    // tool's validate_args enforces this for the tool path; this is the IPC
+    // boundary for direct invocations (e.g. legacy FAB path or a future test
+    // harness).
+    let n = count.unwrap_or(6).clamp(1, 12);
+    let request = crossroads_prompt::CrossroadsRequest {
+        category: Some(cat),
+        player_seed: player_seed.clone(),
+        count: n,
+    };
+    tracing::info!(lens = %cat.id(), has_seed = !player_seed.trim().is_empty(), "crossroads_generate");
+
+    let cancel: llm::CancelToken = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    {
+        let mut g = state.active_cancel.lock().expect("active_cancel mutex");
+        *g = Some(cancel.clone());
+    }
+
+    let system_prompt = crossroads_prompt::build_crossroads_system_prompt(&request);
+
+    // Fold the live world + recent narrator beats into the user message. The
+    // schema render is the same compact snapshot the narrator reads as hard
+    // ground-truth. The 6-beat window (3 exchanges) keeps the context lean;
+    // older beats live in memory and aren't relevant for option generation.
+    let (world_block, beats_block) = {
+        let schema_snapshot = state.fable_schema.lock().await.clone();
+        let world = schema_snapshot.render_for_prompt();
+        let session_snapshot = state.fable_session.lock().await;
+        let msgs = &session_snapshot.messages;
+        let start = msgs.len().saturating_sub(6);
+        let beats: Vec<String> = msgs[start..]
+            .iter()
+            .map(|m| format!("{}: {}", role_label(m.role), m.content))
+            .collect();
+        (world, beats.join("\n\n"))
+    };
+
+    let mut user_content = String::with_capacity(2048);
+    user_content.push_str("[LIVE SCENE]\n");
+    if !world_block.trim().is_empty() {
+        user_content.push_str("Current world state:\n");
+        user_content.push_str(&world_block);
+        user_content.push_str("\n\n");
+    }
+    if !beats_block.trim().is_empty() {
+        user_content.push_str("Recent beats (oldest first):\n");
+        user_content.push_str(&beats_block);
+        user_content.push_str("\n\n");
+    }
+    user_content.push_str("[TASK]\n");
+    user_content.push_str(&format!(
+        "Generate EXACTLY {} options through the {} lens, grounded in the live scene above.\n",
+        crossroads_prompt::count_word_for(n),
+        cat.label()
+    ));
+    user_content.push_str("Follow the OUTPUT_FORMAT from the system instructions exactly. ");
+    user_content.push_str("Do NOT include any preamble.");
+
+    let mut messages: Vec<session::ApiMessage> = Vec::with_capacity(2);
+    messages.push(session::ApiMessage {
+        role: "system".into(),
+        content: system_prompt,
+        raw_output: String::new(),
+    });
+    messages.push(session::ApiMessage {
+        role: "user".into(),
+        content: user_content,
+        raw_output: String::new(),
+    });
+
+    // Same heartbeat pattern as interview_generate: accumulate raw verbatim,
+    // emit empty-text chunks so the UI knows generation is alive without
+    // flickering half-parsed options.
+    let raw_accumulator: Arc<std::sync::Mutex<String>> =
+        Arc::new(std::sync::Mutex::new(String::new()));
+    let on_chunk: llm::ChunkFn = {
+        let on_event = on_event.clone();
+        let acc = Arc::clone(&raw_accumulator);
+        Arc::new(move |piece: &str| {
+            if let Ok(mut g) = acc.lock() {
+                g.push_str(piece);
+            }
+            let _ = on_event.send(serde_json::json!({ "type": "chunk", "text": "" }));
+        })
+    };
+
+    let context_swap_clone = state.context_swap.clone();
+    let backend_slot = Arc::clone(&state.backend);
+    let source = {
+        let g = state.model_source.lock().expect("model_source mutex");
+        *g
+    };
+    let settings = {
+        let g = state.settings.lock().expect("settings mutex");
+        g.clone()
+    };
+    // Crossroads' system prompt is ~1800-2400 tokens depending on lens
+    // (role + lens block + output format + guidelines + final reminder), and
+    // the user message adds the world + 6 beats (~600-900 tokens). The total
+    // comfortably fits the full local ctx (settings.context_size, default
+    // 4096) but exceeds the 2048 silent-agent demotion under API mode. So
+    // under API mode the cloud model handles it (its 8192 budget is more than
+    // enough); under Local mode the resident backend is already at the full
+    // ctx. The API-fallback re-spawn mirrors interview_generate.
+    let local_ctx = settings.context_size;
+    let _chat_lease = context_swap_clone
+        .acquire(
+            context_swap::ContextRole::Chat,
+            Box::new(move || {
+                let backend = {
+                    let mut g = backend_slot.lock().map_err(|e| e.to_string())?;
+                    g.take()
+                };
+                if let Some(backend) = backend {
+                    backend.shutdown();
+                    tracing::info!("context-swap: chat backend torn down (crossroads_generate)");
+                }
+                Ok(())
+            }),
+        )
+        .await;
+
+    let stream_result = if source == api::ModelSource::Api {
+        let profile_opt = {
+            let cfg = state.api_config.lock().expect("api_config mutex");
+            cfg.active_profile().cloned()
+        };
+        match profile_opt {
+            Some(profile) => {
+                let http = llm::HttpBackend::new(profile);
+                match http
+                    .stream(messages.clone(), None, None, Vec::new(), settings.context_size, on_chunk.clone(), cancel.clone())
+                    .await
+                {
+                    Ok(text) => Ok(text),
+                    Err(e) => {
+                        tracing::warn!(error = %e, "crossroads_generate: API stream failed; falling back to local");
+                        let _ = on_event.send(serde_json::json!({
+                            "type": "fallback",
+                            "reason": "api_unreachable",
+                            "source": "local",
+                        }));
+                        run_interview_local(
+                            &state, messages, local_ctx, on_chunk.clone(), cancel.clone(),
+                            /* force_full_ctx */ true,
+                        )
+                        .await
+                    }
+                }
+            }
+            None => {
+                tracing::warn!("crossroads_generate: source=Api but no active profile; falling back to local");
+                let _ = on_event.send(serde_json::json!({
+                    "type": "fallback",
+                    "reason": "no_active_profile",
+                    "source": "local",
+                }));
+                run_interview_local(
+                    &state, messages, local_ctx, on_chunk.clone(), cancel.clone(),
+                    /* force_full_ctx */ true,
+                )
+                .await
+            }
+        }
+    } else {
+        run_interview_local(
+            &state, messages, local_ctx, on_chunk.clone(), cancel.clone(),
+            /* force_full_ctx */ false,
+        )
+        .await
+    };
+
+    clear_active_cancel(&state);
+
+    let parsed = match stream_result {
+        Ok(p) => p,
+        Err(e) => {
+            let _ = on_event.send(serde_json::json!({
+                "type": "error",
+                "message": format!("generation failed: {e}"),
+            }));
+            return Ok(());
+        }
+    };
+
+    let raw_full = {
+        let acc = raw_accumulator.lock().expect("raw accumulator mutex").clone();
+        if acc.trim().is_empty() { parsed.raw } else { acc }
+    };
+
+    let options = crossroads_prompt::parse_options(&raw_full, n as usize);
+    if options.is_empty() {
+        tracing::warn!("crossroads_generate: parser produced zero options");
+        let _ = on_event.send(serde_json::json!({
+            "type": "error",
+            "message": "no parseable options in the model output",
+        }));
+        return Ok(());
+    }
+    on_event
+        .send(serde_json::json!({
+            "type": "done",
+            "options": options,
+        }))
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+// ===========================================================================
+// Ghostwriter — the Fable authoring assistant (§11.24, 2026-07-27).
+//
+// Two modes (Impersonate + Director) over the SAME memoryless one-shot shape
+// as interview_generate. Impersonate returns fleshed-out prose for the
+// compose box; Director returns a single <director_directive> block the
+// frontend stores via fable_director_set below.
+// ===========================================================================
+
+#[tauri::command]
+async fn ghostwriter_generate(
+    mode: String,
+    player_input: String,
+    on_event: tauri::ipc::Channel<serde_json::Value>,
+    _app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+) -> Result<(), String> {
+    let m = guided_prompt::GhostwriterMode::from_id(&mode)
+        .ok_or_else(|| format!("ghostwriter_generate: unknown mode {mode:?}"))?;
+    let request = guided_prompt::GhostwriterRequest {
+        mode: Some(m),
+        player_input: player_input.clone(),
+    };
+    tracing::info!(mode = %mode, has_input = !player_input.trim().is_empty(), "ghostwriter_generate");
+
+    let cancel: llm::CancelToken = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    {
+        let mut g = state.active_cancel.lock().expect("active_cancel mutex");
+        *g = Some(cancel.clone());
+    }
+
+    let system_prompt = guided_prompt::build_ghostwriter_system_prompt(&request);
+
+    let mut messages: Vec<session::ApiMessage> = Vec::with_capacity(2);
+    messages.push(session::ApiMessage {
+        role: "system".into(),
+        content: system_prompt,
+        raw_output: String::new(),
+    });
+    messages.push(session::ApiMessage {
+        role: "user".into(),
+        content: "Generate the output now.".into(),
+        raw_output: String::new(),
+    });
+
+    let raw_accumulator: Arc<std::sync::Mutex<String>> =
+        Arc::new(std::sync::Mutex::new(String::new()));
+    let on_chunk: llm::ChunkFn = {
+        let on_event = on_event.clone();
+        let acc = Arc::clone(&raw_accumulator);
+        Arc::new(move |piece: &str| {
+            if let Ok(mut g) = acc.lock() {
+                g.push_str(piece);
+            }
+            let _ = on_event.send(serde_json::json!({ "type": "chunk", "text": "" }));
+        })
+    };
+
+    let context_swap_clone = state.context_swap.clone();
+    let backend_slot = Arc::clone(&state.backend);
+    let source = {
+        let g = state.model_source.lock().expect("model_source mutex");
+        *g
+    };
+    let settings = {
+        let g = state.settings.lock().expect("settings mutex");
+        g.clone()
+    };
+    // Ghostwriter's system prompt is ~800-1200 tokens — small. But under API
+    // mode the resident backend is at 2048, and even a small prompt benefits
+    // from the API's wider budget when the player's input runs long. Route
+    // the same way as the other one-shots.
+    let local_ctx = settings.context_size;
+    let _chat_lease = context_swap_clone
+        .acquire(
+            context_swap::ContextRole::Chat,
+            Box::new(move || {
+                let backend = {
+                    let mut g = backend_slot.lock().map_err(|e| e.to_string())?;
+                    g.take()
+                };
+                if let Some(backend) = backend {
+                    backend.shutdown();
+                    tracing::info!("context-swap: chat backend torn down (ghostwriter_generate)");
+                }
+                Ok(())
+            }),
+        )
+        .await;
+
+    let stream_result = if source == api::ModelSource::Api {
+        let profile_opt = {
+            let cfg = state.api_config.lock().expect("api_config mutex");
+            cfg.active_profile().cloned()
+        };
+        match profile_opt {
+            Some(profile) => {
+                let http = llm::HttpBackend::new(profile);
+                match http
+                    .stream(messages.clone(), None, None, Vec::new(), settings.context_size, on_chunk.clone(), cancel.clone())
+                    .await
+                {
+                    Ok(text) => Ok(text),
+                    Err(e) => {
+                        tracing::warn!(error = %e, "ghostwriter_generate: API stream failed; falling back to local");
+                        let _ = on_event.send(serde_json::json!({
+                            "type": "fallback",
+                            "reason": "api_unreachable",
+                            "source": "local",
+                        }));
+                        run_interview_local(
+                            &state, messages, local_ctx, on_chunk.clone(), cancel.clone(),
+                            /* force_full_ctx */ true,
+                        )
+                        .await
+                    }
+                }
+            }
+            None => {
+                tracing::warn!("ghostwriter_generate: source=Api but no active profile; falling back to local");
+                let _ = on_event.send(serde_json::json!({
+                    "type": "fallback",
+                    "reason": "no_active_profile",
+                    "source": "local",
+                }));
+                run_interview_local(
+                    &state, messages, local_ctx, on_chunk.clone(), cancel.clone(),
+                    /* force_full_ctx */ true,
+                )
+                .await
+            }
+        }
+    } else {
+        run_interview_local(
+            &state, messages, local_ctx, on_chunk.clone(), cancel.clone(),
+            /* force_full_ctx */ false,
+        )
+        .await
+    };
+
+    clear_active_cancel(&state);
+
+    let parsed = match stream_result {
+        Ok(p) => p,
+        Err(e) => {
+            let _ = on_event.send(serde_json::json!({
+                "type": "error",
+                "message": format!("generation failed: {e}"),
+            }));
+            return Ok(());
+        }
+    };
+
+    let raw_full = {
+        let acc = raw_accumulator.lock().expect("raw accumulator mutex").clone();
+        if acc.trim().is_empty() { parsed.raw } else { acc }
+    };
+
+    // Strip any markdown fence the model wrapped the output in despite the
+    // "no markdown fence" instruction. For Director mode, also extract just
+    // the inner text of the <director_directive> block (the frontend stores
+    // the directive, not the tags — fable_send wraps it again when emitting
+    // the narrator prompt block).
+    let cleaned = strip_code_fence(raw_full.trim());
+    let final_text = match m {
+        guided_prompt::GhostwriterMode::Impersonate => cleaned.trim().to_string(),
+        guided_prompt::GhostwriterMode::Director => {
+            extract_directive_body(&cleaned).unwrap_or_else(|| cleaned.trim().to_string())
+        }
+    };
+
+    on_event
+        .send(serde_json::json!({
+            "type": "done",
+            "text": final_text,
+        }))
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Strip a wrapping ```markdown fence if present.
+fn strip_code_fence(s: &str) -> String {
+    let t = s.trim();
+    if let Some(rest) = t.strip_prefix("```") {
+        let body_start = rest.find('\n').map(|i| i + 1).unwrap_or(rest.len());
+        let body = &rest[body_start..];
+        if let Some(b) = body.strip_suffix("```") {
+            return b.trim().to_string();
+        }
+        return body.trim().to_string();
+    }
+    t.to_string()
+}
+
+/// Extract the inner text of a `<director_directive>…</director_directive>`
+/// block. Returns None if the tags aren't found (the caller falls back to the
+/// raw text — the directive will still flow through, just untrimmed).
+fn extract_directive_body(s: &str) -> Option<String> {
+    let start = s.find("<director_directive>")?;
+    let after_open = &s[start + "<director_directive>".len()..];
+    let end = after_open.find("</director_directive>")?;
+    Some(after_open[..end].trim().to_string())
+}
+
+/// Tiny helper: render a session::Role as a label for the crossroads context
+/// block ("you" for the protagonist, "narrator" for the world voice).
+fn role_label(role: session::Role) -> &'static str {
+    match role {
+        session::Role::User => "you",
+        session::Role::Assistant => "narrator",
+        session::Role::System => "system",
+    }
+}
+
+// ===========================================================================
+// Ghostwriter Director state IPCs (§11.24).
+//
+// `fable_director_set(text)`: arm a one-shot directive. The frontend calls
+// this after Ghostwriter rewrites the player's steer into a clean block.
+// `fable_director_clear()`: explicitly clear (e.g. if the player cancels).
+// `fable_director_peek()`: read the current directive WITHOUT consuming —
+// used by the FAB badge to show "1 directive armed" without firing it.
+//
+// `fable_send` consumes the directive server-side (takes + clears in one
+// atomic lock acquisition at the top of the schema-lock block); there's no
+// dedicated consume IPC.
+// ===========================================================================
+
+#[tauri::command]
+async fn fable_director_set(text: String, state: tauri::State<'_, AppState>) -> Result<(), String> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        // Empty = clear (treat an empty set as a cancel for robustness).
+        let mut g = state.pending_directive.lock().await;
+        *g = None;
+        return Ok(());
+    }
+    let mut g = state.pending_directive.lock().await;
+    *g = Some(trimmed.to_string());
+    tracing::info!("director directive armed (one-shot, will fire on next fable_send)");
+    Ok(())
+}
+
+#[tauri::command]
+async fn fable_director_clear(state: tauri::State<'_, AppState>) -> Result<(), String> {
+    let mut g = state.pending_directive.lock().await;
+    *g = None;
+    Ok(())
+}
+
+#[tauri::command]
+async fn fable_director_peek(state: tauri::State<'_, AppState>) -> Result<Option<String>, String> {
+    let g = state.pending_directive.lock().await;
+    Ok(g.clone())
+}
+
+/// Parse the model's three-block output into a `(SimCard, WorldSchema,
+/// PlayerState)` tuple. Each block is isolated by tag, then parsed by its
+/// native parser with `json_repair` as the JSON fallback. The card is the
+/// load-bearing piece (the others are best-effort seeds: a missing or
+/// malformed world_schema/player_state falls back to default rather than
+/// failing the whole generation).
+///
+/// Returns a clean error string (caller surfaces it to the UI) when the card
+/// itself fails to parse — without a card there's no simulation to enter.
+fn parse_generation_output(
+    raw: &str,
+) -> Result<(sim_card::SimCard, schema::WorldSchema, player_state::PlayerState), String> {
+    let card_xml = extract_sim_card_block(raw);
+    let card = sim_card::parse_from_xml_str(&card_xml)
+        .map_err(|e| format!("the generated card didn't parse: {e}"))?;
+
+    // World schema: best-effort seed. A missing/malformed block falls back to
+    // default — the delta engine will grow it during play.
+    let world_schema = extract_block(raw, "world_schema")
+        .as_deref()
+        .and_then(|json_str| parse_json_lenient::<schema::WorldSchema>(json_str))
+        .unwrap_or_default();
+
+    // Player state: same best-effort contract. Default = fully healthy, zero
+    // wealth/reputation, which is the right starting point for most scenarios.
+    let player_state = extract_block(raw, "player_state")
+        .as_deref()
+        .and_then(|json_str| parse_json_lenient::<player_state::PlayerState>(json_str))
+        .unwrap_or_default();
+
+    Ok((card, world_schema, player_state))
+}
+
+/// Parse a JSON string into T, falling back to `json_repair::repair` on a
+/// direct-parse failure. Returns None on total failure (caller falls back to
+/// default). Used for the schema + player_state blocks where partial output
+/// must not fail the whole generation.
+fn parse_json_lenient<T: serde::de::DeserializeOwned>(json_str: &str) -> Option<T> {
+    let trimmed = json_str.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if let Ok(v) = serde_json::from_str::<T>(trimmed) {
+        return Some(v);
+    }
+    let repaired = json_repair::repair(trimmed);
+    serde_json::from_str::<T>(&repaired).ok()
+}
+
+/// Isolate the `<sim_card>...</sim_card>` block from a raw model output that
+/// may carry Gemma4 channel markers + stray prose. Falls back to the whole
+/// text if no block is found (the parser will then surface a clean error).
+fn extract_sim_card_block(raw: &str) -> String {
+    // sim_card is special: it carries nested XML, so we return the WHOLE
+    // block (tags included) — the card parser expects the <sim_card> wrapper.
+    let open = "<sim_card>";
+    let close = "</sim_card>";
+    if let Some(start) = raw.find(open) {
+        if let Some(end_rel) = raw[start..].find(close) {
+            let end = start + end_rel + close.len();
+            return raw[start..end].to_owned();
+        }
+    }
+    // No clean block found — return the whole thing + let the parser error
+    // out with a useful message (the caller surfaces it to the UI).
+    raw.to_owned()
+}
+
+/// Isolate the inner text of a `<tag>...</tag>` block from a raw model
+/// output. Returns the inner content (between the tags, NOT including the
+/// tags themselves) so JSON parsers / downstream consumers get a clean body.
+/// Returns None when the tag isn't found. For the `sim_card` block the caller
+/// wants the tags included (the XML parser needs them), so it re-wraps via
+/// `extract_sim_card_block` above; for the JSON-shaped `world_schema` and
+/// `player_state` blocks the inner text is what we want.
+fn extract_block(raw: &str, tag: &str) -> Option<String> {
+    let open = format!("<{tag}>");
+    let close = format!("</{tag}>");
+    let start = raw.find(&open)?;
+    let after_open = start + open.len();
+    let end_rel = raw[after_open..].find(&close)?;
+    let end = after_open + end_rel;
+    Some(raw[after_open..end].trim().to_owned())
+}
+
+/// Whether a Quick Play quicksave exists on disk. Drives the title-screen
+/// inline Resume/Start-New choice (no quicksave → straight into the interview).
+#[tauri::command]
+fn fable_quick_exists(app: tauri::AppHandle) -> Result<bool, String> {
+    let fable_root = resolve_apps_dir(&app).join("fable");
+    Ok(fable_save::quick_save_exists(&fable_root))
+}
+
+/// Enter a brand-new Quick Play session from a freshly-generated card. The
+/// frontend calls this after `interview_generate` returns a card + the
+/// optional seed world/player state. Wipes the prior quick play's memory
+/// partition + session/schema files (the locked "new Quick Play overwrites
+/// everything" contract), seats the card in memory, sets `is_quick_play =
+/// true`, seeds the world schema + player state (when the generation
+/// produced them), and hands off to the shared `enter_fable_session` helper
+/// (the in-memory card path — no .sim on disk).
+///
+/// The card's id is overridden to the fixed `QUICK_PLAY_CARD_ID` sentinel so
+/// the per-card saves/sessions/schemas dirs are stable across runs.
+///
+/// `world_schema` + `player_state` are optional: `interview_generate` always
+/// emits them, but they may be `None` here if a future caller wants the
+/// default (empty) world. When `Some`, they OVERRIDE the fresh-game default
+/// that `enter_fable_session` would otherwise install.
+#[tauri::command]
+async fn fable_quick_start(
+    mut card: sim_card::SimCard,
+    world_schema: Option<schema::WorldSchema>,
+    player_state: Option<player_state::PlayerState>,
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+) -> Result<FableLoadResult, String> {
+    tracing::info!(orig_id = %card.id, "fable_quick_start: entering Quick Play session");
+
+    // Refuse if a game is already running (defense-in-depth, mirrors
+    // fable_start).
+    {
+        let existing = state.fable_engine.lock().expect("fable_engine mutex");
+        if existing.is_some() {
+            return Err("a game is already running: call fable_end first".into());
+        }
+    }
+
+    // Override the card id to the fixed sentinel. The id the model emitted
+    // is discarded (it's only for display inside the card XML). The sentinel
+    // is what scopes the saves/sessions/schemas/memory for Quick Play.
+    card.id = fable_save::QUICK_PLAY_CARD_ID.to_owned();
+    card.card_type = "roleplay".to_owned();
+
+    let fable_root = resolve_apps_dir(&app).join("fable");
+
+    // Wipe the prior Quick Play state for a true clean slate. Memory first
+    // (codex-safe wipe — Quick Play has no codex, so this just nukes episodic
+    // rows), then the on-disk session/schema files, then any prior quicksave.
+    // The memory wipe MUST happen under the QUICK_PLAY_CARD_ID partition
+    // (before enter_fable_session swaps active_card_id).
+    if let Some(engine) = state.memory.get() {
+        match engine.wipe_episodic_card(fable_save::QUICK_PLAY_CARD_ID).await {
+            Ok(n) => tracing::info!(wiped = n, "fable_quick_start: wiped prior quick-play memory"),
+            Err(e) => tracing::warn!(error = %format!("{e}"), "fable_quick_start: memory wipe failed (continuing)"),
+        }
+    }
+    let _ = fable_save::delete_quick_save(&fable_root);
+    let session_path = resolve_session_path(&fable_root, fable_save::QUICK_PLAY_CARD_ID);
+    let schema_path = resolve_schema_path(&fable_root, fable_save::QUICK_PLAY_CARD_ID);
+    let _ = tokio::fs::remove_file(&session_path).await;
+    let _ = tokio::fs::remove_file(&schema_path).await;
+
+    // Mark this as a Quick Play session (drives the autosave branch in
+    // fable_send + the frontend's Save/Load disable).
+    *state.is_quick_play.lock().expect("is_quick_play mutex") = true;
+
+    let model_path = resolve_model_path(&app)
+        .ok_or_else(|| "no WUPI.gguf found: cannot start quick play".to_string())?;
+    let card_id_for_meta = card.id.clone();
+    let result = enter_fable_session(card, None, true, model_path, card_id_for_meta, &app, &state).await?;
+
+    // Seed the world schema + player state from the generation output.
+    // `enter_fable_session`'s fresh-game branch installed defaults; here we
+    // OVERRIDE them with whatever the model produced. Best-effort: the seeds
+    // are already-validated (they parsed cleanly in `parse_generation_output`),
+    // so the lock-then-write is a one-shot replacement.
+    let mut seeded_summary = String::new();
+    let mut seeded_entities = 0u32;
+    let mut seeded_player_default = false;
+    // Quick-start is a session boundary: clear the undo ring BEFORE seeding
+    // the new schema (the prior history belongs to a different game). Done
+    // outside the schema lock to keep lock-ordering uniform across all
+    // history callers (history-only → schema-only, never nested).
+    clear_fable_history(&state).await;
+    {
+        let mut s = state.fable_schema.lock().await;
+        if let Some(ws) = world_schema {
+            seeded_summary = ws.summary.clone();
+            seeded_entities = ws.entities.len() as u32;
+            s.summary = ws.summary;
+            s.recent_events = ws.recent_events;
+            // Merge entities rather than wholesale-replace: the default is
+            // empty so this is equivalent to assignment, but the merge keeps
+            // the contract honest if a future default ever seeds anything.
+            for (k, v) in ws.entities { s.entities.insert(k, v); }
+            // Player state lives INSIDE WorldSchema (schema.rs §2); install
+            // the player_state seed if one was provided, else leave whatever
+            // default the schema carries.
+            if let Some(ps) = player_state {
+                s.player_state = ps;
+            } else {
+                seeded_player_default = true;
+            }
+        } else if let Some(ps) = player_state {
+            s.player_state = ps;
+        } else {
+            seeded_player_default = true;
+        }
+    }
+    if seeded_entities > 0 || !seeded_summary.is_empty() {
+        tracing::info!(
+            entities = seeded_entities,
+            summary_len = seeded_summary.len(),
+            player_default = seeded_player_default,
+            "fable_quick_start: seeded world schema from generation output",
+        );
+    }
+
+    Ok(result)
+}
+
+/// Resume the existing Quick Play quicksave. Loads the bundled card out of
+/// the save file, seats it in memory, sets `is_quick_play = true`, and hands
+/// off to `enter_fable_session` with the quicksave slot (which loads the
+/// bundled session + schema). Errors cleanly if no quicksave exists.
+#[tauri::command]
+async fn fable_quick_resume(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+) -> Result<FableLoadResult, String> {
+    tracing::info!("fable_quick_resume: loading quicksave");
+
+    {
+        let existing = state.fable_engine.lock().expect("fable_engine mutex");
+        if existing.is_some() {
+            return Err("a game is already running: call fable_end first".into());
+        }
+    }
+
+    let fable_root = resolve_apps_dir(&app).join("fable");
+    let save = {
+        let fable_root_clone = fable_root.clone();
+        tokio::task::spawn_blocking(move || fable_save::load_quick_save(&fable_root_clone))
+            .await
+            .map_err(|e| format!("load quicksave join: {e}"))?
+            .map_err(|e| format!("failed to load quicksave: {e}"))?
+    };
+    let card = save.card.clone().ok_or_else(|| {
+        "quicksave has no bundled card (corrupt or pre-Quick Play save)".to_string()
+    })?;
+
+    *state.is_quick_play.lock().expect("is_quick_play mutex") = true;
+
+    let model_path = resolve_model_path(&app)
+        .ok_or_else(|| "no WUPI.gguf found: cannot resume quick play".to_string())?;
+    let card_id_for_meta = card.id.clone();
+    // Pass Some(QUICKSAVE_ID) so enter_fable_session loads the bundled
+    // session + schema from the save file (the resume path).
+    enter_fable_session(
+        card,
+        Some(fable_save::QUICKSAVE_ID.to_owned()),
+        false,
+        model_path,
+        card_id_for_meta,
+        &app,
+        &state,
+    )
+    .await
+}
+
+/// Wipe the Quick Play quicksave + memory + session/schema before starting a
+/// brand-new interview. Called by the frontend when the user picks "Start
+/// New" from the inline choice (so the new interview starts from a clean
+/// slate, not layered on top of the old one). Idempotent.
+#[tauri::command]
+async fn fable_quick_reset(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+) -> Result<(), String> {
+    tracing::info!("fable_quick_reset: wiping prior quick play");
+    let fable_root = resolve_apps_dir(&app).join("fable");
+    let _ = fable_save::delete_quick_save(&fable_root);
+    let session_path = resolve_session_path(&fable_root, fable_save::QUICK_PLAY_CARD_ID);
+    let schema_path = resolve_schema_path(&fable_root, fable_save::QUICK_PLAY_CARD_ID);
+    let _ = tokio::fs::remove_file(&session_path).await;
+    let _ = tokio::fs::remove_file(&schema_path).await;
+    if let Some(engine) = state.memory.get() {
+        let _ = engine.wipe_episodic_card(fable_save::QUICK_PLAY_CARD_ID).await;
+    }
+    Ok(())
+}
+
+/// Query the in-memory Quick Play flag. The frontend's stage uses this to
+/// disable the manual Save/Load footer buttons (Quick Play is single-slot
+/// quicksave only — Save/Load are irrelevant).
+#[tauri::command]
+fn is_quick_play(state: tauri::State<'_, AppState>) -> Result<bool, String> {
+    let g = state.is_quick_play.lock().expect("is_quick_play mutex");
+    Ok(*g)
 }
 
 /// List all save slots for a card. Used by the Load Game screen. Most-recent
@@ -4861,16 +6946,138 @@ async fn player_state_get(
     state: tauri::State<'_, AppState>,
 ) -> Result<serde_json::Value, String> {
     // Bail when no game is active — the stats panel shouldn't be queryable
-    // from the title screen. Cheap check under the std Mutex.
-    {
-        let guard = state.fable_engine.lock().expect("fable_engine mutex");
-        if guard.is_none() {
-            return Err("no fable game active: call fable_start first".to_string());
-        }
+    // from the title screen. Use `active_fable_card` (NOT `fable_engine`):
+    // under the §2B VRAM swap-lock the engine is evicted whenever chat/schema
+    // acquires the lease, so the engine slot is regularly `None` mid-game.
+    // The card, by contrast, is seated on `fable_start` / `fable_quick_start`
+    // and cleared on `fable_end` — the true game-lifetime signal. Same fix
+    // as `fable_is_active` (lib.rs ~2099) and `fable_rollback` below.
+    if !fable_is_active(&state) {
+        return Err("no fable game active: call fable_start first".to_string());
     }
     let s = state.fable_schema.lock().await;
     Ok(serde_json::to_value(&s.player_state)
         .map_err(|e| format!("serialize player state: {e}"))?)
+}
+
+/// A single entity-key change in a rollback diff (1-click undo, 2026-07-27).
+/// `before`/`after` are `Option` because the diff covers set, change, AND
+/// delete (None = key absent in that snapshot).
+#[derive(Clone, Debug, serde::Serialize)]
+struct EntityDiff {
+    key: String,
+    before: Option<String>,
+    after: Option<String>,
+}
+
+/// The structured diff between two consecutive `fable_schema` snapshots.
+/// Emitted by `fable_rollback` so the frontend drawer can visually render
+/// exactly what changed (e.g. "Gold: 100 → 80", "Marcus: tavern → blacksmith",
+/// "Iron Sword: removed"). Pure value type — computed by `diff_schemas`.
+#[derive(Clone, Debug, serde::Serialize)]
+struct RollbackDiff {
+    entities_changed: Vec<EntityDiff>,
+    summary_changed: bool,
+    /// The schema's recent_events grew or shrank (rare for a single undo).
+    events_count_before: usize,
+    events_count_after: usize,
+}
+
+/// Compute the diff between two `WorldSchema` snapshots. Pure fn — no locks,
+/// no I/O. Used by `fable_rollback` to report what was undone. Entity keys
+/// are unioned; for each, before/after are looked up (None = absent).
+/// Summary + recent_events counts are compared directly. PlayerState / clock
+/// / immutable_keys / scene_pacing changes are NOT surfaced in the diff
+/// (kept to the user-visible "what the world looks like" surface; a future
+/// revision can extend if needed).
+fn diff_schemas(before: &schema::WorldSchema, after: &schema::WorldSchema) -> RollbackDiff {
+    use std::collections::HashSet;
+    let keys: HashSet<&str> = before
+        .entities
+        .keys()
+        .chain(after.entities.keys())
+        .map(|s| s.as_str())
+        .collect();
+    let mut entities_changed: Vec<EntityDiff> = keys
+        .into_iter()
+        .filter_map(|k| {
+            let b = before.entities.get(k).cloned();
+            let a = after.entities.get(k).cloned();
+            if b == a {
+                None
+            } else {
+                Some(EntityDiff {
+                    key: k.to_owned(),
+                    before: b,
+                    after: a,
+                })
+            }
+        })
+        .collect();
+    // Sort for deterministic IPC output (frontend may diff consecutive
+    // rollbacks; stable order keeps the diff meaningful).
+    entities_changed.sort_by(|a, b| a.key.cmp(&b.key));
+    RollbackDiff {
+        entities_changed,
+        summary_changed: before.summary != after.summary,
+        events_count_before: before.recent_events.len(),
+        events_count_after: after.recent_events.len(),
+    }
+}
+
+/// Roll the game's world schema back to its state before the last mutation
+/// (1-click undo, 2026-07-27). Pops the last snapshot from
+/// `fable_schema_history` and restores it as the live `fable_schema`. The
+/// diff between the post-rollback (popped) state and the pre-rollback (live)
+/// state is emitted as a `fable_rollback` Tauri event AND returned so the
+/// UI can show "Gold: 100 → 80" etc. Bypasses the immutability lock, same
+/// precedent as `fable_load_save` (the §5 contract applies to LLM deltas,
+/// not user-initiated restore). Errors if the history is empty.
+#[tauri::command]
+async fn fable_rollback(
+    state: tauri::State<'_, AppState>,
+    app: tauri::AppHandle,
+) -> Result<RollbackDiff, String> {
+    // Bail when no game is active (undo is meaningless on the title screen).
+    // Use `fable_is_active` (active_fable_card check), NOT `fable_engine` —
+    // under the §2B VRAM swap-lock the engine slot is `None` whenever chat/
+    // schema holds the lease, which is the default state between turns. The
+    // prior `fable_engine.is_none()` check made rollback unreachable in the
+    // common case (2026-07-27 playtest finding). Mirrors `player_state_get`.
+    if !fable_is_active(&state) {
+        return Err("no fable game active: call fable_start first".to_string());
+    }
+    let prior = {
+        let mut hist = state.fable_schema_history.lock().await;
+        hist.pop_back()
+    };
+    let prior = prior.ok_or_else(|| "nothing to roll back: history is empty".to_string())?;
+    let diff = {
+        let live = state.fable_schema.lock().await;
+        // diff_schemas(prior=before-rollback-state, live=after-rollback-state):
+        // the diff describes what will change WHEN we restore `prior`. The
+        // emitted event reports "before/after" from the player's POV (what
+        // they currently see → what they'll see post-undo), so we pass
+        // (prior, live).
+        diff_schemas(&prior, &live)
+    };
+    // Restore: wholesale overwrite, same shape as fable_load_save. Bypasses
+    // the immutability lock by design (user-initiated restore).
+    *state.fable_schema.lock().await = prior;
+    tracing::info!(
+        entities_changed = diff.entities_changed.len(),
+        summary_changed = diff.summary_changed,
+        "fable_rollback: restored prior world state"
+    );
+    let _ = app.emit("fable_rollback", &diff);
+    Ok(diff)
+}
+
+/// Return the current depth of the schema history ring buffer. The frontend
+/// uses this to enable/disable the undo button (depth == 0 → nothing to undo).
+#[tauri::command]
+async fn fable_history_depth(state: tauri::State<'_, AppState>) -> Result<usize, String> {
+    Ok(state.fable_schema_history.lock().await.len())
 }
 
 /// Save the current game state into a named slot. `save_id` of "autosave"
@@ -4982,6 +7189,7 @@ async fn fable_load_save(
         .collect();
     *state.fable_session.lock().await = save.session;
     *state.fable_schema.lock().await = save.schema;
+    clear_fable_history(&state).await;
     tracing::info!(save_id = %meta.save_id, "game state loaded");
     // opening_scene is None on a save-load: resumed games render their feed
     // from `messages`, not from the card's opening beat. Only fresh starts
@@ -5026,7 +7234,551 @@ fn fable_delete_save(
         .map_err(|e| format!("delete save '{save_id}': {e}"))
 }
 
-/// Resolve the roleplay scenario cards dir. Per §8C scenario `.sim` files
+// =============================================================
+// FABLE EDIT / REROLL / REWIND (UX chat controls — 2026-07-27)
+//
+// Three pure mutators over `fable_session`. They touch ONLY the message
+// history — the schema ring buffer (`AppState::fable_schema_history`,
+// landed in parallel work) is owned by `fable_rollback`. So each command
+// here returns `schema_pop_count` (the number of schema snapshots the
+// caller must pop to keep world state aligned with the new timeline):
+//   edit_message           → 0  (in-place typo fix, no turns removed)
+//   reroll_last_turn       → 1  (the bad AI turn is gone)
+//   rewind_and_edit_user   → N  (count of assistant turns truncated away)
+//
+// The frontend consumes `schema_pop_count` and invokes `fable_rollback`
+// (or its successor) that many times after rebuilding the feed.
+//
+// The commands are PURE: no Channel, no engine. After mutating + persisting
+// they return the new `messages[]` (same shape as `fable_quick_resume`) so
+// the frontend can rebuild the feed via `loadHistory`, then re-invoke
+// `fable_send(text, { regenerate: true })` for reroll / rewind-and-edit.
+// `edit_message` does NOT re-trigger inference (per spec).
+//
+// Core logic is split into pure helpers (apply_*) that take `&mut
+// Conversation` and are unit-tested without Tauri plumbing; the
+// `#[tauri::command]` wrappers are thin shells that lock + call the
+// helper + persist.
+// =============================================================
+
+/// Return shape for the three mutation commands. Mirrors `FableLoadResult`'s
+/// `messages` field (role as lowercase string, content trimmed — no
+/// `raw_output`/`reasoning`/`id`/`timestamp` leaked to the UI) plus
+/// `schema_pop_count` so the parallel schema-ring-buffer work can pop the
+/// matching number of snapshots when it lands.
+#[derive(Debug, Clone, serde::Serialize)]
+struct EditResponse {
+    messages: Vec<FableLoadMessage>,
+    schema_pop_count: usize,
+}
+
+/// In-place content overwrite for either a user or assistant message. Does
+/// NOT change role/id/timestamp. Clears `raw_output` so a stale raw can't
+/// desync a future KV-cache-coherent re-render (the edited content is now
+/// the source of truth). Returns `Err` on out-of-bounds.
+fn apply_edit(conv: &mut session::Conversation, index: usize, new_text: String) -> Result<(), String> {
+    let len = conv.messages.len();
+    let msg = conv
+        .messages
+        .get_mut(index)
+        .ok_or_else(|| format!("edit_message: index {index} out of bounds (len {len})"))?;
+    msg.content = new_text;
+    msg.raw_output.clear();
+    Ok(())
+}
+
+/// Pop the last message (the assistant turn being re-rolled). Returns `Err`
+/// if the last message isn't an assistant turn (can't reroll a user turn or
+/// an empty conversation). After this the last message is the user turn to
+/// regenerate from.
+fn apply_reroll(conv: &mut session::Conversation) -> Result<(), String> {
+    match conv.messages.last() {
+        Some(m) if m.role == session::Role::Assistant => {
+            conv.pop_last_message();
+            Ok(())
+        }
+        Some(_) => Err("reroll_last_turn: last message is not an assistant turn".into()),
+        None => Err("reroll_last_turn: conversation is empty".into()),
+    }
+}
+
+/// Truncate right after `index` (drops everything past the target user
+/// message), then overwrite the target with `new_text`. The edited user
+/// message is now the last message. Counts how many assistant turns were
+/// removed by the truncation and returns that count so the caller can pop
+/// the schema ring buffer in step. Returns `Err` if `index` is out of
+/// bounds or doesn't point at a user message.
+fn apply_rewind_and_edit(
+    conv: &mut session::Conversation,
+    index: usize,
+    new_text: String,
+) -> Result<usize, String> {
+    let len = conv.messages.len();
+    let target_role = conv
+        .messages
+        .get(index)
+        .map(|m| m.role)
+        .ok_or_else(|| format!("rewind_and_edit_user: index {index} out of bounds (len {len})"))?;
+    if target_role != session::Role::User {
+        return Err(format!(
+            "rewind_and_edit_user: index {index} is not a user message (role {target_role:?})"
+        ));
+    }
+    // Count assistant turns that will be removed by the truncation BEFORE we
+    // mutate, so the count is computed on the pre-truncation vector.
+    let deleted_assistant = conv.messages[index + 1..]
+        .iter()
+        .filter(|m| m.role == session::Role::Assistant)
+        .count();
+    conv.messages.truncate(index + 1);
+    // Now overwrite the target (still at `index`, now the last message).
+    apply_edit(conv, index, new_text)?;
+    Ok(deleted_assistant)
+}
+
+/// Splice a regenerated passage into the middle of an assistant message's
+/// `content`. The selective-regenerate UX chat control (the 4th sibling of
+/// edit/reroll/rewind, §11.23): the player highlighted a passage of the last
+/// AI beat, the model produced a replacement, and this helper swaps the
+/// highlighted slice for the replacement in-place.
+///
+/// `before` + `highlight` + `after` are the three pieces the frontend
+/// extracted from the beat's body when the popup fired. We RECONSTRUCT the
+/// expected current content as `before + highlight + after` and require it
+/// to be a contiguous substring of the live message — defensive against a
+/// stale UI snapshot (a concurrent edit, a memory injection, anything that
+/// touched the beat between popup and confirm). On mismatch we refuse rather
+/// than corrupt the prose: a failed splice is recoverable (the player just
+/// re-highlights), a corrupted beat is not.
+///
+/// Like `apply_edit`, this is a pure content overwrite that does NOT branch
+/// the timeline and does NOT touch the schema (`schema_pop_count = 0` — same
+/// line as edit_message). The splice is a prose-level fix, not a turn.
+fn apply_regenerate_slice(
+    conv: &mut session::Conversation,
+    index: usize,
+    before: String,
+    highlight: String,
+    after: String,
+    replacement: String,
+) -> Result<(), String> {
+    let len = conv.messages.len();
+    let msg = conv
+        .messages
+        .get_mut(index)
+        .ok_or_else(|| format!("regenerate_slice: index {index} out of bounds (len {len})"))?;
+    if msg.role != session::Role::Assistant {
+        return Err(format!(
+            "regenerate_slice: index {index} is not an assistant message (role {:?}) — selective regenerate is last-AI-beat only",
+            msg.role
+        ));
+    }
+    // Reconstruct the expected pre-splice content. The frontend sent us the
+    // three slices it saw when the popup fired; if the live content no longer
+    // contains that exact concatenation, the snapshot is stale and we bail.
+    let expected = format!("{before}{highlight}{after}");
+    match msg.content.find(&expected) {
+        Some(start) => {
+            // Single splice site (the first occurrence). Replace `expected`
+            // with `before + replacement + after` — i.e. swap the highlight
+            // for the replacement, keep the anchors verbatim.
+            let mut new_content = String::with_capacity(msg.content.len() + replacement.len());
+            new_content.push_str(&msg.content[..start]);
+            new_content.push_str(&before);
+            new_content.push_str(&replacement);
+            new_content.push_str(&after);
+            new_content.push_str(&msg.content[start + expected.len()..]);
+            msg.content = new_content;
+            // Clear raw_output so a stale raw can't desync a future KV-cache-
+            // coherent re-render (the spliced content is now the source of
+            // truth — mirrors apply_edit).
+            msg.raw_output.clear();
+            Ok(())
+        }
+        None => Err(format!(
+            "regenerate_slice: the before+highlight+after snapshot no longer matches the live message content — the beat changed between popup and confirm; re-highlight and try again"
+        )),
+    }
+}
+
+
+/// Render a snapshot of the conversation as the wire shape the frontend
+/// expects (lowercase role + content, no internals). Mirrors the projection
+/// used by `fable_load_save` / `fable_quick_resume`.
+fn project_messages(conv: &session::Conversation) -> Vec<FableLoadMessage> {
+    conv.messages
+        .iter()
+        .map(|m| FableLoadMessage {
+            role: match m.role {
+                session::Role::User => "user",
+                session::Role::Assistant => "assistant",
+                session::Role::System => "system",
+            },
+            content: m.content.clone(),
+        })
+        .collect()
+}
+
+/// Resolve the active fable card_id for persistence. Quick Play uses the
+/// fixed `__quickplay__` sentinel; otherwise the active roleplay card's id.
+/// Errors if no game is seated (the mutation commands require an active
+/// game — they're meaningless without one).
+fn active_fable_card_id(state: &AppState) -> Result<String, String> {
+    let is_quick = *state.is_quick_play.lock().expect("is_quick_play mutex");
+    if is_quick {
+        return Ok(fable_save::QUICK_PLAY_CARD_ID.to_owned());
+    }
+    let guard = state.active_fable_card.lock().expect("active_fable_card mutex");
+    guard
+        .as_ref()
+        .map(|c| c.id.clone())
+        .ok_or_else(|| "no active fable card: call fable_start first".to_string())
+}
+
+/// Persist `fable_session` to `<fable_root>/sessions/<card_id>.json`. Used
+/// by the three mutation commands. Unlike the best-effort autosave in
+/// `fable_send`, failures here are surfaced to the caller (the user
+/// explicitly initiated the mutation — silent data loss would be a bug).
+async fn persist_fable_session(
+    app: &tauri::AppHandle,
+    state: &AppState,
+    card_id: &str,
+) -> Result<(), String> {
+    let fable_root = resolve_apps_dir(app).join("fable");
+    let path = resolve_session_path(&fable_root, card_id);
+    // Snapshot under the lock, drop the guard, then do the blocking write.
+    // Atomic save (temp+fsync+rename) lives in `Conversation::save`.
+    let snapshot = {
+        let gs = state.fable_session.lock().await;
+        gs.clone()
+    };
+    tokio::task::spawn_blocking(move || snapshot.save(&path))
+        .await
+        .map_err(|e| format!("persist_fable_session join: {e}"))?
+        .map_err(|e| format!("persist_fable_session write: {e}"))
+}
+
+/// In-place typo/content fix for either a user or assistant message. Locks
+/// the session, applies the edit, persists, returns the new message list.
+/// Does NOT trigger inference (per spec §1) and does NOT touch the schema
+/// (schema_pop_count = 0).
+#[tauri::command]
+async fn edit_message(
+    index: usize,
+    new_text: String,
+    state: tauri::State<'_, AppState>,
+    app: tauri::AppHandle,
+) -> Result<EditResponse, String> {
+    let card_id = active_fable_card_id(&state)?;
+    let messages = {
+        let mut gs = state.fable_session.lock().await;
+        apply_edit(&mut gs, index, new_text)?;
+        project_messages(&gs)
+    };
+    persist_fable_session(&app, &state, &card_id).await?;
+    Ok(EditResponse { messages, schema_pop_count: 0 })
+}
+
+/// Regenerate the AI's last response. Pops the last (assistant) message so
+/// the user turn becomes the regeneration seed, persists, returns the new
+/// message list + schema_pop_count = 1 (the caller pops one schema
+/// snapshot to undo the bad turn's world-state mutation). The frontend
+/// then re-invokes `fable_send(text, { regenerate: true })` with the now-
+/// last user message's text.
+#[tauri::command]
+async fn reroll_last_turn(
+    state: tauri::State<'_, AppState>,
+    app: tauri::AppHandle,
+) -> Result<EditResponse, String> {
+    let card_id = active_fable_card_id(&state)?;
+    let messages = {
+        let mut gs = state.fable_session.lock().await;
+        apply_reroll(&mut gs)?;
+        project_messages(&gs)
+    };
+    persist_fable_session(&app, &state, &card_id).await?;
+    Ok(EditResponse { messages, schema_pop_count: 1 })
+}
+
+/// Branch the timeline: edit a user message from N turns ago. Truncates the
+/// conversation right after the target index (dropping every subsequent
+/// AI/user turn), overwrites the target with `new_text`, persists, returns
+/// the new message list + schema_pop_count = (count of assistant turns the
+/// truncation removed). The frontend rebuilds the feed and re-invokes
+/// `fable_send(text, { regenerate: true })` with the edited text.
+#[tauri::command]
+async fn rewind_and_edit_user(
+    index: usize,
+    new_text: String,
+    state: tauri::State<'_, AppState>,
+    app: tauri::AppHandle,
+) -> Result<EditResponse, String> {
+    let card_id = active_fable_card_id(&state)?;
+    let (messages, schema_pop_count) = {
+        let mut gs = state.fable_session.lock().await;
+        let pop = apply_rewind_and_edit(&mut gs, index, new_text)?;
+        (project_messages(&gs), pop)
+    };
+    persist_fable_session(&app, &state, &card_id).await?;
+    Ok(EditResponse { messages, schema_pop_count })
+}
+
+// ===========================================================================
+// Selective Regenerate — highlight-to-regenerate a slice of the last AI beat
+// (the 4th UX chat control, §11.23 sibling).
+//
+// Memoryless one-shot generation that mirrors `ghostwriter_generate`'s shape
+// (API-first + seamless local fallback, Chat-lease acquired, real-text chunks
+// streamed live via the Channel). The difference: instead of dropping the
+// result into a compose box or directive slot, the result is SPLICED into the
+// highlighted beat in-place via `apply_regenerate_slice` (same pure-helper +
+// persist + project pattern as the other three mutation commands).
+//
+// Channel event shapes (the contract, paralleling fable_send + ghostwriter):
+//   { type: 'chunk', text }              — live replacement text (the user
+//                                          sees the gap refill in real time)
+//   { type: 'done',  messages, schema_pop_count, replacement }
+//                                        — splice applied server-side; the
+//                                          frontend rebuilds from `messages`.
+//   { type: 'fallback', reason, source } — API dropped, local took over
+//   { type: 'error',  message }          — generation or splice failed
+//
+// `schema_pop_count` is always 0 (in-place prose splice, same line as
+// `apply_edit` — no turns removed, no world-state mutation to undo).
+// ===========================================================================
+
+#[tauri::command]
+async fn regenerate_slice(
+    index: usize,
+    before: String,
+    highlight: String,
+    after: String,
+    on_event: tauri::ipc::Channel<serde_json::Value>,
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+) -> Result<(), String> {
+    // Defensive: refuse an empty highlight up front (the frontend popup only
+    // appears on a non-empty selection, but a stale click race could send one).
+    if highlight.trim().is_empty() {
+        return Err("regenerate_slice: highlight is empty".into());
+    }
+    let request = regenerate_slice_prompt::RegenerateSliceRequest {
+        before: before.clone(),
+        highlight: highlight.clone(),
+        after: after.clone(),
+    };
+    tracing::info!(
+        index,
+        hl_len = highlight.len(),
+        has_before = !before.is_empty(),
+        has_after = !after.is_empty(),
+        "regenerate_slice"
+    );
+
+    let cancel: llm::CancelToken = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    {
+        // Dedicated `active_slice_cancel` slot (NOT `active_cancel`) — same
+        // Bug #7 cross-wire lesson as `active_fable_cancel` (§2C). Currently
+        // unreachable from the UI, but the symmetric slot removes the latent
+        // footgun where a future direct-`chat_stop` caller could cancel a
+        // slice regen mid-stream.
+        let mut g = state.active_slice_cancel.lock().expect("active_slice_cancel mutex");
+        *g = Some(cancel.clone());
+    }
+
+    let system_prompt = regenerate_slice_prompt::build_regenerate_slice_system_prompt(&request);
+
+    let mut messages: Vec<session::ApiMessage> = Vec::with_capacity(2);
+    messages.push(session::ApiMessage {
+        role: "system".into(),
+        content: system_prompt,
+        raw_output: String::new(),
+    });
+    messages.push(session::ApiMessage {
+        role: "user".into(),
+        content: "Rewrite the highlighted passage now.".into(),
+        raw_output: String::new(),
+    });
+
+    // Stream real text chunks (unlike Crossroads/Ghostwriter's empty-text
+    // heartbeats — the user watches the gap refill, so each piece matters).
+    // Accumulate raw verbatim so the post-stream cleanup can strip any fence.
+    let raw_accumulator: Arc<std::sync::Mutex<String>> =
+        Arc::new(std::sync::Mutex::new(String::new()));
+    let on_chunk: llm::ChunkFn = {
+        let on_event = on_event.clone();
+        let acc = Arc::clone(&raw_accumulator);
+        Arc::new(move |piece: &str| {
+            if let Ok(mut g) = acc.lock() {
+                g.push_str(piece);
+            }
+            let _ = on_event.send(serde_json::json!({ "type": "chunk", "text": piece }));
+        })
+    };
+
+    let context_swap_clone = state.context_swap.clone();
+    let backend_slot = Arc::clone(&state.backend);
+    let source = {
+        let g = state.model_source.lock().expect("model_source mutex");
+        *g
+    };
+    let settings = {
+        let g = state.settings.lock().expect("settings mutex");
+        g.clone()
+    };
+    let local_ctx = settings.context_size;
+    let _chat_lease = context_swap_clone
+        .acquire(
+            context_swap::ContextRole::Chat,
+            Box::new(move || {
+                let backend = {
+                    let mut g = backend_slot.lock().map_err(|e| e.to_string())?;
+                    g.take()
+                };
+                if let Some(backend) = backend {
+                    backend.shutdown();
+                    tracing::info!("context-swap: chat backend torn down (regenerate_slice)");
+                }
+                Ok(())
+            }),
+        )
+        .await;
+
+    let stream_result = if source == api::ModelSource::Api {
+        let profile_opt = {
+            let cfg = state.api_config.lock().expect("api_config mutex");
+            cfg.active_profile().cloned()
+        };
+        match profile_opt {
+            Some(profile) => {
+                let http = llm::HttpBackend::new(profile);
+                match http
+                    .stream(messages.clone(), None, None, Vec::new(), settings.context_size, on_chunk.clone(), cancel.clone())
+                    .await
+                {
+                    Ok(text) => Ok(text),
+                    Err(e) => {
+                        tracing::warn!(error = %e, "regenerate_slice: API stream failed; falling back to local");
+                        let _ = on_event.send(serde_json::json!({
+                            "type": "fallback",
+                            "reason": "api_unreachable",
+                            "source": "local",
+                        }));
+                        run_interview_local(
+                            &state, messages, local_ctx, on_chunk.clone(), cancel.clone(),
+                            /* force_full_ctx */ true,
+                        )
+                        .await
+                    }
+                }
+            }
+            None => {
+                tracing::warn!("regenerate_slice: source=Api but no active profile; falling back to local");
+                let _ = on_event.send(serde_json::json!({
+                    "type": "fallback",
+                    "reason": "no_active_profile",
+                    "source": "local",
+                }));
+                run_interview_local(
+                    &state, messages, local_ctx, on_chunk.clone(), cancel.clone(),
+                    /* force_full_ctx */ true,
+                )
+                .await
+            }
+        }
+    } else {
+        run_interview_local(
+            &state, messages, local_ctx, on_chunk.clone(), cancel.clone(),
+            /* force_full_ctx */ false,
+        )
+        .await
+    };
+
+    clear_active_slice_cancel(&state);
+
+    let parsed = match stream_result {
+        Ok(p) => p,
+        Err(e) => {
+            let _ = on_event.send(serde_json::json!({
+                "type": "error",
+                "message": format!("generation failed: {e}"),
+            }));
+            return Ok(());
+        }
+    };
+
+    let raw_full = {
+        let acc = raw_accumulator.lock().expect("raw accumulator mutex").clone();
+        if acc.trim().is_empty() { parsed.raw } else { acc }
+    };
+
+    // Strip any markdown fence the model wrapped the output in despite the
+    // "no markdown fence" instruction. The splice site expects clean prose.
+    let replacement = strip_code_fence(raw_full.trim()).trim().to_string();
+
+    // Empty-output guard: if the model returned nothing (or only whitespace
+    // + fence that strip_code_fence + trim emptied), DO NOT splice. Splicing
+    // an empty replacement would silently delete the highlighted passage —
+    // the user asked to REWRITE it, not remove it. Surface as an error event
+    // instead so the user knows to retry (the beat content is untouched on
+    // this path; the frontend's `error` handler leaves the live content
+    // alone since no `done` event arrived).
+    //
+    // This is stricter than `ghostwriter_generate`'s "send whatever you got"
+    // pattern — for a compose-box / directive drop an empty result is just a
+    // no-op; for a SPLICE into existing prose it's a silent data loss.
+    if replacement.is_empty() {
+        let _ = on_event.send(serde_json::json!({
+            "type": "error",
+            "message": "Regenerate produced no output — the model returned empty text. Try again, or rewrite the passage manually with the edit button.",
+        }));
+        return Ok(());
+    }
+
+    // Splice the replacement into the beat. apply_regenerate_slice is
+    // defensive: if before+highlight+after is no longer a contiguous
+    // substring of the live content (a concurrent mutation between popup
+    // and confirm), it refuses rather than corrupt the prose. On refusal
+    // we surface an error event — the user can re-highlight and retry.
+    let card_id = active_fable_card_id(&state)?;
+    let splice_result = {
+        let mut gs = state.fable_session.lock().await;
+        apply_regenerate_slice(
+            &mut gs, index, before, highlight, after, replacement.clone(),
+        )
+        .map(|_| project_messages(&gs))
+    };
+    match splice_result {
+        Ok(messages) => {
+            // Persist BEFORE declaring success so a crash between splice and
+            // save can't lose the edit (mirrors edit_message / rewind_and_edit).
+            if let Err(e) = persist_fable_session(&app, &state, &card_id).await {
+                let _ = on_event.send(serde_json::json!({
+                    "type": "error",
+                    "message": format!("splice applied but persist failed: {e}"),
+                }));
+                return Ok(());
+            }
+            on_event
+                .send(serde_json::json!({
+                    "type": "done",
+                    "messages": messages,
+                    "schema_pop_count": 0usize,
+                    "replacement": replacement,
+                }))
+                .map_err(|e| e.to_string())?;
+            Ok(())
+        }
+        Err(e) => {
+            let _ = on_event.send(serde_json::json!({
+                "type": "error",
+                "message": e,
+            }));
+            Ok(())
+        }
+    }
+}
+
 /// live at `<exe_dir>/apps/games/cards/`. Returns `None` if no such dir
 /// exists in any candidate location (graceful: the picker shows empty).
 fn resolve_fable_cards_dir(app: &tauri::AppHandle) -> Option<std::path::PathBuf> {
@@ -5256,9 +8008,11 @@ mod tests {
 
     #[test]
     fn effective_local_ctx_default_settings() {
-        // Default settings (context_size: 4000) under Local → 4000.
+        // Default settings (context_size: 4096 — raised 2026-07-27 from the
+        // 3072 set in §2C; see prompts.rs Default impl for the budget math)
+        // under Local → 4096.
         let settings = prompts::WupiSettings::default();
-        assert_eq!(effective_local_ctx(api::ModelSource::Local, &settings), 4000);
+        assert_eq!(effective_local_ctx(api::ModelSource::Local, &settings), 4096);
         // Under Api → 2048 (the constant, not the default).
         assert_eq!(effective_local_ctx(api::ModelSource::Api, &settings), 2048);
     }
@@ -5308,5 +8062,547 @@ mod tests {
                 spec.name
             );
         }
+    }
+
+    // ── parse_generation_output tests ────────────────────────────────────
+    //
+    // These cover the Quick Play single-shot generation parser: it isolates
+    // three tagged blocks from the model's raw output and parses each with
+    // its native parser, with json_repair as the JSON fallback and default
+    // fallbacks for the seed blocks.
+
+    const SAMPLE_CARD_XML: &str = "\
+<sim_card>\
+  <metadata><id>qp_test</id><type>roleplay</type></metadata>\
+  <identity><name>Test Sim</name><core_persona><![CDATA[A test sim.]]></core_persona></identity>\
+  <scenario>\
+    <setting><![CDATA[A place.]]></setting>\
+    <tone><![CDATA[quiet]]></tone>\
+    <protagonist><![CDATA[Hero]]></protagonist>\
+    <opening_scene><![CDATA[The scene opens.]]></opening_scene>\
+    <start_npcs><![CDATA[- npc_one\n- npc_two]]></start_npcs>\
+    <activities><![CDATA[conversation]]></activities>\
+  </scenario>\
+</sim_card>";
+
+    #[test]
+    fn parse_generation_output_succeeds_on_clean_three_blocks() {
+        let raw = format!(
+            "{card}\n<world_schema>{{ \"summary\": \"night\", \"recent_events\": [\"a\"], \"entities\": {{ \"loc.current\": \"tavern\" }} }}</world_schema>\n<player_state>{{ \"wealth\": 5, \"reputation\": 1, \"stamina\": \"Active\", \"body\": {{}} }}</player_state>",
+            card = SAMPLE_CARD_XML
+        );
+        let (card, ws, ps) = parse_generation_output(&raw).expect("clean three-block output must parse");
+        assert_eq!(card.id, "qp_test");
+        assert_eq!(card.name, "Test Sim");
+        assert_eq!(card.opening_scene.as_deref(), Some("The scene opens."));
+        assert_eq!(ws.summary, "night");
+        assert_eq!(ws.recent_events.len(), 1);
+        assert_eq!(ws.entities.get("loc.current").map(|s| s.as_str()), Some("tavern"));
+        assert_eq!(ps.wealth, 5);
+        assert_eq!(ps.reputation, 1);
+    }
+
+    #[test]
+    fn parse_generation_output_falls_back_to_default_when_schema_block_missing() {
+        // The card is the load-bearing piece. Missing world_schema + player_state
+        // must NOT fail generation — they default cleanly.
+        let raw = SAMPLE_CARD_XML.to_string();
+        let (card, ws, ps) = parse_generation_output(&raw).expect("missing seed blocks must not fail");
+        assert_eq!(card.id, "qp_test");
+        assert!(ws.summary.is_empty() && ws.entities.is_empty(), "world schema defaults empty");
+        assert!(ps.is_default(), "player state defaults to fresh/healthy");
+    }
+
+    #[test]
+    fn parse_generation_output_fails_when_card_block_missing() {
+        // No <sim_card> → no simulation to enter. The parser must surface a
+        // clean error rather than silently producing an empty card.
+        let raw = "<world_schema>{\"summary\":\"x\"}</world_schema><player_state>{\"wealth\":0}</player_state>";
+        let err = parse_generation_output(raw).expect_err("missing card must error");
+        assert!(err.contains("card"), "error must mention the card: {err}");
+    }
+
+    #[test]
+    fn parse_generation_output_repairs_malformed_json_schema() {
+        // Trailing comma in the JSON — json_repair must fix it.
+        let raw = format!(
+            "{card}\n<world_schema>{{ \"summary\": \"s\", \"entities\": {{ \"a\": \"1\", }} }}</world_schema>",
+            card = SAMPLE_CARD_XML
+        );
+        let (_card, ws, _ps) = parse_generation_output(&raw).expect("json_repair must salvage the schema block");
+        assert_eq!(ws.summary, "s");
+        assert_eq!(ws.entities.get("a").map(|s| s.as_str()), Some("1"));
+    }
+
+    #[test]
+    fn extract_sim_card_block_returns_full_block_including_tags() {
+        let raw = format!("prose before\n{card}\nprose after", card = SAMPLE_CARD_XML);
+        let block = extract_sim_card_block(&raw);
+        assert!(block.starts_with("<sim_card>"));
+        assert!(block.ends_with("</sim_card>"));
+        // Stray prose is excluded.
+        assert!(!block.contains("prose before"));
+        assert!(!block.contains("prose after"));
+    }
+
+    #[test]
+    fn extract_sim_card_block_falls_back_to_whole_text_when_missing() {
+        let raw = "no card here at all";
+        let block = extract_sim_card_block(raw);
+        assert_eq!(block, raw, "fallback returns the whole text so the parser surfaces the real error");
+    }
+
+    #[test]
+    fn extract_block_returns_inner_text_only() {
+        let raw = "<world_schema>{ \"a\": 1 }</world_schema>";
+        let inner = extract_block(raw, "world_schema");
+        assert_eq!(inner.as_deref(), Some("{ \"a\": 1 }"));
+    }
+
+    #[test]
+    fn extract_block_returns_none_when_tag_absent() {
+        assert!(extract_block("nothing here", "world_schema").is_none());
+    }
+
+    // --- Phase 1: Schema history ring buffer (2026-07-27) ---
+    //
+    // We test the pure pieces directly (`diff_schemas` + the cap math) and a
+    // ring-buffer simulation that mirrors `push_fable_history_snapshot`'s
+    // exact FIFO-eviction logic. Constructing a full `AppState` for these
+    // would pull in the GPU backend + every IPC dependency — not worth it
+    // for logic this isolated. The mutation-site instrumentation is verified
+    // by `cargo test` compiling the call sites (any signature drift fails
+    // the build) + by reading the inline `push_fable_history*` call sites.
+
+    fn make_test_schema(entities: &[(&str, &str)]) -> schema::WorldSchema {
+        let mut s = schema::WorldSchema::default();
+        for (k, v) in entities {
+            s.entities.insert((*k).to_owned(), (*v).to_owned());
+        }
+        s
+    }
+
+    #[test]
+    fn ring_buffer_caps_at_five_with_fifo_eviction() {
+        // Mirrors push_fable_history_snapshot's exact cap + eviction logic.
+        let mut ring: std::collections::VecDeque<schema::WorldSchema> =
+            std::collections::VecDeque::new();
+        for i in 0..7 {
+            if ring.len() >= 5 {
+                ring.pop_front();
+            }
+            ring.push_back(make_test_schema(&[("turn", &i.to_string())]));
+        }
+        assert_eq!(ring.len(), 5, "ring buffer must cap at FABLE_HISTORY_CAP");
+        // FIFO: oldest (turn 2) should be at the front, newest (turn 6) at the back.
+        assert_eq!(
+            ring.front().unwrap().entities.get("turn").map(|s| s.as_str()),
+            Some("2"),
+            "FIFO eviction must drop the OLDEST snapshot"
+        );
+        assert_eq!(
+            ring.back().unwrap().entities.get("turn").map(|s| s.as_str()),
+            Some("6"),
+            "newest snapshot must be at the back"
+        );
+    }
+
+    #[test]
+    fn diff_schemas_detects_entity_value_change() {
+        // Gold: 100 → 80 (the canonical "undo" use case).
+        let before = make_test_schema(&[("gold", "100"), ("location", "tavern")]);
+        let after = make_test_schema(&[("gold", "80"), ("location", "tavern")]);
+        let diff = diff_schemas(&before, &after);
+        assert_eq!(diff.entities_changed.len(), 1, "only the changed key should diff");
+        let e = &diff.entities_changed[0];
+        assert_eq!(e.key, "gold");
+        assert_eq!(e.before.as_deref(), Some("100"));
+        assert_eq!(e.after.as_deref(), Some("80"));
+        assert!(!diff.summary_changed, "summary unchanged");
+    }
+
+    #[test]
+    fn diff_schemas_detects_entity_added_and_removed() {
+        // Marcus: tavern → blacksmith (value change) + iron_sword removed + key2 added.
+        let before = make_test_schema(&[
+            ("npc.marcus", "tavern"),
+            ("item.iron_sword", "1"),
+        ]);
+        let after = make_test_schema(&[
+            ("npc.marcus", "blacksmith"),
+            ("item.health_potion", "3"),
+        ]);
+        let diff = diff_schemas(&before, &after);
+        // All three keys differ (none are equal).
+        assert_eq!(diff.entities_changed.len(), 3);
+        // Find each by key (sorted output, but verify by lookup not position).
+        let by_key: std::collections::HashMap<&str, &EntityDiff> = diff
+            .entities_changed
+            .iter()
+            .map(|e| (e.key.as_str(), e))
+            .collect();
+        // Value change.
+        assert_eq!(by_key["npc.marcus"].before.as_deref(), Some("tavern"));
+        assert_eq!(by_key["npc.marcus"].after.as_deref(), Some("blacksmith"));
+        // Removed (before Some, after None).
+        assert_eq!(by_key["item.iron_sword"].before.as_deref(), Some("1"));
+        assert_eq!(by_key["item.iron_sword"].after, None);
+        // Added (before None, after Some).
+        assert_eq!(by_key["item.health_potion"].before, None);
+        assert_eq!(by_key["item.health_potion"].after.as_deref(), Some("3"));
+    }
+
+    #[test]
+    fn diff_schemas_detects_summary_and_events_change() {
+        let mut before = make_test_schema(&[("k", "v")]);
+        before.summary = "Act 1 begins.".to_owned();
+        before.recent_events.push("met the king".to_owned());
+        let mut after = make_test_schema(&[("k", "v")]);
+        after.summary = "Act 1 ends.".to_owned();
+        after.recent_events.push("met the king".to_owned());
+        after.recent_events.push("killed the dragon".to_owned());
+        let diff = diff_schemas(&before, &after);
+        assert!(diff.summary_changed, "summary change must surface");
+        assert!(diff.entities_changed.is_empty(), "entities identical");
+        assert_eq!(diff.events_count_before, 1);
+        assert_eq!(diff.events_count_after, 2);
+    }
+
+    #[test]
+    fn diff_schemas_empty_when_identical() {
+        let s = make_test_schema(&[("k", "v")]);
+        let diff = diff_schemas(&s, &s);
+        assert!(diff.entities_changed.is_empty());
+        assert!(!diff.summary_changed);
+        assert_eq!(diff.events_count_before, diff.events_count_after);
+    }
+
+    // =============================================================
+    // Fable edit / reroll / rewind-and-edit mutator tests (2026-07-27).
+    // These cover the PURE helpers (apply_*) — the #[tauri::command]
+    // wrappers are thin lock+call+persist shells over them and need no
+    // Tauri plumbing to exercise. The helpers are the load-bearing logic.
+    // =============================================================
+
+    /// Build a Conversation with an alternating user/assistant/user/assistant
+    /// sequence. Assistant turns carry a non-empty raw_output so the
+    /// "edit clears raw_output" assertion is meaningful.
+    fn make_test_conversation() -> session::Conversation {
+        let mut c = session::Conversation::new();
+        c.add_message(session::Role::User, "I attack the goblin.".into());
+        c.add_assistant_turn(
+            "The goblin falls.".into(),
+            String::new(),
+            "<raw>goblin dies</raw>".into(),
+        );
+        c.add_message(session::Role::User, "I loot the body.".into());
+        c.add_assistant_turn(
+            "You find 100 gold.".into(),
+            String::new(),
+            "<raw>100 gold</raw>".into(),
+        );
+        c.add_message(session::Role::User, "I leave the room.".into());
+        c.add_assistant_turn(
+            "The door creaks shut.".into(),
+            String::new(),
+            "<raw>door shuts</raw>".into(),
+        );
+        c
+    }
+
+    #[test]
+    fn apply_edit_overwrites_content_and_clears_raw_output() {
+        let mut c = make_test_conversation();
+        // Edit the assistant turn at index 1 ("The goblin falls.").
+        apply_edit(&mut c, 1, "The goblin staggers but lives.".into()).unwrap();
+        assert_eq!(c.messages[1].content, "The goblin staggers but lives.");
+        assert_eq!(c.messages[1].raw_output, "");
+    }
+
+    #[test]
+    fn apply_edit_preserves_role_id_and_timestamp() {
+        let mut c = make_test_conversation();
+        let before = (
+            c.messages[3].role,
+            c.messages[3].id.clone(),
+            c.messages[3].timestamp,
+        );
+        apply_edit(&mut c, 3, "You find 50 gold.".into()).unwrap();
+        let after = (
+            c.messages[3].role,
+            c.messages[3].id.clone(),
+            c.messages[3].timestamp,
+        );
+        assert_eq!(before, after, "edit must NOT touch role/id/timestamp");
+    }
+
+    #[test]
+    fn apply_edit_out_of_bounds_errors() {
+        let mut c = make_test_conversation();
+        let len = c.messages.len();
+        let err = apply_edit(&mut c, len, "x".into()).unwrap_err();
+        assert!(err.contains("out of bounds"), "got: {err}");
+        // Negative-equivalent: index at len is one past the end.
+    }
+
+    #[test]
+    fn apply_reroll_pops_only_when_last_is_assistant() {
+        let mut c = make_test_conversation();
+        // 6 messages, last is assistant ("door creaks shut").
+        assert_eq!(c.messages.len(), 6);
+        apply_reroll(&mut c).unwrap();
+        assert_eq!(c.messages.len(), 5);
+        // Now the last is the user turn "I leave the room." — the seed
+        // the frontend will regenerate from.
+        assert_eq!(c.messages.last().unwrap().role, session::Role::User);
+        assert_eq!(c.messages.last().unwrap().content, "I leave the room.");
+    }
+
+    #[test]
+    fn apply_reroll_errors_when_last_is_user() {
+        let mut c = session::Conversation::new();
+        c.add_message(session::Role::User, "hi".into());
+        let err = apply_reroll(&mut c).unwrap_err();
+        assert!(err.contains("not an assistant turn"), "got: {err}");
+    }
+
+    #[test]
+    fn apply_reroll_errors_when_empty() {
+        let mut c = session::Conversation::new();
+        let err = apply_reroll(&mut c).unwrap_err();
+        assert!(err.contains("empty"), "got: {err}");
+    }
+
+    #[test]
+    fn apply_rewind_truncates_after_index_and_overwrites_target() {
+        let mut c = make_test_conversation();
+        // Rewind to user index 2 ("I loot the body.") and edit it. The pop
+        // count is asserted in `apply_rewind_counts_deleted_assistant_turns`;
+        // here we only validate the truncation + overwrite shape.
+        let _popped = apply_rewind_and_edit(&mut c, 2, "I check the walls.".into()).unwrap();
+        // Truncated right after index 2 → only indexes 0,1,2 survive.
+        assert_eq!(c.messages.len(), 3);
+        // The edited message is now the last and is a user turn.
+        assert_eq!(c.messages.last().unwrap().role, session::Role::User);
+        assert_eq!(c.messages.last().unwrap().content, "I check the walls.");
+        // The earlier messages are untouched.
+        assert_eq!(c.messages[0].content, "I attack the goblin.");
+        assert_eq!(c.messages[1].content, "The goblin falls.");
+    }
+
+    #[test]
+    fn apply_rewind_counts_deleted_assistant_turns() {
+        let mut c = make_test_conversation();
+        // Rewinding from user index 0 drops indexes 1..5: assistants at
+        // 1, 3, 5 → 3 assistant turns removed.
+        let popped = apply_rewind_and_edit(&mut c, 0, "I enter the tavern.".into()).unwrap();
+        assert_eq!(popped, 3, "should count 3 deleted assistant turns");
+        // Rewinding from user index 2 drops indexes 3..5: assistant at
+        // 3, 5 → 2 assistant turns removed.
+        let mut c2 = make_test_conversation();
+        let popped2 = apply_rewind_and_edit(&mut c2, 2, "x".into()).unwrap();
+        assert_eq!(popped2, 2);
+        // Rewinding from the LAST user index (4) drops only index 5 (the
+        // final assistant turn) → 1 assistant turn removed.
+        let mut c3 = make_test_conversation();
+        let popped3 = apply_rewind_and_edit(&mut c3, 4, "x".into()).unwrap();
+        assert_eq!(popped3, 1);
+    }
+
+    #[test]
+    fn apply_rewind_errors_when_index_is_assistant() {
+        let mut c = make_test_conversation();
+        let err = apply_rewind_and_edit(&mut c, 1, "x".into()).unwrap_err();
+        assert!(err.contains("not a user message"), "got: {err}");
+    }
+
+    #[test]
+    fn apply_rewind_errors_when_out_of_bounds() {
+        let mut c = make_test_conversation();
+        let len = c.messages.len();
+        let err = apply_rewind_and_edit(&mut c, len, "x".into()).unwrap_err();
+        assert!(err.contains("out of bounds"), "got: {err}");
+    }
+
+    #[test]
+    fn apply_regenerate_slice_swaps_highlight_for_replacement() {
+        let mut c = make_test_conversation();
+        // Splice into the last assistant turn ("The door creaks shut.").
+        // Split as: "The door " + "creaks" + " shut." — replace "creaks"
+        // with "groans". The before/after anchors must survive verbatim.
+        apply_regenerate_slice(
+            &mut c,
+            5,
+            "The door ".into(),
+            "creaks".into(),
+            " shut.".into(),
+            "groans".into(),
+        )
+        .unwrap();
+        assert_eq!(c.messages[5].content, "The door groans shut.");
+        // raw_output is cleared (mirrors apply_edit — splice is the new
+        // source of truth, a stale raw mustn't desync a future re-render).
+        assert_eq!(c.messages[5].raw_output, "");
+    }
+
+    #[test]
+    fn apply_regenerate_slice_preserves_role_id_and_timestamp() {
+        let mut c = make_test_conversation();
+        let before = (
+            c.messages[5].role,
+            c.messages[5].id.clone(),
+            c.messages[5].timestamp,
+        );
+        apply_regenerate_slice(
+            &mut c,
+            5,
+            "The door ".into(),
+            "creaks".into(),
+            " shut.".into(),
+            "groans".into(),
+        )
+        .unwrap();
+        let after = (
+            c.messages[5].role,
+            c.messages[5].id.clone(),
+            c.messages[5].timestamp,
+        );
+        assert_eq!(before, after, "splice must NOT touch role/id/timestamp");
+    }
+
+    #[test]
+    fn apply_regenerate_slice_handles_empty_anchors() {
+        let mut c = session::Conversation::new();
+        c.add_message(session::Role::User, "go".into());
+        c.add_assistant_turn("whole beat".into(), String::new(), String::new());
+        // Empty before + after → the whole content is the highlight.
+        apply_regenerate_slice(&mut c, 1, "".into(), "whole beat".into(), "".into(), "new beat".into())
+            .unwrap();
+        assert_eq!(c.messages[1].content, "new beat");
+    }
+
+    #[test]
+    fn apply_regenerate_slice_errors_when_index_is_not_assistant() {
+        let mut c = make_test_conversation();
+        // Index 0 is the user turn "I attack the goblin."
+        let err = apply_regenerate_slice(
+            &mut c,
+            0,
+            "I ".into(),
+            "attack".into(),
+            " the goblin.".into(),
+            "miss".into(),
+        )
+        .unwrap_err();
+        assert!(err.contains("not an assistant message"), "got: {err}");
+    }
+
+    #[test]
+    fn apply_regenerate_slice_errors_on_stale_snapshot() {
+        let mut c = make_test_conversation();
+        // The before+highlight+after snapshot doesn't concatenate to a real
+        // substring of the live content — simulate a stale UI snapshot.
+        let err = apply_regenerate_slice(
+            &mut c,
+            5,
+            "wrong before".into(),
+            "creaks".into(),
+            " shut.".into(),
+            "groans".into(),
+        )
+        .unwrap_err();
+        assert!(err.contains("no longer matches"), "got: {err}");
+        // Content untouched on the failure path.
+        assert_eq!(c.messages[5].content, "The door creaks shut.");
+    }
+
+    #[test]
+    fn apply_regenerate_slice_errors_when_out_of_bounds() {
+        let mut c = make_test_conversation();
+        let len = c.messages.len();
+        let err = apply_regenerate_slice(
+            &mut c,
+            len,
+            "".into(),
+            "x".into(),
+            "".into(),
+            "y".into(),
+        )
+        .unwrap_err();
+        assert!(err.contains("out of bounds"), "got: {err}");
+    }
+
+    // --- regenerate_slice empty-output guard predicate ---
+    //
+    // The IPC guard refuses to splice when
+    // `strip_code_fence(raw_full.trim()).trim().is_empty()`. These tests pin
+    // that predicate across every empty shape the model might emit, so a
+    // future refactor of `strip_code_fence` can't silently break the guard
+    // (which would reintroduce the silent-highlight-deletion bug). The guard
+    // itself lives in the `regenerate_slice` IPC and isn't unit-testable
+    // without Tauri plumbing; these tests cover the load-bearing predicate.
+
+    /// Mirror of the IPC's empty-detection expression. Kept in lockstep with
+    /// the `let replacement = strip_code_fence(raw_full.trim()).trim()...`
+    /// + `if replacement.is_empty()` block in `regenerate_slice`.
+    fn slice_replacement_is_empty(raw_full: &str) -> bool {
+        strip_code_fence(raw_full.trim()).trim().is_empty()
+    }
+
+    #[test]
+    fn slice_empty_guard_treats_truly_empty_as_empty() {
+        assert!(slice_replacement_is_empty(""));
+    }
+
+    #[test]
+    fn slice_empty_guard_treats_whitespace_only_as_empty() {
+        assert!(slice_replacement_is_empty("   "));
+        assert!(slice_replacement_is_empty("\n\n\t  \n"));
+    }
+
+    #[test]
+    fn slice_empty_guard_treats_bare_code_fence_as_empty() {
+        // Model wrapped nothing in a markdown fence despite the contract.
+        assert!(slice_replacement_is_empty("```\n```"));
+        assert!(slice_replacement_is_empty("```"));
+    }
+
+    #[test]
+    fn slice_empty_guard_treats_fence_with_only_whitespace_as_empty() {
+        assert!(slice_replacement_is_empty("```\n   \n```"));
+    }
+
+    #[test]
+    fn slice_empty_guard_does_not_treat_real_prose_as_empty() {
+        // Sanity: genuine replacement text passes the guard. These are the
+        // shapes we EXPECT to splice — one-liners, multi-paragraph, prose
+        // that happens to start/end with whitespace.
+        assert!(!slice_replacement_is_empty("The door groans shut."));
+        assert!(!slice_replacement_is_empty("The door groans shut.\n\nRain follows."));
+        assert!(!slice_replacement_is_empty("  leading whitespace  "));
+        assert!(!slice_replacement_is_empty("```\nThe door groans.\n```"));
+    }
+
+    #[test]
+    fn project_messages_returns_lowercase_role_and_content_only() {
+        let c = make_test_conversation();
+        let projected = project_messages(&c);
+        assert_eq!(projected.len(), 6);
+        assert_eq!(projected[0].role, "user");
+        assert_eq!(projected[0].content, "I attack the goblin.");
+        assert_eq!(projected[1].role, "assistant");
+        assert_eq!(projected[1].content, "The goblin falls.");
+        // Spot-check: the wire shape is just role+content (the struct has
+        // only those two fields, so this is structural — but assert to pin
+        // the contract against a future field addition leaking internals).
+        let serialized = serde_json::to_string(&projected[1]).unwrap();
+        assert!(
+            !serialized.contains("raw_output"),
+            "raw_output must NOT leak to UI: {serialized}"
+        );
+        assert!(
+            !serialized.contains("timestamp"),
+            "timestamp must NOT leak to UI: {serialized}"
+        );
     }
 }

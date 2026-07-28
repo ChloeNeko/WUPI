@@ -3261,8 +3261,6 @@ const dropdownMenu = document.getElementById('dropdownMenu');
   (function wupiChat() {
     const msgsEl = document.getElementById('chatMessages');
     const inputEl = document.getElementById('chatInput');
-    const sendBtn = document.getElementById('chatSendBtn');
-    const stopBtn = document.getElementById('chatStopBtn');
     if (!msgsEl) return;
 
     // Tauri v2 Channel for streaming: imported statically at the top of the
@@ -3342,9 +3340,12 @@ const dropdownMenu = document.getElementById('dropdownMenu');
 
     function setGenerating(on) {
       generating = on;
-      inputEl.disabled = on;
-      sendBtn.disabled = on;
-      stopBtn.disabled = !on;
+      // The input stays ENABLED (2026-07-27, no send/stop buttons): pressing
+      // Enter on an EMPTY field while generating stops the turn. The placeholder
+      // flips to hint that affordance; otherwise the idle hint stays.
+      inputEl.placeholder = on
+        ? 'Press Enter to stop…  (Shift+Enter for newline)'
+        : 'Message Wupi…  (Enter to send, Shift+Enter for newline)';
       // Bridge to the title status indicator: the main model is "typing"
       // during a chat_send. This flag is the authoritative source: it only
       // flips on user-driven chat sends, so Agent.gguf (schema engine, own
@@ -3421,15 +3422,17 @@ const dropdownMenu = document.getElementById('dropdownMenu');
         });
     }
 
-    sendBtn?.addEventListener('click', send);
-    stopBtn?.addEventListener('click', () => {
-      invoke('chat_stop').catch((e) => console.warn('[Wupi] chat_stop failed', e));
-    });
-
-    // Enter sends, Shift+Enter for newline.
+    // Enter does double duty (2026-07-27, no send/stop buttons): on a
+    // non-empty field it sends; on an EMPTY field while a turn streams it
+    // stops the generation. Shift+Enter is a literal newline. The input
+    // stays focusable + enabled during generation so the stop gesture works.
     inputEl?.addEventListener('keydown', (e) => {
       if (e.key === 'Enter' && !e.shiftKey) {
         e.preventDefault();
+        if (generating && !inputEl.value.trim()) {
+          invoke('chat_stop').catch((err) => console.warn('[Wupi] chat_stop failed', err));
+          return;
+        }
         send();
       }
     });

@@ -26,6 +26,11 @@ import { createTitleGrass } from './grass.js';
 import { createWindLeaves } from './leaves.js';
 import { createCloudLayer } from './clouds.js';
 import { createTitleSparkle } from './sparkle.js';
+// The FABLE wordmark. Moved from public/ (served at /fable_title.png, flat
+// at the install root) into src/fable/assets/ so Vite processes + hashes it
+// into dist/assets/ (matches how paw.png is handled). Keeps the install
+// root clean — only wupi.exe/html + assets/ + bin/ + data/ + msvcp140.dll.
+import fableTitleUrl from '../assets/fable_title.png';
 import { invoke } from '@tauri-apps/api/core';
 
 export function buildTitle(handlers) {
@@ -70,7 +75,7 @@ export function buildTitle(handlers) {
          buttons can never push each other. The PNG is rendered at its NATURAL
          size (1400x425); sizing/positioning lives in fable.css. -->
     <div class="fable-title-wordmark" aria-hidden="true">
-      <img class="fable-title-img" src="/fable_title.png" alt="">
+      <img class="fable-title-img" src="${fableTitleUrl}" alt="">
     </div>
     <!-- Menu buttons — independent of the wordmark. Positioned via
          .fable-title-actions in fable.css. -->
@@ -83,9 +88,15 @@ export function buildTitle(handlers) {
            target is confirmed via the fable_continue_target IPC. This is
            the load-bearing default: in a fresh browser build with no
            backend, Continue stays dim + unclickable rather than firing
-           a no-op click. -->
+           a no-op click.
+           NEW GAME is DISABLED (2026-07-26): Quick Play is the live authoring
+           flow now; New Game's dedicated interview is future work. The button
+           stays in the DOM (greyed + unclickable) so the title layout is
+           intact for when its flow lands. Same disabled contract as Continue:
+           the click handler guards on the btn.disabled flag and blocks
+           stray clicks. -->
       <button class="fable-title-btn" data-act="continue" disabled>Continue</button>
-      <button class="fable-title-btn" data-act="new">New Game</button>
+      <button class="fable-title-btn" data-act="new" disabled>New Game</button>
       <button class="fable-title-btn" data-act="quickplay">Quick Play</button>
       <button class="fable-title-btn" data-act="load">Load</button>
       <button class="fable-title-btn" data-act="exit">Exit</button>
@@ -179,10 +190,11 @@ export function buildTitle(handlers) {
   };
 
   // ── Wordmark = PNG (no JS styling) ────────────────────────
-  // The FABLE wordmark is a single image: public/fable_title.png, rendered
-  // via <img class="fable-title-img"> above (sized in fable.css). The prior
-  // CSS-text approach (per-letter spans + fill/border/glow experiments) is
-  // gone. No JS work happens here for the title.
+  // The FABLE wordmark is a single image: src/fable/assets/fable_title.png,
+  // imported at the top of this module (Vite hashes it into dist/assets/),
+  // rendered via <img class="fable-title-img"> above (sized in fable.css).
+  // The prior CSS-text approach (per-letter spans + fill/border/glow
+  // experiments) is gone. No JS work happens here for the title.
   //
   // DESIGN HISTORY (tombstone — the CSS-text title is retired):
   //   - Per-letter font spans (F=Uncial Antiqua, ABL=Cinzel Decorative,

@@ -175,18 +175,46 @@ const TRANSLATION_INSTRUCTION: &str = "\
 You are translating a player's natural-language request into a state delta
 for the roleplay game's world_state. The world_state is a JSON object with
 three top-level keys: summary (string), recent_events (array of strings),
-entities (object of key → string).
+entities (object of key -> flat string).
 
-Emit ONLY the changed keys as a JSON delta with this shape:
+ Emit ONLY the changed keys as a JSON delta with this EXACT shape:
 {
   \"summary\": \"...\" (optional, only if the arc shifted),
   \"recent_events\": [\"...\"] (optional, append-only),
   \"entities\": {\"key\": \"value\" | null} (optional; null deletes a key)
 }
 
-Do NOT re-emit unchanged keys. Do NOT wrap the JSON in markdown fences.
-If the request cannot be expressed as a state change (e.g. it's a question
-or a normal chat message), emit an empty object: {}";
+ CRITICAL — entity value type rule:
+   Every entity value MUST be a single flat STRING, or null to delete.
+   Numbers MUST be quoted as strings (\"50\", not 50).
+   NEVER use nested objects, arrays, or numbers as entity values.
+   WRONG:  {\"entities\": {\"player_state\": {\"wealth\": 50}}}      // nested object
+   WRONG:  {\"entities\": {\"wealth\": 50}}                          // bare number
+   RIGHT:  {\"entities\": {\"wealth\": \"50\"}}                       // flat string
+   RIGHT:  {\"entities\": {\"weather\": \"stormy\"}}                  // flat string
+
+ Use snake_case keys. Flatten structured concepts into descriptive keys
+ (e.g. \"innkeeper_mood\", \"player_gold\", \"time_of_day\") rather than
+ nesting sub-objects.
+
+ Examples (player request -> your emitted JSON):
+   \"make it stormy with heavy rain\"
+     -> {\"entities\": {\"weather\": \"stormy_heavy_rain\"}}
+   \"give me a steel sword\"
+     -> {\"entities\": {\"inventory_steel_sword\": \"held\"}}
+   \"set my gold to 50 coins\"
+     -> {\"entities\": {\"player_gold\": \"50\"}}
+   \"make the innkeeper Mara friendly toward me\"
+     -> {\"entities\": {\"innkeeper_mara_mood\": \"friendly\"}}
+   \"change the time of day to midnight\"
+     -> {\"entities\": {\"time_of_day\": \"midnight\"}}
+   \"what's the weather like?\"
+     -> {}                                  // question, not a mutation
+
+ Do NOT re-emit unchanged keys. Do NOT wrap the JSON in markdown fences.
+ Do NOT include the <|channel> protocol markers — emit raw JSON only.
+ If the request cannot be expressed as a state change, emit an empty
+ object: {}";
 
 // ---------------------------------------------------------------------------
 // Tests
@@ -274,6 +302,29 @@ mod tests {
         assert!(prompt.contains("\"weather\":\"clear\""));
         assert!(prompt.contains("<|turn>system"));
         assert!(prompt.contains("<|turn>model"));
+    }
+
+    // Regression guard for the 2026-07-26 Phase B bug: GLM-5.2 was emitting
+    // nested-object entity values ({"entities":{"player_state":{"wealth":50}}})
+    // because the prompt didn't explicitly forbid them. These assertions pin
+    // the flat-string rule + the worked examples so a future prompt edit can't
+    // silently drop them.
+    #[test]
+    fn translation_prompt_pins_flat_string_entity_rule() {
+        let prompt = render_translation_prompt("set gold to 50", "{}", &[]);
+        // The explicit prohibition of nested/bare-number entity values.
+        assert!(
+            prompt.contains("NEVER use nested objects"),
+            "prompt must forbid nested entity values"
+        );
+        // At least one worked example showing a number quoted as a string.
+        assert!(
+            prompt.contains("\"player_gold\": \"50\""),
+            "prompt must show numbers quoted as flat strings"
+        );
+        // The WRONG/RIGHT contrast that teaches the rule by negation.
+        assert!(prompt.contains("WRONG"));
+        assert!(prompt.contains("RIGHT"));
     }
 
     #[test]

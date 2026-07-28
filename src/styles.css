@@ -1665,8 +1665,15 @@ input[type="password"]::-webkit-credentials-auto-fill-button {
 .chat-messages::-webkit-scrollbar { width: 8px; }
 .chat-messages::-webkit-scrollbar-track { background: transparent; }
 .chat-messages::-webkit-scrollbar-thumb { background: rgba(181, 52, 250, 0.3); border-radius: 4px; }
+/* Sleek chat bubbles (2026-07-27 rework): profile pictures are gone, so the
+   conversational rhythm comes from each bubble sitting slightly off-center —
+   wupi (AI) to the LEFT, user to the RIGHT. The column is a flex container
+   (flex-direction:column), so each bubble's alignment is a combination of
+   align-self (which axis-cross edge it hugs) + a side margin that pulls it
+   in from that edge to create the "slightly left/right of center" resting
+   spot rather than hugging the wall. */
 .msg {
-    max-width: 82%;
+    max-width: 70%;
     padding: 10px 14px;
     border-radius: 16px;
     font-size: 14px;
@@ -1679,18 +1686,26 @@ input[type="password"]::-webkit-credentials-auto-fill-button {
     from { opacity: 0; transform: translateY(6px); }
     to   { opacity: 1; transform: translateY(0); }
 }
+/* Wupi (AI): slightly LEFT of center. align-self:flex-start hugs the left
+   edge; margin-right:auto + a 22% right margin pulls the bubble inward so it
+   rests left-of-center rather than against the wall. */
+.msg.wupi {
+    align-self: flex-start;
+    margin-right: 22%;
+    background: rgba(255, 255, 255, 0.07);
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    border-bottom-left-radius: 4px;
+}
+/* User: slightly RIGHT of center (mirror of wupi). align-self:flex-end hugs
+   the right edge; margin-left:22% pulls it inward to the right-of-center
+   resting spot. */
 .msg.user {
     align-self: flex-end;
+    margin-left: 22%;
     background: linear-gradient(135deg, #b534fa, #6a0dad);
     color: #fff;
     border-bottom-right-radius: 4px;
     box-shadow: 0 4px 12px rgba(181, 52, 250, 0.3);
-}
-.msg.wupi {
-    align-self: flex-start;
-    background: rgba(255, 255, 255, 0.07);
-    border: 1px solid rgba(255, 255, 255, 0.08);
-    border-bottom-left-radius: 4px;
 }
 .msg.wupi.streaming::after {
     content: '▍';
@@ -1800,36 +1815,9 @@ input[type="password"]::-webkit-credentials-auto-fill-button {
     box-shadow: 0 0 0 3px rgba(181, 52, 250, 0.12);
 }
 .chat-input::placeholder { color: rgba(255, 255, 255, 0.3); }
-.chat-input:disabled { opacity: 0.5; cursor: not-allowed; }
-.chat-send-row {
-    display: flex;
-    justify-content: flex-end;
-    gap: 8px;
-    margin-top: 8px;
-}
-.chat-btn {
-    padding: 8px 18px;
-    border-radius: 10px;
-    border: none;
-    font-family: inherit;
-    font-size: 13px;
-    font-weight: 600;
-    cursor: pointer;
-    transition: transform 0.1s, box-shadow 0.15s, opacity 0.15s;
-}
-.chat-btn:active { transform: scale(0.97); }
-.chat-btn:disabled { opacity: 0.4; cursor: not-allowed; }
-.chat-send-btn {
-    background: linear-gradient(135deg, #b534fa, #6a0dad);
-    color: #fff;
-    box-shadow: 0 4px 14px rgba(181, 52, 250, 0.35);
-}
-.chat-send-btn:not(:disabled):hover { box-shadow: 0 6px 20px rgba(181, 52, 250, 0.5); }
-.chat-stop-btn {
-    background: rgba(255, 255, 255, 0.1);
-    color: rgba(255, 255, 255, 0.8);
-}
-.chat-stop-btn:not(:disabled):hover { background: rgba(255, 80, 80, 0.25); color: #fff; }
+/* The send/stop buttons + .chat-send-row are GONE (2026-07-27): generation
+   is Enter-driven (Enter to send, empty-Enter to stop, Shift+Enter newline).
+   The input stays enabled during generation so the stop gesture works. */
 
 /* ───────────────────────────────────────────────────────────────────────
    Boot paw — the WUPI mascot paw.png flies from screen-center to its

@@ -29,11 +29,17 @@ let generating = false;
 let onTurnStart = null;    // hook: UI disables input
 let onTurnEnd = null;      // hook: UI re-enables input
 let npcPretty = null;      // optional fn: npcId → display name
+let onSchemaPop = null;    // hook: (count) => void — the schema-ring-buffer
+                           // consumer (the parallel fable_rollback work) wires
+                           // here so the mutation commands below can hand off
+                           // the pop count without narrator.js knowing about
+                           // the schema layer.
 
 export function initNarrator(hooks = {}) {
   onTurnStart = hooks.onTurnStart || null;
   onTurnEnd = hooks.onTurnEnd || null;
   npcPretty = hooks.npcPretty || null;
+  onSchemaPop = hooks.onSchemaPop || null;
 }
 
 // Hard reset of all module state (Chloe 2026-07-23: the resource-isolation
@@ -47,19 +53,25 @@ export function resetNarrator() {
   generating = false;
 }
 
-// Send a narrator turn. `silent` skips the user bubble (for system-driven
-// turns; not currently used but reserved).
+// Send a narrator turn. `opts.silent` skips the user bubble (for system-
+// driven turns; not currently used but reserved). `opts.regenerate` is the
+// re-generation flag: when true, the backend SKIPS pushing a fresh user
+// message and generates from the existing last user message in
+// `fable_session` (the mutation commands — rerollLastTurn /
+// rewindAndEditUser — left it there). We also skip the local `addUserBeat`
+// on regenerate since the feed was already rebuilt by the mutation wrapper.
 export async function sendFableTurn(text, opts = {}) {
   if (generating) return;
   generating = true;
   if (onTurnStart) onTurnStart();
-  if (!opts.silent) beats.addUserBeat(text);
+  const regenerate = !!opts.regenerate;
+  if (!opts.silent && !regenerate) beats.addUserBeat(text);
 
   const channel = new Channel();
   channel.onmessage = (msg) => handleEvent(msg);
 
   try {
-    await invoke('fable_send', { text, onEvent: channel });
+    await invoke('fable_send', { text, onEvent: channel, regenerate });
   } catch (err) {
     beats.addErrorBeat(String(err));
     finishTurn();
@@ -138,6 +150,119 @@ export function isGenerating() { return generating; }
 
 export async function stopFableTurn() {
   try { await invoke('fable_stop'); } catch (_) {}
+}
+
+// =============================================================
+// UX CHAT CONTROLS — edit / reroll / rewind-and-edit.
+//
+// Each wrapper invokes the corresponding Tauri command, rebuilds the feed
+// from the returned `messages[]` (the backend is the source of truth —
+// the DOM is regenerated, not patched), and hands the `schema_pop_count`
+// to the `onSchemaPop` hook so the parallel schema-ring-buffer work can
+// keep world state aligned with the new timeline.
+//
+// Flow summary:
+//   editMessage(idx, text)         → edit_message         → rebuild, NO regen
+//   rerollLastTurn()               → reroll_last_turn     → rebuild + regen
+//   rewindAndEditUser(idx, text)   → rewind_and_edit_user → rebuild + regen
+//
+// All three guard on `isGenerating()` — mutating mid-stream would collide
+// with the live `activeBeat` (the streaming turn appends to it). edit
+// blocks too because the round-trip shouldn't race a concurrent send.
+// =============================================================
+
+// In-place typo/content fix for either a user or assistant message. Does
+// NOT re-trigger inference (per spec §1) and does NOT touch the schema
+// (schema_pop_count is always 0, but we still hand it to onSchemaPop for
+// contract symmetry — it's a no-op there).
+export async function editMessage(index, newText) {
+  if (generating) return false;
+  generating = true;
+  if (onTurnStart) onTurnStart();
+  try {
+    const res = await invoke('edit_message', { index, newText });
+    if (res && Array.isArray(res.messages)) {
+      beats.rebuildFromMessages(res.messages);
+    }
+    if (onSchemaPop && typeof res.schema_pop_count === 'number') {
+      onSchemaPop(res.schema_pop_count);
+    }
+    return true;
+  } catch (err) {
+    beats.addErrorBeat(String(err));
+    return false;
+  } finally {
+    finishTurn();
+  }
+}
+
+// Regenerate the AI's last response. Pops the last assistant message,
+// rebuilds the feed, then re-streams a fresh turn via `fable_send` with
+// `regenerate: true` (the backend generates from the now-last user
+// message without pushing a duplicate). schema_pop_count is 1 — the
+// bad turn's world-state mutation is undone by the onSchemaPop hook.
+export async function rerollLastTurn() {
+  if (generating) return false;
+  generating = true;
+  if (onTurnStart) onTurnStart();
+  let seedText = '';
+  try {
+    const res = await invoke('reroll_last_turn');
+    if (res && Array.isArray(res.messages)) {
+      beats.rebuildFromMessages(res.messages);
+      // The seed for regeneration is the now-last user message (the reroll
+      // popped the assistant reply that followed it). Grab its text so the
+      // `fable_send` invoke below has a non-empty `text` arg (the backend
+      // ignores it under regenerate=true, but it's the natural payload and
+      // useful for any future logging).
+      const lastUser = [...(res.messages || [])].reverse().find((m) => m.role === 'user');
+      seedText = lastUser ? lastUser.content : '';
+    }
+    if (onSchemaPop && typeof res.schema_pop_count === 'number') {
+      onSchemaPop(res.schema_pop_count);
+    }
+  } catch (err) {
+    beats.addErrorBeat(String(err));
+    finishTurn();
+    return false;
+  }
+  // Hand off to the normal streaming path with regenerate=true. We DO NOT
+  // call finishTurn() here — sendFableTurn owns the turn lifecycle from
+  // this point (it set generating=true itself, fires onTurnStart, and
+  // finishTurn runs in its done/error handler). Reset generating first so
+  // sendFableTurn's `if (generating) return` guard doesn't bail.
+  generating = false;
+  await sendFableTurn(seedText, { regenerate: true });
+  return true;
+}
+
+// Branch the timeline: edit a user message from N turns ago. Truncates the
+// conversation right after the target index, overwrites the target, rebuilds
+// the feed, then re-streams a fresh turn for the newly edited timeline.
+// schema_pop_count is N (count of assistant turns the truncation removed).
+export async function rewindAndEditUser(index, newText) {
+  if (generating) return false;
+  generating = true;
+  if (onTurnStart) onTurnStart();
+  try {
+    const res = await invoke('rewind_and_edit_user', { index, newText });
+    if (res && Array.isArray(res.messages)) {
+      beats.rebuildFromMessages(res.messages);
+    }
+    if (onSchemaPop && typeof res.schema_pop_count === 'number') {
+      onSchemaPop(res.schema_pop_count);
+    }
+  } catch (err) {
+    beats.addErrorBeat(String(err));
+    finishTurn();
+    return false;
+  }
+  // Regenerate from the edited user message (now the last message). Same
+  // hand-off pattern as rerollLastTurn: reset generating + delegate to the
+  // streaming path with regenerate=true.
+  generating = false;
+  await sendFableTurn(newText, { regenerate: true });
+  return true;
 }
 
 // npc_id → display name. Cards declare start_npcs as ids; the model
