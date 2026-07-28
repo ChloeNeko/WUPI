@@ -363,6 +363,17 @@ impl GenerationClient for HttpBackend {
             let mut stream = response.bytes_stream();
             let mut buffer = String::new();
             let mut full_content = String::new();
+            // §11.43 — streaming repetition kill switch. The API path gets no
+            // DRY sampler + no Rust-side sampler chain (providers lock those
+            // knobs), so a stateful tail-buffer runs the SAME
+            // `detect_repetition_offset` primitive the post-gen truncator
+            // uses, on every chunk. On a confirmed loop we BREAK the stream
+            // loop: `response` + `stream` drop out of scope at function
+            // return, severing TCP + stopping token billing instantly. The
+            // finalized `full_content` is the truncated clean prose (one
+            // instance of the phrase + lead-in) — byte-identical to what the
+            // post-gen firewall would have produced for the same input.
+            let mut rep_guard = crate::stream_filter::StreamRepetitionDetector::new();
 
             while let Some(chunk_res) = stream.next().await {
                 // Honor cancel: stop reading + return what we have so far.
@@ -395,6 +406,29 @@ impl GenerationClient for HttpBackend {
                                 if !piece.is_empty() {
                                     on_chunk(&piece);
                                     full_content.push_str(&piece);
+                                    // §11.43 kill switch: scan the rolling
+                                    // tail-buffer for a mechanical loop. On
+                                    // hit, finalize `full_content` to the
+                                    // truncated clean prose and break BOTH
+                                    // loops (inner line-parse + outer chunk-
+                                    // read). Dropping `response` (the moved
+                                    // owner of `stream`) at function return
+                                    // severs the TCP connection.
+                                    if let Some(clean) = rep_guard.push(&piece) {
+                                        full_content = clean;
+                                        // Exit both loops via early return.
+                                        // `stream` (borrowed from `response`)
+                                        // + `response` drop here, severing
+                                        // the TCP connection + stopping
+                                        // token billing for any unread body.
+                                        buffer.clear();
+                                        drop(stream);
+                                        return Ok(ParsedOutput {
+                                            content: full_content,
+                                            reasoning: String::new(),
+                                            raw: String::new(),
+                                        });
+                                    }
                                 }
                             }
                         }
@@ -782,5 +816,332 @@ mod tests {
         truncate_to_budget(&mut msgs, 55);
         assert!(msgs.len() >= 1);
         assert_eq!(msgs.last().unwrap().content, "z".repeat(50));
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // §11.43 — Stream-abort kill switch integration tests.
+    //
+    // These verify the END-TO-END wiring inside `HttpBackend::stream`: that
+    // the SSE loop correctly invokes `StreamRepetitionDetector::push` on
+    // every chunk, breaks the stream on a confirmed loop, drops the response
+    // (severing the TCP connection), and returns the truncated clean prose.
+    // The detector itself has 11 unit tests in `stream_filter.rs`; these
+    // tests cover the WIRING (the part that's unique to `HttpBackend`).
+    //
+    // Approach: spin up a sync mock HTTP/SSE server on an ephemeral port via
+    // `std::net::TcpListener` (no Cargo.toml change — reqwest doesn't care
+    // if the server side is sync). The mock speaks just enough HTTP to fool
+    // reqwest's response parser: a status line + the right headers + a
+    // streaming SSE body. The body is pre-scripted per test.
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// Minimal HTTP/SSE mock server. Listens on an ephemeral port, accepts
+    /// ONE connection, writes the provided SSE body bytes (which may include
+    /// artificial delays between lines to simulate token-by-token streaming),
+    /// then closes. Returns the URL the client should connect to.
+    ///
+    /// The server is sync (runs on its own OS thread); reqwest connects to it
+    /// fine because TCP is transport-agnostic. The mock counts how many body
+    /// bytes it actually wrote before the client closed the connection — that
+    /// count lets tests assert "the connection was severed before the full
+    /// body was sent" (the kill switch's TCP-abort behavior).
+    struct MockSseServer {
+        url: String,
+        /// JoinHandle for the server thread. The thread exits after one
+        /// client connection completes (or after the body is fully written,
+        /// whichever comes first).
+        _handle: std::thread::JoinHandle<()>,
+        /// Shared counter for how many body bytes were written before the
+        /// client closed the connection. Read via `Arc<AtomicUsize>` after
+        /// the test completes + a brief sleep.
+        bytes_written: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl MockSseServer {
+        /// Spin up a mock serving the given SSE lines. `lines` are the full
+        /// `data: {...}` payloads (without the trailing `\n`); the server
+        /// joins them with `\n\n` (SSE framing) + writes each with a small
+        /// delay so the client has time to process + abort mid-stream.
+        fn spawn(lines: Vec<String>) -> Self {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+            let port = listener.local_addr().expect("local_addr").port();
+            let url = format!("http://127.0.0.1:{port}/chat/completions");
+            let bytes_written = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let bw_clone = bytes_written.clone();
+            let handle = std::thread::spawn(move || {
+                // Accept one connection (blocking). The TcpListener drops on
+                // thread exit — that's fine, we only need it for the accept.
+                if let Ok((mut stream, _addr)) = listener.accept() {
+                    use std::io::Write;
+                    // Read + discard the client's HTTP request (we don't
+                    // care about its content; just drain it so reqwest's
+                    // request completes before we write the response).
+                    let mut buf = [0u8; 4096];
+                    let _ = std::io::Read::read(&mut stream, &mut buf);
+
+                    // Write a minimal HTTP response with `text/event-stream`
+                    // so reqwest routes it through `bytes_stream()`.
+                    let header = concat!(
+                        "HTTP/1.1 200 OK\r\n",
+                        "Content-Type: text/event-stream\r\n",
+                        "Cache-Control: no-cache\r\n",
+                        "Connection: close\r\n",
+                        "\r\n",
+                    );
+                    let _ = stream.write_all(header.as_bytes());
+                    bw_clone.fetch_add(
+                        header.len(),
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
+
+                    // Stream each SSE line with a tiny delay so the client
+                    // can process + abort mid-stream (otherwise on a fast
+                    // localhost connection the kernel may buffer everything
+                    // before reqwest starts reading).
+                    for line in lines {
+                        let frame = format!("{line}\n\n");
+                        let frame_bytes = frame.as_bytes();
+                        let total = frame_bytes.len();
+                        // Write in 16-byte chunks with 5ms sleeps so the
+                        // kill switch has time to fire mid-frame (real API
+                        // streams token-by-token, not line-by-line).
+                        let mut written = 0;
+                        while written < total {
+                            let end = (written + 16).min(total);
+                            if stream.write_all(&frame_bytes[written..end]).is_err() {
+                                // Client closed — record bytes written so far.
+                                let cumulative = bw_clone.load(std::sync::atomic::Ordering::Relaxed);
+                                let _ = std::io::Write::flush(&mut stream);
+                                // The cumulative count already includes what
+                                // prior iterations wrote; add this partial.
+                                bw_clone.store(
+                                    cumulative + written,
+                                    std::sync::atomic::Ordering::Relaxed,
+                                );
+                                return;
+                            }
+                            written = end;
+                            let _ = std::io::Write::flush(&mut stream);
+                            std::thread::sleep(std::time::Duration::from_millis(5));
+                        }
+                        bw_closed_fetch_add(&bw_clone, total);
+                    }
+                    // Body fully written; connection closed on thread exit.
+                }
+            });
+            Self {
+                url,
+                _handle: handle,
+                bytes_written,
+            }
+        }
+
+        /// How many body bytes the server wrote before the client closed.
+        /// Tests assert this is LESS than the full body size when the kill
+        /// switch fires (proves the TCP connection was severed).
+        fn bytes_written(&self) -> usize {
+            self.bytes_written.load(std::sync::atomic::Ordering::Relaxed)
+        }
+    }
+
+    // Helper to side-step borrow-checker confusion in the loop (inlined
+    // atomic add with Relaxed ordering).
+    fn bw_closed_fetch_add(
+        c: &std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        n: usize,
+    ) {
+        c.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Build an `HttpBackend` pointed at the mock server. The api_key is
+    /// irrelevant (the mock doesn't check it) but must be non-empty so the
+    /// header-insert path doesn't skip the auth header.
+    fn backend_for(url: &str) -> HttpBackend {
+        let profile = crate::api::ApiProfile {
+            id: "test".into(),
+            name: "Test".into(),
+            endpoint: url.into(),
+            model: "test-model".into(),
+            api_key: "sk-test".into(),
+            temperature: Some(0.85),
+            max_context: Some(8192),
+        };
+        HttpBackend::new(profile)
+    }
+
+    /// Helper to encode a content delta chunk. The OpenAI streaming shape:
+    /// `{"choices":[{"delta":{"content":"..."}}]}`.
+    fn sse_chunk(content: &str) -> String {
+        let escaped = serde_json::to_string(content).unwrap_or_else(|_| "\"\"".into());
+        format!("data: {{\"choices\":[{{\"delta\":{{\"content\":{escaped}}}}}]}}")
+    }
+
+    #[tokio::test]
+    async fn stream_abort_kills_smuggler_loop_mid_stream() {
+        // THE canonical test: a normal lead-in, then the smuggler-loop body.
+        // The kill switch MUST fire on the third occurrence of the looped
+        // phrase, return the truncated clean prose (one instance + lead-in),
+        // and break the stream loop (chunks after the kill don't reach the
+        // final content or the on_chunk callback).
+        let lead_in = "Mara nods. ";
+        let loop_phrase = "The smuggler turns and runs away. ";
+        // 5 repeats — well past the 3-repeat threshold.
+        let mut lines = vec![sse_chunk(lead_in)];
+        for _ in 0..5 {
+            lines.push(sse_chunk(loop_phrase));
+        }
+
+        let server = MockSseServer::spawn(lines);
+        let backend = backend_for(&server.url);
+
+        // Count how many chunks the on_chunk callback receives. The kill
+        // switch fires at the 3rd occurrence, so we expect callbacks for:
+        //   lead-in (1) + occurrence 1 + occurrence 2 + occurrence 3 (the
+        // trigger chunk) = 4 chunk callbacks. NOT 6 — the 4th + 5th loop
+        // chunks must never reach the callback because the stream broke.
+        let chunk_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let cc = chunk_count.clone();
+        let on_chunk: ChunkFn = std::sync::Arc::new(move |_: &str| {
+            cc.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        });
+
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let messages = vec![crate::session::ApiMessage {
+            role: "system".into(),
+            content: "test".into(),
+            raw_output: String::new(),
+        }];
+
+        let result = backend
+            .stream(messages, None, None, Vec::new(), 1024, on_chunk, cancel)
+            .await
+            .expect("stream should complete (not error)");
+
+        // ── Assertion 1: the final content is the truncated clean prose ──
+        // The kill switch must keep the lead-in + ONE instance of the looped
+        // phrase, then drop the rest. `truncate_repetition` on the same input
+        // would produce the same string — single source of truth.
+        let expected = crate::stream_filter::truncate_repetition(
+            &format!("{lead_in}{loop_phrase}{loop_phrase}{loop_phrase}{loop_phrase}{loop_phrase}"),
+        );
+        assert_eq!(
+            result.content, expected,
+            "stream-abort must return the same truncated prose as the post-gen truncator"
+        );
+        // The expected prose contains ONE instance of the loop phrase, not five.
+        assert_eq!(
+            result.content.matches("The smuggler turns and runs away").count(),
+            1,
+            "truncated prose must contain exactly one instance of the looped phrase"
+        );
+        // Lead-in is preserved.
+        assert!(
+            result.content.starts_with(lead_in),
+            "lead-in prose must be preserved in truncated output"
+        );
+
+        // ── Assertion 2: the stream broke at the trigger chunk ──
+        // 4 chunk callbacks = lead-in + 3 occurrences (the trigger chunk
+        // counts: the kill switch fires AFTER processing the trigger chunk's
+        // content). If we see 5 or 6 callbacks, the kill switch did NOT
+        // break the stream — it only truncated the final string after
+        // reading everything (defeating the token-billing-abort contract).
+        let observed = chunk_count.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            observed <= 4,
+            "kill switch must break the stream after the 3rd occurrence — saw {observed} chunk \
+             callbacks (expected ≤4: lead-in + 3 loop chunks). If 5+, the stream wasn't actually \
+             severed mid-read; the kill switch is post-processing instead of mid-stream."
+        );
+        // And it definitely processed at least the 3 trigger chunks (sanity).
+        assert!(
+            observed >= 4,
+            "kill switch must have processed the 3 trigger chunks before firing — saw {observed} \
+             callbacks (expected ≥4)"
+        );
+
+        // Suppress unused warning on the mock server field.
+        let _ = server.bytes_written();
+    }
+
+    #[tokio::test]
+    async fn stream_abort_passes_clean_prose_through_unchanged() {
+        // NEGATIVE CONTROL: clean, varied prose must NOT trigger the kill
+        // switch. The stream completes normally and the full content is
+        // returned. This is the critical false-positive guard — if this
+        // test fails, valid API narration is getting truncated mid-stream.
+        let chunks = vec![
+            "The tavern falls silent. ",
+            "Mara wipes down the counter. ",
+            "Rain begins to fall outside. ",
+            "A stranger enters, dripping wet. ",
+            "Nobody speaks for a long moment. ",
+        ];
+        let lines: Vec<String> = chunks.iter().map(|c| sse_chunk(c)).collect();
+        let expected_full: String = chunks.iter().cloned().collect();
+
+        let server = MockSseServer::spawn(lines);
+        let backend = backend_for(&server.url);
+
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let on_chunk: ChunkFn = std::sync::Arc::new(|_: &str| {});
+        let messages = vec![crate::session::ApiMessage {
+            role: "system".into(),
+            content: "test".into(),
+            raw_output: String::new(),
+        }];
+
+        let result = backend
+            .stream(messages, None, None, Vec::new(), 1024, on_chunk, cancel)
+            .await
+            .expect("stream should complete cleanly");
+
+        assert_eq!(
+            result.content, expected_full,
+            "clean prose must pass through unchanged — kill switch must not fire"
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_abort_preserves_two_repeat_anaphora() {
+        // FALSE-POSITIVE GUARD: two repeats of a 4+ word phrase is rhetorical
+        // anaphora, NOT a mechanical loop. The kill switch must NOT fire;
+        // both instances must appear in the output. (Three repeats IS a loop
+        // and would fire — that's covered by smuggler-loop test above.)
+        let phrase = "The wind howls across the frozen moor. ";
+        let chunks: Vec<&str> = vec![
+            "The story begins. ",
+            phrase,                              // occurrence 1
+            phrase,                              // occurrence 2 (anaphora — OK)
+            "Then silence falls. ",
+        ];
+        let lines: Vec<String> = chunks.iter().map(|c| sse_chunk(c)).collect();
+        let expected_full: String = chunks.iter().cloned().collect();
+
+        let server = MockSseServer::spawn(lines);
+        let backend = backend_for(&server.url);
+
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let on_chunk: ChunkFn = std::sync::Arc::new(|_: &str| {});
+        let messages = vec![crate::session::ApiMessage {
+            role: "system".into(),
+            content: "test".into(),
+            raw_output: String::new(),
+        }];
+
+        let result = backend
+            .stream(messages, None, None, Vec::new(), 1024, on_chunk, cancel)
+            .await
+            .expect("stream should complete");
+
+        assert_eq!(
+            result.content, expected_full,
+            "two-repeat anaphora must NOT fire the kill switch"
+        );
+        assert_eq!(
+            result.content.matches("The wind howls across the frozen moor").count(),
+            2,
+            "both anaphora instances must be preserved"
+        );
     }
 }

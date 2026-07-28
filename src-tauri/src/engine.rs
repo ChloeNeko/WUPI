@@ -35,6 +35,7 @@ use llama_cpp_2::context::LlamaContext;
 use llama_cpp_2::llama_batch::LlamaBatch;
 use llama_cpp_2::model::{AddBos, LlamaModel};
 use llama_cpp_2::sampling::LlamaSampler;
+use llama_cpp_2::token::logit_bias::LlamaLogitBias;
 use llama_cpp_2::token::LlamaToken;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
@@ -719,11 +720,60 @@ impl EngineRuntime {
         on_chunk: &ChunkFn,
         cancel: &Arc<AtomicBool>,
     ) -> anyhow::Result<DecodeTelemetry> {
+        // Sampler config (mirrors fable_engine.rs — see there for full docs):
+        //   temp → top_p → min_p → dry(...) → logit_bias(-) → dist(0).
+        // - dry(...): DRY sampler (§11.40.E follow-up fix 2026-07-28).
+        //   Purpose-built for sequence repetition; penalizes repeated
+        //   multi-token sequences. Does NOT suffer the penalties() failure
+        //   mode (Gemma common-token suppression → `(player) is (player)`
+        //   loop — REVERTED 2026-07-28); DRY only fires on a sequence ≥
+        //   allowed_length tokens. Conservative values mirror fable_engine:
+        //   multiplier 0.8 / base 1.75 / allowed_length 2 / penalty_last_n
+        //   -1 / seq_breakers ["\n"] (the false-positive guard that resets
+        //   the DRY window at every newline so paragraph-level rhetorical
+        //   anaphora is never penalized). Defense-in-depth here on the chat
+        //   engine — the repetition problem is narrator-only, but the chat
+        //   sampler gets DRY for free since the chain already exists.
+        //   NOTE: the post-generation `truncate_repetition` firewall is
+        //   narrator-only (lib.rs::fable_send); the chat path would have
+        //   KV-coherence implications if it truncated raw_out (delta-prefill
+        //   next turn). DRY here is the chat path's sole repetition defense.
+        // - logit_bias on the hyphen token(s): Bug B fix (the model natively
+        //   generates `the-tavern`-style hyphenated tokens; -10.0 bias on `-`
+        //   before sampling makes it reach for a space instead). Defensive
+        //   resolution — biases both bare `-` and space-prefixed ` -` (Gemma's
+        //   SentencePiece tokenizer may encode either). Empty slice on
+        //   resolution failure → no-op stage (chain shape stays stable).
+        // - Anti-repetition: DRY sampler (above) + PROMPT-LEVEL "CRITICAL —
+        //   DO NOT REPEAT" clause in the narrator's BRACKET_PROTOCOL; see
+        //   fable_engine.rs for why `penalties` was reverted (Gemma common-
+        //   token suppression → `(player) is (player)` loop).
+        //
+        // HISTORY: previously ended in `greedy()` (pure argmax after temp
+        // scaling, making temp/top_p/min_p no-ops). Replaced with `dist(0)`
+        // 2026-07-28. NOT bare — leaving the chain without a terminal
+        // sampler triggers `GGML_ASSERT(cur_p.selected >= 0)` in llama-
+        // sampler.cpp on the first decode (the chain's `selected` field
+        // stays at its -1 sentinel). `dist` is the correct probabilistic
+        // terminal sampler.
+        let hyphen_biases: Vec<LlamaLogitBias> = ["-", " -"]
+            .iter()
+            .filter_map(|s| {
+                self.model
+                    .str_to_token(s, AddBos::Never)
+                    .ok()
+                    .and_then(|v| v.first().copied())
+                    .map(|t| LlamaLogitBias::new(t, -10.0))
+            })
+            .collect();
+        let n_vocab = self.model.n_vocab();
         let mut sampler = LlamaSampler::chain_simple([
             LlamaSampler::temp(0.85),
             LlamaSampler::top_p(0.95, 1),
             LlamaSampler::min_p(0.1, 1),
-            LlamaSampler::greedy(),
+            LlamaSampler::dry(self.model, 0.8, 1.75, 2, -1, ["\n"]),
+            LlamaSampler::logit_bias(n_vocab, &hyphen_biases),
+            LlamaSampler::dist(0),
         ]);
 
         let mut raw_out = String::new();
@@ -732,7 +782,16 @@ impl EngineRuntime {
             "<|turn>",
             "<turn|>",
             "<|think|>",
+            // Order matters: `<|channel>thought` MUST precede bare `<|channel>`
+            // so the regex (first-match-wins) takes the longer match on a
+            // thought-channel opener, leaving no `thought` suffix as prose.
+            // The bare opener catches every other channel variant
+            // (`<|channel>reply`, `<|channel>analysis`, etc.) that the chat
+            // model can emit and that ThoughtGate doesn't consume (ThoughtGate
+            // is hardcoded to `<|channel>thought`). See fable_engine.rs for
+            // the same change with full rationale (2026-07-28 leak fix).
             "<|channel>thought",
+            "<|channel>",
             "<channel|>",
             "<audio|>",
             "<|tool_call>",

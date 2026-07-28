@@ -610,6 +610,75 @@ pub fn referee_evaluate(text: &str, state: &PlayerState) -> Option<RefereeOutcom
     referee_evaluate_with_tier(text, state, AttackerTier::Soldier)
 }
 
+/// Select the attacker tier for a combat turn from the schema's entity map
+/// (Fable Phase 3 Slice 5 wiring, 2026-07-28 — unblocks the tier-scaling the
+/// `referee_evaluate_with_tier` integration test verified).
+///
+/// The narrator can declare an NPC's combat tier via entity keys shaped
+/// `npc.<id>.tier` with one of these values (case-insensitive, plus common
+/// synonyms): `minion`, `soldier` (default), `elite`, `boss`, `legendary`
+/// (also `dragon`, `apex`, `arch`, `ancient` → Legendary; `giant`, `warlord`
+/// → Boss; `veteran`, `knight`, `guard` → Elite; `grunt`, `thug`, `bandit`
+/// → Soldier; `rat`, `wolf`, `spider`, `goblin` → Minion).
+///
+/// This fn scans the entity map for any `npc.*.tier` keys + picks the
+/// HIGHEST threat found (if the player fights two foes, the dangerous one
+/// dominates the severity distribution). If no tier keys exist, returns
+/// `AttackerTier::Soldier` (the safe default — preserves the v1
+/// distribution). The caller then passes the result to
+/// `referee_evaluate_with_tier`.
+///
+/// Pure fn — no I/O. The entity map is `&HashMap<String, String>` (the
+/// WorldSchema's `entities` field shape).
+pub fn select_attacker_tier_from_entities(
+    entities: &std::collections::HashMap<String, String>,
+) -> AttackerTier {
+    // Single-pass scan: collect every npc.*.tier value, parse each, keep the
+    // max. Cheap (entity maps are small — typically <50 keys).
+    let mut best: Option<AttackerTier> = None;
+    for (key, value) in entities.iter() {
+        if !key.starts_with("npc.") || !key.ends_with(".tier") {
+            continue;
+        }
+        if let Some(tier) = parse_attacker_tier(value) {
+            best = Some(match best {
+                Some(prev) if prev as u8 >= tier as u8 => prev,
+                _ => tier,
+            });
+        }
+    }
+    best.unwrap_or(AttackerTier::Soldier)
+}
+
+/// Parse a free-form tier string into an AttackerTier. Case-insensitive,
+/// tolerant of common synonyms. Returns None for unparseable input. Mirrors
+/// `relationship::parse_tier`'s tolerant-parse style.
+pub fn parse_attacker_tier(s: &str) -> Option<AttackerTier> {
+    let lower = s.trim().to_lowercase();
+    // Direct enum names first (the canonical form).
+    let direct = match lower.as_str() {
+        "minion" | "trash" | "mob" => Some(AttackerTier::Minion),
+        "soldier" | "regular" | "standard" | "normal" => Some(AttackerTier::Soldier),
+        "elite" | "veteran" | "knight" | "guard" | "champion" => Some(AttackerTier::Elite),
+        "boss" | "giant" | "warlord" | "ogre" | "troll" => Some(AttackerTier::Boss),
+        "legendary" | "dragon" | "apex" | "arch" | "ancient" | "lich" | "demon" | "demigod" => {
+            Some(AttackerTier::Legendary)
+        }
+        _ => None,
+    };
+    if direct.is_some() {
+        return direct;
+    }
+    // Synonym fall-through: common low-tier creatures.
+    match lower.as_str() {
+        "rat" | "wolf" | "spider" | "goblin" | "bat" | "rat_king" | "kobold" => {
+            Some(AttackerTier::Minion)
+        }
+        "grunt" | "thug" | "bandit" | "brigand" | "cultist" => Some(AttackerTier::Soldier),
+        _ => None,
+    }
+}
+
 /// The tier-aware Referee entry point (Slice 3, 2026-07-28). Identical to
 /// [`referee_evaluate`] except the severity-roll weights + the lethality
 /// threshold are scaled by the attacker's tier. The default `referee_evaluate`

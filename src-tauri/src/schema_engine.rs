@@ -72,15 +72,17 @@ const SCHEMA_BATCH: u32 = 512;
 const SCHEMA_MAX_TOKENS: i32 = 256;
 /// Schema-engine sampler temperature. TASK-based, not source-based: schema
 /// tracking is a NON-creative JSON task whether the API or the local model is
-/// the active narrator. 0.2 flattens the distribution to near-greedy so the
-/// model commits to the structurally-correct token instead of a "creative"
+/// the active narrator. 0.2 strongly flattens the distribution so the model
+/// commits to the structurally-correct token instead of a "creative"
 /// alternative (which would corrupt the delta and force the 3-pass repair
 /// loop to fire). The chat/narrator engines use their own NARRATIVE_TEMP
 /// (0.85) for prose — same local model, different task, different temp.
-/// 0.2 was chosen over strict greedy (the prior config) because at temp 0
-/// the model occasionally picks the first plausible token even when a
-/// slightly-less-likely one is the structurally-correct JSON shape; 0.2
-/// lets it consider both while still strongly favoring the high-prob pick.
+/// Combined with top_p(0.9) + min_p(0.1) in the sampler chain, this keeps
+/// JSON output near-deterministic without the pure-argmax collapse that
+/// strict greedy produced (the prior `temp + greedy` config made temp a
+/// no-op — greedy after temp scaling always picks the top-1 logit, so the
+/// "0.2 lets it consider both" intent was defeated). See the chain
+/// construction in `generate_with_repair`.
 const SCHEMA_TEMP: f32 = 0.2;
 
 /// Maximum number of generation passes per delta attempt (initial + 2
@@ -861,8 +863,10 @@ impl SchemaRuntime {
     }
 
     /// Tokenize → prefill → sample-and-decode a single response. One-shot
-    /// generation with a max-tokens cap and greedy sampling (the delta is
-    /// deterministic JSON; no creativity needed). Returns the decoded text.
+    /// generation with a max-tokens cap and near-greedy probabilistic
+    /// sampling (the delta is deterministic JSON; no creativity needed —
+    /// see the sampler-chain comment below for the temp/top_p/min_p config).
+    /// Returns the decoded text.
     ///
     /// The context is fully reset each call (clear_kv_cache + re-prefill from
     /// zero). Unlike the chat engine, there's no delta-prefill optimization
@@ -915,29 +919,37 @@ impl SchemaRuntime {
             consumed += take;
         }
 
-        // Sample-and-decode loop. Temp-shaped greedy: the temperature scales
-        // the logits before argmax. Schema deltas are strict JSON — a NON-
-        // creative task — so we want near-greedy determinism: SCHEMA_TEMP
-        // (0.2) flattens the distribution enough that the model commits to
-        // the structurally-correct token instead of picking a "creative"
-        // alternative (which corrupts the delta and forces the 3-pass
-        // repair loop to fire). This temp is TASK-based, not source-based:
-        // schema tracking is non-creative JSON whether the API or local
-        // model is the active narrator — both modes produce the same kind
-        // of structured output here, so both use SCHEMA_TEMP. The chat/
-        // narrator engines use their own NARRATIVE_TEMP (0.85) for prose.
+        // Sample-and-decode loop. Near-greedy probabilistic sampling.
         //
-        // No top_p / min_p in this chain. The chat/narrator sampler knobs
-        // shape creative-token diversity, which is the opposite of what
-        // structured JSON wants. Temp + greedy is the right minimal shape
-        // (matches the schema engine's original greedy intent, just
-        // temp-controllable for the rare ambiguous-JSON case where strict
-        // greedy picked the wrong first-token). No ThoughtGate/StreamFilter
-        // here either (output is JSON, not the Gemma4 channel protocol).
-        // n_cur = next position to decode.
+        // Sampler chain (2026-07-28): temp(SCHEMA_TEMP=0.2) + top_p(0.9) +
+        // min_p(0.1) + dist(0). The temp/top_p/min_p trio filters the
+        // distribution tightly (low temp + tight top_p + min_p floor) so
+        // the JSON output stays near-deterministic; `dist` does the final
+        // multinomial sample from what remains.
+        //
+        // HISTORY: previously ended in `greedy()` (pure argmax after temp
+        // scaling, making temp a no-op). Replaced with `dist(0)` 2026-07-28
+        // — the correct probabilistic terminal sampler. NOT bare: leaving
+        // the chain without a terminal sampler triggers
+        // `GGML_ASSERT(cur_p.selected >= 0)` in llama-sampler.cpp on the
+        // first decode (the chain's `selected` stays at -1).
+        //
+        // Schema deltas are strict JSON — a NON-creative task — so we want
+        // near-deterministic token selection: the model commits to the
+        // structurally-correct token instead of a "creative" alternative
+        // (which corrupts the delta and forces the 3-pass repair loop).
+        // SCHEMA_TEMP is TASK-based: schema tracking is non-creative JSON
+        // whether the API or local model is the active narrator. The chat
+        // + fable engines use temp 0.85 + top_p 0.95 + min_p 0.1 for prose
+        // (same chain shape, looser values for creative narrative).
+        //
+        // No ThoughtGate/StreamFilter here (output is JSON, not the Gemma4
+        // channel protocol). n_cur = next position to decode.
         let mut sampler = LlamaSampler::chain_simple([
             LlamaSampler::temp(SCHEMA_TEMP),
-            LlamaSampler::greedy(),
+            LlamaSampler::top_p(0.9, 1),
+            LlamaSampler::min_p(0.1, 1),
+            LlamaSampler::dist(0),
         ]);
         let eos = self.model.token_eos();
         let mut n_cur = n_prompt;
