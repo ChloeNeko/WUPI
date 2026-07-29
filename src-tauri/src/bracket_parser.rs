@@ -41,6 +41,42 @@ pub enum BracketCommand {
     Object { id: String, state: String },
     /// A scene effect should activate.
     Fx { effect: String },
+    /// The global atmospheric condition changed (Fable Phase 4 Component 2,
+    /// 2026-07-28). Single-region like FX/TIME/OBJECT. `condition` is the
+    /// diegetic phrase the narrator weaves into prose ("heavy rain", "clear",
+    /// "thick fog", "snowfall"). The Rust side owns the weather field — this
+    /// is the ONLY bracket path that writes `WorldSchema::weather` (the World
+    /// Progression tick drift is the other writer, but it's pure Rust, not a
+    /// bracket). Named `condition` (not `kind`) to avoid colliding with this
+    /// enum's `#[serde(tag = "kind")]` external discriminator (same reason
+    /// `Effect.tag_kind` isn't named `kind`, see above).
+    Weather { condition: String },
+    /// The player moved to a new node (Fable Phase 4 Component 3, 2026-07-28).
+    /// Single-region like WEATHER/TIME. `destination` is a bare node id
+    /// ("cellar", "market_square") — NOT the diegetic name, NOT "node.cellar"
+    /// (the parser strips an optional `node.` prefix the narrator may emit).
+    /// Rust is the SOLE authority on whether the move is legal: the applier
+    /// validates the destination exists + is adjacent to the current node
+    /// (anti-sycophancy gate — non-neighbor moves are rejected with a
+    /// [DIRECTIVE]). The first `[TRAVEL]` from `current_node: None` is allowed
+    /// (seeds initial location without scenario-card wiring). Named
+    /// `destination` (not `kind` / `node`) to avoid colliding with this
+    /// enum's `#[serde(tag = "kind")]` external discriminator.
+    Travel { destination: String },
+    /// A rumor is seeded at the current node (Fable Phase 4 Component 4,
+    /// 2026-07-28). Single-region like WEATHER/TRAVEL. `label` is the
+    /// free-form diegetic phrase the narrator weaves into ambient gossip
+    /// ("the stranger paid in gold coins", "the captain is looking for
+    /// someone", "a bandit scout was seen at the ridge"). The applier roots
+    /// the rumor at the current node (`known_nodes` initialized to
+    /// `[origin_node]`); the World Progression tick then propagates it to
+    /// adjacent nodes via `rumor::propagate_rumors`. Propagation-only by
+    /// design — no polarity / truth field, no stored reputation score. Named
+    /// `label` (not `kind`) to avoid colliding with this enum's
+    /// `#[serde(tag = "kind")]` external discriminator (same reason
+    /// `Effect.tag_kind` / `Weather.condition` / `Travel.destination` aren't
+    /// named `kind`).
+    Rumor { label: String },
     /// The in-world clock advanced. `minutes` is the authoritative value
     /// (minutes since 0001-01-01, parsed by [`parse_in_world_time`]); `raw`
     /// is the verbatim string the narrator emitted (kept for diagnostics +
@@ -56,10 +92,18 @@ pub enum BracketCommand {
     /// the World Progression tick drops it (the tag's `expires_at` =
     /// current clock + duration). `0` duration means permanent (the
     /// sentinel; only removed by an explicit event, not time).
+    ///
+    /// `tag_kind` (Phase 4 §11.44, Component 1) is the optional
+    /// discriminator routed into the resulting `StatusTag.kind`. Named
+    /// `tag_kind` (not `kind`) to avoid colliding with this enum's
+    /// `#[serde(tag = "kind")]` external discriminator. Currently
+    /// recognized non-empty value: `"disguise"` (the disguise Referee gate
+    /// reads it). Empty string = generic effect (the historical case).
     Effect {
         label: String,
         polarity: Polarity,
         duration_minutes: i64,
+        tag_kind: String,
     },
     /// A relationship milestone event was recorded (Fable Phase 3 Slice 5
     /// wiring, 2026-07-28). `npc_id` matches the entity-map convention
@@ -469,6 +513,9 @@ fn json_value_to_command(obj: &serde_json::Map<String, serde_json::Value>) -> Op
         "character_turn" | "character" | "dialogue" => json_to_character_turn(obj),
         "object" => json_to_object(obj),
         "fx" | "effect_fx" | "scene_fx" => json_to_fx(obj),
+        "weather" => json_to_weather(obj),
+        "travel" | "move" | "arrive" | "go" => json_to_travel(obj),
+        "rumor" | "gossip" | "hearsay" => json_to_rumor(obj),
         _ => None,
     }
 }
@@ -499,6 +546,33 @@ fn infer_kind_from_fields(obj: &serde_json::Map<String, serde_json::Value>) -> O
     }
     if keys.iter().any(|k| *k == "state") {
         return Some("object".to_string());
+    }
+    // Travel: destination / to / node (Component 3, 2026-07-28). Placed before
+    // the weather single-field rule so a `{"destination": ...}` body doesn't
+    // fall through to `condition`-based weather inference. None of these keys
+    // collide with the richer discriminators above (effect_*/event_id/eta/
+    // clock/npc+line/state), so order relative to those is safe.
+    if keys
+        .iter()
+        .any(|k| matches!(*k, "destination" | "to" | "node"))
+    {
+        return Some("travel".to_string());
+    }
+    // Rumor: label / text / gossip / hearsay (Component 4, 2026-07-28). Placed
+    // before the weather single-`condition` rule so a `{"label": ...}` body
+    // doesn't fall through. None of these keys collide with the richer
+    // discriminators above (effect_*/event_id/eta/clock/npc+line/state/
+    // destination), so order relative to those is safe.
+    if keys
+        .iter()
+        .any(|k| matches!(*k, "label" | "text" | "gossip" | "hearsay"))
+    {
+        return Some("rumor".to_string());
+    }
+    // Weather: only `condition` (the single field). Placed last so it doesn't
+    // shadow any richer discriminator above (Component 2, 2026-07-28).
+    if keys.iter().any(|k| *k == "condition") {
+        return Some("weather".to_string());
     }
     None
 }
@@ -536,10 +610,20 @@ fn json_to_effect(obj: &serde_json::Map<String, serde_json::Value>) -> Option<Br
         })
         .unwrap_or_else(|| infer_polarity(&label));
 
+    // §11.44 (Component 1): optional kind discriminator. Mirrors the
+    // key=value EFFECT path; the resulting StatusTag.kind routes it out of
+    // the generic buff/debuff lanes when non-empty (e.g. "disguise").
+    let kind = obj
+        .get("kind")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+
     Some(BracketCommand::Effect {
         label,
         polarity,
         duration_minutes,
+        tag_kind: kind,
     })
 }
 
@@ -674,6 +758,66 @@ fn json_to_fx(obj: &serde_json::Map<String, serde_json::Value>) -> Option<Bracke
     Some(BracketCommand::Fx { effect })
 }
 
+/// Parse a `{"kind": "weather", ...}` JSON body into `BracketCommand::Weather`
+/// (Fable Phase 4 Component 2, 2026-07-28). Single field `condition` (aliased
+/// `weather`); mirrors `json_to_fx`'s leniency. Empty condition → None.
+fn json_to_weather(obj: &serde_json::Map<String, serde_json::Value>) -> Option<BracketCommand> {
+    let condition = obj
+        .get("condition")
+        .or_else(|| obj.get("weather"))
+        .and_then(|v| v.as_str())?
+        .to_string();
+    if condition.trim().is_empty() {
+        return None;
+    }
+    Some(BracketCommand::Weather { condition })
+}
+
+/// Parse a `{"kind": "travel", ...}` JSON body (Component 3, 2026-07-28).
+/// Destination is read from `destination` / `to` / `node` (model flexibility —
+/// the field name is unstable across models). An optional `node.` prefix the
+/// narrator may emit is stripped ("node.cellar" → "cellar"). Empty → None.
+fn json_to_travel(obj: &serde_json::Map<String, serde_json::Value>) -> Option<BracketCommand> {
+    let dest_raw = obj
+        .get("destination")
+        .or_else(|| obj.get("to"))
+        .or_else(|| obj.get("node"))
+        .and_then(|v| v.as_str())?
+        .trim()
+        .to_string();
+    if dest_raw.is_empty() {
+        return None;
+    }
+    let dest = dest_raw
+        .strip_prefix("node.")
+        .map(|s| s.trim().to_string())
+        .unwrap_or(dest_raw);
+    if dest.is_empty() {
+        return None;
+    }
+    Some(BracketCommand::Travel { destination: dest })
+}
+
+/// Parse a `{"kind": "rumor", ...}` JSON body (Component 4, 2026-07-28).
+/// Label is read from `label` / `text` / `gossip` / `hearsay` / `rumor`
+/// (model flexibility — the field name is unstable across models). Empty →
+/// None. Mirrors `json_to_weather`'s single-field leniency.
+fn json_to_rumor(obj: &serde_json::Map<String, serde_json::Value>) -> Option<BracketCommand> {
+    let label = obj
+        .get("label")
+        .or_else(|| obj.get("text"))
+        .or_else(|| obj.get("gossip"))
+        .or_else(|| obj.get("hearsay"))
+        .or_else(|| obj.get("rumor"))
+        .and_then(|v| v.as_str())?
+        .trim()
+        .to_string();
+    if label.is_empty() {
+        return None;
+    }
+    Some(BracketCommand::Rumor { label })
+}
+
 fn parse_one(bracket: &str, text_after: &str) -> Option<(BracketCommand, usize)> {
     let bracket = bracket.trim();
 
@@ -767,6 +911,62 @@ fn parse_one(bracket: &str, text_after: &str) -> Option<(BracketCommand, usize)>
         return None;
     }
 
+    // [WEATHER <condition>] — Fable Phase 4 Component 2 (2026-07-28). Single-
+    // region like FX/TIME/OBJECT. The body is a free-form diegetic phrase
+    // (spaces allowed: "heavy rain", "clearing skies", "thick morning fog").
+    // Empty body → None (emitted as literal prose). Case-insensitive via the
+    // §11.41 follow-up `strip_prefix_ci` helper (ASCII-safe — "WEATHER" is
+    // ASCII). The JSON form `{"kind": "weather", "condition": "..."}` is
+    // handled by the serde-tag routing in `parse_json_command` — zero parse
+    // code here (the `#[serde(tag = "kind")]` discriminator does the work).
+    if let Some(rest) = strip_prefix_ci(bracket, "WEATHER") {
+        let condition = rest.trim().to_string();
+        if !condition.is_empty() {
+            return Some((BracketCommand::Weather { condition }, 0));
+        }
+        return None;
+    }
+
+    // [TRAVEL <destination>] — Fable Phase 4 Component 3 (2026-07-28). Single-
+    // region like WEATHER/TIME. The body is a bare node id ("cellar",
+    // "market_square") — NOT the diegetic name. An optional `node.` prefix the
+    // narrator may emit is stripped for ergonomics ("node.cellar" → "cellar").
+    // Empty body → None (literal prose). Case-insensitive via `strip_prefix_ci`
+    // (ASCII-safe — "TRAVEL" is ASCII). The JSON form `{"kind": "travel",
+    // "destination": "..."}` is handled by the manual per-variant dispatch in
+    // `parse_json_command` (the `travel` arm + `json_to_travel` helper) — zero
+    // parse code here beyond the prefix-form.
+    if let Some(rest) = strip_prefix_ci(bracket, "TRAVEL") {
+        let dest_raw = rest.trim().to_string();
+        // Ergonomic: strip an optional `node.` prefix (narrator convention).
+        let dest = dest_raw
+            .strip_prefix("node.")
+            .map(|s| s.trim().to_string())
+            .unwrap_or(dest_raw);
+        if !dest.is_empty() {
+            return Some((BracketCommand::Travel {
+                destination: dest,
+            }, 0));
+        }
+        return None;
+    }
+
+    // [RUMOR <label>] — Fable Phase 4 Component 4 (2026-07-28). Single-region
+    // like WEATHER/TRAVEL. The body is a free-form diegetic phrase (spaces
+    // allowed: "the stranger paid in gold coins", "the captain is looking for
+    // someone"). Empty body → None (emitted as literal prose). Case-insensitive
+    // via `strip_prefix_ci` (ASCII-safe — "RUMOR" is ASCII). The JSON form
+    // `{"kind": "rumor", "label": "..."}` is handled by the manual per-variant
+    // dispatch in `parse_json_command` (the `rumor` arm + `json_to_rumor`
+    // helper) — zero parse code here beyond the prefix-form.
+    if let Some(rest) = strip_prefix_ci(bracket, "RUMOR") {
+        let label = rest.trim().to_string();
+        if !label.is_empty() {
+            return Some((BracketCommand::Rumor { label }, 0));
+        }
+        return None;
+    }
+
     // [TIME <in-world timestamp>] — Seam #4 clock advance. Single-region like
     // OBJECT/FX. The body is parsed by parse_in_world_time into minutes-since-
     // epoch; on failure the bracket is emitted as literal prose (better to
@@ -793,6 +993,12 @@ fn parse_one(bracket: &str, text_after: &str) -> Option<(BracketCommand, usize)>
     //
     // The label may contain spaces (positional) or be a quoted/escaped value
     // (key=value — we strip a trailing `=` and join the rest).
+    //
+    // Phase 4 §11.44 (Component 1): the key=value form accepts an optional
+    // `kind=<value>` discriminator (e.g. `kind=disguise`) that routes the
+    // resulting StatusTag into a dedicated render + mechanic lane. The
+    // positional form does NOT support kind (backwards-compat — it stays
+    // generic); kind defaults to empty string.
     if let Some(rest) = strip_prefix_ci(bracket, "EFFECT") {
         let rest = rest.trim();
         // Parse key=value pairs first (model's preferred shape).
@@ -809,6 +1015,12 @@ fn parse_one(bracket: &str, text_after: &str) -> Option<(BracketCommand, usize)>
                 positional.push(tok);
             }
         }
+        // §11.44: optional `kind` discriminator. Hoisted before the
+        // key=value/positional split so a MIXED form — positional body +
+        // `kind=disguise` trailing (the recommended disguise syntax in
+        // BRACKET_PROTOCOL) — still threads kind through. The key=value
+        // branch below does NOT re-read kind; it inherits this value.
+        let kind = kv.get("kind").copied().unwrap_or("").to_string();
         // Try key=value extraction first.
         if !kv.is_empty() {
             let label = kv.get("label").copied().or_else(|| kv.get("name").copied());
@@ -830,6 +1042,7 @@ fn parse_one(bracket: &str, text_after: &str) -> Option<(BracketCommand, usize)>
                             label: label.to_string(),
                             polarity,
                             duration_minutes: duration,
+                            tag_kind: kind,
                         },
                         0,
                     ));
@@ -861,6 +1074,10 @@ fn parse_one(bracket: &str, text_after: &str) -> Option<(BracketCommand, usize)>
                                 label,
                                 polarity,
                                 duration_minutes,
+                                // §11.44: kind is hoisted above so a mixed
+                                // positional-body + `kind=disguise` form threads
+                                // it through; pure-positional forms carry "".
+                                tag_kind: kind,
                             },
                             0,
                         ));
@@ -1384,6 +1601,284 @@ mod tests {
         assert!(!parsed.prose.contains("[FX"));
     }
 
+    // ---------- WEATHER (Fable Phase 4 Component 2, 2026-07-28) ----------
+
+    #[test]
+    fn extracts_weather_command_basic() {
+        let raw = "The sky darkens. [WEATHER heavy rain] Drops hammer the roof.";
+        let parsed = parse(raw);
+        assert_eq!(parsed.commands.len(), 1);
+        assert_eq!(
+            parsed.commands[0],
+            BracketCommand::Weather { condition: "heavy rain".into() }
+        );
+        // Prose: the bracket is stripped, surrounding text preserved.
+        assert!(parsed.prose.contains("The sky darkens."));
+        assert!(parsed.prose.contains("Drops hammer the roof."));
+        assert!(!parsed.prose.contains("[WEATHER"));
+    }
+
+    #[test]
+    fn extracts_weather_command_case_insensitive() {
+        // The §11.41 follow-up convention: prefix matching is ASCII-case-
+        // insensitive. The condition's casing is preserved (it's free-form
+        // diegetic text the narrator chose).
+        for (bracket, expected_cond) in [
+            ("[weather heavy rain]", "heavy rain"),
+            ("[Weather Heavy Rain]", "Heavy Rain"),
+            ("[WEATHER thick morning fog]", "thick morning fog"),
+        ] {
+            let parsed = parse(bracket);
+            assert_eq!(parsed.commands.len(), 1, "bracket: {}", bracket);
+            assert_eq!(
+                parsed.commands[0],
+                BracketCommand::Weather { condition: expected_cond.into() },
+                "bracket: {}",
+                bracket
+            );
+        }
+    }
+
+    #[test]
+    fn extracts_weather_preserves_spaces_in_condition() {
+        // The condition may contain spaces (positional body, free-form).
+        let raw = "[WEATHER clearing skies after dawn]";
+        let parsed = parse(raw);
+        assert_eq!(parsed.commands.len(), 1);
+        assert_eq!(
+            parsed.commands[0],
+            BracketCommand::Weather { condition: "clearing skies after dawn".into() }
+        );
+    }
+
+    #[test]
+    fn weather_empty_body_emitted_as_literal_prose() {
+        // No condition → not a valid command → the bracket leaks verbatim
+        // (mirrors FX empty-body behavior). Better to surface a malformed
+        // bracket than silently drop it.
+        let raw = "Odd text [WEATHER] trailing.";
+        let parsed = parse(raw);
+        assert_eq!(parsed.commands.len(), 0);
+        assert!(parsed.prose.contains("[WEATHER]"));
+    }
+
+    #[test]
+    fn weather_whitespace_only_body_emitted_as_literal_prose() {
+        // `[WEATHER   ]` trims to empty → same as above.
+        let raw = "[WEATHER   ]";
+        let parsed = parse(raw);
+        assert_eq!(parsed.commands.len(), 0);
+        assert!(parsed.prose.contains("[WEATHER"));
+    }
+
+    #[test]
+    fn json_weather_kind_dispatches() {
+        // The JSON form `{"kind": "weather", "condition": "..."}` dispatches
+        // via the per-variant arm in parse_json_command.
+        let raw = "```json\n{ \"type\": \"weather\", \"condition\": \"heavy rain\" }\n```";
+        let parsed = parse(raw);
+        assert_eq!(parsed.commands.len(), 1);
+        assert_eq!(
+            parsed.commands[0],
+            BracketCommand::Weather { condition: "heavy rain".into() }
+        );
+    }
+
+    #[test]
+    fn json_weather_kind_alias_works() {
+        // `kind` discriminator + `weather` field alias (the json_to_weather
+        // leniency — accepts both `condition` and `weather` keys).
+        let raw = "```json\n{ \"kind\": \"weather\", \"weather\": \"thick fog\" }\n```";
+        let parsed = parse(raw);
+        assert_eq!(parsed.commands.len(), 1);
+        assert_eq!(
+            parsed.commands[0],
+            BracketCommand::Weather { condition: "thick fog".into() }
+        );
+    }
+
+    #[test]
+    fn json_weather_inferred_from_condition_field() {
+        // No explicit type/kind discriminator → infer_kind_from_fields should
+        // route a body with only `condition` to the weather variant.
+        let raw = "```json\n{ \"condition\": \"snowfall\" }\n```";
+        let parsed = parse(raw);
+        assert_eq!(parsed.commands.len(), 1);
+        assert!(matches!(parsed.commands[0], BracketCommand::Weather { .. }));
+    }
+
+    #[test]
+    fn json_weather_empty_condition_is_noop() {
+        // Empty condition → not a valid command → dropped silently.
+        let raw = "```json\n{ \"type\": \"weather\", \"condition\": \"\" }\n```";
+        let parsed = parse(raw);
+        assert_eq!(parsed.commands.len(), 0);
+    }
+
+    // ---------- [TRAVEL] (Fable Phase 4 Component 3, 2026-07-28) ----------
+
+    #[test]
+    fn extracts_travel_basic() {
+        let raw = "[TRAVEL cellar]";
+        let parsed = parse(raw);
+        assert_eq!(parsed.commands.len(), 1);
+        assert_eq!(
+            parsed.commands[0],
+            BracketCommand::Travel { destination: "cellar".into() }
+        );
+    }
+
+    #[test]
+    fn extracts_travel_strips_node_prefix() {
+        // The narrator may emit "node.cellar"; the parser strips the prefix
+        // for ergonomics (the id is "cellar").
+        let raw = "[TRAVEL node.cellar]";
+        let parsed = parse(raw);
+        assert_eq!(parsed.commands.len(), 1);
+        assert_eq!(
+            parsed.commands[0],
+            BracketCommand::Travel { destination: "cellar".into() }
+        );
+    }
+
+    #[test]
+    fn extracts_travel_case_insensitive() {
+        // §11.41 follow-up: all command-verb prefixes are case-insensitive.
+        for verb in ["travel", "Travel", "TrAvEl"] {
+            let raw = format!("[{verb} market_square]");
+            let parsed = parse(&raw);
+            assert_eq!(parsed.commands.len(), 1, "verb={verb}");
+            assert_eq!(
+                parsed.commands[0],
+                BracketCommand::Travel { destination: "market_square".into() }
+            );
+        }
+    }
+
+    #[test]
+    fn travel_with_underscore_id_preserved() {
+        // Node ids are bare slugs (snake_case allowed).
+        let raw = "[TRAVEL market_square]";
+        let parsed = parse(raw);
+        assert_eq!(parsed.commands.len(), 1);
+        assert_eq!(
+            parsed.commands[0],
+            BracketCommand::Travel { destination: "market_square".into() }
+        );
+    }
+
+    #[test]
+    fn travel_empty_body_emitted_as_literal_prose() {
+        // No destination → not a valid command → the bracket leaks verbatim.
+        let raw = "Odd text [TRAVEL] trailing.";
+        let parsed = parse(raw);
+        assert_eq!(parsed.commands.len(), 0);
+        assert!(parsed.prose.contains("[TRAVEL]"));
+    }
+
+    #[test]
+    fn travel_whitespace_only_body_emitted_as_literal_prose() {
+        let raw = "[TRAVEL   ]";
+        let parsed = parse(raw);
+        assert_eq!(parsed.commands.len(), 0);
+        assert!(parsed.prose.contains("[TRAVEL"));
+    }
+
+    #[test]
+    fn json_travel_kind_dispatches() {
+        // The JSON form `{"kind": "travel", "destination": "..."}` dispatches
+        // via the per-variant arm in parse_json_command.
+        let raw = "```json\n{ \"type\": \"travel\", \"destination\": \"cellar\" }\n```";
+        let parsed = parse(raw);
+        assert_eq!(parsed.commands.len(), 1);
+        assert_eq!(
+            parsed.commands[0],
+            BracketCommand::Travel { destination: "cellar".into() }
+        );
+    }
+
+    #[test]
+    fn json_travel_to_alias_works() {
+        // `to` is one of the lenient aliases (destination / to / node).
+        let raw = "```json\n{ \"kind\": \"travel\", \"to\": \"market_square\" }\n```";
+        let parsed = parse(raw);
+        assert_eq!(parsed.commands.len(), 1);
+        assert_eq!(
+            parsed.commands[0],
+            BracketCommand::Travel { destination: "market_square".into() }
+        );
+    }
+
+    #[test]
+    fn json_travel_node_alias_works() {
+        // `node` is the third alias.
+        let raw = "```json\n{ \"kind\": \"travel\", \"node\": \"cellar\" }\n```";
+        let parsed = parse(raw);
+        assert_eq!(parsed.commands.len(), 1);
+        assert_eq!(
+            parsed.commands[0],
+            BracketCommand::Travel { destination: "cellar".into() }
+        );
+    }
+
+    #[test]
+    fn json_travel_node_prefix_stripped_in_json_form() {
+        // The node. prefix is stripped in the JSON form too (consistency with
+        // the bracket form).
+        let raw = "```json\n{ \"destination\": \"node.cellar\" }\n```";
+        let parsed = parse(raw);
+        assert_eq!(parsed.commands.len(), 1);
+        assert_eq!(
+            parsed.commands[0],
+            BracketCommand::Travel { destination: "cellar".into() }
+        );
+    }
+
+    #[test]
+    fn json_travel_inferred_from_destination_field() {
+        // No explicit discriminator → infer_kind_from_fields routes a body with
+        // `destination` (or `to` / `node`) to the travel variant.
+        let raw = "```json\n{ \"destination\": \"cellar\" }\n```";
+        let parsed = parse(raw);
+        assert_eq!(parsed.commands.len(), 1);
+        assert!(matches!(parsed.commands[0], BracketCommand::Travel { .. }));
+    }
+
+    #[test]
+    fn json_travel_inferred_from_to_field() {
+        let raw = "```json\n{ \"to\": \"cellar\" }\n```";
+        let parsed = parse(raw);
+        assert_eq!(parsed.commands.len(), 1);
+        assert!(matches!(parsed.commands[0], BracketCommand::Travel { .. }));
+    }
+
+    #[test]
+    fn json_travel_empty_destination_is_noop() {
+        // Empty destination → not a valid command → dropped silently.
+        let raw = "```json\n{ \"type\": \"travel\", \"destination\": \"\" }\n```";
+        let parsed = parse(raw);
+        assert_eq!(parsed.commands.len(), 0);
+    }
+
+    #[test]
+    fn json_travel_whitespace_only_destination_is_noop() {
+        let raw = "```json\n{ \"destination\": \"   \" }\n```";
+        let parsed = parse(raw);
+        assert_eq!(parsed.commands.len(), 0);
+    }
+
+    #[test]
+    fn json_travel_does_not_shadow_weather_inference() {
+        // infer_kind_from_fields ordering: travel's heuristic runs BEFORE
+        // weather's `condition` single-field rule. A body with both
+        // `destination` and `condition` should route to travel (the richer
+        // signal), not weather.
+        let raw = "```json\n{ \"destination\": \"cellar\", \"condition\": \"fog\" }\n```";
+        let parsed = parse(raw);
+        assert_eq!(parsed.commands.len(), 1);
+        assert!(matches!(parsed.commands[0], BracketCommand::Travel { .. }));
+    }
+
     #[test]
     fn extracts_character_turn_with_body() {
         let raw = "[CHARACTER_TURN:gorm] Rain's bad tonight. [CHARACTER_TURN:end] Gorm dries a mug.";
@@ -1734,7 +2229,7 @@ mod tests {
         let parsed = parse(raw);
         assert_eq!(parsed.commands.len(), 1, "one effect command");
         match &parsed.commands[0] {
-            BracketCommand::Effect { label, polarity, duration_minutes } => {
+            BracketCommand::Effect { label, polarity, duration_minutes, .. } => {
                 assert_eq!(label, "exploration");
                 assert_eq!(*duration_minutes, 15);
                 // "exploration" has no debuff keyword → inferred Buff.
@@ -1755,7 +2250,7 @@ mod tests {
         let raw = "```json\n{ \"type\": \"effect\", \"label\": \"Berserk Rage\", \"polarity\": \"buff\", \"duration_minutes\": 60 }\n```";
         let parsed = parse(raw);
         assert_eq!(parsed.commands.len(), 1);
-        if let BracketCommand::Effect { label, polarity, duration_minutes } = &parsed.commands[0] {
+        if let BracketCommand::Effect { label, polarity, duration_minutes, .. } = &parsed.commands[0] {
             assert_eq!(label, "Berserk Rage");
             assert_eq!(*polarity, Polarity::Buff);
             assert_eq!(*duration_minutes, 60);
@@ -1785,6 +2280,77 @@ mod tests {
         let parsed = parse(raw);
         if let BracketCommand::Effect { duration_minutes, .. } = &parsed.commands[0] {
             assert_eq!(*duration_minutes, 0, "zero = permanent sentinel");
+        } else {
+            panic!("wrong variant");
+        }
+    }
+
+    // ---- Phase 4 §11.44 (Component 1): EFFECT `kind` discriminator ----
+
+    #[test]
+    fn effect_keyvalue_kind_disguise_parsed() {
+        // key=value form carries the optional `kind` discriminator.
+        let raw = "[EFFECT city guard uniform buff 0 kind=disguise]";
+        let parsed = parse(raw);
+        assert_eq!(parsed.commands.len(), 1);
+        match &parsed.commands[0] {
+            BracketCommand::Effect { label, polarity, duration_minutes, tag_kind } => {
+                assert_eq!(label, "city guard uniform");
+                assert_eq!(*polarity, Polarity::Buff);
+                assert_eq!(*duration_minutes, 0);
+                assert_eq!(tag_kind, "disguise", "kind must thread through");
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn effect_keyvalue_omits_kind_defaults_empty() {
+        // Existing key=value form (no kind) → empty string, NOT a parse failure.
+        let raw = "[EFFECT label=Berserk duration=60]";
+        let parsed = parse(raw);
+        if let BracketCommand::Effect { tag_kind, .. } = &parsed.commands[0] {
+            assert_eq!(tag_kind, "", "absent kind defaults to empty");
+        } else {
+            panic!("wrong variant");
+        }
+    }
+
+    #[test]
+    fn effect_positional_form_never_carries_kind() {
+        // Positional form has no kind channel — always empty (backwards-compat).
+        let raw = "[EFFECT Berserk Rage buff 60]";
+        let parsed = parse(raw);
+        if let BracketCommand::Effect { tag_kind, .. } = &parsed.commands[0] {
+            assert_eq!(tag_kind, "");
+        } else {
+            panic!("wrong variant");
+        }
+    }
+
+    #[test]
+    fn json_effect_kind_disguise_parsed() {
+        // JSON form carries kind alongside the bracket-form parity.
+        let raw = "```json\n{ \"type\": \"effect\", \"label\": \"merchant robes\", \"polarity\": \"buff\", \"duration_minutes\": 0, \"kind\": \"disguise\" }\n```";
+        let parsed = parse(raw);
+        assert_eq!(parsed.commands.len(), 1);
+        if let BracketCommand::Effect { label, tag_kind, .. } = &parsed.commands[0] {
+            assert_eq!(label, "merchant robes");
+            assert_eq!(tag_kind, "disguise");
+        } else {
+            panic!("wrong variant");
+        }
+    }
+
+    #[test]
+    fn effect_kind_case_sensitive_value_preserved() {
+        // The kind value is preserved verbatim (not lowercased) so future
+        // kinds aren't accidentally mangled. Only the discriminator logic
+        // downstream reads it case-sensitively against recognized kinds.
+        let raw = "[EFFECT novice robe buff 0 kind=Disguise]";
+        let parsed = parse(raw);
+        if let BracketCommand::Effect { tag_kind, .. } = &parsed.commands[0] {
+            assert_eq!(tag_kind, "Disguise");
         } else {
             panic!("wrong variant");
         }

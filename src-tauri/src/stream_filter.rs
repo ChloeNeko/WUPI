@@ -142,10 +142,13 @@ impl StreamFilter {
         //   [OBJECT ...]
         //   [FX name]
         //   [TIME Day 3, 14:00]            (Seam #4, 2026-07-27)
+        //   [WEATHER heavy rain]           (Phase 4 Component 2, 2026-07-28)
+        //   [TRAVEL cellar]                (Phase 4 Component 3, 2026-07-28)
         //   [EFFECT label polarity dur]    (Phase 3 Slice 4, 2026-07-28)
         //   [MILESTONE npc_id event_id]    (Phase 3 Slice 5, 2026-07-28)
         //   [TASK npc_id desc | d s eta]   (Phase 3 Slice 6, 2026-07-28)
-        let pattern = r"\[(?:CHARACTER_TURN:(?:end|[A-Za-z0-9_-]+)|OBJECT\s+[^\]]+|FX\s+[^\]]+|TIME\s+[^\]]+|EFFECT\s+[^\]]+|MILESTONE\s+[^\]]+|TASK\s+[^\]]+)\]";
+        //   [RUMOR label]                  (Phase 4 Component 4, 2026-07-28)
+        let pattern = r"\[(?:CHARACTER_TURN:(?:end|[A-Za-z0-9_-]+)|OBJECT\s+[^\]]+|FX\s+[^\]]+|TIME\s+[^\]]+|WEATHER\s+[^\]]+|TRAVEL\s+[^\]]+|EFFECT\s+[^\]]+|MILESTONE\s+[^\]]+|TASK\s+[^\]]+|RUMOR\s+[^\]]+)\]";
         self.bracket_re = Some(Regex::new(pattern).expect("bracket regex always compiles"));
         // Longest realistic bracket: `[TASK npc.marcus scout the bandit camp |
         // challenging adequate 1440]` ≈ 70 chars; an EFFECT with a long label
@@ -1019,6 +1022,78 @@ mod tests {
         assert!(combined.contains("Thunder rolls."));
         assert!(combined.contains("Rain begins."));
         assert!(!combined.contains("[FX"), "FX bracket leaked: {:?}", combined);
+    }
+
+    #[test]
+    fn brackets_stripped_weather() {
+        // Phase 4 Component 2 (2026-07-28) — §11.37 recurrence guard: the
+        // streaming regex MUST recognize [WEATHER ...] so it doesn't leak
+        // raw mid-generation (invisible in finalized text because the
+        // post-turn parser strips it on `done`, but visible in the live feed).
+        let mut f = StreamFilter::new(&["<|turn>"]).with_brackets();
+        let out = f.feed("The sky darkens.[WEATHER heavy rain]Drops hammer the roof.");
+        let flushed = f.flush();
+        let combined = format!("{out}{flushed}");
+        assert!(combined.contains("The sky darkens."), "lead-in prose lost: {:?}", combined);
+        assert!(combined.contains("Drops hammer the roof."), "trailing prose lost: {:?}", combined);
+        assert!(!combined.contains("[WEATHER"), "WEATHER bracket leaked: {:?}", combined);
+        assert!(
+            !combined.contains("heavy rain"),
+            "WEATHER condition body leaked (should be stripped, not rendered): {:?}",
+            combined
+        );
+    }
+
+    #[test]
+    fn weather_bracket_split_across_chunks() {
+        // The streaming holdback must keep a partial `[WEATHE` prefix from
+        // leaking when a chunk boundary falls inside the bracket, then strip
+        // the whole bracket once it completes.
+        let mut f = StreamFilter::new(&["<|turn>"]).with_brackets();
+        let out1 = f.feed("Rain.[WEATHE");
+        let out2 = f.feed("R heavy rain]More prose.");
+        let flushed = f.flush();
+        let combined = format!("{out1}{out2}{flushed}");
+        assert!(combined.contains("Rain."), "lead-in lost: {:?}", combined);
+        assert!(combined.contains("More prose."), "trailing lost: {:?}", combined);
+        assert!(!combined.contains("[WEATHER"), "split bracket leaked: {:?}", combined);
+        assert!(!combined.contains("heavy rain"), "split bracket body leaked: {:?}", combined);
+    }
+
+    #[test]
+    fn brackets_stripped_travel() {
+        // Phase 4 Component 3 (2026-07-28) — §11.37 recurrence guard: the
+        // streaming regex MUST recognize [TRAVEL ...] so it doesn't leak raw
+        // mid-generation (invisible in finalized text because the post-turn
+        // parser strips it on `done`, but visible in the live feed).
+        let mut f = StreamFilter::new(&["<|turn>"]).with_brackets();
+        let out = f.feed("Mara nods.[TRAVEL cellar]You descend the stairs.");
+        let flushed = f.flush();
+        let combined = format!("{out}{flushed}");
+        assert!(combined.contains("Mara nods."), "lead-in prose lost: {:?}", combined);
+        assert!(combined.contains("You descend the stairs."), "trailing prose lost: {:?}", combined);
+        assert!(!combined.contains("[TRAVEL"), "TRAVEL bracket leaked: {:?}", combined);
+        assert!(
+            !combined.contains("cellar"),
+            "TRAVEL destination body leaked (should be stripped, not rendered): {:?}",
+            combined
+        );
+    }
+
+    #[test]
+    fn travel_bracket_split_across_chunks() {
+        // The streaming holdback must keep a partial `[TRAV` prefix from
+        // leaking when a chunk boundary falls inside the bracket, then strip
+        // the whole bracket once it completes.
+        let mut f = StreamFilter::new(&["<|turn>"]).with_brackets();
+        let out1 = f.feed("Mara nods.[TRAV");
+        let out2 = f.feed("EL cellar]You descend.");
+        let flushed = f.flush();
+        let combined = format!("{out1}{out2}{flushed}");
+        assert!(combined.contains("Mara nods."), "lead-in lost: {:?}", combined);
+        assert!(combined.contains("You descend."), "trailing lost: {:?}", combined);
+        assert!(!combined.contains("[TRAVEL"), "split bracket leaked: {:?}", combined);
+        assert!(!combined.contains("cellar"), "split bracket body leaked: {:?}", combined);
     }
 
     #[test]

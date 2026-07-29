@@ -40,6 +40,19 @@ use std::collections::{HashMap, HashSet};
 /// should use `memory::WUPI_SYSTEM_CARD_ID` directly.
 pub const SYSTEM_NAMESPACE: &str = "wupi_system";
 
+/// The unified Fable playbook partition. Sibling of [`SYSTEM_NAMESPACE`]:
+/// tags `data/fable.codex` entries (the deep playbook shared by the Game
+/// Master interview persona AND the simulation narrator — question banks,
+/// genre guides, perfect-card examples, bracket-command reference, narrative
+/// discipline) so they land in the `memory::FABLE_SYSTEM_CARD_ID` partition,
+/// isolated from the OS catgirl's `wupi_system` knowledge. Production callers
+/// should use `memory::FABLE_SYSTEM_CARD_ID` directly.
+///
+/// **Unification (2026-07-29):** was `GM_NAMESPACE = "gm_system"`. Renamed
+/// because the GM and Narrator are both Fable-domain personas on one shared
+/// knowledge base.
+pub const FABLE_NAMESPACE: &str = "fable_system";
+
 /// One snapshot of the runtime state Wupi should be aware of. Plain data so
 /// it can be cloned out of AppState under brief locks and processed without
 /// holding any mutex through the embedding work.

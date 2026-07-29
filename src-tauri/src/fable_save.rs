@@ -350,7 +350,8 @@ mod tests {
             opening_scene: None,
             start_npc_ids: Vec::new(),
             declared_activities: Vec::new(),
-            protagonist_name: Some("Tester".into()),
+            player_name: Some("Tester".into()),
+            locations: Vec::new(),
         }
     }
 
@@ -515,7 +516,7 @@ mod tests {
         assert_eq!(loaded.card_id, QUICK_PLAY_CARD_ID);
         assert!(loaded.card.is_some());
         assert_eq!(loaded.card.as_ref().unwrap().name, "Test Scenario");
-        assert_eq!(loaded.card.as_ref().unwrap().protagonist_name.as_deref(), Some("Tester"));
+        assert_eq!(loaded.card.as_ref().unwrap().player_name.as_deref(), Some("Tester"));
         assert_eq!(loaded.session.messages.len(), 2);
     }
 

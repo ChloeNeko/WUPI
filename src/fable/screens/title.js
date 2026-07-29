@@ -89,14 +89,15 @@ export function buildTitle(handlers) {
            the load-bearing default: in a fresh browser build with no
            backend, Continue stays dim + unclickable rather than firing
            a no-op click.
-           NEW GAME is DISABLED (2026-07-26): Quick Play is the live authoring
-           flow now; New Game's dedicated interview is future work. The button
-           stays in the DOM (greyed + unclickable) so the title layout is
-           intact for when its flow lands. Same disabled contract as Continue:
-           the click handler guards on the btn.disabled flag and blocks
-           stray clicks. -->
+           NEW GAME is ENABLED (Phase D, 2026-07-28): the New Game interview
+           screen (screens/interview.js) is live. Clicking it routes through
+           fable.js's onNewGameClicked → magical transition → interview screen,
+           which runs the GM conversation + live draft preview + finalize hand-
+           off to the stage. CONTINUE still ships DISABLED by default (only
+           enabled by _refreshContinue once a resume target is confirmed via
+           the fable_continue_target IPC). -->
       <button class="fable-title-btn" data-act="continue" disabled>Continue</button>
-      <button class="fable-title-btn" data-act="new" disabled>New Game</button>
+      <button class="fable-title-btn" data-act="new">New Game</button>
       <button class="fable-title-btn" data-act="quickplay">Quick Play</button>
       <button class="fable-title-btn" data-act="load">Load</button>
       <button class="fable-title-btn" data-act="exit">Exit</button>

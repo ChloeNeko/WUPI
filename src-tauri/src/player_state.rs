@@ -1,7 +1,7 @@
 //! Player State engine — the Rust Referee (Fable Seam #7, brought forward).
 //!
 //! The LLM does ZERO math. This module is the sole authority over the
-//! protagonist's body, stamina, wealth, and reputation. It rolls the dice,
+//! player's body, stamina, wealth, and reputation. It rolls the dice,
 //! computes the entropy, and renders SEMANTIC FACTS ("left arm: Medium
 //! Injury; stamina: Winded") that the narrator reads as hard truth and
 //! writes prose to match. The narrator cannot mutate this state — it can
@@ -106,7 +106,7 @@ impl BodyPartState {
 // Stamina
 // ---------------------------------------------------------------------------
 
-/// The protagonist's energy level. A 5-step ordinal, NOT a number — the UI
+/// The player's energy level. A 5-step ordinal, NOT a number — the UI
 /// renders pips, the prompt gets the semantic word. Drains on exertion
 /// (combat, running, climbing); recovers on rest (future: a `rest` keyword).
 ///
@@ -141,7 +141,7 @@ impl Stamina {
     /// Drain one step toward `Depleted`, never wrapping past the floor.
     /// Combat/exertion costs one step; the Referee calls this on every
     /// fired outcome. Stops at `Depleted` (the absolute floor — the
-    /// protagonist collapses rather than dying of stamina).
+    /// player collapses rather than dying of stamina).
     pub fn drain(&mut self) {
         *self = match self {
             Stamina::Fresh => Stamina::Active,
@@ -254,7 +254,7 @@ impl BodyPart {
 // PlayerState (the persisted canonical state)
 // ---------------------------------------------------------------------------
 
-/// The protagonist's canonical state. Rust is the SOLE authority — the
+/// The player's canonical state. Rust is the SOLE authority — the
 /// narrator LLM never writes here, only reads the rendered `<player_state>`
 /// block. Nested inside `WorldSchema` so it persists for free per-card.
 ///
@@ -430,7 +430,7 @@ pub struct RefereeOutcome {
 /// The bands map 1:1 to the Slice 1 prompt clause — they're the Rust side
 /// of the same thesis ("physics don't scale with the player"). The narrator
 /// sees the tier only through the `[DIRECTIVE: ...]` lines it produces.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AttackerTier {
     /// A trivial threat: rat, commoner, small dog. Blows land rarely, and
@@ -596,7 +596,7 @@ fn hash_text(s: &str) -> u64 {
 ///
 /// Returns `None` when:
 /// - no keyword matched (the turn was social/exploratory), OR
-/// - the protagonist is already `Depleted` AND fully amputated (no body
+/// - the player is already `Depleted` AND fully amputated (no body
 ///   part left to injure — the dice have nothing left to say).
 ///
 /// The caller (`fable_send`) applies the outcome via [`PlayerState`]'s
@@ -880,7 +880,7 @@ struct SkillSpec {
     keywords: &'static [&'static str],
     /// Base DC before the ScenePacing modifier (Combat +2, Exploration +0,
     /// Downtime −2). Tuned for d20 (1..=20): 12 = coin-flip for an untrained
-    /// protagonist, 14 = slight disadvantage.
+    /// player, 14 = slight disadvantage.
     base_dc: u32,
     /// Narrator seed when the check succeeds. "{skill}" placeholder NOT used
     /// here — the seed is bespoke per skill so it reads naturally.
@@ -1013,6 +1013,194 @@ fn capitalize_first(s: &str) -> String {
         Some(c) => c.to_uppercase().collect::<String>() + chars.as_str(),
         None => String::new(),
     }
+}
+
+// ===========================================================================
+// Phase 4 §11.44 (Component 1): Disguise Referee — the Rust-side gate
+// ===========================================================================
+//
+// Design (locked with Chloe, 2026-07-28):
+//
+//   A disguise is a StatusTag with `kind == "disguise"` (the Tracker emits
+//   `[EFFECT <label> buff 0 kind=disguise]`). When the player is disguised
+//   and walks past low-tier NPCs (Minion / Soldier), Rust AUTO-PASSES — no
+//   Deception roll, the disguise simply holds. The narrator is handed the
+//   hard fact ("your disguise holds; the guard waves you through") and
+//   writes prose to match.
+//
+//   Two overrides revoke the auto-pass and force a real Deception check:
+//     (1) NPC tier > Soldier. Elite/Boss/Legendary NPCs scrutinize — a
+//         captain knows his garrison's faces. The gate returns None and the
+//         normal skill-check Referee (§11.21) handles the Deception roll.
+//     (2) The player ACTS SUSPICIOUSLY while disguised. Rust keyword-detects
+//         nervous tells / furtive movement / protocol mistakes. Even a
+//         tired rank-and-file guard will challenge a sweating, stammering
+//         stranger in uniform. The auto-pass is revoked; a Deception roll
+//         fires here (so the directive carries the disguise context, not a
+//         bare skill-check line).
+//
+//   This is the anti-bloat design Chloe locked: NO "Perception" stat, NO
+//   "Disguise Level," NO "Guard Alertness Meter." Disguise is a binary tag
+//   + a suspicious-action keyword scan + the existing tier ladder. Rust
+//   owns the dice; the AI just renders the outcome.
+//
+//   Pure fn, no I/O, no schema mutation (mirrors referee_evaluate_skill_
+//   checks' contract). The caller threads the result into turn_directives.
+
+/// Base DC for the scrutinized-disguise Deception roll. Mirrors the
+/// SKILL_TABLE `deceive` entry so there's one source of truth for "a lie
+/// is DC 14" — a disguise under scrutiny IS a deception.
+const DECEPTION_BASE_DC: u32 = 14;
+
+/// Keywords that revoke the disguise auto-pass when present in the player's
+/// turn text. Three families:
+///   - nervous tells: sweat, tremble, stammer, hesitate, flinch, etc.
+///   - furtive movement: sneak, creep, lurk, slink, tiptoe, etc. (intentional
+///     overlap with SKILL_TABLE `sneak` — sneaking while disguised is itself
+///     suspicious)
+///   - protocol mistakes: wrong name, forget, confuse, salute wrong, etc.
+///
+/// Whole-word, case-insensitive substring match (same pattern as
+/// COMBAT_KEYWORDS + SKILL_TABLE keywords). Kept conservative: only flags
+/// behavior a guard would actually notice.
+const SUSPICIOUS_ACTIONS: &[&str] = &[
+    // nervous tells — visible distress
+    "sweat", "sweaty", "nervous", "tense", "tremble", "trembling",
+    "stutter", "stuttering", "stammer", "stammering", "hesitate", "hesitat",
+    "flinch", "flinching", "mumble", "mutter", "fidget", "fumble",
+    "falter", "stiffen", "rigid",
+    // eye behavior — the classic tell
+    "avoid eye contact", "look away", "avert eyes", "avert gaze",
+    "stare at the ground", "eyes dart", "glance around",
+    // furtive movement — trying not to be noticed IS suspicious in uniform
+    "sneak", "sneaking", "creep", "creeping", "lurk", "lurking",
+    "slink", "tiptoe", "slip past", "edge away", "skulk",
+    // protocol mistakes — the disguise breaks down
+    "wrong name", "forget", "forgot", "confuse", "confused",
+    "salute wrong", "wrong salute", "don't know", "do not know",
+    "blunder", "stumble over", "misspell", "wrong badge", "no badge",
+    "wrong uniform", "wrong color", "wrong rank",
+];
+
+/// Find the active disguise tag, if any. Returns the first tag with
+/// `kind == "disguise"`. A player can technically hold multiple disguise
+/// tags (e.g. swapped mid-scene); we evaluate against the first — the
+/// others are stale and the gate cares about presence, not multiplicity.
+pub fn find_disguise_tag(tags: &[crate::consequence::StatusTag]) -> Option<&crate::consequence::StatusTag> {
+    tags.iter().find(|t| t.kind == "disguise")
+}
+
+/// True if the player's turn text contains any suspicious-action keyword.
+/// Pure keyword scan; case-insensitive. Used by the gate to decide whether
+/// to revoke the auto-pass.
+pub fn has_suspicious_action(text: &str) -> bool {
+    let lower = text.to_lowercase();
+    SUSPICIOUS_ACTIONS.iter().any(|kw| lower.contains(kw))
+}
+
+/// The outcome of the disguise gate for one turn. Carries everything the
+/// narrator needs to render the moment — Rust has already rolled the dice;
+/// the AI just writes prose to match.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DisguiseDirective {
+    /// The auto-pass held: a disguised player walked past low-tier
+    /// rank-and-file without drawing scrutiny. `tier_tag` is the
+    /// AttackerTier::tag_for_directive() of the NPCs present (e.g.
+    /// "soldier", "minion") — narratively, who was fooled.
+    AutoPass {
+        label: String,
+        tier_tag: &'static str,
+    },
+    /// The auto-pass was revoked by suspicious behavior; Rust rolled a
+    /// Deception check. `dc`/`roll`/`success` are the dice facts; `seed`
+    /// is the narrator-flavor lead-in (same shape as SkillCheckOutcome).
+    Scrutinized {
+        label: String,
+        dc: u32,
+        roll: u32,
+        success: bool,
+        seed: &'static str,
+    },
+}
+
+impl DisguiseDirective {
+    /// Format the directive line for the `<directives>` block. Reads as a
+    /// hard fact the narrator obeys. Two registers:
+    ///   - AutoPass: "Disguise (city guard uniform): ACCEPTED — soldiers and
+    ///     lesser rank-and-file do not challenge the player."
+    ///   - Scrutinized: "Disguise (city guard uniform): SCRUTINIZED —
+    ///     Deception (DC 14): FAIL. the act cracks under scrutiny."
+    pub fn render(&self) -> String {
+        match self {
+            DisguiseDirective::AutoPass { label, tier_tag } => format!(
+                "Disguise ({}): ACCEPTED — {} and lesser rank-and-file do not challenge the player.",
+                label, tier_tag,
+            ),
+            DisguiseDirective::Scrutinized { label, dc, roll, success, seed } => format!(
+                "Disguise ({}): SCRUTINIZED — Deception (DC {}): {}. {} (roll {})",
+                label, dc, if *success { "SUCCESS" } else { "FAIL" }, seed, roll,
+            ),
+        }
+    }
+}
+
+/// Seeds for the Scrutinized outcome. Mirrors SkillSpec.success_seed /
+/// fail_seed — short narrator-flavor phrases.
+const SCRUTINIZED_SUCCESS_SEED: &str = "the player's nerve holds; the disguise buys passage";
+const SCRUTINIZED_FAIL_SEED: &str = "the act cracks under scrutiny; the disguise is challenged";
+
+/// The gate. Pure fn — no I/O, no schema mutation.
+///
+/// Returns:
+///   - `None` when there's no active disguise tag (nothing to gate).
+///   - `None` when an NPC tier above Soldier is present (Elite+ scrutinize
+///     by default; the normal §11.21 skill-check Referee handles the roll).
+///   - `Some(AutoPass)` when disguised + low-tier NPCs + no suspicious action.
+///   - `Some(Scrutinized)` when disguised + low-tier NPCs + suspicious action
+///     (the auto-pass is revoked; a Deception roll fires here).
+///
+/// `entities` is the WorldSchema entity map (read for `npc.*.tier` keys via
+/// the existing `select_attacker_tier_from_entities`). `pacing_dc_mod` is
+/// the ScenePacing DC modifier (Combat +2, Exploration 0, Downtime −2) —
+/// threaded into the Scrutinized DC exactly as the skill-check Referee does.
+pub fn evaluate_disguise_gate(
+    text: &str,
+    tags: &[crate::consequence::StatusTag],
+    entities: &HashMap<String, String>,
+    pacing_dc_mod: i32,
+) -> Option<DisguiseDirective> {
+    let disguise = find_disguise_tag(tags)?;
+    let label = disguise.label.clone();
+    let tier = select_attacker_tier_from_entities(entities);
+    // Elite+ (captains, bosses, legendary creatures) scrutinize by default.
+    // They know their people. Return None → the normal skill-check Referee
+    // runs a plain Deception roll with no disguise framing.
+    if tier > AttackerTier::Soldier {
+        return None;
+    }
+    // Low-tier rank-and-file. Auto-pass UNLESS the player acts suspiciously.
+    if !has_suspicious_action(text) {
+        return Some(DisguiseDirective::AutoPass {
+            label,
+            tier_tag: tier.tag_for_directive(),
+        });
+    }
+    // Suspicious behavior revokes the auto-pass. Roll a Deception check
+    // (seeded from text + a fixed offset so it diverges from the §11.21
+    // deceive roll that may ALSO fire on the same turn — distinct dice).
+    let seed = hash_text(text).wrapping_add(0xC0FFEE);
+    let mut roller = Roller::new(seed);
+    let roll = roll_d20(&mut roller);
+    let dc = (DECEPTION_BASE_DC as i32 + pacing_dc_mod).clamp(1, 30) as u32;
+    let success = roll >= dc;
+    let s = if success { SCRUTINIZED_SUCCESS_SEED } else { SCRUTINIZED_FAIL_SEED };
+    Some(DisguiseDirective::Scrutinized {
+        label,
+        dc,
+        roll,
+        success,
+        seed: s,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1738,5 +1926,243 @@ mod tests {
             assert!(!tag.is_empty());
             assert!(!tag.contains('_'), "tag must be a natural word: {tag}");
         }
+    }
+
+    // ---- Phase 4 §11.44 (Component 1): Disguise Referee ----
+
+    use crate::consequence::{Polarity, StatusTag};
+
+    fn disguise_tag(label: &str) -> StatusTag {
+        StatusTag {
+            label: label.into(),
+            // polarity is irrelevant when kind=disguise (the renderer routes
+            // by kind, not polarity); use Buff as a sane default.
+            polarity: Polarity::Buff,
+            expires_at: 0,
+            source: String::new(),
+            kind: "disguise".into(),
+        }
+    }
+
+    fn generic_tag(label: &str) -> StatusTag {
+        StatusTag {
+            label: label.into(),
+            polarity: Polarity::Buff,
+            expires_at: 0,
+            source: String::new(),
+            kind: String::new(),
+        }
+    }
+
+    fn entities_with_tier(tier: &str) -> HashMap<String, String> {
+        let mut m = HashMap::new();
+        m.insert("npc.guard1.tier".into(), tier.into());
+        m
+    }
+
+    #[test]
+    fn disguise_gate_none_when_no_disguise_tag() {
+        // No disguise tag → nothing to gate, regardless of tier or behavior.
+        let entities = entities_with_tier("soldier");
+        assert!(evaluate_disguise_gate("I walk past the guard", &[generic_tag("Blessed")], &entities, 0).is_none());
+    }
+
+    #[test]
+    fn disguise_gate_autopass_minion_confident_walkby() {
+        let entities = entities_with_tier("minion");
+        let out = evaluate_disguise_gate(
+            "I nod to the drunk guard and march into the keep.",
+            &[disguise_tag("city guard uniform")],
+            &entities,
+            0,
+        ).expect("minion + confident → AutoPass");
+        match out {
+            DisguiseDirective::AutoPass { label, tier_tag } => {
+                assert_eq!(label, "city guard uniform");
+                assert_eq!(tier_tag, "minion");
+            }
+            _ => panic!("expected AutoPass, got {out:?}"),
+        }
+    }
+
+    #[test]
+    fn disguise_gate_autopass_soldier_confident_walkby() {
+        // The goldilocks cutoff: Soldier is the v1 default tier, so most
+        // NPCs auto-pass. This is the "confident walk-by" fantasy.
+        let entities = entities_with_tier("soldier");
+        let out = evaluate_disguise_gate(
+            "I flash my badge and stride through the gate.",
+            &[disguise_tag("city guard uniform")],
+            &entities,
+            0,
+        ).expect("soldier + confident → AutoPass");
+        assert!(matches!(out, DisguiseDirective::AutoPass { tier_tag: "soldier", .. }));
+    }
+
+    #[test]
+    fn disguise_gate_none_elite_confident() {
+        // Elite+ scrutinize by default. Even a confident walk-by forces a
+        // roll (handled by the §11.21 skill-check Referee, not here).
+        let entities = entities_with_tier("elite");
+        let out = evaluate_disguise_gate(
+            "I nod to the captain and walk past.",
+            &[disguise_tag("city guard uniform")],
+            &entities,
+            0,
+        );
+        assert!(out.is_none(), "Elite+ must NOT auto-pass: {out:?}");
+    }
+
+    #[test]
+    fn disguise_gate_none_legendary_confident() {
+        let entities = entities_with_tier("legendary");
+        let out = evaluate_disguise_gate(
+            "I salute the dragon and walk past.",
+            &[disguise_tag("city guard uniform")],
+            &entities,
+            0,
+        );
+        assert!(out.is_none(), "Legendary must NOT auto-pass: {out:?}");
+    }
+
+    #[test]
+    fn disguise_gate_scrutinized_minion_suspicious() {
+        // Suspicious behavior revokes the auto-pass even for minions.
+        let entities = entities_with_tier("minion");
+        let out = evaluate_disguise_gate(
+            "I sweat nervously, avoid eye contact, and try to slip past.",
+            &[disguise_tag("city guard uniform")],
+            &entities,
+            0,
+        ).expect("suspicious → Scrutinized");
+        match out {
+            DisguiseDirective::Scrutinized { label, dc, roll, success, .. } => {
+                assert_eq!(label, "city guard uniform");
+                assert_eq!(dc, 14, "DC = DECEPTION_BASE_DC + 0 (Downtime not applied here)");
+                assert!(roll >= 1 && roll <= 20);
+                assert_eq!(success, roll >= dc);
+            }
+            _ => panic!("expected Scrutinized, got {out:?}"),
+        }
+    }
+
+    #[test]
+    fn disguise_gate_scrutinized_soldier_suspicious() {
+        let entities = entities_with_tier("soldier");
+        let out = evaluate_disguise_gate(
+            "I stammer, fumble my badge, and mumble an excuse.",
+            &[disguise_tag("city guard uniform")],
+            &entities,
+            0,
+        ).expect("soldier + suspicious → Scrutinized");
+        assert!(matches!(out, DisguiseDirective::Scrutinized { .. }));
+    }
+
+    #[test]
+    fn disguise_gate_none_elite_suspicious() {
+        // Elite+ return None even when suspicious — the normal skill-check
+        // Referee handles the Deception roll there (no disguise framing
+        // needed; the captain would have challenged anyway).
+        let entities = entities_with_tier("elite");
+        let out = evaluate_disguise_gate(
+            "I sweat nervously and stammer at the captain.",
+            &[disguise_tag("city guard uniform")],
+            &entities,
+            0,
+        );
+        assert!(out.is_none());
+    }
+
+    #[test]
+    fn disguise_gate_scrutinized_dc_threads_pacing_modifier() {
+        // Combat (+2) makes scrutiny harder; Downtime (−2) easier. Same shape
+        // as the §11.21 skill-check DC threading.
+        let entities = entities_with_tier("soldier");
+        let combat = evaluate_disguise_gate(
+            "I sweat and stammer.",
+            &[disguise_tag("city guard uniform")],
+            &entities,
+            2,
+        ).unwrap();
+        let downtime = evaluate_disguise_gate(
+            "I sweat and stammer.",
+            &[disguise_tag("city guard uniform")],
+            &entities,
+            -2,
+        ).unwrap();
+        match (combat, downtime) {
+            (DisguiseDirective::Scrutinized { dc: dc_c, .. },
+             DisguiseDirective::Scrutinized { dc: dc_d, .. }) => {
+                assert_eq!(dc_c, 16, "Combat DC = 14 + 2");
+                assert_eq!(dc_d, 12, "Downtime DC = 14 - 2");
+            }
+            _ => panic!("both should be Scrutinized"),
+        }
+    }
+
+    #[test]
+    fn suspicious_action_detector_flags_nervous_tells() {
+        assert!(has_suspicious_action("I sweat and tremble as I walk past."));
+        assert!(has_suspicious_action("I avoid eye contact with the guard."));
+        assert!(has_suspicious_action("I creep along the wall in uniform."));
+        assert!(has_suspicious_action("I salute wrong and the guard frowns."));
+    }
+
+    #[test]
+    fn suspicious_action_detector_clean_when_confident() {
+        // Confident, casual behavior — no tells, no auto-pass revoke.
+        assert!(!has_suspicious_action("I nod to the guard and walk past."));
+        assert!(!has_suspicious_action("I flash my badge and stride through."));
+        assert!(!has_suspicious_action("I greet the sentry by name and enter."));
+    }
+
+    #[test]
+    fn disguise_directive_render_autopass_reads_as_hard_fact() {
+        let d = DisguiseDirective::AutoPass {
+            label: "city guard uniform".into(),
+            tier_tag: "soldier",
+        };
+        let r = d.render();
+        assert!(r.contains("ACCEPTED"), "AutoPass render: {r}");
+        assert!(r.contains("city guard uniform"), "render: {r}");
+        assert!(r.contains("soldier"), "render: {r}");
+        assert!(r.contains("do not challenge"), "render: {r}");
+    }
+
+    #[test]
+    fn disguise_directive_render_scrutinized_carries_dice_facts() {
+        let d = DisguiseDirective::Scrutinized {
+            label: "merchant robes".into(),
+            dc: 14,
+            roll: 7,
+            success: false,
+            seed: "the act cracks under scrutiny",
+        };
+        let r = d.render();
+        assert!(r.contains("SCRUTINIZED"), "render: {r}");
+        assert!(r.contains("DC 14"), "render: {r}");
+        assert!(r.contains("FAIL"), "render: {r}");
+        assert!(r.contains("roll 7"), "render: {r}");
+    }
+
+    #[test]
+    fn find_disguise_tag_returns_first_disguise() {
+        let tags = vec![
+            generic_tag("Blessed"),
+            disguise_tag("city guard uniform"),
+            disguise_tag("merchant robes"), // second disguise ignored
+        ];
+        let found = find_disguise_tag(&tags).expect("must find the disguise");
+        assert_eq!(found.label, "city guard uniform");
+    }
+
+    #[test]
+    fn attacker_tier_ord_ladder_is_threat_order() {
+        // The derived Ord must give Minion < Soldier < Elite < Boss < Legendary.
+        // This is load-bearing for the `tier > Soldier` gate comparison.
+        assert!(AttackerTier::Minion < AttackerTier::Soldier);
+        assert!(AttackerTier::Soldier < AttackerTier::Elite);
+        assert!(AttackerTier::Elite < AttackerTier::Boss);
+        assert!(AttackerTier::Boss < AttackerTier::Legendary);
     }
 }

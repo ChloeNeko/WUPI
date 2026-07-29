@@ -56,33 +56,62 @@ use crate::llm::{shared_backend, shared_model, CancelToken, ChunkFn};
 /// headroom on 12 GB GPUs (~300-400 MiB saved). At the time the narrator
 /// system prompt was ~1000 tokens, so 3072 fit comfortably.
 ///
-/// **Raised back to 4096 on 2026-07-28** after the Phase 3 wiring playtest
-/// found the narrator system prompt had grown to ~5000 tokens (narrator_core
-/// 7.7KB + BRACKET_PROTOCOL 4.2KB after the Phase 3 anti-Oblivion + threat-
-/// tiers + RP-conventions + 3-new-bracket-command additions). At FABLE_CTX=
-/// 3072 the front-truncation guard chopped ~2900 tokens off the front of the
-/// system prompt, breaking the model's attention and producing the
-/// "hyphen-for-space" prose degradation documented in §11.26 ("Hyphen-token-
-/// glitch"). Raising to 4096 gives ~3072 tokens of prompt budget (4096 −
-/// 1024 gen reserve), enough for the full narrator system prompt + an 8-turn
-/// window without truncation.
+/// **Held at 4096 (2026-07-29).** Originally 4000, cut to 3072 on 2026-07-26
+/// (§2C) for VRAM headroom, then raised to 4096 on 2026-07-28 after the
+/// Phase 3 wiring playtest found the narrator system prompt had grown to
+/// ~5000 tokens (narrator_core 7.7KB + BRACKET_PROTOCOL 4.2KB after the
+/// Phase 3 anti-Oblivion + threat-tiers + RP-conventions + 3-new-bracket-
+/// command additions). At FABLE_CTX=3072 the front-truncation guard had
+/// chopped ~2900 tokens off the front of the system prompt, breaking the
+/// model's attention and producing the "hyphen-for-space" prose degradation
+/// documented in §11.26.
 ///
-/// **VRAM cost:** the Q8_0 KV cache at n_ctx=4096 is ~510 MiB (vs ~510 MiB
-/// at 3072 — the SWA cache dominates; the difference is ~100-150 MiB in the
-/// non-SWA cache). Under the §2B swap-lock only ONE of {chat, schema, fable}
-/// is resident at a time, so the +150 MiB is bounded. Stable on 12 GB with
-/// ~2 GB headroom (matches the original 4000-config headroom the §2C cut
-/// was protecting).
+/// **2026-07-29 regression + correct fix (EXECUTED).** Phase 4's Component
+/// 2/3/4 prompt additions re-bloated BRACKET_PROTOCOL alone from ~4.2KB to
+/// ~13.6KB (~3400 tokens); combined with narrator_core (~1900 tok) the
+/// rendered LOCAL narrator prompt measured ~5770 tokens vs the 3072 prompt
+/// budget. The front-truncation guard then `drain(0..2698)`'d the ENTIRE
+/// system prompt, so the local 12B emitted raw JSON as narration (the
+/// §11.38 Bug A recurrence). The unit tests missed this because they verify
+/// prompt CONSTRUCTION, not generation under the ctx budget. **The correct
+/// fix — executed 2026-07-29 in the prompt-distillation scrub — was to
+/// SHRINK the prompt, not raise FABLE_CTX.** narrator_core + BRACKET_PROTOCOL
+/// were distilled to lean declarative laws (the 200-word anti-bias lectures
+/// → one line each; full bracket semantics + COMMON MISTAKES offloaded to
+/// the unified fable.codex, retrieved on-demand via search_fable_visible),
+/// recovering ~3000 tokens. The full narrator prompt is now ~2050 tok;
+/// FABLE_MAX_TOKENS restored 512→1024 and the LOCAL window 6→8 (the
+/// shortcut amputations reversed). FABLE_CTX stays at 4096.
+///
+/// **VRAM cost:** the Q8_0 KV cache at n_ctx=4096 is ~680 MiB (40 layers,
+/// K+V q8_0, measured live on the RTX 5070 Ti Laptop 12 GB). Under the §2B
+/// swap-lock only ONE of {chat, schema, fable} is resident during a turn,
+/// so worst case is weights (~9.8 GB) + fable KV (680 MiB) + embed
+/// (34 MiB, always resident) + compute buffer (~530 MiB) ≈ 11.0 GB of
+/// 12 GB → ~1 GB headroom. Stable.
 ///
 /// The API path uses a wider 16-message window (the cloud model has the
 /// budget). The front-truncation guard below protects against overflow on
 /// the rare turn where the prompt exceeds `FABLE_CTX - FABLE_MAX_TOKENS`.
 const FABLE_CTX: u32 = 4096;
 const FABLE_BATCH: u32 = 512;
-/// Cap on generated tokens for a single narrator turn. 1024 is generous for
-/// a narrative beat (2-4 paragraphs); the narrator system prompt tells the
-/// model to keep prose tight. The clamp (engine.rs pattern) further bounds
-/// this by `n_ctx - n_cur` at decode time.
+/// Cap on generated tokens for a single narrator turn.
+///
+/// **1024 (a CEILING, not a quota — 2026-07-29).** A narrative beat is 2-4
+/// paragraphs (~300-450 tokens of prose + bracket commands); the lean
+/// declarative-law narrator prompt (post the 2026-07-29 distillation scrub)
+/// produces punchy beats naturally and stops when the beat is done. The
+/// §11.41 DRY sampler + post-gen `truncate_repetition` truncator are the
+/// mechanical backstop against token-sequence loops. The clamp (engine.rs
+/// pattern) further bounds this by `n_ctx - n_cur` at decode time.
+///
+/// History: was 1024 from v1 through 2026-07-28. Cut in half 2026-07-29
+/// after the Phase 4 consolidated playtest proved 1024 enabled the loop
+/// failure mode (a symptom of the prompt bloat — the 3,364-token system
+/// prompt left the model filling space). RESTORED to 1024 on 2026-07-29
+/// after the prompt-distillation scrub recovered ~3,000 tokens. The cut
+/// was a shortcut that amputated generation budget to make room for bloat;
+/// the scrub fixed the bloat instead.
 const FABLE_MAX_TOKENS: i32 = 1024;
 
 // ---------------------------------------------------------------------------

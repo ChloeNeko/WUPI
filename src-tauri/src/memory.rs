@@ -156,6 +156,26 @@ pub const WUPI_CARD_ID: &str = "__wupi__";
 /// exist only for this one reserved sentinel, by design (AGENTS.md §2AA).
 pub const WUPI_SYSTEM_CARD_ID: &str = "__wupi_system__";
 
+/// Reserved partition for the unified Fable playbook
+/// (`data/fable.codex` — the deep playbook shared by BOTH the Game Master
+/// interview persona AND the simulation narrator: question banks, genre
+/// guides, perfect-card examples, bracket-command reference, narrative
+/// discipline, common errors). Sibling to [`WUPI_SYSTEM_CARD_ID`]: same
+/// firewall contract (Rust constant, never an IPC arg; only reader is
+/// [`MemoryEngine::search_fable_visible`]), separate partition so
+/// Fable-domain knowledge never leaks into the OS catgirl's prompts and
+/// vice versa. Seeded at boot by `codex::seed_fable_codex` (mirrors
+/// `seed_wupi_codex`); surfaced to BOTH the GM interview path AND the
+/// narrator path via `search_fable_visible`, folded into the respective
+/// system prompts (never exposed verbatim to the UI).
+///
+/// **Unification (2026-07-29):** was `GM_SYSTEM_CARD_ID` / `__gm_system__`.
+/// Renamed + unified because the GM and the Narrator are both Fable-domain
+/// personas operating on the same knowledge base — two personas querying
+/// two fragmented vector spaces wasted a retrieval call/turn and split the
+/// model's logic. One Fable partition, one query/turn.
+pub const FABLE_SYSTEM_CARD_ID: &str = "__fable_system__";
+
 /// Reserved partition for user-authored Codex reference lore (the `.md` files
 /// the user creates/edits via the `codex_*` IPC). Pinned to a fixed sentinel
 /// rather than `active_card_id` so editing codex *during a game* lands the lore
@@ -766,6 +786,97 @@ impl<E: Embedder> MemoryEngine<E> {
         })
         .await
         .map_err(|e| anyhow::anyhow!("search_wupi_visible join: {e}"))??)
+    }
+
+    /// Fable-domain analog of [`Self::search_wupi_visible`]: queries the
+    /// unified `__fable_system__` partition (where `data/fable.codex` lives —
+    /// the deep playbook shared by BOTH the Game Master interview persona AND
+    /// the simulation narrator: question banks, genre guides, perfect-card
+    /// examples, bracket-command reference, narrative discipline) fused with
+    /// the supplied `active_card_id` partition. Sibling, not a
+    /// generalization — the Fable playbook stays isolated from the OS
+    /// catgirl's `__wupi_system__` knowledge so neither persona's reference
+    /// material leaks into the other's prompts.
+    ///
+    /// Same hybrid retrieval (embedding + FTS5 + RRF fusion), same codex
+    /// per-class floor, same graceful FTS5-syntax-error degradation. Only the
+    /// system partition differs (`FABLE_SYSTEM_CARD_ID` instead of
+    /// [`WUPI_SYSTEM_CARD_ID`]). Used by BOTH the New Game interview path
+    /// (`gm_prompt::build_gm_system_prompt`) AND the narrator path
+    /// (`narrator_prompt::build_*_system_prompt`) to surface the relevant
+    /// Fable playbook slice contextually — one query/turn serves both
+    /// Fable personas (they share one knowledge base; two personas querying
+    /// two fragmented vector spaces was the pre-unification waste).
+    pub async fn search_fable_visible(
+        &self,
+        query: &str,
+        active_card_id: &str,
+        limit: usize,
+        dense_floor: Option<f32>,
+    ) -> anyhow::Result<Vec<RankedMemory>> {
+        const RETRIEVAL_DEPTH: usize = 64;
+
+        // Embed ONCE: the query vector is identical for both partitions.
+        let embedding = self.embedder.embed_query(query.to_owned()).await?;
+
+        let query_owned = query.to_owned();
+        let active_card_owned = active_card_id.to_owned();
+        let conn = self.conn.clone();
+        Ok(tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<RankedMemory>> {
+            let c = conn.lock().expect("memory conn mutex");
+
+            // Query each partition independently. FTS5 degrades to dense-only
+            // on syntax error (same resilience as `search` / `search_wupi_visible`).
+            let sparse_active = match fts5_top_k(&c, &query_owned, &active_card_owned, RETRIEVAL_DEPTH) {
+                Ok(ids) => ids,
+                Err(e) => {
+                    tracing::warn!(error = %format!("{e:#}"), "fts5 (fable active card) failed; dense-only");
+                    Vec::new()
+                }
+            };
+            let sparse_system = match fts5_top_k(&c, &query_owned, FABLE_SYSTEM_CARD_ID, RETRIEVAL_DEPTH) {
+                Ok(ids) => ids,
+                Err(e) => {
+                    tracing::warn!(error = %format!("{e:#}"), "fts5 (fable system) failed; dense-only");
+                    Vec::new()
+                }
+            };
+            let dense_active = vec0_top_k(&c, &embedding, &active_card_owned, RETRIEVAL_DEPTH)?;
+            let dense_system = vec0_top_k(&c, &embedding, FABLE_SYSTEM_CARD_ID, RETRIEVAL_DEPTH)?;
+
+            // Merge across partitions (ids unique per card_id; no dedup needed).
+            let mut sparse: Vec<(MemoryId, f32)> = sparse_active;
+            sparse.extend(sparse_system);
+            let mut dense: Vec<(MemoryId, f32)> = dense_active;
+            dense.extend(dense_system);
+
+            let floor = dense_floor.unwrap_or(crate::memory_rrf::DENSE_COSINE_FLOOR);
+
+            // Codex per-class floor applies to codex entries from EITHER
+            // partition (Fable playbook entries tagged namespace=fable_system
+            // get the same lower floor as user codex + Wupi's system docs).
+            let candidate_ids: Vec<MemoryId> = {
+                let mut ids: Vec<MemoryId> = sparse.iter().map(|(id, _)| *id).collect();
+                ids.extend(dense.iter().map(|(id, _)| *id));
+                ids.sort_unstable();
+                ids.dedup();
+                ids
+            };
+            let codex_ids = codex_ids_among(&c, &candidate_ids)?;
+
+            let fused = crate::memory_rrf::fuse_scored_rrf(
+                &sparse,
+                &dense,
+                floor,
+                &codex_ids,
+                crate::memory_rrf::CODEX_DENSE_FLOOR,
+                crate::memory_rrf::FusionWeights::default(),
+                limit,
+            );
+            fetch_entries(&c, &fused)
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("search_fable_visible join: {e}"))??)
     }
     //
     // Codex entries are authored reference lore (system docs, world
@@ -2050,5 +2161,44 @@ mod tests {
         let chunks = chunk_text(text);
         assert_eq!(chunks.len(), 1);
         assert_eq!(chunks[0], text);
+    }
+
+    /// Firewall contract: the Wupi-system, GM-system, codex, and Wupi-assistant
+    /// partition keys are four DISTINCT sentinels. The whole privacy/isolation
+    /// guarantee rests on this — if two ever collided, one persona's reference
+    /// material would leak into the other's prompts. This is a constant-time
+    /// structural check; a full engine-backed firewall test (seed GM entry →
+    /// assert `search_wupi_visible` returns empty) would need a
+    /// SQLite+vec0+FTS5+embedder integration harness that doesn't exist in the
+    /// test suite yet. The structural distinctness + the hardcoded-per-method
+    /// partition constants make leakage impossible by construction.
+    #[test]
+    fn system_partition_keys_are_distinct() {
+        let sentinels = [
+            WUPI_CARD_ID,
+            WUPI_SYSTEM_CARD_ID,
+            FABLE_SYSTEM_CARD_ID,
+            CODEX_CARD_ID,
+        ];
+        for i in 0..sentinels.len() {
+            for j in (i + 1)..sentinels.len() {
+                assert_ne!(
+                    sentinels[i], sentinels[j],
+                    "system partition sentinels must all be distinct (collision at {} ↔ {})",
+                    sentinels[i], sentinels[j]
+                );
+            }
+        }
+        // None of them are empty.
+        for s in sentinels {
+            assert!(!s.is_empty(), "system partition sentinel must be non-empty");
+        }
+        // Spot-check the wrapping convention (engine-internal sentinel keys are
+        // wrapped in double underscores so they can't collide with a real card
+        // id, which is a sanitized stem of the card name).
+        assert!(WUPI_SYSTEM_CARD_ID.starts_with("__"));
+        assert!(WUPI_SYSTEM_CARD_ID.ends_with("__"));
+        assert!(FABLE_SYSTEM_CARD_ID.starts_with("__"));
+        assert!(FABLE_SYSTEM_CARD_ID.ends_with("__"));
     }
 }

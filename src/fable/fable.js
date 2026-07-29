@@ -34,6 +34,7 @@ import './fable.css';
 import { buildTitle } from './screens/title.js';
 import { buildStage, wireStage, teardownStage, toast } from './screens/stage.js';
 import { buildVoid, wireVoid, teardownVoid } from './screens/void.js';
+import { buildInterview, wireInterview, teardownInterview } from './screens/interview.js';
 import {
   startThemeMusic, stopThemeMusic, pauseThemeMusic, resumeThemeMusic,
 } from './screens/reveal.js';
@@ -121,6 +122,9 @@ let inQuickPlay = false;
 // Track whether we're currently in the void interview, so closeFable can
 // tear it down cleanly on EXIT mid-interview.
 let inVoid = false;
+// Track whether we're currently in the New Game interview, so closeFable +
+// returnToTitle can tear it down cleanly on EXIT mid-chat. Mirrors inVoid.
+let inInterview = false;
 
 // The Quick Play button on the title screen. Branches on whether a quicksave
 // exists (inline Resume/Start-New choice) or not (straight into the interview).
@@ -200,6 +204,96 @@ function enterVoidInterview() {
       if (screens.void) wireVoid(screens.void, { onBegin: quickPlayBegin });
     } catch (e) { console.error('[fable] wireVoid threw on fallback', e); }
   });
+}
+
+// === New Game flow (Phase D, 2026-07-28) =================================
+//
+// Clicking New Game on the title screen enters the interview-based authoring
+// flow (a richer, durable counterpart to Quick Play's void interview):
+//   - Stop the title ambient + music, end any prior engine session.
+//   - Play the magical transition; at midpoint swap to the interview screen
+//     + wire it (wireInterview kicks off interview_start + the opening GM
+//     turn + subscribes to the scribe's interview-fact events).
+//   - The interview's onFinalized hook (interviewFinalized below) fires
+//     after a successful interview_finalize: tear down the interview + swap
+//     to the stage with the loadResult (mirrors quickPlayBegin's structure).
+//
+// The interview screen (screens/interview.js) owns the live sim-card preview
+// (top), the GM chat feed (middle), and the compose + Begin button (bottom).
+// The detached scribe emits facts as they're extracted; the preview renders
+// them as they arrive. Begin commits the draft to a .sim file + hands off
+// to the stage with the seeded world/player state.
+
+// The New Game button handler. Mirrors onQuickPlayClicked's shape: stop
+// title ambient, play the magical transition, swap to the interview screen
+// at midpoint, wire it with the finalize callback.
+function onNewGameClicked() {
+  if (screens.title && screens.title._stopAmbient) screens.title._stopAmbient();
+  stopThemeMusic(fableRoot);
+  try { invoke('fable_end').catch(() => {}); } catch (_) {}
+
+  inInterview = true;
+  playMagicalTransition({
+    onMidpoint: () => {
+      showScreen('interview');
+      try {
+        if (screens.interview) {
+          wireInterview(screens.interview, { onFinalized: interviewFinalized });
+        }
+      } catch (e) {
+        console.error('[fable] wireInterview threw', e);
+      }
+    },
+  }).catch((e) => {
+    console.error('[fable] magical transition to interview failed, jumping', e);
+    showScreen('interview');
+    try {
+      if (screens.interview) {
+        wireInterview(screens.interview, { onFinalized: interviewFinalized });
+      }
+    } catch (e) { console.error('[fable] wireInterview threw on fallback', e); }
+  });
+}
+
+// The interview's onFinalized callback. By the time this fires, the
+// interview screen has already faded to black + interview_finalize has
+// produced the FableLoadResult { meta, messages, opening_scene }. We tear
+// down the interview (cancel particles, drop the scribe listener, stop any
+// in-flight stream), then swap to the stage + wire it with the load result
+// (the swap is invisible — the interview's overlay is still dimming). The
+// stage is revealed as the overlay undims. Mirrors quickPlayBegin's tail.
+function interviewFinalized(loadResult) {
+  // Tear down the interview FIRST so its particles + scribe listener + the
+  // beats.js feed binding are released before the stage re-binds beats.
+  teardownInterview();
+  inInterview = false;
+
+  const openingScene = (loadResult && loadResult.opening_scene) || null;
+  const loadMessages = (loadResult && Array.isArray(loadResult.messages) && loadResult.messages.length)
+    ? loadResult.messages : null;
+
+  // A New Game is a fresh .sim on disk → NOT Quick Play. Save/Load stay
+  // enabled in the stage (the manual-card path).
+  engineStarted = true;
+  inQuickPlay = false;
+
+  // Swap to the stage INVISIBLY (the interview's overlay is still dimming).
+  // No second transition here — the interview's fade-to-black IS the handoff
+  // (mirrors quickPlayBegin).
+  showScreen('stage');
+  try {
+    if (screens.stage) {
+      wireStage(screens.stage, {
+        cardContext: null,
+        onExit: returnToTitle,
+        isQuickPlay: false,
+        openingScene,
+        loadMessages,
+      });
+    }
+  } catch (e) {
+    console.error('[fable] wireStage threw after interview finalize', e);
+  }
 }
 
 // The void's onBegin callback. By the time this fires, the void has already
@@ -490,6 +584,10 @@ function closeFable() {
     // Tear down the void if the user EXITs mid-interview (the void screen's
     // particles + listeners would leak otherwise). Safe no-op if not in void.
     if (inVoid) { teardownVoid(); inVoid = false; }
+    // Tear down the New Game interview if the user EXITs mid-chat (its
+    // particles + scribe listener + in-flight stream would leak otherwise).
+    // Safe no-op if not in the interview.
+    if (inInterview) { teardownInterview(); inInterview = false; }
     // Stop the title ambient canvas systems (motes + grass) so their RAF +
     // listeners don't outlive the app (the load-bearing reset against the
     // relaunch bug).
@@ -508,6 +606,7 @@ function closeFable() {
   engineStarted = false;  // mirror the Rust slot clear so returnToTitle's gate stays honest
   inQuickPlay = false;    // reset the Quick Play flag on full close
   inVoid = false;
+  inInterview = false;    // reset the New Game interview flag on full close
   stageActive = false;
   fableRoot.classList.remove('show');
   fableRoot.setAttribute('aria-hidden', 'true');
@@ -541,11 +640,10 @@ export function initFable(extHooks = {}) {
   // we don't build them. The stage stays built (teardownStage needs it on
   // close even though the menu can't reach it yet).
   screens.title = buildTitle({
-    // NEW GAME is disabled on the title (its dedicated interview is future
-    // work, separate from Quick Play). The handler stays a no-op for
-    // belt-and-suspenders (the button itself is `disabled` so the click
-    // never fires; this is the backstop).
-    new: () => {},
+    // NEW GAME (Phase D, 2026-07-28): the New Game interview screen is live.
+    // Routes through onNewGameClicked → magical transition → interview screen
+    // (GM conversation + live draft preview + finalize hand-off to stage).
+    new: () => onNewGameClicked(),
     // QUICK PLAY is the live authoring flow: void interview → GM sketch →
     // Begin → stage. Branches on whether a quicksave exists (inline choice)
     // or not (straight into the interview).
@@ -560,6 +658,7 @@ export function initFable(extHooks = {}) {
   });
   screens.stage = buildStage();
   screens.void = buildVoid();
+  screens.interview = buildInterview();
   for (const s of Object.values(screens)) fableRoot.appendChild(s);
   showScreen('title');
 

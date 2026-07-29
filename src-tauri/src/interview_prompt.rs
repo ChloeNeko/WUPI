@@ -160,9 +160,9 @@ The <sim_card> XML format (every field is required unless noted):\n\
        ]]></setting>\n\
     <tone><![CDATA[ 3-5 mood/atmosphere words + a one-line voice guide. \
        ]]></tone>\n\
-    <protagonist><![CDATA[ The player's name. Use the name from their \
+    <player_name><![CDATA[ The player's name. Use the name from their \
        CHARACTER answer verbatim. If they didn't give one, use the literal \
-       string 'User' — do NOT invent a name. ]]></protagonist>\n\
+       string 'User' — do NOT invent a name. ]]></player_name>\n\
     <opening_scene><![CDATA[ The FIRST narrator beat the player reads on \
        entering the simulation. Write it as a proper scene — sensory detail, \
        one NPC beat, a hook for what they might do. End with an implied \
@@ -269,7 +269,7 @@ hooded figure alone in the corner.\n\
     ]]></setting>\n\
     <tone><![CDATA[ Atmospheric, grounded, slow-burn. Sensory detail first, \
 then character. NPCs are people with their own concerns. ]]></tone>\n\
-    <protagonist><![CDATA[Kaelen]]></protagonist>\n\
+    <player_name><![CDATA[Kaelen]]></player_name>\n\
     <opening_scene><![CDATA[\n\
 The door swings shut behind you, cutting off the cold rain. Warmth and the \
 smell of woodsmoke roll over you; the low murmur of conversation dips for a \

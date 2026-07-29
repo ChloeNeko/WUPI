@@ -9,9 +9,11 @@ pub mod engine;
 pub mod fable_command;
 pub mod fable_engine;
 pub mod fable_save;
+pub mod gm_prompt;
 pub mod guided_prompt;
 #[cfg(windows)]
 pub mod hardware;
+pub mod interview_draft;
 pub mod interview_prompt;
 pub mod json_repair;
 pub mod kv_buffer;
@@ -26,6 +28,7 @@ pub mod offscreen_task;
 pub mod player_state;
 pub mod prompts;
 pub mod regenerate_slice_prompt;
+pub mod scribe_prompt;
 pub mod schema;
 pub mod schema_engine;
 pub mod schema_validator;
@@ -41,6 +44,8 @@ pub mod updater;
 pub mod user_profile;
 pub mod tools;
 pub mod system_codex;
+pub mod weather;
+pub mod rumor;
 
 use std::sync::Arc;
 use tauri::{Emitter, Manager};
@@ -224,6 +229,29 @@ pub struct AppState {
     /// unreachable from the UI (no stop gesture is wired for slice regen),
     /// but the symmetric slot removes the latent footgun.
     pub active_slice_cancel: Arc<std::sync::Mutex<Option<llm::CancelToken>>>,
+    /// Per-interview cancel token, parallel to `active_cancel` +
+    /// `active_fable_cancel` + `active_slice_cancel`. Distinct slot so the
+    /// New Game interview's GM-stream stop can't cross-wire with chat / fable
+    /// / slice — same Bug #7 cross-wire lesson (§2C).
+    pub active_interview_cancel: Arc<std::sync::Mutex<Option<llm::CancelToken>>>,
+    /// The in-progress `InterviewDraft` during a New Game interview. `None`
+    /// when no interview is active. The local Gemma scribe's `sim_draft` tool
+    /// (Phase B) writes here under the mutex; `interview_finalize` reads it to
+    /// build the final `.sim` + seed the world/player state. Cloned into the
+    /// scribe's `ToolCtx` per turn via `with_interview_draft`.
+    pub interview_draft:
+        Arc<std::sync::Mutex<Option<interview_draft::InterviewDraft>>>,
+    /// The GM chat history during a New Game interview. EPHEMERAL by design
+    /// (Phase A.9 zero-memory-footprint contract): never persisted to disk,
+    /// never archived via `memory.add_memory`, never enters chat logs. The
+    /// `.sim` file produced at finalize is the interview's ONLY artifact.
+    /// Windowed to 6 turns when fed to the GM API; the scribe sees the full
+    /// transcript (no window) via a separate pipeline.
+    pub interview_session: Arc<tokio::sync::Mutex<session::Conversation>>,
+    /// Gate flag: true during an active interview. Used by `interview_send`
+    /// (mint scribe tool spec only when true) + the scribe orchestrator (only
+    /// fire when true). Mirrors `is_quick_play`'s role.
+    pub interview_active: Arc<std::sync::Mutex<bool>>,
     /// The game's scoped world-state schema (sibling to `schema`, which is
     /// Wupi-assistant's). Per-card: wiped/reloaded on card switch. Held
     /// under tokio Mutex because `fable_send` reads it + Wupi's game-manager
@@ -334,6 +362,10 @@ impl AppState {
             pending_tick_directives: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             active_fable_cancel: Arc::new(std::sync::Mutex::new(None)),
             active_slice_cancel: Arc::new(std::sync::Mutex::new(None)),
+            active_interview_cancel: Arc::new(std::sync::Mutex::new(None)),
+            interview_draft: Arc::new(std::sync::Mutex::new(None)),
+            interview_session: Arc::new(tokio::sync::Mutex::new(session::Conversation::new())),
+            interview_active: Arc::new(std::sync::Mutex::new(false)),
             fable_schema: Arc::new(tokio::sync::Mutex::new(schema::WorldSchema::default())),
             fable_schema_history: Arc::new(tokio::sync::Mutex::new(
                 std::collections::VecDeque::new(),
@@ -715,6 +747,43 @@ pub fn run() {
                         tracing::info!("no data/wupi.codex file found; skipping playbook seed");
                     }
 
+                    // Unified Fable playbook (`data/fable.codex`): the deep
+                    // reference shared by BOTH the Game Master interview
+                    // persona AND the simulation narrator — question banks,
+                    // genre guides, perfect-card examples, bracket-command
+                    // reference, narrative discipline. Sibling of the
+                    // wupi.codex seed above, isolated into the __fable_system__
+                    // partition (separate from __wupi_system__) so Fable-domain
+                    // knowledge never leaks into the OS catgirl's prompts and
+                    // vice versa. Surfaced to BOTH the GM AND the narrator via
+                    // search_fable_visible (sibling of search_wupi_visible) on
+                    // every turn — one query serves both Fable personas; zero
+                    // baseline-prompt cost (the playbook loads on semantic
+                    // match, same as wupi.codex). **Unification (2026-07-29):**
+                    // was the GM-only `data/gm.codex` seed; merged when GM +
+                    // Narrator codexes unified into one Fable partition.
+                    if let Some(fable_codex_path) = resolve_fable_codex_path(app.handle()) {
+                        if let Some(engine) = state.memory.get() {
+                            match tauri::async_runtime::block_on(
+                                codex::seed_fable_codex(engine, &fable_codex_path, memory::FABLE_SYSTEM_CARD_ID),
+                            ) {
+                                Ok(report) => tracing::info!(
+                                    seeded = report.seeded,
+                                    updated = report.updated,
+                                    purged = report.purged,
+                                    unchanged = report.unchanged,
+                                    "fable codex seeded"
+                                ),
+                                Err(e) => tracing::warn!(
+                                    error = %format!("{e:#}"),
+                                    "fable codex seed failed; continuing without playbook"
+                                ),
+                            }
+                        }
+                    } else {
+                        tracing::info!("no data/fable.codex file found; skipping fable codex seed");
+                    }
+
                     // ── Hidden system-log codex (Phase 4): a periodic background
                     // task snapshots runtime state into the WUPI_SYSTEM_CARD_ID
                     // partition so Wupi retrieves it via search_wupi_visible.
@@ -859,6 +928,17 @@ pub fn run() {
             // Quick Play IPCs (single-shot generation → in-memory card →
             // bundled-card quicksave single-slot persistence).
             interview_generate,
+            // New Game Interview IPCs (Phase C.2): conversational draft-
+            // building flow. interview_start resets state; interview_send
+            // runs one GM turn (API GLM-5.2) + a detached Scribe extraction
+            // pass; interview_stop signals the in-flight stream;
+            // interview_finalize commits the draft to a .sim file + seats
+            // the session; interview_draft_state returns the live snapshot.
+            interview_start,
+            interview_send,
+            interview_stop,
+            interview_finalize,
+            interview_draft_state,
             // Crossroads + Ghostwriter (§11.24, 2026-07-27): memoryless
             // one-shot generators that ride the same interview_generate
             // shape. Crossroads = "Choose a Director" option generator;
@@ -2034,6 +2114,43 @@ fn resolve_wupi_codex_path(app: &tauri::AppHandle) -> Option<std::path::PathBuf>
     }
 }
 
+/// Resolve `data/fable.codex` — the unified Fable playbook (the deep
+/// reference shared by BOTH the Game Master interview persona AND the
+/// simulation narrator: question banks, genre guides, perfect-card examples,
+/// bracket-command reference, narrative discipline). Mirrors
+/// `resolve_gm_sim_path` (NOT `resolve_wupi_codex_path`): the Wupi resolver
+/// only checks the single portable path with no dev fallback, which is fine
+/// for wupi.codex but wrong for fable.* (a Fable artifact that needs the
+/// dev-repo candidate walk so it's findable when running from
+/// `target/{release,debug}`). Missing file → `None` (the Fable playbook seed
+/// is a no-op; the interview + narration still work, just without the
+/// codex-surfaced examples). **Unification (2026-07-29):** was
+/// `resolve_gm_codex_path` reading `gm.codex`; renamed when GM + Narrator
+/// codexes merged into one Fable partition.
+fn resolve_fable_codex_path(app: &tauri::AppHandle) -> Option<std::path::PathBuf> {
+    let mut candidates: Vec<std::path::PathBuf> = Vec::new();
+    // §8C portable layout: `<exe_dir>/data/fable.codex`.
+    candidates.push(resolve_data_dir(app).join("fable.codex"));
+    if let Some(exe) = std::env::current_exe().ok() {
+        if let Some(parent) = exe.parent() {
+            // Dev-repo path (exe lives in target/{release,debug}).
+            if let Some(grand) = parent.parent().and_then(|g| g.parent()) {
+                candidates.push(grand.join("data").join("fable.codex"));
+            }
+            if let Some(gg) = parent.parent().and_then(|g| g.parent()).and_then(|g| g.parent()) {
+                candidates.push(gg.join("data").join("fable.codex"));
+            }
+        }
+    }
+    for c in &candidates {
+        if c.is_file() {
+            tracing::info!("resolved fable.codex: {}", c.display());
+            return Some(c.clone());
+        }
+    }
+    None
+}
+
 // Three small functions: fable_is_active checks whether a FableEngine is
 // running; route_to_fable_manager handles the MutateWorldState intent
 // (translates the player's request to a SchemaDelta via the schema engine's
@@ -2739,7 +2856,7 @@ async fn chat_send(
     // the operator is always their profile name or the literal "User".
     // Fall back to a minimal name-only block so the model always has a
     // neutral handle. (The Fable narrator path uses the SIM card's
-    // <protagonist> name with the same "User" default — separate path.)
+    // <player_name> with the same "User" default — separate path.)
     .filter(|s| !s.trim().is_empty())
     .or_else(|| Some("<user_profile>\nname: User\n</user_profile>".to_owned()));
     // §2F eager-prefill sliding window (2026-07-13): cap visible history to
@@ -3846,7 +3963,7 @@ async fn clear_fable_history(state: &AppState) {
 async fn apply_phase3_bracket_commands(
     parsed: &bracket_parser::ParsedNarration,
     state: &tauri::State<'_, AppState>,
-) -> bool {
+) -> (bool, Vec<String>) {
     // Collect the relevant commands first (no lock held).
     let effects: Vec<&bracket_parser::BracketCommand> = parsed
         .commands
@@ -3863,13 +3980,44 @@ async fn apply_phase3_bracket_commands(
         .iter()
         .filter(|c| matches!(c, bracket_parser::BracketCommand::Task { .. }))
         .collect();
+    let weather_cmds: Vec<&bracket_parser::BracketCommand> = parsed
+        .commands
+        .iter()
+        .filter(|c| matches!(c, bracket_parser::BracketCommand::Weather { .. }))
+        .collect();
+    let travel_cmds: Vec<&bracket_parser::BracketCommand> = parsed
+        .commands
+        .iter()
+        .filter(|c| matches!(c, bracket_parser::BracketCommand::Travel { .. }))
+        .collect();
+    // Component 4 (2026-07-28): rumor creation commands. The applier roots
+    // each at the current node (known_nodes = [origin]); the tick propagates
+    // them. No reject-directive channel — rumors don't reject (the §11.46
+    // contract reserves that for [TRAVEL] adjacency). A [RUMOR] with no
+    // current node is warn-and-skip (mirrors [MILESTONE]'s unknown-id drop).
+    let rumor_cmds: Vec<&bracket_parser::BracketCommand> = parsed
+        .commands
+        .iter()
+        .filter(|c| matches!(c, bracket_parser::BracketCommand::Rumor { .. }))
+        .collect();
 
-    if effects.is_empty() && milestones.is_empty() && tasks.is_empty() {
-        return false;
+    if effects.is_empty()
+        && milestones.is_empty()
+        && tasks.is_empty()
+        && weather_cmds.is_empty()
+        && travel_cmds.is_empty()
+        && rumor_cmds.is_empty()
+    {
+        return (false, Vec::new());
     }
 
     let mut mutated = false;
     let mut undo_snapshot: Option<schema::WorldSchema> = None;
+    // Reject directives surfaced to the narrator (Component 3, 2026-07-28):
+    // e.g. "[TRAVEL] rejected — non-adjacent move". Caller merges these into
+    // the same `<directives>` block as the Referees' output. Empty for the
+    // historical bracket commands (EFFECT/MILESTONE/TASK/WEATHER never reject).
+    let mut reject_directives: Vec<String> = Vec::new();
 
     {
         let mut s = state.fable_schema.lock().await;
@@ -3881,6 +4029,7 @@ async fn apply_phase3_bracket_commands(
                 label,
                 polarity,
                 duration_minutes,
+                tag_kind,
             } = cmd
             {
                 let expires_at = if *duration_minutes == 0 {
@@ -3893,6 +4042,8 @@ async fn apply_phase3_bracket_commands(
                     polarity: *polarity,
                     expires_at,
                     source: String::new(),
+                    // §11.44: thread the parser's tag_kind into StatusTag.kind.
+                    kind: tag_kind.clone(),
                 };
                 if undo_snapshot.is_none() {
                     undo_snapshot = Some(s.clone());
@@ -4007,7 +4158,166 @@ async fn apply_phase3_bracket_commands(
                 );
             }
         }
+
+        // [WEATHER] — set the global weather condition (Fable Phase 4
+        // Component 2, 2026-07-28). Single-region schema-tracking command like
+        // EFFECT/MILESTONE/TASK. Last-wins on multiples (mirrors the [TIME]
+        // "last one is most recent + authoritative" contract at the top of
+        // apply_time_command_and_maybe_tick). Stamps `started_at_minutes` so
+        // the tick drift's persistence curve has a baseline to scale from.
+        let last_weather = weather_cmds.iter().rev().find_map(|cmd| {
+            if let bracket_parser::BracketCommand::Weather { condition } = cmd {
+                Some(condition)
+            } else {
+                None
+            }
+        });
+        if let Some(condition) = last_weather {
+            if undo_snapshot.is_none() {
+                undo_snapshot = Some(s.clone());
+            }
+            s.weather = schema::Weather {
+                condition: condition.clone(),
+                started_at_minutes: now_minutes,
+            };
+            mutated = true;
+            tracing::info!(condition = %condition, "[WEATHER] weather condition set");
+        }
+
+        // [TRAVEL] — advance `current_node` (Fable Phase 4 Component 3,
+        // 2026-07-28). Single-region schema-tracking command, last-wins on
+        // multiples (mirrors [WEATHER] / [TIME]). Rust is the SOLE authority
+        // on legality — the anti-sycophancy gate:
+        //   (a) destination must exist in the graph (else REJECT + directive);
+        //   (b) if `current_node` is already set, the destination must be a
+        //       declared neighbor (else REJECT + directive — the Tracker must
+        //       either chain stops or emit [TIME] between);
+        //   (c) the FIRST `[TRAVEL]` from `current_node: None` is allowed
+        //       (seeds initial location without scenario-card wiring).
+        // Reject directives surface to the narrator via the return tuple;
+        // the caller merges them into the `<directives>` block so the narrator
+        // obeys ("the move to <X> is not possible from here; <exits>").
+        let last_travel = travel_cmds.iter().rev().find_map(|cmd| {
+            if let bracket_parser::BracketCommand::Travel { destination } = cmd {
+                Some(destination.clone())
+            } else {
+                None
+            }
+        });
+        if let Some(dest) = last_travel {
+            if s.travel_graph.find_node(&dest).is_none() {
+                // Unknown destination — the Tracker invented a node id. List
+                // the known node ids so the next emission can be valid.
+                let known: Vec<&str> =
+                    s.travel_graph.nodes.iter().map(|n| n.id.as_str()).collect();
+                tracing::warn!(dest = %dest, known = ?known, "[TRAVEL] rejected — unknown node");
+                reject_directives.push(format!(
+                    "Travel to \"{dest}\" is not possible — that location is not in the world. \
+                     Known locations: {}. Stay where you are or travel to a known location.",
+                    if known.is_empty() {
+                        "(none defined)".to_string()
+                    } else {
+                        known.join(", ")
+                    }
+                ));
+            } else if s.travel_graph.current_node.is_some()
+                && !s.travel_graph.is_adjacent_to_current(&dest)
+            {
+                // Non-neighbor move — the Tracker tried to skip stops. List
+                // the actual exits from the current node.
+                let exits: Vec<String> = s
+                    .travel_graph
+                    .current()
+                    .map(|cur| {
+                        cur.neighbors
+                            .iter()
+                            .map(|id| {
+                                s.travel_graph
+                                    .find_node(id)
+                                    .map(|n| n.name.clone())
+                                    .filter(|n| !n.is_empty())
+                                    .unwrap_or_else(|| id.clone())
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let from_id = s.travel_graph.current_node.clone().unwrap_or_default();
+                tracing::warn!(
+                    from = %from_id,
+                    to = %dest,
+                    exits = ?exits,
+                    "[TRAVEL] rejected — non-adjacent"
+                );
+                reject_directives.push(format!(
+                    "Travel to \"{dest}\" is not possible from the current location \
+                     (it is not adjacent). Reachable exits: {}. To reach a distant \
+                     location, travel to an adjacent stop first, or advance time with \
+                     [TIME] to cover the longer journey.",
+                    if exits.is_empty() {
+                        "(none — this location has no declared exits)".to_string()
+                    } else {
+                        exits.join(", ")
+                    }
+                ));
+            } else {
+                // Legal move (or the bootstrap first-move-from-None case).
+                if undo_snapshot.is_none() {
+                    undo_snapshot = Some(s.clone());
+                }
+                let prev = s.travel_graph.current_node.clone();
+                s.travel_graph.current_node = Some(dest.clone());
+                mutated = true;
+                tracing::info!(
+                    from = ?prev,
+                    to = %dest,
+                    "[TRAVEL] current_node advanced"
+                );
+            }
+        }
+
+    // [RUMOR] — seed a rumor at the current node (Component 4, 2026-07-28).
+    // Runs inside the same schema lock as the TRAVEL/WEATHER/EFFECT appliers
+    // above (so `s` + `now_minutes` are in scope). Append-ALL semantics (a
+    // turn could legitimately seed 2 rumors): each [RUMOR] creates one Rumor
+    // rooted at the current node. No last-wins dedupe (unlike [WEATHER], a
+    // single global field) — the rumors field is a Vec, distinct labels are
+    // distinct rumors. No reject-directive channel: rumors don't reject (a
+    // [RUMOR] with no current node is warn-and-skip — mirrors [MILESTONE]'s
+    // unknown-id drop pattern). The label is free-form diegetic text, so NO
+    // registry validation (unlike [MILESTONE]'s event_id check).
+    for cmd in &rumor_cmds {
+        if let bracket_parser::BracketCommand::Rumor { label } = cmd {
+            // Clone the current node id out of the immutable borrow before the
+            // mutable `s.rumors.push` below (the borrow checker requires the
+            // immutable `s.travel_graph.current_node.as_deref()` borrow to end
+            // before `s` is borrowed mutably). Mirrors how the TRAVEL block
+            // handles its `dest` clone above.
+            if let Some(cur_id) = s.travel_graph.current_node.clone() {
+                if undo_snapshot.is_none() {
+                    undo_snapshot = Some(s.clone());
+                }
+                s.rumors.push(rumor::Rumor {
+                    label: label.clone(),
+                    origin_node: cur_id.clone(),
+                    known_nodes: vec![cur_id.clone()],
+                    born_minutes: now_minutes,
+                });
+                mutated = true;
+                tracing::info!(
+                    label = %label,
+                    origin = %cur_id,
+                    "[RUMOR] rumor seeded at current node"
+                );
+            } else {
+                // No current node → can't root the rumor. Warn-and-skip.
+                tracing::warn!(
+                    label = %label,
+                    "[RUMOR] dropped — no current node to root at"
+                );
+            }
+        }
     }
+    } // end schema lock
 
     // Push one undo snapshot for the whole bracket-command batch (mirrors the
     // single-snapshot-per-turn pattern in fable_send's schema-lock block).
@@ -4015,7 +4325,7 @@ async fn apply_phase3_bracket_commands(
         push_fable_history_snapshot(state, snap).await;
     }
 
-    mutated
+    (mutated, reject_directives)
 }
 
 /// `acquire_schema_engine_from_arcs` helper. The fable lease is still held
@@ -4204,6 +4514,64 @@ async fn apply_time_command_and_maybe_tick(
                     remaining = s.offscreen_tasks.len(),
                     "[tick] off-screen tasks drained"
                 );
+            }
+        }
+
+        // Component 2 (2026-07-28): weather drift. Pure Rust, deterministic
+        // (seeded by clock + current condition — mirrors offscreen_task::
+        // resolve_task). The persistence DC scales with how long the current
+        // condition has held — long-running weather is more likely to shift.
+        // On drift, pick a new condition from the generic pool (never the
+        // same one). Skipped if weather is unset (no [WEATHER] yet — dormant,
+        // like world_clock before the first [TIME]). Combat ticks are
+        // suspended upstream by progression_interval_hours()==0, so weather
+        // is stable mid-fight unless the tracker forces [WEATHER].
+        if s.weather.is_set() {
+            if let Some(new) = weather::drift_weather(&s.weather, now_minutes) {
+                if tick_snapshot.is_none() {
+                    tick_snapshot = Some(s.clone());
+                }
+                tick_mutated = true;
+                tick_directives.push(format!(
+                    "Weather shift — {} gives way to {}. Narrate the changing \
+                     conditions (sensory detail, NPCs reacting, visibility and \
+                     footing). This is a hard fact; do not contradict it.",
+                    s.weather.condition, new.condition
+                ));
+                tracing::info!(
+                    from = %s.weather.condition,
+                    to = %new.condition,
+                    "[tick] weather drifted"
+                );
+                s.weather = new;
+            }
+        }
+        // Component 4 (2026-07-28): rumor propagation between connected nodes.
+        // Each rumor attempts to spread from its known_nodes to their adjacent
+        // unknown neighbors via a per-edge d20 roll against an age-decayed DC
+        // (fresh rumors spread fast, stale news slow). Anti-saturation cap:
+        // at most NEW_NODES_PER_TICK_CAP new nodes per rumor per tick (the
+        // load-bearing anti-bloat guard). Pure Rust, seeded RNG — mirrors
+        // weather::drift_weather's shape exactly (snapshot-once, directive-
+        // push, mutate, log). Skipped when no rumors OR no graph (dormant).
+        // Combat ticks are suspended upstream by progression_interval_hours
+        // ()==0, so rumors are stable mid-fight unless the tracker forces
+        // [RUMOR].
+        if !s.rumors.is_empty() && s.travel_graph.is_set() {
+            let (new_rumors, rumor_dirs) =
+                rumor::propagate_rumors(&s.rumors, &s.travel_graph, now_minutes);
+            if new_rumors != s.rumors {
+                if tick_snapshot.is_none() {
+                    tick_snapshot = Some(s.clone());
+                }
+                tick_mutated = true;
+                tick_directives.extend(rumor_dirs.iter().cloned());
+                let spread_count = rumor_dirs.len();
+                tracing::info!(
+                    spread_events = spread_count,
+                    "[tick] rumors propagated to adjacent nodes"
+                );
+                s.rumors = new_rumors;
             }
         }
     }
@@ -4753,9 +5121,9 @@ async fn api_connect(
 ///
 /// **Schema is NOT affected** — it's a fixed `SCHEMA_CTX = 2048` in both
 /// modes (already the right size for delta work; no source-dependent sizing
-/// needed). **Fable is EXEMPT** — it stays at `FABLE_CTX = 3072` regardless
+/// needed). **Fable is EXEMPT** — it stays at `FABLE_CTX = 4096` regardless
 /// (under API it only materializes as the fallback narrator, and a smaller
-/// context would leave zero room for the ~1000-tok narrator prompt).
+/// context would leave zero room for the narrator prompt).
 ///
 /// **Why a single helper:** every chat spawn site (boot, chat_send slow
 /// path, api_connect/disconnect re-spawn) MUST read this — otherwise the
@@ -5175,9 +5543,9 @@ struct FableCardMeta {
     /// uses this as the evocative "what's this about" blurb below the title.
     /// None when the card doesn't declare one.
     opening_scene_preview: Option<String>,
-    /// Declared protagonist name. The launcher shows this so the player
+    /// Declared player name. The launcher shows this so the player
     /// knows whose shoes they're stepping into before they start.
-    protagonist_name: Option<String>,
+    player_name: Option<String>,
     /// Whether the player has any saves for this card (autosave counts).
     /// Lets the launcher show Continue vs New Game intelligently. Best-effort:
     /// a directory-read error degrades to false (the user can still start).
@@ -5247,7 +5615,7 @@ fn card_to_meta(card: &sim_card::SimCard, has_saves: bool) -> FableCardMeta {
         setting_preview,
         tone: card.tone.clone(),
         opening_scene_preview,
-        protagonist_name: card.protagonist_name.clone(),
+        player_name: card.player_name.clone(),
         has_saves,
     }
 }
@@ -5356,7 +5724,7 @@ async fn enter_fable_session(
 
     // Resolve initial state. Priority: explicit save_id → fresh → fallback.
     let fable_root = resolve_apps_dir(app).join("fable");
-    let (prior_schema, prior_session, resumed_save_label) = if let Some(sid) = save_id.as_deref() {
+    let (mut prior_schema, prior_session, resumed_save_label) = if let Some(sid) = save_id.as_deref() {
         let fable_root_clone = fable_root.clone();
         let cid = card.id.clone();
         let sid_owned = sid.to_owned();
@@ -5376,6 +5744,39 @@ async fn enter_fable_session(
             .unwrap_or_else(session::Conversation::new);
         (s, c, None)
     };
+    // Fable Phase 4 Component 3 (2026-07-28): seed the travel graph from the
+    // card's `<locations>` block IF the resolved schema has no graph yet.
+    // This is the load-bearing fix for Components 3 + 4 being dead in live
+    // play (see docs/phase4-fix-travel-graph-seeding.md). Runs for ALL three
+    // branches (fresh / resume / explicit save): the card's geography is
+    // authoritative; a resumed save whose graph is empty (a pre-Phase-4
+    // save, or a card whose graph was added in a later edit) picks up the
+    // current card's graph. A save that already carries a seeded graph is
+    // left alone (the player's current_node + any Tracker-added state is
+    // preserved). Without this, `[TRAVEL]` is always rejected ("unknown
+    // destination" — nodes is empty) + `[RUMOR]` is always dropped
+    // (no-current-node path) → Components 3 + 4 never fire in live play.
+    if prior_schema.travel_graph.nodes.is_empty() && !card.locations.is_empty() {
+        prior_schema.travel_graph = schema::TravelGraph {
+            nodes: card
+                .locations
+                .iter()
+                .map(|cn| schema::Node {
+                    id: cn.id.clone(),
+                    name: cn.name.clone(),
+                    neighbors: cn.neighbors.clone(),
+                    setting: cn.setting.clone(),
+                })
+                .collect(),
+            // The first <node> in document order is the seed location.
+            current_node: card.locations.first().map(|cn| cn.id.clone()),
+        };
+        tracing::info!(
+            node_count = card.locations.len(),
+            seed = ?card.locations.first().map(|n| n.id.as_str()),
+            "fable_start: seeded travel_graph from card <locations>"
+        );
+    }
     *state.fable_schema.lock().await = prior_schema;
     clear_fable_history(&state).await;
     let messages: Vec<FableLoadMessage> = prior_session
@@ -5740,7 +6141,7 @@ async fn fable_send(
         g.take()
     };
 
-    let (world_state, pacing, turn_directives) = {
+    let (world_state, pacing, mut turn_directives) = {
         let mut s = state.fable_schema.lock().await;
 
         // (1) Scene pacing FIRST — its DC modifier threads into (3).
@@ -5861,6 +6262,21 @@ async fn fable_send(
         // the narrator already treats as hard fact.
         let skills = player_state::referee_evaluate_skill_checks(&text, pacing.mode.dc_modifier());
 
+        // (3a) Phase 4 §11.44 (Component 1): Disguise Referee — the Rust-side
+        // gate. Pure fn, no mutation (mirrors the skill-check Referee's
+        // contract). Returns None when there's no active disguise tag OR when
+        // an Elite+ NPC is present (the normal skill-check Referee handles
+        // that Deception roll with no disguise framing). Otherwise either
+        // AutoPass (low-tier + confident walk-by) or Scrutinized (suspicious
+        // behavior revoked the auto-pass → a Deception roll fires here so the
+        // directive carries the disguise context, not a bare skill line).
+        let disguise_directive = player_state::evaluate_disguise_gate(
+            &text,
+            &s.status_tags,
+            &s.entities,
+            pacing.mode.dc_modifier(),
+        );
+
         // (3b) Combat lethality directive (Slice 3): same injection path as
         // skill checks — the narrator sees ONE `<directives>` block with all
         // hard facts for the turn (combat lethality + skill outcomes).
@@ -5874,13 +6290,15 @@ async fn fable_send(
         };
 
         // Assemble the turn-scoped directives in priority order: lethality
-        // first (most consequential), then skill checks, then off-screen tick
-        // directives (background facts). §11.41 (2026-07-28): these are
-        // returned alongside the world-state render so the API branch can
-        // RE-render world-state after the tracker stage mutates the schema —
-        // the Referees run ONCE (pre-tracker), not twice (several mutate
-        // state), so the same directive lines ride both the tracker prompt
-        // AND the post-tracker API-narrator prompt.
+        // first (most consequential), then the disguise outcome (scene-
+        // establishing — "your disguise holds" / "scrutinized: FAIL"), then
+        // skill checks, then off-screen tick directives (background facts).
+        // §11.41 (2026-07-28): these are returned alongside the world-state
+        // render so the API branch can RE-render world-state after the
+        // tracker stage mutates the schema — the Referees run ONCE (pre-
+        // tracker), not twice (several mutate state), so the same directive
+        // lines ride both the tracker prompt AND the post-tracker API-
+        // narrator prompt.
         let mut turn_directives: Vec<String> = Vec::new();
         if !skills.is_empty() {
             tracing::info!(
@@ -5892,6 +6310,9 @@ async fn fable_send(
         if combat_directive.is_some() {
             tracing::info!("combat lethality directive injected");
         }
+        if disguise_directive.is_some() {
+            tracing::info!("disguise gate directive injected");
+        }
         if !tick_directives.is_empty() {
             tracing::info!(
                 count = tick_directives.len(),
@@ -5900,6 +6321,9 @@ async fn fable_send(
         }
         if let Some(cd) = &combat_directive {
             turn_directives.push(cd.clone());
+        }
+        if let Some(dd) = &disguise_directive {
+            turn_directives.push(dd.render());
         }
         for sc in &skills {
             turn_directives.push(sc.directive.clone());
@@ -5926,32 +6350,71 @@ async fn fable_send(
         let world_state_opt = if rendered.trim().is_empty() { None } else { Some(rendered) };
         (world_state_opt, pacing, turn_directives)
     };
+
+    // Fable codex retrieval (2026-07-29, the core fix): the narrator now
+    // retrieves from the unified fable.codex partition (the deep playbook —
+    // bracket-command reference, narrative discipline, common errors) fused
+    // with the active card's own lore, via search_fable_visible. Mirrors the
+    // proven chat_send pattern at lib.rs:2750. Empty-skip on zero hits = zero
+    // cost when nothing clears the cosine floor. This is what makes the
+    // Phase 3 prompt distillation safe: the offloaded detail lives in the
+    // codex and arrives on semantic match the instant it's relevant, instead
+    // of bloating the system prompt every turn. (FableEngine clears KV every
+    // turn — no eager-prefill invariant to protect here, so the block can go
+    // straight into the system prompt.)
+    let memory_block: Option<String> = match state.memory.get() {
+        Some(engine) => match engine.search_fable_visible(&text, &card.id, 5, None).await {
+            Ok(hits) if !hits.is_empty() => Some(memory::render_memory_block(&hits)),
+            Ok(_) => None,
+            Err(e) => {
+                tracing::warn!(error = %format!("{e}"), "fable codex retrieval failed; injecting nothing");
+                None
+            }
+        },
+        None => {
+            tracing::trace!("memory engine not initialized; skipping fable codex retrieval");
+            None
+        }
+    };
+
     let system_prompt = narrator_prompt::build_narrator_system_prompt(
         &card,
         world_state.as_deref(),
         pacing,
         director_directive.as_deref(),
+        memory_block.as_deref(),
     );
 
     // Append the user turn to the per-card game conversation, then window the
     // visible history. Same sliding-window strategy as chat_send's VISIBLE_WINDOW
-    // (§2I M2): old turns drop from the prompt (memory backfills via retrieval)
-    // so the prompt stays small (~5KB not ~80KB). The full conversation is
-    // persisted on fable_end so games resume across reboots.
+    // (§2I M2): old turns drop from the prompt and the fable codex retrieval
+    // (wired 2026-07-29, the block above) backfills relevant context on
+    // semantic match — so the prompt stays small (~5KB not ~80KB) WITHOUT
+    // losing continuity. The full conversation is persisted on fable_end so
+    // games resume across reboots.
     //
     // v0.6.3: window doubles when the API is the active chat source, matching
     // chat_send's 4 → 12. The cloud model has the context budget and the local
     // model stays hot as the silent agent doing schema tracking.
     //
-    // 2026-07-26 v2: the local window is 8 *messages* (4 beats — 4 user actions
-    // + 4 narrator replies). The slice math at line ~4174 treats the window as
-    // a raw message count (the code is the source of truth). Token math: the
-    // narrator system prompt (~1000 tok) + 8 messages (~1200 tok at ~150/msg)
-    // + 1024-token gen reserve ≈ 3224, fitting FABLE_CTX=3072 with ~270 tok
-    // headroom; if a beat runs long, truncate_to_fit drops oldest turns.
+    // LOCAL window = 8 *messages* (4 beats — 4 user actions + 4 narrator
+    // replies). Token math (post the 2026-07-29 prompt-distillation scrub):
+    // narrator system prompt ~2050 tok (narrator_core ~830 + BRACKET_PROTOCOL
+    // ~400 + scenario/player/world_state/anchors ~820) + 8 messages (~1200 tok
+    // at ~150/msg) + 1024-token gen reserve ≈ 4274. FABLE_CTX=4096 leaves a
+    // ~180 tok shortfall on the rare maximal turn — the engine's
+    // truncate_from_front guard drops the oldest turn(s) to fit (its designed
+    // purpose: a rare safety valve, not a routine crutch). Before the scrub
+    // the prompt alone was ~5000 tok (the two anti-bias lectures + full
+    // BRACKET_PROTOCOL + COMMON MISTAKES), forcing the window 8→6 and
+    // FABLE_MAX_TOKENS 1024→512 just to fit — a shortcut chain that amputated
+    // generation budget + memory to make room for bloat. The scrub recovered
+    // ~3000 tok and restored both. The distilled declarative-law prompt
+    // produces punchy 2-4 paragraph beats naturally; the §11.41 DRY sampler
+    // + post-gen truncator are the mechanical loop backstop.
     //
     // v0.7: the API window was cut 16 → 12 (6 beats). 12 narrator messages
-    // + the ~1000-tok narrator prompt + generation fits comfortably inside
+    // + the ~2050-tok narrator prompt + generation fits comfortably inside
     // the API profile's max_context (default 8192), and 12 matches the chat
     // API window for a consistent "6 beats of recent history" feel across
     // both surfaces.
@@ -6107,7 +6570,18 @@ async fn fable_send(
                             "source": "tracker",
                         }));
                     }
-                    apply_phase3_bracket_commands(&tracker_parsed, &state).await;
+                    // Capture the reject directives (Component 3, 2026-07-28):
+                    // e.g. "[TRAVEL] rejected — non-adjacent". Merge into
+                    // turn_directives so the API narrator (stage 2) sees them
+                    // in its `<directives>` block + obeys ("the move is not
+                    // possible from here; <exits>"). Listed LAST in the block
+                    // (after lethality / disguise / skill / tick directives)
+                    // — a rejected travel is the least consequential of the
+                    // hard facts, and the narrator has already seen the legal
+                    // `location:` line + exits in `<world_state>`.
+                    let (_, travel_rejects) =
+                        apply_phase3_bracket_commands(&tracker_parsed, &state).await;
+                    turn_directives.extend(travel_rejects);
                     apply_time_command_and_maybe_tick(&tracker_parsed, &state).await;
                 } else {
                     tracing::info!("fable_send: tracker produced no bracket commands");
@@ -6133,11 +6607,16 @@ async fn fable_send(
         };
 
         // Build the prose-only API narrator prompt (no BRACKET_PROTOCOL).
+        // memory_block is shared with the tracker stage — same turn, same
+        // player text, same active card, so the one retrieval query above
+        // serves both Fable stages (the GM/Narrator unification principle
+        // extended to the two-stage turn: one codex, one query).
         let narrator_system_prompt = narrator_prompt::build_api_narrator_system_prompt(
             &card,
             narrator_world_state.as_deref(),
             pacing,
             director_directive.as_deref(),
+            memory_block.as_deref(),
         );
 
         // ---- Stage 2: NARRATOR (API GLM-5.2) ----
@@ -6328,7 +6807,17 @@ async fn fable_send(
     // Phase 3 bracket commands ([EFFECT], [MILESTONE], [TASK]) are applied
     // FIRST so the tick sees any freshly-queued tasks / freshly-recorded
     // milestones when it fires (parallel ordering to the [TIME] consume).
-    apply_phase3_bracket_commands(&parsed, &state).await;
+    //
+    // Component 3 (2026-07-28): the return tuple's reject directives (e.g.
+    // "[TRAVEL] rejected — non-adjacent") are intentionally DROPPED here in
+    // local mode. The local narrator has already streamed its prose by this
+    // point, so a reject directive has no live recipient — and pushing it to
+    // turn_directives would leak a stale directive ("the move was rejected")
+    // into the NEXT turn's prompt, which is confusing. The `tracing::warn!`
+    // inside the apply helper captures the rejection for forensics. In API
+    // mode (the tracker-stage caller above), the reject directives DO merge
+    // into turn_directives because the API narrator hasn't run yet.
+    let _ = apply_phase3_bracket_commands(&parsed, &state).await;
     apply_time_command_and_maybe_tick(&parsed, &state).await;
     // §11.41: in API mode, the API narrator emits NO brackets — the tracker
     // stage already applied them above. So `parsed.commands` is empty here and
@@ -6875,6 +7364,1135 @@ async fn interview_generate(
 }
 
 // ===========================================================================
+// New Game Interview — Phase C.2 (2026-07-28).
+//
+// The 5 IPCs below implement the conversational "New Game" flow:
+//   interview_start       — reset state, install empty draft
+//   interview_send        — one GM turn (API GLM-5.2 + seamless local
+//                            fallback) + detached Scribe extraction pass
+//   interview_stop        — signal the in-flight GM stream's cancel token
+//   interview_finalize    — commit the draft to a `.sim` file + seat the
+//                            session (mirrors fable_quick_start's seeding)
+//   interview_draft_state — return a serializable snapshot for the preview UI
+//
+// ZERO MEMORY FOOTPRINT (Phase A.9 contract, load-bearing): the GM transcript
+// in `interview_session` is EPHEMERAL. It is never persisted to disk, never
+// archived via `memory.add_memory`, never enters chat logs. The `.sim` file
+// produced at `interview_finalize` is the interview's ONLY artifact. This is
+// the design hard-gate against transcript contamination of episodic retrieval.
+//
+// VRAM (§2B swap-lock): the GM runs on the API (no local VRAM — the cloud
+// model carries the interview). The Scribe reuses the Chat lease because it
+// runs on the local WUPI.gguf context (the silent-agent 12B). The two never
+// run concurrently: the GM stream completes before the Scribe spawns.
+//
+// §11.29 (hardened): the player is always "User" unless they volunteer a
+// name. No titled defaults ("hero", "protagonist", etc.), no anti-echo meta-
+// rules. The prompts (gm_prompt + scribe_prompt) already enforce this; the
+// IPCs below inherit it transitively.
+// ===========================================================================
+
+/// The card id sentinel for interview-time memory retrieval. The interview
+/// has no `.sim` file yet (one is produced only at finalize), so retrieval
+/// scopes to this ephemeral id + the unified fable.codex partition surfaced
+/// via `search_fable_visible`. Matches the partition-constant style of
+/// `memory::WUPI_CARD_ID` / `FABLE_SYSTEM_CARD_ID`. NEVER archived to: the
+/// zero-memory-footprint contract means no row ever carries this id.
+const INTERVIEW_CARD_ID: &str = "__interview__";
+
+/// A serializable snapshot of the in-progress `InterviewDraft` for the
+/// frontend's live preview panel. Mirrors the draft's fields + carries the
+/// derived `completion_pct` + `is_finalizable` flags so the UI can render
+/// without recomputing. Returned by `interview_draft_state`. `None` (→ JSON
+/// null) when no interview is active.
+#[derive(Debug, Clone, serde::Serialize)]
+struct InterviewDraftSnapshot {
+    name: Option<String>,
+    core_persona: Option<String>,
+    traits: Vec<String>,
+    setting: Option<String>,
+    tone: Option<String>,
+    opening_scene: Option<String>,
+    player_name: Option<String>,
+    start_npc_ids: Vec<String>,
+    declared_activities: Vec<String>,
+    world_summary: Option<String>,
+    world_entities: std::collections::BTreeMap<String, String>,
+    start_node: Option<String>,
+    player_background: Option<String>,
+    starting_condition: Option<String>,
+    last_updated_turn: usize,
+    completion_pct: u8,
+    is_finalizable: bool,
+}
+
+impl InterviewDraftSnapshot {
+    fn from_draft(d: &interview_draft::InterviewDraft) -> Self {
+        Self {
+            name: d.name.clone(),
+            core_persona: d.core_persona.clone(),
+            traits: d.traits.clone(),
+            setting: d.setting.clone(),
+            tone: d.tone.clone(),
+            opening_scene: d.opening_scene.clone(),
+            player_name: d.player_name.clone(),
+            start_npc_ids: d.start_npc_ids.clone(),
+            declared_activities: d.declared_activities.clone(),
+            world_summary: d.world_summary.clone(),
+            world_entities: d.world_entities.clone(),
+            start_node: d.start_node.clone(),
+            player_background: d.player_background.clone(),
+            starting_condition: d.starting_condition.clone(),
+            last_updated_turn: d.last_updated_turn,
+            completion_pct: d.completion_pct(),
+            is_finalizable: d.is_finalizable(),
+        }
+    }
+}
+
+/// Render the interview transcript as plain-text "GM: ...\nPlayer: ...\n..."
+/// for the Scribe's system prompt. The Scribe reads this like a script.
+/// NO windowing: the Scribe sees the FULL exchange every turn (the idempotent
+/// re-extraction contract — `apply_updates` dedupes, so re-seeing old facts
+/// is harmless and lets the Scribe focus on what's NEW). Mirrors the
+/// `role_label` helper used by `crossroads_generate` for narrator beats.
+fn format_interview_transcript(messages: &[session::Message]) -> String {
+    let mut out = String::with_capacity(2048);
+    for m in messages {
+        let label = match m.role {
+            session::Role::Assistant => "GM",
+            session::Role::User => "Player",
+            session::Role::System => "System",
+        };
+        out.push_str(label);
+        out.push_str(": ");
+        out.push_str(&m.content);
+        out.push('\n');
+    }
+    out
+}
+
+/// Reset all interview state and install a fresh empty draft. Called by the
+/// frontend when the user picks "New Game" → "Interview". After this returns,
+/// the frontend calls `interview_send` with a greeting to kick off the GM.
+/// No model calls — pure state reset.
+#[tauri::command]
+async fn interview_start(state: tauri::State<'_, AppState>) -> Result<(), String> {
+    tracing::info!("interview_start: resetting interview state");
+    {
+        let mut s = state.interview_session.lock().await;
+        *s = session::Conversation::new();
+    }
+    {
+        let mut d = state.interview_draft.lock().expect("interview_draft mutex");
+        *d = Some(interview_draft::InterviewDraft::default());
+    }
+    {
+        let mut a = state.interview_active.lock().expect("interview_active mutex");
+        *a = true;
+    }
+    Ok(())
+}
+
+/// The canonical interview turn. Mirrors `chat_send`'s structure (cancel
+/// token, system-prompt assembly, Chat lease, API dispatch + seamless local
+/// fallback) but routes through the interview's ephemeral session + GM
+/// persona + the gm.codex playbook. After the GM stream completes, a
+/// detached Scribe pass extracts facts into the draft and emits
+/// `interview-fact` events to the frontend.
+#[tauri::command]
+async fn interview_send(
+    text: String,
+    on_event: tauri::ipc::Channel<serde_json::Value>,
+    state: tauri::State<'_, AppState>,
+    app: tauri::AppHandle,
+) -> Result<(), String> {
+    tracing::info!(?text, "interview_send");
+
+    // 1. Fresh cancel token in the INTERVIEW slot (Bug #7 cross-wire guard).
+    let cancel: llm::CancelToken =
+        Arc::new(std::sync::atomic::AtomicBool::new(false));
+    {
+        let mut slot = state
+            .active_interview_cancel
+            .lock()
+            .expect("active_interview_cancel mutex");
+        *slot = Some(Arc::clone(&cancel));
+    }
+
+    let settings = state.settings.lock().expect("settings mutex").clone();
+    let source = *state.model_source.lock().expect("model_source mutex");
+
+    // 2. Append the user turn to the EPHEMERAL interview session. NEVER
+    //    `memory.add_memory`, NEVER persist to disk (zero-memory-footprint).
+    {
+        let mut s = state.interview_session.lock().await;
+        s.add_message(session::Role::User, text.clone());
+    }
+
+    // 3. Build the GM system prompt: persona (gm.sim) + fable.codex playbook +
+    //    current draft state summary.
+    //    Persona: mirror chat_send's fable_persona swap. During an interview
+    //    there is no seated Fable card (the .sim is produced at finalize), so
+    //    we read gm.sim fresh via the resolver + load_or_fallback. The
+    //    fable_persona slot is None until finalize seats a card, so we don't
+    //    consult it here (the drawer's chat_send does — different code path).
+    let persona = resolve_gm_sim_path(&app)
+        .map(|p| sim_card::load_or_fallback(&p))
+        .filter(|c| c.id != "__wupi_fallback__")
+        .map(|c| c.render_for_prompt());
+    if persona.is_none() {
+        tracing::info!("interview_send: no gm.sim found — GM runs persona-bare");
+    }
+
+    // fable.codex playbook retrieval (best-effort, mirror chat_send's retrieval
+    // block). Scoped to INTERVIEW_CARD_ID + the fable_system partition surfaced
+    // by search_fable_visible. Errors → None (graceful, never block the turn).
+    // Note: the GM shares the unified fable.codex with the narrator — one
+    // partition serves both Fable personas.
+    let playbook = match state.memory.get() {
+        Some(engine) => {
+            match engine
+                .search_fable_visible(&text, INTERVIEW_CARD_ID, 5, None)
+                .await
+            {
+                Ok(hits) if !hits.is_empty() => Some(memory::render_memory_block(&hits)),
+                Ok(_) => None,
+                Err(e) => {
+                    tracing::warn!(
+                        error = %format!("{e}"),
+                        "interview_send: fable.codex retrieval failed; injecting nothing"
+                    );
+                    None
+                }
+            }
+        }
+        None => {
+            tracing::trace!("interview_send: memory engine not initialized; skipping retrieval");
+            None
+        }
+    };
+
+    // Snapshot the draft for the prompt (clone under the mutex, then drop).
+    let draft_snapshot = {
+        let g = state.interview_draft.lock().expect("interview_draft mutex");
+        g.clone()
+    };
+    let draft_for_prompt = draft_snapshot
+        .clone()
+        .unwrap_or_default();
+    let system_prompt =
+        gm_prompt::build_gm_system_prompt(persona.as_deref(), playbook.as_deref(), &draft_for_prompt);
+
+    // 4. Window the history to 6 turns (token protection). The draft state
+    //    summary folded into the system prompt compensates for windowed-out
+    //    early answers — the GM always knows what's established.
+    let messages = {
+        let s = state.interview_session.lock().await;
+        s.assemble_api_messages_windowed(&system_prompt, 6)
+    };
+
+    // Stream chunks to the Channel as `{"type":"chunk","text":piece}`.
+    let on_chunk: llm::ChunkFn = Arc::new({
+        let on_event = on_event.clone();
+        move |piece: &str| {
+            let _ = on_event.send(serde_json::json!({ "type": "chunk", "text": piece }));
+        }
+    });
+
+    // 5. Acquire the Chat lease (the interview shares it: the GM on API uses
+    //    no local VRAM; the scribe reuses the same WUPI.gguf context). Mirror
+    //    chat_send's lease block.
+    let context_swap_clone = state.context_swap.clone();
+    let backend_slot = Arc::clone(&state.backend);
+    // Under API the resident chat backend is at the 2048 silent-agent ctx —
+    // too small for tool-calling scribe passes. Tear it down so the spawn
+    // branch below produces a fresh one at settings.context_size (mirrors
+    // chat_send's Bug #2 fix + interview_generate's force_full_ctx).
+    if source == api::ModelSource::Api {
+        let old = {
+            let mut g = state.backend.lock().expect("backend mutex");
+            g.take()
+        };
+        if let Some(old) = old {
+            old.shutdown();
+            tracing::info!(
+                "interview_send: API mode — torn down 2048 silent-agent backend; \
+                 re-spawning at full local ctx (settings.context_size={})",
+                settings.context_size
+            );
+        }
+    }
+    let spawn_ctx = if source == api::ModelSource::Api {
+        settings.context_size
+    } else {
+        effective_local_ctx(source, &settings)
+    };
+    let _chat_lease = context_swap_clone
+        .acquire(
+            context_swap::ContextRole::Chat,
+            Box::new(move || {
+                let backend = {
+                    let mut g = backend_slot.lock().map_err(|e| e.to_string())?;
+                    g.take()
+                };
+                if let Some(backend) = backend {
+                    backend.shutdown();
+                    tracing::info!(
+                        "context-swap: chat backend torn down (interview_send)"
+                    );
+                }
+                Ok(())
+            }),
+        )
+        .await;
+
+    // Spawn-or-reuse the chat backend (the silent agent that will run the
+    // Scribe pass below). Mirrors interview_generate's reuse/spawn pattern.
+    let backend_opt = {
+        let existing = state.backend.lock().expect("backend mutex").clone();
+        match existing {
+            Some(b) => Some(b),
+            None => {
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                let backend = llm::LlamaCppBackend::spawn_from_shared(
+                    spawn_ctx,
+                    Box::new(move |result| {
+                        let _ = tx.send(result);
+                    }),
+                );
+                match backend {
+                    Some(backend) => {
+                        {
+                            let mut g = state.backend.lock().expect("backend mutex");
+                            *g = Some(Arc::clone(&backend));
+                        }
+                        let ready = tokio::task::spawn_blocking(move || rx.blocking_recv())
+                            .await
+                            .map_err(|e| format!("interview_send backend readiness join: {e}"))?;
+                        match ready {
+                            Ok(Ok(_)) => Some(backend),
+                            Ok(Err(e)) => {
+                                clear_interview_cancel(&state);
+                                return Err(format!("interview_send backend spawn failed: {e}"));
+                            }
+                            Err(_) => {
+                                clear_interview_cancel(&state);
+                                return Err(
+                                    "interview_send backend readiness dropped".to_string()
+                                );
+                            }
+                        }
+                    }
+                    None => None,
+                }
+            }
+        }
+    };
+
+    // 6. API dispatch (GM). Mirror chat_send's API branch + seamless local
+    //    fallback. The GM gets NO tools (the scribe does, on a separate
+    //    path — see step 9). Vec::new() for the tools arg.
+    let gm_result: chat_format::ParsedOutput = if source == api::ModelSource::Api {
+        let profile_opt = {
+            let cfg = state.api_config.lock().expect("api_config mutex");
+            cfg.active_profile().cloned()
+        };
+        match profile_opt {
+            Some(profile) => {
+                let http = llm::HttpBackend::new(profile);
+                match http
+                    .stream(
+                        messages.clone(),
+                        None,
+                        None,
+                        Vec::new(),
+                        settings.context_size,
+                        on_chunk.clone(),
+                        cancel.clone(),
+                    )
+                    .await
+                {
+                    Ok(text) => text,
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            "interview_send: GM API stream failed; falling back to local"
+                        );
+                        let _ = on_event.send(serde_json::json!({
+                            "type": "fallback",
+                            "reason": "api_unreachable",
+                            "source": "local",
+                        }));
+                        match run_local_or_echo(
+                            &state,
+                            &on_event,
+                            &system_prompt,
+                            6,
+                            None,
+                            None,
+                            Vec::new(),
+                            settings.context_size,
+                            on_chunk.clone(),
+                            cancel.clone(),
+                            backend_opt.as_ref(),
+                        )
+                        .await
+                        {
+                            Ok(text) => text,
+                            Err(()) => {
+                                clear_interview_cancel(&state);
+                                return Ok(());
+                            }
+                        }
+                    }
+                }
+            }
+            None => {
+                tracing::warn!(
+                    "interview_send: source=Api but no active profile; falling back to local"
+                );
+                let _ = on_event.send(serde_json::json!({
+                    "type": "fallback",
+                    "reason": "no_active_profile",
+                    "source": "local",
+                }));
+                match run_local_or_echo(
+                    &state,
+                    &on_event,
+                    &system_prompt,
+                    6,
+                    None,
+                    None,
+                    Vec::new(),
+                    settings.context_size,
+                    on_chunk.clone(),
+                    cancel.clone(),
+                    backend_opt.as_ref(),
+                )
+                .await
+                {
+                    Ok(text) => text,
+                    Err(()) => {
+                        clear_interview_cancel(&state);
+                        return Ok(());
+                    }
+                }
+            }
+        }
+    } else {
+        // Local mode: the resident backend is the GM narrator.
+        // NOTE: run_local_or_echo re-assembles from state.session (Wupi's
+        // chat session), NOT interview_session. For the interview we built
+        // `messages` from interview_session above; to feed the local backend
+        // the right window we bypass run_local_or_echo and call the backend
+        // directly with our pre-assembled messages. Mirror
+        // run_interview_local's backend.stream shape.
+        let local_messages = messages.clone();
+        if let Some(backend) = backend_opt.as_ref() {
+            match backend
+                .stream(
+                    local_messages,
+                    None,
+                    None,
+                    Vec::new(),
+                    settings.context_size,
+                    on_chunk.clone(),
+                    cancel.clone(),
+                )
+                .await
+            {
+                Ok(text) => text,
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "interview_send: local GM stream failed; echo fallback"
+                    );
+                    let _ = on_event.send(serde_json::json!({
+                        "type": "fallback",
+                        "reason": "local_unavailable",
+                        "source": "echo",
+                    }));
+                    let echo = llm::EchoBackend;
+                    match echo
+                        .stream(
+                            vec![session::ApiMessage {
+                                role: "system".into(),
+                                content: String::new(),
+                                raw_output: String::new(),
+                            }],
+                            None,
+                            None,
+                            Vec::new(),
+                            settings.context_size,
+                            Arc::new(|_| {}),
+                            cancel.clone(),
+                        )
+                        .await
+                    {
+                        Ok(t) => t,
+                        Err(e2) => {
+                            let _ = on_event.send(serde_json::json!({
+                                "type": "error",
+                                "message": format!("local GM stream failed: {e2}"),
+                            }));
+                            clear_interview_cancel(&state);
+                            return Ok(());
+                        }
+                    }
+                }
+            }
+        } else {
+            // No backend at all (no model loaded). Echo mode so the UI shows
+            // something instead of hanging.
+            tracing::warn!("interview_send: no local backend; echo mode");
+            let _ = on_event.send(serde_json::json!({
+                "type": "fallback",
+                "reason": "no_local_model",
+                "source": "echo",
+            }));
+            let echo = llm::EchoBackend;
+            echo.stream(
+                vec![session::ApiMessage {
+                    role: "system".into(),
+                    content: String::new(),
+                    raw_output: String::new(),
+                }],
+                None,
+                None,
+                Vec::new(),
+                settings.context_size,
+                Arc::new(|_| {}),
+                cancel.clone(),
+            )
+            .await
+            .map_err(|e| format!("echo backend failed: {e}"))?
+        }
+    };
+
+    // 7. Append the GM's turn to the EPHEMERAL interview session + emit
+    //    gm_done. Still zero memory footprint.
+    {
+        let mut s = state.interview_session.lock().await;
+        s.add_assistant_turn(
+            gm_result.content.clone(),
+            gm_result.reasoning.clone(),
+            gm_result.raw.clone(),
+        );
+    }
+    let _ = on_event.send(serde_json::json!({
+        "type": "gm_done",
+        "final_text": gm_result.content,
+    }));
+
+    // 8. [READY] sentinel: if the GM signaled completion, emit `ready` +
+    //    SKIP the scribe (the draft is final). The frontend enables the
+    //    Begin button on this event.
+    if gm_result.content.contains(gm_prompt::READY_SENTINEL) {
+        let _ = on_event.send(serde_json::json!({ "type": "ready" }));
+        clear_interview_cancel(&state);
+        return Ok(());
+    }
+
+    // 9. Fire the Scribe in a detached spawn. The IPC returns immediately
+    //    after; facts emit as `interview-fact` events as they're extracted.
+    //    Clone all Arcs out (the tauri::State borrow doesn't outlive this fn).
+    let interview_session = Arc::clone(&state.interview_session);
+    let interview_draft = Arc::clone(&state.interview_draft);
+    let backend_arc = Arc::clone(&state.backend);
+    let install_root = resolve_install_root(&app);
+    let app_for_scribe = app.clone();
+    let on_event_for_scribe = on_event.clone();
+    let context_size = settings.context_size;
+    let draft_before = draft_snapshot.clone().unwrap_or_default();
+    tokio::spawn(async move {
+        let scribe_outcome = run_scribe_pass(
+            &interview_session,
+            &interview_draft,
+            &backend_arc,
+            &install_root,
+            context_size,
+            &draft_before,
+        )
+        .await;
+        match scribe_outcome {
+            Ok(Some(diff)) => {
+                // Emit each new/changed field as a global `interview-fact`
+                // event. Mirrors the fable_rollback emit pattern.
+                for fact in &diff.facts {
+                    let _ = app_for_scribe.emit("interview-fact", fact);
+                }
+                tracing::info!(
+                    facts = diff.facts.len(),
+                    "interview_send: scribe extracted facts"
+                );
+            }
+            Ok(None) => {
+                // Scribe ran but extracted nothing new this turn. Not an
+                // error — the exchange may have been pure atmosphere.
+                tracing::debug!("interview_send: scribe extracted nothing new this turn");
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "interview_send: scribe pass failed; draft unchanged (graceful)"
+                );
+                let _ = app_for_scribe.emit(
+                    "interview-fact",
+                    serde_json::json!({
+                        "type": "scribe_warning",
+                        "message": "The Scribe couldn't extract facts this turn; the draft is unchanged.",
+                    }),
+                );
+            }
+        }
+        // Surface the post-scribe snapshot on the Channel so the frontend's
+        // preview can refresh without polling `interview_draft_state`.
+        let snap = interview_draft
+            .lock()
+            .ok()
+            .and_then(|g| g.as_ref().map(InterviewDraftSnapshot::from_draft));
+        let _ = on_event_for_scribe.send(serde_json::json!({
+            "type": "scribe_done",
+            "draft": snap,
+        }));
+    });
+
+    // 10. Clear the interview cancel slot + return. The scribe keeps running
+    //     detached; its facts emit as they arrive.
+    clear_interview_cancel(&state);
+    Ok(())
+}
+
+/// Mirror `clear_active_cancel` for the interview slot. Called at every exit
+/// path of `interview_send` so a stale token is never left behind (a future
+/// `interview_stop` could otherwise cancel a turn that already finished).
+fn clear_interview_cancel(state: &tauri::State<'_, AppState>) {
+    let mut slot = state
+        .active_interview_cancel
+        .lock()
+        .expect("active_interview_cancel mutex");
+    *slot = None;
+}
+
+/// The detached Scribe extraction pass. Runs hidden after each GM turn:
+/// snapshots the FULL transcript, builds the scribe system prompt, runs a
+/// minimal tool-calling loop against the local backend with `sim_draft` as
+/// the only tool, then diffs the draft (before vs after) and returns the
+/// structured diff for the caller to emit as `interview-fact` events.
+///
+/// This helper takes Arc clones (NOT `tauri::State`) so it can run inside a
+/// `tokio::spawn` — `run_agent_loop` can't, because its signature borrows
+/// `&tauri::State<'_, AppState>` which doesn't cross the spawn boundary.
+/// The loop body mirrors `run_agent_loop`'s structure (decode → parse tool
+/// calls → execute → re-decode, up to `MAX_TOOL_ITERATIONS` passes) but
+/// manages its OWN message Vec instead of mutating `state.session` (the
+/// scribe's exchange is invisible to the Wupi chat session — the interview
+/// transcript lives in `interview_session`).
+///
+/// Returns `Ok(Some(diff))` if at least one tool fired (the diff carries the
+/// new/changed fields), `Ok(None)` if the scribe ran cleanly but extracted
+/// nothing new, `Err` on a fatal local-backend failure (the caller surfaces
+/// a `scribe_warning` event).
+async fn run_scribe_pass(
+    interview_session: &Arc<tokio::sync::Mutex<session::Conversation>>,
+    interview_draft: &Arc<std::sync::Mutex<Option<interview_draft::InterviewDraft>>>,
+    backend_slot: &Arc<std::sync::Mutex<Option<Arc<llm::LlamaCppBackend>>>>,
+    install_root: &std::path::PathBuf,
+    context_size: u32,
+    draft_before: &interview_draft::InterviewDraft,
+) -> Result<Option<ScribeFactDiff>, String> {
+    use tools::ToolCtx;
+
+    // Snapshot the FULL transcript (NO windowing — the scribe sees every
+    // turn so re-extraction is idempotent across the whole exchange).
+    let transcript = {
+        let s = interview_session.lock().await;
+        let msgs: Vec<session::Message> = s.messages.iter().cloned().collect();
+        format_interview_transcript(&msgs)
+    };
+
+    let system_prompt =
+        scribe_prompt::build_scribe_system_prompt(&transcript, draft_before);
+
+    // Assemble the scribe's own message list: system + a single user turn
+    // cueing extraction. This is independent of `state.session` — the
+    // scribe's exchange never enters the Wupi chat logs (zero footprint).
+    let mut messages: Vec<session::ApiMessage> = Vec::with_capacity(2);
+    messages.push(session::ApiMessage {
+        role: "system".into(),
+        content: system_prompt,
+        raw_output: String::new(),
+    });
+    messages.push(session::ApiMessage {
+        role: "user".into(),
+        content: "Extract the facts from the transcript above into a sim_draft call.".into(),
+        raw_output: String::new(),
+    });
+
+    // The scribe's tool: just `sim_draft`. The ToolCtx carries the shared
+    // interview_draft slot so the tool's `execute` applies updates directly.
+    let scribe_tools = tools::interview_specs();
+    let ctx = ToolCtx::new(install_root.clone()).with_interview_draft(Arc::clone(interview_draft));
+    let mut registry = tools::registry();
+    registry.extend(tools::interview_registry());
+
+    // Acquire a backend (reuse the resident chat backend the GM turn warmed,
+    // or whatever is in the slot). The Chat lease was already acquired by the
+    // caller (interview_send); we don't re-acquire here (it would block on
+    // itself under the same role).
+    let backend_opt = backend_slot.lock().map_err(|e| e.to_string())?.clone();
+
+    let cancel: llm::CancelToken = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    // Silent chunk handler — the scribe is hidden; its decode stream must
+    // NOT surface as user-visible chunks (only the GM's chunks stream).
+    let silent_chunk: llm::ChunkFn = Arc::new(|_piece: &str| {});
+
+    let mut tools_fired = false;
+    let mut iteration = 0usize;
+    while iteration < tools::MAX_TOOL_ITERATIONS {
+        iteration += 1;
+        let result = if let Some(backend) = backend_opt.as_ref() {
+            backend
+                .stream(
+                    messages.clone(),
+                    None,
+                    None,
+                    scribe_tools.clone(),
+                    context_size,
+                    silent_chunk.clone(),
+                    cancel.clone(),
+                )
+                .await
+                .map_err(|e| format!("scribe backend stream failed: {e}"))?
+        } else {
+            // No local model — nothing the scribe can do. Not an error per
+            // se (the interview can still proceed on the API); report "no
+            // facts extracted" so the caller surfaces nothing alarming.
+            tracing::info!("run_scribe_pass: no local backend; skipping scribe");
+            return Ok(None);
+        };
+
+        let calls = tools::parse_tool_calls(&result.raw);
+        if calls.is_empty() {
+            break;
+        }
+
+        // Execute each call + append a tool-response turn to the scribe's
+        // OWN message list (NOT state.session). Mirrors run_agent_loop's
+        // per-call flow but against the local Vec.
+        for call in &calls {
+            let outcome = match registry.iter().find(|t| t.spec().name == call.name) {
+                Some(tool) => match tool.validate_args(&call.args) {
+                    Ok(()) => match tool.execute(&call.args, &ctx) {
+                        Ok(output) => (true, output),
+                        Err(e) => (false, format!("error: {e}")),
+                    },
+                    Err(e) => (false, format!("invalid args: {e}")),
+                },
+                None => (false, format!("unknown tool: {}", call.name)),
+            };
+            let response_marker = format!(
+                "{{\"__tool_response__\":true,\"name\":{},\"ok\":{},\"output\":{}}}",
+                serde_json::to_string(&call.name).unwrap_or_else(|_| "\"\"".into()),
+                outcome.0,
+                serde_json::to_string(&outcome.1).unwrap_or_else(|_| "\"\"".into())
+            );
+            messages.push(session::ApiMessage {
+                role: "assistant".into(),
+                content: result.content.clone(),
+                raw_output: result.raw.clone(),
+            });
+            messages.push(session::ApiMessage {
+                role: "user".into(),
+                content: response_marker,
+                raw_output: String::new(),
+            });
+            tools_fired = true;
+        }
+    }
+
+    if !tools_fired {
+        return Ok(None);
+    }
+
+    // Diff the draft (before vs after). The caller emits each entry as an
+    // `interview-fact` global event. Done here (inside the helper) so the
+    // diff logic is testable in isolation + collocated with the loop that
+    // produced it.
+    let after = interview_draft
+        .lock()
+        .map_err(|e| format!("interview_draft mutex poisoned: {e}"))?
+        .as_ref()
+        .cloned()
+        .unwrap_or_default();
+    Ok(Some(ScribeFactDiff::from_drafts(draft_before, &after)))
+}
+
+/// One new/changed field surfaced by the Scribe. Emitted as the body of an
+/// `interview-fact` global event so the frontend's preview panel can render
+/// the change incrementally (one chip per fact) without polling. Pure value
+/// type — computed by `ScribeFactDiff::from_drafts`.
+#[derive(Clone, Debug, serde::Serialize)]
+struct ScribeFact {
+    field: String,
+    value: String,
+    /// "set" (new or overwritten scalar), "added" (appended collection
+    /// member), or "scribe_warning" (the degraded-mode marker — only emitted
+    /// by the caller on scribe failure, never by the diff itself).
+    action: &'static str,
+}
+
+/// The structured diff between two consecutive `InterviewDraft` snapshots.
+/// Computed by the scribe pass after `sim_draft` tool calls have applied;
+/// emitted field-by-field as `interview-fact` events. Mirrors the
+/// `RollbackDiff` / `EntityDiff` pattern used by `fable_rollback`.
+#[derive(Clone, Debug, serde::Serialize)]
+struct ScribeFactDiff {
+    facts: Vec<ScribeFact>,
+}
+
+impl ScribeFactDiff {
+    /// Compute the diff. Pure fn — no locks, no I/O. Each scalar that
+    /// changed (None→Some or Some→different-Some) emits one "set" fact;
+    /// each NEW collection member (trait/npc/activity/entity not present in
+    /// BEFORE) emits one "added" fact. Unchanged fields emit nothing.
+    fn from_drafts(
+        before: &interview_draft::InterviewDraft,
+        after: &interview_draft::InterviewDraft,
+    ) -> Self {
+        let mut facts: Vec<ScribeFact> = Vec::new();
+
+        // Scalar Option<String> fields. "set" covers None→Some and Some→Some
+        // (overwrite). The idempotent contract means re-extracting the same
+        // value still emits a "set" (harmless — the UI just re-renders the
+        // same value); a future optimization could suppress no-op sets.
+        for (field, b, a) in [
+            ("name", before.name.as_deref(), after.name.as_deref()),
+            ("core_persona", before.core_persona.as_deref(), after.core_persona.as_deref()),
+            ("setting", before.setting.as_deref(), after.setting.as_deref()),
+            ("tone", before.tone.as_deref(), after.tone.as_deref()),
+            ("opening_scene", before.opening_scene.as_deref(), after.opening_scene.as_deref()),
+            ("player_name", before.player_name.as_deref(), after.player_name.as_deref()),
+            ("world_summary", before.world_summary.as_deref(), after.world_summary.as_deref()),
+            ("start_node", before.start_node.as_deref(), after.start_node.as_deref()),
+            ("player_background", before.player_background.as_deref(), after.player_background.as_deref()),
+            ("starting_condition", before.starting_condition.as_deref(), after.starting_condition.as_deref()),
+        ] {
+            if b != a {
+                if let Some(v) = a {
+                    facts.push(ScribeFact {
+                        field: field.to_string(),
+                        value: v.to_string(),
+                        action: "set",
+                    });
+                }
+            }
+        }
+
+        // Collection fields: each NEW member (not in BEFORE) emits "added".
+        for t in after.traits.iter() {
+            if !before.traits.iter().any(|b| b == t) {
+                facts.push(ScribeFact {
+                    field: "trait".to_string(),
+                    value: t.clone(),
+                    action: "added",
+                });
+            }
+        }
+        for n in after.start_npc_ids.iter() {
+            if !before.start_npc_ids.iter().any(|b| b == n) {
+                facts.push(ScribeFact {
+                    field: "npc".to_string(),
+                    value: n.clone(),
+                    action: "added",
+                });
+            }
+        }
+        for a in after.declared_activities.iter() {
+            if !before.declared_activities.iter().any(|b| b == a) {
+                facts.push(ScribeFact {
+                    field: "activity".to_string(),
+                    value: a.clone(),
+                    action: "added",
+                });
+            }
+        }
+        // Entities: a key absent in BEFORE OR with a different value → "set"
+        // (AddEntity overwrites; the "added" distinction is meaningless for
+        // a map). New keys + changed values both surface as "set".
+        for (k, v) in after.world_entities.iter() {
+            let changed = match before.world_entities.get(k) {
+                Some(bv) => bv != v,
+                None => true,
+            };
+            if changed {
+                facts.push(ScribeFact {
+                    field: format!("entity.{}", k),
+                    value: v.clone(),
+                    action: "set",
+                });
+            }
+        }
+
+        Self { facts }
+    }
+}
+
+/// Signal the in-flight GM stream's cancel token. Mirrors `chat_stop` /
+/// `fable_stop` exactly but reads the interview slot. The next chunk check
+/// in the stream loop sees the flag and aborts.
+#[tauri::command]
+async fn interview_stop(state: tauri::State<'_, AppState>) -> Result<(), String> {
+    tracing::info!("interview_stop requested");
+    let slot = state
+        .active_interview_cancel
+        .lock()
+        .expect("active_interview_cancel mutex");
+    if let Some(cancel) = slot.as_ref() {
+        cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+    Ok(())
+}
+
+/// Commit the interview draft to a `.sim` file + seat the session. Mirrors
+/// `fable_quick_start`'s seeding block: the draft's `to_sim_card_xml` +
+/// `sim_card::parse_from_xml_str` produce the typed card, the file is
+/// written under the fable cards dir, `enter_fable_session` seats it, and
+/// the world/player state seeds are overridden from the draft.
+#[tauri::command]
+async fn interview_finalize(
+    opening_preference: Option<String>,
+    state: tauri::State<'_, AppState>,
+    app: tauri::AppHandle,
+) -> Result<FableLoadResult, String> {
+    tracing::info!(has_pref = opening_preference.is_some(), "interview_finalize");
+
+    // Refuse if a game is already running (defense-in-depth, mirrors
+    // fable_quick_start).
+    {
+        let existing = state.fable_engine.lock().expect("fable_engine mutex");
+        if existing.is_some() {
+            return Err("a game is already running: call fable_end first".into());
+        }
+    }
+
+    // 1. Take the draft out of the slot (leave None behind — the interview
+    //    is over either way).
+    let draft = {
+        let mut g = state.interview_draft.lock().expect("interview_draft mutex");
+        g.take()
+            .ok_or_else(|| "no interview active: call interview_start first".to_string())?
+    };
+
+    // 2. Finalizability gate.
+    if !draft.is_finalizable() {
+        return Err(format!(
+            "draft not finalizable; missing: {}",
+            draft.missing_required().join(", ")
+        ));
+    }
+
+    // 3. Build the SimCard XML (Rust assembly + roxmltree smoke-validate).
+    let xml = draft.to_sim_card_xml()?;
+
+    // 4. Parse into a typed SimCard (verifies well-formedness + gives us the
+    //    card with parsed scenario fields).
+    let mut card = sim_card::parse_from_xml_str(&xml)
+        .map_err(|e| format!("interview_finalize: parsed XML failed re-parse: {e}"))?;
+    // The draft's id is sanitized from the name; force card_type to roleplay
+    // (the parser may leave it blank if the XML omitted it, though the
+    // builder always emits <type>roleplay</type>).
+    if card.card_type.is_empty() {
+        card.card_type = "roleplay".to_owned();
+    }
+
+    // 5. Write the `.sim` file under the fable cards dir. Mirrors
+    //    create_sim_card's path logic.
+    let dir = resolve_fable_cards_dir(&app)
+        .ok_or_else(|| "no cards dir resolved: cannot write interview card".to_string())?;
+    let path = dir.join(format!("{}.sim", card.id));
+    std::fs::write(&path, xml.as_bytes())
+        .map_err(|e| format!("interview_finalize: failed to write {}: {e}", path.display()))?;
+    tracing::info!(path = %path.display(), card_id = %card.id, "interview_finalize: wrote .sim file");
+
+    // Mark not-Quick-Play (this is a real authored card on disk, not the
+    // in-memory Quick Play sentinel). enter_fable_session will swap
+    // active_card_id to the card's id.
+    *state.is_quick_play.lock().expect("is_quick_play mutex") = false;
+
+    // 6. Seat the card via the shared session-entry primitive. The model
+    //    path is required (lazy-spawn fallback); resolve it here.
+    let model_path = resolve_model_path(&app)
+        .ok_or_else(|| "no WUPI.gguf found: cannot start game".to_string())?;
+    let card_id_for_meta = card.id.clone();
+    let mut result = enter_fable_session(
+        card,
+        None,
+        true,
+        model_path,
+        card_id_for_meta,
+        &app,
+        &state,
+    )
+    .await?;
+
+    // 7. Seed the world + player state from the draft. Mirror
+    //    fable_quick_start's seeding block: override summary/entities from
+    //    to_world_schema() + install to_player_state().
+    let ws = draft.to_world_schema();
+    let ps = draft.to_player_state();
+    clear_fable_history(&state).await;
+    {
+        let mut s = state.fable_schema.lock().await;
+        s.summary = ws.summary;
+        s.recent_events = ws.recent_events;
+        for (k, v) in ws.entities {
+            s.entities.insert(k, v);
+        }
+        s.player_state = ps;
+    }
+
+    // 8. Optional opening message: a one-shot GLM-5.2 call addressing the
+    //    player's preference. Mirror interview_generate's API dispatch.
+    if let Some(pref) = opening_preference {
+        if !pref.trim().is_empty() {
+            if let Some(opening) = generate_interview_opening(&pref, &state).await {
+                // Surface as the first narrator beat. If the card already
+                // carried an opening_scene, prefer the freshly generated one
+                // (it addresses the player's stated preference); otherwise
+                // this is the only opener.
+                result.opening_scene = Some(opening);
+            }
+        }
+    }
+
+    // 9. Clear all interview state (the .sim file is the artifact; the
+    //    ephemeral session/draft are no longer needed).
+    *state.interview_session.lock().await = session::Conversation::new();
+    *state.interview_draft.lock().expect("interview_draft mutex") = None;
+    *state.interview_active.lock().expect("interview_active mutex") = false;
+
+    Ok(result)
+}
+
+/// One-shot GLM-5.2 call for the optional opening scene addressing the
+/// player's preference. Mirrors interview_generate's API dispatch: API-first
+/// with seamless local fallback (the local path produces a shorter opener,
+/// still usable). Returns None on total failure (the card's existing
+/// opening_scene — if any — is used as the fallback, set by the caller).
+async fn generate_interview_opening(
+    preference: &str,
+    state: &tauri::State<'_, AppState>,
+) -> Option<String> {
+    let settings = state.settings.lock().expect("settings mutex").clone();
+    let source = *state.model_source.lock().expect("model_source mutex");
+
+    let system_prompt = format!(
+        "You are the narrator. In 2-4 sentences, write the opening scene for a \
+         new roleplay. Address this preference from the player:\n{}\n\
+         Sensory, present tense, second person ('you'). No stats, no numbers, \
+         no XML. End on an open beat that invites the player's first action.",
+        preference.trim()
+    );
+    let messages: Vec<session::ApiMessage> = vec![
+        session::ApiMessage {
+            role: "system".into(),
+            content: system_prompt,
+            raw_output: String::new(),
+        },
+        session::ApiMessage {
+            role: "user".into(),
+            content: "Begin.".into(),
+            raw_output: String::new(),
+        },
+    ];
+
+    let cancel: llm::CancelToken = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let silent_chunk: llm::ChunkFn = Arc::new(|_| {});
+
+    if source == api::ModelSource::Api {
+        let profile_opt = {
+            let cfg = state.api_config.lock().expect("api_config mutex");
+            cfg.active_profile().cloned()
+        };
+        if let Some(profile) = profile_opt {
+            let http = llm::HttpBackend::new(profile);
+            match http
+                .stream(
+                    messages.clone(),
+                    None,
+                    None,
+                    Vec::new(),
+                    settings.context_size,
+                    silent_chunk.clone(),
+                    cancel.clone(),
+                )
+                .await
+            {
+                Ok(parsed) => {
+                    let txt = parsed.content.trim();
+                    if !txt.is_empty() {
+                        return Some(txt.to_string());
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "interview_finalize: opening-scene API call failed; trying local"
+                    );
+                }
+            }
+        }
+    }
+
+    // Local fallback (or Local mode): one decode against the resident
+    // backend. Best-effort; None on any failure (caller falls back to the
+    // card's opening_scene).
+    let backend_opt = state.backend.lock().expect("backend mutex").clone();
+    if let Some(backend) = backend_opt.as_ref() {
+        match backend
+            .stream(
+                messages,
+                None,
+                None,
+                Vec::new(),
+                settings.context_size,
+                silent_chunk,
+                cancel,
+            )
+            .await
+        {
+            Ok(parsed) => {
+                let txt = parsed.content.trim();
+                if !txt.is_empty() {
+                    return Some(txt.to_string());
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "interview_finalize: opening-scene local decode failed"
+                );
+            }
+        }
+    }
+    None
+}
+
+/// Return a serializable snapshot of the current interview draft for the
+/// frontend's live preview panel. `None` (→ JSON null) when no interview is
+/// active. The snapshot carries the derived `completion_pct` +
+/// `is_finalizable` flags so the UI renders without recomputing.
+#[tauri::command]
+async fn interview_draft_state(
+    state: tauri::State<'_, AppState>,
+) -> Result<Option<InterviewDraftSnapshot>, String> {
+    let g = state.interview_draft.lock().expect("interview_draft mutex");
+    Ok(g.as_ref().map(InterviewDraftSnapshot::from_draft))
+}
+
+// ===========================================================================
 // Crossroads — "Choose a Director" option generator (§11.24, 2026-07-27).
 //
 // Memoryless one-shot generation (mirrors interview_generate exactly): no
@@ -7316,7 +8934,7 @@ fn extract_directive_body(s: &str) -> Option<String> {
 }
 
 /// Tiny helper: render a session::Role as a label for the crossroads context
-/// block ("you" for the protagonist, "narrator" for the world voice).
+/// block ("you" for the player, "narrator" for the world voice).
 fn role_label(role: session::Role) -> &'static str {
     match role {
         session::Role::User => "you",
@@ -8783,6 +10401,124 @@ mod tests {
         );
     }
 
+    /// §7 sibling (2026-07-29): the narrator prompt builders MUST accept + render
+    /// a `memory_block` (the retrieved fable.codex knowledge) as a
+    /// `<retrieved_knowledge>` block. This is the core fix that makes the prompt
+    /// distillation safe: the offloaded detail (bracket semantics, narrative
+    /// discipline, common errors) lives in the codex and arrives on semantic
+    /// match, keeping the inline prompt lean. Pin the wiring so a future refactor
+    /// that drops the `memory_block` param fails loudly. Mirrors
+    /// `fable_send_never_includes_tools` for the retrieval path.
+    #[test]
+    fn narrator_prompt_renders_retrieved_knowledge_block() {
+        use crate::schema::{SceneMode, ScenePacing};
+        use crate::sim_card::SimCard;
+
+        let card = SimCard {
+            id: "test".to_owned(),
+            name: "Test Scenario".to_owned(),
+            card_type: "roleplay".to_owned(),
+            core_persona: String::new(),
+            traits: String::new(),
+            appearance: String::new(),
+            role_instruction: String::new(),
+            responsibilities: String::new(),
+            conversational_rules: String::new(),
+            technical_rules: String::new(),
+            introductions: Vec::new(),
+            setting: Some("A test.".to_owned()),
+            tone: Some("atmospheric".to_owned()),
+            opening_scene: None,
+            player_name: Some("Kaelen".to_owned()),
+            start_npc_ids: Vec::new(),
+            declared_activities: Vec::new(),
+            locations: Vec::new(),
+        };
+        let pacing = ScenePacing {
+            mode: SceneMode::Exploration,
+            spatial: 0,
+            emotional: 0,
+            kinetic: 0,
+        };
+        let block = "Reference knowledge\n<c title=\"Bracket Commands Reference\">the full per-command detail</c>";
+
+        // Tracker path: the block must render between <world_state> and <scene_pacing>.
+        let tracker_prompt = narrator_prompt::build_narrator_system_prompt(
+            &card,
+            Some("gold: 100"),
+            pacing,
+            None,
+            Some(block),
+        );
+        assert!(
+            tracker_prompt.contains("<retrieved_knowledge>"),
+            "tracker prompt must render the <retrieved_knowledge> block when memory_block is Some"
+        );
+        assert!(
+            tracker_prompt.contains("Bracket Commands Reference"),
+            "tracker prompt must contain the retrieved codex content"
+        );
+        // Ordering: retrieved_knowledge AFTER world_state, BEFORE scene_pacing.
+        let ws = tracker_prompt.find("<world_state>").expect("world_state tag");
+        let rk = tracker_prompt
+            .find("<retrieved_knowledge>")
+            .expect("retrieved_knowledge tag");
+        let sp = tracker_prompt.find("<scene_pacing").expect("scene_pacing tag");
+        assert!(ws < rk, "retrieved_knowledge must come after world_state");
+        assert!(rk < sp, "retrieved_knowledge must come before scene_pacing");
+
+        // None memory_block → no block emitted (zero baseline cost).
+        let no_block_prompt = narrator_prompt::build_narrator_system_prompt(
+            &card,
+            None,
+            pacing,
+            None,
+            None,
+        );
+        assert!(
+            !no_block_prompt.contains("<retrieved_knowledge>"),
+            "tracker prompt must NOT render the block when memory_block is None"
+        );
+
+        // API narrator path: same wiring.
+        let api_prompt = narrator_prompt::build_api_narrator_system_prompt(
+            &card,
+            Some("gold: 100"),
+            pacing,
+            None,
+            Some(block),
+        );
+        assert!(
+            api_prompt.contains("<retrieved_knowledge>"),
+            "API narrator prompt must render the <retrieved_knowledge> block"
+        );
+    }
+
+    /// §7 invariant for the interview path (Phase C.2): the GM's system
+    /// prompt NEVER includes tool declarations or tool-call markers. The GM
+    /// speaks pure prose; only the Scribe gets tools (via `run_agent_loop`
+    /// on a SEPARATE path with `interview_specs()`). This pins the
+    /// structural separation so a future refactor that accidentally routes
+    /// tool specs into the GM prompt fails loudly. Mirrors
+    /// `fable_send_never_includes_tools` for the narrator.
+    #[test]
+    fn interview_send_uses_interview_path_not_fable_send() {
+        let prompt =
+            gm_prompt::build_gm_system_prompt(None, None, &interview_draft::InterviewDraft::default());
+        assert!(
+            !prompt.contains("<|tool>declaration:"),
+            "GM prompt must never include tool declarations: {prompt}"
+        );
+        assert!(
+            !prompt.contains("<|tool_call>"),
+            "GM prompt must never include tool_call markers: {prompt}"
+        );
+        assert!(
+            !prompt.contains("<|tool>"),
+            "GM prompt must never include any tool protocol token: {prompt}"
+        );
+    }
+
     /// Phase 3 guard: the tool registry is non-empty (so the chat path CAN
     /// tool-call) but the narrator builder doesn't touch it. This double
     /// assertion catches the case where someone adds tools to the registry
@@ -8820,7 +10556,7 @@ mod tests {
   <scenario>\
     <setting><![CDATA[A place.]]></setting>\
     <tone><![CDATA[quiet]]></tone>\
-    <protagonist><![CDATA[Hero]]></protagonist>\
+    <player_name><![CDATA[Hero]]></player_name>\
     <opening_scene><![CDATA[The scene opens.]]></opening_scene>\
     <start_npcs><![CDATA[- npc_one\n- npc_two]]></start_npcs>\
     <activities><![CDATA[conversation]]></activities>\
@@ -9579,6 +11315,96 @@ mod phase3_integration_tests {
         assert!(rendered.ends_with("</directives>"));
     }
 
+    // ---- Phase 4 §11.44 (Component 1): disguise gate wiring ----
+
+    #[test]
+    fn component1_disguise_directive_orders_between_lethality_and_skills() {
+        // The §11.42 <directives> block assembly order is:
+        //   lethality → disguise → skill checks → tick directives.
+        // Disguise sits after lethality (the most consequential fact) but
+        // before skill checks — it's scene-establishing ("your disguise
+        // holds" gates whether the skill checks even fire in spirit).
+        let combat_directive: Option<String> =
+            Some("Lethal blow (soldier tier, DC 18): the player is DOWNED".to_string());
+        let disguise_directive: Option<String> =
+            Some(player_state::DisguiseDirective::AutoPass {
+                label: "city guard uniform".into(),
+                tier_tag: "soldier",
+            }.render());
+        let skill_directives: Vec<String> = vec![
+            "Lockpick (DC 12): FAIL. The pick snaps.".to_string(),
+        ];
+
+        // Mirror the fable_send assembly order exactly.
+        let mut turn_directives: Vec<String> = Vec::new();
+        if let Some(cd) = &combat_directive { turn_directives.push(cd.clone()); }
+        if let Some(dd) = &disguise_directive { turn_directives.push(dd.clone()); }
+        for sc in &skill_directives { turn_directives.push(sc.clone()); }
+
+        let lethal_pos = turn_directives.iter().position(|d| d.contains("DOWNED"))
+            .expect("lethality present");
+        let disguise_pos = turn_directives.iter().position(|d| d.contains("ACCEPTED"))
+            .expect("disguise present");
+        let skill_pos = turn_directives.iter().position(|d| d.contains("Lockpick"))
+            .expect("skill present");
+        assert!(
+            lethal_pos < disguise_pos && disguise_pos < skill_pos,
+            "order must be lethality → disguise → skill; got {:?}",
+            turn_directives
+        );
+    }
+
+    #[test]
+    fn component1_gate_autopass_renders_into_directives_block() {
+        // End-to-end: the gate produces a DisguiseDirective whose render()
+        // output is a clean one-liner that slots into the <directives> block.
+        use std::collections::HashMap;
+        let mut entities = HashMap::new();
+        entities.insert("npc.gate_guard.tier".to_string(), "soldier".to_string());
+        let tags = vec![consequence::StatusTag {
+            label: "city guard uniform".into(),
+            polarity: consequence::Polarity::Buff,
+            expires_at: 0,
+            source: String::new(),
+            kind: "disguise".into(),
+        }];
+        let dd = player_state::evaluate_disguise_gate(
+            "I nod to the guard and walk past confidently.",
+            &tags,
+            &entities,
+            0,
+        ).expect("soldier + confident → AutoPass");
+        let rendered = dd.render();
+        assert!(rendered.contains("ACCEPTED"));
+        assert!(rendered.contains("city guard uniform"));
+        // It must read as a single directive line (no newlines — the block
+        // wraps each entry in [DIRECTIVE: ...]).
+        assert!(!rendered.contains('\n'), "directive must be one line: {rendered}");
+    }
+
+    #[test]
+    fn component1_gate_returns_none_when_no_disguise_tag_so_no_directive() {
+        // The wiring must NOT inject a disguise directive when the player
+        // has no disguise tag — the gate returning None means the assembly
+        // skips it entirely.
+        use std::collections::HashMap;
+        let entities = HashMap::new();
+        let tags = vec![consequence::StatusTag {
+            label: "Blessed".into(),
+            polarity: consequence::Polarity::Buff,
+            expires_at: 0,
+            source: String::new(),
+            kind: String::new(), // generic buff, NOT a disguise
+        }];
+        let dd = player_state::evaluate_disguise_gate(
+            "I walk past the guard.",
+            &tags,
+            &entities,
+            0,
+        );
+        assert!(dd.is_none(), "no disguise tag → no directive");
+    }
+
     // ------------------------------------------------------------------------
     // Slice 2 (§11.31): consequence.rs Driver taxonomy + read-time derived
     // Condition. Verify the read-time derivation contract: the same wound +
@@ -9706,12 +11532,14 @@ mod phase3_integration_tests {
                 polarity: Polarity::Debuff,
                 expires_at: 0, // permanent
                 source: String::new(),
+            kind: String::new(),
             },
             StatusTag {
                 label: "Berserk Rage".to_string(),
                 polarity: Polarity::Buff,
                 expires_at: 1000, // expires at minute 1000
                 source: String::new(),
+            kind: String::new(),
             },
         ];
 
@@ -9741,6 +11569,7 @@ mod phase3_integration_tests {
             polarity: Polarity::Buff,
             expires_at: 2000,
             source: String::new(),
+        kind: String::new(),
         }];
 
         // Before the tick (minute 1000): buff active → Unscathed.
@@ -10539,6 +12368,7 @@ mod phase3_wiring_tests {
             label,
             polarity,
             duration_minutes,
+            ..
         } = effects[0]
         {
             assert_eq!(label, "Berserk Rage");
@@ -10796,6 +12626,7 @@ mod phase3_wiring_tests {
                 polarity: Polarity::Buff,
                 expires_at: 1000,
                 source: String::new(),
+            kind: String::new(),
             },
         ];
         // The wiring computes these counts then passes them to derive_condition.
@@ -10826,18 +12657,21 @@ mod phase3_wiring_tests {
                 polarity: Polarity::Debuff,
                 expires_at: 0, // permanent
                 source: String::new(),
+            kind: String::new(),
             },
             StatusTag {
                 label: "Short Buff".to_string(),
                 polarity: Polarity::Buff,
                 expires_at: 500, // expired at minute 1000
                 source: String::new(),
+            kind: String::new(),
             },
             StatusTag {
                 label: "Active Buff".to_string(),
                 polarity: Polarity::Buff,
                 expires_at: 2000, // still active at minute 1000
                 source: String::new(),
+            kind: String::new(),
             },
         ];
         let dropped = consequence::expire_tags(&mut tags, 1000);
@@ -10952,6 +12786,7 @@ mod phase3_wiring_tests {
             polarity: Polarity::Buff,
             expires_at: 1000,
             source: "test".to_string(),
+        kind: String::new(),
         });
         schema.world_clock.current_minutes = 500;
         let mut rel = relationship::RelationshipState::default();
@@ -11023,7 +12858,7 @@ mod phase3_wiring_tests {
             .filter(|c| matches!(c, BracketCommand::Effect { .. }))
             .collect();
         assert_eq!(effects.len(), 1, "exactly one Effect from JSON");
-        if let BracketCommand::Effect { label, polarity, duration_minutes } = effects[0] {
+        if let BracketCommand::Effect { label, polarity, duration_minutes, .. } = effects[0] {
             assert_eq!(label, "Berserk Rage");
             assert_eq!(*polarity, Polarity::Buff);
             assert_eq!(*duration_minutes, 60);

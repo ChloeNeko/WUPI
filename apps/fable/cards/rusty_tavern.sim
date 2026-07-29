@@ -19,7 +19,7 @@ The wider world: Ashford sits at the frontier of charted lands; beyond the King'
     <tone><![CDATA[
 Atmospheric, grounded, slow-burn. The tavern feels real before anything happens. Sensory detail first (firelight, rain, the smell of woodsmoke and spilled ale), then character. NPCs are people with their own concerns, not quest dispensers. Danger, when it comes, should feel earned — never gratuitous. Leave room for the player to set the pace.
     ]]></tone>
-    <protagonist><![CDATA[Kaelen]]></protagonist>
+    <player_name><![CDATA[Kaelen]]></player_name>
     <opening_scene><![CDATA[
 The door of the Rusty Lantern swings shut behind you, cutting off the cold rain. Warmth and the smell of woodsmoke roll over you; the low murmur of conversation dips for a moment as a few patrons glance your way, then returns. Water drips from your cloak onto the flagstones. Behind the bar, Mara looks up from the tankard she's polishing and gives you a measured nod — neither welcoming nor unwelcoming, just... assessing. "Traveler," she says, loud enough to carry. "Kitchen's closed, but the ale's warm and the fire's free. Sit where you like." The dice game by the hearth resumes; the hooded figure in the corner doesn't look up at all. What do you do?
     ]]></opening_scene>
@@ -35,6 +35,48 @@ The door of the Rusty Lantern swings shut behind you, cutting off the cold rain.
 - exploration
 - mystery
     ]]></activities>
+
+    <!-- Fable Phase 4 Component 3 (2026-07-28): the spatial travel graph.
+         Parsed by sim_card::parse into TravelGraph.nodes; the FIRST <node>
+         in document order seeds current_node (the player's starting
+         location). Each <node> carries: id (bare slug, no "node." prefix),
+         setting ("indoor"|"outdoor"|empty — gates whether the global
+         weather: line renders for this node), <name> (diegetic prose label),
+         and one <neighbor> per adjacency edge (bare node id; edges are
+         undirected but EACH side must list the other — the parser does NOT
+         symmetrize). A card with no <locations> block stays dormant (the
+         pre-Phase-4 behavior — travel_graph.nodes empty, no location: line,
+         [TRAVEL]/[RUMOR] bracket commands have nowhere to root). -->
+    <locations>
+      <node id="tavern" setting="indoor">
+        <name>The Rusty Lantern Tavern</name>
+        <neighbor>cellar</neighbor>
+        <neighbor>market_square</neighbor>
+        <neighbor>guest_rooms</neighbor>
+      </node>
+      <node id="cellar" setting="indoor">
+        <name>The Tavern Cellar</name>
+        <neighbor>tavern</neighbor>
+      </node>
+      <node id="market_square" setting="outdoor">
+        <name>Ashford Market Square</name>
+        <neighbor>tavern</neighbor>
+        <neighbor>north_road</neighbor>
+      </node>
+      <node id="guest_rooms" setting="indoor">
+        <name>The Tavern Guest Rooms</name>
+        <neighbor>tavern</neighbor>
+      </node>
+      <node id="north_road" setting="outdoor">
+        <name>The Northern Trade Road</name>
+        <neighbor>market_square</neighbor>
+        <neighbor>kings_wood</neighbor>
+      </node>
+      <node id="kings_wood" setting="outdoor">
+        <name>The King's Wood</name>
+        <neighbor>north_road</neighbor>
+      </node>
+    </locations>
   </scenario>
 
 </sim_card>
