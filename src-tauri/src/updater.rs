@@ -564,16 +564,23 @@ fn apply_extracted(extracted: &Path, exe_dir: &Path) -> Result<(), String> {
 }
 
 /// The §8C preserve rule as a predicate. Returns true for paths that must NOT
-/// be overwritten by an update (user data). `data/wupi.sim` and `data/wupi.codex`
-/// are the two exceptions: both are engine content shipped in the zip and
-/// replaced verbatim on update (Wupi's persona + her static playbook).
+/// be overwritten by an update (user data). The engine-content exceptions
+/// (shipped in the zip, replaced verbatim on update) are:
+/// - `data/wupi.sim` + `data/wupi.codex` — Wupi's persona + her static playbook.
+/// - `data/gm.sim` + `data/fable.codex` — the Game Master persona + the unified
+///   Fable playbook (shared by the New Game interview persona AND the
+///   simulation narrator; fable.codex is the 2026-07-29 unification, was
+///   gm.codex).
 ///
 /// `rel` is the file's path relative to the extract root (e.g. `data/user.xml`,
 /// `memory/memory.sqlite`, `wupi.exe`).
 fn is_preserved(rel: &Path) -> bool {
-    // data/: preserved EXCEPT data/wupi.sim + data/wupi.codex (engine content).
+    // data/: preserved EXCEPT the four engine-content files above.
     if rel.starts_with("data") {
-        return rel != Path::new("data/wupi.sim") && rel != Path::new("data/wupi.codex");
+        return rel != Path::new("data/wupi.sim")
+            && rel != Path::new("data/wupi.codex")
+            && rel != Path::new("data/gm.sim")
+            && rel != Path::new("data/fable.codex");
     }
     // memory/, models/, apps/: fully preserved.
     rel.starts_with("memory") || rel.starts_with("models") || rel.starts_with("apps")

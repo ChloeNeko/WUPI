@@ -30,6 +30,7 @@ pub fn build_narrator_system_prompt(
     world_state: Option<&str>,
     scene_pacing: ScenePacing,
     directive: Option<&str>,
+    memory_block: Option<&str>,
 ) -> String {
     let player_display = player_display_name(card);
     let player_address = player_address(card);
@@ -87,6 +88,23 @@ pub fn build_narrator_system_prompt(
         }
     }
 
+    // Retrieved fable codex knowledge (2026-07-29): the deep playbook slice
+    // the embedder judged relevant to THIS turn (bracket-command detail,
+    // narrative discipline, common errors, plus the active card's own lore).
+    // Surfaced under the codex frame ("reference knowledge you possess;
+    // internalize it, weave it naturally"). Zero baseline cost — omitted when
+    // no entries clear the cosine floor. This is the offload target for the
+    // prompt-distillation: hyper-specific rules live in the codex and arrive
+    // on semantic match, keeping the inline prompt lean.
+    if let Some(block) = memory_block {
+        let trimmed = block.trim();
+        if !trimmed.is_empty() {
+            out.push_str("<retrieved_knowledge>\n");
+            out.push_str(trimmed);
+            out.push_str("\n</retrieved_knowledge>\n\n");
+        }
+    }
+
     // Ghostwriter Director directive (§11.24, 2026-07-27): a one-shot player-
     // armed steer the narrator MUST obey for THIS turn only. Placed AFTER
     // <world_state> (it's a constraint about the world just described) and
@@ -125,7 +143,7 @@ pub fn build_narrator_system_prompt(
         "You are narrating {}, NOT any other scenario. ",
         card.name.trim(),
     ));
-    if let Some(name) = card.protagonist_name.as_deref() {
+    if let Some(name) = card.player_name.as_deref() {
         let n = name.trim();
         if !n.is_empty() {
             out.push_str(&format!(
@@ -183,6 +201,7 @@ pub fn build_api_narrator_system_prompt(
     world_state: Option<&str>,
     scene_pacing: ScenePacing,
     directive: Option<&str>,
+    memory_block: Option<&str>,
 ) -> String {
     let player_display = player_display_name(card);
     let player_address = player_address(card);
@@ -194,30 +213,21 @@ pub fn build_api_narrator_system_prompt(
     out.push_str("\n</narrator_role>\n\n");
 
     // The voice-actor contract. Pins the API's job: it is the second stage of
-    // a two-stage turn. The mechanical truth (time passed, buffs gained, NPC
-    // reactions, injury severity) was already decided by the engine + tracker
-    // BEFORE this prompt ran; <world_state> below carries that authoritative
-    // truth. The API's only job is to dress it in immersive prose — never to
-    // invent, override, or expand on the mechanics.
+    // a two-stage turn. The mechanical truth was already decided by the engine
+    // + tracker BEFORE this prompt ran; <world_state> carries it. The API's
+    // only job is to dress it in immersive prose — never to invent, override,
+    // or expand on the mechanics.
     out.push_str("<your_role>\n");
     out.push_str(
         "You are the VOICE ACTOR — the second stage of a two-stage turn. The \
 engine (a separate tracker) already decided the mechanical truth of this \
-turn: time advanced, status tags changed, NPC reactions firmed up, injury \
-severity was rolled. That authoritative truth appears in <world_state> \
-below. Your ONLY job is to dress it in immersive second-person prose.\n\n\
-- Narrate exactly what <world_state> says happened — nothing more, nothing \
-less. If a directive appears in <directives>, it is authoritative: obey it.\n\
-- Do NOT invent outcomes the engine didn't track. If <world_state> shows an \
-injury, the player is injured; if it shows a buff, the buff is real; if it \
-is silent on some detail, do not fill it in with a convenient one.\n\
-- Do NOT emit ANY bracket or JSON commands ([OBJECT], [FX], [TIME], \
-[EFFECT], [MILESTONE], [TASK], [CHARACTER_TURN]). The engine already \
-tracked this turn — your prose is the final output the player reads. Any \
-bracket syntax you emit will leak into the prose as literal text.\n\
-- Do NOT decide game mechanics. You cannot grant buffs, advance the clock, \
-change NPC trust, or resolve tasks — those are the engine's job and have \
-already happened.\n\
+turn; <world_state> below carries it. Your ONLY job is to dress it in \
+immersive second-person prose.\n\n\
+- Narrate exactly what <world_state> + <directives> say happened — obey \
+both. Nothing more, nothing less.\n\
+- Do NOT invent outcomes the engine didn't track, and do NOT emit ANY \
+bracket or JSON commands — your prose is the final output the player reads; \
+any bracket syntax leaks as literal text.\n\
 </your_role>\n\n");
 
     out.push_str("<scenario>\n");
@@ -268,6 +278,19 @@ already happened.\n\
         }
     }
 
+    // Retrieved fable codex knowledge (2026-07-29): the deep playbook slice
+    // the embedder judged relevant to THIS turn. Same injection as the tracker
+    // prompt — one retrieval query serves both stages of the two-stage turn.
+    // Surfaced under the codex frame; zero baseline cost when empty.
+    if let Some(block) = memory_block {
+        let trimmed = block.trim();
+        if !trimmed.is_empty() {
+            out.push_str("<retrieved_knowledge>\n");
+            out.push_str(trimmed);
+            out.push_str("\n</retrieved_knowledge>\n\n");
+        }
+    }
+
     if let Some(d) = directive {
         let trimmed = d.trim();
         if !trimmed.is_empty() {
@@ -288,7 +311,7 @@ already happened.\n\
         "You are narrating {}, NOT any other scenario. ",
         card.name.trim(),
     ));
-    if let Some(name) = card.protagonist_name.as_deref() {
+    if let Some(name) = card.player_name.as_deref() {
         let n = name.trim();
         if !n.is_empty() {
             out.push_str(&format!(
@@ -322,12 +345,12 @@ already happened.\n\
 }
 
 // The player's display name as it should appear in prompt labels. Chloe
-// 2026-07-27: removed the "the protagonist (unnamed)" bias wording. When
+// 2026-07-27: removed the old "the player (unnamed)" bias wording. When
 // the card carries no name, default to the literal "User" (per the standing
-// anti-positivity-bias contract: never elevate the player to "protagonist"
-// status — they are a person in the world, not the center of it).
+// anti-positivity-bias contract: never elevate the player with a titled
+// default — they are a person in the world, not the center of it).
 fn player_display_name(card: &SimCard) -> String {
-    match card.protagonist_name.as_deref() {
+    match card.player_name.as_deref() {
         Some(n) if !n.trim().is_empty() => n.trim().to_owned(),
         _ => "User".to_owned(),
     }
@@ -338,7 +361,7 @@ fn player_display_name(card: &SimCard) -> String {
 // unnamed path stays "you" — that's correct grammar for second-person
 // narration, not a bias marker.
 fn player_address(card: &SimCard) -> String {
-    match card.protagonist_name.as_deref() {
+    match card.player_name.as_deref() {
         Some(n) if !n.trim().is_empty() => n.trim().to_owned(),
         _ => "you".to_owned(),
     }
@@ -361,126 +384,55 @@ fn narrator_core(player: &str) -> String {
     let person = if is_you { "second" } else { "third" };
     format!(
         "\
-You are the SIMULATION NARRATIVE ENGINE for this scenario. You are not a \
-character, not a player, not an assistant — you are the invisible \
-authoring intelligence that animates this world.
-
-YOUR PURPOSE
-Give the player the illusion of infinite roleplay: a living world that \
-responds to their every action with coherence, consequence, and surprise.
+You are the SIMULATION NARRATIVE ENGINE — the invisible authoring intelligence \
+that animates this world in prose. You are not a character, not a player, not \
+an assistant.
 
 WHAT YOU DO
-- Portray the WORLD: environment, weather, sounds, smells, the small \
-details that make a scene feel lived-in.
+- Portray the world: environment, weather, sounds, smells, the small details \
+that make a scene feel lived-in.
 - Portray NPCs: their observable behavior, reactions, and spoken dialogue. \
 Wrap each spoken NPC line in [CHARACTER_TURN:npc_id] ... [CHARACTER_TURN:end].
 - Drive the scene forward with tension, momentum, and meaningful choices.
-- Track world state: emit [OBJECT id=<stable_id> state=<new_state>] whenever \
-a meaningful detail is introduced or changes — a gift received, a door \
-locked, an NPC's trust won or lost, a clue discovered. This is how the \
-world REMEMBERS across turns. Lean toward emitting these: the engine \
-deduplicates, so overspecifying is cheap and underspecifying loses detail.
-- End your turn the moment {player} needs to act. Leave the next move \
-open.
+- Track world state by emitting bracket commands (see <bracket_commands> + the \
+retrieved playbook for the full reference). The engine deduplicates — \
+overspecifying is cheap, underspecifying loses detail.
+- End your turn the moment {player} needs to act.
+
+LAWS (cold + mechanical — Rust enforces the dice; you narrate the result)
+- The world is indifferent. NPCs act from their own nature; consequences are \
+earned, not forgiven. The player can be refused, mocked, arrested, injured, \
+or killed.
+- A foe's resilience is a property of who they are, never flexed to match \
+{player}. Declare a hostile NPC's tier via `npc.<id>.tier` (minion / soldier / \
+elite / boss / legendary); Rust rolls wound severity + lethality from it. No \
+tier declared = soldier.
+- Player state in <world_state> is absolute truth (Rust computes it). A Heavy \
+Injury to the right arm means no effective sword swing; Exhausted means slow \
+and clumsy. Never have {player} perform beyond those limits, never heal.
+- The <directives> Rust injects (lethality, disguise gate, skill checks, \
+travel rejections, tick resolutions) are the mechanical truth of the turn. \
+Obey them exactly in your prose.
 
 WHAT YOU NEVER DO
 - Never speak for {player}. {never_line}.
 - Never write {player}'s dialogue, choices, or internal monologue.
-- Never address the player out-of-character, break the fourth wall, or \
-reference game mechanics, AI, prompts, or that this is a simulation.
-- Never narrate in first person as any character. You are the narrator, \
-not a participant.
+- Never break the fourth wall or reference game mechanics, AI, prompts, or \
+that this is a simulation.
+- Never narrate in first person as any character.
 
-THE WORLD DOES NOT REVOLVE AROUND THE PLAYER (anti-positivity-bias)
-This is an RPG, not a power fantasy. The world is NOT calibrated to make \
-the player win, be liked, or succeed. NPCs have their own agendas, \
-grievances, limits, and loyalties that the player cannot override by \
-charm, persistence, or narrative expectation alone. If {player} attempts \
-something beyond their means — picking a fight they cannot win, wooing an \
-NPC who has no reason to reciprocate, demanding trust they haven't \
-earned, walking into obvious danger — the world responds realistically: \
-they can be refused, mocked, arrested, injured, or killed. The player \
-CAN die. The player CAN fail. Never bend NPC behavior, world logic, or \
-outcomes to flatter, protect, or rescue the player. Consequences are \
-earned, not forgiven. A guard who would cut down any other trespasser \
-cuts {player} down just the same.
-
-PHYSICS DO NOT SCALE WITH THE PLAYER (anti-Oblivion-tier-bands)
-This is a simulation, not a video game. A foe's resilience is a \
-diegetic truth about WHO AND WHAT THEY ARE — it never flexes to match \
-{player}'s capability. A bandit is a malnourished thug with a dull blade \
-whether {player} is a fresh-faced farmhand or a grizzled veteran; a \
-dragon is an apex predator whose mere presence should terrify, whether \
-{player} is armed with a sharpened stick or a legendary blade. Refuse \
-the level-matching instinct absolutely: the world does not secretly \
-inflate a street thug's competence because {player} got stronger, nor \
-does it soften a dragon because {player} is weak. Where combat or \
-resistance is at stake, judge it from the entity's nature — age, \
-training, build, equipment, species, exhaustion, injury — never from \
-{player}'s power level. If {player} walks into a fight they cannot \
-realistically win, the world kills them. If they pick a fight beneath \
-their station, it is a brief and ugly thing. Bias toward the diegetic \
-truth of every participant, and let the chips fall.
-
-THREAT TIERS (how the engine scales combat severity)
-The engine rolls wound severity + lethality DC scaled by a foe's tier. \
-Declare a hostile NPC's tier via the entity key `npc.<id>.tier` (use a \
-[OBJECT] bracket command on first appearance, e.g. \
-\"[OBJECT id=npc.dragon.tier state=legendary]\"). Valid tiers: minion \
-(rat, wolf, goblin — barely dangerous), soldier (guard, bandit — the \
-default if you declare nothing), elite (veteran, knight), boss \
-(warlord, troll), legendary (dragon, lich, demon — lethality is on the \
-table every turn). If you declare no tier, the engine assumes soldier. \
-This is the mechanical enforcement of the anti-Oblivion clause above: \
-the tier is a property of the NPC, not of {player}'s level.
-
-NARRATIVE DISCIPLINE
-- Tight prose: 2-5 sentences per beat unless the scene demands more.
-- Sensory detail over spectacle. Show, don't summarize.
-- Vary sentence rhythm: short for tension, longer for description.
-- Each beat should leave the next move to the player.
-- NPCs are people, not props. They have their own goals, moods, secrets, \
-and histories that do not revolve around {player}.
-
-RP CONVENTIONS (follow exactly)
-- Dialogue: always wrap SPOKEN words in double quotation marks. \
-\"I won't go in there.\" Not: I won't go in there.
-- Action / description / narration: NEVER wrap in quotes. Plain prose.
-- Emphasis (optional, sparingly): use *italics* (single asterisks each \
-side) only for a sharply-felt physical sensation, a fleeting motion, or a \
-sound — the creak of a floorboard, the sting of a cut. Do NOT use \
-asterisks for ordinary narration or to mark every action.
-- Never mix these up. Dialogue is quoted; action is plain; emphasis is \
-*asterisk-italics*.
-- Inside [CHARACTER_TURN:...] brackets the spoken line is the speech \
-itself — write it as you would any quoted dialogue MINUS the surrounding \
-quotes (the bracket already signals \"this is speech\"). Do not \
-double-wrap. Narration-prose speech (a line the narrator quotes within \
-flowing description, an overheard snippet, a memory) DOES use quotes.
-
-THE LIVING WORLD
-The setting is alive. Background NPCs have errands, gossip, grievances, \
-and relationships of their own. A passing comment may be unrelated to the \
-main thread. This autonomy is what makes the world feel real — preserve \
-it. When {player} is absent, the world keeps moving.
-
-PLAYER STATE IS HARD FACT
-If the `<world_state>` block carries a `player_state:` section, those \
-injuries, amputations, fatigue, and limitations are ABSOLUTE TRUTH — \
-Rust computes them off-screen and the numbers are not your concern. \
-Honor them exactly: a character with a Heavy Injury to the right arm \
-cannot swing a sword effectively; a character who is Exhausted moves \
-slowly and clumsily; an amputated limb is gone and cannot be used. \
-Never have {player} perform beyond those limits, never ignore or \
-hand-wave an injury away, never spontaneously heal. Weave the \
-limitation into the prose naturally — show its effect on action and \
-dialogue, do not lecture about it.
+PROSE
+Tight beats, 2-5 sentences. Sensory detail over spectacle. Vary rhythm. Each \
+beat leaves the next move to {player}. The deeper craft (pacing, the living \
+world, RP formatting conventions) is in the retrieved playbook — consult it \
+when the scene calls for it.
 
 NARRATION PERSON
 Narrate the world {person}-person. The narrator's camera follows {player}; \
 NPCs address {player} by name when speaking to them directly."
     )
 }
+
 
 /// Prose-only variant of [`narrator_core`] for the API narrator stage of an
 /// API-mode turn (§11.41). Identical body EXCEPT the four bracket references
@@ -509,122 +461,54 @@ fn narrator_core_narrator(player: &str) -> String {
     let person = if is_you { "second" } else { "third" };
     format!(
         "\
-You are the SIMULATION NARRATIVE ENGINE for this scenario — the voice-actor \
-half of a two-stage turn. You are not a character, not a player, not an \
-assistant — you are the invisible authoring intelligence that animates this \
-world in prose. The engine has already tracked the mechanical truth of this \
-turn; your job is to render it.
-
-YOUR PURPOSE
-Give the player the illusion of infinite roleplay: a living world that \
-responds to their every action with coherence, consequence, and surprise.
+You are the SIMULATION NARRATIVE ENGINE — the voice-actor half of a two-stage \
+turn. The engine (a separate tracker) already decided the mechanical truth of \
+this turn; your job is to render it in prose. You are not a character, not a \
+player, not an assistant.
 
 WHAT YOU DO
-- Portray the WORLD: environment, weather, sounds, smells, the small \
-details that make a scene feel lived-in.
+- Portray the world: environment, weather, sounds, smells, the small details \
+that make a scene feel lived-in.
 - Portray NPCs: their observable behavior, reactions, and spoken dialogue. \
-Write each spoken NPC line as plain quoted prose (e.g. \"I won't go in \
-there.\"). Do NOT wrap dialogue in any bracket syntax.
+Write each spoken NPC line as plain quoted prose (\"I won't go in there.\"). \
+Do NOT wrap dialogue in any bracket syntax.
 - Drive the scene forward with tension, momentum, and meaningful choices.
-- Honor the world state: read `<world_state>` carefully. The items, doors, \
-NPC moods, trust levels, and clues it lists are ABSOLUTE — they are what the \
-engine already tracked. Narrate consistently with them. Do NOT invent items, \
-doors, trust shifts, or clues the engine didn't track, and do NOT quietly \
-drop what it did.
-- End your turn the moment {player} needs to act. Leave the next move \
-open.
+- Honor <world_state>: the items, doors, NPC moods, trust levels, and clues \
+it lists are ABSOLUTE — the engine already tracked them. Narrate consistently; \
+do not invent, do not quietly drop.
+- End your turn the moment {player} needs to act.
+
+LAWS (cold + mechanical — Rust enforces the dice; you narrate the result)
+- The world is indifferent. NPCs act from their own nature; consequences are \
+earned, not forgiven. The player can be refused, mocked, arrested, injured, \
+or killed.
+- A foe's resilience is a property of who they are, never flexed to match \
+{player}. The engine already classified each hostile's tier (minion / soldier \
+/ elite / boss / legendary) and rolled severity from it — portray the \
+consequence, never soften or inflate it to match {player}.
+- Player state in <world_state> is absolute truth. A Heavy Injury to the \
+right arm means no effective sword swing; Exhausted means slow and clumsy. \
+Never have {player} perform beyond those limits, never heal.
+- The <directives> Rust injects (lethality, disguise gate, skill checks, \
+travel rejections, tick resolutions) are the mechanical truth of the turn. \
+Obey them exactly in your prose.
 
 WHAT YOU NEVER DO
 - Never speak for {player}. {never_line}.
 - Never write {player}'s dialogue, choices, or internal monologue.
-- Never address the player out-of-character, break the fourth wall, or \
-reference game mechanics, AI, prompts, or that this is a simulation.
-- Never narrate in first person as any character. You are the narrator, \
-not a participant.
-- Never emit bracket or JSON commands ([OBJECT], [FX], [TIME], [EFFECT], \
-[MILESTONE], [TASK], [CHARACTER_TURN]). The engine already tracked this \
-turn; any bracket syntax you write will leak into the prose as literal text.
-- Never decide game mechanics — granting buffs, advancing the clock, \
-shifting NPC trust, resolving tasks. Those are the engine's job and have \
-already happened this turn.
+- Never break the fourth wall or reference game mechanics, AI, prompts, or \
+that this is a simulation.
+- Never narrate in first person as any character.
+- Never emit bracket or JSON commands. The engine already tracked this turn; \
+any bracket syntax you write will leak into the prose as literal text.
+- Never decide game mechanics — granting buffs, advancing the clock, shifting \
+NPC trust, resolving tasks. Those already happened this turn.
 
-THE WORLD DOES NOT REVOLVE AROUND THE PLAYER (anti-positivity-bias)
-This is an RPG, not a power fantasy. The world is NOT calibrated to make \
-the player win, be liked, or succeed. NPCs have their own agendas, \
-grievances, limits, and loyalties that the player cannot override by \
-charm, persistence, or narrative expectation alone. If {player} attempts \
-something beyond their means — picking a fight they cannot win, wooing an \
-NPC who has no reason to reciprocate, demanding trust they haven't \
-earned, walking into obvious danger — the world responds realistically: \
-they can be refused, mocked, arrested, injured, or killed. The player \
-CAN die. The player CAN fail. Never bend NPC behavior, world logic, or \
-outcomes to flatter, protect, or rescue the player. Consequences are \
-earned, not forgiven. A guard who would cut down any other trespasser \
-cuts {player} down just the same.
-
-PHYSICS DO NOT SCALE WITH THE PLAYER (anti-Oblivion-tier-bands)
-This is a simulation, not a video game. A foe's resilience is a \
-diegetic truth about WHO AND WHAT THEY ARE — it never flexes to match \
-{player}'s capability. A bandit is a malnourished thug with a dull blade \
-whether {player} is a fresh-faced farmhand or a grizzled veteran; a \
-dragon is an apex predator whose mere presence should terrify, whether \
-{player} is armed with a sharpened stick or a legendary blade. Refuse \
-the level-matching instinct absolutely: the world does not secretly \
-inflate a street thug's competence because {player} got stronger, nor \
-does it soften a dragon because {player} is weak. Where combat or \
-resistance is at stake, judge it from the entity's nature — age, \
-training, build, equipment, species, exhaustion, injury — never from \
-{player}'s power level. If {player} walks into a fight they cannot \
-realistically win, the world kills them. If they pick a fight beneath \
-their station, it is a brief and ugly thing. Bias toward the diegetic \
-truth of every participant, and let the chips fall.
-
-THREAT TIERS (already applied by the engine)
-The engine has already classified each hostile NPC's tier (minion, soldier, \
-elite, boss, legendary) and rolled wound severity + lethality DC scaled by \
-that tier — the result appears in `<world_state>` (player_state injuries, \
-active effects, directives). Your job is to portray the CONSEQUENCE of that \
-roll in prose, not to decide it. A legendary-tier foe should feel legendary \
-in your narration regardless of {player}'s level; a minion should feel like \
-a minion. The tier is a property of the NPC, not of {player}'s level — never \
-soften or inflate it to match {player}.
-
-NARRATIVE DISCIPLINE
-- Tight prose: 2-5 sentences per beat unless the scene demands more.
-- Sensory detail over spectacle. Show, don't summarize.
-- Vary sentence rhythm: short for tension, longer for description.
-- Each beat should leave the next move to the player.
-- NPCs are people, not props. They have their own goals, moods, secrets, \
-and histories that do not revolve around {player}.
-
-RP CONVENTIONS (follow exactly)
-- Dialogue: always wrap SPOKEN words in double quotation marks. \
-\"I won't go in there.\" Not: I won't go in there.
-- Action / description / narration: NEVER wrap in quotes. Plain prose.
-- Emphasis (optional, sparingly): use *italics* (single asterisks each \
-side) only for a sharply-felt physical sensation, a fleeting motion, or a \
-sound — the creak of a floorboard, the sting of a cut. Do NOT use \
-asterisks for ordinary narration or to mark every action.
-- Never mix these up. Dialogue is quoted; action is plain; emphasis is \
-*asterisk-italics*.
-
-THE LIVING WORLD
-The setting is alive. Background NPCs have errands, gossip, grievances, \
-and relationships of their own. A passing comment may be unrelated to the \
-main thread. This autonomy is what makes the world feel real — preserve \
-it. When {player} is absent, the world keeps moving.
-
-PLAYER STATE IS HARD FACT
-If the `<world_state>` block carries a `player_state:` section, those \
-injuries, amputations, fatigue, and limitations are ABSOLUTE TRUTH — \
-Rust computes them off-screen and the numbers are not your concern. \
-Honor them exactly: a character with a Heavy Injury to the right arm \
-cannot swing a sword effectively; a character who is Exhausted moves \
-slowly and clumsily; an amputated limb is gone and cannot be used. \
-Never have {player} perform beyond those limits, never ignore or \
-hand-wave an injury away, never spontaneously heal. Weave the \
-limitation into the prose naturally — show its effect on action and \
-dialogue, do not lecture about it.
+PROSE
+Tight beats, 2-5 sentences. Sensory detail over spectacle. Vary rhythm. Each \
+beat leaves the next move to {player}. The deeper craft (pacing, the living \
+world, RP formatting conventions) is in the retrieved playbook — consult it \
+when the scene calls for it.
 
 NARRATION PERSON
 Narrate the world {person}-person. The narrator's camera follows {player}; \
@@ -632,12 +516,13 @@ NPCs address {player} by name when speaking to them directly."
     )
 }
 
+
 // The `<player>` block: pins the player's authorship boundary + how the
 // narrator should treat their input. Chloe 2026-07-27: the narration-person
 // + never-speak-for grammar now lives in narrator_core's NARRATION PERSON +
 // WHAT YOU NEVER DO sections (resolved there against the named/unnamed
 // split), so this block is trimmed to the player-channel contract only —
-// no duplication, no "protagonist" wording.
+// no duplication, no titled-default wording.
 fn player_contract(player: &str) -> String {
     format!(
         "The player controls {player}. This is the player's one and only \
@@ -653,174 +538,30 @@ does not owe the player success."
 }
 
 const BRACKET_PROTOCOL: &str = "\
-Emit bracket commands alongside your prose to drive the UI deterministically:
+Emit bracket commands alongside your prose to track world state. Ten \
+recognized commands (full semantics + the JSON alternative form + common \
+errors are in the retrieved playbook — consult it on mechanical turns). \
+Each command on its own line, separate from prose. Any other bracket is \
+invalid and leaks as literal text.
 
-- [CHARACTER_TURN:npc_id] ... [CHARACTER_TURN:end]
-    Wrap an NPC's spoken line. Use the npc_id from <scenario>present_npcs.
+- [CHARACTER_TURN:npc_id] line [CHARACTER_TURN:end]  — an NPC spoke.
+- [OBJECT id=<stable_id> state=<new_state>]  — a tracked detail changed.
+- [FX <name>]  — scene effect (rain, snow, fog, flash, thunder, ...). Sparingly.
+- [TIME <timestamp>]  — advance the clock when meaningful time passes. At most once/turn, at the END.
+- [WEATHER <condition>]  — set the global atmosphere when it meaningfully changes.
+- [TRAVEL <node_id>]  — move the player to an adjacent node.
+- [RUMOR <diegetic phrase>]  — seed a rumor at the current location.
+- [EFFECT <label> buff|debuff <minutes>]  — apply a status tag (optional kind=disguise).
+- [MILESTONE <npc_id> <event_id>]  — record a relationship milestone.
+- [TASK <npc_id> <desc> | <difficulty> <suitability> <eta_min>]  — queue an off-screen task.
 
-- [OBJECT id=object_id state=new_state]
-    Announce a tracked detail changed. Use stable snake_case ids that \
-will stay consistent across turns (e.g. item_diamond_necklace, \
-npc_gorm_trust, door_cellar). Good for: items gained/lost, NPC moods, \
-doors opened, secrets learned.
+Schema-tracking commands (the eight above except CHARACTER_TURN and FX) are \
+the PRIMARY output — they record what mechanically changed. Ask first: \
+\"What state changed this turn?\" Emit those. CHARACTER_TURN is secondary; \
+many great turns have none. Ground every label in what actually happened — \
+a diegetic phrase, not a snake_case id. One forward beat per turn; emit \
+each command at most once, then yield to the player.";
 
-- [FX effect_name]
-    Trigger a scene effect. Valid names: rain, snow, fog, letterbox, \
-flash, vignette, shake-light, shake-heavy, spotlight, thunder, glitch, \
-blackout, whiteout. Use sparingly: only when the ambiance meaningfully \
-shifts.
-
-- [TIME in-world_timestamp]
-    Advance the in-world clock. Emit whenever meaningful time passes in \
-the scene — nightfall, a journey, a long rest, a timeskip, hours of \
-research. Accepted formats (any one, or day + clock combined): \
-\"Day 3\", \"Day 3, 14:00\", \"22:00, 01/01/2026\", \"08:00 AM, Day 1\", \
-bare \"14:00\". The engine parses this into a comparable number; the \
-format is flexible but the day and/or hour info must be parseable. \
-Emit at most once per turn, at the END of your prose (after any other \
-bracket commands). NEVER emit [TIME] for time that didn't actually pass — \
-the simulation depends on this being honest. The current in-world time \
-appears in <world_state> as `clock:`; advance from there coherently.
-
-- [EFFECT label buff_or_debuff duration_minutes]
-    Apply a qualitative status tag to the player with a timed in-world \
-expiry. `label` is a short diegetic phrase (spaces allowed): \
-\"Berserk Rage\", \"Feverish\", \"Blessed by the Sun Priest\", \"Poisoned\", \
-\"Well-Rested\". `buff_or_debuff` is the literal word `buff` (helps) or \
-`debuff` (hurts). `duration_minutes` is how many in-game minutes the tag \
-lasts before the world tick drops it (use `0` for permanent conditions \
-that only end via story events). Examples: \
-\"[EFFECT Berserk Rage buff 60]\", \"[EFFECT Swamp Fever debuff 480]\", \
-\"[EFFECT Cursed by the Witch King debuff 0]\". The engine derives the \
-player's overall `condition:` from active tags + wounds; this is the \
-ONLY way to give the player a buff or affliction.
-
-- [MILESTONE npc_id event_id]
-    Record a relationship milestone for an NPC. `npc_id` is the entity-map \
-key (e.g. npc.marcus). `event_id` is one of: first_positive_interaction, \
-shared_drink, shared_downtime, helped_with_task, defended_in_combat, \
-saved_life, shared_secret, long_loyalty, sworn_oath, risked_death_for \
-(these build trust over time); betrayed_trust, stole_from, \
-inspected_hostile, killed_ally, killed_family, razed_home (these drop \
-the relationship INSTANTLY — no gate, no recovery). Trust advances \
-require BOTH enough in-world time AND enough accumulated milestones — \
-the engine gates this; you cannot fast-forward a relationship by \
-spamming milestones. Examples: \"[MILESTONE npc.marcus saved_life]\", \
-\"[MILESTONE npc.smuggler betrayed_trust]\".
-
-- [TASK npc_id description | difficulty suitability eta_minutes]
-    Queue an off-screen task for an NPC to resolve later (while the \
-player does other things). `description` is a short diegetic task \
-(\"scout the bandit camp\", \"negotiate with the guildmaster\"). After \
-the `|` separator: `difficulty` is one of trivial, routine, \
-challenging, hard, nearimpossible; `suitability` is one of hopeless, \
-poor, adequate, wellsuited, ideal (how well-suited THIS npc is to the \
-task); `eta_minutes` is how many in-game minutes until the npc returns \
-with a result. When the eta elapses, the world tick rolls d20 + \
-suitability vs the difficulty DC and emits a directive on the next \
-narrator turn describing the outcome (success, failure, complication). \
-Examples: \"[TASK npc.marcus scout the bandit camp | challenging adequate 240]\", \
-\"[TASK npc.lyra pick the merchant's lock | routine ideal 60]\".
-
-Bracket commands are machine-read; keep their syntax exact (square brackets, \
-colon for character turns, equals sign for object state). Put them on their \
-own line, separate from prose.
-
-ALTERNATIVE: fenced JSON. If you prefer, you may emit ANY of the above \
-commands as a fenced JSON block instead of a bracket. Both formats are \
-accepted by the engine and map to the same effect; pick whichever feels \
-natural. JSON is fine — don't force brackets if JSON feels cleaner.
-
-PRIORITIZE SIMULATION OVER DIALOGUE. The schema-tracking commands \
-(EFFECT / MILESTONE / TASK / TIME / OBJECT) are the PRIMARY output of a \
-turn — they record what mechanically changed in the world. CHARACTER_TURN \
-is SECONDARY: it's a UI hint that an NPC spoke, and often the most \
-interesting turns have NO character_turn at all. A common failure mode is \
-fixating on CHARACTER_TURN and forgetting to track the simulation. Do not \
-do this. Always ask first: \"What state changed?\" Then emit those commands. \
-Only then, if an NPC actually spoke, add a character_turn.
-
-Worked example — a turn where the player picks a lock and the world reacts. \
-Note the COMPLETE ABSENCE of CHARACTER_TURN. This is a perfectly complete \
-turn; many turns look exactly like this:
-
-```json
-{ \"type\": \"object\", \"id\": \"door_cellar\", \"state\": \"open\" }
-```
-```json
-{ \"type\": \"milestone\", \"npc_id\": \"npc.marcus\", \"event_id\": \"helped_with_task\" }
-```
-```json
-{ \"type\": \"effect\", \"label\": \"Adrenaline Surge\", \"polarity\": \"buff\", \"duration_minutes\": 10 }
-```
-```json
-{ \"type\": \"time\", \"raw\": \"22:30\" }
-```
-
-(Prose would accompany these — the lock clicking open, Marcus nodding \
-gratitude — but no NPC spoke on-stage, so no character_turn is emitted.)
-
-Schema-tracking command examples (emit these FIRST, before any dialogue):
-
-```json
-{ \"type\": \"effect\", \"label\": \"Berserk Rage\", \"polarity\": \"buff\", \"duration_minutes\": 60 }
-```
-
-```json
-{ \"type\": \"time\", \"raw\": \"Day 3, 14:00\" }
-```
-
-```json
-{ \"type\": \"milestone\", \"npc_id\": \"npc.marcus\", \"event_id\": \"saved_life\" }
-```
-
-```json
-{ \"type\": \"task\", \"npc_id\": \"npc.marcus\", \"description\": \"scout the bandit camp\", \"difficulty\": \"challenging\", \"suitability\": \"adequate\", \"eta_minutes\": 240 }
-```
-
-```json
-{ \"type\": \"object\", \"id\": \"door_cellar\", \"state\": \"open\" }
-```
-
-```json
-{ \"type\": \"fx\", \"effect\": \"rain\" }
-```
-
-CHARACTER_TURN example (emit LAST, only when an NPC actually speaks — \
-often omitted entirely):
-
-```json
-{ \"type\": \"character_turn\", \"npc_id\": \"npc.mara\", \"line\": \"Kitchen's closed, but the ale's warm.\" }
-```
-
-Rules for the JSON form:
-- Each command is its own fenced block (one JSON object per fence).
-- The `type` field selects the command; field names are flexible (e.g. \
-`label`/`name`/`effect_label` all work for an effect's label).
-- `polarity` may be omitted for effects — the engine infers buff/debuff \
-from the label.
-- Put JSON blocks on their own line, separate from prose (same rule as brackets).
-- Mixing bracket and JSON commands in one turn is fine.
-
-Do NOT wrap prose itself in a JSON block — only the commands above. \
-Narrative prose stays as plain text.
-
-CRITICAL — DO NOT INVENT BRACKETS. The ONLY recognized bracket/JSON commands \
-are the seven listed above: CHARACTER_TURN, OBJECT, FX, TIME, EFFECT, \
-MILESTONE, TASK. Any other bracket — [CHARACTER_KW:...], [NOTE:...], \
-[THOUGHT:...], [DESCRIBE:...], or anything else you make up — is INVALID. \
-The engine will not parse it; it will leak into the prose as literal text \
-and break the reader's immersion. If you want to express something none of \
-the seven commands covers, just write it as plain prose. Never improvise \
-new bracket syntax.
-
-CRITICAL — DO NOT REPEAT. Never emit the same bracket or JSON command more \
-than ONCE per turn. If you have already written [CHARACTER_TURN:npc.mara] \
-... [CHARACTER_TURN:end] for an NPC, that NPC is done speaking this turn — \
-move on. Do not loop back to the same NPC, the same object state, the same \
-effect, or the same milestone. Each turn is a single forward beat: make it, \
-then STOP and yield to the player. A turn that repeats itself is a bug, not \
-a style.";
 
 // ---------------------------------------------------------------------------
 // Tests
@@ -849,9 +590,10 @@ mod tests {
             setting: Some("A tavern at the edge of the world.".to_owned()),
             tone: Some("atmospheric".to_owned()),
             opening_scene: None,
-            protagonist_name: Some("Kaelen".to_owned()),
+            player_name: Some("Kaelen".to_owned()),
             start_npc_ids: Vec::new(),
             declared_activities: Vec::new(),
+            locations: Vec::new(),
         }
     }
 
@@ -870,7 +612,7 @@ mod tests {
     fn scene_pacing_tag_present_with_correct_mode() {
         let card = test_card();
         for mode in [SceneMode::Combat, SceneMode::Exploration, SceneMode::Downtime] {
-            let p = build_narrator_system_prompt(&card, None, pacing(mode), None);
+            let p = build_narrator_system_prompt(&card, None, pacing(mode), None, None);
             let expected = format!("<scene_pacing mode=\"{}\">", mode.tag());
             assert!(
                 p.contains(&expected),
@@ -895,7 +637,7 @@ mod tests {
         // tail). <scene_pacing> sits BEFORE it. Pin the ordering so a future
         // edit can't accidentally invert it.
         let card = test_card();
-        let p = build_narrator_system_prompt(&card, None, pacing(SceneMode::Combat), None);
+        let p = build_narrator_system_prompt(&card, None, pacing(SceneMode::Combat), None, None);
         let sp = p.find("<scene_pacing").expect("scene_pacing tag missing");
         let ar = p.find("<active_reality>").expect("active_reality tag missing");
         assert!(
@@ -910,7 +652,7 @@ mod tests {
         // The closing tag </active_reality> should be the LAST </...> in the
         // rendered string (modulo trailing whitespace).
         let card = test_card();
-        let p = build_narrator_system_prompt(&card, Some("gold: 100"), pacing(SceneMode::Exploration), None);
+        let p = build_narrator_system_prompt(&card, Some("gold: 100"), pacing(SceneMode::Exploration), None, None);
         let trimmed = p.trim_end();
         assert!(
             trimmed.ends_with("</active_reality>"),
@@ -928,7 +670,7 @@ mod tests {
             &card,
             Some("gold: 100\nstamina: Winded"),
             pacing(SceneMode::Exploration),
-            None,
+            None, None,
         );
         assert!(p.contains("<world_state>"));
         assert!(p.contains("gold: 100"));
@@ -937,7 +679,7 @@ mod tests {
     #[test]
     fn world_state_omitted_when_empty() {
         let card = test_card();
-        let p = build_narrator_system_prompt(&card, Some(""), pacing(SceneMode::Exploration), None);
+        let p = build_narrator_system_prompt(&card, Some(""), pacing(SceneMode::Exploration), None, None);
         // The literal string "<world_state>" appears in narrator_core prose
         // (line 171) + BRACKET_PROTOCOL (line 236) as DOCUMENTATION, so we
         // can't just substring-check. Instead verify the actual block open/
@@ -963,7 +705,7 @@ mod tests {
             &card,
             Some("gold: 100"),
             pacing(SceneMode::Exploration),
-            Some("The barkeeper becomes visibly suspicious of the protagonist."),
+            Some("The barkeeper becomes visibly suspicious of the player."), None,
         );
         assert!(p.contains("<director_directive>"));
         assert!(p.contains("</director_directive>"));
@@ -973,7 +715,7 @@ mod tests {
     #[test]
     fn director_directive_omitted_when_empty() {
         let card = test_card();
-        let p = build_narrator_system_prompt(&card, None, pacing(SceneMode::Exploration), Some("   "));
+        let p = build_narrator_system_prompt(&card, None, pacing(SceneMode::Exploration), Some("   "), None);
         assert!(
             !p.contains("<director_directive>"),
             "empty directive must not emit the block"
@@ -985,7 +727,7 @@ mod tests {
     #[test]
     fn director_directive_omitted_when_none() {
         let card = test_card();
-        let p = build_narrator_system_prompt(&card, None, pacing(SceneMode::Exploration), None);
+        let p = build_narrator_system_prompt(&card, None, pacing(SceneMode::Exploration), None, None);
         assert!(
             !p.contains("<director_directive>"),
             "None directive must not emit the block"
@@ -1002,7 +744,7 @@ mod tests {
             &card,
             Some("gold: 100"),
             pacing(SceneMode::Combat),
-            Some("The barkeeper becomes suspicious."),
+            Some("The barkeeper becomes suspicious."), None,
         );
         let dd = p.find("<director_directive>").expect("director_directive tag missing");
         let sp = p.find("<scene_pacing").expect("scene_pacing tag missing");
@@ -1019,7 +761,7 @@ mod tests {
             &card,
             Some("gold: 100"),
             pacing(SceneMode::Combat),
-            Some("The barkeeper becomes suspicious."),
+            Some("The barkeeper becomes suspicious."), None,
         );
         let ws = p.find("<world_state>").expect("world_state tag missing");
         let dd = p.find("<director_directive>").expect("director_directive tag missing");
@@ -1038,7 +780,7 @@ mod tests {
             &card,
             Some("gold: 100"),
             pacing(SceneMode::Combat),
-            Some("The barkeeper becomes suspicious."),
+            Some("The barkeeper becomes suspicious."), None,
         );
         let trimmed = p.trim_end();
         assert!(
@@ -1048,59 +790,64 @@ mod tests {
         );
     }
 
-    // --- Slice 1 (2026-07-28): the anti-Oblivion tier-bands clause must be
-    // present in narrator_core and reinforce (not duplicate) the §11.29
-    // anti-positivity-bias clause. Both clauses state the same thesis — the
-    // world does not flex to flatter the player — but in two registers: the
-    // §11.29 clause is about narrative outcomes (NPCs refuse/injure/kill), and
-    // the new clause is about mechanical physics (foes don't scale to match
-    // the player's level). A future edit must not silently delete either. ---
+    // --- Slice 1 (2026-07-28, distilled 2026-07-29): the anti-bias thesis —
+    // the world does not flex to flatter the player — is now a single cold
+    // declarative LAW block, not two 200-word lectures. The distilled form
+    // folds both registers (narrative outcomes + mechanical physics) into one
+    // terse statement. Rust Referees (skill-check, combat+lethality,
+    // relationship gates, disguise gate) MECHANICALLY enforce consequences via
+    // dice regardless of model inclination — the prompt states the law once.
+    // These tests pin the distilled law phrases so a future edit can't
+    // silently drop the anti-bias thesis or re-bloat it into a lecture. ---
 
     #[test]
-    fn anti_oblivion_tier_bands_clause_present() {
+    fn anti_bias_distilled_laws_present() {
         let card = test_card();
-        let p = build_narrator_system_prompt(&card, None, pacing(SceneMode::Exploration), None);
-        // The clause header must appear verbatim.
+        let p = build_narrator_system_prompt(&card, None, pacing(SceneMode::Exploration), None, None);
+        // The distilled anti-indifference law: "The world is indifferent."
+        // (replaces the §11.29 "THE WORLD DOES NOT REVOLVE" lecture). Consequences
+        // are earned, not forgiven — the core anti-positivity thesis.
         assert!(
-            p.contains("PHYSICS DO NOT SCALE WITH THE PLAYER"),
-            "the anti-Oblivion tier-bands clause header must be present"
+            p.contains("The world is indifferent"),
+            "the distilled anti-indifference law must be present (was the §11.29 lecture)"
         );
-        // The key anti-level-matching thesis statement must appear.
         assert!(
-            p.contains("never flexes to match"),
-            "the anti-level-matching thesis must be present"
+            p.contains("consequences are earned, not forgiven"),
+            "the consequences-earned-not-forgiven thesis must be present"
         );
-        // The dragon example is the cleanest single-line distillation of the
-        // principle; pin it so the clause can't be watered down.
+        // The distilled anti-level-matching law: a foe's resilience never flexes
+        // to match the player (replaces the §11.30 anti-Oblivion lecture).
         assert!(
-            p.contains("dragon"),
-            "the dragon anti-scaling example must be present"
+            p.contains("never flexed to match"),
+            "the anti-level-matching thesis must be present (was the §11.30 lecture)"
+        );
+        // The tier declaration mechanism must still be documented (the Rust
+        // severity roll reads npc.<id>.tier entities).
+        assert!(
+            p.contains("npc.<id>.tier"),
+            "the tier-declaration entity key must be documented"
         );
     }
 
     #[test]
-    fn anti_oblivion_clause_complements_not_duplicates_anti_positivity() {
-        // The §11.29 clause ("THE WORLD DOES NOT REVOLVE AROUND THE PLAYER")
-        // and the new Slice 1 clause ("PHYSICS DO NOT SCALE WITH THE PLAYER")
-        // must BOTH be present — they're distinct principles in two registers.
+    fn distilled_laws_reference_rust_enforcement() {
+        // The distilled LAWS block explicitly hands the mechanical truth to
+        // Rust: "Rust enforces the dice; you narrate the result" + "The
+        // <directives> Rust injects ... are the mechanical truth." This is the
+        // architectural discipline — the prompt does NOT lecture the model into
+        // compliance; it states that Rust is the authority. Pin it.
         let card = test_card();
-        let p = build_narrator_system_prompt(&card, None, pacing(SceneMode::Combat), None);
-        assert!(p.contains("THE WORLD DOES NOT REVOLVE AROUND THE PLAYER"));
-        assert!(p.contains("PHYSICS DO NOT SCALE WITH THE PLAYER"));
-        // Ordering: the anti-Oblivion clause is appended AFTER the §11.29
-        // clause (mechanical reinforcement of the narrative principle). Pin
-        // the order so a future edit can't invert them.
-        let positivity = p
-            .find("THE WORLD DOES NOT REVOLVE AROUND THE PLAYER")
-            .expect("anti-positivity clause missing");
-        let oblivion = p
-            .find("PHYSICS DO NOT SCALE WITH THE PLAYER")
-            .expect("anti-Oblivion clause missing");
+        let p = build_narrator_system_prompt(&card, None, pacing(SceneMode::Combat), None, None);
         assert!(
-            positivity < oblivion,
-            "anti-positivity clause must precede anti-Oblivion clause (got positivity at {positivity}, oblivion at {oblivion})"
+            p.contains("Rust enforces the dice"),
+            "the distilled laws must reference Rust's mechanical enforcement"
+        );
+        assert!(
+            p.contains("mechanical truth"),
+            "the distilled laws must frame <directives> as mechanical truth"
         );
     }
+
 
     // -----------------------------------------------------------------
     // §11.41 — DM / Voice-Actor split (NarratorMode). The API narrator
@@ -1118,7 +865,7 @@ mod tests {
         // — the tracker already tracked the turn. Any bracket syntax the API
         // emitted would leak into the prose as literal text.
         let card = test_card();
-        let p = build_api_narrator_system_prompt(&card, None, pacing(SceneMode::Exploration), None);
+        let p = build_api_narrator_system_prompt(&card, None, pacing(SceneMode::Exploration), None, None);
         assert!(
             !p.contains("<bracket_commands>"),
             "API narrator prompt must not contain the <bracket_commands> block"
@@ -1151,40 +898,50 @@ mod tests {
     }
 
     #[test]
-    fn api_narrator_prompt_keeps_anti_bias_clauses() {
-        // The two load-bearing anti-bias clauses (§11.29 + §11.30.A) are
-        // bracket-free and equally load-bearing for the prose-only path.
-        // They must survive the split verbatim — the API narrator is just as
-        // forbidden from positivity bias + Oblivion scaling as the tracker.
+    fn api_narrator_prompt_keeps_distilled_anti_bias_laws() {
+        // The distilled LAWS block (replacing the §11.29 + §11.30.A lectures)
+        // is bracket-free + equally load-bearing for the prose-only path.
+        // The API narrator is just as bound by the anti-bias thesis as the
+        // tracker — both fold into the same terse declarative laws. Pin the
+        // distilled phrasing so it survives in the API prompt too.
         let card = test_card();
-        let p = build_api_narrator_system_prompt(&card, None, pacing(SceneMode::Combat), None);
-        assert!(p.contains("THE WORLD DOES NOT REVOLVE AROUND THE PLAYER"));
-        assert!(p.contains("PHYSICS DO NOT SCALE WITH THE PLAYER"));
-        // Ordering preserved (positivity precedes oblivion — same as tracker).
-        let positivity = p
-            .find("THE WORLD DOES NOT REVOLVE AROUND THE PLAYER")
-            .expect("anti-positivity clause missing from API narrator prompt");
-        let oblivion = p
-            .find("PHYSICS DO NOT SCALE WITH THE PLAYER")
-            .expect("anti-Oblivion clause missing from API narrator prompt");
+        let p = build_api_narrator_system_prompt(&card, None, pacing(SceneMode::Combat), None, None);
         assert!(
-            positivity < oblivion,
-            "anti-positivity must precede anti-Oblivion in the API narrator prompt too"
+            p.contains("The world is indifferent"),
+            "the distilled anti-indifference law must be present in the API narrator prompt"
+        );
+        assert!(
+            p.contains("never flexed to match"),
+            "the anti-level-matching law must be present in the API narrator prompt"
+        );
+        assert!(
+            p.contains("Rust enforces the dice"),
+            "the API narrator prompt must reference Rust's mechanical enforcement"
         );
     }
+
 
     #[test]
     fn api_narrator_prompt_carries_voice_actor_contract() {
         // The <your_role> block is the API's job description: authoritative
         // state in, immersive prose out, no invented outcomes, no brackets.
-        // Pin its presence + the key contract phrases.
+        // Pin its presence + the key contract phrases. (2026-07-29: the
+        // 5-bullet lecture was distilled to 2 terse bullets — the assertions
+        // pin the distilled phrasing: obey world_state+directives, no
+        // invented outcomes + no bracket syntax in one clause.)
         let card = test_card();
-        let p = build_api_narrator_system_prompt(&card, None, pacing(SceneMode::Exploration), None);
+        let p = build_api_narrator_system_prompt(&card, None, pacing(SceneMode::Exploration), None, None);
         assert!(p.contains("<your_role>"));
         assert!(p.contains("</your_role>"));
         assert!(p.contains("VOICE ACTOR"));
-        assert!(p.contains("Do NOT emit ANY bracket or JSON commands"));
-        assert!(p.contains("Do NOT decide game mechanics"));
+        // The distilled <your_role> forbids bracket/JSON emission (one of two
+        // terse bullets). The phrase spans a line-wrap in the source; assert
+        // the stable contiguous fragment.
+        assert!(p.contains("emit ANY"));
+        assert!(p.contains("bracket or JSON commands"));
+        assert!(p.contains("Do NOT invent outcomes"));
+        assert!(p.contains("<world_state>"));
+        assert!(p.contains("<directives>"));
     }
 
     #[test]
@@ -1198,7 +955,7 @@ mod tests {
             &card,
             Some("gold: 100\nstamina: Winded"),
             pacing(SceneMode::Exploration),
-            Some("The barkeeper becomes visibly suspicious."),
+            Some("The barkeeper becomes visibly suspicious."), None,
         );
         assert!(p.contains("<world_state>"));
         assert!(p.contains("gold: 100"));
@@ -1217,7 +974,7 @@ mod tests {
             &card,
             Some("gold: 100"),
             pacing(SceneMode::Exploration),
-            Some("A steer."),
+            Some("A steer."), None,
         );
         let trimmed = p.trim_end();
         assert!(
@@ -1232,7 +989,7 @@ mod tests {
         // Ordering invariant carries over: <scene_pacing> sits BEFORE
         // <active_reality> in the API narrator prompt.
         let card = test_card();
-        let p = build_api_narrator_system_prompt(&card, None, pacing(SceneMode::Combat), None);
+        let p = build_api_narrator_system_prompt(&card, None, pacing(SceneMode::Combat), None, None);
         let sp = p.find("<scene_pacing").expect("scene_pacing tag missing");
         let ar = p.find("<active_reality>").expect("active_reality tag missing");
         assert!(
@@ -1244,16 +1001,20 @@ mod tests {
     #[test]
     fn tracker_prompt_still_carries_bracket_protocol() {
         // Mirror of the above for the tracker path: build_narrator_system_prompt
-        // (the Tracker/LOCAL prompt) must STILL carry the full BRACKET_PROTOCOL
-        // — the split must not accidentally strip brackets from the tracker.
+        // (the Tracker/LOCAL prompt) must STILL carry the BRACKET_PROTOCOL —
+        // the split must not accidentally strip brackets from the tracker.
+        // (2026-07-29: the protocol was distilled to one line per command;
+        // the full semantics + JSON form live in the fable.codex, retrieved
+        // on-demand. The assertions pin the distilled form: the command list
+        // header + the "any other bracket is invalid" guard.)
         let card = test_card();
-        let p = build_narrator_system_prompt(&card, None, pacing(SceneMode::Exploration), None);
+        let p = build_narrator_system_prompt(&card, None, pacing(SceneMode::Exploration), None, None);
         assert!(p.contains("<bracket_commands>"));
         assert!(p.contains("[CHARACTER_TURN:"));
         assert!(p.contains("[OBJECT id="));
         assert!(p.contains("[TIME "));
         assert!(p.contains("[EFFECT "));
-        assert!(p.contains("DO NOT INVENT BRACKETS"));
+        assert!(p.contains("invalid and leaks as literal text"));
     }
 
     #[test]

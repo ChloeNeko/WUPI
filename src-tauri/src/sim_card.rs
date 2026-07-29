@@ -27,6 +27,43 @@ use rand::seq::IndexedRandom;
 /// `Serialize` + `Deserialize` (added for Quick Play so a generated card can
 /// be bundled inside the quicksave file) — every field is a primitive
 /// `String`/`Option<String>`/`Vec<String>`, so serde handles the round trip
+/// A location node as authored in a `.sim` card's `<scenario><locations>`
+/// block (Fable Phase 4 Component 3, 2026-07-28). Converted to
+/// [`crate::schema::Node`] by `enter_fable_session` at `fable_start`. Kept
+/// in `sim_card` (not reusing `schema::Node` directly) so the card parser
+/// stays decoupled from the schema module — the conversion is a one-liner
+/// at the seed site.
+///
+/// Parsed from:
+/// ```xml
+/// <node id="tavern" setting="indoor">
+///   <name>The Rusty Lantern Tavern</name>
+///   <neighbor>cellar</neighbor>
+///   <neighbor>market_square</neighbor>
+/// </node>
+/// ```
+/// Edges are undirected in concept but each side must list the other — the
+/// parser does NOT symmetrize (matches the [`crate::schema::TravelGraph`]
+/// contract: `neighbors` is the source of truth).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default)]
+pub struct CardNode {
+    /// Bare slug ("tavern", "cellar"). NOT "node.tavern" — the `node.`
+    /// prefix is a narrator convention only; the `[TRAVEL]` parser strips
+    /// it for ergonomics.
+    pub id: String,
+    /// Diegetic prose label shown to the narrator ("The Rusty Anchor
+    /// tavern"). This is the prose label only; flavor prose about the node
+    /// lives in `entities`.
+    pub name: String,
+    /// Reachable neighbor node ids (bare slugs). Pure adjacency — no
+    /// weights, no terrain (anti-bloat).
+    pub neighbors: Vec<String>,
+    /// Free hint, lowercased + matched against a tiny known set ("indoor" /
+    /// "outdoor" / empty). Gates whether the global `weather:` line renders
+    /// for this node (the only node→weather coupling in v1).
+    pub setting: String,
+}
+
 /// with no custom impl. `#[serde(default)]` on the `Option` fields keeps older
 /// save JSON (written before a field existed) loading cleanly.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -79,15 +116,35 @@ pub struct SimCard {
     /// activity modules. Empty for system cards.
     #[serde(default)]
     pub declared_activities: Vec<String>,
-    /// The protagonist's name for roleplay cards (e.g. "Alex", "Kaelen").
+    /// The player's chosen name for roleplay cards (e.g. "Alex", "Kaelen").
     /// Used by the narrator prompt's `<active_reality>` tail block (Phase E,
     /// 2026-07-18) to anchor the model in the current card's identity and
     /// prevent cross-card KV-cache contamination (the "Alex hallucination"
-    /// where the cyberpunk narrator used the dungeon protagonist's name).
-    /// `None` for system cards; narrator hardening falls back to generic
-    /// "the protagonist" phrasing.
+    /// where one card's narrator used another card's player name).
+    /// `None` for system cards (defaults to "User"). The XML tag is
+    /// `<player_name>` (legacy saves using `<protagonist>` are auto-migrated
+    /// on load — see `parse`).
     #[serde(default)]
-    pub protagonist_name: Option<String>,
+    pub player_name: Option<String>,
+    /// Fable Phase 4 Component 3 (2026-07-28): the spatial travel graph
+    /// seeded from the card's `<scenario><locations>` block. Empty for
+    /// system cards (Wupi) and for roleplay cards that omit the block
+    /// (stays dormant — the pre-Phase-4 behavior; `travel_graph.nodes`
+    /// empty, no `location:` line, `[TRAVEL]`/`[RUMOR]` bracket commands
+    /// have nowhere to root). When non-empty, `enter_fable_session` seeds
+    /// [`crate::schema::WorldSchema::travel_graph`] from this; the first
+    /// node in document order becomes `current_node` (the player's
+    /// starting location). See `docs/phase4-fix-travel-graph-seeding.md`
+    /// for the full rationale (this field is the load-bearing fix for
+    /// Components 3 + 4 being dead in live play).
+    ///
+    /// `Vec<CardNode>` (not `schema::TravelGraph` directly) to keep
+    /// `sim_card` free of the `schema` module dependency — `fable_start`
+    /// does the one-line conversion. `#[serde(default)]` keeps older
+    /// quicksave JSON (bundled cards written before this field existed)
+    /// loading cleanly.
+    #[serde(default)]
+    pub locations: Vec<CardNode>,
 }
 
 impl SimCard {
@@ -205,7 +262,8 @@ pub fn fallback() -> SimCard {
         opening_scene: None,
         start_npc_ids: Vec::new(),
         declared_activities: Vec::new(),
-        protagonist_name: None,
+        player_name: None,
+        locations: Vec::new(),
     }
 }
 
@@ -357,11 +415,48 @@ fn parse(xml: &str) -> anyhow::Result<SimCard> {
         .and_then(|n| first_child(n, "activities"))
         .map(|n| parse_bullet_list(&text_content(n)))
         .unwrap_or_default();
-    // Protagonist name (Phase E narrator hardening, 2026-07-18). Optional;
+    // Player name (Phase E narrator hardening, 2026-07-18). Optional;
     // absent on system cards and on roleplay cards that don't declare one.
-    let protagonist_name = scenario
-        .and_then(|n| child_text(n, "protagonist"))
+    // Reads `<player_name>` (current); falls back to the legacy tag for old
+    // saves authored before the rename. Auto-migration, NOT deletion — old
+    // user .sim files in the wild must still load.
+    let player_name = scenario
+        .and_then(|n| child_text(n, "player_name"))
+        .or_else(|| scenario.and_then(|n| child_text(n, "protagonist")))
         .filter(|s| !s.is_empty());
+
+    // Fable Phase 4 Component 3 (2026-07-28): optional <locations> block.
+    // Each <node> has an `id` attribute, an optional `setting` attribute
+    // ("indoor"/"outdoor"/empty), a <name> child, and 0+ <neighbor>
+    // children (bare node ids). Absent on system cards + roleplay cards
+    // that don't declare geography → empty Vec (dormant graph, pre-Phase-4
+    // behavior). This is the load-bearing fix for Components 3 + 4 being
+    // dead in live play — see docs/phase4-fix-travel-graph-seeding.md.
+    let locations = scenario
+        .and_then(|n| first_child(n, "locations"))
+        .map(|loc| {
+            loc.children()
+                .filter(|c| c.is_element() && c.has_tag_name("node"))
+                .map(|node_el| {
+                    let id = node_el.attribute("id").unwrap_or("").trim().to_owned();
+                    let setting = node_el
+                        .attribute("setting")
+                        .unwrap_or("")
+                        .trim()
+                        .to_owned();
+                    let name = child_text(node_el, "name").unwrap_or_default();
+                    let neighbors: Vec<String> = node_el
+                        .children()
+                        .filter(|c| c.is_element() && c.has_tag_name("neighbor"))
+                        .map(|n| text_content(n).trim().to_owned())
+                        .filter(|s| !s.is_empty())
+                        .collect();
+                    CardNode { id, name, neighbors, setting }
+                })
+                .filter(|n| !n.id.is_empty()) // defensive: drop id-less nodes
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
 
     Ok(SimCard {
         id,
@@ -380,7 +475,8 @@ fn parse(xml: &str) -> anyhow::Result<SimCard> {
         opening_scene,
         start_npc_ids,
         declared_activities,
-        protagonist_name,
+        player_name,
+        locations,
     })
 }
 
@@ -534,7 +630,8 @@ mod tests {
             opening_scene: None,
             start_npc_ids: Vec::new(),
             declared_activities: Vec::new(),
-            protagonist_name: None,
+            player_name: None,
+            locations: Vec::new(),
         };
         assert!(card.random_intro().is_none());
     }
@@ -614,7 +711,7 @@ ago. A locked iron chest sits under a table by the hearth.
     <activities><![CDATA[
 - combat
     ]]></activities>
-    <protagonist>Alex</protagonist>
+    <player_name>Alex</player_name>
   </scenario>
 </sim_card>"#;
         let card = parse(roleplay).expect("roleplay card parses");
@@ -625,7 +722,7 @@ ago. A locked iron chest sits under a table by the hearth.
         assert!(card.opening_scene.as_deref().unwrap().contains("Rain lashes"));
         assert_eq!(card.start_npc_ids, vec!["barkeeper".to_string(), "goblin".to_string()]);
         assert_eq!(card.declared_activities, vec!["combat".to_string()]);
-        assert_eq!(card.protagonist_name.as_deref(), Some("Alex"));
+        assert_eq!(card.player_name.as_deref(), Some("Alex"));
     }
 
     /// The system card (Wupi.sim) has NO `<scenario>` block. Every roleplay
@@ -640,7 +737,7 @@ ago. A locked iron chest sits under a table by the hearth.
         assert!(card.opening_scene.is_none());
         assert!(card.start_npc_ids.is_empty());
         assert!(card.declared_activities.is_empty());
-        assert!(card.protagonist_name.is_none());
+        assert!(card.player_name.is_none());
     }
 
     /// Quick Play bundles the generated card inside the quicksave file as
@@ -666,7 +763,8 @@ ago. A locked iron chest sits under a table by the hearth.
             opening_scene: Some("The scene opens.".into()),
             start_npc_ids: vec!["npc_one".into(), "npc_two".into()],
             declared_activities: vec!["combat".into()],
-            protagonist_name: Some("Hero".into()),
+            player_name: Some("Kaelen".into()),
+            locations: Vec::new(),
         };
         let json = serde_json::to_string(&original).expect("serialize");
         let back: SimCard = serde_json::from_str(&json).expect("deserialize");
@@ -678,13 +776,14 @@ ago. A locked iron chest sits under a table by the hearth.
         assert_eq!(back.opening_scene, original.opening_scene);
         assert_eq!(back.start_npc_ids, original.start_npc_ids);
         assert_eq!(back.declared_activities, original.declared_activities);
-        assert_eq!(back.protagonist_name, original.protagonist_name);
+        assert_eq!(back.player_name, original.player_name);
         assert_eq!(back.introductions, original.introductions);
     }
 
     /// `parse_from_xml_str` is the public entry the Quick Play `finalize`
     /// step uses to parse the model's `<sim_card>` output. Pins that it
-    /// accepts the same shape as the on-disk parser.
+    /// accepts the same shape as the on-disk parser. Uses the modern
+    /// `<player_name>` tag.
     #[test]
     fn parse_from_xml_str_works() {
         let xml = r#"<sim_card>
@@ -693,7 +792,7 @@ ago. A locked iron chest sits under a table by the hearth.
   <scenario>
     <setting>A place.</setting>
     <tone>atmospheric</tone>
-    <protagonist>Hero</protagonist>
+    <player_name>Kaelen</player_name>
     <opening_scene>The scene opens.</opening_scene>
     <start_npcs>- npc_a</start_npcs>
     <activities>- exploration</activities>
@@ -703,8 +802,43 @@ ago. A locked iron chest sits under a table by the hearth.
         assert_eq!(card.id, "test_id");
         assert_eq!(card.name, "Test Scenario");
         assert_eq!(card.card_type, "roleplay");
-        assert_eq!(card.protagonist_name.as_deref(), Some("Hero"));
+        assert_eq!(card.player_name.as_deref(), Some("Kaelen"));
         assert_eq!(card.start_npc_ids, vec!["npc_a".to_string()]);
+    }
+
+    /// Legacy auto-migration: an old `.sim` file using the pre-rename tag
+    /// `<protagonist>` must still load, with the value migrated to the new
+    /// `player_name` field. This is for old user-authored cards in the wild —
+    /// the on-disk file format must stay backwards-compatible.
+    #[test]
+    fn parse_legacy_tag_auto_migrates_to_player_name() {
+        let xml = r#"<sim_card>
+  <metadata><id>legacy</id><type>roleplay</type></metadata>
+  <identity><name>Legacy</name></identity>
+  <scenario>
+    <setting>x.</setting>
+    <protagonist>Kaelen</protagonist>
+  </scenario>
+</sim_card>"#;
+        let card = parse(xml).expect("legacy card parses");
+        assert_eq!(card.player_name.as_deref(), Some("Kaelen"));
+    }
+
+    /// The modern tag takes precedence when BOTH are present (defensive — a
+    /// card author shouldn't write both, but if they do, modern wins).
+    #[test]
+    fn modern_player_name_tag_wins_over_legacy() {
+        let xml = r#"<sim_card>
+  <metadata><id>dual</id><type>roleplay</type></metadata>
+  <identity><name>Dual</name></identity>
+  <scenario>
+    <setting>x.</setting>
+    <player_name>Modern</player_name>
+    <protagonist>Legacy</protagonist>
+  </scenario>
+</sim_card>"#;
+        let card = parse(xml).expect("dual-tag card parses");
+        assert_eq!(card.player_name.as_deref(), Some("Modern"));
     }
 
     /// A JSON object missing the roleplay fields (an older save, or a
@@ -718,7 +852,135 @@ ago. A locked iron chest sits under a table by the hearth.
         assert!(card.setting.is_none());
         assert!(card.opening_scene.is_none());
         assert!(card.start_npc_ids.is_empty());
-        assert!(card.protagonist_name.is_none());
+        assert!(card.player_name.is_none());
         assert!(card.introductions.is_empty());
+        // Phase 4 Component 3: locations defaults to empty (backward-compat).
+        assert!(card.locations.is_empty());
+    }
+
+    /// Phase 4 Component 3 (2026-07-28): a card with no `<locations>` block
+    /// must parse with `locations` empty (the dormant-graph contract — the
+    /// pre-Phase-4 behavior, preserved for every card that doesn't declare
+    /// geography). This is the backward-compat invariant.
+    #[test]
+    fn card_without_locations_loads_empty() {
+        let xml = r#"<sim_card>
+  <metadata><id>noloc</id><type>roleplay</type></metadata>
+  <identity><name>No Locations</name></identity>
+  <scenario>
+    <setting>A setting with no geography declared.</setting>
+  </scenario>
+</sim_card>"#;
+        let card = parse(xml).expect("card without <locations> parses");
+        assert!(card.locations.is_empty(), "card without <locations> must have empty locations");
+    }
+
+    /// Phase 4 Component 3 (2026-07-28): a card WITH a `<locations>` block
+    /// must parse every `<node>` in document order, capturing id / setting
+    /// attribute, `<name>` child, and all `<neighbor>` children. This pins
+    /// the parser's behavior — the load-bearing path for Components 3 + 4
+    /// being reachable in live play (see docs/phase4-fix-travel-graph-seeding.md).
+    #[test]
+    fn card_with_locations_parses_nodes_in_document_order() {
+        let xml = r#"<sim_card>
+  <metadata><id>graphed</id><type>roleplay</type></metadata>
+  <identity><name>Graphed</name></identity>
+  <scenario>
+    <setting>A setting with declared geography.</setting>
+    <locations>
+      <node id="tavern" setting="indoor">
+        <name>The Rusty Lantern</name>
+        <neighbor>cellar</neighbor>
+        <neighbor>market_square</neighbor>
+      </node>
+      <node id="cellar" setting="indoor">
+        <name>The Cellar</name>
+        <neighbor>tavern</neighbor>
+      </node>
+      <node id="market_square" setting="outdoor">
+        <name>Market Square</name>
+        <neighbor>tavern</neighbor>
+      </node>
+    </locations>
+  </scenario>
+</sim_card>"#;
+        let card = parse(xml).expect("card with <locations> parses");
+        assert_eq!(card.locations.len(), 3, "expected 3 parsed nodes");
+
+        // Document order preserved (the first node seeds current_node).
+        assert_eq!(card.locations[0].id, "tavern");
+        assert_eq!(card.locations[0].name, "The Rusty Lantern");
+        assert_eq!(card.locations[0].setting, "indoor");
+        assert_eq!(card.locations[0].neighbors, vec!["cellar", "market_square"]);
+
+        assert_eq!(card.locations[1].id, "cellar");
+        assert_eq!(card.locations[1].setting, "indoor");
+        assert_eq!(card.locations[1].neighbors, vec!["tavern"]);
+
+        assert_eq!(card.locations[2].id, "market_square");
+        assert_eq!(card.locations[2].setting, "outdoor");
+        assert_eq!(card.locations[2].neighbors, vec!["tavern"]);
+    }
+
+    /// Phase 4 Component 3 (2026-07-28): a node with no `setting` attribute
+    /// must default to empty string (not crash, not "indoor"). The indoor/
+    /// outdoor gate treats empty as outdoor (renders weather: line). This
+    /// pins the optional-attribute handling.
+    #[test]
+    fn card_location_node_without_setting_defaults_to_empty() {
+        let xml = r#"<sim_card>
+  <metadata><id>settingless</id><type>roleplay</type></metadata>
+  <identity><name>Settingless</name></identity>
+  <scenario>
+    <locations>
+      <node id="void">
+        <name>The Void</name>
+      </node>
+    </locations>
+  </scenario>
+</sim_card>"#;
+        let card = parse(xml).expect("card parses");
+        assert_eq!(card.locations.len(), 1);
+        assert_eq!(card.locations[0].id, "void");
+        assert_eq!(card.locations[0].setting, "", "missing setting attribute must default to empty");
+        assert!(card.locations[0].neighbors.is_empty(), "node with no <neighbor> children must have empty neighbors");
+    }
+
+    /// Phase 4 Component 3 (2026-07-28): a `<node>` with no `id` attribute
+    /// is defensively DROPPED (an id-less node is unreferenceable — the
+    /// [TRAVEL] parser + rumor propagation both key on id). The parser
+    /// must not panic; other valid nodes in the same block still parse.
+    #[test]
+    fn card_location_node_without_id_is_dropped() {
+        let xml = r#"<sim_card>
+  <metadata><id>idless</id><type>roleplay</type></metadata>
+  <identity><name>Idless</name></identity>
+  <scenario>
+    <locations>
+      <node setting="indoor"><name>No Id Here</name></node>
+      <node id="valid"><name>Valid Node</name></node>
+    </locations>
+  </scenario>
+</sim_card>"#;
+        let card = parse(xml).expect("card parses");
+        assert_eq!(card.locations.len(), 1, "id-less node must be dropped, valid node kept");
+        assert_eq!(card.locations[0].id, "valid");
+    }
+
+    /// Phase 4 Component 3 (2026-07-28): a `<locations>` block that is an
+    /// empty container (no `<node>` children) parses to an empty Vec. This
+    /// is the "card declares geography but provides none" edge case —
+    /// handled gracefully (dormant graph, same as no block at all).
+    #[test]
+    fn card_empty_locations_block_parses_to_empty_vec() {
+        let xml = r#"<sim_card>
+  <metadata><id>emptyloc</id><type>roleplay</type></metadata>
+  <identity><name>Empty Locations</name></identity>
+  <scenario>
+    <locations></locations>
+  </scenario>
+</sim_card>"#;
+        let card = parse(xml).expect("card parses");
+        assert!(card.locations.is_empty(), "empty <locations> block must yield empty Vec");
     }
 }

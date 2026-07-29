@@ -310,31 +310,27 @@ fn split_compound(text: &str) -> Vec<&str> {
     out
 }
 
-/// Seed Wupi's static playbook (engine-shipped reference knowledge) into the
-/// `__wupi_system__` partition. Mirrors `seed_codex` but reads from a single
-/// compound file (parsed via `parse_compound_file`) instead of a directory,
-/// and hard-wires the namespace to `system_codex::SYSTEM_NAMESPACE`
-/// (`"wupi_system"`).
+/// Seed an engine-shipped static playbook (compound front-matter file) into a
+/// reserved system partition. Generic core used by both [`seed_wupi_codex`]
+/// (the OS catgirl's `data/wupi.codex` → `__wupi_system__`) and
+/// [`seed_fable_codex`] (the unified Fable playbook `data/fable.codex` →
+/// `__fable_system__`).
 ///
-/// This fills the previously-empty static-seed side of `WUPI_SYSTEM_CARD_ID`
-/// (the runtime-snapshot writer in `system_codex.rs` is the other writer).
-/// The sentinel constant + `search_wupi_visible` read side + the per-class
-/// lower cosine floor (0.10) have all been live since §8C; this just turns on
-/// the seed path they were designed for. Wupi retrieves her playbook via
-/// `search_wupi_visible` on every chat turn — surface the design contract +
-/// file formats + worked examples the moment the user mentions `.sim` cards,
-/// codex authoring, or game-mechanic design.
+/// Mirrors `seed_codex` but reads from a single compound file (parsed via
+/// `parse_compound_file`) instead of a directory, and takes both the partition
+/// (`card_id`) and the metadata `namespace` as parameters so the same reconcile
+/// logic serves any engine-shipped playbook.
 ///
 /// Same reconcile contract as `seed_codex`: idempotent, hash-gated, deletes
 /// orphans (entries in the partition whose source block was removed from the
 /// compound file). Missing `path` → empty report (graceful).
-pub(crate) async fn seed_wupi_codex<E: Embedder>(
+async fn seed_compound_codex<E: Embedder>(
     engine: &MemoryEngine<E>,
     path: &Path,
     card_id: &str,
+    namespace: &str,
 ) -> anyhow::Result<ReconcileReport> {
     let mut report = ReconcileReport::default();
-    let namespace = crate::system_codex::SYSTEM_NAMESPACE;
 
     let sources = match parse_compound_file(path) {
         Ok(s) => s,
@@ -343,13 +339,13 @@ pub(crate) async fn seed_wupi_codex<E: Embedder>(
                 file = %path.display(),
                 error = %format!("{e}"),
                 namespace,
-                "wupi codex file unreadable; skipping seed"
+                "compound codex file unreadable; skipping seed"
             );
             return Ok(report);
         }
     };
     if sources.is_empty() {
-        tracing::info!(file = %path.display(), namespace, "wupi codex file empty or missing; nothing to seed");
+        tracing::info!(file = %path.display(), namespace, "compound codex file empty or missing; nothing to seed");
         return Ok(report);
     }
 
@@ -378,7 +374,8 @@ pub(crate) async fn seed_wupi_codex<E: Embedder>(
                         tracing::warn!(
                             title = %src.title,
                             error = %format!("{e}"),
-                            "wupi codex update: failed to delete old entry; skipping"
+                            namespace,
+                            "compound codex update: failed to delete old entry; skipping"
                         );
                         continue;
                     }
@@ -388,7 +385,7 @@ pub(crate) async fn seed_wupi_codex<E: Embedder>(
                         report.updated += 1;
                         consumed.insert(&src.title);
                     }
-                    Err(e) => tracing::warn!(title = %src.title, error = %format!("{e}"), "wupi codex update insert failed"),
+                    Err(e) => tracing::warn!(title = %src.title, error = %format!("{e}"), namespace, "compound codex update insert failed"),
                 }
             }
             None => match insert_entry(engine, src, card_id, namespace).await {
@@ -396,7 +393,7 @@ pub(crate) async fn seed_wupi_codex<E: Embedder>(
                     report.seeded += 1;
                     consumed.insert(&src.title);
                 }
-                Err(e) => tracing::warn!(title = %src.title, error = %format!("{e}"), "wupi codex seed insert failed"),
+                Err(e) => tracing::warn!(title = %src.title, error = %format!("{e}"), namespace, "compound codex seed insert failed"),
             },
         }
     }
@@ -404,11 +401,45 @@ pub(crate) async fn seed_wupi_codex<E: Embedder>(
         if !consumed.contains(title.as_str()) {
             match engine.delete_memory(*id).await {
                 Ok(()) => report.purged += 1,
-                Err(e) => tracing::warn!(title = %title, error = %format!("{e}"), "wupi codex orphan purge failed"),
+                Err(e) => tracing::warn!(title = %title, error = %format!("{e}"), namespace, "compound codex orphan purge failed"),
             }
         }
     }
     Ok(report)
+}
+
+/// Seed Wupi's static playbook (`data/wupi.codex`) into the `__wupi_system__`
+/// partition. Thin wrapper over [`seed_compound_codex`] pinning the Wupi
+/// namespace.
+///
+/// This fills the previously-empty static-seed side of `WUPI_SYSTEM_CARD_ID`
+/// (the runtime-snapshot writer in `system_codex.rs` is the other writer).
+/// Wupi retrieves her playbook via `search_wupi_visible` on every chat turn —
+/// surface the design contract + file formats + worked examples the moment the
+/// user mentions `.sim` cards, codex authoring, or game-mechanic design.
+pub(crate) async fn seed_wupi_codex<E: Embedder>(
+    engine: &MemoryEngine<E>,
+    path: &Path,
+    card_id: &str,
+) -> anyhow::Result<ReconcileReport> {
+    seed_compound_codex(engine, path, card_id, crate::system_codex::SYSTEM_NAMESPACE).await
+}
+
+/// Seed the unified Fable playbook (`data/fable.codex`) into the
+/// `__fable_system__` partition. Sibling of [`seed_wupi_codex`]: same
+/// reconcile contract, isolated partition so Fable-domain knowledge (the
+/// deep playbook shared by the Game Master interview persona AND the
+/// simulation narrator — question banks, genre guides, perfect-card
+/// examples, bracket-command reference, narrative discipline) never leaks
+/// into the OS catgirl's prompts and vice versa. Both the GM and the
+/// narrator retrieve their playbook via `search_fable_visible` (sibling of
+/// `search_wupi_visible`) — one query/turn serves both Fable personas.
+pub(crate) async fn seed_fable_codex<E: Embedder>(
+    engine: &MemoryEngine<E>,
+    path: &Path,
+    card_id: &str,
+) -> anyhow::Result<ReconcileReport> {
+    seed_compound_codex(engine, path, card_id, crate::system_codex::FABLE_NAMESPACE).await
 }
 
 /// Insert one parsed entry via `add_codex_entry`, building its `metadata_json`.
@@ -995,6 +1026,67 @@ mod tests {
                 "playbook entry '{}' body is {} chars (budget 1400); bge-small may truncate",
                 e.title,
                 e.body.len()
+            );
+        }
+    }
+
+    /// Sibling of `shipped_playbook_parses_to_four_entries`: the shipped
+    /// `data/fable.codex` (unified Fable playbook — shared by the Game Master
+    /// interview persona AND the simulation narrator) must parse cleanly into
+    /// its authored entries with valid front-matter + non-empty bodies, all
+    /// under the bge-small chunk budget. Pins the file the boot seed reads so a
+    /// typo'd fence or fragmented entry doesn't silently degrade Fable
+    /// retrieval. **Unification (2026-07-29):** was `shipped_gm_playbook_
+    /// parses_cleanly` reading `gm.codex`; renamed + threshold bumped to 11
+    /// (9 original GM entries + 3 narrator entries added in the Phase 3 scrub).
+    #[test]
+    fn shipped_fable_codex_parses_cleanly() {
+        let candidates = [
+            // Cargo test cwd = src-tauri/, so the playbook is one level up.
+            std::path::PathBuf::from("../data/fable.codex"),
+            // Standalone invocation from repo root.
+            std::path::PathBuf::from("data/fable.codex"),
+        ];
+        let path = candidates.iter().find(|p| p.is_file());
+        let Some(path) = path else {
+            eprintln!("shipped_fable_codex_parses_cleanly: data/fable.codex not found; skipping");
+            return;
+        };
+        let entries = parse_compound_file(path).expect("shipped fable codex parses");
+        assert!(
+            entries.len() >= 11,
+            "shipped fable codex has {} entries (expected >= 11); fable.codex may be malformed",
+            entries.len()
+        );
+        // Each entry must have a title + non-empty tags + non-empty body +
+        // stay under the bge-small chunk budget.
+        for e in &entries {
+            assert!(!e.title.is_empty(), "fable codex entry has empty title");
+            assert!(!e.tags.is_empty(), "fable codex entry '{}' has no tags", e.title);
+            assert!(!e.body.trim().is_empty(), "fable codex entry '{}' has empty body", e.title);
+            assert!(
+                e.body.len() <= 1400,
+                "fable codex entry '{}' body is {} chars (budget 1400); bge-small may truncate",
+                e.title,
+                e.body.len()
+            );
+        }
+        // Spot-check that the canonical playbook sections are present (titles
+        // from the plan). If the playbook is reorganized, update these.
+        let titles: Vec<&str> = entries.iter().map(|e| e.title.as_str()).collect();
+        for expected in [
+            "Card Archetypes",
+            "The Core Question Ladder",
+            "World Card Example — Fantasy Tavern",
+            "World Card Example — Cyberpunk Bar",
+            "Perfect Character Card Examples",
+            "The Scribe Contract",
+        ] {
+            assert!(
+                titles.contains(&expected),
+                "fable codex missing required entry '{}'; found: {:?}",
+                expected,
+                titles
             );
         }
     }

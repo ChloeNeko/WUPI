@@ -38,6 +38,7 @@ use crate::consequence::StatusTag;
 use crate::offscreen_task::OffScreenTask;
 use crate::player_state::PlayerState;
 use crate::relationship::RelationshipState;
+use crate::rumor; // Component 4 (2026-07-28): WorldSchema.rumors field references rumor::Rumor.
 
 /// The in-world clock (Fable Seam #4, 2026-07-27). Pure data: two `i64`
 /// minute-counters since the fixed ancient epoch 0001-01-01 (the same trick
@@ -105,6 +106,200 @@ impl WorldClock {
         let h24 = rem / 60;
         let m = rem % 60;
         Some(format!("Day {day}, {h24:02}:{m:02}"))
+    }
+}
+
+/// The global atmospheric condition (Fable Phase 4 Component 2, 2026-07-28).
+/// Pure data: a free-form diegetic condition phrase + the in-world minute at
+/// which it started (drives the persistence-DC curve in `weather::drift_weather`).
+///
+/// `WorldSchema::apply_delta` deliberately does NOT touch this struct — it
+/// lives outside the LLM delta path, same architectural line as `WorldClock` /
+/// `PlayerState` / `ScenePacing` / `status_tags`. The ONLY writers are:
+/// (1) the `[WEATHER ...]` bracket command (sets the condition + stamps the
+/// start time), (2) the World Progression tick drift (pure Rust, seeded RNG —
+/// shifts the condition from the generic pool when a persistence check fails).
+/// Global for v1 — the narrator sees one `weather:` line for the whole world.
+/// Component 3 (Node-Based Spatial Travel Graph, SHIPPED 2026-07-28) adds the
+/// only node→weather coupling: the `weather:` line is suppressed when the
+/// current node's `setting` is "indoor" (see `TravelGraph::current_is_indoor`).
+/// Full per-node weather (climate-specific condition pools) is a Component 4+
+/// refinement; the bracket syntax + tick hook are forward-compatible with it.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
+pub struct Weather {
+    /// Diegetic condition phrase the narrator weaves into prose ("heavy
+    /// rain", "clear", "thick fog", "snowfall"). Free-form; the narrator owns
+    /// the prose, Rust owns the dice. Empty = unset (no `[WEATHER]` emitted
+    /// yet — weather is dormant, like a fresh clock with no `[TIME]`).
+    #[serde(default)]
+    pub condition: String,
+
+    /// The in-world minute this condition started (epoch-minutes, same units
+    /// as `WorldClock::current_minutes`). Drives the persistence curve: the
+    /// longer a condition has held, the higher its drift DC (overdue for a
+    /// shift). 0 = unset. Stamped by the `[WEATHER]` applier + by the tick
+    /// drift on a successful shift.
+    #[serde(default)]
+    pub started_at_minutes: i64,
+}
+
+impl Weather {
+    /// True once a `[WEATHER ...]` has set a non-empty condition (or the tick
+    /// has drifted to one). Until then the weather is dormant: the tick drift
+    /// is a no-op, the render emits no `weather:` block (zero tokens).
+    pub fn is_set(&self) -> bool {
+        !self.condition.is_empty()
+    }
+
+    /// Render the current weather as a compact prompt line. Returns `None`
+    /// when unset (so `render_for_prompt` can skip the block entirely — zero
+    /// tokens for a fresh game, mirroring `WorldClock::render_clock_line`).
+    pub fn render_line(&self) -> Option<String> {
+        if !self.is_set() {
+            return None;
+        }
+        Some(self.condition.clone())
+    }
+}
+
+/// A discrete in-world location (Fable Phase 4 Component 3, 2026-07-28).
+/// Structural truth Rust reasons about (edges, reachability); NOT free-form
+/// narrative flavor — that lives in `entities` (`Node.name` is the diegetic
+/// label only, `entities` holds the flavor prose). v1 is geography only:
+/// flat adjacency graph, no weights / terrain / coordinates / distance.
+///
+/// `WorldSchema::apply_delta` deliberately does NOT touch nodes — they live
+/// outside the LLM delta path, same line as `WorldClock` / `Weather` /
+/// `PlayerState`. The ONLY writer in v1 is the scenario card (seeded at game
+/// start); the player's `current_node` advances via `[TRAVEL]`. (Component 4
+/// may add NPC movement between nodes on the World Progression tick — that
+/// will require NPC-position state, NOT a mutation of the graph itself.)
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
+pub struct Node {
+    /// Stable identifier ("tavern", "cellar", "market_square"). Bare slug,
+    /// NOT "node.tavern" — the `node.` prefix is a narrator convention only
+    /// (the `[TRAVEL]` parser strips it for ergonomics).
+    #[serde(default)]
+    pub id: String,
+
+    /// Diegetic name shown to the narrator ("The Rusty Anchor tavern"). This
+    /// is the prose label only; flavor prose about the node lives in `entities`
+    /// (e.g. `entities["node.tavern.flavor"]`).
+    #[serde(default)]
+    pub name: String,
+
+    /// Reachable neighbors by node id. Pure adjacency — NO weights, NO
+    /// terrain, NO distance (anti-bloat: the weighted-graph trap). Component 4
+    /// rumor propagation reads this; the `[TRAVEL]` Referee validates against
+    /// it (non-neighbor moves are rejected).
+    #[serde(default)]
+    pub neighbors: Vec<String>,
+
+    /// Free hint, lowercased + matched against a tiny known set ("indoor" /
+    /// "outdoor" / empty). Zero-cost when empty; "indoor" gates whether the
+    /// global `weather:` line renders for the current node (the only
+    /// node→weather coupling in v1 — see `render_for_prompt`). No enum —
+    /// string match, forward-compat for richer flags without a migration.
+    #[serde(default)]
+    pub setting: String,
+}
+
+/// The spatial travel graph (Rust-authoritative — same line as `world_clock` /
+/// `weather`). Nodes + a single `current_node` pointer. v1 is structural
+/// geography: no NPC positions, no tick-resolved traversal mechanics, no
+/// per-node weather. The only writer to `current_node` is the `[TRAVEL]`
+/// bracket command (validated for adjacency); `nodes` itself is seeded once
+/// by the scenario card + treated as read-only thereafter.
+///
+/// `WorldSchema::apply_delta` deliberately does NOT touch this field —
+/// see `apply_delta_does_not_touch_travel_graph`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
+pub struct TravelGraph {
+    /// The nodes in the graph. `Vec` (not a map) — matches the
+    /// `Vec<StatusTag>` / `Vec<OffScreenTask>` precedent; small graphs
+    /// (dozens of nodes), O(n) edge validation is correct + cheap.
+    #[serde(default)]
+    pub nodes: Vec<Node>,
+
+    /// Current location by node id. `None` = unseeded (dormant, like
+    /// `WorldClock` before the first `[TIME]`). Collocated with `nodes` so
+    /// "current_node refers to a real node" is enforceable in one place
+    /// (no desync vector). The first `[TRAVEL]` from `None` is allowed —
+    /// seeds initial location without scenario-card wiring.
+    #[serde(default)]
+    pub current_node: Option<String>,
+}
+
+impl TravelGraph {
+    /// True once at least one node exists (the dormant contract — a fresh
+    /// game with no seeded nodes suppresses the `location:` block entirely).
+    pub fn is_set(&self) -> bool {
+        !self.nodes.is_empty()
+    }
+
+    /// Linear scan for a node by id. Small graphs (dozens of nodes); O(n) is
+    /// correct + cheap. Returns `None` for unknown ids.
+    pub fn find_node(&self, id: &str) -> Option<&Node> {
+        self.nodes.iter().find(|n| n.id == id)
+    }
+
+    /// `Some(&Node)` if `current_node` is set AND refers to a real node.
+    /// Defensively returns `None` if the pointer has drifted off the graph
+    /// (should never happen given the collocation invariant, but cheap to
+    /// honor rather than unwrap).
+    pub fn current(&self) -> Option<&Node> {
+        self.current_node
+            .as_ref()
+            .and_then(|id| self.find_node(id))
+    }
+
+    /// True if `to` is a declared neighbor of the current node — the
+    /// `[TRAVEL]` Referee's anti-sycophancy gate. Returns `false` if there
+    /// is no current node, `to` is not in the graph, or `to` is not adjacent.
+    /// (The first-move-from-`None` bootstrap case is handled by the caller,
+    /// not here — this fn strictly answers "is it a neighbor?".)
+    pub fn is_adjacent_to_current(&self, to: &str) -> bool {
+        match self.current() {
+            Some(cur) => cur.neighbors.iter().any(|n| n == to),
+            None => false,
+        }
+    }
+
+    /// True if the current node's `setting` (lowercased) is "indoor" — gates
+    /// whether the global `weather:` line renders. Returns `false` when there
+    /// is no current node or the setting is empty / outdoor / unrecognized
+    /// (i.e. weather renders by default; only explicit "indoor" suppresses).
+    pub fn current_is_indoor(&self) -> bool {
+        match self.current() {
+            Some(cur) => cur.setting.trim().eq_ignore_ascii_case("indoor"),
+            None => false,
+        }
+    }
+
+    /// Compact prompt render. Returns `None` when dormant (no current node).
+    /// Mirrors `Weather::render_line` (single-region, dormant-suppress).
+    /// Emits ONE line:
+    ///   `<name> [<id>] (exits: <comma-joined neighbor names or ids>)`
+    /// Neighbor names resolve to diegetic names where possible; unknown
+    /// neighbor ids fall back to the bare id (defensive — never panics).
+    pub fn render_line(&self) -> Option<String> {
+        let cur = self.current()?;
+        let exits: Vec<String> = cur
+            .neighbors
+            .iter()
+            .map(|id| {
+                self.find_node(id)
+                    .map(|n| n.name.clone())
+                    .filter(|n| !n.is_empty())
+                    .unwrap_or_else(|| id.clone())
+            })
+            .collect();
+        let exits_str = if exits.is_empty() {
+            "none".to_string()
+        } else {
+            exits.join(", ")
+        };
+        Some(format!("{} [{}] (exits: {})", cur.name, cur.id, exits_str))
     }
 }
 
@@ -257,7 +452,7 @@ pub struct WorldSchema {
     #[serde(default)]
     pub entities: HashMap<String, String>,
 
-    /// The protagonist's canonical state (Fable Seam #7, Player State).
+    /// The player's canonical state (Fable Seam #7, Player State).
     /// Rust is the SOLE authority here — the schema-delta LLM pass never
     /// writes to it; the Referee (`player_state::referee_evaluate`) does.
     /// Nested inside WorldSchema so per-card persistence + autosave inherit
@@ -280,6 +475,41 @@ pub struct WorldSchema {
     /// matching Multihog's first-call behavior.
     #[serde(default)]
     pub world_clock: WorldClock,
+
+    /// Global weather state (Fable Phase 4 Component 2, 2026-07-28): the
+    /// current atmospheric condition + the in-world minute it started (for the
+    /// tick drift's persistence curve). Rust is the SOLE authority —
+    /// `apply_delta` does NOT touch this field (mirrors `world_clock` /
+    /// `player_state` / `scene_pacing` / `status_tags`). The only writers are:
+    /// (1) the `[WEATHER ...]` bracket command (sets the condition + stamps
+    /// the start), (2) the World Progression tick drift (`weather::drift_
+    /// weather` — pure Rust, seeded RNG; shifts the condition from the
+    /// generic pool when a persistence check fails). Global for v1 — the
+    /// narrator sees one `weather:` line for the whole world. Component 3
+    /// (Node-Based Spatial Travel Graph, SHIPPED 2026-07-28) adds the only
+    /// node→weather coupling: the `weather:` line is suppressed when the
+    /// current node's `setting` is "indoor" (the narrator doesn't see weather
+    /// while indoors — see `TravelGraph::current_is_indoor`). Per-node weather
+    /// pools (climate-specific) remain a Component 4+ refinement; the bracket
+    /// syntax + tick hook are forward-compatible with it.
+    /// `#[serde(default)]` keeps pre-Phase-4 saves loadable as unset (empty
+    /// condition → dormant, no `weather:` line).
+    #[serde(default)]
+    pub weather: Weather,
+
+    /// The spatial travel graph (Fable Phase 4 Component 3, 2026-07-28):
+    /// discrete locations (nodes) + adjacency edges + a single current
+    /// location pointer. Rust is the SOLE authority — `apply_delta` does NOT
+    /// touch this field (mirrors `world_clock` / `weather` / `player_state`).
+    /// The only writer to `current_node` is the `[TRAVEL ...]` bracket command
+    /// (the Tracker owns "the player moved"; Rust validates adjacency + rejects
+    /// non-neighbor moves). `nodes` itself is seeded once by the scenario card
+    /// and treated as read-only thereafter. v1 is geography only: no NPC
+    /// positions, no tick traversal mechanics, no weighted edges.
+    /// `#[serde(default)]` keeps pre-Component-3 saves loadable as an empty
+    /// graph (dormant — no `location:` line, no adjacency to validate).
+    #[serde(default)]
+    pub travel_graph: TravelGraph,
 
     /// Entity keys flagged immutable (the `[CORE]`-style lock; closes the §5
     /// "deliberately permissive at v1" NPC-drift hole). A key in this set can
@@ -353,6 +583,28 @@ pub struct WorldSchema {
     /// `#[serde(default)]` keeps pre-Phase-3 saves loadable as an empty queue.
     #[serde(default)]
     pub offscreen_tasks: Vec<OffScreenTask>,
+
+    /// Propagation-based rumor state (Fable Phase 4 Component 4, 2026-07-28):
+    /// free-form diegetic phrases that spread between connected nodes on the
+    /// World Progression tick. Each [`rumor::Rumor`] owns its `known_nodes`
+    /// (the nodes that have heard it). Rust is the SOLE authority —
+    /// `apply_delta` does NOT touch this field (mirrors `world_clock` /
+    /// `weather` / `travel_graph` / `status_tags` / `offscreen_tasks`). The
+    /// only writers are: (1) the `[RUMOR ...]` bracket command (creates a
+    /// rumor rooted at the current node — `known_nodes` initialized to
+    /// `[origin_node]`), (2) the World Progression tick propagation pass
+    /// (`rumor::propagate_rumors` — pure Rust, seeded RNG; spreads each
+    /// rumor to adjacent unknown nodes when an age-decayed DC check passes).
+    ///
+    /// The `rumors:` render line in `render_for_prompt` shows ONLY rumors the
+    /// CURRENT node has heard (the node-based knowledge model — "the tavern
+    /// has heard X", not "Marcus specifically has heard X"). Propagation-only
+    /// by design: no polarity / truth field, no stored reputation score —
+    /// reputation is narratively derived from which rumor texts circulate.
+    /// `#[serde(default)]` keeps pre-Component-4 saves loadable as an empty
+    /// list (dormant — no `rumors:` line, nothing to propagate).
+    #[serde(default)]
+    pub rumors: Vec<rumor::Rumor>,
 }
 
 impl WorldSchema {
@@ -408,7 +660,10 @@ impl WorldSchema {
             && self.recent_events.is_empty()
             && self.entities.is_empty()
             && self.player_state.is_default()
-            && !self.world_clock.is_set();
+            && !self.world_clock.is_set()
+            && !self.weather.is_set()
+            && !self.travel_graph.is_set()
+            && self.rumors.is_empty();
         if empty {
             return String::new();
         }
@@ -422,6 +677,59 @@ impl WorldSchema {
             out.push_str("clock: ");
             out.push_str(&clock_line);
             out.push('\n');
+        }
+        // Weather renders alongside clock (Component 2, 2026-07-28): the two
+        // atmospheric anchors the narrator needs top-of-mind to write coherent
+        // scene-setting prose (a storm should color sound + visibility + NPC
+        // reactions; the narrator can't weave weather it can't see). Empty
+        // condition → no line (zero tokens for a fresh game, dormant until the
+        // first [WEATHER] or the first tick-driven shift).
+        //
+        // Component 3 coupling (2026-07-28): when the current node's `setting`
+        // is "indoor", the weather line is suppressed — the narrator doesn't
+        // see weather while inside (a windowless cellar doesn't show rain).
+        // Outdoor / empty / unset setting → weather renders as before. This is
+        // the ONLY node→weather coupling in v1 (no per-node weather data).
+        if !self.travel_graph.current_is_indoor() {
+            if let Some(weather_line) = self.weather.render_line() {
+                out.push_str("weather: ");
+                out.push_str(&weather_line);
+                out.push('\n');
+            }
+        }
+        // Location renders alongside clock + weather (Component 3, 2026-07-28):
+        // the third top-of-mind anchor. The narrator needs the current location
+        // + its exits to write coherent movement prose + emit valid `[TRAVEL]`
+        // commands (without seeing the exits, the Tracker would guess at node
+        // ids). `None` when no current node is set (dormant — zero tokens,
+        // mirroring `WorldClock` / `Weather` before their first command).
+        if let Some(travel_line) = self.travel_graph.render_line() {
+            out.push_str("location: ");
+            out.push_str(&travel_line);
+            out.push('\n');
+        }
+        // Rumors at the current node (Component 4, 2026-07-28): the fourth
+        // "where/when" anchor + the node-based knowledge model. The narrator
+        // sees ONLY the rumors the current node has heard — "the tavern has
+        // heard X", not "Marcus specifically has heard X" (per-NPC knowledge
+        // graphs are the anti-bloat trap, deliberately avoided at v1). This is
+        // what frames ambient gossip + NPC reactions in prose (the propagated
+        // rumor texts ARE the reputation signal — no stored score). Dormant
+        // when no current node OR no heard rumors (zero tokens for a fresh
+        // game, or for a node the rumor hasn't reached yet — the player can
+        // travel away from a rumor and have it vanish from this line).
+        if let Some(cur_id) = self.travel_graph.current_node.as_deref() {
+            let heard: Vec<&str> = self
+                .rumors
+                .iter()
+                .filter(|r| r.known_nodes.iter().any(|n| n == cur_id))
+                .map(|r| r.label.as_str())
+                .collect();
+            if !heard.is_empty() {
+                out.push_str("rumors: ");
+                out.push_str(&heard.join("; "));
+                out.push('\n');
+            }
         }
         if !self.summary.trim().is_empty() {
             out.push_str("summary: ");
@@ -454,7 +762,7 @@ impl WorldSchema {
         }
         // Player state (the Rust Referee's canonical fact block). Rendered
         // LAST in the world-state block so it's the loudest signal — the
-        // protagonist's injuries + fatigue are the most turn-relevant facts.
+        // player's injuries + fatigue are the most turn-relevant facts.
         // Returns None when fully default, so a fresh game adds zero tokens.
         if let Some(player_block) = self.player_state.render_for_prompt() {
             out.push_str("player_state:\n");
@@ -1047,6 +1355,491 @@ mod tests {
         // regular key from apply_delta's perspective). Whether it stays there
         // is the validator's call, not apply_delta's.
         assert_eq!(schema.entities.get("world_clock").map(|s| s.as_str()), Some("9999"));
+    }
+
+    // ---------- weather (Fable Phase 4 Component 2, 2026-07-28) ----------
+
+    #[test]
+    fn weather_default_is_unset() {
+        // Fresh schema: weather dormant (empty condition). Mirrors world_clock.
+        let schema = WorldSchema::default();
+        assert!(!schema.weather.is_set());
+        assert_eq!(schema.weather.render_line(), None);
+    }
+
+    #[test]
+    fn weather_is_set_when_condition_non_empty() {
+        let mut w = Weather::default();
+        w.condition = "heavy rain".to_string();
+        assert!(w.is_set());
+        assert_eq!(w.render_line().as_deref(), Some("heavy rain"));
+    }
+
+    #[test]
+    fn render_for_prompt_includes_weather_when_set() {
+        let mut schema = WorldSchema::default();
+        schema.weather = Weather {
+            condition: "thick fog".to_string(),
+            started_at_minutes: 1000,
+        };
+        let rendered = schema.render_for_prompt();
+        assert!(rendered.contains("weather: thick fog"));
+    }
+
+    #[test]
+    fn render_for_prompt_omits_weather_when_unset() {
+        // A fresh game (no [WEATHER] yet) → no weather line, zero tokens.
+        let schema = WorldSchema::default();
+        assert!(!schema.render_for_prompt().contains("weather:"));
+    }
+
+    #[test]
+    fn render_for_prompt_emits_weather_only_when_set() {
+        // The empty predicate must include weather: a schema with ONLY weather
+        // set (nothing else) should still emit the block.
+        let mut schema = WorldSchema::default();
+        schema.weather.condition = "clear".to_string();
+        let rendered = schema.render_for_prompt();
+        assert!(rendered.contains("weather: clear"));
+        // And it shouldn't drag in empty blocks for unset fields.
+        assert!(!rendered.contains("clock:"));
+        assert!(!rendered.contains("summary:"));
+    }
+
+    #[test]
+    fn apply_delta_does_not_touch_weather() {
+        // Architectural invariant: weather is outside the LLM delta path
+        // (mirrors apply_delta_does_not_touch_world_clock). A delta carrying
+        // "weather" in its entities map must NOT mutate the typed field — it
+        // just becomes a regular entity key (the playtest "weather" entity
+        // convention; the typed field is authoritative going forward).
+        let mut schema = WorldSchema::default();
+        schema.weather = Weather {
+            condition: "heavy rain".to_string(),
+            started_at_minutes: 1000,
+        };
+        let mut ents = HashMap::new();
+        // A naive/malicious delta trying to overwrite weather via entities.
+        ents.insert("weather".to_string(), Some("sunny".to_string()));
+        let delta = SchemaDelta {
+            summary: None,
+            recent_events: None,
+            entities: Some(ents),
+        };
+        schema.apply_delta(delta);
+        // The typed weather is unchanged.
+        assert_eq!(schema.weather.condition, "heavy rain");
+        assert_eq!(schema.weather.started_at_minutes, 1000);
+        // The "weather" string landed in the entities map (legacy convention).
+        assert_eq!(schema.entities.get("weather").map(|s| s.as_str()), Some("sunny"));
+    }
+
+    #[test]
+    fn weather_backwards_compat_pre_phase4_save_loads_as_unset() {
+        // A pre-Phase-4 save JSON (no "weather" field) must deserialize to
+        // Weather::default() (unset). The #[serde(default)] attribute on the
+        // field enforces this; this test pins it.
+        let pre_phase4_json = r#"{
+            "summary": "",
+            "recent_events": [],
+            "entities": {},
+            "player_state": {},
+            "world_clock": {"current_minutes": 0, "last_tick_minutes": 0},
+            "immutable_keys": [],
+            "scene_pacing": {"mode": "Exploration", "spatial": 0, "emotional": 0, "kinetic": 0},
+            "status_tags": [],
+            "relationships": {},
+            "offscreen_tasks": []
+        }"#;
+        let parsed: WorldSchema = serde_json::from_str(pre_phase4_json)
+            .expect("pre-Phase-4 JSON must deserialize");
+        assert!(!parsed.weather.is_set());
+        assert_eq!(parsed.weather.condition, "");
+        assert_eq!(parsed.weather.started_at_minutes, 0);
+    }
+
+    #[test]
+    fn weather_serialize_roundtrip() {
+        // Save/load must preserve the weather field.
+        let mut schema = WorldSchema::default();
+        schema.weather = Weather {
+            condition: "heavy rain".to_string(),
+            started_at_minutes: 4321,
+        };
+        let dir = std::env::temp_dir();
+        let path = dir.join("wupi_schema_weather_test.json");
+        let _ = std::fs::remove_file(&path);
+        schema.save(&path).unwrap();
+        let loaded = WorldSchema::load(&path).unwrap();
+        assert_eq!(loaded.weather.condition, "heavy rain");
+        assert_eq!(loaded.weather.started_at_minutes, 4321);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // ---------- travel_graph (Fable Phase 4 Component 3, 2026-07-28) ----------
+
+    /// Helper: a small 3-node graph (tavern ↔ cellar ↔ market_square) used by
+    /// several tests. Tavern is indoor; the others outdoor. Tavern↔cellar +
+    /// tavern↔market_square are the edges (cellar↔market_square is NOT adjacent).
+    fn sample_travel_graph() -> TravelGraph {
+        TravelGraph {
+            nodes: vec![
+                Node {
+                    id: "tavern".to_string(),
+                    name: "The Rusty Anchor".to_string(),
+                    neighbors: vec!["cellar".to_string(), "market_square".to_string()],
+                    setting: "indoor".to_string(),
+                },
+                Node {
+                    id: "cellar".to_string(),
+                    name: "The Cellar".to_string(),
+                    neighbors: vec!["tavern".to_string()],
+                    setting: "outdoor".to_string(),
+                },
+                Node {
+                    id: "market_square".to_string(),
+                    name: "Market Square".to_string(),
+                    neighbors: vec!["tavern".to_string()],
+                    setting: "".to_string(),
+                },
+            ],
+            current_node: Some("tavern".to_string()),
+        }
+    }
+
+    #[test]
+    fn travel_graph_default_is_dormant() {
+        // Fresh schema: no nodes → dormant (mirrors world_clock / weather).
+        let schema = WorldSchema::default();
+        assert!(!schema.travel_graph.is_set());
+        assert_eq!(schema.travel_graph.render_line(), None);
+        assert_eq!(schema.travel_graph.current(), None);
+        assert!(!schema.travel_graph.current_is_indoor());
+    }
+
+    #[test]
+    fn travel_graph_is_set_when_nodes_exist() {
+        let mut g = TravelGraph::default();
+        g.nodes.push(Node {
+            id: "lonely".to_string(),
+            name: "A Lonely Place".to_string(),
+            neighbors: vec![],
+            setting: "".to_string(),
+        });
+        // is_set is about the GRAPH existing, not the current_node pointer.
+        assert!(g.is_set());
+        // But render_line is None when there's no current_node.
+        assert_eq!(g.render_line(), None);
+    }
+
+    #[test]
+    fn travel_graph_find_node_returns_node_for_known_id() {
+        let g = sample_travel_graph();
+        assert_eq!(g.find_node("cellar").map(|n| n.name.as_str()), Some("The Cellar"));
+    }
+
+    #[test]
+    fn travel_graph_find_node_returns_none_for_unknown() {
+        let g = sample_travel_graph();
+        assert!(g.find_node("nonexistent").is_none());
+    }
+
+    #[test]
+    fn travel_graph_current_returns_node_when_set() {
+        let g = sample_travel_graph();
+        assert_eq!(g.current().map(|n| n.id.as_str()), Some("tavern"));
+    }
+
+    #[test]
+    fn travel_graph_current_returns_none_when_unset() {
+        let mut g = sample_travel_graph();
+        g.current_node = None;
+        assert_eq!(g.current(), None);
+        assert_eq!(g.render_line(), None);
+    }
+
+    #[test]
+    fn travel_graph_current_returns_none_for_dangling_pointer() {
+        // Defensive: current_node points at a missing node (should never happen
+        // given the collocation invariant, but the helper must not panic).
+        let mut g = sample_travel_graph();
+        g.current_node = Some("deleted_node".to_string());
+        assert_eq!(g.current(), None);
+        assert_eq!(g.render_line(), None);
+        assert!(!g.current_is_indoor());
+    }
+
+    #[test]
+    fn travel_graph_is_adjacent_to_current_true_for_neighbor() {
+        let g = sample_travel_graph();
+        // tavern's neighbors: cellar, market_square.
+        assert!(g.is_adjacent_to_current("cellar"));
+        assert!(g.is_adjacent_to_current("market_square"));
+    }
+
+    #[test]
+    fn travel_graph_is_adjacent_to_current_false_for_non_neighbor() {
+        let g = sample_travel_graph();
+        // cellar is in the graph but NOT adjacent to tavern (one-way edge).
+        // Wait — sample graph has cellar→tavern; tavern's neighbors are
+        // cellar + market_square, so cellar IS adjacent to tavern. Use a node
+        // that exists but isn't in tavern's neighbor list.
+        // Actually all nodes ARE adjacent from tavern in this sample. Build a
+        // case where the destination exists but isn't a neighbor:
+        let mut g = sample_travel_graph();
+        g.nodes.push(Node {
+            id: "distant".to_string(),
+            name: "Far Away".to_string(),
+            neighbors: vec!["market_square".to_string()],
+            setting: "".to_string(),
+        });
+        // "distant" exists in graph but is not in tavern's neighbor list.
+        assert!(!g.is_adjacent_to_current("distant"));
+    }
+
+    #[test]
+    fn travel_graph_is_adjacent_to_current_false_for_unknown() {
+        let g = sample_travel_graph();
+        assert!(!g.is_adjacent_to_current("nonexistent"));
+    }
+
+    #[test]
+    fn travel_graph_is_adjacent_to_current_false_when_no_current() {
+        let mut g = sample_travel_graph();
+        g.current_node = None;
+        assert!(!g.is_adjacent_to_current("cellar"));
+    }
+
+    #[test]
+    fn travel_graph_render_line_shows_current_and_exits() {
+        let g = sample_travel_graph();
+        let rendered = g.render_line().expect("current is set");
+        // Format: "<name> [<id>] (exits: <comma-joined neighbor names>)".
+        assert!(rendered.contains("The Rusty Anchor"));
+        assert!(rendered.contains("[tavern]"));
+        // Exits resolve to neighbor names ("The Cellar", "Market Square").
+        assert!(rendered.contains("The Cellar"));
+        assert!(rendered.contains("Market Square"));
+        assert!(rendered.starts_with("The Rusty Anchor [tavern] (exits: "));
+    }
+
+    #[test]
+    fn travel_graph_render_line_shows_none_for_no_exits() {
+        let g = TravelGraph {
+            nodes: vec![Node {
+                id: "island".to_string(),
+                name: "Deserted Island".to_string(),
+                neighbors: vec![],
+                setting: "".to_string(),
+            }],
+            current_node: Some("island".to_string()),
+        };
+        let rendered = g.render_line().expect("current is set");
+        assert!(rendered.contains("(exits: none)"));
+    }
+
+    #[test]
+    fn travel_graph_render_line_falls_back_to_id_for_unknown_neighbor() {
+        // A node lists a neighbor id that doesn't exist in the graph
+        // (defensive — should never happen, but render must not panic).
+        let g = TravelGraph {
+            nodes: vec![Node {
+                id: "tavern".to_string(),
+                name: "Tavern".to_string(),
+                neighbors: vec!["ghost_node".to_string()],
+                setting: "".to_string(),
+            }],
+            current_node: Some("tavern".to_string()),
+        };
+        let rendered = g.render_line().expect("current is set");
+        // The unknown neighbor id falls back to the bare id.
+        assert!(rendered.contains("ghost_node"));
+    }
+
+    #[test]
+    fn travel_graph_current_is_indoor_true_for_indoor_setting() {
+        let g = sample_travel_graph();
+        // tavern.setting = "indoor".
+        assert!(g.current_is_indoor());
+    }
+
+    #[test]
+    fn travel_graph_current_is_indoor_false_for_outdoor() {
+        let mut g = sample_travel_graph();
+        g.current_node = Some("cellar".to_string()); // cellar.setting = "outdoor"
+        assert!(!g.current_is_indoor());
+    }
+
+    #[test]
+    fn travel_graph_current_is_indoor_false_for_empty_setting() {
+        let mut g = sample_travel_graph();
+        g.current_node = Some("market_square".to_string()); // setting = ""
+        assert!(!g.current_is_indoor());
+    }
+
+    #[test]
+    fn travel_graph_current_is_indoor_case_insensitive() {
+        let g = TravelGraph {
+            nodes: vec![Node {
+                id: "hall".to_string(),
+                name: "Great Hall".to_string(),
+                neighbors: vec![],
+                setting: "INDOOR".to_string(),
+            }],
+            current_node: Some("hall".to_string()),
+        };
+        assert!(g.current_is_indoor());
+    }
+
+    #[test]
+    fn render_for_prompt_omits_location_when_dormant() {
+        // Fresh game (no nodes) → no location line, zero tokens.
+        let schema = WorldSchema::default();
+        assert!(!schema.render_for_prompt().contains("location:"));
+    }
+
+    #[test]
+    fn render_for_prompt_omits_location_when_no_current_node() {
+        // Graph exists but current_node is None → no location line.
+        let mut schema = WorldSchema::default();
+        schema.travel_graph = sample_travel_graph();
+        schema.travel_graph.current_node = None;
+        assert!(!schema.render_for_prompt().contains("location:"));
+    }
+
+    #[test]
+    fn render_for_prompt_includes_location_when_set() {
+        let mut schema = WorldSchema::default();
+        schema.travel_graph = sample_travel_graph();
+        let rendered = schema.render_for_prompt();
+        assert!(rendered.contains("location: The Rusty Anchor [tavern]"));
+        assert!(rendered.contains("(exits:"));
+    }
+
+    #[test]
+    fn render_for_prompt_suppresses_weather_for_indoor_node() {
+        // Component 3 coupling: indoor current node → no weather line.
+        let mut schema = WorldSchema::default();
+        schema.travel_graph = sample_travel_graph(); // current = tavern (indoor)
+        schema.weather = Weather {
+            condition: "heavy rain".to_string(),
+            started_at_minutes: 1000,
+        };
+        let rendered = schema.render_for_prompt();
+        assert!(rendered.contains("location:"));
+        // Weather suppressed because the player is indoors.
+        assert!(!rendered.contains("weather:"));
+    }
+
+    #[test]
+    fn render_for_prompt_keeps_weather_for_outdoor_node() {
+        let mut schema = WorldSchema::default();
+        schema.travel_graph = sample_travel_graph();
+        schema.travel_graph.current_node = Some("cellar".to_string()); // outdoor
+        schema.weather = Weather {
+            condition: "heavy rain".to_string(),
+            started_at_minutes: 1000,
+        };
+        let rendered = schema.render_for_prompt();
+        assert!(rendered.contains("weather: heavy rain"));
+        assert!(rendered.contains("location: The Cellar"));
+    }
+
+    #[test]
+    fn render_for_prompt_keeps_weather_for_empty_setting_node() {
+        // Back-compat: a node with empty setting (no indoor/outdoor flag) →
+        // weather renders as before (the default behavior).
+        let mut schema = WorldSchema::default();
+        schema.travel_graph = sample_travel_graph();
+        schema.travel_graph.current_node = Some("market_square".to_string()); // setting = ""
+        schema.weather = Weather {
+            condition: "clear".to_string(),
+            started_at_minutes: 0,
+        };
+        let rendered = schema.render_for_prompt();
+        assert!(rendered.contains("weather: clear"));
+    }
+
+    #[test]
+    fn render_for_prompt_keeps_weather_when_graph_unset() {
+        // No graph at all → weather renders (no indoor gate possible).
+        let mut schema = WorldSchema::default();
+        schema.weather = Weather {
+            condition: "fog".to_string(),
+            started_at_minutes: 0,
+        };
+        let rendered = schema.render_for_prompt();
+        assert!(rendered.contains("weather: fog"));
+        assert!(!rendered.contains("location:"));
+    }
+
+    #[test]
+    fn apply_delta_does_not_touch_travel_graph() {
+        // Architectural invariant: travel_graph is outside the LLM delta path
+        // (mirrors apply_delta_does_not_touch_world_clock / _weather). A delta
+        // carrying "travel_graph" in its entities map must NOT mutate the typed
+        // field — it just becomes a regular entity key.
+        let mut schema = WorldSchema::default();
+        schema.travel_graph = sample_travel_graph();
+        let original = schema.travel_graph.clone();
+        let mut ents = HashMap::new();
+        ents.insert("travel_graph".to_string(), Some("injected".to_string()));
+        let delta = SchemaDelta {
+            summary: None,
+            recent_events: None,
+            entities: Some(ents),
+        };
+        schema.apply_delta(delta);
+        // The typed travel_graph is unchanged.
+        assert_eq!(schema.travel_graph, original);
+        // The "travel_graph" string landed in the entities map (legacy).
+        assert_eq!(
+            schema.entities.get("travel_graph").map(|s| s.as_str()),
+            Some("injected")
+        );
+    }
+
+    #[test]
+    fn travel_graph_backwards_compat_pre_component3_save_loads_as_empty() {
+        // A pre-Component-3 save JSON (no "travel_graph" field) must
+        // deserialize to TravelGraph::default() (empty graph, dormant).
+        let pre_comp3_json = r#"{
+            "summary": "",
+            "recent_events": [],
+            "entities": {},
+            "player_state": {},
+            "world_clock": {"current_minutes": 0, "last_tick_minutes": 0},
+            "weather": {"condition": "", "started_at_minutes": 0},
+            "immutable_keys": [],
+            "scene_pacing": {"mode": "Exploration", "spatial": 0, "emotional": 0, "kinetic": 0},
+            "status_tags": [],
+            "relationships": {},
+            "offscreen_tasks": []
+        }"#;
+        let parsed: WorldSchema = serde_json::from_str(pre_comp3_json)
+            .expect("pre-Component-3 JSON must deserialize");
+        assert!(!parsed.travel_graph.is_set());
+        assert!(parsed.travel_graph.nodes.is_empty());
+        assert_eq!(parsed.travel_graph.current_node, None);
+    }
+
+    #[test]
+    fn travel_graph_serialize_roundtrip() {
+        let mut schema = WorldSchema::default();
+        schema.travel_graph = sample_travel_graph();
+        let dir = std::env::temp_dir();
+        let path = dir.join("wupi_schema_travel_graph_test.json");
+        let _ = std::fs::remove_file(&path);
+        schema.save(&path).unwrap();
+        let loaded = WorldSchema::load(&path).unwrap();
+        // The graph survives the roundtrip intact (nodes + current_node).
+        assert_eq!(loaded.travel_graph.nodes.len(), 3);
+        assert_eq!(loaded.travel_graph.current_node.as_deref(), Some("tavern"));
+        assert_eq!(
+            loaded.travel_graph.find_node("tavern").map(|n| n.name.as_str()),
+            Some("The Rusty Anchor")
+        );
+        let _ = std::fs::remove_file(&path);
     }
 
     // ---------- immutable_keys (the [CORE]-style lock) ----------

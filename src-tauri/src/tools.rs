@@ -198,7 +198,15 @@ fn is_denied(rel_str: &str) -> bool {
     }
     // Wupi's own persona + playbook (engine content per §8C, replaced on
     // update). She authors USER codex in data/docs/, never her own docs.
-    if rel_str == "data/wupi.sim" || rel_str == "data/wupi.codex" {
+    // Same carve-out for the Game Master persona + the unified Fable
+    // playbook — engine content for the New Game interview flow + the
+    // simulation narrator, never tool-authored. (fable.codex is the
+    // 2026-07-29 unified Fable partition; was gm.codex.)
+    if rel_str == "data/wupi.sim"
+        || rel_str == "data/wupi.codex"
+        || rel_str == "data/gm.sim"
+        || rel_str == "data/fable.codex"
+    {
         return true;
     }
     // API config (creds — user edits via the dedicated IPC).
@@ -340,6 +348,15 @@ pub struct ToolCtx {
     /// (NOT `tokio::sync`). Default `None` → test/standalone unaffected; the
     /// `set_directive` tool errors gracefully if invoked without a slot.
     pub directive_slot: Option<Arc<std::sync::Mutex<Option<String>>>>,
+    /// The interview draft slot (the `sim_draft` tool's write target). A clone
+    /// of `AppState::interview_draft` (`Arc<Mutex<Option<InterviewDraft>>>`).
+    /// The `sim_draft` tool locks it, takes the `InterviewDraft`, applies a
+    /// batch of updates atomically, puts it back. `None` outside an interview
+    /// → `sim_draft` errors gracefully (defensive: the tool spec says
+    /// interview-only, but a model could still emit it). The scribe orchestrator
+    /// in lib.rs snapshots the draft before the agent loop, then reads it again
+    /// after to compute the diff → `interview-fact` events to the frontend.
+    pub interview_draft: Option<Arc<std::sync::Mutex<Option<crate::interview_draft::InterviewDraft>>>>,
 }
 
 impl ToolCtx {
@@ -348,6 +365,7 @@ impl ToolCtx {
             install_root,
             codex_dirty: None,
             directive_slot: None,
+            interview_draft: None,
         }
     }
     /// Attach the shared codex-dirty flag (called once per chat_send from
@@ -362,6 +380,17 @@ impl ToolCtx {
     /// drains the slot into `state.pending_directive`.
     pub fn with_directive_slot(mut self, slot: Arc<std::sync::Mutex<Option<String>>>) -> Self {
         self.directive_slot = Some(slot);
+        self
+    }
+    /// Attach the interview draft slot (called once per interview_send scribe
+    /// turn from lib.rs, before the agent loop iterates). The `sim_draft` tool
+    /// locks + applies updates here; the orchestrator snapshots before + reads
+    /// after to compute the diff for `interview-fact` events.
+    pub fn with_interview_draft(
+        mut self,
+        draft: Arc<std::sync::Mutex<Option<crate::interview_draft::InterviewDraft>>>,
+    ) -> Self {
+        self.interview_draft = Some(draft);
         self
     }
     /// Resolve a sandboxed relative path against the install root.
@@ -425,6 +454,16 @@ pub fn fable_registry() -> Vec<Box<dyn Tool>> {
     vec![Box::new(GenerateOptions), Box::new(SetDirective)]
 }
 
+/// The interview-only tools (the "Scribe" suite): `sim_draft` applies a batch
+/// of incremental updates to the in-progress `InterviewDraft`. Attached to the
+/// agent loop ONLY during a New Game interview scribe turn (`interview_send`
+/// gates this in lib.rs) — invisible to the model outside an interview.
+/// Disjoint from `registry()` and `fable_registry()` (test-pinned like
+/// `fable_registry_specs_disjoint_from_main_registry`).
+pub fn interview_registry() -> Vec<Box<dyn Tool>> {
+    vec![Box::new(SimDraft)]
+}
+
 /// The full tool spec list, ready to hand to `Gemma4Format::render_prompt`.
 pub fn specs() -> Vec<ToolSpec> {
     registry().iter().map(|t| t.spec()).collect()
@@ -434,6 +473,12 @@ pub fn specs() -> Vec<ToolSpec> {
 /// when a Fable session is active (lib.rs).
 pub fn fable_specs() -> Vec<ToolSpec> {
     fable_registry().iter().map(|t| t.spec()).collect()
+}
+
+/// The interview-only tool spec list. `interview_send` passes these to the
+/// scribe's agent loop (lib.rs) so the Scribe can emit `sim_draft` calls.
+pub fn interview_specs() -> Vec<ToolSpec> {
+    interview_registry().iter().map(|t| t.spec()).collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -1042,6 +1087,125 @@ impl Tool for SetDirective {
     }
 }
 
+// --- sim_draft (Scribe tool for the New Game interview) --------------------
+
+/// The Scribe's only tool. Called by the local Gemma 12B scribe after each GM
+/// turn during a New Game interview: extracts facts from the conversation +
+/// emits a batched `{updates: [...]}` that this tool applies to the in-progress
+/// `InterviewDraft` (held in `AppState::interview_draft`).
+///
+/// **Single batched tool per scribe turn** (not granular per-field tools): the
+/// §11.26 finding (Gemma 12B emits unquoted JSON keys, validation failures
+/// WILL happen) made granular tools fragile — one bigger call survives the
+/// 3-pass repair loop better than many small ones. The batch is atomic
+/// (`InterviewDraft::apply_updates` validates the whole batch before any
+/// mutation; one bad update rejects the whole batch, leaving the draft clean).
+///
+/// The tool does NOT emit UI events — the orchestrator in lib.rs snapshots the
+/// draft before the agent loop, reads it after, and emits the diff as
+/// `app.emit("interview-fact", ...)` events to the frontend's preview panel.
+struct SimDraft;
+impl Tool for SimDraft {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "sim_draft".into(),
+            description: "Apply a batch of incremental updates to the building SimCard draft. \
+                          Called by the Scribe after each GM turn during a New Game interview. \
+                          \
+                          Argument: {\"updates\": [{...}, {...}]}. \
+                          Each update is one of: \
+                          {\"type\":\"set_field\",\"field\":\"name|setting|tone|opening_scene|player_name|core_persona\",\"value\":\"...\"}, \
+                          {\"type\":\"add_trait\",\"value\":\"- Measured.\"}, \
+                          {\"type\":\"add_npc\",\"id\":\"mara_the_innkeep\"}, \
+                          {\"type\":\"add_activity\",\"value\":\"conversation\"}, \
+                          {\"type\":\"add_entity\",\"key\":\"loc.tavern\",\"state\":\"warm, half-full\"}, \
+                          {\"type\":\"set_player_background\",\"value\":\"a traveling herbalist\"}, \
+                          {\"type\":\"set_starting_condition\",\"value\":\"exhausted from the road\"}, \
+                          {\"type\":\"set_start_node\",\"value\":\"tavern\"}. \
+                          \
+                          Extract ONLY what the player/GM established; never invent facts. \
+                          Return: a short summary of what was applied.".into(),
+        }
+    }
+    fn validate_args(&self, args: &serde_json::Value) -> Result<(), ToolError> {
+        let updates = args
+            .get("updates")
+            .and_then(|v| v.as_array())
+            .ok_or_else(|| ToolError::new("missing or non-array argument `updates`"))?;
+        if updates.is_empty() {
+            return Err(ToolError::new("`updates` must not be empty"));
+        }
+        if updates.len() > 40 {
+            return Err(ToolError::new("too many updates (>40); split across turns"));
+        }
+        // Smoke-deserialize each update so `execute` can't fail on a shape
+        // error. Detailed per-field validation happens in
+        // `InterviewDraft::apply_updates`.
+        for (i, u) in updates.iter().enumerate() {
+            serde_json::from_value::<crate::interview_draft::DraftUpdate>(u.clone())
+                .map_err(|e| ToolError::new(format!("updates[{i}] invalid: {e}")))?;
+        }
+        Ok(())
+    }
+    fn execute(&self, args: &serde_json::Value, ctx: &ToolCtx) -> Result<String, ToolError> {
+        let Some(slot) = &ctx.interview_draft else {
+            // No slot = no interview. Defensive: the spec says interview-only.
+            return Err(ToolError::new(
+                "no interview draft available (not in a New Game interview?)",
+            ));
+        };
+        // Re-parse from args (validated above; clone avoids borrowing args
+        // across the mutex lock).
+        let updates_val = args
+            .get("updates")
+            .and_then(|v| v.as_array())
+            .ok_or_else(|| ToolError::new("updates vanished (bug)"))?;
+        let mut updates: Vec<crate::interview_draft::DraftUpdate> = Vec::with_capacity(updates_val.len());
+        for u in updates_val {
+            updates.push(
+                serde_json::from_value(u.clone())
+                    .map_err(|e| ToolError::new(format!("re-parse failed (bug): {e}")))?,
+            );
+        }
+        let count = updates.len();
+        let mut g = slot
+            .lock()
+            .map_err(|_| ToolError::new("interview draft slot poisoned"))?;
+        let draft_opt = g.take();
+        let mut draft = draft_opt.unwrap_or_default();
+        // apply_updates validates the whole batch before mutating; on failure
+        // we put the unchanged draft back so the preview stays consistent.
+        match draft.apply_updates(updates) {
+            Ok(()) => {
+                // Build a short human-readable summary of the new state.
+                let summary = format!(
+                    "applied {} update{}; draft now {}% complete ({})",
+                    count,
+                    if count == 1 { "" } else { "s" },
+                    draft.completion_pct(),
+                    if draft.is_finalizable() {
+                        "finalizable"
+                    } else {
+                        "missing: "
+                    }
+                );
+                let summary = if draft.is_finalizable() {
+                    summary
+                } else {
+                    format!("{}{}", summary, draft.missing_required().join(", "))
+                };
+                *g = Some(draft);
+                Ok(summary)
+            }
+            Err(e) => {
+                // Put the unchanged draft back, return the model-facing error.
+                *g = Some(draft);
+                Err(ToolError::new(format!("batch rejected: {e}")))
+            }
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -1380,6 +1544,109 @@ mod tests {
         for s in fable_specs() {
             assert!(!main.contains(&s.name), "fable tool {} also in main registry", s.name);
         }
+    }
+
+    #[test]
+    fn interview_registry_includes_sim_draft() {
+        let names: Vec<String> = interview_specs().iter().map(|s| s.name.clone()).collect();
+        assert!(names.contains(&"sim_draft".to_string()), "have: {names:?}");
+    }
+
+    #[test]
+    fn interview_registry_disjoint_from_main_and_fable() {
+        // sim_draft must never collide with main-registry tools (file_read,
+        // create_sim_card, ...) NOR fable-registry tools (generate_options,
+        // set_directive). Three disjoint suites.
+        let main: std::collections::HashSet<String> =
+            specs().iter().map(|s| s.name.clone()).collect();
+        let fable: std::collections::HashSet<String> =
+            fable_specs().iter().map(|s| s.name.clone()).collect();
+        for s in interview_specs() {
+            assert!(!main.contains(&s.name), "interview tool {} also in main registry", s.name);
+            assert!(!fable.contains(&s.name), "interview tool {} also in fable registry", s.name);
+        }
+    }
+
+    #[test]
+    fn sim_draft_rejects_missing_slot() {
+        // No interview_draft attached → graceful error (defensive; the tool
+        // spec says interview-only, but a model could still emit it).
+        let ctx = ToolCtx::new(PathBuf::from("/tmp"));
+        let err = SimDraft.execute(
+            &args(r#"{"updates":[{"type":"add_trait","value":"x"}]}"#),
+            &ctx,
+        )
+        .unwrap_err();
+        assert!(err.message.contains("interview draft"));
+    }
+
+    #[test]
+    fn sim_draft_rejects_empty_updates() {
+        let err = SimDraft
+            .validate_args(&args(r#"{"updates":[]}"#))
+            .unwrap_err();
+        assert!(err.message.contains("empty"));
+    }
+
+    #[test]
+    fn sim_draft_rejects_bad_update_shape() {
+        // Unknown `type` discriminator → serde fails the smoke-deserialize.
+        let err = SimDraft
+            .validate_args(&args(
+                r#"{"updates":[{"type":"set_hit_points","value":50}]}"#,
+            ))
+            .unwrap_err();
+        assert!(err.message.contains("updates[0]"));
+    }
+
+    #[test]
+    fn sim_draft_applies_valid_batch_to_draft_slot() {
+        use crate::interview_draft::InterviewDraft;
+        let slot: Arc<std::sync::Mutex<Option<InterviewDraft>>> =
+            Arc::new(std::sync::Mutex::new(Some(InterviewDraft::default())));
+        let ctx = ToolCtx::new(PathBuf::from("/tmp")).with_interview_draft(slot.clone());
+        let out = SimDraft
+            .execute(
+                &args(
+                    r#"{"updates":[
+                        {"type":"set_field","field":"name","value":"The Neon Dragon"},
+                        {"type":"set_field","field":"setting","value":"3 AM in the arcology."},
+                        {"type":"add_npc","id":"vex"}
+                    ]}"#,
+                ),
+                &ctx,
+            )
+            .unwrap();
+        assert!(out.contains("applied 3 updates"));
+        let g = slot.lock().unwrap();
+        let draft = g.as_ref().unwrap();
+        assert_eq!(draft.name.as_deref(), Some("The Neon Dragon"));
+        assert!(draft.start_npc_ids.contains(&"vex".to_string()));
+    }
+
+    #[test]
+    fn sim_draft_rejects_atomic_on_partial_invalid() {
+        use crate::interview_draft::InterviewDraft;
+        let slot: Arc<std::sync::Mutex<Option<InterviewDraft>>> =
+            Arc::new(std::sync::Mutex::new(Some(InterviewDraft::default())));
+        let ctx = ToolCtx::new(PathBuf::from("/tmp")).with_interview_draft(slot.clone());
+        // Valid update + invalid (unknown field) → whole batch rejects,
+        // draft untouched.
+        let err = SimDraft
+            .execute(
+                &args(
+                    r#"{"updates":[
+                        {"type":"set_field","field":"name","value":"X"},
+                        {"type":"set_field","field":"bogus","value":"Y"}
+                    ]}"#,
+                ),
+                &ctx,
+            )
+            .unwrap_err();
+        assert!(err.message.contains("batch rejected"));
+        let g = slot.lock().unwrap();
+        let draft = g.as_ref().unwrap();
+        assert!(draft.name.is_none(), "atomic: valid update did NOT apply");
     }
 
     #[test]

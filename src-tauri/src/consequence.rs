@@ -653,6 +653,13 @@ fn nudge_condition_down(c: Condition) -> Condition {
 /// the counts separately (buffs lift toward Unscathed; debuffs drag toward
 /// Downed). The label itself is free-form: the narrator sees it as a phrase
 /// it can weave into prose, NOT as "+2 to attack."
+///
+/// `kind` (Phase 4 §11.44, Component 1) is the optional discriminator that
+/// routes a tag out of the generic buff/debuff lanes into a dedicated render
+/// lane — the load-bearing case is `"disguise"`, which the disguise Referee
+/// gate reads to decide auto-pass vs scrutiny. Generic tags (the historical
+/// case) leave `kind` empty; they route by `polarity` as before. Backwards-
+/// compatible via `#[serde(default)]` — pre-Phase-4 saves load as empty.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct StatusTag {
     /// The diegetic label. Free-form, narrator-facing. Reads as a phrase
@@ -669,6 +676,12 @@ pub struct StatusTag {
     /// "bitten by a swamp viper"). Tracing + narrator flavor; not load-bearing.
     #[serde(default)]
     pub source: String,
+    /// Optional discriminator routing a tag out of the generic buff/debuff
+    /// lanes into a dedicated render + mechanic lane. Currently recognized:
+    /// `"disguise"` (Phase 4 Component 1 — read by the disguise Referee
+    /// gate). Empty string = generic effect (the historical case).
+    #[serde(default)]
+    pub kind: String,
 }
 
 /// Whether a `StatusTag` helps or hurts. The polarity drives `derive_condition`'s
@@ -679,6 +692,22 @@ pub struct StatusTag {
 pub enum Polarity {
     Buff,
     Debuff,
+}
+
+impl Default for StatusTag {
+    /// Default is a generic, non-expiring Buff with no source and no kind —
+    /// matches the historical pre-Phase-4 construction shape so existing
+    /// call sites can use `..Default::default()` to omit fields they don't
+    /// care about.
+    fn default() -> Self {
+        Self {
+            label: String::new(),
+            polarity: Polarity::Buff,
+            expires_at: 0,
+            source: String::new(),
+            kind: String::new(),
+        }
+    }
 }
 
 impl StatusTag {
@@ -726,26 +755,32 @@ pub fn count_by_polarity(tags: &[StatusTag], polarity: Polarity) -> usize {
 /// empty. Format:
 /// ```text
 /// buffs: Berserk Rage, Blessed by the Sun Priest
-/// debuffs: Feverish, Poisoned (expires Day 3, 14:00)
+/// debuffs: Feverish, Poisoned
+/// disguises: city guard uniform
 /// ```
 /// The narrator reads this as flavor it can weave in, not as a stat sheet.
-/// The `expires` annotation on debuffs is intentional: it tells the narrator
-/// the affliction is time-limited (the player can wait it out), which shapes
-/// scene-planning prose. Buffs don't get the annotation because their
-/// expiry is less narratively relevant (you don't usually narrate "the
-/// potion will wear off in 4 hours" — the player just feels it fade).
+///
+/// Phase 4 §11.44 (Component 1): tags carrying a recognized `kind` route
+/// out of the buff/debuff lanes into a dedicated lane. Currently the only
+/// recognized kind is `"disguise"`. Tags with an unrecognized or empty
+/// `kind` route by `polarity` exactly as before (backwards-compatible).
 pub fn render_tags_for_prompt(tags: &[StatusTag]) -> Option<String> {
     if tags.is_empty() {
         return None;
     }
     let buffs: Vec<&str> = tags
         .iter()
-        .filter(|t| t.polarity == Polarity::Buff)
+        .filter(|t| t.kind.is_empty() && t.polarity == Polarity::Buff)
         .map(|t| t.label.as_str())
         .collect();
     let debuffs: Vec<&str> = tags
         .iter()
-        .filter(|t| t.polarity == Polarity::Debuff)
+        .filter(|t| t.kind.is_empty() && t.polarity == Polarity::Debuff)
+        .map(|t| t.label.as_str())
+        .collect();
+    let disguises: Vec<&str> = tags
+        .iter()
+        .filter(|t| t.kind == "disguise")
         .map(|t| t.label.as_str())
         .collect();
     let mut lines: Vec<String> = Vec::new();
@@ -754,6 +789,9 @@ pub fn render_tags_for_prompt(tags: &[StatusTag]) -> Option<String> {
     }
     if !debuffs.is_empty() {
         lines.push(format!("debuffs: {}", debuffs.join(", ")));
+    }
+    if !disguises.is_empty() {
+        lines.push(format!("disguises: {}", disguises.join(", ")));
     }
     if lines.is_empty() {
         None
@@ -1264,6 +1302,7 @@ mod tests {
             polarity: Polarity::Buff,
             expires_at: 1000,
             source: "quaffed a potion".into(),
+        kind: String::new(),
         };
         // Just before expiry: still active.
         assert!(!tag.is_expired(999));
@@ -1282,6 +1321,7 @@ mod tests {
             polarity: Polarity::Debuff,
             expires_at: 0,
             source: String::new(),
+        kind: String::new(),
         };
         assert!(!tag.is_expired(0), "permanent tags never expire");
         assert!(!tag.is_expired(9_999_999), "permanent tags never expire");
@@ -1295,24 +1335,28 @@ mod tests {
                 polarity: Polarity::Buff,
                 expires_at: 500,
                 source: String::new(),
+            kind: String::new(),
             },
             StatusTag {
                 label: "Blessed".into(),
                 polarity: Polarity::Buff,
                 expires_at: 1500,
                 source: String::new(),
+            kind: String::new(),
             },
             StatusTag {
                 label: "Feverish".into(),
                 polarity: Polarity::Debuff,
                 expires_at: 200,
                 source: String::new(),
+            kind: String::new(),
             },
             StatusTag {
                 label: "Cursed (permanent)".into(),
                 polarity: Polarity::Debuff,
                 expires_at: 0, // permanent — must survive
                 source: String::new(),
+            kind: String::new(),
             },
         ];
         let dropped = expire_tags(&mut tags, 1000);
@@ -1332,6 +1376,7 @@ mod tests {
                 polarity: Polarity::Buff,
                 expires_at: 1000,
                 source: String::new(),
+            kind: String::new(),
             },
         );
         assert!(!ok, "empty label must be rejected");
@@ -1343,6 +1388,7 @@ mod tests {
                 polarity: Polarity::Buff,
                 expires_at: 1000,
                 source: String::new(),
+            kind: String::new(),
             },
         );
         assert!(ok);
@@ -1357,18 +1403,21 @@ mod tests {
                 polarity: Polarity::Buff,
                 expires_at: 1000,
                 source: String::new(),
+            kind: String::new(),
             },
             StatusTag {
                 label: "Hasted".into(),
                 polarity: Polarity::Buff,
                 expires_at: 1000,
                 source: String::new(),
+            kind: String::new(),
             },
             StatusTag {
                 label: "Poisoned".into(),
                 polarity: Polarity::Debuff,
                 expires_at: 1000,
                 source: String::new(),
+            kind: String::new(),
             },
         ];
         assert_eq!(count_by_polarity(&tags, Polarity::Buff), 2);
@@ -1383,17 +1432,134 @@ mod tests {
                 polarity: Polarity::Buff,
                 expires_at: 1000,
                 source: String::new(),
+            kind: String::new(),
             },
             StatusTag {
                 label: "Poisoned".into(),
                 polarity: Polarity::Debuff,
                 expires_at: 1000,
                 source: String::new(),
+            kind: String::new(),
             },
         ];
         let rendered = render_tags_for_prompt(&tags).expect("non-empty must render");
         assert!(rendered.contains("buffs: Blessed"));
         assert!(rendered.contains("debuffs: Poisoned"));
+    }
+
+    // ---- Phase 4 §11.44 (Component 1): StatusTag.kind discriminator ----
+
+    #[test]
+    fn status_tag_kind_defaults_empty_via_serde() {
+        // Pre-Phase-4 saves don't carry `kind`; serde must load them as empty
+        // (the generic-effect lane), NOT fail, NOT coerce to anything else.
+        let json = r#"{"label":"Blessed","polarity":"buff","expires_at":0,"source":""}"#;
+        let tag: StatusTag = serde_json::from_str(json).expect("missing kind must default");
+        assert_eq!(tag.label, "Blessed");
+        assert_eq!(tag.kind, "", "kind defaults to empty string");
+    }
+
+    #[test]
+    fn status_tag_kind_round_trips_through_serde() {
+        let tag = StatusTag {
+            label: "city guard uniform".into(),
+            polarity: Polarity::Buff,
+            expires_at: 0,
+            source: String::new(),
+            kind: "disguise".into(),
+        };
+        let json = serde_json::to_string(&tag).unwrap();
+        let back: StatusTag = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.kind, "disguise");
+    }
+
+    #[test]
+    fn render_tags_routes_disguise_into_own_lane() {
+        // A disguise tag (kind="disguise") must NOT appear in buffs:/debuffs:,
+        // even when its polarity is Buff. It goes to its own `disguises:` line.
+        let tags = vec![
+            StatusTag {
+                label: "Blessed".into(),
+                polarity: Polarity::Buff,
+                expires_at: 1000,
+                source: String::new(),
+                kind: String::new(),
+            },
+            StatusTag {
+                label: "city guard uniform".into(),
+                polarity: Polarity::Buff, // buff polarity, but kind routes it away
+                expires_at: 0,
+                source: String::new(),
+                kind: "disguise".into(),
+            },
+        ];
+        let rendered = render_tags_for_prompt(&tags).expect("must render");
+        assert!(
+            rendered.contains("buffs: Blessed"),
+            "generic buff stays in buffs lane: {rendered}"
+        );
+        assert!(
+            !rendered.contains("buffs: city guard uniform"),
+            "disguise must NOT leak into buffs lane: {rendered}"
+        );
+        assert!(
+            rendered.contains("disguises: city guard uniform"),
+            "disguise lands in its own lane: {rendered}"
+        );
+    }
+
+    #[test]
+    fn render_tags_disguise_lane_joins_multiple_disguises() {
+        let tags = vec![
+            StatusTag {
+                label: "city guard uniform".into(),
+                polarity: Polarity::Buff,
+                expires_at: 0,
+                source: String::new(),
+                kind: "disguise".into(),
+            },
+            StatusTag {
+                label: "merchant robes".into(),
+                polarity: Polarity::Debuff, // polarity ignored when kind=disguise
+                expires_at: 0,
+                source: String::new(),
+                kind: "disguise".into(),
+            },
+        ];
+        let rendered = render_tags_for_prompt(&tags).expect("must render");
+        assert!(rendered.contains("disguises: city guard uniform, merchant robes"));
+        assert!(!rendered.contains("buffs:"), "no buffs lane when only disguises");
+        assert!(!rendered.contains("debuffs:"), "no debuffs lane when only disguises");
+    }
+
+    #[test]
+    fn render_tags_empty_kind_generic_tag_unaffected() {
+        // Empty kind = generic effect → routes by polarity exactly as before.
+        // This is the backwards-compat guarantee: pre-Phase-4 tags unchanged.
+        let tags = vec![StatusTag {
+            label: "Poisoned".into(),
+            polarity: Polarity::Debuff,
+            expires_at: 1000,
+            source: String::new(),
+            kind: String::new(),
+        }];
+        let rendered = render_tags_for_prompt(&tags).expect("must render");
+        assert!(rendered.contains("debuffs: Poisoned"));
+        assert!(!rendered.contains("disguises:"));
+    }
+
+    #[test]
+    fn render_tags_only_disguises_no_buffs_debuffs() {
+        // Sanity: a disguise-only list produces a disguises: line and nothing else.
+        let tags = vec![StatusTag {
+            label: "novice robe".into(),
+            polarity: Polarity::Buff,
+            expires_at: 0,
+            source: String::new(),
+            kind: "disguise".into(),
+        }];
+        let rendered = render_tags_for_prompt(&tags).expect("must render");
+        assert_eq!(rendered.trim(), "disguises: novice robe");
     }
 
     #[test]
@@ -1409,6 +1575,7 @@ mod tests {
             polarity: Polarity::Buff,
             expires_at: 1000,
             source: String::new(),
+        kind: String::new(),
         }];
         let rendered = render_tags_for_prompt(&tags).expect("non-empty must render");
         assert!(rendered.contains("buffs: Blessed"));
