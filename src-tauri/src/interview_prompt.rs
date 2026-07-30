@@ -320,7 +320,7 @@ hooded figure in the corner doesn't look up at all.\n\
 // The old `InterviewMessage` struct + `build_interview_system_prompt` +
 // `build_finalize_system_prompt` were deleted when Quick Play moved from a
 // multi-turn GM chat to a single-shot generation. The GM persona
-// (`data/gm.sim`) is no longer referenced from this module.
+// (`data/fable.sim`) is no longer referenced from this module.
 
 #[cfg(test)]
 mod tests {

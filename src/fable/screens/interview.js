@@ -39,6 +39,8 @@
 
 import { invoke, Channel } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
+import { open as openDialog } from '@tauri-apps/plugin-dialog';
+import { getCurrentWebview } from '@tauri-apps/api/webview';
 import { createVoidParticles } from './void-particles.js';
 import * as beats from '../engine/beats.js';
 
@@ -85,6 +87,13 @@ let listeners = [];             // [el, type, handler] tracked for teardown
 let unlistenFact = null;        // the interview-fact unsubscribe fn
 let activeBeat = null;          // the currently-streaming narrator beat
 let toastTimer = null;          // scribeToast auto-dismiss timer
+
+// ── Import flow state (2026-07-29, the "Create vs Import" fork) ──────────
+let choiceMode = false;         // true while the Create/Import buttons are showing
+let dropMode = false;           // true while the screen is listening for a file drop
+let deciphering = false;        // true while import_decipher_card is running
+let unlistenDragDrop = null;    // the tauri://drag-drop unsubscribe fn
+let dropOverlay = null;         // the full-screen drop-zone overlay element
 
 export function buildInterview() {
   const root = document.createElement('section');
@@ -173,6 +182,13 @@ export function wireInterview(root, hooks) {
   aborted = false;
   ready = false;
   activeBeat = null;
+  // Import-flow state (2026-07-29): reset on every entry.
+  choiceMode = false;
+  dropMode = false;
+  deciphering = false;
+  if (unlistenDragDrop) { try { unlistenDragDrop(); } catch (_) {} unlistenDragDrop = null; }
+  if (dropOverlay && dropOverlay.parentNode) dropOverlay.parentNode.removeChild(dropOverlay);
+  dropOverlay = null;
   if (toastTimer) { clearTimeout(toastTimer); toastTimer = null; }
 
   // Reset the DOM to its empty state.
@@ -264,10 +280,232 @@ async function startInterview() {
   } catch (err) {
     console.error('[interview] interview_draft_state failed', err);
   }
-  // Seed the GM with an opening turn. The text is a neutral handshake —
-  // the GM is persona-driven server-side, so a short prompt is enough to
-  // get the conversation rolling without biasing the draft.
-  sendTurn("Hi! I'd like to set up a new game. Walk me through what you need.");
+  // CANNED greeting + the Create/Import choice (Gemini ruling #1: never spend
+  // model tokens on a UI greeting). The GM beat is a canned system beat; the
+  // two buttons are frontend-rendered, not model-generated. The user picks;
+  // only AFTER the pick does the model get involved (Create → normal interview;
+  // Import → the decipher pass).
+  const greetBeat = beats.startNarratorBeat();
+  beats.appendChunk(greetBeat,
+    'Welcome. I am the Game Master.\n\n' +
+    'Would you like to create something from scratch, or import something you own?');
+  beats.finalizeBeat(greetBeat);
+  showChoice();
+}
+
+// ── The Create/Import choice ────────────────────────────────────────────
+//
+// Renders two buttons (Create / Import) as a system beat under the greeting.
+// Create → canned GM acknowledgement + the normal interview question ladder.
+// Import → canned GM acknowledgement + drop-listening mode (the whole screen
+// becomes a drop zone + a folder-icon fallback button).
+function showChoice() {
+  choiceMode = true;
+  const choice = document.createElement('div');
+  choice.className = 'fable-interview-choice';
+  const createBtn = document.createElement('button');
+  createBtn.type = 'button';
+  createBtn.className = 'fable-interview-choice-btn';
+  createBtn.textContent = 'Create';
+  const importBtn = document.createElement('button');
+  importBtn.type = 'button';
+  importBtn.className = 'fable-interview-choice-btn';
+  importBtn.textContent = 'Import';
+  choice.appendChild(createBtn);
+  choice.appendChild(importBtn);
+  // Append the choice row into the feed as a system-style beat so it sits
+  // right under the greeting + scrolls naturally.
+  if (feedEl) feedEl.appendChild(choice);
+  beats.scrollDown();
+
+  const choose = (kind) => {
+    if (!choiceMode) return;
+    choiceMode = false;
+    if (choice.parentNode) choice.remove();
+    if (kind === 'create') {
+      onChooseCreate();
+    } else {
+      onChooseImport();
+    }
+  };
+  createBtn.addEventListener('click', () => choose('create'));
+  importBtn.addEventListener('click', () => choose('import'));
+}
+
+// Create: canned GM ack, then kick the normal question ladder via the first
+// real interview_send turn.
+function onChooseCreate() {
+  const ack = beats.startNarratorBeat();
+  beats.appendChunk(ack,
+    'Ah, so you wish to create something new? Very well — let us begin.');
+  beats.finalizeBeat(ack);
+  // The first real turn: hand control to the persona-driven GM. A short
+  // handshake is enough; the GM's system prompt drives the question ladder.
+  sendTurn("Let's build a new world together.");
+}
+
+// Import: canned GM ack, then enter drop-listening mode.
+function onChooseImport() {
+  const ack = beats.startNarratorBeat();
+  beats.appendChunk(ack,
+    'Oh, you already have something? Please drag it over here and show me.');
+  beats.finalizeBeat(ack);
+  enterDropMode();
+}
+
+// ── Drop-listening mode ─────────────────────────────────────────────────
+//
+// Gemini ruling #3: a GATED JS listener scoped to the interview screen. We do
+// NOT toggle Tauri's global dragDropEnabled flag (that races the chat input's
+// text-drop). Instead we listen to Tauri's native drag-drop events
+// (tauri://drag-drop) ONLY while dropMode is true + the interview is mounted.
+// The whole screen becomes a drop target (a dimming overlay + central prompt)
+// + a white folder-icon button below for users who prefer a native picker.
+function enterDropMode() {
+  if (dropMode) return;
+  dropMode = true;
+
+  // The drop overlay: dims the screen + shows a central "drop here" prompt +
+  // the folder-icon fallback. Lives inside the interview screen so teardown
+  // removes it with the DOM.
+  dropOverlay = document.createElement('div');
+  dropOverlay.className = 'fable-interview-drop';
+  dropOverlay.innerHTML = `
+    <div class="fable-interview-drop-inner">
+      <div class="fable-interview-drop-prompt">Drop your card file here</div>
+      <div class="fable-interview-drop-hint">.png or .json · character card or lorebook</div>
+      <button type="button" class="fable-interview-folder-btn" data-folder-btn>
+        <span class="fable-interview-folder-icon">🗀</span>
+        <span>or browse…</span>
+      </button>
+    </div>`;
+  if (interviewRoot) interviewRoot.appendChild(dropOverlay);
+
+  // The folder-icon fallback → native OS picker, filtered to card files.
+  const folderBtn = dropOverlay.querySelector('[data-folder-btn]');
+  if (folderBtn) {
+    folderBtn.addEventListener('click', () => {
+      openDialog({
+        multiple: false,
+        filters: [
+          { name: 'Card files', extensions: ['png', 'json'] },
+        ],
+      }).then((selected) => {
+        if (!selected) return;
+        // The dialog returns either a single path string or {path} on some
+        // platforms — normalize to a path string.
+        const p = typeof selected === 'string' ? selected : (selected && selected.path) || null;
+        if (p) handleDroppedFile(p);
+      }).catch((err) => {
+        console.error('[interview] folder picker failed', err);
+      });
+    });
+  }
+
+  // The gated Tauri drag-drop listener. Tauri 2 emits 'tauri://drag-drop'
+  // with payload { type: 'drop', paths: [abs, ...] }. We only act on it while
+  // dropMode is true (the gate) + the interview screen is the active screen.
+  // Other screens' drops do nothing here (the listener is unsubscribed on
+  // teardown). This keeps the chat input's text-drop behavior intact outside
+  // the import flow.
+  try {
+    const wv = getCurrentWebview();
+    const off = wv.onDragDropEvent((e) => {
+      if (!dropMode) return;
+      if (e && e.payload && e.payload.type === 'drop') {
+        const paths = Array.isArray(e.payload.paths) ? e.payload.paths : [];
+        if (paths.length > 0) handleDroppedFile(paths[0]);
+      }
+    });
+    unlistenDragDrop = off;
+  } catch (err) {
+    console.error('[interview] drag-drop listener bind failed', err);
+  }
+}
+
+function exitDropMode() {
+  dropMode = false;
+  if (unlistenDragDrop) { try { unlistenDragDrop(); } catch (_) {} unlistenDragDrop = null; }
+  if (dropOverlay && dropOverlay.parentNode) dropOverlay.parentNode.removeChild(dropOverlay);
+  dropOverlay = null;
+}
+
+// A file was dropped or picked. Hide the drop zone, show a canned "one
+// moment" GM beat, then fire the decipher IPC.
+function handleDroppedFile(path) {
+  if (deciphering) return;
+  exitDropMode();
+  const beat = beats.startNarratorBeat();
+  beats.appendChunk(beat, 'Oh, this is very interesting. Please give me one moment…');
+  beats.finalizeBeat(beat);
+  runDecipher(path);
+}
+
+// ── The decipher pass (import_decipher_card via Channel) ────────────────
+//
+// Mirrors the interview_send Channel pattern. Routes deciphering/done/error.
+// On done (card kind), the draft snapshot fills the preview + a canned GM
+// beat asks if it's alright. On done (lorebook kind), a beat notes how many
+// entries were imported. The UNCHANGED refinement loop takes over from here.
+async function runDecipher(path) {
+  if (deciphering) return;
+  deciphering = true;
+  if (inputEl) inputEl.disabled = true;
+
+  const channel = new Channel();
+  channel.onmessage = (msg) => handleDecipherEvent(msg);
+
+  try {
+    await invoke('import_decipher_card', { path, onEvent: channel });
+  } catch (err) {
+    console.error('[interview] import_decipher_card failed', err);
+    beats.addErrorBeat(String((err && err.message) || err || 'Could not read that file.'));
+  } finally {
+    deciphering = false;
+    if (inputEl) inputEl.disabled = false;
+  }
+}
+
+function handleDecipherEvent(msg) {
+  if (!msg || typeof msg !== 'object') return;
+  switch (msg.type) {
+    case 'deciphering':
+      // The model is rebuilding the prose. (The canned "one moment" beat is
+      // already showing.) No UI action needed.
+      break;
+    case 'done': {
+      if (msg.kind === 'lorebook') {
+        const n = typeof msg.entry_count === 'number' ? msg.entry_count : 0;
+        const beat = beats.startNarratorBeat();
+        beats.appendChunk(beat,
+          n > 0
+            ? `I've absorbed ${n} entries from your lorebook into the world's memory. Is there a character you'd like to bring in next?`
+            : 'That lorebook had no entries I could read. Is there something else you\'d like to import?');
+        beats.finalizeBeat(beat);
+      } else {
+        // Card kind: the draft snapshot filled server-side. Pull it so the
+        // preview reflects the imported card, then ask if it's alright.
+        const snap = msg.draft || null;
+        if (snap) {
+          draft = snap;
+          renderPreview(snap);
+          if (snap.is_finalizable && !ready) revealBegin();
+        }
+        const beat = beats.startNarratorBeat();
+        beats.appendChunk(beat,
+          'Here is what I made of your card. Is this alright, or would you like to make some adjustments?');
+        beats.finalizeBeat(beat);
+      }
+      break;
+    }
+    case 'error': {
+      const m = typeof msg.message === 'string' ? msg.message : 'I could not decipher that file.';
+      beats.addErrorBeat(m);
+      break;
+    }
+    default:
+      break;
+  }
 }
 
 // ── Send one GM turn ────────────────────────────────────────────────────
@@ -600,6 +838,11 @@ export function teardownInterview() {
   aborted = true;
   if (particles) { particles.destroy(); particles = null; }
   if (unlistenFact) { try { unlistenFact(); } catch (_) {} unlistenFact = null; }
+  // Import-flow cleanup: unsubscribe the drag-drop listener + remove the drop
+  // overlay so a re-entry never double-binds or leaves a stale overlay.
+  exitDropMode();
+  choiceMode = false;
+  deciphering = false;
   if (toastTimer) { clearTimeout(toastTimer); toastTimer = null; }
   // Best-effort: stop an in-flight GM stream so the backend's cancel token
   // doesn't dangle. Safe no-op if nothing is streaming.

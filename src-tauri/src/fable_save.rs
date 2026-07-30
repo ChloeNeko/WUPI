@@ -352,6 +352,7 @@ mod tests {
             declared_activities: Vec::new(),
             player_name: Some("Tester".into()),
             locations: Vec::new(),
+            cast: Vec::new(),
         }
     }
 

@@ -148,7 +148,8 @@ impl StreamFilter {
         //   [MILESTONE npc_id event_id]    (Phase 3 Slice 5, 2026-07-28)
         //   [TASK npc_id desc | d s eta]   (Phase 3 Slice 6, 2026-07-28)
         //   [RUMOR label]                  (Phase 4 Component 4, 2026-07-28)
-        let pattern = r"\[(?:CHARACTER_TURN:(?:end|[A-Za-z0-9_-]+)|OBJECT\s+[^\]]+|FX\s+[^\]]+|TIME\s+[^\]]+|WEATHER\s+[^\]]+|TRAVEL\s+[^\]]+|EFFECT\s+[^\]]+|MILESTONE\s+[^\]]+|TASK\s+[^\]]+|RUMOR\s+[^\]]+)\]";
+        //   [PRESENCE npc_id stance]       (Phase 5A, 2026-07-29)
+        let pattern = r"\[(?:CHARACTER_TURN:(?:end|[A-Za-z0-9_-]+)|OBJECT\s+[^\]]+|FX\s+[^\]]+|TIME\s+[^\]]+|WEATHER\s+[^\]]+|TRAVEL\s+[^\]]+|EFFECT\s+[^\]]+|MILESTONE\s+[^\]]+|TASK\s+[^\]]+|RUMOR\s+[^\]]+|PRESENCE\s+[^\]]+)\]";
         self.bracket_re = Some(Regex::new(pattern).expect("bracket regex always compiles"));
         // Longest realistic bracket: `[TASK npc.marcus scout the bandit camp |
         // challenging adequate 1440]` ≈ 70 chars; an EFFECT with a long label

@@ -20,11 +20,12 @@
 //              destroyed, music removed, chrome restored, OS aurora resumed,
 //              fable_end IPC sent. Nothing survives the close.
 //
-// MENU STATE: the 4 menu flows (New Game / Continue / Load / Quick Play)
-// are currently NO-OPS — their buttons stay in the DOM but do nothing. The
-// entire title-screen UI for those flows is being redone; the working stage
-// + gameplay engine (stage.js, engine/*, fx/*, panels/*) stay on disk,
-// fully functional, just temporarily unreachable from this menu.
+// MENU STATE: all 4 title flows are now wired.
+//   New Game / Quick Play → interview authoring (interview.js / void.js).
+//   Continue              → resume the freshest New Game save (resumeSave).
+//   Load                  → two-level picker: worlds.js → saves.js → resume.
+// The working stage + gameplay engine (stage.js, engine/*, fx/*, panels/*)
+// are the destination of every flow.
 // =============================================================
 
 import { invoke } from '@tauri-apps/api/core';
@@ -35,6 +36,8 @@ import { buildTitle } from './screens/title.js';
 import { buildStage, wireStage, teardownStage, toast } from './screens/stage.js';
 import { buildVoid, wireVoid, teardownVoid } from './screens/void.js';
 import { buildInterview, wireInterview, teardownInterview } from './screens/interview.js';
+import { buildWorlds, renderWorlds } from './screens/worlds.js';
+import { buildSaves, renderSaves } from './screens/saves.js';
 import {
   startThemeMusic, stopThemeMusic, pauseThemeMusic, resumeThemeMusic,
 } from './screens/reveal.js';
@@ -105,9 +108,9 @@ function showScreen(name) {
 // by isQuickPlay), and starting a new Quick Play wipes the old quicksave +
 // memory entirely.
 //
-// New Game is DISABLED on the title (its dedicated interview is future
-// work). Continue + Load are still no-ops (their flows are also future work,
-// separate from Quick Play).
+// New Game is wired (its dedicated interview is live). Continue resumes the
+// freshest New Game save; Load opens the worlds → saves picker. Both feed
+// into resumeSave (mirrors quickPlayResume but for durable .sim worlds).
 
 // Track whether the engine started for the current stage session, so
 // returnToTitle knows whether to call fable_end (no-op call is wasteful +
@@ -175,6 +178,79 @@ async function quickPlayResume() {
   }
 
   enterStageViaTransition(openingScene, loadMessages, /* isQuickPlay */ true);
+}
+
+// === Continue / Load flow (New Game worlds) ===============================
+//
+// CONTINUE: resume the freshest save for ANY New Game world (the title's
+// _refreshContinue stashes the target from fable_continue_target). Quick Play
+// is excluded by the backend (it owns its own resume); autosaves are included
+// (the per-turn checkpoint is "where you left off"). The stashed target
+// carries both card_id + save_id, so this is a one-shot resume.
+//
+// LOAD: a two-level picker — choose a world (screens/worlds.js), then choose
+// a save in that world (screens/saves.js). Both feed into resumeSave.
+//
+// resumeSave mirrors quickPlayResume's shape (stop ambient/music → fable_end →
+// load → enterStageViaTransition) but drives a New Game world via
+// fable_start(cardId, saveId), which re-reads the .sim from disk + resumes the
+// named slot. inQuickPlay stays false so the stage's manual Save/Load footer
+// stays enabled (correct for a durable New Game world, unlike single-slot
+// Quick Play).
+
+// Resume a named save for a New Game world. `cardId` resolves the .sim card;
+// `saveId` is the slot to resume. Cold-resume from the title (no game running
+// yet), so fable_start is the entry — NOT fable_load_save (that requires an
+// already-running game).
+async function resumeSave(cardId, saveId) {
+  if (screens.title && screens.title._stopAmbient) screens.title._stopAmbient();
+  stopThemeMusic(fableRoot);
+  try { await invoke('fable_end'); } catch (_) {}
+
+  let openingScene = null;
+  let loadMessages = null;
+  try {
+    const result = await invoke('fable_start', { cardId, saveId });
+    engineStarted = true;
+    inQuickPlay = false;
+    if (result && result.opening_scene) openingScene = result.opening_scene;
+    if (result && Array.isArray(result.messages) && result.messages.length) {
+      loadMessages = result.messages;
+    }
+  } catch (err) {
+    console.error('[fable] fable_start (resume) failed — entering stage without engine', err);
+    engineStarted = false;
+  }
+
+  enterStageViaTransition(openingScene, loadMessages, /* isQuickPlay */ false);
+}
+
+// CONTINUE button handler: resume the stashed continue target. The target is
+// refreshed on every title show via _refreshContinue (title.js); if it's null
+// (no New Game save exists) the button is disabled, so a null target here is a
+// race/state bug — guard + log rather than crash.
+function onContinueClicked() {
+  const target = (screens.title && screens.title._continueTarget) || null;
+  if (!target || !target.card_id || !target.save_id) {
+    console.warn('[fable] Continue clicked with no resume target — ignoring');
+    return;
+  }
+  resumeSave(target.card_id, target.save_id);
+}
+
+// LOAD button handler: show the world picker + populate it. The worlds screen
+// lists only worlds that have saves (a world with no saves is a New Game
+// target). Selecting one routes to the saves list for that world.
+function onLoadClicked() {
+  showScreen('worlds');
+  renderWorlds(screens.worlds, (card) => openWorldSaves(card));
+}
+
+// World-picker select → switch to the saves screen for the chosen world +
+// render its save list. onSelect(save) resumes that slot.
+function openWorldSaves(card) {
+  showScreen('saves');
+  renderSaves(screens.saves, card.id, (save) => resumeSave(card.id, save.save_id), card.name);
 }
 
 // Enter the void interview: stop the title ambient + music, play the magical
@@ -635,10 +711,9 @@ export function initFable(extHooks = {}) {
   fableRoot.setAttribute('aria-hidden', 'true');
   document.body.appendChild(fableRoot);
 
-  // Build the screens we still use. The 4 menu flows (picker / saves /
-  // interview / loading) are no-ops for now — their UI is being redone, so
-  // we don't build them. The stage stays built (teardownStage needs it on
-  // close even though the menu can't reach it yet).
+  // Build the screens we use. New Game (interview) + Quick Play (void) +
+  // Continue/Load (worlds + saves pickers) are all wired; the stage stays
+  // built (teardownStage needs it on close too).
   screens.title = buildTitle({
     // NEW GAME (Phase D, 2026-07-28): the New Game interview screen is live.
     // Routes through onNewGameClicked → magical transition → interview screen
@@ -648,10 +723,11 @@ export function initFable(extHooks = {}) {
     // Begin → stage. Branches on whether a quicksave exists (inline choice)
     // or not (straight into the interview).
     quickplay: () => onQuickPlayClicked(),
-    // CONTINUE + LOAD stay no-ops: their flows (resume target / save picker)
-    // are being rebuilt separately from Quick Play.
-    continue: () => {},
-    load: () => {},
+    // CONTINUE: resume the freshest New Game save (autosave-inclusive, Quick
+    // Play excluded by the backend). Target stashed by title._refreshContinue.
+    continue: () => onContinueClicked(),
+    // LOAD: two-level picker — worlds screen → saves screen → resumeSave.
+    load: () => onLoadClicked(),
     // EXIT is the ONLY real close path — routes through the lifecycle
     // manager for full teardown.
     exit: () => AppLifecycle.closeApp('fable'),
@@ -659,6 +735,10 @@ export function initFable(extHooks = {}) {
   screens.stage = buildStage();
   screens.void = buildVoid();
   screens.interview = buildInterview();
+  // The two-level Load picker. Both Back buttons return up the chain:
+  // saves → worlds → title. Hidden until the Load button is clicked.
+  screens.worlds = buildWorlds({ back: () => showScreen('title') });
+  screens.saves = buildSaves({ back: () => showScreen('worlds') });
   for (const s of Object.values(screens)) fableRoot.appendChild(s);
   showScreen('title');
 

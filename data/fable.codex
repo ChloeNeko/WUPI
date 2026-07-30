@@ -66,10 +66,16 @@ A WORLD card is a mood board in XML — sensory, room for the player. Bad cards 
     <tone><![CDATA[Slow-burn. NPCs are people, not quest dispensers.]]></tone>
     <opening_scene><![CDATA[The door swings shut behind you, cutting off the cold.]]></opening_scene>
     <start_npcs><![CDATA[- mara_the_innkeep\n- the_hooded_stranger]]></start_npcs>
+    <locations>
+      <node id="tavern" setting="indoor"><name>The Rusty Lantern</name>
+        <neighbor>cellar</neighbor><neighbor>market_square</neighbor></node>
+      <node id="cellar" setting="indoor"><name>The Cellar</name><neighbor>tavern</neighbor></node>
+      <node id="market_square" setting="outdoor"><name>Ashford Market</name><neighbor>tavern</neighbor></node>
+    </locations>
   </scenario>
 </sim_card>
 ```
-Note: NO stats, NO numbers. Tone + sensory setting + NPCs with implied lives.
+Note: NO stats, NO numbers. Tone + sensory setting + NPCs with implied lives, + a small geography (`<locations>`, see that entry).
 
 ---
 title: World Card Example — Cyberpunk Bar
@@ -248,3 +254,28 @@ WEATHER FIRES ON CHANGE: emit [WEATHER ...] when weather meaningfully changes in
 TIME FIRES ON PASSAGE: emit [TIME ...] when meaningful time passes (nightfall, a long rest, hours of travel). A turn that spans hours must advance the clock coherently from `clock:`.
 
 ONE BEAT, THEN YIELD: each turn is a single forward beat. Emit each command at most once. If you've written a character_turn for an NPC, that NPC is done — don't loop back. Keep prose tight; do not fill space restating the same idea.
+
+---
+title: Authoring Locations — Travel Graph
+tags: interview, scribe, locations, travel-graph, geography, sim-card, world
+---
+
+The `<locations>` block is the world's geography: discrete places (nodes) + the doors between them (edges). The Scribe authors it via ONE `set_locations` call (whole-graph, idempotent overwrite) once the geography is clear. The GM asks "what else is reachable from here?" to surface it.
+
+XML shape (inside `<scenario>`):
+```xml
+<locations>
+  <node id="tavern" setting="indoor"><name>The Tavern</name>
+    <neighbor>cellar</neighbor><neighbor>market</neighbor></node>
+  <node id="cellar" setting="indoor"><name>The Cellar</name><neighbor>tavern</neighbor></node>
+</locations>
+```
+`neighbors` is an ARRAY OF BARE ID STRINGS — `"cellar"`, `"market"` — each a single id referencing another `<node id>` in the same block. Never nest a node object inside neighbors.
+
+RULES:
+- 2-6 nodes. Small vivid map beats a sprawling one.
+- The FIRST node is where the player starts (current_node).
+- BIDIRECTIONAL EDGES ARE YOUR JOB: the parser does NOT symmetrize. If tavern lists cellar, cellar MUST list tavern back, or `[TRAVEL]` fails in reverse.
+- `id`: bare slug ("tavern", not "node.tavern"). `setting`: "indoor"/"outdoor"/empty (indoor hides the weather: line). `name`: diegetic prose.
+
+Without `<locations>`, `[TRAVEL]` is always rejected + `[RUMOR]` dropped (no current node). The graph is the foundation for spatial play.

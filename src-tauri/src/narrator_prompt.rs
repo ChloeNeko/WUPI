@@ -410,6 +410,9 @@ tier declared = soldier.
 - Player state in <world_state> is absolute truth (Rust computes it). A Heavy \
 Injury to the right arm means no effective sword swing; Exhausted means slow \
 and clumsy. Never have {player} perform beyond those limits, never heal.
+- The `present:` line in <world_state> is the on-camera cast. Only NPCs listed \
+there may speak, act, or be addressed in the scene this turn. An NPC who left \
+is gone until you re-assert them with [PRESENCE]; do not summon them back.
 - The <directives> Rust injects (lethality, disguise gate, skill checks, \
 travel rejections, tick resolutions) are the mechanical truth of the turn. \
 Obey them exactly in your prose.
@@ -489,6 +492,9 @@ consequence, never soften or inflate it to match {player}.
 - Player state in <world_state> is absolute truth. A Heavy Injury to the \
 right arm means no effective sword swing; Exhausted means slow and clumsy. \
 Never have {player} perform beyond those limits, never heal.
+- The `present:` line in <world_state> is the on-camera cast — the engine \
+already filtered it. Only NPCs listed there may speak, act, or be addressed \
+in the scene this turn. An NPC who left is gone; do not summon them back.
 - The <directives> Rust injects (lethality, disguise gate, skill checks, \
 travel rejections, tick resolutions) are the mechanical truth of the turn. \
 Obey them exactly in your prose.
@@ -538,7 +544,7 @@ does not owe the player success."
 }
 
 const BRACKET_PROTOCOL: &str = "\
-Emit bracket commands alongside your prose to track world state. Ten \
+Emit bracket commands alongside your prose to track world state. Eleven \
 recognized commands (full semantics + the JSON alternative form + common \
 errors are in the retrieved playbook — consult it on mechanical turns). \
 Each command on its own line, separate from prose. Any other bracket is \
@@ -554,13 +560,21 @@ invalid and leaks as literal text.
 - [EFFECT <label> buff|debuff <minutes>]  — apply a status tag (optional kind=disguise).
 - [MILESTONE <npc_id> <event_id>]  — record a relationship milestone.
 - [TASK <npc_id> <desc> | <difficulty> <suitability> <eta_min>]  — queue an off-screen task.
+- [PRESENCE <npc_id> <stance and micro-location>]  — assert who is on-camera now (one per present NPC).
 
-Schema-tracking commands (the eight above except CHARACTER_TURN and FX) are \
+Schema-tracking commands (the nine above except CHARACTER_TURN and FX) are \
 the PRIMARY output — they record what mechanically changed. Ask first: \
 \"What state changed this turn?\" Emit those. CHARACTER_TURN is secondary; \
 many great turns have none. Ground every label in what actually happened — \
 a diegetic phrase, not a snake_case id. One forward beat per turn; emit \
-each command at most once, then yield to the player.";
+each command at most once, then yield to the player.
+
+PRESENCE is special: emit one bracket per NPC physically in the scene this \
+turn, every turn. Re-assert the full on-camera cast each turn (the whitelist \
+refreshes). An NPC you do not re-assert drops after a grace turn — if they \
+left the scene, that is correct; if they are still there, emit them again. \
+Use the npc's id or alias as the first token; the stance is a short phrase \
+of where they stand and what they are doing.";
 
 
 // ---------------------------------------------------------------------------
@@ -594,6 +608,7 @@ mod tests {
             start_npc_ids: Vec::new(),
             declared_activities: Vec::new(),
             locations: Vec::new(),
+            cast: Vec::new(),
         }
     }
 

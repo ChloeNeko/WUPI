@@ -1086,6 +1086,53 @@ body.fable-active.fable-chrome-peek .top-bar { transform: translateY(0); }
 }
 .fable-beat-btn svg { display: block; }
 
+/* --- Swipeable variants (the ‹ 1/N › bar, 2026-07-29) --- */
+/* Sibling to the reroll button inside .fable-beat-controls. The arrows flank
+   the index counter; disabled at the ends (variant 0 / last). Revealed on
+   hover alongside the rest of the controls. */
+.fable-swipe-bar {
+    display: inline-flex;
+    align-items: center;
+    gap: 2px;
+}
+.fable-swipe-btn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 22px;
+    height: 22px;
+    padding: 0;
+    background: transparent;
+    border: 1px solid transparent;
+    border-radius: 5px;
+    color: var(--fable-text-faint);
+    font-size: 16px;
+    line-height: 1;
+    cursor: pointer;
+    transition: color 120ms ease, border-color 120ms ease, background 120ms ease;
+}
+.fable-swipe-btn:hover:not(:disabled) {
+    color: var(--fable-brass);
+    border-color: var(--fable-brass-dim);
+    background: rgba(232, 201, 138, 0.06);
+}
+.fable-swipe-btn:focus-visible {
+    outline: 1.5px solid var(--fable-brass);
+    outline-offset: 1px;
+}
+.fable-swipe-btn:disabled {
+    opacity: 0.3;
+    cursor: default;
+}
+.fable-swipe-count {
+    min-width: 28px;
+    text-align: center;
+    font-size: 11px;
+    color: var(--fable-text-faint);
+    font-variant-numeric: tabular-nums;
+    user-select: none;
+}
+
 /* --- Inline edit mode (beats.enterEditMode) --- */
 /* The editor textarea + Save/Cancel footer swap in for the read-only body.
    `beats.enterEditMode` hides the original `.fable-beat-body` via inline
@@ -2952,5 +2999,108 @@ body.fable-active.fable-chrome-peek .top-bar { transform: translateY(0); }
 .fable-interview-stop-btn:hover {
     color: var(--fable-text);
     border-color: var(--fable-brass);
+}
+
+/* --- Create/Import choice (2026-07-29) --- */
+/* A centered button row rendered as a feed beat under the greeting. Two equal
+   brass-outlined buttons; hover lifts them. Matches the beat-card aesthetic. */
+.fable-interview-choice {
+    display: flex;
+    gap: 16px;
+    justify-content: center;
+    margin: 0 auto 18px;
+    max-width: 720px;
+    padding: 0 max(40px, 10vw);
+    animation: fable-interview-choice-in 220ms ease;
+}
+@keyframes fable-interview-choice-in {
+    from { opacity: 0; transform: translateY(6px); }
+    to   { opacity: 1; transform: translateY(0); }
+}
+.fable-interview-choice-btn {
+    flex: 1;
+    padding: 12px 24px;
+    background: rgba(232, 201, 138, 0.04);
+    border: 1px solid var(--fable-brass-dim);
+    border-radius: 10px;
+    color: var(--fable-text);
+    font-size: 15px;
+    font-family: var(--fable-font, inherit);
+    letter-spacing: 0.04em;
+    cursor: pointer;
+    transition: background 140ms ease, border-color 140ms ease, transform 140ms ease;
+}
+.fable-interview-choice-btn:hover {
+    background: rgba(232, 201, 138, 0.12);
+    border-color: var(--fable-brass);
+    transform: translateY(-1px);
+}
+.fable-interview-choice-btn:focus-visible {
+    outline: 1.5px solid var(--fable-brass);
+    outline-offset: 2px;
+}
+
+/* --- Drop-listening mode (2026-07-29) --- */
+/* A full-screen overlay that dims everything except a central "drop here"
+   prompt + the folder-icon fallback. pointer-events: auto so it catches the
+   drop visually (Tauri's native drag-drop handles the actual file capture;
+   this is the affordance). */
+.fable-interview-drop {
+    position: absolute;
+    inset: 0;
+    z-index: 40;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: rgba(8, 5, 3, 0.82);
+    backdrop-filter: blur(2px);
+    animation: fable-interview-drop-in 200ms ease;
+    pointer-events: auto;
+}
+@keyframes fable-interview-drop-in {
+    from { opacity: 0; }
+    to   { opacity: 1; }
+}
+.fable-interview-drop-inner {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 10px;
+    padding: 48px 64px;
+    border: 2px dashed var(--fable-brass-dim);
+    border-radius: 16px;
+    background: rgba(20, 14, 9, 0.6);
+    text-align: center;
+}
+.fable-interview-drop-prompt {
+    font-size: 20px;
+    color: var(--fable-brass);
+    letter-spacing: 0.04em;
+}
+.fable-interview-drop-hint {
+    font-size: 12px;
+    color: var(--fable-text-faint);
+}
+.fable-interview-folder-btn {
+    margin-top: 14px;
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    padding: 8px 16px;
+    background: transparent;
+    border: 1px solid var(--fable-brass-dim);
+    border-radius: 8px;
+    color: var(--fable-text);
+    font-size: 13px;
+    cursor: pointer;
+    transition: border-color 140ms ease, background 140ms ease;
+}
+.fable-interview-folder-btn:hover {
+    border-color: var(--fable-brass);
+    background: rgba(232, 201, 138, 0.08);
+}
+.fable-interview-folder-icon {
+    font-size: 18px;
+    line-height: 1;
 }
 

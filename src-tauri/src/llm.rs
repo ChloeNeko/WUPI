@@ -485,13 +485,148 @@ pub struct LlamaCppBackend {
     engine: Arc<std::sync::Mutex<Option<ChatEngine>>>,
 }
 
-/// Process-level slot for the leaked `&'static LlamaModel`. Filled once when
-/// the chat backend loads (so the leaked model survives the loader thread
-/// exiting). The schema delta engine reads this to create its OWN isolated
-/// `LlamaContext` on the same model: true context isolation, the same
-/// pattern as the embedder (§3B). `LlamaModel` is `Sync`, so a `&'static` ref
-/// is safely shareable across the chat, embedder, and schema threads.
-static SHARED_MODEL: std::sync::OnceLock<&'static LlamaModel> = std::sync::OnceLock::new();
+/// Process-level slot for the leaked `LlamaModel`.
+///
+/// **Phase 5B (2026-07-29) — the weight-unload lift.** Was a
+/// `OnceLock<&'static LlamaModel>` (set once, never clearable — `Box::leak`
+/// memory cannot be reclaimed). The LLM⇄SD VRAM swap requires the weights to
+/// UNLOAD so SD can use VRAM, so the slot is now a `RwLock<Option<*mut>>`
+/// holding the **raw leaked pointer**. The pointer can be reclaimed via
+/// `Box::from_raw` on unload (freeing VRAM) + re-leaked on reload.
+///
+/// `shared_model()` reconstitutes the `&'static LlamaModel` ref from the raw
+/// pointer — **same signature, same lifetime** — so the three consumers
+/// (`spawn_from_shared`, `fable_engine`, `schema_engine`) compile unchanged.
+/// The `&'static` is honest as long as the model is resident: the pointer
+/// stays valid from `reload`/first-boot until `unload`. Callers must NOT hold
+/// the `&'static` across an `unload` (use-after-free) — the swap-lock's
+/// teardown joins every engine's `LlamaContext` BEFORE `unload_shared_model`
+/// runs, so no `&'static` ref outlives the model. This ordering invariant is
+/// load-bearing + enforced by the SD teardown path, not assumed.
+///
+/// The stored pointer is `*mut` (not `&'static`) so `Box::from_raw` can
+/// reclaim it. `*mut LlamaModel` is `!Send`/`!Sync` by default; we assert the
+/// module-level invariant that access is serialized through the `RwLock` (the
+/// raw pointer never escapes except as a reconstituted `&'static` that lives
+/// only while the slot is `Some`). The unsafe impl is the same rationale as
+/// the existing `LlamaModelHandle` Send/Sync.
+static SHARED_MODEL: std::sync::RwLock<Option<SharedModelPtr>> =
+    std::sync::RwLock::new(None);
+
+/// Newtype around the leaked-model pointer so the `Send` impl satisfies the
+/// orphan rules (foreign types like `NonNull` can't have a local `Send` impl
+/// directly). Same safety rationale as the previous bare-NonNull impl below.
+#[derive(Clone, Copy)]
+struct SharedModelPtr(std::ptr::NonNull<LlamaModel>);
+
+// SAFETY: SHARED_MODEL holds a raw pointer to a leaked LlamaModel. Access is
+// serialized through the RwLock. The pointer is only dereferenced (reconstituted
+// to &'static) while the write-lock guards against concurrent unload. The
+// underlying LlamaModel is Sync (llama-cpp-2 declares it so). The only hazard
+// is use-after-unload, prevented by the swap-lock ordering invariant (all
+// LlamaContexts joined before unload_shared_model). This mirrors the existing
+// SHARED_BACKEND + LlamaModelHandle unsafe rationales.
+unsafe impl Send for SharedModelPtr {}
+unsafe impl Sync for SharedModelPtr {}
+
+/// Free function: the leaked `&'static LlamaModel`, available after the chat
+/// backend finishes loading. Used by the schema delta engine + the fable engine
+/// to create an isolated `LlamaContext` on the same model. Returns `None` if
+/// the model hasn't loaded yet OR has been unloaded (the Phase 5B LLM⇄SD swap).
+///
+/// **Lifetime honesty:** the returned `&'static` is valid only while the model
+/// is resident in `SHARED_MODEL`. The caller must NOT retain it across an
+/// `unload_shared_model()` call (use-after-free). The swap-lock enforces this:
+/// every engine's `LlamaContext` (which holds the `&'static`) is joined before
+/// the SD teardown calls `unload_shared_model`.
+pub fn shared_model() -> Option<&'static LlamaModel> {
+    let g = SHARED_MODEL.read().ok()?;
+    let ptr = (*g)?;
+    let nn = ptr.0;
+    // SAFETY: the pointer is a valid leaked Box<LlamaModel> that stays valid
+    // until unload_shared_model reclaims it. The caller's LlamaContext is
+    // joined before any unload (the swap-lock invariant), so this &'static ref
+    // cannot outlive the allocation. Reconstituting &'static from the raw
+    // pointer is honest for the pointer's lifetime.
+    Some(unsafe { nn.as_ref() })
+}
+
+/// Phase 5B (2026-07-29): unload the shared LLM weights from VRAM. Reclaims
+/// the leaked `Box<LlamaModel>` via `Box::from_raw` + drops it → frees ~9.8GB.
+/// After this, `shared_model()` returns `None` until `reload_shared_model`
+/// re-leaks.
+///
+/// **LOAD-BEARING PRECONDITION:** the caller MUST guarantee no `LlamaContext`
+/// borrowing the model is alive when this runs. The swap-lock's teardown joins
+/// every engine (chat/schema/fable) before the SD role's teardown fires, so by
+/// the time this is called from an SD teardown, all LLM contexts are dropped.
+/// Violating this is use-after-free. Returns `true` if a model was unloaded,
+/// `false` if the slot was already empty (idempotent).
+///
+/// Takes a write lock; blocks `shared_model()` readers for the duration of the
+/// drop (~instant — llama.cpp's LlamaModel Drop frees VRAM synchronously).
+pub fn unload_shared_model() -> bool {
+    let mut g = match SHARED_MODEL.write() {
+        Ok(g) => g,
+        Err(e) => {
+            tracing::error!(error = %e, "unload_shared_model: SHARED_MODEL lock poisoned; aborting unload");
+            return false;
+        }
+    };
+    let ptr = g.take();
+    drop(g); // release the write lock BEFORE the drop (the drop itself is fine,
+             // but holding the lock through a ~9.8GB free is unnecessary).
+    if let Some(wrapped) = ptr {
+        // Unwrap the newtype; SAFETY as below.
+        let nn = wrapped.0;
+        // SAFETY: the pointer came from Box::leak(Box::new(model)) in
+        // set_shared_model. Reclaiming it via Box::from_raw + dropping frees
+        // the VRAM. The precondition guarantees no LlamaContext holds a borrow.
+        let boxed: Box<LlamaModel> = unsafe { Box::from_raw(nn.as_ptr()) };
+        drop(boxed);
+        tracing::info!("shared model unloaded (VRAM freed for SD swap)");
+        true
+    } else {
+        false
+    }
+}
+
+/// Phase 5B (2026-07-29): reload the shared LLM weights into VRAM after an SD
+/// swap. Re-runs `load_blocking` + re-leaks the model into the slot. After
+/// this returns Ok, `shared_model()` is live again + the engines can spawn
+/// fresh `LlamaContext`s on it.
+///
+/// Returns the model family (Gemma4 for WUPI.gguf — LOCKED per AGENTS.md §10).
+/// On error, the slot stays empty (the caller must surface the failure —
+/// typically by disabling auto-gen + keeping the user notified; the
+/// one-strike latch handles this).
+pub fn reload_shared_model(path: &std::path::Path, n_gpu_layers: u32) -> anyhow::Result<ModelFamily> {
+    // load_blocking owns its own LlamaModel (no shared-state borrow). Safe to
+    // run while the slot is empty (the SD teardown already freed it).
+    let handle = LlamaCppBackend::load_blocking(path, n_gpu_layers)?;
+    let model = handle.model;
+    let family = handle.family;
+    // Re-leak to &'static via Box::leak, storing the raw pointer for a future
+    // unload. Mirrors into_static's leak but threads the pointer into the slot.
+    let leaked: &'static LlamaModel = Box::leak(Box::new(model));
+    let ptr = std::ptr::NonNull::new(leaked as *const LlamaModel as *mut LlamaModel)
+        .expect("Box::leak returns a non-null pointer");
+    let mut g = SHARED_MODEL.write().map_err(|e| anyhow::anyhow!("SHARED_MODEL lock poisoned: {e}"))?;
+    *g = Some(SharedModelPtr(ptr));
+    tracing::info!(path = %path.display(), "shared model reloaded after SD swap");
+    Ok(family)
+}
+
+/// Internal: store a freshly-leaked model into the slot. Called by
+/// `spawn_load` at first boot (replacing the old `SHARED_MODEL.set(model_ref)`).
+/// Idempotent-overwrite: if a model is somehow already resident (shouldn't
+/// happen — first boot only), the prior one is leaked permanently (logged).
+fn set_shared_model(model_ref: &'static LlamaModel) {
+    let ptr = std::ptr::NonNull::new(model_ref as *const LlamaModel as *mut LlamaModel)
+        .expect("model ref is non-null");
+    let mut g = SHARED_MODEL.write().expect("SHARED_MODEL lock not poisoned at first boot");
+    *g = Some(SharedModelPtr(ptr));
+}
 
 impl LlamaCppBackend {
     /// Load the model off-thread, then spawn the persistent engine. Returns
@@ -526,9 +661,11 @@ impl LlamaCppBackend {
                 let (backend_ref, model_ref, family) = handle.into_static();
 
                 // Stash the model ref in the process-level slot so the schema
-                // delta engine can create an isolated context on the same model.
-                // set() is a no-op if already set (it won't be: first load).
-                let _ = SHARED_MODEL.set(model_ref);
+                // delta engine + fable engine can create isolated contexts on
+                // the same model. Phase 5B: set_shared_model replaces the old
+                // OnceLock::set (the slot is now a reloadable RwLock<Option<*mut>>
+                // so the LLM⇄SD swap can unload it).
+                set_shared_model(model_ref);
 
                 // Spawn the persistent engine with Q8_0 KV cache + delta prefill.
                 let (engine, init_rx) =
@@ -732,14 +869,6 @@ impl LlamaCppBackend {
             tracing::info!("chat engine shutdown complete (thread joined + context dropped)");
         }
     }
-}
-
-/// Free function: the leaked `&'static LlamaModel`, available after the chat
-/// backend finishes loading. Used by the schema delta engine to create an
-/// isolated `LlamaContext` on the same model. Returns `None` if the model
-/// hasn't loaded yet (callers should gate on backend readiness first).
-pub fn shared_model() -> Option<&'static LlamaModel> {
-    SHARED_MODEL.get().copied()
 }
 
 #[cfg(test)]

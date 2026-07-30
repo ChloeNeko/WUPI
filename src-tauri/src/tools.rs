@@ -88,9 +88,33 @@ pub fn parse_tool_calls(raw: &str) -> Vec<ToolCall> {
         // closing marker (no-args / bare form). Trim whitespace around it.
         let rest = &raw[after_open..];
         let close_rel = rest.find(close).map(|i| after_open + i);
-        let Some(close_idx) = close_rel else {
-            // Unterminated block: drop the rest (the model cut off mid-call).
-            break;
+        let close_idx = match close_rel {
+            Some(idx) => idx,
+            None => {
+                // EOF SALVAGE (Gemini Option 3): the opener exists but the
+                // closer is missing — the model hit max_tokens mid-call (the
+                // runaway-recursion failure mode). Instead of dropping the
+                // call, slice from the opener's `{` to the absolute end of
+                // the output and let json_repair + the serde salvager close
+                // the dangling brackets downstream. Only salvage if there's
+                // an args block to salvage (a `{` exists); a bare truncated
+                // name with no args has nothing to recover.
+                let args_open_rel = rest.find(|c: char| c == '{' || c == '[');
+                let (name, args_span) = match args_open_rel {
+                    Some(rel) => {
+                        let name_end = after_open + rel;
+                        (raw[after_open..name_end].trim().to_string(), &raw[name_end..])
+                    }
+                    None => break, // no args block → nothing to salvage
+                };
+                if !name.is_empty() {
+                    calls.push(ToolCall {
+                        name,
+                        args: parse_args_lenient(args_span),
+                    });
+                }
+                break; // consumed to EOF; no more calls possible.
+            }
         };
 
         // Find where the args block starts: the first `{` or `[` BEFORE the
@@ -122,11 +146,138 @@ pub fn parse_tool_calls(raw: &str) -> Vec<ToolCall> {
     calls
 }
 
+/// The Scribe's greedy extractor: WUPI-tag calls first, then a fenced-JSON /
+/// bare-JSON fallback scoped to `sim_draft` only.
+///
+/// Why a scribe-specific path (NOT baked into the shared `parse_tool_calls`):
+/// the fallback treats any fenced or bare JSON carrying the `sim_draft`
+/// signature (`"updates"` or `"type":"set_"`) as a tool call. That is correct
+/// for the Scribe (whose ONLY tool is `sim_draft` and whose output IS the
+/// extraction payload), but would be WRONG for the general chat agent loop —
+/// a player pasting a code fence containing `"updates"` while chatting with
+/// Wupi must not be parsed as a tool call. Scoping keeps the fallback safe.
+///
+/// Pipeline (Gemini Option 3 — the "Greedy Extractor"):
+///   1. Primary: `parse_tool_calls` (WUPI `<|tool_call>` tags + EOF salvage
+///      for truncated closers).
+///   2. Fallback: if primary found 0 calls, scan the raw output for a
+///      ```` ```json ```` fence OR the first `{`...last `}` span. If that
+///      extracted text carries the `sim_draft` signature, synthesize a
+///      `sim_draft` ToolCall whose args are the extracted JSON (later stages —
+///      `parse_args_lenient` → `json_repair` → `normalize_updates_args` → the
+///      `deserialize_neighbor_ids` salvager — handle truncation, shape
+///      variation, and runaway nesting respectively).
+///
+/// This makes the Rust backend immune to the three most common open-12B
+/// failures: truncated tags (EOF salvage), markdown-fence bleed (this
+/// fallback), and hallucinated nesting (the serde salvager).
+pub fn parse_scribe_calls(raw: &str) -> Vec<ToolCall> {
+    // Primary path: WUPI tags (+ EOF salvage inside).
+    let primary = parse_tool_calls(raw);
+    if !primary.is_empty() {
+        return primary;
+    }
+
+    // Fallback: look for a fenced or bare JSON block carrying the sim_draft
+    // signature. The model sometimes emits the correct payload as a prose
+    // reply with a ```` ```json ```` fence (no `<|tool_call>` marker) — the
+    // 2026-07-29 WEAVER playtest's dominant failure mode.
+    let extracted = extract_json_payload(raw);
+    if let Some(json_span) = extracted {
+        if has_sim_draft_signature(&json_span) {
+            // Synthesize a sim_draft call. parse_args_lenient (→ json_repair)
+            // + normalize_updates_args + the salvager handle the rest.
+            return vec![ToolCall {
+                name: "sim_draft".to_string(),
+                args: parse_args_lenient(&json_span),
+            }];
+        }
+    }
+
+    Vec::new()
+}
+
+/// Extract the first plausible JSON object/array payload from `raw`, in
+/// priority order:
+///   1. The contents of the first ```` ```json ```` / ```` ``` ```` fenced block.
+///   2. Otherwise the span from the first `{` to the last `}` (or first `[` to
+///      last `]`) — tolerant of max_tokens truncation (no closing brace just
+///      means we slice to the last one we DO have; json_repair closes it).
+///
+/// Returns the raw substring (untrimmed of fences) or None if no JSON-like
+/// structure is present.
+fn extract_json_payload(raw: &str) -> Option<String> {
+    // 1. Fenced block (```json ... ``` or ``` ... ```). Tolerant of a missing
+    //    closing fence (truncation): take from the opening fence to EOF.
+    if let Some(fence_start) = raw.find("```") {
+        let after_fence = &raw[fence_start + 3..];
+        // Skip an optional language tag (json/js/etc.) on the fence line.
+        let body_start = after_fence
+            .find('\n')
+            .map(|i| 3 + i + 1)
+            .unwrap_or(3);
+        let body = &raw[fence_start + body_start..];
+        // Find a closing fence; if absent, take to EOF (truncation salvage).
+        let body_end = body.find("```").unwrap_or(body.len());
+        let payload = &body[..body_end];
+        if payload.contains('{') || payload.contains('[') {
+            return Some(payload.to_string());
+        }
+    }
+
+    // 2. Bare JSON: first `{` ... last `}` (or `[` ... `]`). Using LAST closer
+    //    captures the fullest span even if the model emitted trailing prose.
+    //    If there's no closer (truncation), slice to EOF from the opener.
+    if let Some(brace_start) = raw.find('{') {
+        let span = match raw.rfind('}') {
+            Some(brace_end) if brace_end > brace_start => &raw[brace_start..=brace_end],
+            _ => &raw[brace_start..], // no closer → to EOF; json_repair caps it
+        };
+        return Some(span.to_string());
+    }
+    if let Some(bracket_start) = raw.find('[') {
+        let span = match raw.rfind(']') {
+            Some(bracket_end) if bracket_end > bracket_start => &raw[bracket_start..=bracket_end],
+            _ => &raw[bracket_start..],
+        };
+        return Some(span.to_string());
+    }
+
+    None
+}
+
+/// True iff `json_span` carries the `sim_draft` signature — evidence it's a
+/// draft-update payload, not arbitrary JSON the model happened to emit. The
+/// signature is the `updates` wrapper key OR any `set_`/`add_`/`set_locations`
+/// DraftUpdate type tag. Conservative: avoids mis-claiming unrelated JSON.
+fn has_sim_draft_signature(json_span: &str) -> bool {
+    json_span.contains("\"updates\"")
+        || json_span.contains("\"type\": \"set_")
+        || json_span.contains("\"type\":\"set_")
+        || json_span.contains("\"type\": \"add_")
+        || json_span.contains("\"type\":\"add_")
+        || json_span.contains("\"type\": \"set_locations\"")
+        // Unquoted-key form (the model sometimes omits quotes on `type`).
+        || json_span.contains("type:set_")
+        || json_span.contains("type:add_")
+}
+
 /// Parse a single tool's args span as JSON, falling back to a string carrier
 /// on failure. We do NOT silently drop the call: a malformed-args tool call is
 /// exactly the case the 3-pass repair loop is designed to handle, and dropping
 /// it here would prevent the repair prompt from ever showing the model its
 /// error.
+///
+/// **Two-stage parse (§11.17 fix for the local Gemma 12B unquoted-key case):**
+/// the strict `serde_json::from_str` is tried first. On failure, we run the
+/// span through `json_repair::repair` (the microsecond-cost syntactic pre-
+/// parser that fixes unquoted keys, smart quotes, trailing commas, bare
+/// newlines, bracket imbalance) and retry. This recovers `{updates:[...]}` →
+/// `{"updates":[...]}` at zero LLM cost — exactly the WEAVER-Scribe failure
+/// the 2026-07-29 playtest surfaced (the model emits the `updates` wrapper
+/// correctly but leaves the key unquoted; strict parse rejected the whole
+/// batch, silently dropping every extracted fact). Only if BOTH stages fail
+/// do we carry the raw text for the repair loop.
 fn parse_args_lenient(span: &str) -> serde_json::Value {
     let trimmed = span.trim();
     if trimmed.is_empty() {
@@ -135,9 +286,46 @@ fn parse_args_lenient(span: &str) -> serde_json::Value {
     match serde_json::from_str::<serde_json::Value>(trimmed) {
         Ok(v) => v,
         Err(_) => {
-            // Carry the raw text so the executor can surface a helpful error.
+            // Stage 2: syntactic repair + retry. This is the cheap win that
+            // rescues the common LLM mangling (unquoted keys chief among them)
+            // without burning a 5-8s model repair pass.
+            let repaired = crate::json_repair::repair(trimmed);
+            if repaired != trimmed {
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&repaired) {
+                    return v;
+                }
+            }
+            // Both stages failed: carry the raw text so the executor can
+            // surface a helpful error to the repair loop.
             serde_json::json!({ "raw": trimmed })
         }
+    }
+}
+
+/// Normalize a `sim_draft` argument value into a flat `Vec` of update objects,
+/// tolerating three shapes the local 12B may emit (Gemini's robustness
+/// backstop, §11.17). We never burn prompt tokens begging for a specific outer
+/// wrapper — Rust absorbs the variation:
+///
+///   1. Standard:   `{"updates": [...]}`
+///   2. Bare array: `[{"type":"set_field",...}, ...]`
+///   3. Single obj: `{"type":"set_locations", ...}` (no `updates` wrapper)
+///
+/// Returns owned `Vec<Value>` (cloned) so callers can `serde_json::from_value`
+/// each element without borrowing the input. Errors only when none of the
+/// three shapes match — the caller surfaces that to the repair loop.
+fn normalize_updates_args(args: &serde_json::Value) -> Result<Vec<serde_json::Value>, ToolError> {
+    if let Some(arr) = args.get("updates").and_then(|v| v.as_array()) {
+        Ok(arr.clone())
+    } else if let Some(arr) = args.as_array() {
+        Ok(arr.clone())
+    } else if args.is_object() && args.get("type").is_some() && args.get("updates").is_none() {
+        // A bare DraftUpdate object (has "type", no "updates" wrapper).
+        Ok(vec![args.clone()])
+    } else {
+        Err(ToolError::new(
+            "expected {\"updates\":[...]} OR a single update object OR a bare array",
+        ))
     }
 }
 
@@ -201,10 +389,11 @@ fn is_denied(rel_str: &str) -> bool {
     // Same carve-out for the Game Master persona + the unified Fable
     // playbook — engine content for the New Game interview flow + the
     // simulation narrator, never tool-authored. (fable.codex is the
-    // 2026-07-29 unified Fable partition; was gm.codex.)
+    // 2026-07-29 unified Fable partition; was gm.codex. fable.sim is the
+    // 2026-07-29 rename of gm.sim.)
     if rel_str == "data/wupi.sim"
         || rel_str == "data/wupi.codex"
-        || rel_str == "data/gm.sim"
+        || rel_str == "data/fable.sim"
         || rel_str == "data/fable.codex"
     {
         return true;
@@ -438,6 +627,7 @@ pub fn registry() -> Vec<Box<dyn Tool>> {
         Box::new(FileList),
         Box::new(CreateSimCard),
         Box::new(DeleteSimCard),
+        Box::new(WireSimCard),
         Box::new(EditUserProfile),
         Box::new(CodexCreate),
         Box::new(CodexDelete),
@@ -762,6 +952,169 @@ impl Tool for DeleteSimCard {
             }
             Err(e) => Err(ToolError::new(format!("delete {rel}: {e}"))),
         }
+    }
+}
+
+// --- wire_sim_card ---------------------------------------------------------
+// Fable Phase 5A (2026-07-29). Authoring-time assistance: reads an existing
+// .sim card, extracts its <cast> + <locations> blocks, and writes one codex
+// .md entry per NPC + per location so the card is "wired" into the retrieval
+// index without the user hand-authoring each lore entry. This is the user-
+// owned, user-initiated version of codex maintenance (explicitly NOT runtime
+// autonomy — per the §1C discipline, AI must not mutate the codex at runtime;
+// this tool runs only when Wupi is asked to wire a card, and the output is
+// plain .md the user can review/edit via codex list).
+//
+// Composition of three existing capabilities (the §11.49 Scribe precedent):
+//   1. sim_card::parse_from_xml_str — read + parse the card (the .sim format).
+//   2. codex::save_file — write each entry (the CodexCreate path).
+//   3. codex_dirty drain — re-seed retrieval so the new entries are visible
+//      on the next narrator turn (the §11.25 hot-load fix).
+//
+// The entries it authors serve two consumers:
+//   - The narrator: canonical NPC identities + location flavor (the
+//     `npc.<id>.core` immutable keys the relationship engine + image-gen
+//     parent chain read from).
+//   - The Phase 5B image generator: location lore for the parent-chain style
+//     guide (the Multihog "match the parent's palette" recipe, ported to
+//     codex entries instead of a cloud image API).
+
+struct WireSimCard;
+impl Tool for WireSimCard {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "wire_sim_card".into(),
+            description: "Wire an existing Fable scenario card into the codex: \
+                          read its <cast> and <locations> blocks and write one \
+                          codex lore entry (.md) per NPC + per location so the \
+                          card is fully retrievable. Argument: \
+                          {\"filename\": \"rusty_tavern\"} (the card stem, no \
+                          .sim extension). Reads apps/fable/cards/<stem>.sim, \
+                          writes data/docs/npc_<id>.md + data/docs/loc_<id>.md. \
+                          Overwrites existing entries with the same stem. Use \
+                          this when the user drops in a new card and wants it \
+                          wired up, or to refresh codex entries after editing a \
+                          card's cast/geography."
+                .into(),
+        }
+    }
+    fn validate_args(&self, args: &serde_json::Value) -> Result<(), ToolError> {
+        let filename = req_str_nonempty(args, "filename")?;
+        let stem = crate::codex::sanitize_stem(&filename)
+            .ok_or_else(|| ToolError::new("filename empty after sanitization"))?;
+        // Verify the card path resolves safely + is readable (the read target).
+        let card_rel = format!("apps/fable/cards/{stem}.sim");
+        let card_safe = sandbox_path(&card_rel)
+            .ok_or_else(|| ToolError::new(format!("unsafe card path: {card_rel}")))?;
+        if !is_writable(&card_safe) {
+            return Err(ToolError::new(format!("card path {card_rel} not accessible")));
+        }
+        // Verify the codex dir is writable (the write targets). We don't
+        // pre-validate each entry path (they're derived from the card's ids
+        // + sanitized); sandbox_path is checked per-write in execute.
+        let docs_rel = "data/docs";
+        let docs_safe = sandbox_path(docs_rel)
+            .ok_or_else(|| ToolError::new(format!("unsafe codex path: {docs_rel}")))?;
+        if !is_writable(&docs_safe) {
+            return Err(ToolError::new(format!("codex path {docs_rel} not writable")));
+        }
+        Ok(())
+    }
+    fn execute(&self, args: &serde_json::Value, ctx: &ToolCtx) -> Result<String, ToolError> {
+        let filename = req_str(args, "filename")?;
+        let stem = crate::codex::sanitize_stem(&filename)
+            .ok_or_else(|| ToolError::new("filename empty after sanitization"))?;
+        let card_rel = format!("apps/fable/cards/{stem}.sim");
+        let card_path = ctx.resolve(&card_rel)?;
+        let xml = std::fs::read_to_string(&card_path)
+            .map_err(|e| ToolError::new(format!("read card {card_rel}: {e}")))?;
+        let card = crate::sim_card::parse_from_xml_str(&xml)
+            .map_err(|e| ToolError::new(format!("parse card {card_rel}: {e}")))?;
+        let docs_dir = ctx.resolve("data/docs")?;
+
+        let mut written: Vec<String> = Vec::new();
+        let card_tag = card.name.clone();
+
+        // One entry per NPC in <cast>.
+        for npc in &card.cast {
+            let entry_stem = format!("npc_{}", crate::codex::sanitize_stem(&npc.id).unwrap_or_else(|| "unknown".into()));
+            let title = if npc.name.trim().is_empty() {
+                format!("{} (NPC)", npc.id)
+            } else {
+                format!("{} — {}", npc.name.trim(), npc.role.trim())
+            };
+            let tags = vec!["npc".to_string(), card_tag.clone()]
+                .into_iter()
+                .filter(|t| !t.is_empty())
+                .collect::<Vec<_>>();
+            let mut body = String::new();
+            body.push_str(&format!("**Canonical id:** `{}`\n\n", npc.id));
+            if !npc.name.trim().is_empty() {
+                body.push_str(&format!("**Name:** {}\n\n", npc.name.trim()));
+            }
+            if !npc.role.trim().is_empty() {
+                body.push_str(&format!("**Role:** {}\n\n", npc.role.trim()));
+            }
+            if let Some(tier) = npc.tier.as_ref().filter(|t| !t.trim().is_empty()) {
+                body.push_str(&format!("**Threat tier:** {}\n\n", tier.trim()));
+            }
+            if !npc.aliases.is_empty() {
+                body.push_str(&format!("**Aliases:** {}\n\n", npc.aliases.join(", ")));
+            }
+            body.push_str(&format!(
+                "Canonical identity for `{}` — the Rust-owned registry key. \
+                 Immutable world fact (do not contradict). Seed source: <cast> \
+                 in {}.\n",
+                npc.id, card_rel
+            ));
+            crate::codex::save_file(&docs_dir, &entry_stem, &title, &tags, &body)
+                .map_err(|e| ToolError::new(format!("write {entry_stem}: {e}")))?;
+            written.push(format!("data/docs/{entry_stem}.md"));
+        }
+
+        // One entry per node in <locations>.
+        for node in &card.locations {
+            let entry_stem = format!("loc_{}", crate::codex::sanitize_stem(&node.id).unwrap_or_else(|| "unknown".into()));
+            let title = if node.name.trim().is_empty() {
+                format!("{} (location)", node.id)
+            } else {
+                node.name.trim().to_string()
+            };
+            let tags = vec!["location".to_string(), card_tag.clone()]
+                .into_iter()
+                .filter(|t| !t.is_empty())
+                .collect::<Vec<_>>();
+            let mut body = String::new();
+            body.push_str(&format!("**Node id:** `{}`\n\n", node.id));
+            if !node.name.trim().is_empty() {
+                body.push_str(&format!("**Name:** {}\n\n", node.name.trim()));
+            }
+            if !node.setting.trim().is_empty() {
+                body.push_str(&format!("**Setting:** {}\n\n", node.setting.trim()));
+            }
+            if !node.neighbors.is_empty() {
+                body.push_str(&format!("**Exits:** {}\n\n", node.neighbors.join(", ")));
+            }
+            body.push_str(&format!(
+                "Location node in {}. Aesthetic guide for scene imagery — \
+                 match the palette/architecture/materials of this place. \
+                 Seed source: <locations> in {}.\n",
+                card_tag, card_rel
+            ));
+            crate::codex::save_file(&docs_dir, &entry_stem, &title, &tags, &body)
+                .map_err(|e| ToolError::new(format!("write {entry_stem}: {e}")))?;
+            written.push(format!("data/docs/{entry_stem}.md"));
+        }
+
+        // Re-seed the retrieval index so the new entries are visible next turn.
+        ctx.mark_codex_dirty();
+
+        if written.is_empty() {
+            return Ok(format!(
+                "wired {card_rel} — no <cast> or <locations> blocks found (nothing to write)"
+            ));
+        }
+        Ok(format!("wired {card_rel} — {} entries: {}", written.len(), written.join(", ")))
     }
 }
 
@@ -1121,17 +1474,15 @@ impl Tool for SimDraft {
                           {\"type\":\"add_entity\",\"key\":\"loc.tavern\",\"state\":\"warm, half-full\"}, \
                           {\"type\":\"set_player_background\",\"value\":\"a traveling herbalist\"}, \
                           {\"type\":\"set_starting_condition\",\"value\":\"exhausted from the road\"}, \
-                          {\"type\":\"set_start_node\",\"value\":\"tavern\"}. \
+                          {\"type\":\"set_locations\",\"nodes\":[{\"id\":\"tavern\",\"name\":\"The Rusty Lantern\",\"setting\":\"indoor\",\"neighbors\":[\"cellar\",\"market\"]},...]}. \
+                          (the WHOLE travel graph in one call — idempotent overwrite; 2-6 nodes; first node is where the player starts; EACH side of an edge must list the other: tavern lists cellar AND cellar lists tavern). \
                           \
                           Extract ONLY what the player/GM established; never invent facts. \
                           Return: a short summary of what was applied.".into(),
         }
     }
     fn validate_args(&self, args: &serde_json::Value) -> Result<(), ToolError> {
-        let updates = args
-            .get("updates")
-            .and_then(|v| v.as_array())
-            .ok_or_else(|| ToolError::new("missing or non-array argument `updates`"))?;
+        let updates = normalize_updates_args(args)?;
         if updates.is_empty() {
             return Err(ToolError::new("`updates` must not be empty"));
         }
@@ -1154,12 +1505,10 @@ impl Tool for SimDraft {
                 "no interview draft available (not in a New Game interview?)",
             ));
         };
-        // Re-parse from args (validated above; clone avoids borrowing args
-        // across the mutex lock).
-        let updates_val = args
-            .get("updates")
-            .and_then(|v| v.as_array())
-            .ok_or_else(|| ToolError::new("updates vanished (bug)"))?;
+        // Re-derive the updates Vec via the same normalization validate_args
+        // used (so the structural tolerance round-trips cleanly — a single-
+        // update or bare-array call validated above executes identically here).
+        let updates_val = normalize_updates_args(args)?;
         let mut updates: Vec<crate::interview_draft::DraftUpdate> = Vec::with_capacity(updates_val.len());
         for u in updates_val {
             updates.push(
@@ -1246,9 +1595,25 @@ mod tests {
     }
 
     #[test]
-    fn unterminated_call_dropped() {
-        // No closing marker → drop everything after.
+    fn unterminated_call_with_args_now_salvaged() {
+        // EOF SALVAGE (Gemini Option 3): an opener with args but no closer
+        // (the model hit max_tokens mid-call) is now SALVAGED to EOF, not
+        // dropped. The args span is sliced from the `{` to the end of the
+        // output + handed to parse_args_lenient (→ json_repair closes any
+        // dangling brackets). This was `unterminated_call_dropped` before the
+        // greedy extractor; the salvage is the correct, robust behavior.
         let raw = "<|tool_call>call:file_read{\"path\":\"a\"} ... no closer";
+        let calls = parse_tool_calls(raw);
+        assert_eq!(calls.len(), 1, "truncated opener with args is salvaged");
+        assert_eq!(calls[0].name, "file_read");
+    }
+
+    #[test]
+    fn unterminated_call_without_args_still_dropped() {
+        // A bare truncated NAME with no `{` args block has nothing to salvage
+        // → still dropped (the salvage only fires when there are args to
+        // recover). This pins the conservative edge of the EOF salvage.
+        let raw = "<|tool_call>call:codex_list ... no closer, no braces";
         assert!(parse_tool_calls(raw).is_empty());
     }
 
@@ -1271,6 +1636,139 @@ mod tests {
         assert_eq!(calls[0].name, "codex_list");
         assert!(calls[0].args.is_null());
     }
+
+    // --- parse_args_lenient §11.17 fix: unquoted-key repair ---
+
+    /// The live WEAVER-Scribe failure (2026-07-29 playtest): the local Gemma
+    /// 12B emits the `updates` wrapper correctly but leaves the KEY unquoted
+    /// (`{updates:[...]}` not `{"updates":[...]}`). Strict serde_json rejects
+    /// at the lexer. The json_repair stage recovers it — this is the test that
+    /// would have caught the bug that left every WEAVER draft empty.
+    #[test]
+    fn unquoted_updates_key_recovered_via_json_repair() {
+        // Exactly the shape observed in the live scribe dump (verbatim form).
+        let raw = "<|tool_call>call:sim_draft{updates:[{\"type\":\"add_npc\",\"id\":\"mara\"}]}<tool_call|>";
+        let calls = parse_tool_calls(raw);
+        assert_eq!(calls.len(), 1);
+        // NOT carried as raw — repaired + parsed into the real structure.
+        assert!(calls[0].args.get("raw").is_none(), "must not fall back to raw carrier");
+        let updates = calls[0].args.get("updates").and_then(|v| v.as_array());
+        assert!(updates.is_some(), "updates array recovered");
+        assert_eq!(updates.unwrap().len(), 1);
+    }
+
+    /// Truly unrepairable JSON (a bare word value, not just an unquoted key)
+    /// still carries as `raw` so the repair loop can show the model. This pins
+    /// that the repair stage is conservative — it doesn't silently mangle.
+    #[test]
+    fn genuinely_broken_json_still_carried_as_raw() {
+        let raw = "<|tool_call>call:file_read{path: broken}<tool_call|>";
+        let calls = parse_tool_calls(raw);
+        assert_eq!(calls.len(), 1);
+        // `path: broken` — `broken` isn't a valid JSON token → unrepairable.
+        assert_eq!(calls[0].args["raw"], "{path: broken}");
+    }
+
+    // --- normalize_updates_args: structural tolerance (Gemini's backstop) ---
+
+    #[test]
+    fn normalize_accepts_standard_updates_wrapper() {
+        let args = serde_json::json!({"updates": [{"type":"add_npc","id":"a"}]});
+        let v = normalize_updates_args(&args).unwrap();
+        assert_eq!(v.len(), 1);
+    }
+
+    #[test]
+    fn normalize_accepts_bare_array() {
+        let args = serde_json::json!([{"type":"add_npc","id":"a"},{"type":"add_npc","id":"b"}]);
+        let v = normalize_updates_args(&args).unwrap();
+        assert_eq!(v.len(), 2);
+    }
+
+    #[test]
+    fn normalize_accepts_single_update_object() {
+        // A bare DraftUpdate with no `updates` wrapper.
+        let args = serde_json::json!({"type":"set_locations","nodes":[{"id":"x","name":"X","neighbors":[],"setting":""}]});
+        let v = normalize_updates_args(&args).unwrap();
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0]["type"], "set_locations");
+    }
+
+    #[test]
+    fn normalize_rejects_unrecognized_shape() {
+        let args = serde_json::json!({"foo":"bar"});
+        assert!(normalize_updates_args(&args).is_err());
+        // A string or number isn't any of the three shapes.
+        assert!(normalize_updates_args(&serde_json::json!("hello")).is_err());
+        assert!(normalize_updates_args(&serde_json::json!(42)).is_err());
+    }
+
+    // --- parse_scribe_calls: the greedy extractor (Gemini Option 3) ---
+
+    /// Primary path passes through: a proper WUPI-tag call is extracted by the
+    /// primary path (the fallback must not double-claim or interfere).
+    #[test]
+    fn scribe_greedy_primary_tag_path_passes_through() {
+        let raw = "<|tool_call>call:sim_draft{\"updates\":[{\"type\":\"add_npc\",\"id\":\"a\"}]}<tool_call|>";
+        let calls = parse_scribe_calls(raw);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "sim_draft");
+    }
+
+    /// The 2026-07-29 dominant failure: the model emits PERFECT JSON but
+    /// wrapped in a ```json fence with NO <|tool_call> marker. The greedy
+    /// fallback must synthesize a sim_draft call from the fenced block.
+    #[test]
+    fn scribe_greedy_recovers_fenced_json_with_no_marker() {
+        let raw = "<|channel>thought\n<channel|>```json\n{\n  \"updates\": [\n    {\"type\":\"set_field\",\"field\":\"name\",\"value\":\"The Mossy Gate\"}\n  ]\n}\n```";
+        let calls = parse_scribe_calls(raw);
+        assert_eq!(calls.len(), 1, "fenced JSON with sim_draft signature must be claimed");
+        assert_eq!(calls[0].name, "sim_draft");
+        assert!(calls[0].args.get("raw").is_none(), "args parsed, not carried as raw");
+        assert!(calls[0].args.get("updates").is_some(), "updates wrapper recovered");
+    }
+
+    /// EOF salvage (truncated closer): the <|tool_call> opener exists but the
+    /// model hit max_tokens before <tool_call|>. Slice from { to EOF + repair.
+    #[test]
+    fn scribe_greedy_eof_salvage_truncated_closer() {
+        // No closer, raw cut off mid-array. json_repair must close the brackets.
+        let raw = "<|tool_call>call:sim_draft{updates:[{\"type\":\"add_npc\",\"id\":\"a\"},{\"type\":\"add_npc\",\"id\":\"b\"";
+        let calls = parse_scribe_calls(raw);
+        assert_eq!(calls.len(), 1, "truncated opener must be salvaged to EOF");
+        assert_eq!(calls[0].name, "sim_draft");
+        // The repaired args should yield a parseable updates array.
+        let updates = calls[0].args.get("updates").and_then(|v| v.as_array());
+        assert!(updates.is_some(), "json_repair closed the dangling brackets");
+    }
+
+    /// A fenced block WITHOUT the sim_draft signature is NOT claimed — the
+    /// fallback is scoped to draft payloads, not arbitrary JSON. This is the
+    /// safety gate that keeps the greedy path from over-claiming.
+    #[test]
+    fn scribe_greedy_ignores_unrelated_fenced_json() {
+        let raw = "Here's some config:\n```json\n{\"version\": \"1.0\", \"name\": \"not a draft\"}\n```";
+        let calls = parse_scribe_calls(raw);
+        assert!(calls.is_empty(), "non-sim_draft JSON must not be claimed");
+    }
+
+    /// Pure prose with no JSON yields zero calls (the no-op path).
+    #[test]
+    fn scribe_greedy_no_json_yields_empty() {
+        assert!(parse_scribe_calls("Just a normal conversational reply.").is_empty());
+        assert!(parse_scribe_calls("").is_empty());
+    }
+
+    /// Bare JSON (no fence, no marker) carrying the signature is also claimed —
+    /// the model sometimes emits a raw object with no markdown wrapping at all.
+    #[test]
+    fn scribe_greedy_recovers_bare_json_with_signature() {
+        let raw = "Sure! {\"updates\":[{\"type\":\"set_locations\",\"nodes\":[{\"id\":\"x\",\"name\":\"X\",\"neighbors\":[],\"setting\":\"\"}]}]}";
+        let calls = parse_scribe_calls(raw);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "sim_draft");
+    }
+
 
     // === sandbox_path =======================================================
 
@@ -1324,6 +1822,7 @@ mod tests {
         assert!(!is_writable(Path::new("memory/memory.sqlite")));
         assert!(!is_writable(Path::new("memory/memory.sqlite-wal")));
         assert!(!is_writable(Path::new("data/wupi.sim")));
+        assert!(!is_writable(Path::new("data/fable.sim"))); // 2026-07-29 rename of gm.sim
         assert!(!is_writable(Path::new("data/api_config.json")));
         assert!(!is_writable(Path::new("data/theme.json")));
         assert!(!is_writable(Path::new("target/debug/wupi.exe")));
@@ -1803,5 +2302,91 @@ mod tests {
             .execute(&serde_json::json!({ "text": "x" }), &ctx)
             .unwrap_err();
         assert!(err.message.contains("directive slot") || err.message.contains("Fable"));
+    }
+
+    // ---------- wire_sim_card (Phase 5A, 2026-07-29) ----------
+
+    #[test]
+    fn wire_sim_card_writes_npc_and_location_entries() {
+        let (_guard, ctx) = temp_ctx();
+        std::fs::create_dir_all(ctx.install_root.join("data/docs")).unwrap();
+        std::fs::create_dir_all(ctx.install_root.join("apps/fable/cards")).unwrap();
+        // Write a card with <cast> + <locations> blocks.
+        let xml = r#"<?xml version="1.0"?>
+<sim_card>
+  <metadata><id>test_cast</id><type>roleplay</type></metadata>
+  <identity><name>Test Tavern</name></identity>
+  <scenario>
+    <locations>
+      <node id="tavern" setting="indoor"><name>The Test Tavern</name><neighbor>cellar</neighbor></node>
+      <node id="cellar" setting="indoor"><name>The Cellar</name><neighbor>tavern</neighbor></node>
+    </locations>
+    <cast>
+      <npc id="mara" tier="soldier"><name>Mara</name><role>innkeep</role><alias>innkeep</alias></npc>
+      <npc id="corin"><name>Corin</name><role>bard</role></npc>
+    </cast>
+  </scenario>
+</sim_card>"#;
+        std::fs::write(
+            ctx.resolve("apps/fable/cards/test_cast.sim").unwrap(),
+            xml.as_bytes(),
+        )
+        .unwrap();
+
+        let result = WireSimCard
+            .execute(&serde_json::json!({ "filename": "test_cast" }), &ctx)
+            .unwrap();
+        // 2 NPCs + 2 locations = 4 entries.
+        assert!(result.contains("4 entries"), "result: {result}");
+
+        // NPC entry exists + carries the canonical id.
+        let npc_path = ctx.resolve("data/docs/npc_mara.md").unwrap();
+        assert!(npc_path.exists(), "npc entry must be written");
+        let npc_md = std::fs::read_to_string(&npc_path).unwrap();
+        assert!(npc_md.contains("**Canonical id:** `mara`"));
+        assert!(npc_md.contains("**Name:** Mara"));
+        assert!(npc_md.contains("**Threat tier:** soldier"));
+
+        // Location entry exists + carries the node id + exits.
+        let loc_path = ctx.resolve("data/docs/loc_tavern.md").unwrap();
+        assert!(loc_path.exists(), "location entry must be written");
+        let loc_md = std::fs::read_to_string(&loc_path).unwrap();
+        assert!(loc_md.contains("**Node id:** `tavern`"));
+        assert!(loc_md.contains("**Exits:** cellar"));
+
+        // An alias-only NPC (corin) gets its own entry too.
+        assert!(ctx.resolve("data/docs/npc_corin.md").unwrap().exists());
+    }
+
+    #[test]
+    fn wire_sim_card_reports_nothing_when_card_has_no_cast_or_locations() {
+        let (_guard, ctx) = temp_ctx();
+        std::fs::create_dir_all(ctx.install_root.join("data/docs")).unwrap();
+        std::fs::create_dir_all(ctx.install_root.join("apps/fable/cards")).unwrap();
+        let xml = r#"<?xml version="1.0"?>
+<sim_card>
+  <identity><name>Bare Card</name></identity>
+</sim_card>"#;
+        std::fs::write(
+            ctx.resolve("apps/fable/cards/bare.sim").unwrap(),
+            xml.as_bytes(),
+        )
+        .unwrap();
+        let result = WireSimCard
+            .execute(&serde_json::json!({ "filename": "bare" }), &ctx)
+            .unwrap();
+        assert!(result.contains("nothing to write"), "result: {result}");
+    }
+
+    #[test]
+    fn wire_sim_card_errors_when_card_missing() {
+        let (_guard, ctx) = temp_ctx();
+        std::fs::create_dir_all(ctx.install_root.join("data/docs")).unwrap();
+        std::fs::create_dir_all(ctx.install_root.join("apps/fable/cards")).unwrap();
+        // validate_args passes (paths are accessible); execute fails on read.
+        let payload = serde_json::json!({ "filename": "nonexistent" });
+        WireSimCard.validate_args(&payload).unwrap();
+        let err = WireSimCard.execute(&payload, &ctx).unwrap_err();
+        assert!(err.message.contains("read card"), "err: {}", err.message);
     }
 }

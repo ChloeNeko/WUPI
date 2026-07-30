@@ -5,7 +5,7 @@
 //! to build the player's character + world. This module builds the GM's
 //! per-turn system prompt, which folds in:
 //!
-//! 1. The GM persona from `data/gm.sim` (rendered via `SimCard::render_for_prompt`)
+//! 1. The GM persona from `data/fable.sim` (rendered via `SimCard::render_for_prompt`)
 //! 2. Retrieved `fable.codex` entries (the deep playbook — question banks, genre
 //!    guides, perfect-card examples) via `search_fable_visible` (Phase A)
 //! 3. The current `InterviewDraft` state summary (compensates for the 6-turn
@@ -29,7 +29,8 @@ pub const READY_SENTINEL: &str = "[READY]";
 
 /// Build the GM's system prompt for one interview turn.
 ///
-/// `gm_persona` is the rendered `data/gm.sim` persona block (from
+/// `gm_persona` is the rendered `data/fable.sim` persona block (the Game
+/// Master; from
 /// `SimCard::render_for_prompt`). `retrieved_playbook` is the optional
 /// `fable.codex` retrieval block (from `render_memory_block(hits)` — already
 /// formatted with the codex frame). `draft` is the current interview draft
@@ -45,7 +46,7 @@ pub fn build_gm_system_prompt(
     out.push_str(GM_ROLE);
     out.push_str("\n</gm_role>\n\n");
 
-    // The GM persona from gm.sim (the lean identity — the deep playbook lives
+    // The GM persona from fable.sim (the lean identity — the deep playbook lives
     // in fable.codex, surfaced via retrieval below).
     if let Some(persona) = gm_persona {
         if !persona.trim().is_empty() {
@@ -98,6 +99,10 @@ INTERVIEW FLOW:\
 playbook for genre-specific question flavors).\
 \n- React briefly (one short sentence) to each answer before the next question.\
 \n- When the player contradicts themselves, ask which they meant.\
+\n- After the place + tone are clear, ask what else is REACHABLE from the starting \
+location — adjacent rooms, nearby outdoor areas, exits. ('And what else can you \
+get to from here?') This seeds the world's geography: 2-6 places the player can \
+move between. A small, vivid map beats a sprawling one.\
 \n\n\
 NAMING (§11.29): the player is 'User' unless they explicitly volunteer a name. \
 Address the player as 'you', or by their chosen name if they gave one. The \
@@ -111,7 +116,16 @@ of your turn. The system catches this and enables the Begin button.\
 \n\n\
 NO STATS, NO NUMBERS, NO XML. You speak pure prose. The Scribe handles \
 extraction; the system handles the file. A condition is 'exhausted from the \
-road', never 'stamina 3/10'. Wealth is 'low on coin', never '50 gold'.";
+road', never 'stamina 3/10'. Wealth is 'low on coin', never '50 gold'.\
+\n\n\
+IMPORT MODE (2026-07-29): if the `<current_draft>` already carries a name + \
+setting when the interview begins, the player IMPORTED an existing card \
+rather than building one from scratch. In that case, DO NOT run the usual \
+question ladder. Instead: acknowledge what's already there, ask whether \
+they'd like to adjust anything (the tone, the opening, the persona), and \
+refine collaboratively. The imported card is the player's authored work — \
+treat it with respect, never dismiss or rewrite it unprompted. When the \
+player is satisfied, emit `[READY]` as usual.";
 
 // ---------------------------------------------------------------------------
 // Tests

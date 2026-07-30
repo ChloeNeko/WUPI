@@ -11,6 +11,35 @@ marked <user_profile> describes the operator you are speaking with: treat it \
 as authoritative identity, not a suggestion. When memory and the live \
 conversation disagree, the live conversation always wins.";
 
+/// The agent/tool-calling protocol. Scoped to the TOOL pass of `chat_send`
+/// ONLY (see `lib.rs::chat_send`'s `agent_system_prompt` branch): the catgirl
+/// persona carries conversational text, and this block carries the structured-
+/// output contract for tool arguments, file contents, and code blocks. The
+/// prose pass (API handoff, local fallbacks, the no-tool final decode) never
+/// sees it — mirroring the narrator-prose vs tracker-mechanical split already
+/// in place on the Fable side (`build_api_narrator_system_prompt` vs the
+/// tracker/scribe prompts).
+///
+/// **§1C compliance — written POSITIVELY.** No "suppress", no "do not", no
+/// "CRITICAL WALL": negative framing is the Logit Echo Effect engine (it
+/// surfaces the very behavior it prohibits). The contract is stated as what
+/// the structured output IS, not what it must stop being. The natural catgirl
+/// voice is the default for all conversational text; this block only governs
+/// the machine-readable surface. The two are complementary, not in tension —
+/// co-residence in the system turn causes zero persona contamination (unlike
+/// the §11.52 fable tracker split, which needed a `clear_kv_cache` because the
+/// narrator's "never emit brackets" directly conflicted with the tracker's
+/// "emit brackets"). No clear-KV is needed here.
+pub const WUPI_AGENT_PROTOCOL: &str = "\
+<agent_protocol>\n\
+Structured outputs — tool arguments, file contents, code blocks, and any \
+machine-readable payload — are raw, syntactically valid, and exact. Emit only \
+the payload itself: valid JSON for tool arguments, valid source for code, the \
+literal file body for file writes. No prose, commentary, emoji, or framing \
+around these payloads; your natural conversational voice carries all \
+surrounding chat text.\n\
+</agent_protocol>";
+
 pub fn build_system_content(
     settings: &WupiSettings,
     persona: Option<&str>,
@@ -143,5 +172,34 @@ mod tests {
             "settings.context_size must NOT leak when effective_ctx differs"
         );
         assert!(content.contains("conversation_budget: 16000"));
+    }
+
+    #[test]
+    fn agent_protocol_is_wrapped_and_positive() {
+        // §1C (Prompt-Codex Discipline): the agent protocol must be wrapped in
+        // its tagged section and written POSITIVELY — no negative framing that
+        // would echo the very behavior it governs ("suppress", "do not",
+        // "CRITICAL WALL", "never"). Negative meta-rules surface the banned
+        // token in the model's context.
+        assert!(WUPI_AGENT_PROTOCOL.contains("<agent_protocol>"));
+        assert!(WUPI_AGENT_PROTOCOL.contains("</agent_protocol>"));
+        let lower = WUPI_AGENT_PROTOCOL.to_lowercase();
+        for banned in [
+            "suppress",
+            "do not",
+            "don't",
+            "critical wall",
+            "never ",
+            "must stop",
+            "forbidden",
+        ] {
+            assert!(
+                !lower.contains(banned),
+                "WUPI_AGENT_PROTOCOL must not contain '{}' (§1C no-echo: negative framing surfaces the banned token)",
+                banned
+            );
+        }
+        // The positive contract must be present.
+        assert!(WUPI_AGENT_PROTOCOL.contains("syntactically valid"));
     }
 }

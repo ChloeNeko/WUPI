@@ -1,8 +1,16 @@
 // =============================================================
-// SCREEN: SAVES — the save-slot list (Load Game flow).
-// Reads SaveMeta from fable_list_saves:
+// SCREEN: SAVES — the save-slot list (Load Game flow, step 2).
+//
+// Reached after picking a world (screens/worlds.js). Reads SaveMeta for that
+// world from fable_list_saves:
 //   { save_id, name, summary, timestamp, turn_count, is_autosave }
-// Delete → fable_delete_save. Select → handlers.onSelect(save).
+// Every slot — manual AND autosave — is listed AND deletable here. Autosaves
+// still carry an "auto" tag for visual distinction (they're the per-turn
+// checkpoint) but are not protected from deletion (the user may want to clear
+// the recovery checkpoint, and deleting an autosave is harmless — the next
+// turn simply writes a fresh one).
+//
+// Load    → onSelect(save). Delete → fable_delete_save, then re-render.
 // =============================================================
 
 import { listSaves, deleteSave } from '../engine/saves-io.js';
@@ -36,7 +44,12 @@ export function buildSaves(handlers) {
   return root;
 }
 
-export async function renderSaves(root, cardId, onSelect) {
+// Render the list for a world. `cardName` is shown in the header title so the
+// user knows which world's saves they're browsing; `cardId` scopes the list +
+// delete calls. `onSelect` receives the chosen SaveMeta.
+export async function renderSaves(root, cardId, onSelect, cardName) {
+  const titleEl = root.querySelector('[data-title]');
+  if (titleEl) titleEl.textContent = cardName ? `${cardName} — Saves` : 'Saves';
   const host = root.querySelector('[data-host]');
   host.innerHTML = '';
   let saves = [];
@@ -63,16 +76,15 @@ export async function renderSaves(root, cardId, onSelect) {
       </div>
       <div class="fable-save-actions">
         <button class="fable-save-btn" data-act="load">Load</button>
-        ${!save.is_autosave ? '<button class="fable-save-btn danger" data-act="del">Delete</button>' : ''}
+        <button class="fable-save-btn danger" data-act="del">Delete</button>
       </div>
     `;
     row.querySelector('[data-act="load"]').addEventListener('click', () => onSelect(save));
-    const delBtn = row.querySelector('[data-act="del"]');
-    if (delBtn) delBtn.addEventListener('click', async () => {
+    row.querySelector('[data-act="del"]').addEventListener('click', async () => {
       try {
         await deleteSave(cardId, save.save_id);
       } catch (_) {}
-      renderSaves(root, cardId, onSelect);
+      renderSaves(root, cardId, onSelect, cardName);
     });
     host.appendChild(row);
   }

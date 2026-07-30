@@ -24,6 +24,125 @@ pub struct Message {
     #[serde(default)]
     pub raw_output: String,
     pub timestamp: i64,
+    /// Swipeable reroll variants (the SillyTavern-style "1/N" UX, 2026-07-29).
+    ///
+    /// Holds EVERY variant of this message, INCLUDING the active one, indexed
+    /// directly by `active_idx`. `content`/`raw_output` are kept as a
+    /// denormalized mirror of `variants[active_idx]`/`raw_outputs[active_idx]`
+    /// so the rest of the codebase (context assembly, the chat formatter) can
+    /// keep reading `.content` for free — only these helpers ever touch the
+    /// `variants` Vec. `variant_count() == variants.len()` (always ≥ 1).
+    ///
+    /// Backwards-compatible: a legacy save with only `content` (no `variants`)
+    /// deserializes via `normalize_variants` into a single-element `variants`
+    /// (a copy of `content`) + `active_idx` 0, so old saves behave identically.
+    ///
+    /// Only `content` ever reaches inference — `assemble_api_messages*` reads
+    /// `.content` exclusively — so the variant list is pure UI/persistence
+    /// state with zero model-context cost.
+    #[serde(default)]
+    pub variants: Vec<String>,
+    /// Parallel to `variants`: the raw model output for each variant, so KV-
+    /// cache-coherent re-render (Bug #3) still works after a swipe to an older
+    /// variant. `variants[i]` corresponds to `raw_outputs[i]`.
+    #[serde(default)]
+    pub raw_outputs: Vec<String>,
+    /// Which variant is active — a DIRECT index into `variants`. Default 0.
+    /// Clamped on load by `normalize_variants`.
+    #[serde(default)]
+    pub active_idx: usize,
+}
+
+impl Message {
+    /// Total number of variants. This is the `N` in the UI's `1/N`. A freshly-
+    /// constructed message has an empty `variants` Vec (the constructors don't
+    /// seed a redundant copy) but is implicitly single-variant — `content`
+    /// itself is the one variant — so this returns `max(1, variants.len())`.
+    /// After the first `push_variant` (a reroll) or after `normalize_variants`
+    /// (on load), `variants` carries every variant including the active one.
+    pub fn variant_count(&self) -> usize {
+        self.variants.len().max(1)
+    }
+
+    /// The text of variant `i`. For a fresh single-variant message (empty
+    /// `variants`), `i == 0` returns the active `content`. Otherwise `i` is a
+    /// direct index into `variants`. Returns `None` if out of range.
+    pub fn variant_at(&self, i: usize) -> Option<&str> {
+        if self.variants.is_empty() {
+            return if i == 0 { Some(&self.content) } else { None };
+        }
+        self.variants.get(i).map(String::as_str)
+    }
+
+    /// The raw_output for variant `i` (parallel to `variant_at`).
+    pub fn raw_at(&self, i: usize) -> Option<&str> {
+        if self.raw_outputs.is_empty() {
+            return if i == 0 { Some(&self.raw_output) } else { None };
+        }
+        self.raw_outputs.get(i).map(String::as_str)
+    }
+
+    /// Append a freshly-generated variant + make it the active one. Used by
+    /// the reroll flow: the prior active content survives as a sibling, the
+    /// new text becomes active. Mirrors `content`/`raw_output` to the new tail.
+    /// For a fresh message (empty `variants`) the prior `content`/`raw_output`
+    /// are seeded as variant 0 first so nothing is orphaned.
+    pub fn push_variant(&mut self, new_content: String, new_raw: String) {
+        if self.variants.is_empty() {
+            self.variants.push(self.content.clone());
+            self.raw_outputs.push(self.raw_output.clone());
+        }
+        self.variants.push(new_content.clone());
+        self.raw_outputs.push(new_raw.clone());
+        self.content = new_content;
+        self.raw_output = new_raw;
+        self.active_idx = self.variants.len() - 1;
+    }
+
+    /// Make variant `i` the active one + re-mirror `content`/`raw_output` to
+    /// it. No-op if `i == active_idx` or out of range. Used by swipe-left/right.
+    pub fn select_variant(&mut self, i: usize) {
+        if i == self.active_idx || i >= self.variant_count() {
+            return;
+        }
+        // A fresh message with empty variants has only the implicit content
+        // variant (index 0); selecting anything else is out of range (no-op).
+        if self.variants.is_empty() {
+            return;
+        }
+        self.active_idx = i;
+        self.content = self.variants[i].clone();
+        self.raw_output = self.raw_outputs.get(i).cloned().unwrap_or_default();
+    }
+
+    /// Sanitize on construction: ensure `variants`/`raw_outputs` are non-empty
+    /// + length-aligned, seed them from `content`/`raw_output` for a legacy
+    /// single-content save, and clamp `active_idx` into range. Defensive only
+    /// — the accessors are already range-safe — but keeps hand-edited or
+    /// future-different saves from panicking.
+    pub(crate) fn normalize_variants(&mut self) {
+        // Legacy save: no variants field → seed a single-element list from the
+        // active content so the rest of the model can assume ≥1 variant.
+        if self.variants.is_empty() {
+            self.variants.push(self.content.clone());
+            self.raw_outputs.push(self.raw_output.clone());
+            self.active_idx = 0;
+            return;
+        }
+        if self.raw_outputs.len() < self.variants.len() {
+            self.raw_outputs.resize(self.variants.len(), String::new());
+        } else if self.raw_outputs.len() > self.variants.len() {
+            self.raw_outputs.truncate(self.variants.len());
+        }
+        if self.active_idx >= self.variants.len() {
+            self.active_idx = 0;
+        }
+        // Keep the mirror honest (a hand-edit could have changed variants but
+        // not content). The active variant is the source of truth here.
+        if self.content != self.variants[self.active_idx] {
+            self.content = self.variants[self.active_idx].clone();
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -56,6 +175,9 @@ impl Conversation {
             reasoning,
             raw_output: String::new(),
             timestamp: chrono_now_millis(),
+            variants: Vec::new(),
+            raw_outputs: Vec::new(),
+            active_idx: 0,
         };
         self.messages.push(msg);
         self.messages.last().expect("just pushed")
@@ -77,6 +199,9 @@ impl Conversation {
             reasoning,
             raw_output,
             timestamp: chrono_now_millis(),
+            variants: Vec::new(),
+            raw_outputs: Vec::new(),
+            active_idx: 0,
         };
         self.messages.push(msg);
         self.messages.last().expect("just pushed")
@@ -145,8 +270,16 @@ impl Conversation {
 
     pub fn load(path: &Path) -> std::io::Result<Self> {
         match std::fs::read_to_string(path) {
-            Ok(text) => serde_json::from_str(&text)
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e)),
+            Ok(text) => {
+                let mut conv: Self = serde_json::from_str(&text)
+                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+                // Defensive: clamp active_idx + reconcile variant/raw lengths
+                // so a hand-edited or skewed save can't panic the accessors.
+                for m in &mut conv.messages {
+                    m.normalize_variants();
+                }
+                Ok(conv)
+            }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::new()),
             Err(e) => Err(e),
         }
@@ -626,5 +759,167 @@ mod tests {
         assert_eq!(normalize_alternating(vec![]).len(), 0);
         let one = vec![api("user", "solo")];
         assert_eq!(normalize_alternating(one).len(), 1);
+    }
+
+    // ---- Variant model (swipeable rerolls) ----------------------------------
+
+    fn variant_msg() -> Message {
+        Message {
+            id: "m_test".into(),
+            role: Role::Assistant,
+            content: "first".into(),
+            reasoning: String::new(),
+            raw_output: "<raw1>".into(),
+            timestamp: 0,
+            variants: Vec::new(),
+            raw_outputs: Vec::new(),
+            active_idx: 0,
+        }
+    }
+
+    #[test]
+    fn fresh_message_has_one_variant() {
+        let m = variant_msg();
+        assert_eq!(m.variant_count(), 1);
+        assert_eq!(m.variant_at(0), Some("first"));
+        assert_eq!(m.variant_at(1), None, "no second variant yet");
+        assert_eq!(m.raw_at(0), Some("<raw1>"));
+    }
+
+    #[test]
+    fn push_variant_keeps_old_as_sibling_and_makes_new_active() {
+        let mut m = variant_msg();
+        m.push_variant("second".into(), "<raw2>".into());
+        // content is now the new one; old is stashed as a sibling.
+        assert_eq!(m.content, "second");
+        assert_eq!(m.raw_output, "<raw2>");
+        assert_eq!(m.active_idx, 1, "new variant becomes #1 (0-indexed)");
+        assert_eq!(m.variant_count(), 2);
+        // Both variants are retrievable by index.
+        assert_eq!(m.variant_at(0), Some("first"), "old text at index 0");
+        assert_eq!(m.variant_at(1), Some("second"), "new text at index 1");
+        assert_eq!(m.raw_at(0), Some("<raw1>"));
+        assert_eq!(m.raw_at(1), Some("<raw2>"));
+    }
+
+    #[test]
+    fn two_pushes_yield_three_variants() {
+        // The reroll-twice case from the plan.
+        let mut m = variant_msg();
+        m.push_variant("second".into(), "<raw2>".into());
+        m.push_variant("third".into(), "<raw3>".into());
+        assert_eq!(m.variant_count(), 3);
+        assert_eq!(m.content, "third");
+        assert_eq!(m.active_idx, 2);
+        assert_eq!(m.variant_at(0), Some("first"));
+        assert_eq!(m.variant_at(1), Some("second"));
+        assert_eq!(m.variant_at(2), Some("third"));
+    }
+
+    #[test]
+    fn select_variant_swaps_active_with_sibling() {
+        let mut m = variant_msg();
+        m.push_variant("second".into(), "<raw2>".into());
+        // Swipe back to the first variant.
+        m.select_variant(0);
+        assert_eq!(m.content, "first", "active content is now the old one");
+        assert_eq!(m.raw_output, "<raw1>");
+        assert_eq!(m.active_idx, 0);
+        assert_eq!(m.variant_at(0), Some("first"));
+        assert_eq!(m.variant_at(1), Some("second"), "second still retrievable");
+        // Swipe forward again.
+        m.select_variant(1);
+        assert_eq!(m.content, "second");
+        assert_eq!(m.active_idx, 1);
+    }
+
+    #[test]
+    fn select_variant_noop_on_active_or_out_of_range() {
+        let mut m = variant_msg();
+        m.push_variant("second".into(), "<raw2>".into());
+        // Selecting the already-active variant is a no-op.
+        m.select_variant(1);
+        assert_eq!(m.content, "second");
+        assert_eq!(m.active_idx, 1);
+        // Out-of-range is a no-op (no panic).
+        m.select_variant(99);
+        assert_eq!(m.content, "second");
+        assert_eq!(m.active_idx, 1);
+    }
+
+    #[test]
+    fn legacy_save_with_only_content_loads_as_single_variant() {
+        // A save written before the variant fields existed: only id/role/
+        // content/reasoning/raw_output/timestamp. serde defaults must fill the
+        // new fields so the message behaves as a single-variant message.
+        let legacy = r#"{
+            "id": "m_old",
+            "role": "assistant",
+            "content": "legacy prose",
+            "reasoning": "",
+            "raw_output": "<legacy_raw>",
+            "timestamp": 123
+        }"#;
+        let m: Message = serde_json::from_str(legacy).expect("legacy message parses");
+        assert_eq!(m.variants, Vec::<String>::new());
+        assert_eq!(m.active_idx, 0);
+        assert_eq!(m.variant_count(), 1);
+        assert_eq!(m.content, "legacy prose");
+        assert_eq!(m.variant_at(0), Some("legacy prose"));
+    }
+
+    #[test]
+    fn normalize_variants_clamps_skewed_save() {
+        // A hand-edited save with active_idx beyond range + mismatched lengths.
+        // Under the "variants includes active" model: variants=["a","b"] →
+        // 2 variants total; the out-of-range active_idx clamps to 0, which
+        // re-mirrors content to variants[0]="a" (the active source of truth).
+        let mut m = Message {
+            id: "x".into(),
+            role: Role::Assistant,
+            content: "active".into(),
+            reasoning: String::new(),
+            raw_output: "<active>".into(),
+            timestamp: 0,
+            variants: vec!["a".into(), "b".into()],
+            raw_outputs: vec!["<ra>".into()], // short by one
+            active_idx: 99,                    // out of range
+        };
+        m.normalize_variants();
+        assert_eq!(m.active_idx, 0, "clamped to 0");
+        assert_eq!(m.raw_outputs.len(), m.variants.len(), "lengths reconciled");
+        assert_eq!(m.variant_count(), 2);
+        assert_eq!(m.content, "a", "content re-mirrored to the active variant");
+    }
+
+    #[test]
+    fn variant_roundtrips_through_conversation_save_load() {
+        // The full persistence contract: a message with variants survives a
+        // save→load cycle with all its swipe state intact.
+        let path = unique_test_path("variants");
+        cleanup(&path);
+
+        let mut conv = Conversation::new();
+        conv.add_message(Role::User, "roll the dice".into());
+        conv.add_assistant_turn("first reply".into(), String::new(), "<raw1>".into());
+        // Simulate two rerolls on the assistant turn.
+        {
+            let last = conv.messages.last_mut().unwrap();
+            last.push_variant("second reply".into(), "<raw2>".into());
+            last.push_variant("third reply".into(), "<raw3>".into());
+        }
+        conv.save(&path).expect("save");
+
+        let loaded = Conversation::load(&path).expect("load");
+        assert_eq!(loaded.messages.len(), 2);
+        let a = &loaded.messages[1];
+        assert_eq!(a.variant_count(), 3, "all three variants persisted");
+        assert_eq!(a.content, "third reply", "active variant preserved");
+        assert_eq!(a.active_idx, 2);
+        assert_eq!(a.variant_at(0), Some("first reply"));
+        assert_eq!(a.variant_at(1), Some("second reply"));
+        assert_eq!(a.variant_at(2), Some("third reply"));
+
+        cleanup(&path);
     }
 }

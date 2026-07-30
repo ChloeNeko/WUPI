@@ -207,6 +207,59 @@ struct SamplerConfig {
     dry_allowed_length: i32,
 }
 
+/// The punctuation logit-bias table applied to the narrator + tracker sampler
+/// chains (Prong 2 of the LOCAL Phase 4 fix, 2026-07-29). Each entry is a
+/// (token-text, bias) pair resolved against the live model at sampler-build
+/// time via `str_to_token`. Returns a `&'static` slice so it is trivially
+/// unit-testable without a loaded model.
+///
+/// Rationale (per the blueprint):
+/// - Hyphen `"-"` / `" -"`: -10.0 (the original §11.40 Bug B defense —
+///   suppresses the hyphen-spam attractor).
+/// - Comma `","`: -1.0 (mild — still available for natural sentence
+///   structure, but kills the comma-splicing attractor from Finding B).
+/// - Semicolon `";"`: -10.0 (heavy — semicolons invite run-on attention).
+/// - En-dash `"\u{2013}"` / Em-dash `"\u{2014}"`: -100.0 (hard ban — these
+///   are garbage tokens for this model that cause run-on sentences; nuke
+///   them from the distribution).
+///
+/// NOTE on multi-token characters: `str_to_token` returns a `Vec`; the
+/// caller resolves only the FIRST token of each entry. For ASCII punctuation
+/// that is the whole token. For the non-ASCII en/em-dashes Gemma's tokenizer
+/// may split them into 2-3 sub-tokens; biasing the lead token makes the
+/// sequence near-unreachable (each subsequent sub-token carries its own
+/// probability mass), which achieves the blueprint's "nuke them completely"
+/// intent. A future pass can bias all sub-tokens if the lead-token bias
+/// proves insufficient under live play.
+fn punct_bias_table() -> &'static [(&'static str, f32)] {
+    &[
+        ("-", -10.0),         // §11.40 Bug B — hyphen-spam defense (preserved)
+        (" -", -10.0),        // leading-space hyphen (same attractor)
+        (",", -1.0),          // mild — kills comma-splicing, keeps natural commas
+        (";", -10.0),         // heavy — semicolons invite run-ons
+        ("\u{2013}", -100.0), // en-dash — hard ban
+        ("\u{2014}", -100.0), // em-dash — hard ban
+    ]
+}
+
+/// Resolve the punctuation bias table against the live model into concrete
+/// `LlamaLogitBias` pairs. Each table entry maps to (at most) one bias on the
+/// lead token; entries whose text doesn't tokenize are silently dropped (the
+/// `filter_map` mirrors the legacy inline pattern). Pure given a model ref —
+/// testable via `shared_model()` once a model is loaded.
+fn resolve_punct_biases(model: &LlamaModel) -> Vec<LlamaLogitBias> {
+    punct_bias_table()
+        .iter()
+        .filter_map(|(s, bias)| {
+            model
+                .str_to_token(s, AddBos::Never)
+                .ok()
+                .and_then(|v| v.first().copied())
+                .map(|t| LlamaLogitBias::new(t, *bias))
+        })
+        .collect()
+}
+
 /// Returns the sampler profile for the requested turn mode. See
 /// [`SamplerConfig`] + the `sampler_config_*` tests for the pinned values.
 fn sampler_config(tracker_mode: bool) -> SamplerConfig {
@@ -582,24 +635,21 @@ impl FableRuntime {
         // silent greedy collapse was producing low-creativity deterministic
         // prose. The seed is fixed at 0; a future pass can use a per-turn
         // time-based seed for nondeterminism across re-rolls of the same input.
-        let hyphen_biases: Vec<LlamaLogitBias> = ["-", " -"]
-            .iter()
-            .filter_map(|s| {
-                self.model
-                    .str_to_token(s, AddBos::Never)
-                    .ok()
-                    .and_then(|v| v.first().copied())
-                    .map(|t| LlamaLogitBias::new(t, -10.0))
-            })
-            .collect();
+        // Prong 2 (2026-07-29): the punctuation logit-bias table — comma
+        // (mild), semicolon (heavy), en/em-dash (hard ban), plus the legacy
+        // hyphen bias. Resolved against the live model at sampler-build time
+        // via the shared `resolve_punct_biases` helper. See `punct_bias_table`
+        // for the per-token rationale + the multi-token-resolution caveat.
+        let punct_biases: Vec<LlamaLogitBias> = resolve_punct_biases(self.model);
         let n_vocab = self.model.n_vocab();
         // §11.43.B (2026-07-28): two sampler profiles sharing the same chain
         // shape (temp → top_p → min_p → dry → logit_bias → dist). The tracker
         // is an AGENT emitting rigid JSON/brackets — it gets a deterministic
         // profile (low temp, tight top_p, aggressive DRY). The narrator keeps
         // the existing creative profile (high temp, wide top_p, lenient DRY).
-        // The hyphen logit bias + dist(0) terminal are shared (Bug B defense
-        // applies to both; the chain needs a terminal sampler either way).
+        // The punctuation logit bias + dist(0) terminal are shared (the Bug B
+        // hyphen defense + the Prong 2 comma/semicolon/dash biases apply to
+        // both passes; the chain needs a terminal sampler either way).
         //
         // Why DRY allowed_length=1 for the tracker: the `(player)(player)`
         // loop we saw in the §11.42 playtest repeated a 1-2 token sequence
@@ -619,7 +669,7 @@ impl FableRuntime {
                 LlamaSampler::top_p(cfg.top_p, 1),
                 LlamaSampler::min_p(0.1, 1),
                 LlamaSampler::dry(self.model, cfg.dry_multiplier, cfg.dry_base, cfg.dry_allowed_length, -1, ["\n"]),
-                LlamaSampler::logit_bias(n_vocab, &hyphen_biases),
+                LlamaSampler::logit_bias(n_vocab, &punct_biases),
                 LlamaSampler::dist(0),
             ])
         } else {
@@ -628,17 +678,17 @@ impl FableRuntime {
                 LlamaSampler::top_p(cfg.top_p, 1),
                 LlamaSampler::min_p(0.1, 1),
                 LlamaSampler::dry(self.model, cfg.dry_multiplier, cfg.dry_base, cfg.dry_allowed_length, -1, ["\n"]),
-                LlamaSampler::logit_bias(n_vocab, &hyphen_biases),
+                LlamaSampler::logit_bias(n_vocab, &punct_biases),
                 LlamaSampler::dist(0),
             ])
         };
-        if !hyphen_biases.is_empty() {
+        if !punct_biases.is_empty() {
             tracing::info!(
-                biased = hyphen_biases.len(),
-                "sampler: hyphen logit bias active (Bug B fix)"
+                biased = punct_biases.len(),
+                "sampler: punctuation logit biases active (comma/semicolon/en-dash/em-dash + hyphen)"
             );
         } else {
-            tracing::warn!("sampler: could not resolve hyphen token — logit bias disabled");
+            tracing::warn!("sampler: could not resolve any punctuation tokens — logit bias disabled");
         }
         let eos = self.model.token_eos();
         let mut n_cur = n_prompt;
@@ -865,5 +915,47 @@ mod tests {
         assert!(tracker.temp < narrator.temp);
         assert!(tracker.top_p < narrator.top_p);
         assert!(tracker.dry_allowed_length < narrator.dry_allowed_length);
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Prong 2 (2026-07-29): punctuation logit-bias table tests. The table is
+    // a pure &'static slice — testable without a loaded model. The model
+    // resolution (`resolve_punct_biases`) needs a real LlamaModel, so it's
+    // verified via the live build (the tracing log confirms the bias count)
+    // rather than a unit test.
+    // ─────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn punct_bias_table_has_the_locked_entries() {
+        let table = punct_bias_table();
+        // The blueprint's exact bias values. Pinned so any drift breaks the
+        // test, not silently ships.
+        let as_map: std::collections::HashMap<&str, f32> = table.iter().copied().collect();
+        // Hyphen defenses (Bug B) — preserved from the pre-Prong-2 inline form.
+        assert_eq!(as_map.get("-"), Some(&-10.0), "hyphen bias preserved (Bug B)");
+        assert_eq!(as_map.get(" -"), Some(&-10.0), "leading-space hyphen bias preserved");
+        // New Prong 2 entries.
+        assert_eq!(as_map.get(","), Some(&-1.0), "comma bias is mild (-1.0)");
+        assert_eq!(as_map.get(";"), Some(&-10.0), "semicolon bias is heavy (-10.0)");
+        assert_eq!(
+            as_map.get("\u{2013}"),
+            Some(&-100.0),
+            "en-dash is hard-banned (-100.0)"
+        );
+        assert_eq!(
+            as_map.get("\u{2014}"),
+            Some(&-100.0),
+            "em-dash is hard-banned (-100.0)"
+        );
+    }
+
+    #[test]
+    fn punct_bias_table_ordering_is_hyphen_first() {
+        // The hyphen entry MUST stay first so the legacy "Bug B" identity is
+        // obvious in the table source (a future reader scanning for the
+        // historical defense finds it immediately). Pinned.
+        let table = punct_bias_table();
+        assert_eq!(table[0].0, "-", "hyphen is the first entry (legacy Bug B defense)");
+        assert_eq!(table[1].0, " -", "leading-space hyphen is second");
     }
 }

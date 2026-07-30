@@ -58,7 +58,7 @@ function prose(s) {
   return esc(s).replace(/\n/g, '<br>');
 }
 
-function scrollDown() {
+export function scrollDown() {
   if (!feed) return;
   feed.scrollTop = feed.scrollHeight;
 }
@@ -145,6 +145,49 @@ export function finalizeBeat(beat, finalText) {
   scrollDown();
 }
 
+// =============================================================
+// SWIPEABLE VARIANTS (2026-07-29) — the ‹ 1/N › UX.
+// Three beat-level helpers used by narrator.js's reroll + swipe paths.
+// All three mutate a single beat in place (no feed wipe) — mirroring the
+// §11.29 selective-regenerate splice that proved single-beat mutation
+// works without the full-rebuild flash.
+// =============================================================
+
+// The last assistant/narrator beat in the feed, or null. Used by the reroll
+// path to claim the existing beat as the streaming target (so the new
+// variant renders over the old prose in place).
+export function lastNarratorBeat() {
+  if (!feed) return null;
+  const all = feed.querySelectorAll('.fable-beat.narrator, .fable-beat.character');
+  return all.length ? all[all.length - 1] : null;
+}
+
+// Prepare a beat for an in-place reroll: drop into streaming state + clear
+// its body + reset the raw-chunk accumulator so the new variant streams in
+// fresh. The old text was already stashed into the message's `variants` by
+// the backend (`fable_send` reroll=true), so clearing the DOM is safe.
+export function beginReroll(beat) {
+  if (!beat) return;
+  beat._raw = '';
+  beat.classList.add('streaming', 'regenerating');
+  const body = beat.querySelector('.fable-beat-body');
+  if (body) body.innerHTML = '';
+}
+
+// Swap a beat's displayed body to a different variant's content (the swipe-
+// left/right action). Finds the beat by `data-index`, re-renders its body
+// from `content`, clears the raw accumulator so a subsequent finalize won't
+// restore stale text. No feed rebuild.
+export function swapVariantBody(index, content) {
+  if (!feed) return;
+  const beat = feed.querySelector(`.fable-beat[data-index="${index}"]`);
+  if (!beat) return;
+  beat._raw = content || '';
+  const body = beat.querySelector('.fable-beat-body');
+  if (body) body.innerHTML = prose(content || '');
+  scrollDown();
+}
+
 // Re-class a live narrator beat as a character beat when a
 // CHARACTER_TURN bracket arrives mid-stream. Speaker label prepended.
 // MVP limitation (AGENTS.md §11.10): a second CHARACTER_TURN in the
@@ -196,11 +239,26 @@ export function rebuildFromMessages(messages) {
     } else if (m.role === 'assistant') {
       const b = startNarratorBeat();
       finalizeBeat(b, m.content);
+      // Stamp the swipeable-variant state (2026-07-29) so refreshControls can
+      // render the ‹ 1/N › bar without a separate message cache. `variants` on
+      // the wire holds the INACTIVE siblings; total = variants.length + 1.
+      stampVariants(b, m.variants, m.active_idx);
     } else {
       addSystemBeat(m.content);
     }
   }
   scrollDown();
+}
+
+// Record the variant state on a beat's dataset. `variants` is the array of
+// inactive siblings (matches the wire shape); activeIdx is the 0-indexed
+// position. Used by rebuildFromMessages + the reroll/swipe paths so the
+// delegated controls renderer can read it straight off the DOM.
+export function stampVariants(beat, variants, activeIdx) {
+  if (!beat) return;
+  const count = Array.isArray(variants) ? variants.length + 1 : 1;
+  beat.dataset.variantCount = String(count);
+  beat.dataset.activeVariant = String(Number.isInteger(activeIdx) ? activeIdx : 0);
 }
 
 // Read the text content of the body of a beat (used to seed the inline
@@ -227,35 +285,66 @@ export function getBeatText(beat) {
 // enable `pointer-events: auto`, so anything outside a beat is unclickable.
 //
 // Buttons shown:
-//   - edit (pencil): always on user beats; on the LAST assistant beat too
-//     (in-place typo fix per spec §1 — distinct from reroll, which regens).
+//   - swipe bar (‹ 1/N ›): on assistant beats with >1 variant (the 2026-07-29
+//     swipeable-reroll UX). Arrows navigate variants; disabled at the ends.
 //   - reroll (circular-arrow): only on the last assistant beat (regen path).
+//
+// Editing is now DOUBLE-CLICK (2026-07-29): the pencil button is gone; a
+// dblclick anywhere on a beat enters edit mode (stage.js wires the listener).
 // =============================================================
-const ICON_EDIT = '<svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true">' +
-  '<path fill="currentColor" d="M11.5 1.5l3 3L5 14H2v-3z" opacity="0.9"/>' +
-  '<path fill="currentColor" d="M11.5 1.5l3 3" stroke="currentColor" stroke-width="0.5" fill="none"/></svg>';
 const ICON_REROLL = '<svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true">' +
   '<path fill="none" stroke="currentColor" stroke-width="1.5" ' +
   'd="M3 8a5 5 0 1 1 1.5 3.6M3 11.5V8h3.5" stroke-linecap="round" stroke-linejoin="round"/></svg>';
 
-export function renderControls(beat, { canEdit = false, canReroll = false } = {}) {
+export function renderControls(beat, {
+  canReroll = false,
+  // Swipeable-variant state (2026-07-29). variantCount is the `N` in `1/N`;
+  // activeVariant is the current 0-indexed position. The swipe bar only
+  // renders when variantCount > 1.
+  variantCount = 1,
+  activeVariant = 0,
+} = {}) {
   if (!beat) return;
   const card = beat.querySelector('.fable-beat-card');
   if (!card) return; // system beats have no card → no controls.
   // Idempotent: remove any prior controls block before injecting.
   card.querySelector('.fable-beat-controls')?.remove();
-  if (!canEdit && !canReroll) return;
+  const showSwipe = variantCount > 1;
+  if (!canReroll && !showSwipe) return;
   const wrap = document.createElement('div');
   wrap.className = 'fable-beat-controls';
-  if (canEdit) {
-    const btn = document.createElement('button');
-    btn.type = 'button';
-    btn.className = 'fable-beat-btn';
-    btn.dataset.action = 'edit';
-    btn.title = 'Edit message';
-    btn.setAttribute('aria-label', 'Edit message');
-    btn.innerHTML = ICON_EDIT;
-    wrap.appendChild(btn);
+  if (showSwipe) {
+    // The ‹ 1/N › swipe bar. Arrows are disabled at the ends (‹ at variant 0,
+    // › at the last). Both arrows carry the beat's data-index + the target
+    // variant index so the delegated swipe handler in stage.js can route
+    // without re-deriving position.
+    const bar = document.createElement('div');
+    bar.className = 'fable-swipe-bar';
+    const left = document.createElement('button');
+    left.type = 'button';
+    left.className = 'fable-swipe-btn';
+    left.dataset.action = 'swipe-left';
+    left.dataset.targetVariant = String(Math.max(0, activeVariant - 1));
+    left.title = 'Previous variant';
+    left.setAttribute('aria-label', 'Previous variant');
+    left.innerHTML = '&#8249;';
+    if (activeVariant === 0) left.disabled = true;
+    const count = document.createElement('span');
+    count.className = 'fable-swipe-count';
+    count.textContent = `${activeVariant + 1}/${variantCount}`;
+    const right = document.createElement('button');
+    right.type = 'button';
+    right.className = 'fable-swipe-btn';
+    right.dataset.action = 'swipe-right';
+    right.dataset.targetVariant = String(Math.min(variantCount - 1, activeVariant + 1));
+    right.title = 'Next variant';
+    right.setAttribute('aria-label', 'Next variant');
+    right.innerHTML = '&#8250;';
+    if (activeVariant === variantCount - 1) right.disabled = true;
+    bar.appendChild(left);
+    bar.appendChild(count);
+    bar.appendChild(right);
+    wrap.appendChild(bar);
   }
   if (canReroll) {
     const btn = document.createElement('button');

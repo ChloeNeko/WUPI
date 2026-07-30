@@ -77,6 +77,54 @@ The door of the Rusty Lantern swings shut behind you, cutting off the cold rain.
         <neighbor>north_road</neighbor>
       </node>
     </locations>
+
+    <!-- Fable Phase 5A (2026-07-29): the named NPC registry. Parsed by
+         sim_card::parse into cast: Vec<CardNpc>; enter_fable_session seeds
+         schema::WorldSchema::npc_registry from this. The id is the
+         load-bearing field — the [PRESENCE] bracket validates against it
+         (unknown id → reject; the anti-hallucination gate that closes the
+         "teleporting NPC" bug). name is the diegetic prose label; role is a
+         one-line hook; tier is forward-compat for the §11.30 threat heuristic
+         (optional — atmosphere NPCs omit it); alias lists alternate surface
+         forms the presence applier normalizes back to id. The ids here MUST
+         match <start_npcs> so the narrator-prompt seeding and the registry
+         agree on canonical keys. A card with no <cast> block stays dormant
+         (pre-Phase-5 behavior — no whitelist, [PRESENCE] has nothing to
+         validate against). -->
+    <cast>
+      <npc id="mara_the_innkeep" tier="soldier">
+        <name>Mara</name>
+        <role>The innkeeper behind the bar; watches the door, pours ale, knows the town's comings and goings</role>
+        <alias>mara</alias>
+        <alias>innkeep</alias>
+        <alias>innkeeper</alias>
+      </npc>
+      <npc id="the_hooded_stranger">
+        <name>The Hooded Stranger</name>
+        <role>A silent figure alone in the corner nursing an untouched ale; wary, watching without seeming to</role>
+        <alias>stranger</alias>
+        <alias>hooded figure</alias>
+      </npc>
+      <npc id="bard_corin">
+        <name>Corin</name>
+        <role>A traveling bard tuning a lute on the small stage; sells songs and gossip for coin</role>
+        <alias>corin</alias>
+        <alias>bard</alias>
+      </npc>
+      <npc id="guards_dice_game" tier="soldier">
+        <name>The Dice-Playing Guards</name>
+        <role>Two off-duty town guards shooting dice by the hearth; bored, loud, lightly armed</role>
+        <alias>guards</alias>
+        <alias>the guards</alias>
+        <alias>dice players</alias>
+      </npc>
+      <npc id="merchant_aldric">
+        <name>Aldric</name>
+        <role>A cloaked merchant counting coin at the bar; arrives with the trade caravans, deals in goods and information</role>
+        <alias>aldric</alias>
+        <alias>merchant</alias>
+      </npc>
+    </cast>
   </scenario>
 
 </sim_card>
