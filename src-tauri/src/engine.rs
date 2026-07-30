@@ -142,6 +142,37 @@ pub struct ChatEngine {
 unsafe impl Send for ChatEngine {}
 unsafe impl Sync for ChatEngine {}
 
+/// The punctuation logit-bias table applied to the chat sampler chain (Prong
+/// 2 of the LOCAL Phase 4 fix, 2026-07-29). Kept byte-identical to
+/// `fable_engine::punct_bias_table` — the chat + fable narrator prose benefit
+/// from the same biases, and §1C lists them under one sampler config. See the
+/// fable_engine copy for the full per-token rationale.
+fn punct_bias_table() -> &'static [(&'static str, f32)] {
+    &[
+        ("-", -10.0),         // hyphen-spam defense (preserved)
+        (" -", -10.0),        // leading-space hyphen (same attractor)
+        (",", -1.0),          // mild — kills comma-splicing, keeps natural commas
+        (";", -10.0),         // heavy — semicolons invite run-ons
+        ("\u{2013}", -100.0), // en-dash — hard ban
+        ("\u{2014}", -100.0), // em-dash — hard ban
+    ]
+}
+
+/// Resolve the punctuation bias table against the live model into concrete
+/// `LlamaLogitBias` pairs (mirror of `fable_engine::resolve_punct_biases`).
+fn resolve_punct_biases(model: &LlamaModel) -> Vec<LlamaLogitBias> {
+    punct_bias_table()
+        .iter()
+        .filter_map(|(s, bias)| {
+            model
+                .str_to_token(s, AddBos::Never)
+                .ok()
+                .and_then(|v| v.first().copied())
+                .map(|t| LlamaLogitBias::new(t, *bias))
+        })
+        .collect()
+}
+
 impl ChatEngine {
     /// Spawn the engine thread. The caller has already loaded the model and
     /// leaked it to `&'static` (see `llm.rs::spawn_engine`). We take the
@@ -756,23 +787,18 @@ impl EngineRuntime {
         // sampler.cpp on the first decode (the chain's `selected` field
         // stays at its -1 sentinel). `dist` is the correct probabilistic
         // terminal sampler.
-        let hyphen_biases: Vec<LlamaLogitBias> = ["-", " -"]
-            .iter()
-            .filter_map(|s| {
-                self.model
-                    .str_to_token(s, AddBos::Never)
-                    .ok()
-                    .and_then(|v| v.first().copied())
-                    .map(|t| LlamaLogitBias::new(t, -10.0))
-            })
-            .collect();
+        // Prong 2 (2026-07-29): punctuation logit-bias table (comma mild,
+        // semicolon heavy, en/em-dash hard ban, plus the legacy hyphen bias).
+        // Kept in lockstep with fable_engine::resolve_punct_biases so the
+        // chat + narrator prose share identical sampler shaping.
+        let punct_biases: Vec<LlamaLogitBias> = resolve_punct_biases(self.model);
         let n_vocab = self.model.n_vocab();
         let mut sampler = LlamaSampler::chain_simple([
             LlamaSampler::temp(0.85),
             LlamaSampler::top_p(0.95, 1),
             LlamaSampler::min_p(0.1, 1),
             LlamaSampler::dry(self.model, 0.8, 1.75, 2, -1, ["\n"]),
-            LlamaSampler::logit_bias(n_vocab, &hyphen_biases),
+            LlamaSampler::logit_bias(n_vocab, &punct_biases),
             LlamaSampler::dist(0),
         ]);
 

@@ -33,6 +33,7 @@ import * as beats from '../engine/beats.js';
 import * as narrator from '../engine/narrator.js';
 import * as wupiDrawer from '../engine/wupi-drawer.js';
 import * as selection from '../engine/selection.js';
+import * as sceneImage from '../engine/scene-image.js';
 import { invoke } from '@tauri-apps/api/core';
 // playFX + clearFX were the weather-render hooks pre-stripping; weather is
 // gone now (file header), so only initFX + clearAllFX remain used. The two
@@ -259,6 +260,14 @@ export function wireStage(root, hooks) {
   wupiDrawer.setStageRoot(root);
   wupiDrawer.initImpersonateButton(root.querySelector('[data-input]'));
 
+  // Phase 5B: scene-image backdrop subscriber. Listens for the late-arriving
+  // 'fable-scene-image' event (the SD swap runs after the turn's `done`) and
+  // swaps the generated PNG into the dormant `.fable-stage-bg` backdrop via
+  // the asset protocol. The failed-latch toast rides the stage's `toast` fn.
+  // Dormant by default: only fires when `sd_autogen_enabled` is flipped on
+  // (the orchestrator's done-beat spawn is gated on it Rust-side).
+  sceneImage.initSceneImage(root, { onToast: toast });
+
   // Selective regenerate (4th UX chat control): highlight a passage in the
   // last AI beat → "Regenerate" popup → AI rewrites only that slice in-place.
   // Rides the same `setGenerating` hook so the input's "Press Enter to stop…"
@@ -342,6 +351,32 @@ export function wireStage(root, hooks) {
   //     "edit 3 turns ago" case the spec describes — branch the timeline).
   // Reroll is only ever on the last assistant beat (refreshControls pins
   // it there) → `rerollLastTurn`.
+  // Shared edit entry-point used by BOTH the legacy pencil (removed) and the
+  // new double-click-to-edit (2026-07-29). Routes by role: user beats branch
+  // the timeline (rewind + regen); assistant beats get an in-place typo fix.
+  function beginEdit(beat) {
+    const role = beat.dataset.role;
+    const idx = Number.parseInt(beat.dataset.index || '', 10);
+    if (!Number.isInteger(idx)) return;
+    beats.enterEditMode(beat, {
+      onSave: (newText) => {
+        if (!newText) return;
+        if (role === 'user') {
+          // Editing a user message always branches the timeline (the AI
+          // would reply differently to the new text) → rewind + regen.
+          narrator.rewindAndEditUser(idx, newText);
+        } else {
+          // Assistant message edit → in-place typo fix, no regen.
+          narrator.editMessage(idx, newText);
+        }
+      },
+      onCancel: () => { /* no-op — editor already torn down */ },
+    });
+  }
+
+  // Delegated click handler for the feed controls (reroll + swipe arrows).
+  // Editing is now dblclick (separate listener below), so the `edit` action
+  // is gone from here.
   on(feed, 'click', (e) => {
     const btn = e.target.closest('[data-action]');
     if (!btn) return;
@@ -355,29 +390,25 @@ export function wireStage(root, hooks) {
       narrator.rerollLastTurn();
       return;
     }
-    if (action === 'edit') {
-      const role = beat.dataset.role;
-      const feedEl = stageRoot && stageRoot.querySelector('[data-feed]');
-      const allBeats = feedEl ? feedEl.querySelectorAll('.fable-beat') : [];
-      const isLast = allBeats.length > 0 && beat === allBeats[allBeats.length - 1];
-      // Enter edit mode; the Save callback fires the right mutation based
-      // on role + position. Cancel just leaves the beat as-is (the editor
-      // is torn down by enterEditMode's finish()).
-      beats.enterEditMode(beat, {
-        onSave: (newText) => {
-          if (!newText) return;
-          if (role === 'user') {
-            // Editing a user message always branches the timeline (the AI
-            // would reply differently to the new text) → rewind + regen.
-            narrator.rewindAndEditUser(idx, newText);
-          } else {
-            // Assistant message edit → in-place typo fix, no regen.
-            narrator.editMessage(idx, newText);
-          }
-        },
-        onCancel: () => { /* no-op — editor already torn down */ },
-      });
+    if (action === 'swipe-left' || action === 'swipe-right') {
+      const target = Number.parseInt(btn.dataset.targetVariant || '0', 10);
+      if (Number.isInteger(target)) narrator.swipeVariant(idx, target);
+      return;
     }
+  });
+
+  // Double-click anywhere on a beat → edit mode (2026-07-29, replaces the
+  // pencil button). Same routing as the old pencil click: user beats branch,
+  // assistant beats get an in-place fix. Ignored while generating so a
+  // mid-stream dblclick can't collide with the active beat.
+  on(feed, 'dblclick', (e) => {
+    const beat = e.target.closest('.fable-beat');
+    if (!beat) return;
+    if (beat.classList.contains('streaming') || beat.classList.contains('editing')) return;
+    if (narrator.isGenerating() || selection.isRegenerating()) return;
+    const role = beat.dataset.role;
+    if (role !== 'user' && role !== 'assistant') return; // no editing system beats
+    beginEdit(beat);
   });
 
   // Wupi trigger: invisible right-edge strip with a 300ms dwell.
@@ -662,13 +693,24 @@ function refreshControls() {
   const lastIdx = allBeats.length - 1;
   allBeats.forEach((beat, i) => {
     const role = beat.dataset.role;
-    if (role === 'user') {
-      beats.renderControls(beat, { canEdit: true, canReroll: false });
-    } else if (role === 'assistant' && i === lastIdx) {
-      beats.renderControls(beat, { canEdit: true, canReroll: true });
+    // Variant state is stamped on the beat dataset (beats.stampVariants) so
+    // we can render the ‹ 1/N › swipe bar without a message cache. Default
+    // count 1 = no swipe bar.
+    const variantCount = Number.parseInt(beat.dataset.variantCount || '1', 10);
+    const activeVariant = Number.parseInt(beat.dataset.activeVariant || '0', 10);
+    if (role === 'assistant' && i === lastIdx) {
+      // Last assistant beat: swipe bar (if >1 variant) + reroll.
+      beats.renderControls(beat, {
+        canReroll: true,
+        variantCount,
+        activeVariant,
+      });
+    } else if (role === 'assistant') {
+      // Earlier assistant beats: swipe bar only (no reroll).
+      beats.renderControls(beat, { canReroll: false, variantCount, activeVariant });
     } else {
-      // No controls on system beats or non-final assistant beats.
-      beats.renderControls(beat, { canEdit: false, canReroll: false });
+      // User + system beats: no hover controls (editing is now dblclick).
+      beats.renderControls(beat, { canReroll: false, variantCount: 1 });
     }
   });
 }
@@ -716,4 +758,7 @@ export function teardownStage() {
   // Tear down the selection popup + its document-level listeners so re-
   // wireStage binds exactly once (mirrors the stageListeners audit).
   selection.teardownSelection();
+  // Tear down the scene-image listeners so a close mid-generation can't swap
+  // an image into a torn-down backdrop (mirrors the other engine resets).
+  sceneImage.teardownSceneImage();
 }

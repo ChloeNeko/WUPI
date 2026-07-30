@@ -30,6 +30,9 @@ use std::collections::BTreeMap;
 use crate::player_state::PlayerState;
 use crate::schema::WorldSchema;
 
+// For the custom `deserialize_neighbor_ids` salvager (neighbor shape tolerance).
+use serde::de;
+
 // ---------------------------------------------------------------------------
 // DraftUpdate — the wire shape the Scribe's `sim_draft` tool emits.
 // ---------------------------------------------------------------------------
@@ -76,6 +79,10 @@ pub enum DraftUpdate {
     SetField { field: String, value: String },
     /// Append a trait bullet to `<traits>`. Idempotent on exact match.
     AddTrait { value: String },
+    /// Append an alternate opening greeting to `<introductions>` (SillyTavern
+    /// `alternate_greetings`). Idempotent on exact match. The primary opening
+    /// is `opening_scene`; these are the swipeable extras.
+    AddIntroduction { value: String },
     /// Register a starting NPC id (also stubs a `char.<id>.name` world entity
     /// so the narrator sees the NPC on turn one). Idempotent on exact match.
     AddNpc { id: String },
@@ -97,6 +104,138 @@ pub enum DraftUpdate {
     /// the draft captures it if the Scribe extracts it, `interview_finalize`
     /// stamps it onto `WorldSchema.travel_graph.current_node`). Optional.
     SetStartNode { value: String },
+    /// Set the WHOLE travel-graph in one idempotent overwrite (Phase 4 Component
+    /// 3). The Scribe emits the full graph in a single coherent call — no
+    /// cross-update node-id ordering, no forward-reference fragility (the
+    /// robust shape for a local 12B). `to_sim_card_xml` serializes this to the
+    /// `<locations>` block; `enter_fable_session` seeds `WorldSchema
+    /// .travel_graph` from it (first node = `current_node`, the player's start).
+    SetLocations { nodes: Vec<DraftNode> },
+}
+
+/// A location node as authored by the Scribe via `SetLocations`. Mirrors the
+/// `sim_card::CardNode` shape (id/name/neighbors/setting) 1:1 but kept in
+/// `interview_draft` so the draft module stays decoupled from `sim_card` — the
+/// conversion is a struct-literal copy at `to_sim_card_xml` time. `#[serde
+/// (default)]` on the collection + setting fields so the Scribe's JSON can omit
+/// `setting`/`neighbors` when empty (the parser tolerates both).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default, PartialEq)]
+pub struct DraftNode {
+    /// Bare slug ("tavern", "cellar") — NOT "node.tavern" (the parser strips
+    /// that prefix for ergonomics, but the authoring convention is bare).
+    pub id: String,
+    /// Diegetic prose label shown to the narrator on the `location:` line.
+    pub name: String,
+    /// Reachable neighbor node ids (bare slugs). Pure adjacency — each side of
+    /// an undirected edge must list the other (the parser does NOT symmetrize).
+    ///
+    /// Deserialized via `deserialize_neighbor_ids` — a custom visitor that
+    /// tolerates the local 12B's two emission shapes for this field: the
+    /// correct form (`["cellar","market"]` — bare id strings) AND the runaway-
+    /// recursion form it sometimes produces (`[{id:"cellar",neighbors:[{id:...
+    /// neighbors:[...]}]}]` — full node objects nested inside neighbors). The
+    /// visitor salvages the latter: for an object entry it extracts the `id`
+    /// and recurses into any nested `neighbors` to harvest their ids too, then
+    /// discards the rest. This converts a parse failure into a silent salvage
+    /// at zero LLM cost (no retry loop, no prompt nagging — the PROMPT-CODEX
+    /// mechanical-tolerance discipline). `json_repair` upstream closes the
+    /// dangling brackets when the recursion hits max_tokens, so the salvager
+    /// always sees a parseable structure.
+    #[serde(default, deserialize_with = "deserialize_neighbor_ids")]
+    pub neighbors: Vec<String>,
+    /// `"indoor"` / `"outdoor"` / empty. Gates whether the global `weather:`
+    /// line renders for this node (the only node→weather coupling in v1).
+    #[serde(default)]
+    pub setting: String,
+}
+
+/// Custom deserializer for `DraftNode::neighbors`. Tolerates BOTH shapes the
+/// local Gemma 12B emits (the 2026-07-29 WEAVER playtest finding):
+///
+/// - **Correct:** `["cellar", "market"]` — an array of bare id strings.
+/// - **Runaway recursion:** `[{id:"cellar", neighbors:[{id:"market", neighbors:
+///   [...]}]}]` — the model nests full node objects inside `neighbors`
+///   (conflating "neighbor = an id" with "neighbor = the node definition"),
+///   recursing until max_tokens.
+///
+/// The salvager: for a string entry → push it. For an object entry → extract
+/// its `id` (push it) AND recurse into the object's own `neighbors` array to
+/// harvest those ids too, then discard everything else (name/setting/recurse-
+/// depth). This maximizes salvage from even a badly-runaway output: after
+/// `json_repair` closes the dangling brackets, every reachable `id` at every
+/// nesting depth is collected. Duplicates are deduped (a node listing the same
+/// neighbor twice, or a recursion that revisits an id, yields one entry).
+///
+/// This is the mechanical-tolerance answer (PROMPT-CODEX discipline): no
+/// prompt nagging, no retry loop, no latency. Rust absorbs the model's shape
+/// confusion at the parse boundary.
+fn deserialize_neighbor_ids<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: de::Deserializer<'de>,
+{
+    struct NeighborIdsVisitor;
+
+    impl<'de> de::Visitor<'de> for NeighborIdsVisitor {
+        type Value = Vec<String>;
+
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            f.write_str("an array of neighbor id strings (objects-with-id tolerated + salvaged)")
+        }
+
+        fn visit_seq<A>(self, mut seq: A) -> Result<Vec<String>, A::Error>
+        where
+            A: de::SeqAccess<'de>,
+        {
+            let mut out: Vec<String> = Vec::new();
+            while let Some(entry) = seq.next_element::<serde_json::Value>()? {
+                harvest_neighbor_ids(&entry, &mut out);
+            }
+            Ok(out)
+        }
+    }
+
+    deserializer.deserialize_seq(NeighborIdsVisitor)
+}
+
+/// Walk one neighbor-array entry (a string OR an object-with-id, possibly
+/// carrying its own nested `neighbors`) and collect every reachable id into
+/// `out`. Recursive on nested `neighbors` arrays so a runaway-recursion output
+/// still yields its full id set. Dedupes against `out` (order-preserving).
+fn harvest_neighbor_ids(entry: &serde_json::Value, out: &mut Vec<String>) {
+    match entry {
+        // The correct shape: a bare id string.
+        serde_json::Value::String(s) => {
+            let s = s.trim();
+            if !s.is_empty() && !out.iter().any(|x| x == s) {
+                out.push(s.to_string());
+            }
+        }
+        // The recursion shape: an object (with an `id` + maybe nested
+        // `neighbors`). Salvage the id, then recurse to harvest deeper ids.
+        serde_json::Value::Object(obj) => {
+            if let Some(id) = obj.get("id").and_then(|v| v.as_str()) {
+                let id = id.trim();
+                if !id.is_empty() && !out.iter().any(|x| x == id) {
+                    out.push(id.to_string());
+                }
+            }
+            // Recurse into nested neighbors (the recursion source). Each
+            // nesting level's ids get harvested too — we want the full set
+            // of places the model was trying to connect, not just the
+            // outermost. A nested `neighbors` that's itself an array of
+            // objects/strings recurses through harvest_neighbor_ids per entry.
+            if let Some(nested) = obj.get("neighbors") {
+                if let Some(arr) = nested.as_array() {
+                    for e in arr {
+                        harvest_neighbor_ids(e, out);
+                    }
+                }
+            }
+        }
+        // Numbers/bools/null/arrays-at-this-position: not a valid neighbor
+        // entry. Silently skip (don't fail the whole parse over one bad entry).
+        _ => {}
+    }
 }
 
 /// The scalar fields `SetField` accepts. anything else rejects at validation.
@@ -107,6 +246,7 @@ pub const SETFIELD_FIELDS: &[&str] = &[
     "opening_scene",
     "player_name",
     "core_persona",
+    "appearance",
 ];
 
 /// The default player name when the player hasn't volunteered one. Per §11.29
@@ -131,10 +271,23 @@ pub struct InterviewDraft {
     // --- Card fields (mirror SimCard's roleplay-relevant subset) ---
     pub name: Option<String>,
     pub core_persona: Option<String>,
+    /// Physical description of the world's central NPC / the player character /
+    /// the setting's defining figure. Added 2026-07-29 (Gemini hard ruling #2:
+    /// "do not drop appearance" — ST users spend hours crafting exact physical
+    /// descriptions for image generation; dropping them on import is a data-
+    /// loss riot). Serialized to `<appearance>` by `to_sim_card_xml`.
+    pub appearance: Option<String>,
     pub traits: Vec<String>,
     pub setting: Option<String>,
     pub tone: Option<String>,
     pub opening_scene: Option<String>,
+    /// Alternate opening messages (the SillyTavern `alternate_greetings` field
+    /// from an imported card). Added 2026-07-29. Serialized to `<introductions>`
+    /// by `to_sim_card_xml`; consumed downstream by the swipeable-variant UX
+    /// (the same model the reroll-swipe feature uses) so an imported card with
+    /// several greetings surfaces them as ‹ 1/N › swipeable intro variants.
+    /// `opening_scene` (index 0) is always the primary; these are the extras.
+    pub introductions: Vec<String>,
     /// The player's chosen name, if they volunteered one. `None` until the
     /// Scribe extracts a name from the conversation. **Per §11.29 (load-
     /// bearing): the player is ALWAYS "User" — never defaulted to anything
@@ -153,6 +306,15 @@ pub struct InterviewDraft {
     pub world_entities: BTreeMap<String, String>,
     /// Optional starting travel-graph node id (Phase 4 Component 3).
     pub start_node: Option<String>,
+    /// The authored travel-graph locations (Phase 4 Component 3). Set wholesale
+    /// by `SetLocations` (idempotent overwrite — the Scribe emits the full graph
+    /// in one coherent call). Serialized to `<locations>` by `to_sim_card_xml`;
+    /// seeded into `WorldSchema.travel_graph` by `enter_fable_session` (first
+    /// node = `current_node`). Without this, `[TRAVEL]` is always rejected
+    /// ("unknown destination" — nodes empty) + `[RUMOR]` always dropped (no
+    /// current node) → Components 3 + 4 dead in live play (the §11.48 failure
+    /// recurring upstream for WEAVER-generated cards).
+    pub locations: Vec<DraftNode>,
 
     // --- Player state seeds ---
     pub player_background: Option<String>,
@@ -190,11 +352,17 @@ impl InterviewDraft {
                 "opening_scene" => self.opening_scene = Some(value),
                 "player_name" => self.player_name = Some(value),
                 "core_persona" => self.core_persona = Some(value),
+                "appearance" => self.appearance = Some(value),
                 _ => unreachable!("validate_update gates SetField fields"),
             },
             DraftUpdate::AddTrait { value } => {
                 if !self.traits.iter().any(|t| t == &value) {
                     self.traits.push(value);
+                }
+            }
+            DraftUpdate::AddIntroduction { value } => {
+                if !self.introductions.iter().any(|i| i == &value) {
+                    self.introductions.push(value);
                 }
             }
             DraftUpdate::AddNpc { id } => {
@@ -223,6 +391,12 @@ impl InterviewDraft {
             }
             DraftUpdate::SetStartNode { value } => {
                 self.start_node = Some(value);
+            }
+            DraftUpdate::SetLocations { nodes } => {
+                // Idempotent overwrite: the Scribe emits the WHOLE graph in one
+                // call (the robust shape for a local 12B — no incremental merge
+                // complexity, no cross-update ordering). Refinement = re-emit.
+                self.locations = nodes;
             }
         }
     }
@@ -265,11 +439,17 @@ impl InterviewDraft {
         }
         // Optional slots that add to the bar but don't gate finalization —
         // they round out the card but a great card can ship without them.
-        total += 2;
+        total += 4;
         if self.core_persona.is_some() {
             filled += 1;
         }
         if self.player_background.is_some() {
+            filled += 1;
+        }
+        if !self.locations.is_empty() {
+            filled += 1;
+        }
+        if self.appearance.is_some() {
             filled += 1;
         }
         ((filled as u32 * 100) / (total as u32)).min(100) as u8
@@ -308,7 +488,7 @@ impl InterviewDraft {
     /// `<identity>` (name + core_persona + traits), `<scenario>` (setting +
     /// tone + player_name + opening_scene + start_npcs + activities). CDATA-
     /// wraps every prose block so smart quotes / angle brackets parse cleanly
-    /// (the same contract `wupi.sim` / `gm.sim` / `rusty_tavern.sim` rely on).
+    /// (the same contract `wupi.sim` / `fable.sim` / `rusty_tavern.sim` rely on).
     ///
     /// Returns `Err` if `card_id()` is `None` (no name set) — the caller
     /// (`interview_finalize`) gates on `is_finalizable` first, so this is a
@@ -345,6 +525,21 @@ impl InterviewDraft {
             out.push_str("]]></traits>\n");
         }
         out.push_str("  </identity>\n\n");
+        // <appearance> — the physical description (Gemini ruling #2: never drop
+        // on import). Root-level (sibling of <identity>, NOT nested in it) —
+        // `sim_card::parse` reads `first_child(root, "appearance")`. The parser
+        // renders `<appearance>` element children as `tag: text` lines, so we
+        // wrap the prose in a single `<description>` child to preserve it as a
+        // coherent block. Round-trips as `description: <prose>` on re-parse.
+        if let Some(a) = &self.appearance {
+            if !a.trim().is_empty() {
+                out.push_str("  <appearance>\n");
+                out.push_str("    <description><![CDATA[");
+                out.push_str(a.trim());
+                out.push_str("]]></description>\n");
+                out.push_str("  </appearance>\n\n");
+            }
+        }
         // <scenario>
         out.push_str("  <scenario>\n");
         if let Some(s) = &self.setting {
@@ -385,7 +580,62 @@ impl InterviewDraft {
             }
             out.push_str("]]></activities>\n");
         }
+        // Phase 4 Component 3: the <locations> travel-graph block. Emitted only
+        // when the Scribe authored a graph (a draft with no SetLocations call
+        // produces no block — back-compat with pre-Phase-4 cards). Matches the
+        // parser's expected shape exactly: <node id=... setting=...> attributes
+        // + <name>/<neighbor> children. Empty `setting` omits the attribute
+        // (parser defaults to ""). `escape_text` keeps both attribute + text
+        // values safe (smart quotes, angle brackets). This is the load-bearing
+        // emission — without it, enter_fable_session's seeding block sees an
+        // empty card.locations and Components 3+4 stay dead (§11.48 upstream).
+        if !self.locations.is_empty() {
+            out.push_str("    <locations>\n");
+            for n in &self.locations {
+                out.push_str("      <node id=\"");
+                out.push_str(&escape_text(&n.id));
+                out.push('"');
+                if !n.setting.trim().is_empty() {
+                    out.push_str(" setting=\"");
+                    out.push_str(&escape_text(n.setting.trim()));
+                    out.push('"');
+                }
+                out.push_str(">\n");
+                out.push_str("        <name>");
+                out.push_str(&escape_text(n.name.trim()));
+                out.push_str("</name>\n");
+                for nb in &n.neighbors {
+                    let nb = nb.trim();
+                    if nb.is_empty() {
+                        continue;
+                    }
+                    out.push_str("        <neighbor>");
+                    out.push_str(&escape_text(nb));
+                    out.push_str("</neighbor>\n");
+                }
+                out.push_str("      </node>\n");
+            }
+            out.push_str("    </locations>\n");
+        }
         out.push_str("  </scenario>\n");
+        // <introductions> — alternate opening greetings (SillyTavern
+        // `alternate_greetings` from an imported card). Root-level CDATA bullet
+        // list, parsed identically to the start_npcs/activities lists. Emitted
+        // only when the draft carries extras. The primary opening is
+        // <opening_scene> above; these are the swipeable alternates.
+        if !self.introductions.is_empty() {
+            out.push_str("  <introductions><![CDATA[\n");
+            for intro in &self.introductions {
+                let intro = intro.trim();
+                if intro.is_empty() {
+                    continue;
+                }
+                out.push_str("- ");
+                out.push_str(intro);
+                out.push('\n');
+            }
+            out.push_str("]]></introductions>\n");
+        }
         out.push_str("</sim_card>\n");
 
         // Smoke-validate: roxmltree parses the whole document. A bug in the
@@ -513,8 +763,23 @@ impl InterviewDraft {
         if let Some(b) = &self.player_background {
             lines.push(format!("Background: {}", truncate_for_summary(b)));
         }
+        if let Some(a) = &self.appearance {
+            lines.push(format!("Appearance: {}", truncate_for_summary(a)));
+        }
+        if !self.introductions.is_empty() {
+            lines.push(format!("Alternate openings: {}", self.introductions.len()));
+        }
         if let Some(c) = &self.starting_condition {
             lines.push(format!("Condition: {}", truncate_for_summary(c)));
+        }
+        if !self.locations.is_empty() {
+            // Surface authored geography so the GM knows what's reachable
+            // (and can ask follow-ups about adjacent areas). Ids only — the
+            // diegetic names live on the card, not in this compact summary.
+            lines.push(format!(
+                "Locations: {}",
+                self.locations.iter().map(|n| n.id.as_str()).collect::<Vec<_>>().join(", ")
+            ));
         }
         if lines.is_empty() {
             return None;
@@ -547,6 +812,7 @@ fn validate_update(u: &DraftUpdate) -> Result<(), String> {
             }
         }
         DraftUpdate::AddTrait { value }
+        | DraftUpdate::AddIntroduction { value }
         | DraftUpdate::AddActivity { value }
         | DraftUpdate::SetPlayerBackground { value }
         | DraftUpdate::SetStartingCondition { value }
@@ -566,6 +832,32 @@ fn validate_update(u: &DraftUpdate) -> Result<(), String> {
             }
             if state.trim().is_empty() {
                 return Err(format!("AddEntity state for key '{}' is empty", key));
+            }
+        }
+        DraftUpdate::SetLocations { nodes } => {
+            if nodes.is_empty() {
+                return Err("SetLocations nodes is empty".to_string());
+            }
+            // Shallow per-node check: every node needs a non-empty id (the
+            // parser drops id-less nodes defensively; rejecting here surfaces
+            // the bug to the Scribe instead). name may be empty (the narrator
+            // can paint an unnamed location). neighbors entries must be
+            // non-empty slugs. We deliberately do NOT cross-check neighbor ids
+            // against node ids here — the Scribe may emit a graph whose nodes
+            // list each other, and validating within-batch ordering would force
+            // fragility. Downstream `enter_fable_session` seeding is tolerant
+            // of dangling neighbors (`find_node` just won't match).
+            for (i, n) in nodes.iter().enumerate() {
+                if n.id.trim().is_empty() {
+                    return Err(format!("SetLocations nodes[{i}].id is empty"));
+                }
+                for (j, nb) in n.neighbors.iter().enumerate() {
+                    if nb.trim().is_empty() {
+                        return Err(format!(
+                            "SetLocations nodes[{i}].neighbors[{j}] is empty"
+                        ));
+                    }
+                }
             }
         }
     }
@@ -796,8 +1088,10 @@ mod tests {
         let d = draft_with_basics();
         assert!(d.is_finalizable());
         assert!(d.missing_required().is_empty());
-        // 3 of 8 slots filled → ~37%.
-        assert_eq!(d.completion_pct(), 37);
+        // 3 of 10 slots filled (name + setting + player_name) → 30%.
+        // (appearance was added as an optional slot in the 2026-07-29 import
+        // extension, bumping the total 9 → 10.)
+        assert_eq!(d.completion_pct(), 30);
     }
 
     #[test]
@@ -835,11 +1129,23 @@ mod tests {
                 field: "core_persona".into(),
                 value: "A sandbox tavern.".into(),
             },
+            DraftUpdate::SetField {
+                field: "appearance".into(),
+                value: "Smoke-stained rafters, brass lanterns.".into(),
+            },
             DraftUpdate::SetPlayerBackground {
                 value: "A traveling herbalist.".into(),
             },
             DraftUpdate::AddNpc {
                 id: "mara".into(),
+            },
+            DraftUpdate::SetLocations {
+                nodes: vec![DraftNode {
+                    id: "tavern".into(),
+                    name: "The Tavern".into(),
+                    neighbors: vec![],
+                    setting: "indoor".into(),
+                }],
             },
         ])
         .unwrap();
@@ -908,6 +1214,271 @@ mod tests {
         assert_eq!(card.setting.as_deref(), Some("Night; rain on the shutters."));
         assert_eq!(card.tone.as_deref(), Some("Noir."));
         assert_eq!(card.player_name.as_deref(), Some("Kaelen"));
+    }
+
+    #[test]
+    fn appearance_and_introductions_round_trip_through_xml() {
+        // Gemini hard ruling #2 (2026-07-29): imported appearance prose MUST
+        // survive the draft→.sim→parse pipeline (ST users spend hours crafting
+        // physical descriptions). Alternate greetings (`alternate_greetings`)
+        // surface as swipeable intro variants via the same model. Both must
+        // round-trip through to_sim_card_xml + the real parser.
+        let mut d = draft_with_basics();
+        d.apply_updates(vec![
+            DraftUpdate::SetField {
+                field: "appearance".into(),
+                value: "Tall, raven-haired, with a scar across one eye.".into(),
+            },
+            DraftUpdate::AddIntroduction {
+                value: "The stranger looks up from their drink.".into(),
+            },
+            DraftUpdate::AddIntroduction {
+                value: "Rain lashes the windows as you enter.".into(),
+            },
+        ])
+        .unwrap();
+        let xml = d.to_sim_card_xml().unwrap();
+        let card = crate::sim_card::parse_from_xml_str(&xml).expect("parses");
+        // Appearance survives (rendered as `description: <prose>` by the
+        // parser's child-element renderer).
+        assert!(
+            card.appearance.contains("Tall, raven-haired"),
+            "appearance prose must survive the round-trip; got: {}",
+            card.appearance
+        );
+        // Both alternate greetings survived.
+        assert_eq!(card.introductions.len(), 2, "both intros persisted");
+        assert!(card.introductions[0].contains("The stranger looks up"));
+        assert!(card.introductions[1].contains("Rain lashes the windows"));
+    }
+
+    // --- SetLocations: the Phase 4 travel-graph authoring path ---
+
+    /// A small 2-node graph with BIDIRECTIONAL edges (tavern↔cellar). This is
+    /// the canonical shape the worked example teaches + the CDP playtest
+    /// verifies the Scribe actually produces (Gemini's bidirectionality concern:
+    /// the parser does NOT symmetrize, so each side must list the other).
+    fn sample_bidirectional_graph() -> Vec<DraftNode> {
+        vec![
+            DraftNode {
+                id: "tavern".into(),
+                name: "The Rusty Lantern Tavern".into(),
+                neighbors: vec!["cellar".into()],
+                setting: "indoor".into(),
+            },
+            DraftNode {
+                id: "cellar".into(),
+                name: "The Tavern Cellar".into(),
+                neighbors: vec!["tavern".into()],
+                setting: "indoor".into(),
+            },
+        ]
+    }
+
+    #[test]
+    fn set_locations_round_trips_through_sim_card_parser() {
+        // The load-bearing test for the WEAVER→Phase 4 unblock: a draft with a
+        // SetLocations update must produce XML that (a) parses, (b) lands in
+        // SimCard.locations, (c) is in document order with first node as seed.
+        // enter_fable_session seeds WorldSchema.travel_graph from card.locations
+        // — so if this passes, Components 3+4 are reachable from a WEAVER card.
+        let mut d = draft_with_basics();
+        d.apply_updates(vec![DraftUpdate::SetLocations {
+            nodes: sample_bidirectional_graph(),
+        }])
+        .unwrap();
+        assert_eq!(d.locations.len(), 2, "SetLocations populated the draft field");
+        let xml = d.to_sim_card_xml().unwrap();
+        let card = crate::sim_card::parse_from_xml_str(&xml).expect("WEAVER XML parses");
+        assert_eq!(card.locations.len(), 2, "locations round-tripped into the card");
+        // Document order preserved — first node is the seed (current_node).
+        assert_eq!(card.locations[0].id, "tavern", "first node = seed");
+        assert_eq!(card.locations[0].name, "The Rusty Lantern Tavern");
+        assert_eq!(card.locations[0].setting, "indoor");
+        assert_eq!(card.locations[0].neighbors, vec!["cellar"]);
+        assert_eq!(card.locations[1].id, "cellar");
+        assert_eq!(card.locations[1].neighbors, vec!["tavern"], "bidirectional edge");
+    }
+
+    #[test]
+    fn set_locations_is_idempotent_overwrite() {
+        // Refinement = re-emit the whole graph. A second SetLocations replaces,
+        // does NOT merge. This is the contract that makes the single-call shape
+        // robust for a local 12B (no incremental-merge complexity).
+        let mut d = draft_with_basics();
+        d.apply_updates(vec![DraftUpdate::SetLocations {
+            nodes: sample_bidirectional_graph(),
+        }])
+        .unwrap();
+        assert_eq!(d.locations.len(), 2);
+        d.apply_updates(vec![DraftUpdate::SetLocations {
+            nodes: vec![DraftNode {
+                id: "ship".into(),
+                name: "The Starship".into(),
+                neighbors: vec![],
+                setting: "indoor".into(),
+            }],
+        }])
+        .unwrap();
+        assert_eq!(d.locations.len(), 1, "second SetLocations overwrote (not merged)");
+        assert_eq!(d.locations[0].id, "ship");
+    }
+
+    #[test]
+    fn set_locations_validates_rejects_empty_id_and_empty_nodes() {
+        let mut d = InterviewDraft::default();
+        // Empty nodes vec.
+        let err = d
+            .apply_updates(vec![DraftUpdate::SetLocations { nodes: vec![] }])
+            .unwrap_err();
+        assert!(err.contains("empty"), "empty nodes rejected: {err}");
+        // Node with empty id.
+        let err = d
+            .apply_updates(vec![DraftUpdate::SetLocations {
+                nodes: vec![DraftNode {
+                    id: "  ".into(),
+                    name: "x".into(),
+                    neighbors: vec![],
+                    setting: "".into(),
+                }],
+            }])
+            .unwrap_err();
+        assert!(err.contains("id"), "empty node id rejected: {err}");
+        // Empty neighbor slug.
+        let err = d
+            .apply_updates(vec![DraftUpdate::SetLocations {
+                nodes: vec![DraftNode {
+                    id: "a".into(),
+                    name: "A".into(),
+                    neighbors: vec!["   ".into()],
+                    setting: "".into(),
+                }],
+            }])
+            .unwrap_err();
+        assert!(err.contains("neighbor"), "empty neighbor slug rejected: {err}");
+        // Nothing applied on any rejection.
+        assert!(d.locations.is_empty());
+    }
+
+    #[test]
+    fn to_sim_card_xml_omits_locations_when_empty() {
+        // Back-compat: a draft with no SetLocations produces NO <locations>
+        // block (a pre-Phase-4 card shape — the parser yields empty Vec).
+        let d = draft_with_basics();
+        let xml = d.to_sim_card_xml().unwrap();
+        assert!(!xml.contains("<locations>"), "no <locations> when empty");
+        let card = crate::sim_card::parse_from_xml_str(&xml).expect("parses");
+        assert!(card.locations.is_empty(), "card has no locations");
+    }
+
+    #[test]
+    fn to_sim_card_xml_emits_locations_with_setting_omitted_when_empty() {
+        // A node with empty `setting` must omit the setting= attribute entirely
+        // (the parser defaults to ""). Verifies the conditional-attribute path.
+        let mut d = draft_with_basics();
+        d.apply_updates(vec![DraftUpdate::SetLocations {
+            nodes: vec![
+                DraftNode {
+                    id: "outside".into(),
+                    name: "The Road".into(),
+                    neighbors: vec![],
+                    setting: "outdoor".into(),
+                },
+                DraftNode {
+                    id: "unknown".into(),
+                    name: "Unspecified".into(),
+                    neighbors: vec![],
+                    setting: "".into(),
+                },
+            ],
+        }])
+        .unwrap();
+        let xml = d.to_sim_card_xml().unwrap();
+        // outdoor node carries the attribute; empty-setting node does not.
+        assert!(xml.contains(r#"<node id="outside" setting="outdoor">"#));
+        assert!(xml.contains(r#"<node id="unknown">"#));
+        assert!(!xml.contains(r#"setting="""#));
+    }
+
+    // --- deserialize_neighbor_ids: the runaway-recursion salvager (Gemini's
+    //     Option 4 — Serde coercion, the WUPI mechanical-tolerance answer) ---
+
+    /// The correct shape: an array of bare id strings. Passes through untouched.
+    #[test]
+    fn neighbors_string_array_parses_unchanged() {
+        let json = r#"{"id":"tavern","name":"T","neighbors":["cellar","market"],"setting":"indoor"}"#;
+        let node: DraftNode = serde_json::from_str(json).unwrap();
+        assert_eq!(node.neighbors, vec!["cellar", "market"]);
+    }
+
+    /// The 2026-07-29 WEAVER failure: the model nested FULL node objects
+    /// inside `neighbors` (conflating "neighbor = id" with "neighbor = node
+    /// definition"), recursing until max_tokens. After json_repair closes the
+    /// brackets, the salvager must harvest every reachable id at every depth
+    /// and discard the rest. This is the test that pins the salvage contract.
+    #[test]
+    fn neighbors_nested_objects_salvaged_to_id_strings() {
+        // A 3-level runaway recursion: tavern.neighbors has village_common
+        // (full object), whose neighbors has cellar (full object), whose
+        // neighbors has tavern (full object). The salvager should yield the
+        // deduped id set: [village_common, cellar, tavern].
+        let json = r#"{"id":"tavern","name":"T","setting":"indoor","neighbors":[
+            {"id":"village_common","name":"VC","setting":"outdoor","neighbors":[
+                {"id":"cellar","name":"C","setting":"indoor","neighbors":[
+                    {"id":"tavern","name":"T","setting":"indoor","neighbors":[]}
+                ]}
+            ]}
+        ]}"#;
+        let node: DraftNode = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            node.neighbors,
+            vec!["village_common", "cellar", "tavern"],
+            "nested-object neighbors must be salvaged to their ids (deduped)"
+        );
+    }
+
+    /// Mixed array (some strings, some objects) — the salvager handles each
+    /// entry independently. Mirrors the real model output (it may emit a
+    /// correct string for one neighbor + a runaway object for another).
+    #[test]
+    fn neighbors_mixed_strings_and_objects_salvaged() {
+        let json = r#"{"id":"tavern","name":"T","neighbors":[
+            "cellar",
+            {"id":"market","name":"M","neighbors":[{"id":"square","name":"S"}]}
+        ]}"#;
+        let node: DraftNode = serde_json::from_str(json).unwrap();
+        assert_eq!(node.neighbors, vec!["cellar", "market", "square"]);
+    }
+
+    /// An empty neighbors array is valid (a leaf node with no exits).
+    #[test]
+    fn neighbors_empty_array_parses_to_empty_vec() {
+        let json = r#"{"id":"dead_end","name":"DE","neighbors":[]}"#;
+        let node: DraftNode = serde_json::from_str(json).unwrap();
+        assert!(node.neighbors.is_empty());
+    }
+
+    /// An object neighbor WITHOUT an `id` field is silently skipped (not a
+    /// valid neighbor reference — don't fail the whole parse over one bad entry).
+    #[test]
+    fn neighbors_object_without_id_silently_skipped() {
+        let json = r#"{"id":"tavern","name":"T","neighbors":[
+            "cellar",
+            {"name":"no id here","setting":"outdoor"},
+            "market"
+        ]}"#;
+        let node: DraftNode = serde_json::from_str(json).unwrap();
+        assert_eq!(node.neighbors, vec!["cellar", "market"]);
+    }
+
+    /// Duplicate ids (the recursion revisits tavern) are deduped — one entry.
+    #[test]
+    fn neighbors_duplicate_ids_deduped() {
+        let json = r#"{"id":"tavern","name":"T","neighbors":[
+            "cellar","cellar",{"id":"cellar"}
+        ]}"#;
+        let node: DraftNode = serde_json::from_str(json).unwrap();
+        assert_eq!(node.neighbors, vec!["cellar"]);
     }
 
     #[test]

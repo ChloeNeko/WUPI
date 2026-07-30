@@ -77,6 +77,22 @@ pub enum BracketCommand {
     /// `Effect.tag_kind` / `Weather.condition` / `Travel.destination` aren't
     /// named `kind`).
     Rumor { label: String },
+    /// An NPC is on-camera right now (Fable Phase 5A, 2026-07-29). Emitted by
+    /// the Pass 2 Tracker for each NPC physically present in the scene, every
+    /// turn. `npc_id` is the surface form the narrator used (id OR alias —
+    /// the applier resolves it to the canonical id via
+    /// `NpcRegistry::resolve`); `stance` is the free-text micro-location +
+    /// posture ("standing by the wooden table, arms crossed"). The applier
+    /// rejects unknown npc_ids (the anti-hallucination gate — the §11.46
+    /// reject-directive channel), upserts known ones into
+    /// `WorldSchema::presences` with the 1-turn grace TTL. The `present:`
+    /// render line is the whitelist the narrator obeys: only asserted NPCs
+    /// may speak/act in the scene (the anti-teleport fix). Named `npc_id` +
+    /// `stance` (NEITHER named `kind`) to avoid colliding with this enum's
+    /// `#[serde(tag = "kind")]` external discriminator (same reason
+    /// `Rumor.label` / `Weather.condition` / `Travel.destination` aren't
+    /// named `kind`).
+    Presence { npc_id: String, stance: String },
     /// The in-world clock advanced. `minutes` is the authoritative value
     /// (minutes since 0001-01-01, parsed by [`parse_in_world_time`]); `raw`
     /// is the verbatim string the narrator emitted (kept for diagnostics +
@@ -516,6 +532,7 @@ fn json_value_to_command(obj: &serde_json::Map<String, serde_json::Value>) -> Op
         "weather" => json_to_weather(obj),
         "travel" | "move" | "arrive" | "go" => json_to_travel(obj),
         "rumor" | "gossip" | "hearsay" => json_to_rumor(obj),
+        "presence" | "onscreen" | "onstage" | "present" => json_to_presence(obj),
         _ => None,
     }
 }
@@ -573,6 +590,20 @@ fn infer_kind_from_fields(obj: &serde_json::Map<String, serde_json::Value>) -> O
     // shadow any richer discriminator above (Component 2, 2026-07-28).
     if keys.iter().any(|k| *k == "condition") {
         return Some("weather".to_string());
+    }
+    // Presence (Phase 5A, 2026-07-29): npc_id/npc + stance/location/pose, but
+    // NO `line` (that's character_turn). Placed after the weather catch-all so
+    // it doesn't shadow — a presence body has none of the keys weather checks
+    // for (`condition`), so reaching here means it's genuinely ambiguous
+    // between presence + nothing. The `npc_id`+`line` character_turn check
+    // (above) already routed dialogue away; reaching here with npc_id + stance
+    // (no line) is unambiguously presence.
+    if keys.iter().any(|k| matches!(*k, "npc_id" | "npc"))
+        && keys
+            .iter()
+            .any(|k| matches!(*k, "stance" | "location" | "micro_location" | "pose" | "posture"))
+    {
+        return Some("presence".to_string());
     }
     None
 }
@@ -818,6 +849,37 @@ fn json_to_rumor(obj: &serde_json::Map<String, serde_json::Value>) -> Option<Bra
     Some(BracketCommand::Rumor { label })
 }
 
+/// Parse a `{"kind": "presence", ...}` JSON body (Phase 5A, 2026-07-29).
+/// `npc_id` is read from `npc_id` / `npc` / `name` (model flexibility); the
+/// `stance` is read from `stance` / `location` / `micro_location` / `pose` /
+/// `posture` (the model's field name is unstable). Empty npc_id → None (the
+/// applier needs a surface form to resolve via `NpcRegistry::resolve`). Empty
+/// stance is allowed (the applier stores it as empty + the `present:` line
+/// renders the bare name). Mirrors `json_to_rumor`'s leniency.
+fn json_to_presence(obj: &serde_json::Map<String, serde_json::Value>) -> Option<BracketCommand> {
+    let npc_id = obj
+        .get("npc_id")
+        .or_else(|| obj.get("npc"))
+        .or_else(|| obj.get("name"))
+        .and_then(|v| v.as_str())?
+        .trim()
+        .to_string();
+    if npc_id.is_empty() {
+        return None;
+    }
+    let stance = obj
+        .get("stance")
+        .or_else(|| obj.get("location"))
+        .or_else(|| obj.get("micro_location"))
+        .or_else(|| obj.get("pose"))
+        .or_else(|| obj.get("posture"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    Some(BracketCommand::Presence { npc_id, stance })
+}
+
 fn parse_one(bracket: &str, text_after: &str) -> Option<(BracketCommand, usize)> {
     let bracket = bracket.trim();
 
@@ -965,6 +1027,35 @@ fn parse_one(bracket: &str, text_after: &str) -> Option<(BracketCommand, usize)>
             return Some((BracketCommand::Rumor { label }, 0));
         }
         return None;
+    }
+
+    // [PRESENCE <npc_id> <stance and micro-location>] — Fable Phase 5A
+    // (2026-07-29). Flexible two-arg syntax: the FIRST whitespace-delimited
+    // token is the npc_id (a surface form — id OR alias; the applier resolves
+    // it via `NpcRegistry::resolve`); the REMAINDER (everything after the
+    // first space) is the stance string. The stance may be:
+    //   - quoted: `[PRESENCE elara "by the table, arms crossed"]`
+    //   - unquoted: `[PRESENCE elara by the table, arms crossed]`
+    // Both forms yield the same result — surrounding `"` (if present, exactly
+    // one pair) are stripped from the stance. Empty npc_id → None. Empty
+    // stance is allowed (the applier stores it; the `present:` line renders
+    // the bare name). Case-insensitive prefix via `strip_prefix_ci`. The JSON
+    // form `{"kind": "presence", "npc_id": "...", "stance": "..."}` is
+    // handled by the manual dispatch in `parse_json_command`.
+    if let Some(rest) = strip_prefix_ci(bracket, "PRESENCE") {
+        let rest = rest.trim();
+        // Split on first whitespace: token = npc_id, remainder = stance.
+        let mut iter = rest.splitn(2, char::is_whitespace);
+        let npc_id = iter.next().unwrap_or("").trim().to_string();
+        let stance_raw = iter.next().unwrap_or("").trim();
+        if npc_id.is_empty() {
+            return None;
+        }
+        // Strip a single surrounding pair of double quotes if present
+        // (`"by the table"` → `by the table`). Only the outermost pair —
+        // internal quotes are preserved.
+        let stance = strip_one_quote_pair(stance_raw).to_string();
+        return Some((BracketCommand::Presence { npc_id, stance }, 0));
     }
 
     // [TIME <in-world timestamp>] — Seam #4 clock advance. Single-region like
@@ -1283,6 +1374,28 @@ fn find_ci(text: &str, needle: &str) -> Option<usize> {
         }
     }
     None
+}
+
+/// Strip a single surrounding pair of ASCII double quotes from `s`, if both
+/// the first and last non-empty char are `"`. Only the outermost pair —
+/// internal quotes are preserved (`"by the \"table\""` keeps its inner pair).
+/// Returns the input unchanged when there's no surrounding pair, when the
+/// string is empty/too short, or when only ONE end is quoted (defensive — a
+/// lone quote is kept as literal prose rather than silently dropped). Used by
+/// the `[PRESENCE]` parser to normalize the quoted-stance form
+/// (`[PRESENCE elara "by the table"]` → stance `by the table`).
+fn strip_one_quote_pair(s: &str) -> &str {
+    let trimmed = s.trim();
+    if trimmed.len() < 2 {
+        return s;
+    }
+    let bytes = trimmed.as_bytes();
+    if bytes.first() == Some(&b'"') && bytes.last() == Some(&b'"') {
+        // Safe: we verified both ends are ASCII `"` (1 byte each, char boundaries).
+        &trimmed[1..trimmed.len() - 1]
+    } else {
+        s
+    }
 }
 
 /// Split a whitespace-separated string into (key=value pairs, positional tokens).
@@ -2655,5 +2768,149 @@ mod tests {
         assert_eq!(find_ci("text [character_turn:end] more", "[CHARACTER_TURN:end]"), Some(5));
         assert_eq!(find_ci("no match here", "[CHARACTER_TURN:end]"), None);
         assert_eq!(find_ci("anything", ""), Some(0));
+    }
+
+    // ---------- PRESENCE (Fable Phase 5A, 2026-07-29) ----------
+
+    #[test]
+    fn extracts_presence_command_unquoted_stance() {
+        // The flexible two-arg form: first token = npc_id, remainder = stance.
+        let raw = "Elara scowls. [PRESENCE elara standing by the table, arms crossed] The bard watches.";
+        let parsed = parse(raw);
+        assert_eq!(parsed.commands.len(), 1);
+        assert_eq!(
+            parsed.commands[0],
+            BracketCommand::Presence {
+                npc_id: "elara".into(),
+                stance: "standing by the table, arms crossed".into(),
+            }
+        );
+        // Prose: the bracket is stripped, surrounding text preserved.
+        assert!(parsed.prose.contains("Elara scowls."));
+        assert!(parsed.prose.contains("The bard watches."));
+        assert!(!parsed.prose.contains("[PRESENCE"));
+    }
+
+    #[test]
+    fn extracts_presence_command_quoted_stance() {
+        // Quoted form: surrounding `"` stripped from the stance (one pair).
+        let raw = "[PRESENCE mara \"behind the bar, polishing a tankard\"]";
+        let parsed = parse(raw);
+        assert_eq!(parsed.commands.len(), 1);
+        assert_eq!(
+            parsed.commands[0],
+            BracketCommand::Presence {
+                npc_id: "mara".into(),
+                stance: "behind the bar, polishing a tankard".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn extracts_presence_command_case_insensitive_prefix() {
+        // Prefix matching is ASCII-case-insensitive (the §11.41 follow-up
+        // convention). The npc_id + stance casing is preserved (free-form).
+        let raw = "[presence Corin tuning a lute on the small stage]";
+        let parsed = parse(raw);
+        assert_eq!(parsed.commands.len(), 1);
+        assert_eq!(
+            parsed.commands[0],
+            BracketCommand::Presence {
+                npc_id: "Corin".into(),
+                stance: "tuning a lute on the small stage".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn extracts_presence_command_empty_stance_allowed() {
+        // Empty stance is valid — the applier stores it; the `present:` line
+        // renders the bare name. (Only npc_id is required.)
+        let raw = "[PRESENCE bard_corin]";
+        let parsed = parse(raw);
+        assert_eq!(parsed.commands.len(), 1);
+        assert_eq!(
+            parsed.commands[0],
+            BracketCommand::Presence {
+                npc_id: "bard_corin".into(),
+                stance: String::new(),
+            }
+        );
+    }
+
+    #[test]
+    fn presence_empty_npc_id_emitted_as_literal_prose() {
+        // No npc_id token → not a valid command → leaks verbatim (mirrors
+        // WEATHER empty-body behavior).
+        let raw = "Odd text [PRESENCE] trailing.";
+        let parsed = parse(raw);
+        assert_eq!(parsed.commands.len(), 0);
+        assert!(parsed.prose.contains("[PRESENCE]"));
+    }
+
+    #[test]
+    fn json_presence_kind_dispatches() {
+        // The JSON form `{"kind": "presence", "npc_id": "...", "stance": "..."}`.
+        let raw = "```json\n{ \"type\": \"presence\", \"npc_id\": \"elara\", \"stance\": \"arms crossed\" }\n```";
+        let parsed = parse(raw);
+        assert_eq!(parsed.commands.len(), 1);
+        assert_eq!(
+            parsed.commands[0],
+            BracketCommand::Presence {
+                npc_id: "elara".into(),
+                stance: "arms crossed".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn json_presence_alias_fields_work() {
+        // `npc` (alias for npc_id) + `location`/`pose`/`posture` (aliases for
+        // stance) — the model's field name is unstable, so all recognized.
+        let raw = "```json\n{ \"kind\": \"present\", \"npc\": \"mara\", \"pose\": \"leaning on the bar\" }\n```";
+        let parsed = parse(raw);
+        assert_eq!(parsed.commands.len(), 1);
+        assert_eq!(
+            parsed.commands[0],
+            BracketCommand::Presence {
+                npc_id: "mara".into(),
+                stance: "leaning on the bar".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn json_presence_inferred_from_fields() {
+        // No explicit type/kind → infer_kind_from_fields should route a body
+        // with npc_id + stance (no `line`) to the presence variant.
+        let raw = "```json\n{ \"npc_id\": \"corin\", \"stance\": \"tuning a lute\" }\n```";
+        let parsed = parse(raw);
+        assert_eq!(parsed.commands.len(), 1);
+        assert!(matches!(parsed.commands[0], BracketCommand::Presence { .. }));
+    }
+
+    #[test]
+    fn json_presence_with_line_field_is_character_turn_not_presence() {
+        // Defensive: a body with npc_id + `line` is CHARACTER_TURN (dialogue),
+        // NOT presence. The character_turn check (npc_id + line) runs BEFORE
+        // presence inference; presence requires npc_id + stance/location/pose
+        // WITHOUT a line. This pins the non-collision.
+        let raw = "```json\n{ \"npc_id\": \"mara\", \"line\": \"Welcome, traveler.\" }\n```";
+        let parsed = parse(raw);
+        assert_eq!(parsed.commands.len(), 1);
+        assert!(matches!(parsed.commands[0], BracketCommand::CharacterTurn { .. }),
+            "npc_id + line is dialogue, not presence");
+    }
+
+    #[test]
+    fn strip_one_quote_pair_helper() {
+        // Unit test for the stance-quote normalizer.
+        assert_eq!(strip_one_quote_pair("\"by the table\""), "by the table");
+        assert_eq!(strip_one_quote_pair("  \"by the table\"  "), "by the table", "trims then strips");
+        assert_eq!(strip_one_quote_pair("no quotes"), "no quotes", "unchanged without quotes");
+        assert_eq!(strip_one_quote_pair(""), "", "empty unchanged");
+        assert_eq!(strip_one_quote_pair("\""), "\"", "single quote unchanged (lone)");
+        assert_eq!(strip_one_quote_pair("\"unclosed"), "\"unclosed", "unclosed pair unchanged");
+        assert_eq!(strip_one_quote_pair("\"a \"b\" c\""), "a \"b\" c", "only outermost pair stripped");
     }
 }

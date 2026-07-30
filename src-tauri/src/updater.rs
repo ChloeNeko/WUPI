@@ -567,10 +567,11 @@ fn apply_extracted(extracted: &Path, exe_dir: &Path) -> Result<(), String> {
 /// be overwritten by an update (user data). The engine-content exceptions
 /// (shipped in the zip, replaced verbatim on update) are:
 /// - `data/wupi.sim` + `data/wupi.codex` — Wupi's persona + her static playbook.
-/// - `data/gm.sim` + `data/fable.codex` — the Game Master persona + the unified
-///   Fable playbook (shared by the New Game interview persona AND the
-///   simulation narrator; fable.codex is the 2026-07-29 unification, was
-///   gm.codex).
+/// - `data/fable.sim` + `data/fable.codex` — the Fable persona (the Game Master
+///   for the New Game interview) + the unified Fable playbook (shared by the
+///   interview persona AND the simulation narrator; fable.codex is the
+///   2026-07-29 unification, was gm.codex; fable.sim is the 2026-07-29 rename
+///   of gm.sim).
 ///
 /// `rel` is the file's path relative to the extract root (e.g. `data/user.xml`,
 /// `memory/memory.sqlite`, `wupi.exe`).
@@ -579,7 +580,7 @@ fn is_preserved(rel: &Path) -> bool {
     if rel.starts_with("data") {
         return rel != Path::new("data/wupi.sim")
             && rel != Path::new("data/wupi.codex")
-            && rel != Path::new("data/gm.sim")
+            && rel != Path::new("data/fable.sim")
             && rel != Path::new("data/fable.codex");
     }
     // memory/, models/, apps/: fully preserved.

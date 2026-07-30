@@ -303,6 +303,186 @@ impl TravelGraph {
     }
 }
 
+/// One named NPC in the Rust-authoritative registry (Fable Phase 5A,
+/// 2026-07-29). Seeded once from the scenario card's `<cast>` block by
+/// `enter_fable_session`; treated as read-only thereafter (mirrors `Node`).
+/// The registry is the `[PRESENCE]` whitelist the Tracker validates against
+/// (unknown id → reject; the anti-hallucination gate that closes the
+/// "teleporting NPC" bug — the narrator cannot summon an NPC that isn't on
+/// the whitelist because it isn't in the `present:` line).
+///
+/// `WorldSchema::apply_delta` deliberately does NOT touch the registry — see
+/// `apply_delta_does_not_touch_npc_registry`. The ONLY writer is the scenario
+/// card seed at game start.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
+pub struct NpcEntry {
+    /// Stable identifier ("mara_the_innkeep"). Bare slug, matches the `<cast>`
+    /// `id` attribute. This is the load-bearing field the `[PRESENCE]`
+    /// bracket's first token is validated against.
+    #[serde(default)]
+    pub id: String,
+
+    /// Diegetic prose label shown to the narrator + the image-gen prompt
+    /// composer ("Mara"). The prose label only; personality/appearance prose
+    /// lives in the codex lore entry that `wire_sim_card` authors.
+    #[serde(default)]
+    pub name: String,
+
+    /// One-line vocation/role hint ("The innkeeper behind the bar"). Optional
+    /// flavor; helps the narrator + the image-gen prompt composer.
+    #[serde(default)]
+    pub role: String,
+
+    /// Optional combat tier label ("soldier" / "elite" / "boss" / ...).
+    /// Forward-compat for the §11.30 `select_attacker_tier_from_entities`
+    /// heuristic; `None` for non-combat NPCs (civilians, vendors, atmosphere).
+    /// Left optional at Phase 5A — the registry's job is the ID whitelist +
+    /// name; tier threads in later when the heuristic reads the registry
+    /// directly instead of scanning `entities`.
+    #[serde(default)]
+    pub tier: Option<String>,
+
+    /// Alternate surface forms the narrator may emit ("mara", "innkeep").
+    /// The `[PRESENCE]` applier normalizes any alias back to `id` so the
+    /// `[PRESENCE mara "..."]` and `[PRESENCE mara_the_innkeep "..."]` forms
+    /// both resolve to the same registry entry. Populated from the `<alias>`
+    /// children in `<cast>`.
+    #[serde(default)]
+    pub aliases: Vec<String>,
+}
+
+impl NpcEntry {
+    /// True if `candidate` matches this entry's `id` or any `alias`
+    /// (case-insensitive). The normalization the `[PRESENCE]` applier uses so
+    /// the narrator's surface form ("Mara") resolves to the canonical id.
+    pub fn matches(&self, candidate: &str) -> bool {
+        let c = candidate.trim();
+        if c.eq_ignore_ascii_case(&self.id) {
+            return true;
+        }
+        self.aliases.iter().any(|a| c.eq_ignore_ascii_case(a))
+    }
+}
+
+/// The Rust-authoritative named-NPC registry (Phase 5A, 2026-07-29). Seeded
+/// from the scenario card's `<cast>` block; the source of truth for which NPC
+/// ids exist (the `[PRESENCE]` whitelist). `Vec` (not a map) — matches the
+/// `TravelGraph::nodes` precedent; small casts (dozens of NPCs), O(n) lookup
+/// is correct + cheap. Rust is the SOLE authority — `apply_delta` does NOT
+/// touch this field (mirrors `travel_graph` / `weather` / `world_clock`).
+///
+/// Deliberately NOT nested in `TravelGraph`: the registry is the cast
+/// (characters), the graph is the geography (places) — collocating muddies
+/// both (the §11.47 "topology vs propagation state are conceptually distinct"
+/// lesson, applied to cast vs geography).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
+pub struct NpcRegistry {
+    /// The registered NPCs. Seeded once; read-only thereafter.
+    #[serde(default)]
+    pub entries: Vec<NpcEntry>,
+}
+
+impl NpcRegistry {
+    /// True once at least one NPC is registered (the dormant contract — a
+    /// fresh game with no seeded cast suppresses the registry entirely; the
+    /// `[PRESENCE]` applier reject-gates on an empty registry by returning
+    /// reject-directives for every bracket, same as `[TRAVEL]` on an empty
+    /// graph).
+    pub fn is_set(&self) -> bool {
+        !self.entries.is_empty()
+    }
+
+    /// Find a registry entry by id (exact match). O(n); small casts.
+    pub fn find(&self, id: &str) -> Option<&NpcEntry> {
+        self.entries.iter().find(|e| e.id == id)
+    }
+
+    /// Resolve a surface form (id OR alias) to the canonical `NpcEntry`.
+    /// Case-insensitive. Returns `None` for unknown forms — the caller (the
+    /// `[PRESENCE]` applier) treats that as a reject-directive (the
+    /// anti-hallucination gate). This is the load-bearing normalization fn.
+    pub fn resolve(&self, surface: &str) -> Option<&NpcEntry> {
+        self.entries.iter().find(|e| e.matches(surface))
+    }
+
+    /// Compact prompt render for the `cast:` line (the registry's roster —
+    /// distinct from the `present:` line which shows only on-camera NPCs).
+    /// Returns `None` when dormant (no registered NPCs). Mirrors
+    /// `TravelGraph::render_line`. The narrator sees the full roster so it
+    /// knows which ids are valid `[PRESENCE]` targets; the `present:` line
+    /// (rendered from `WorldSchema::presences`) narrows to who's on-camera.
+    /// Format: `Mara [mara_the_innkeep], Corin [bard_corin]`.
+    pub fn render_line(&self) -> Option<String> {
+        if self.entries.is_empty() {
+            return None;
+        }
+        let parts: Vec<String> = self
+            .entries
+            .iter()
+            .map(|e| {
+                if e.name.is_empty() {
+                    format!("[{}]", e.id)
+                } else {
+                    format!("{} [{}]", e.name, e.id)
+                }
+            })
+            .collect();
+        Some(parts.join(", "))
+    }
+}
+
+/// One NPC currently on-camera (Fable Phase 5A, 2026-07-29). The Tracker
+/// emits `[PRESENCE npc_id "stance and micro-location"]` per on-camera NPC
+/// each turn; the applier resolves the surface form to a canonical id via
+/// `NpcRegistry::resolve`, then upserts a `Presence` here. The `present:`
+/// render line in `render_for_prompt` is the whitelist the narrator obeys —
+/// only NPCs in `presences` may speak, act, or be addressed in the scene.
+///
+/// The `ttl` field implements the 1-turn grace: an NPC not re-asserted by a
+/// `[PRESENCE]` this turn has its `ttl` decremented; it drops when `ttl`
+/// reaches 0. This tolerates a single missed extraction (the §11.51 Tracker
+/// under-emission failure mode) without vaporizing the barkeep. `GRACE_RESET`
+/// is the value fresh/re-asserted presences start at.
+///
+/// NO `Default` (mirrors `rumor::Rumor`): a presence is always authored by
+/// the Tracker, never default-constructed. NO `node_id` (Option B —
+/// presence-implies-location; off-screen NPC positions are the rumor/task
+/// engine's job, not this struct's). Clone but NOT Copy (owns Strings).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Presence {
+    /// Canonical NPC id (resolved from the bracket's surface form via
+    /// `NpcRegistry::resolve`). The key the registry + relationship engine
+    /// + off-screen task queue all index by.
+    pub npc_id: String,
+
+    /// Diegetic name (copied from the registry entry at upsert time, so the
+    /// `present:` line renders a readable label even if the registry were
+    /// later cleared — defensive, mirrors how `Rumor::label` is self-contained).
+    pub name: String,
+
+    /// Free-text stance + micro-location ("standing by the wooden table, arms
+    /// crossed"). The Tracker extracts this from the narrator's prose; the
+    /// image-gen prompt composer aggregates it into the "micro (subjects)"
+    /// layer of the scene prompt. Run through `truncate_repetition` +
+    /// `normalize_whitespace` before storing (the §11.41 / §11.29 prose-cleanup
+    /// contract — free-text Tracker output carries the repetition +
+    /// verbatim-copy risks).
+    pub stance: String,
+
+    /// Turns of grace remaining before this presence drops (see struct doc).
+    /// The applier sets this to `GRACE_RESET` on every re-assertion +
+    /// decrements on every turn the NPC is NOT re-asserted.
+    pub ttl: u32,
+}
+
+/// The grace-TTL reset value (Phase 5A, 2026-07-29). Fresh + re-asserted
+/// presences start at 2; an NPC survives ONE missed `[PRESENCE]` extraction
+/// (2 → 1 → drop). Tuned to absorb the §11.51 single-miss failure mode
+/// without letting a genuinely-departed NPC linger on-camera for multiple
+/// turns. A single constant so the apply logic + tests reference one source
+/// of truth.
+pub const PRESENCE_GRACE_RESET: u32 = 2;
+
 /// The scene pacing mode (Fable Seam #4 expansion, 2026-07-27): a
 /// Rust-computed per-turn classification of the scene's rhythm. Drives:
 /// (1) the narrator prose cadence via a `<scene_pacing>` prompt tag, (2) the
@@ -605,6 +785,30 @@ pub struct WorldSchema {
     /// list (dormant — no `rumors:` line, nothing to propagate).
     #[serde(default)]
     pub rumors: Vec<rumor::Rumor>,
+
+    /// The Rust-authoritative named-NPC registry (Fable Phase 5A, 2026-07-29):
+    /// seeded once from the scenario card's `<cast>` block by
+    /// `enter_fable_session`; the source of truth for which NPC ids exist
+    /// (the `[PRESENCE]` whitelist). Rust is the SOLE authority —
+    /// `apply_delta` does NOT touch this field (mirrors `travel_graph` /
+    /// `weather` / `world_clock`). The only writer is the scenario card seed.
+    /// Dormant when empty (a card with no `<cast>` block → pre-Phase-5
+    /// behavior: no `cast:` line, no `present:` line, `[PRESENCE]` brackets
+    /// reject every npc_id as unknown). `#[serde(default)]` keeps pre-Phase-5
+    /// saves loadable as an empty registry.
+    #[serde(default)]
+    pub npc_registry: NpcRegistry,
+
+    /// NPCs currently on-camera (Fable Phase 5A, 2026-07-29): one entry per
+    /// NPC the Tracker asserted via `[PRESENCE ...]` this turn or within the
+    /// grace window (`PRESENCE_GRACE_RESET`). The `present:` render line in
+    /// `render_for_prompt` is the anti-teleport whitelist the narrator obeys
+    /// — only NPCs in this list may speak, act, or be addressed in the scene.
+    /// Rust is the SOLE authority — `apply_delta` does NOT touch this field;
+    /// the only writer is the `[PRESENCE]` applier (with the grace-decay
+    /// pass). `#[serde(default)]` keeps pre-Phase-5 saves loadable as empty.
+    #[serde(default)]
+    pub presences: Vec<Presence>,
 }
 
 impl WorldSchema {
@@ -663,7 +867,9 @@ impl WorldSchema {
             && !self.world_clock.is_set()
             && !self.weather.is_set()
             && !self.travel_graph.is_set()
-            && self.rumors.is_empty();
+            && self.rumors.is_empty()
+            && !self.npc_registry.is_set()
+            && self.presences.is_empty();
         if empty {
             return String::new();
         }
@@ -706,6 +912,32 @@ impl WorldSchema {
         if let Some(travel_line) = self.travel_graph.render_line() {
             out.push_str("location: ");
             out.push_str(&travel_line);
+            out.push('\n');
+        }
+        // Present NPCs (Phase 5A, 2026-07-29): the on-camera whitelist. The
+        // narrator sees ONLY the NPCs the Tracker asserted via `[PRESENCE]`
+        // this turn (or within the grace window). This is the anti-teleport
+        // enforcement vector: an NPC not in this list may not speak, act, or
+        // be addressed in the scene (bound by the narrator_core clause).
+        // Renders immediately after `location:` — the natural "who's here"
+        // pairing with "where am I". Dormant when `presences` is empty (a
+        // fresh game with no `[PRESENCE]` yet, or a card with no `<cast>`
+        // registry — zero tokens). Format:
+        //   `present: Mara (standing by the bar, arms crossed), Corin (tuning a lute)`
+        if !self.presences.is_empty() {
+            let parts: Vec<String> = self
+                .presences
+                .iter()
+                .map(|p| {
+                    if p.stance.trim().is_empty() {
+                        p.name.clone()
+                    } else {
+                        format!("{} ({})", p.name, p.stance.trim())
+                    }
+                })
+                .collect();
+            out.push_str("present: ");
+            out.push_str(&parts.join(", "));
             out.push('\n');
         }
         // Rumors at the current node (Component 4, 2026-07-28): the fourth
@@ -1840,6 +2072,178 @@ mod tests {
             Some("The Rusty Anchor")
         );
         let _ = std::fs::remove_file(&path);
+    }
+
+    // ---------- Phase 5A: NpcRegistry + Presence (2026-07-29) ----------
+
+    /// Architectural invariant: the npc_registry is outside the LLM delta path
+    /// (mirrors apply_delta_does_not_touch_travel_graph). A delta carrying
+    /// "npc_registry" in its entities map must NOT mutate the typed field —
+    /// the registry is seeded once from the card and read-only thereafter.
+    #[test]
+    fn apply_delta_does_not_touch_npc_registry() {
+        let mut schema = WorldSchema::default();
+        schema.npc_registry = NpcRegistry {
+            entries: vec![NpcEntry {
+                id: "mara".into(),
+                name: "Mara".into(),
+                role: "innkeep".into(),
+                tier: Some("soldier".into()),
+                aliases: vec!["innkeep".into()],
+            }],
+        };
+        let original = schema.npc_registry.clone();
+        let mut ents = HashMap::new();
+        ents.insert("npc_registry".to_string(), Some("injected".to_string()));
+        let delta = SchemaDelta {
+            summary: None,
+            recent_events: None,
+            entities: Some(ents),
+        };
+        schema.apply_delta(delta);
+        assert_eq!(schema.npc_registry, original, "registry must be LLM-immutable");
+        assert_eq!(
+            schema.entities.get("npc_registry").map(|s| s.as_str()),
+            Some("injected"),
+            "the injected key lands in entities (legacy), NOT the typed field"
+        );
+    }
+
+    /// Architectural invariant: presences is outside the LLM delta path
+    /// (mirrors apply_delta_does_not_touch_travel_graph). A delta carrying
+    /// "presences" must NOT mutate the typed Vec — the only writer is the
+    /// `[PRESENCE]` applier (with grace decay).
+    #[test]
+    fn apply_delta_does_not_touch_presences() {
+        let mut schema = WorldSchema::default();
+        schema.presences = vec![Presence {
+            npc_id: "mara".into(),
+            name: "Mara".into(),
+            stance: "behind the bar".into(),
+            ttl: PRESENCE_GRACE_RESET,
+        }];
+        let original = schema.presences.clone();
+        let mut ents = HashMap::new();
+        ents.insert("presences".to_string(), Some("injected".to_string()));
+        let delta = SchemaDelta {
+            summary: None,
+            recent_events: None,
+            entities: Some(ents),
+        };
+        schema.apply_delta(delta);
+        assert_eq!(schema.presences, original, "presences must be LLM-immutable");
+    }
+
+    /// NpcRegistry dormant contract: empty registry is_set()==false, renders
+    /// no line (zero tokens for a fresh game).
+    #[test]
+    fn npc_registry_dormant_when_empty() {
+        let reg = NpcRegistry::default();
+        assert!(!reg.is_set());
+        assert!(reg.render_line().is_none());
+        assert!(reg.resolve("anyone").is_none(), "empty registry resolves nothing");
+    }
+
+    /// NpcRegistry.resolve is the load-bearing normalization fn — id OR alias
+    /// matches, case-insensitive. Unknown forms return None (the reject gate).
+    #[test]
+    fn npc_registry_resolve_matches_id_or_alias_case_insensitive() {
+        let reg = NpcRegistry {
+            entries: vec![NpcEntry {
+                id: "mara_the_innkeep".into(),
+                name: "Mara".into(),
+                role: String::new(),
+                tier: None,
+                aliases: vec!["mara".into(), "Innkeep".into()],
+            }],
+        };
+        assert_eq!(reg.resolve("mara_the_innkeep").map(|e| e.id.as_str()), Some("mara_the_innkeep"));
+        assert_eq!(reg.resolve("MARA").map(|e| e.id.as_str()), Some("mara_the_innkeep"), "alias + case-insensitive");
+        assert_eq!(reg.resolve("innkeep").map(|e| e.id.as_str()), Some("mara_the_innkeep"), "alias lowercased vs stored mixed-case");
+        assert!(reg.resolve("stranger").is_none(), "unknown form → None (reject gate)");
+    }
+
+    /// NpcRegistry.render_line emits `Name [id]` per entry, joined by commas.
+    /// Id-only (no name) renders as `[id]`.
+    #[test]
+    fn npc_registry_render_line_format() {
+        let reg = NpcRegistry {
+            entries: vec![
+                NpcEntry {
+                    id: "mara_the_innkeep".into(),
+                    name: "Mara".into(),
+                    role: String::new(),
+                    tier: None,
+                    aliases: vec![],
+                },
+                NpcEntry {
+                    id: "anon".into(),
+                    name: String::new(),
+                    role: String::new(),
+                    tier: None,
+                    aliases: vec![],
+                },
+            ],
+        };
+        assert_eq!(reg.render_line().as_deref(), Some("Mara [mara_the_innkeep], [anon]"));
+    }
+
+    /// A pre-Phase-5 save JSON (no "npc_registry"/"presences" fields) must
+    /// deserialize to empty defaults (backward-compat — mirrors the pre-
+    /// Component-3 travel_graph test).
+    #[test]
+    fn phase5a_backwards_compat_pre_phase5_save_loads_empty() {
+        let pre_phase5_json = r#"{
+            "summary": "",
+            "recent_events": [],
+            "entities": {},
+            "player_state": {},
+            "world_clock": {"current_minutes": 0, "last_tick_minutes": 0},
+            "weather": {"condition": "", "started_at_minutes": 0},
+            "travel_graph": {"nodes": [], "current_node": null},
+            "immutable_keys": [],
+            "scene_pacing": {"mode": "Exploration", "spatial": 0, "emotional": 0, "kinetic": 0},
+            "status_tags": [],
+            "relationships": {},
+            "offscreen_tasks": [],
+            "rumors": []
+        }"#;
+        let parsed: WorldSchema = serde_json::from_str(pre_phase5_json)
+            .expect("pre-Phase-5 JSON must deserialize");
+        assert!(!parsed.npc_registry.is_set());
+        assert!(parsed.npc_registry.entries.is_empty());
+        assert!(parsed.presences.is_empty());
+    }
+
+    /// The `present:` render line emits only when presences is non-empty, in
+    /// `Name (stance)` form (or bare `Name` when stance is empty). Dormant
+    /// (zero tokens) when empty — a fresh game suppresses the line entirely.
+    #[test]
+    fn present_line_renders_on_camera_whitelist() {
+        let mut schema = WorldSchema::default();
+        // Empty → no present: line.
+        let rendered = schema.render_for_prompt();
+        assert!(!rendered.contains("present:"), "empty presences must not render");
+
+        // Set one presence (force clock set so render_for_prompt emits at all).
+        schema.world_clock = WorldClock { current_minutes: 60, last_tick_minutes: 0 };
+        schema.presences = vec![
+            Presence {
+                npc_id: "mara".into(),
+                name: "Mara".into(),
+                stance: "behind the bar, polishing a tankard".into(),
+                ttl: PRESENCE_GRACE_RESET,
+            },
+            Presence {
+                npc_id: "corin".into(),
+                name: "Corin".into(),
+                stance: String::new(),
+                ttl: PRESENCE_GRACE_RESET,
+            },
+        ];
+        let rendered = schema.render_for_prompt();
+        assert!(rendered.contains("present: Mara (behind the bar, polishing a tankard), Corin"),
+            "present line must list on-camera NPCs with stance; bare name when stance empty.\n---\n{rendered}");
     }
 
     // ---------- immutable_keys (the [CORE]-style lock) ----------

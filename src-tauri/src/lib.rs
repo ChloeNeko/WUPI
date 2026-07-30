@@ -1,10 +1,12 @@
 pub mod api;
 pub mod bracket_parser;
+pub mod card_import;
 pub mod chat_format;
 pub mod codex;
 pub mod consequence;
 pub mod context_swap;
 pub mod crossroads_prompt;
+pub mod decipher_prompt;
 pub mod engine;
 pub mod fable_command;
 pub mod fable_engine;
@@ -34,6 +36,7 @@ pub mod schema_engine;
 pub mod schema_validator;
 pub mod relationship;
 pub mod scene_pacing;
+pub mod scene_art;
 pub mod session;
 pub mod sim_card;
 pub mod stream_filter;
@@ -196,7 +199,44 @@ pub struct AppState {
     // while a game is actually running. Same shape as `schema_engine` (Mutex
     // of Option of Arc). None = no game running.
     pub fable_engine: Arc<std::sync::Mutex<Option<Arc<fable_engine::FableEngine>>>>,
-    /// Ghostwriter Director one-shot directive (§11.24, 2026-07-27). The
+    /// Phase 5B (2026-07-29): the Stable Diffusion image generator. NOT
+    /// eagerly spawned at boot (the SD model is heavy; load lazily on the
+    /// first image-gen request). Same shape as `fable_engine` (Mutex of
+    /// Option of Arc). The concrete type is `Box<dyn SceneImageGenerator>`
+    /// so the backend stays swappable (the `NoopImageGenerator` stub ships
+    /// before the diffusion-rs dependency lands; the real `DiffusionRs
+    /// Generator` replaces it behind a cargo feature). Held under std Mutex
+    /// (the trait is Sync; the generator's interior mutability is its own
+    /// concern, never held across an await — the SD swap runs in a
+    /// `spawn_blocking`-style detached task). `None` = no SD engine resident
+    /// (the common state — SD only exists during the image-gen window).
+    pub sd_engine: Arc<std::sync::Mutex<Option<Arc<Box<dyn scene_art::SceneImageGenerator>>>>>,
+    /// Phase 5B (2026-07-29): the SD model path, resolved at boot via a
+    /// sibling of `resolve_model_path` (looks in `models/sd/`). Stashed here
+    /// (NOT consumed) so every image-gen request can re-resolve if needed +
+    /// the boot path can populate it without an SD load. `None` = no SD model
+    /// found on disk → image gen is disabled (the done-beat spawn no-ops).
+    pub pending_sd_model_path: Arc<std::sync::Mutex<Option<std::path::PathBuf>>>,
+    /// Phase 5B (2026-07-29): the one-strike failure latch. Set `true` the
+    /// first time SD load/generate fails (OOM, corrupt model, missing GPU).
+    /// Once set, auto-gen is disabled for the rest of the process lifetime
+    /// AND the LLM is locked back into memory (never strand the game with no
+    /// engine — the §2B invariant). Requires a user ack (IPC) to clear — a
+    /// simple flip back to false after the user fixes the cause. Mirrors the
+    /// `codex_dirty` AtomicBool pattern (§11.25).
+    pub sd_autogen_disabled: Arc<std::sync::atomic::AtomicBool>,
+    /// Phase 5B (2026-07-29): the master opt-in for per-turn scene-image
+    /// generation. Default `false` — the SD wiring ships DORMANT so a
+    /// shipping build never spawns the LLM⇄SD⇄LLM swap (which, even with the
+    /// NoopImageGenerator stub, evicts + reloads the LLM every turn = needless
+    /// ~5-10s reload churn once the real backend lands). The user flips this
+    /// via a future toggle (or you flip it manually for the consolidated CDP
+    /// playtest). Independent of `sd_autogen_disabled` (the one-strike latch
+    /// that a runtime failure trips): `enabled` gates the spawn, `disabled`
+    /// latches it off after a failure. Both must be true/false respectively
+    /// for a generation to proceed. AtomicBool (set from IPC, read in the
+    /// `fable_send` done-beat spawn).
+    pub sd_autogen_enabled: Arc<std::sync::atomic::AtomicBool>,
     /// player arms this via the `fable_director_set` IPC (typically after
     /// Ghostwriter rewrites their free-text steer into a clean
     /// `<director_directive>` block). `fable_send` consumes it at the top of
@@ -234,6 +274,12 @@ pub struct AppState {
     /// New Game interview's GM-stream stop can't cross-wire with chat / fable
     /// / slice — same Bug #7 cross-wire lesson (§2C).
     pub active_interview_cancel: Arc<std::sync::Mutex<Option<llm::CancelToken>>>,
+    /// Phase 5B (2026-07-29): per-SD-generation cancel token, parallel to the
+    /// others. Distinct slot so an image-gen in flight can be cancelled
+    /// (user navigates away, ends the game, etc.) without cross-wiring with
+    /// chat / fable / slice / interview. Same Bug #7 lesson (§2C). The SD
+    /// swap task checks this between phases (unload → load → gen → reload).
+    pub active_sd_cancel: Arc<std::sync::Mutex<Option<llm::CancelToken>>>,
     /// The in-progress `InterviewDraft` during a New Game interview. `None`
     /// when no interview is active. The local Gemma scribe's `sim_draft` tool
     /// (Phase B) writes here under the mutex; `interview_finalize` reads it to
@@ -278,12 +324,12 @@ pub struct AppState {
     /// reads this each `fable_send` turn.
     pub active_fable_card: Arc<std::sync::Mutex<Option<sim_card::SimCard>>>,
     /// The Game-Master persona spoken by the Fable drawer's chat_send.
-    /// Loaded from `data/gm.sim` on `fable_start` (mirrors the Wupi-assistant
+    /// Loaded from `data/fable.sim` on `fable_start` (mirrors the Wupi-assistant
     /// `active_card` OnceLock, but held under a Mutex so it can be swapped in/
     /// out with the game lifetime). When `fable_is_active`, the drawer's
     /// chat_send renders THIS instead of `active_card` (the OS catgirl): the
     /// drawer speaks in GM voice inside Fable, the OS chat stays the catgirl
-    /// outside. `None` when no game is running OR when gm.sim is missing/
+    /// outside. `None` when no game is running OR when fable.sim is missing/
     /// malformed (graceful: drawer falls back to the OS catgirl persona).
     pub fable_persona: Arc<std::sync::Mutex<Option<sim_card::SimCard>>>,
     /// The card id BEFORE a game started, so `fable_end` can restore it. The
@@ -358,11 +404,16 @@ impl AppState {
             api_config_path: Arc::new(std::sync::OnceLock::new()),
             model_source: Arc::new(std::sync::Mutex::new(api::ModelSource::default())),
             fable_engine: Arc::new(std::sync::Mutex::new(None)),
+            sd_engine: Arc::new(std::sync::Mutex::new(None)),
+            pending_sd_model_path: Arc::new(std::sync::Mutex::new(None)),
+            sd_autogen_disabled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            sd_autogen_enabled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             pending_directive: Arc::new(tokio::sync::Mutex::new(None)),
             pending_tick_directives: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             active_fable_cancel: Arc::new(std::sync::Mutex::new(None)),
             active_slice_cancel: Arc::new(std::sync::Mutex::new(None)),
             active_interview_cancel: Arc::new(std::sync::Mutex::new(None)),
+            active_sd_cancel: Arc::new(std::sync::Mutex::new(None)),
             interview_draft: Arc::new(std::sync::Mutex::new(None)),
             interview_session: Arc::new(tokio::sync::Mutex::new(session::Conversation::new())),
             interview_active: Arc::new(std::sync::Mutex::new(false)),
@@ -407,6 +458,7 @@ pub fn run() {
 
     tracing::info!("=== WUPI starting ===");
     tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
         .manage(AppState::new())
         .manage(hardware::AudioRegistry)
         .setup(|app| {
@@ -444,6 +496,11 @@ pub fn run() {
             std::fs::create_dir_all(fable_dir.join("cards")).ok();
             std::fs::create_dir_all(fable_dir.join("saves")).ok();
             std::fs::create_dir_all(fable_dir.join("profiles")).ok();
+            // Phase 5B: the shared scene-image dir. The SD orchestrator
+            // overwrites `backgrounds/scene.png` each turn (one current-scene
+            // image, not a per-card history). Created eagerly so the first
+            // generation never races a missing dir.
+            std::fs::create_dir_all(fable_dir.join("backgrounds")).ok();
             // §8C v0.2.4 → v0.3.0 one-shot boot migration: a v0.2.4 install
             // has its user state scattered under data/ (memory.sqlite, models/,
             // sessions/, schemas/, Operator.xml). v0.3.0 promotes those to
@@ -602,6 +659,21 @@ pub fn run() {
                     );
                 }
             }
+
+            // Phase 5B: resolve the SD checkpoint (best-effort, no emit on
+            // absence — image gen is opt-in). Stashed the same way as the
+            // chat model; the orchestrator early-outs on `None`. A fresh
+            // install never has this; the user drops a checkpoint into
+            // `models/sd/` + flips `sd_autogen_enabled` to opt in.
+            let sd_path = resolve_sd_model_path(app.handle());
+            match &sd_path {
+                Some(p) => tracing::info!(path = %p.display(), "SD model resolved (image gen available once enabled)"),
+                None => tracing::info!("no SD model found; image gen stays dormant"),
+            }
+            *state
+                .pending_sd_model_path
+                .lock()
+                .expect("pending_sd_model_path mutex") = sd_path;
 
             // Build the MemoryEngine with the real BERT embedder if
             // `Embed.gguf` is on disk; fall back to StubEmbedder otherwise
@@ -920,6 +992,7 @@ pub fn run() {
             edit_message,
             reroll_last_turn,
             rewind_and_edit_user,
+            swipe_variant,
             // Selective regenerate (4th UX chat control): highlight a slice of
             // the last AI beat, regenerate it in-place via a memoryless
             // one-shot. Streams the replacement live, then splices it back.
@@ -937,6 +1010,7 @@ pub fn run() {
             interview_start,
             interview_send,
             interview_stop,
+            import_decipher_card,
             interview_finalize,
             interview_draft_state,
             // Crossroads + Ghostwriter (§11.24, 2026-07-27): memoryless
@@ -950,6 +1024,8 @@ pub fn run() {
             fable_director_set,
             fable_director_clear,
             fable_director_peek,
+            fable_set_sd_autogen,
+            fable_sd_autogen_state,
             fable_quick_exists,
             fable_quick_start,
             fable_quick_resume,
@@ -1176,6 +1252,18 @@ fn resolve_models_dir(app: &tauri::AppHandle) -> std::path::PathBuf {
 /// updates.
 fn resolve_apps_dir(app: &tauri::AppHandle) -> std::path::PathBuf {
     resolve_install_root(app).join("apps")
+}
+
+/// Phase 5B (2026-07-29): the shared scene-image path. A single current-scene
+/// image (NOT a per-card history) — the SD orchestrator overwrites it each
+/// turn, the frontend swaps it into the dormant `.fable-stage-bg` backdrop.
+/// Lives at `apps/fable/backgrounds/scene.png`. The dir is created eagerly at
+/// boot; this fn just resolves the path (total — always returns a PathBuf).
+fn scene_background_path(app: &tauri::AppHandle) -> std::path::PathBuf {
+    resolve_apps_dir(app)
+        .join("fable")
+        .join("backgrounds")
+        .join("scene.png")
 }
 
 /// §8C v0.2.4 → v0.3.0 one-shot boot migration. The §8C reorg promoted
@@ -1497,6 +1585,53 @@ fn pick_main_model(dir: &std::path::Path) -> Option<std::path::PathBuf> {
     }
     ggufs
         .into_iter()
+        .max_by_key(|e| e.metadata().ok().map(|m| m.len()).unwrap_or(0))
+        .map(|e| e.path())
+}
+
+/// Phase 5B (2026-07-29): resolve the Stable Diffusion checkpoint. Sibling
+/// of `resolve_model_path`, but searches each candidate dir's `sd/` subdir
+/// (so `models/`, `src-tauri/models/`, etc. each carry an optional `sd/`
+/// sibling). SD checkpoints are `.safetensors` (canonical) or `.gguf`; pick
+/// the largest when several are present. Returns `None` when absent — the SD
+/// swap orchestrator (`run_sd_swap_from_arcs`) early-outs cleanly on `None`
+/// ("no SD model resolved on disk"), so a fresh install with no SD model
+/// just silently skips image gen. The dependency add (diffusion-rs) is a
+/// separate build-safety gate owned by Chloe (§0); this resolver only walks
+/// the disk, so it needs no Cargo change.
+fn resolve_sd_model_path(app: &tauri::AppHandle) -> Option<std::path::PathBuf> {
+    for dir in model_search_dirs(app) {
+        let sd_dir = dir.join("sd");
+        if sd_dir.exists() {
+            if let Some(picked) = pick_sd_checkpoint(&sd_dir) {
+                tracing::info!(
+                    path = %picked.display(),
+                    from = %sd_dir.display(),
+                    "resolved SD model",
+                );
+                return Some(picked);
+            }
+        }
+    }
+    None
+}
+
+/// Pick a single SD checkpoint from a directory: `.safetensors` or `.gguf`,
+/// largest first. SD checkpoints don't have a locked naming convention (unlike
+/// the chat model's `WUPI.gguf`), so the size fallback is the primary selector.
+/// The SD swap is opt-in (gated by `sd_autogen_enabled` + the model path), so a
+/// stray non-SD `.gguf` in `sd/` would just produce a load error that trips the
+/// one-strike latch — no correctness risk to the narrator path.
+fn pick_sd_checkpoint(dir: &std::path::Path) -> Option<std::path::PathBuf> {
+    std::fs::read_dir(dir)
+        .ok()?
+        .flatten()
+        .filter(|e| {
+            matches!(
+                e.path().extension().and_then(|x| x.to_str()).map(|x| x.to_lowercase()),
+                Some(ref ext) if ext == "safetensors" || ext == "gguf"
+            )
+        })
         .max_by_key(|e| e.metadata().ok().map(|m| m.len()).unwrap_or(0))
         .map(|e| e.path())
 }
@@ -1981,30 +2116,36 @@ fn resolve_wupi_sim_path(app: &tauri::AppHandle) -> Option<std::path::PathBuf> {
     None
 }
 
-/// Resolve the Game-Master persona path (`data/gm.sim`). Mirrors
-/// `resolve_wupi_sim_path` but for the GM card spoken inside the Fable drawer.
-/// Only the primary portable path + its dev-repo mirror are consulted — the
-/// legacy `cards/` fallbacks are NOT (gm.sim is a Fable-v1 artifact with no
-/// pre-rename history). Returns None if absent (graceful: the drawer then
-/// falls back to the OS catgirl persona in chat_send).
-fn resolve_gm_sim_path(app: &tauri::AppHandle) -> Option<std::path::PathBuf> {
+/// Resolve the Fable persona path (`data/fable.sim`). Mirrors
+/// `resolve_wupi_sim_path` but for the card spoken inside the Fable drawer
+/// (the Game Master during a New Game interview). Only the primary portable
+/// path + its dev-repo mirror are consulted — the legacy `cards/` fallbacks
+/// are NOT (fable.sim is a Fable-v1 artifact with no pre-rename history).
+/// Returns None if absent (graceful: the drawer then falls back to the OS
+/// catgirl persona in chat_send).
+///
+/// 2026-07-29 rename: was `data/gm.sim` + `resolve_gm_sim_path`. The file
+/// was renamed to `fable.sim` to pair with `fable.codex` (the unified Fable
+/// playbook); the Game Master identity (`<name>Game Master</name>`) is
+/// UNCHANGED.
+fn resolve_fable_sim_path(app: &tauri::AppHandle) -> Option<std::path::PathBuf> {
     let mut candidates: Vec<std::path::PathBuf> = Vec::new();
-    // §8C portable layout: `<exe_dir>/data/gm.sim`.
-    candidates.push(resolve_data_dir(app).join("gm.sim"));
+    // §8C portable layout: `<exe_dir>/data/fable.sim`.
+    candidates.push(resolve_data_dir(app).join("fable.sim"));
     if let Some(exe) = std::env::current_exe().ok() {
         if let Some(parent) = exe.parent() {
             // Dev-repo path (exe lives in target/{release,debug}).
             if let Some(grand) = parent.parent().and_then(|g| g.parent()) {
-                candidates.push(grand.join("data").join("gm.sim"));
+                candidates.push(grand.join("data").join("fable.sim"));
             }
             if let Some(gg) = parent.parent().and_then(|g| g.parent()).and_then(|g| g.parent()) {
-                candidates.push(gg.join("data").join("gm.sim"));
+                candidates.push(gg.join("data").join("fable.sim"));
             }
         }
     }
     for c in &candidates {
         if c.is_file() {
-            tracing::info!("resolved gm card: {}", c.display());
+            tracing::info!("resolved fable card: {}", c.display());
             return Some(c.clone());
         }
     }
@@ -2118,7 +2259,7 @@ fn resolve_wupi_codex_path(app: &tauri::AppHandle) -> Option<std::path::PathBuf>
 /// reference shared by BOTH the Game Master interview persona AND the
 /// simulation narrator: question banks, genre guides, perfect-card examples,
 /// bracket-command reference, narrative discipline). Mirrors
-/// `resolve_gm_sim_path` (NOT `resolve_wupi_codex_path`): the Wupi resolver
+/// `resolve_fable_sim_path` (NOT `resolve_wupi_codex_path`): the Wupi resolver
 /// only checks the single portable path with no dev fallback, which is fine
 /// for wupi.codex but wrong for fable.* (a Fable artifact that needs the
 /// dev-repo candidate walk so it's findable when running from
@@ -2126,7 +2267,9 @@ fn resolve_wupi_codex_path(app: &tauri::AppHandle) -> Option<std::path::PathBuf>
 /// is a no-op; the interview + narration still work, just without the
 /// codex-surfaced examples). **Unification (2026-07-29):** was
 /// `resolve_gm_codex_path` reading `gm.codex`; renamed when GM + Narrator
-/// codexes merged into one Fable partition.
+/// codexes merged into one Fable partition. (The sibling `data/gm.sim` was
+/// likewise renamed to `data/fable.sim` + `resolve_fable_sim_path` the same
+/// day; both now share the `fable.*` stem.)
 fn resolve_fable_codex_path(app: &tauri::AppHandle) -> Option<std::path::PathBuf> {
     let mut candidates: Vec<std::path::PathBuf> = Vec::new();
     // §8C portable layout: `<exe_dir>/data/fable.codex`.
@@ -2249,6 +2392,207 @@ async fn acquire_schema_engine_from_arcs(
         }
     };
     Ok((engine, lease))
+}
+
+/// Phase 5B (2026-07-29): the SD swap orchestrator. Runs the full
+/// LLM⇄SD⇄LLM cycle for one image generation, off the turn's hot path. This
+/// is the load-bearing 5B function — it ties together everything:
+///
+/// 1. **Gate** on the one-strike latch (`sd_autogen_disabled`) + the cancel
+///    token. If disabled or cancelled, no-op (never strand the game).
+/// 2. **Acquire the `ContextRole::Sd` lease** — the swap-lock evicts whatever
+///    LLM context is resident (joining its engine thread so the KV context is
+///    freed). Returns the guard; held for the whole cycle.
+/// 3. **`unload_shared_model()`** — frees the ~9.8GB LLM weights. PRECONDITION
+///    satisfied: the lease's teardown already joined every LLM context, so no
+///    `LlamaContext` borrows the weights (no use-after-free — the documented
+///    invariant in `llm::unload_shared_model`).
+/// 4. **Load SD** — populate the `sd_engine` slot with `default_sd_backend()`
+///    + call `load(model_path)`. On the stub backend this is instant; on the
+///    real backend it loads the SD model into the now-free VRAM.
+/// 5. **Generate** — `compose_scene_prompt` builds the deterministic prompt
+///    from the world state; `generate(&request)` writes the PNG. On any error,
+///    trip the one-strike latch + jump to cleanup (reload the LLM so the game
+///    can continue).
+/// 6. **Cleanup (always runs)** — unload SD (free VRAM), `reload_shared_model`
+///    (re-leak the LLM weights — ~5-10s file-read, the only reverse-swap cost),
+///    drop the lease. The next `fable_send`/`chat_send` re-spawns a fresh
+///    LlamaContext on the reloaded weights (the per-turn KV clear means there
+///    was nothing to preserve).
+/// 7. Emit the result (or the failure) via `on_result`.
+///
+/// Arcs-only (no `tauri::State`) so it can run in a detached `tokio::spawn`
+/// from `fable_send`'s done beat. The SD work is blocking (CUDA), so it runs
+/// inside `spawn_blocking` for the load/generate/unload phases — the async
+/// wrapper just sequences them.
+async fn run_sd_swap_from_arcs(
+    context_swap: context_swap::ContextSwap,
+    sd_engine_slot: Arc<std::sync::Mutex<Option<Arc<Box<dyn scene_art::SceneImageGenerator>>>>>,
+    sd_model_path: Option<std::path::PathBuf>,
+    sd_autogen_disabled: Arc<std::sync::atomic::AtomicBool>,
+    active_sd_cancel: Arc<std::sync::Mutex<Option<llm::CancelToken>>>,
+    schema_arc: Arc<tokio::sync::Mutex<schema::WorldSchema>>,
+    llm_model_path: Arc<std::sync::Mutex<Option<std::path::PathBuf>>>,
+    dest_path: std::path::PathBuf,
+    on_result: Box<dyn FnOnce(scene_art::SwapOutcome) + Send>,
+) {
+    use std::sync::atomic::Ordering;
+
+    // 1. Gate: one-strike latch + no-SD-model early-out.
+    if sd_autogen_disabled.load(Ordering::Relaxed) {
+        tracing::debug!("sd-swap: skipped (auto-gen disabled by one-strike latch)");
+        on_result(scene_art::SwapOutcome::Skipped);
+        return;
+    }
+    let sd_model_path = match sd_model_path {
+        Some(p) => p,
+        None => {
+            tracing::debug!("sd-swap: skipped (no SD model resolved on disk)");
+            on_result(scene_art::SwapOutcome::Skipped);
+            return;
+        }
+    };
+
+    // 2. Acquire the Sd lease. The swap-lock evicts the resident LLM context
+    //    (joining its thread). The teardown here is a no-op for the SD side —
+    //    SD doesn't have a resident engine to evict on the FIRST acquire; the
+    //    reload-unload dance is what frees VRAM. The lease is held for the
+    //    whole cycle so no other role can grab VRAM mid-generation.
+    let sd_teardown_slot = Arc::clone(&sd_engine_slot);
+    let lease = context_swap
+        .acquire(
+            context_swap::ContextRole::Sd,
+            Box::new(move || {
+                // Synchronous teardown: take + drop the SD engine so its VRAM
+                // is freed before the LLM reloads. unload() is the backend's
+                // contract for synchronous VRAM release.
+                let gen = {
+                    let mut g = sd_teardown_slot.lock().map_err(|e| e.to_string())?;
+                    g.take()
+                };
+                if let Some(gen) = gen {
+                    gen.unload();
+                    tracing::info!("context-swap: SD engine unloaded (VRAM freed for LLM reload)");
+                }
+                Ok(())
+            }),
+        )
+        .await;
+
+    // Helper: check the cancel token. Returns true if cancelled.
+    let is_cancelled = || {
+        active_sd_cancel
+            .lock()
+            .ok()
+            .and_then(|g| g.clone())
+            .map(|t| t.load(std::sync::atomic::Ordering::Relaxed))
+            .unwrap_or(false)
+    };
+    if is_cancelled() {
+        drop(lease);
+        on_result(scene_art::SwapOutcome::Cancelled);
+        return;
+    }
+
+    // 3-6. The blocking core: unload LLM → load SD → gen → unload SD → reload
+    //      LLM. Runs in spawn_blocking so the CUDA calls don't stall the async
+    //      runtime. The lease is moved in + moved out (held for the duration).
+    let llm_model_path_clone = Arc::clone(&llm_model_path);
+    // Clone the latch Arc for the closure (it's also used after the closure
+    // returns, in the post-swap error paths — Arc isn't Copy, so clone first).
+    let latch_in_closure = Arc::clone(&sd_autogen_disabled);
+    let outcome = tokio::task::spawn_blocking(move || {
+        // 3. Unload the LLM weights. The lease's teardown already joined every
+        //    LLM context, so the precondition (no LlamaContext alive) holds.
+        let unloaded = llm::unload_shared_model();
+        if !unloaded {
+            tracing::warn!("sd-swap: unload_shared_model reported nothing resident (unexpected — proceeding anyway)");
+        }
+
+        // 4. Load SD. Populate the slot + call load(model_path).
+        let backend: Arc<Box<dyn scene_art::SceneImageGenerator>> =
+            Arc::new(scene_art::default_sd_backend());
+        {
+            let mut g = sd_engine_slot.lock().expect("sd_engine slot mutex");
+            *g = Some(Arc::clone(&backend));
+        }
+        if let Err(e) = backend.load(&sd_model_path) {
+            tracing::error!(error = %e, "sd-swap: SD load failed — tripping one-strike latch");
+            latch_in_closure.store(true, Ordering::Relaxed);
+            // Jump to cleanup (the LLM must reload so the game continues).
+            return scene_art::SwapOutcome::Failed(e);
+        }
+
+        // 5. Compose the prompt from the world state + generate. The dest is
+        //    the shared current-scene image (apps/fable/backgrounds/scene.png),
+        //    resolved by the caller + threaded in as `dest_path` (the
+        //    orchestrator is arcs-only, no app handle). Overwritten each turn.
+        let (prompt, dest) = {
+            let s = schema_arc.blocking_lock();
+            let prompt = scene_art::compose_scene_prompt(&s);
+            (prompt, dest_path.clone())
+        };
+        if prompt.is_empty() {
+            tracing::debug!("sd-swap: empty compose prompt (no current node) — skipping gen");
+            return scene_art::SwapOutcome::Skipped;
+        }
+        let request = scene_art::SceneImageRequest {
+            prompt,
+            dest: dest.clone(),
+            ..Default::default()
+        };
+        match backend.generate(&request) {
+            Ok(result) => {
+                tracing::info!(dest = %result.dest.display(), elapsed_ms = result.elapsed_ms, "sd-swap: image generated");
+                scene_art::SwapOutcome::Generated(result)
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "sd-swap: SD generate failed — tripping one-strike latch");
+                latch_in_closure.store(true, Ordering::Relaxed);
+                scene_art::SwapOutcome::Failed(e)
+            }
+        }
+        // The `backend` Arc drops here, but the slot still holds a clone —
+        // the lease's teardown (registered above) unloads + clears it when the
+        // lease drops. The SD VRAM is freed by that teardown, not here.
+    })
+    .await;
+
+    // The spawn_blocking returned (either the outcome or a JoinError). The
+    // lease drops here → the SD teardown fires (unloading SD), but the LLM
+    // weights are STILL unloaded (step 3 freed them). We must reload the LLM
+    // BEFORE the lease drops so the next fable_send/chat_send finds a live
+    // model — otherwise the game is stranded with no narrator.
+    //
+    // Order: reload the LLM weights FIRST (so shared_model() is live again),
+    // THEN drop the lease (the SD teardown frees SD VRAM, which the LLM
+    // reload didn't need — they're sequential, not concurrent).
+    let llm_path = llm_model_path_clone
+        .lock()
+        .ok()
+        .and_then(|g| g.clone());
+    if let Some(path) = llm_path {
+        // reload_shared_model re-leaks the weights. ~5-10s file-read (the only
+        // reverse-swap cost; hidden behind the user reading the new image).
+        if let Err(e) = llm::reload_shared_model(&path, 99) {
+            tracing::error!(error = %e, "sd-swap: LLM RELOAD FAILED — the game has no narrator until reboot. Tripping one-strike latch.");
+            sd_autogen_disabled.store(true, Ordering::Relaxed);
+        }
+    } else {
+        tracing::error!("sd-swap: no LLM model path to reload — the game has no narrator until reboot. Tripping one-strike latch.");
+        sd_autogen_disabled.store(true, Ordering::Relaxed);
+    }
+    drop(lease); // SD teardown fires here (frees SD VRAM).
+
+    match outcome {
+        Ok(inner) => on_result(inner),
+        Err(e) => {
+            tracing::error!(error = %e, "sd-swap: spawn_blocking panicked");
+            on_result(scene_art::SwapOutcome::Failed(scene_art::SceneImageError {
+                message: format!("SD task panicked: {e}"),
+            }));
+        }
+    }
 }
 
 // Both route helpers are invoked from the top of chat_send via an early
@@ -2815,14 +3159,15 @@ async fn chat_send(
     // inter-turn memory block does, by design). The fallback card renders to
     // "" → section suppressed.
     //
-    // Phase 2 (gm.sim split): when a game is active, the drawer's chat_send
-    // (the `NotACommand` fallthrough) renders the Game-Master persona
-    // (`fable_persona`) instead of `active_card` (the OS catgirl). So the
-    // drawer speaks in GM voice inside Fable; OS chat outside Fable stays the
-    // catgirl. The narrator path (`fable_send`) reads `active_fable_card`
-    // independently and is unaffected. `fable_persona` is None when gm.sim is
-    // missing/malformed → graceful fallback to the OS catgirl (best-effort,
-    // mirrors the embedder's degradation contract).
+    // Phase 2 (fable.sim split): when a game is active, the drawer's chat_send
+    // (the `NotACommand` fallthrough) renders the Fable persona
+    // (`fable_persona`, the Game Master from data/fable.sim) instead of
+    // `active_card` (the OS catgirl). So the drawer speaks in GM voice inside
+    // Fable; OS chat outside Fable stays the catgirl. The narrator path
+    // (`fable_send`) reads `active_fable_card` independently and is
+    // unaffected. `fable_persona` is None when fable.sim is missing/malformed
+    // → graceful fallback to the OS catgirl (best-effort, mirrors the
+    // embedder's degradation contract).
     let persona = if fable_is_active(&state) {
         state
             .fable_persona
@@ -3094,6 +3439,29 @@ async fn chat_send(
         Vec::new()
     };
 
+    // Per-pass system prompt (the core of the 2026-07-29 persona/protocol split).
+    // The .sim cards are now PURE FLAVOR (identity, voice, personality) — they
+    // carry no technical protocols. The structured-output protocol
+    // (`WUPI_AGENT_PROTOCOL`) is Rust-injected here, scoped to the TOOL pass
+    // ONLY. This mirrors the existing Fable split (narrator = prose, tracker/
+    // scribe = mechanical): the catgirl persona carries all conversational text,
+    // and the agent protocol carries the machine-readable surface (tool args,
+    // file contents, code). The two are complementary — no KV clear is needed
+    // (unlike the §11.52 tracker split, where the two prompts conflicted).
+    //
+    // `chat_tools.is_empty()` is the precise pass discriminator: when tools are
+    // attached, this decode is an AGENT pass (may emit tool calls → needs the
+    // protocol); when empty, it's a PROSE pass (pure persona, no protocol). The
+    // API handoff (`messages` assembled at line ~2883) + both local fallbacks
+    // (below) keep the bare `system_prompt` — the protocol would be inert there
+    // anyway (no tools advertised), but keeping it out also keeps those decodes
+    // byte-identical to the pre-change behavior (zero cold-reset risk).
+    let agent_system_prompt = if chat_tools.is_empty() {
+        system_prompt.clone()
+    } else {
+        format!("{system_prompt}\n\n{}", prompts::WUPI_AGENT_PROTOCOL)
+    };
+
     // Per-turn Director directive slot. Minted fresh each chat_send call; the
     // `set_directive` tool (Fable-only) writes here when the model steers the
     // world. Drained to `state.pending_directive` after the agent loop returns
@@ -3118,7 +3486,7 @@ async fn chat_send(
         // under API mode errored instantly with "context too long even
         // after truncation: 2501 tokens, max 1536".
         match run_agent_loop(
-            &state, &app, &on_event, &system_prompt, 6,
+            &state, &app, &on_event, &agent_system_prompt, 6,
             memory_block.clone(), world_state.clone(), chat_tools.clone(),
             settings.context_size,
             on_chunk.clone(), cancel.clone(), backend_opt.clone(),
@@ -3227,7 +3595,7 @@ async fn chat_send(
         // (Local mode never torn down to 2048), so the fast reuse path
         // in `backend_opt` above applies — no teardown needed.
         match run_agent_loop(
-            &state, &app, &on_event, &system_prompt, visible_window,
+            &state, &app, &on_event, &agent_system_prompt, visible_window,
             memory_block, world_state, chat_tools,
             settings.context_size,
             on_chunk.clone(), cancel.clone(), backend_opt.clone(),
@@ -4000,6 +4368,19 @@ async fn apply_phase3_bracket_commands(
         .iter()
         .filter(|c| matches!(c, bracket_parser::BracketCommand::Rumor { .. }))
         .collect();
+    // Phase 5A (2026-07-29): presence-assertion commands. The applier resolves
+    // each surface form to a canonical id via NpcRegistry::resolve, rejects
+    // unknown ids (the anti-hallucination gate — the §11.46 reject-directive
+    // channel), + applies the 1-turn grace TTL to the presences Vec. Unlike
+    // the other brackets, presence runs EVERY turn even when only asserting
+    // (the grace-decay pass must fire on every turn, including turns with no
+    // [PRESENCE] at all — handled by the dedicated decay step in fable_send's
+    // turn flow, NOT here; this applier only handles the assertion side).
+    let presence_cmds: Vec<&bracket_parser::BracketCommand> = parsed
+        .commands
+        .iter()
+        .filter(|c| matches!(c, bracket_parser::BracketCommand::Presence { .. }))
+        .collect();
 
     if effects.is_empty()
         && milestones.is_empty()
@@ -4007,8 +4388,20 @@ async fn apply_phase3_bracket_commands(
         && weather_cmds.is_empty()
         && travel_cmds.is_empty()
         && rumor_cmds.is_empty()
+        && presence_cmds.is_empty()
     {
-        return (false, Vec::new());
+        // Phase 5A: even with no bracket commands this turn, presence grace-
+        // decay must run if there are existing presences (a turn with zero
+        // [PRESENCE] assertions should still decay the whitelist — otherwise
+        // the cast would freeze on-camera forever once asserted). Fall through
+        // to the presence block below; if presences is also empty, the block
+        // is a no-op.
+        // Peek under the lock: if there's nothing to decay, early-out (zero
+        // work, zero snapshot).
+        let nothing_to_decay = state.fable_schema.lock().await.presences.is_empty();
+        if nothing_to_decay {
+            return (false, Vec::new());
+        }
     }
 
     let mut mutated = false;
@@ -4315,6 +4708,146 @@ async fn apply_phase3_bracket_commands(
                     "[RUMOR] dropped — no current node to root at"
                 );
             }
+        }
+    }
+
+    // [PRESENCE] — assert who is on-camera this turn (Phase 5A, 2026-07-29).
+    // Runs inside the same schema lock. The load-bearing anti-teleport logic:
+    //   1. Resolve each [PRESENCE] surface form (id OR alias) via
+    //      NpcRegistry::resolve. Unknown forms → reject directive (the
+    //      anti-hallucination gate — a hallucinated npc_id surfaces as a hard
+    //      fact the narrator obeys, NOT a silent accept). Known forms →
+    //      upsert into presences with ttl = GRACE_RESET.
+    //   2. Grace-decay: every existing presence NOT re-asserted this turn has
+    //      its ttl decremented; it drops when ttl hits 0. This tolerates ONE
+    //      missed extraction (the §11.51 Tracker under-emission failure mode)
+    //      without vaporizing the barkeep mid-scene.
+    // No node rooting (Option B — presence-implies-location; off-screen NPC
+    // positions are the rumor/task engine's job). The presence applier ALWAYS
+    // runs the decay pass when there are presence_cmds (even if all are
+    // rejects) so the whitelist stays current. Note the borrow dance: the
+    // registry lookup (immutable `s.npc_registry`) + the existing-presences
+    // scan must complete before the mutable `s.presences` rebuild.
+    // Gate: runs on EVERY turn that has assertions OR existing presences.
+    // The decay-only path (assertions empty but presences non-empty) is the
+    // load-bearing case: a turn where the Tracker emitted zero [PRESENCE]
+    // brackets must still age the cast out, else NPCs freeze on-camera
+    // forever once asserted. The early-out above already ensured we only
+    // reach here when there's actual work to do.
+    if !presence_cmds.is_empty() || !s.presences.is_empty() {
+        // Snapshot the registry + existing presences out of the immutable
+        // borrow before the mutable rebuild (mirrors the TRAVEL/RUMOR clone-
+        // before-mutable-push pattern).
+        let registry_entries: Vec<schema::NpcEntry> = s.npc_registry.entries.clone();
+        let existing: Vec<schema::Presence> = s.presences.clone();
+
+        // Resolve this turn's assertions: surface → (canonical id, name, stance).
+        // Unknown surfaces collected for reject directives; known ones build
+        // the asserted map (canonical_id → stance).
+        let mut asserted: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        let mut unknown_surfaces: Vec<String> = Vec::new();
+        for cmd in &presence_cmds {
+            if let bracket_parser::BracketCommand::Presence { npc_id, stance } = cmd {
+                // Normalize the stance through the prose-cleanup contract
+                // (free-text Tracker output carries the §11.41 repetition +
+                // §11.29 whitespace risks — truncate_repetition is already
+                // applied to the tracker's raw output upstream, but a defensive
+                // whitespace-normalize here is cheap insurance).
+                let stance_clean = stance.trim();
+                // Resolve against the registry (id OR alias, case-insensitive).
+                match registry_entries.iter().find(|e| e.matches(npc_id)) {
+                    Some(entry) => {
+                        asserted.insert(entry.id.clone(), stance_clean.to_string());
+                    }
+                    None => {
+                        unknown_surfaces.push(npc_id.clone());
+                    }
+                }
+            }
+        }
+
+        // Reject directives for unknown npc_ids (the anti-hallucination gate).
+        // Format mirrors [TRAVEL]'s reject (lists valid options so the
+        // narrator self-corrects next turn). Unknown surfaces are deduped +
+        // joined so a single directive covers a multi-hallucination turn.
+        if !unknown_surfaces.is_empty() {
+            let valid_ids: Vec<&str> = registry_entries.iter().map(|e| e.id.as_str()).collect();
+            let deduped: Vec<&str> = {
+                let mut seen = std::collections::HashSet::new();
+                unknown_surfaces
+                    .iter()
+                    .map(|s| s.as_str())
+                    .filter(|s| seen.insert(*s))
+                    .collect()
+            };
+            reject_directives.push(format!(
+                "Presence not recorded — \"{}\" is not a known NPC. Known NPCs: {}. Re-assert presence with a valid id or alias next turn.",
+                deduped.join("\", \""),
+                if valid_ids.is_empty() { "(none registered)".to_string() } else { valid_ids.join(", ") }
+            ));
+            tracing::warn!(
+                unknown = ?deduped,
+                "[PRESENCE] rejected — unknown npc_id(s)"
+            );
+        }
+
+        // Rebuild the presences Vec: re-asserted (reset ttl) + carried-over
+        // (decrement ttl, drop at 0) + newly-asserted (fresh ttl). This is the
+        // grace-decay pass. Order: existing first (preserves stable ordering
+        // for the `present:` render line), then newly-asserted appended.
+        if !asserted.is_empty() || !registry_entries.is_empty() {
+            if undo_snapshot.is_none() {
+                undo_snapshot = Some(s.clone());
+            }
+            let mut rebuilt: Vec<schema::Presence> = Vec::new();
+            // Carry over existing: reset ttl if re-asserted, else decay.
+            for p in &existing {
+                if let Some(new_stance) = asserted.get(&p.npc_id) {
+                    rebuilt.push(schema::Presence {
+                        npc_id: p.npc_id.clone(),
+                        name: p.name.clone(),
+                        stance: new_stance.clone(),
+                        ttl: schema::PRESENCE_GRACE_RESET,
+                    });
+                } else if p.ttl > 1 {
+                    // Grace: decrement, keep (one miss tolerated).
+                    rebuilt.push(schema::Presence {
+                        npc_id: p.npc_id.clone(),
+                        name: p.name.clone(),
+                        stance: p.stance.clone(),
+                        ttl: p.ttl - 1,
+                    });
+                    tracing::debug!(
+                        npc_id = %p.npc_id,
+                        new_ttl = p.ttl - 1,
+                        "[PRESENCE] grace-decay (not re-asserted this turn)"
+                    );
+                } else {
+                    // ttl was 1 → drops to 0 → removed from the whitelist.
+                    tracing::info!(
+                        npc_id = %p.npc_id,
+                        "[PRESENCE] dropped — grace expired (not re-asserted for 2 turns)"
+                    );
+                }
+                asserted.remove(&p.npc_id);
+            }
+            // Newly-asserted (not in existing): fresh presence at GRACE_RESET.
+            for (npc_id, stance) in asserted {
+                if let Some(entry) = registry_entries.iter().find(|e| e.id == npc_id) {
+                    rebuilt.push(schema::Presence {
+                        npc_id: entry.id.clone(),
+                        name: entry.name.clone(),
+                        stance,
+                        ttl: schema::PRESENCE_GRACE_RESET,
+                    });
+                    tracing::info!(
+                        npc_id = %entry.id,
+                        "[PRESENCE] asserted (new on-camera)"
+                    );
+                }
+            }
+            s.presences = rebuilt;
+            mutated = true;
         }
     }
     } // end schema lock
@@ -5777,6 +6310,38 @@ async fn enter_fable_session(
             "fable_start: seeded travel_graph from card <locations>"
         );
     }
+    // Fable Phase 5A (2026-07-29): seed the named-NPC registry from the
+    // card's <cast> block. Mirrors the travel_graph seed above (same gate
+    // shape: only seed when the schema's registry is empty AND the card
+    // declares a cast — a resumed save with a populated registry is left
+    // alone, preserving the player's [PRESENCE] state). This is the
+    // load-bearing fix for the "teleporting NPC" bug: without it the
+    // [PRESENCE] bracket has no whitelist to validate against → every npc_id
+    // is "unknown" → every bracket is rejected → the anti-teleport whitelist
+    // (the `present:` line) never populates → the narrator is free to
+    // hallucinate absent NPCs back into the scene (the §11.48-shaped gap,
+    // recurring for Phase 5). The ids here are the Rust-authoritative keys;
+    // a card without <cast> stays dormant (pre-Phase-5 behavior).
+    if prior_schema.npc_registry.entries.is_empty() && !card.cast.is_empty() {
+        prior_schema.npc_registry = schema::NpcRegistry {
+            entries: card
+                .cast
+                .iter()
+                .map(|cn| schema::NpcEntry {
+                    id: cn.id.clone(),
+                    name: cn.name.clone(),
+                    role: cn.role.clone(),
+                    tier: cn.tier.clone(),
+                    aliases: cn.aliases.clone(),
+                })
+                .collect(),
+        };
+        tracing::info!(
+            npc_count = card.cast.len(),
+            ids = ?card.cast.iter().map(|n| n.id.as_str()).collect::<Vec<_>>(),
+            "fable_start: seeded npc_registry from card <cast>"
+        );
+    }
     *state.fable_schema.lock().await = prior_schema;
     clear_fable_history(&state).await;
     let messages: Vec<FableLoadMessage> = prior_session
@@ -5789,6 +6354,8 @@ async fn enter_fable_session(
                 session::Role::System => "system",
             },
             content: m.content.clone(),
+            variants: m.variants.clone(),
+            active_idx: m.active_idx,
         })
         .collect();
     let turn_count = messages.len();
@@ -5799,14 +6366,15 @@ async fn enter_fable_session(
     let opening_scene = card.opening_scene.clone();
     *state.active_fable_card.lock().expect("active_fable_card mutex") = Some(card);
 
-    // Phase 2: seat the GM persona (best-effort; None → OS catgirl fallback).
-    let gm_persona = resolve_gm_sim_path(app)
+    // Phase 2: seat the Fable persona (best-effort; None → OS catgirl fallback).
+    // `data/fable.sim` carries the Game Master identity spoken by the drawer.
+    let fable_persona_card = resolve_fable_sim_path(app)
         .map(|p| sim_card::load_or_fallback(&p))
         .filter(|c| c.id != "__wupi_fallback__");
-    if gm_persona.is_none() {
-        tracing::info!("fable_start: no gm.sim found — drawer will use the OS catgirl persona");
+    if fable_persona_card.is_none() {
+        tracing::info!("fable_start: no fable.sim found — drawer will use the OS catgirl persona");
     }
-    *state.fable_persona.lock().expect("fable_persona mutex") = gm_persona;
+    *state.fable_persona.lock().expect("fable_persona mutex") = fable_persona_card;
 
     tracing::info!(?resumed_save_label, "game started: narrator engine live, memory scoped to card, state loaded");
     Ok(FableLoadResult {
@@ -5824,26 +6392,43 @@ async fn enter_fable_session(
     })
 }
 
-/// The title-screen CONTINUE button's resume target. Scans EVERY card's saves
-/// dir and returns the single most-recent MANUAL or QUICK save (autosaves are
-/// EXCLUDED by contract — the directive is "dim Continue unless the user has a
-/// manual or quick save to resume"). `None` (→ JSON null) when there are no
-/// qualifying saves, which is the signal for the frontend to disable the
-/// CONTINUE button.
+/// The title-screen CONTINUE button's resume target. Scans every New Game
+/// world's saves dir + returns the single most-recent save of ANY kind
+/// (autosave OR manual). `None` (→ JSON null) when no qualifying save exists,
+/// which is the signal for the frontend to disable CONTINUE.
 ///
-/// Why a dedicated IPC instead of `fable_list_saves`: that one is per-card
-/// and the title sits BEFORE card selection, so CONTINUE must look across all
-/// cards for "your last manual save, anywhere."
+/// The contract is "Continue = land me exactly where I left off in a New Game
+/// world." Two exclusions make that precise:
+///   - **Quick Play is excluded.** Quick Play has its own single-slot quicksave
+///     + its own Resume button (the Quick Play title flow). CONTINUE is for the
+///     durable New Game worlds (`.sim` cards on disk), so the `__quickplay__`
+///     card_id is skipped to keep the two flows from colliding.
+///   - **Autosaves are INCLUDED.** An autosave is written every turn, so the
+///     freshest save for any active world is almost always the autosave;
+///     resuming the last *manual* save would silently discard turns. CONTINUE
+///     means "pick up where I stopped," which is the per-turn checkpoint.
+///
+/// Why a dedicated IPC instead of `fable_list_saves`: that one is per-card and
+/// the title sits BEFORE card selection, so CONTINUE must look across all New
+/// Game worlds for "your last save, anywhere."
 ///
 /// Returns a `SaveMeta` (lightweight — no session/schema payload). The
-/// frontend loads it via `fable_load_save` only when the user actually clicks
-/// CONTINUE.
+/// frontend stashes it + resumes via `fable_start(card_id, save_id)` only when
+/// the user actually clicks CONTINUE.
 #[tauri::command]
 fn fable_continue_target(app: tauri::AppHandle) -> Result<Option<fable_save::SaveMeta>, String> {
     let fable_root = resolve_apps_dir(&app).join("fable");
+    Ok(most_recent_continue_target(&fable_root))
+}
+
+/// Pure core of `fable_continue_target`: walks `saves/<card_id>/` for every
+/// card except Quick Play, returning the globally-most-recent `SaveMeta` of
+/// any slot type (autosave + manual). Extracted so the contract (New Game
+/// worlds only; autosaves count) is unit-testable with a tempdir.
+fn most_recent_continue_target(fable_root: &std::path::Path) -> Option<fable_save::SaveMeta> {
     let saves_dir = fable_root.join("saves");
     let Ok(entries) = std::fs::read_dir(&saves_dir) else {
-        return Ok(None);
+        return None;
     };
     let mut best: Option<fable_save::SaveMeta> = None;
     for entry in entries.flatten() {
@@ -5852,21 +6437,22 @@ fn fable_continue_target(app: tauri::AppHandle) -> Result<Option<fable_save::Sav
             continue;
         }
         let card_id = entry.file_name().to_string_lossy().to_string();
-        if let Ok(saves) = fable_save::list_saves(&fable_root, &card_id) {
+        // Quick Play owns its own resume flow; exclude it so CONTINUE never
+        // collides with the Quick Play button's Resume.
+        if card_id == fable_save::QUICK_PLAY_CARD_ID {
+            continue;
+        }
+        if let Ok(saves) = fable_save::list_saves(fable_root, &card_id) {
             for s in saves {
-                // Autosaves don't count toward the CONTINUE gate. The user must
-                // have an explicit manual/quick save to resume.
-                if s.is_autosave {
-                    continue;
-                }
                 // list_saves is newest-first per-card; track the global newest.
+                // Autosaves ARE eligible (see the command doc above).
                 if best.as_ref().map_or(true, |b| s.timestamp > b.timestamp) {
                     best = Some(s);
                 }
             }
         }
     }
-    Ok(best)
+    best
 }
 
 /// Render the narrator prompt in the Gemma4 `<|turn>` protocol: system +
@@ -5897,7 +6483,51 @@ fn build_narrator_prompt(system_prompt: &str, window: &[session::Message]) -> St
     prompt
 }
 
-/// Render the canonical world-state snapshot for a narrator prompt: the base
+/// Build the Pass-2 tracker prompt for the LOCAL two-pass flow (Prong 1 of
+/// the LOCAL Phase 4 fix, 2026-07-29). The tracker is the SECOND half of a
+/// LOCAL turn — it runs on a fresh KV (the engine's per-turn `clear_kv_cache`
+/// wipes the narrator's attention weights) and sees ONLY this prompt: the
+/// full bracket-tracker system prompt + a single stateless user turn
+/// carrying `[Scene] / [Player action] / [Narrator prose]` + the generation
+/// cue. No history window — the tracker is stateless by design (blueprint:
+/// "a secondary micro-pass to extract the mechanical tags"), so prior turns
+/// would only bloat the context and risk cross-contamination.
+///
+/// The narrator's just-written prose is passed verbatim — the tracker's job
+/// is to read it and emit the `[TRAVEL]`/`[TIME]`/`[EFFECT]`/... brackets the
+/// prose implies. If the narrator already emitted a bracket (rare under the
+/// prose-only narrator prompt), it is preserved here so the tracker can see
+/// it and decide whether to echo/extend it.
+///
+/// Mirrors `build_narrator_prompt`'s `<|turn>` protocol (system → user →
+/// model cue), but with ONE synthetic user turn instead of the windowed
+/// history. Pure fn — unit-testable without the engine.
+fn build_tracker_extraction_prompt(
+    system_prompt: &str,
+    player_action: &str,
+    narrator_prose: &str,
+) -> String {
+    let mut prompt = String::with_capacity(4096);
+    prompt.push_str("<|turn>system\n");
+    prompt.push_str(system_prompt.trim());
+    prompt.push_str("<turn|>\n");
+    // One stateless user turn: the minimal extraction context the blueprint
+    // specifies ([Scene + Player Action + Narrator Prose]). The system prompt
+    // already carries the authoritative <world_state> + <directives>, so the
+    // scene block here is a thin pointer ("see world_state above") rather than
+    // a duplicate render — keeps the tracker prompt small + single-source.
+    prompt.push_str("<|turn>user\n");
+    prompt.push_str("[Scene]\nSee <world_state> in the system prompt above for the authoritative current state.\n\n");
+    prompt.push_str("[Player action]\n");
+    prompt.push_str(player_action.trim());
+    prompt.push_str("\n\n[Narrator prose]\n");
+    prompt.push_str(narrator_prose.trim());
+    prompt.push_str("\n\nEmit the tracking brackets for what changed this turn based on the narrator prose above.<turn|>\n");
+    prompt.push_str("<|turn>model\n");
+    prompt
+}
+
+
 /// `WorldSchema::render_for_prompt` + the read-time-derived `condition:` +
 /// active status tags + a `<directives>` block of turn-scoped hard facts the
 /// narrator must obey. Pure read of Rust-authoritative state (the schema lock
@@ -5958,13 +6588,21 @@ async fn fable_send(
     state: tauri::State<'_, AppState>,
     app: tauri::AppHandle,
     regenerate: Option<bool>,
+    #[allow(non_snake_case)]
+    // `reroll: Some(true)` (2026-07-29, swipeable variants): set by the
+    // frontend after a reroll. The last message is an assistant turn whose
+    // current content we want to KEEP as a swipeable sibling while generating
+    // a fresh variant. Distinct from `regenerate` (which assumes the mutation
+    // left a user tail): here the assistant message STAYS, stashed into
+    // variants, and we regenerate from the user turn BEFORE it.
+    reroll: Option<bool>,
 ) -> Result<(), String> {
-    tracing::info!(?text, regenerate, "fable_send");
-    // `regenerate: Some(true)` is set by the frontend after a reroll /
-    // rewind-and-edit mutation: the user turn to reply to is already the
-    // last message in `fable_session` (the mutation commands left it
-    // there), so we SKIP pushing a fresh user message and generate from
-    // the existing tail. The window slice below picks it up unchanged.
+    tracing::info!(?text, regenerate, reroll, "fable_send");
+    // `regenerate: Some(true)` is set by the frontend after a rewind-and-edit
+    // mutation: the user turn to reply to is already the last message in
+    // `fable_session` (the mutation command left it there), so we SKIP pushing
+    // a fresh user message and generate from the existing tail. The window
+    // slice below picks it up unchanged.
 
     // TOOL EXCLUSION GUARD (v0.8): the narrator path NEVER gets tools. This is
     // enforced structurally — fable_send dispatches to the FableEngine (a
@@ -6421,14 +7059,43 @@ async fn fable_send(
     let source = *state.model_source.lock().expect("model_source mutex");
     let fable_visible_window = if source == api::ModelSource::Api { 12 } else { 8 };
     let regenerate = regenerate.unwrap_or(false);
+    let reroll = reroll.unwrap_or(false);
     {
         let mut gs = state.fable_session.lock().await;
-        if regenerate {
+        if reroll {
+            // Reroll path (swipeable variants, 2026-07-29): the last message is
+            // an assistant turn. Stash its current content/raw into variants so
+            // the old prose survives as a swipeable sibling, then we generate a
+            // fresh variant from the user turn BEFORE it. We do NOT pop the
+            // assistant message — it stays, now with empty content, and the
+            // window slice below excludes it (last message dropped) so the
+            // model sees only up to the preceding user turn.
+            let last_is_assistant = gs
+                .messages
+                .last()
+                .map(|m| m.role == session::Role::Assistant)
+                .unwrap_or(false);
+            if !last_is_assistant {
+                return Err(
+                    "fable_send: reroll=true but the last message is not an assistant turn".into(),
+                );
+            }
+            if let Some(m) = gs.messages.last_mut() {
+                // Move current content/raw into variants, leave content empty
+                // (the new generation fills it via push_variant below at line
+                // ~7555). active_idx advances to the new tail.
+                let old_content = std::mem::take(&mut m.content);
+                let old_raw = std::mem::take(&mut m.raw_output);
+                m.variants.push(old_content);
+                m.raw_outputs.push(old_raw);
+                // active_idx will be set to variants.len() (= new index) by
+                // push_variant when the new content is installed.
+            }
+        } else if regenerate {
             // Re-generation path: the user turn to reply to is already the
-            // last message (a mutation command — reroll_last_turn or
-            // rewind_and_edit_user — left it there). Bail if the contract
-            // is violated so we don't generate from a stale or assistant
-            // tail silently.
+            // last message (a mutation command — rewind_and_edit_user — left
+            // it there). Bail if the contract is violated so we don't generate
+            // from a stale or assistant tail silently.
             if !gs.last_message_is_user() {
                 return Err(
                     "fable_send: regenerate=true but the last message is not a user turn".into(),
@@ -6449,8 +7116,17 @@ async fn fable_send(
     let window: Vec<session::Message> = {
         let gs = state.fable_session.lock().await;
         let msgs = &gs.messages;
-        let start = msgs.len().saturating_sub(fable_visible_window);
-        msgs[start..].to_vec()
+        // Reroll: the trailing assistant message has empty content (stashed into
+        // variants above). Exclude it from the prompt window so the model
+        // regenerates from the preceding user turn, not from an empty assistant
+        // turn. We slice to `len - 1` in that case.
+        let end = if reroll && msgs.last().map(|m| m.role == session::Role::Assistant).unwrap_or(false) {
+            msgs.len().saturating_sub(1)
+        } else {
+            msgs.len()
+        };
+        let start = end.saturating_sub(fable_visible_window);
+        msgs[start..end].to_vec()
     };
 
     // Streaming callback wraps the Channel send.
@@ -6482,14 +7158,22 @@ async fn fable_send(
     // voice actor (dresses mechanics in prose). On any API error, the fallback
     // runs a LOCAL narration using the prose-only narrator prompt (NOT the
     // tracker prompt) so a failed API doesn't dump raw brackets in the user's
-    // face. The LOCAL-only path (no API configured) is unchanged: one model
-    // does the full job — narration + brackets — via the Tracker prompt.
+    // face.
+    //
+    // Prong 1 (2026-07-29): the LOCAL-only path (no API configured) is now
+    // ALSO two-pass, but narrator-FIRST (the LOCAL 12B does both jobs in
+    // sequence since there's no API voice model). Pass 1 = narrator (universal
+    // prose-only prompt, streams live); the engine clears KV; Pass 2 = tracker
+    // (hidden, deterministic sampler, emits brackets from the narrator's prose).
+    // The narrator prompt is now the SAME universal prose-only builder in BOTH
+    // modes (build_api_narrator_system_prompt), so a LOCAL narrator turn and an
+    // API narrator turn behave identically.
     //
     // The reply shape ({ content, raw }) is normalized to FableReply
     // ({ raw_output, error, cancelled }) so the downstream bracket-parsing +
-    // archival path is identical for both. In API mode the API emits no
-    // brackets, so the final bracket parse is a no-op for state (the tracker
-    // already applied them) but still cleans/strips the prose.
+    // archival path is identical for both. In BOTH modes the narrator emits no
+    // brackets (the tracker does), so the final bracket parse is a no-op for
+    // state (the tracker already applied them) but still cleans/strips the prose.
     let reply: fable_engine::FableReply = if source == api::ModelSource::Api {
         // ---- Stage 1: TRACKER (local 12B, hidden) ----
         // The tracker gets the SAME Tracker prompt LOCAL mode uses
@@ -6727,15 +7411,182 @@ async fn fable_send(
             }
         }
     } else {
-        // Local-only path (the default): render the prompt + run the FableEngine.
-        let prompt = build_narrator_prompt(&system_prompt, &window);
-        let reply_rx = engine
-            .request_turn(prompt, on_chunk.clone(), cancel.clone(), false)
-            .map_err(|e| format!("{e:#}"))?;
-        tokio::task::spawn_blocking(move || reply_rx.recv())
-            .await
-            .map_err(|e| format!("game reply join: {e}"))?
-            .map_err(|e| format!("game reply channel: {e}"))?
+        // ─────────────────────────────────────────────────────────────────
+        // LOCAL two-pass flow (Prong 1, 2026-07-29). The LOCAL 12B does BOTH
+        // jobs in sequence because there is no separate API voice model:
+        //
+        //   Pass 1 — NARRATOR: the universal prose-only prompt
+        //   (build_api_narrator_system_prompt — identical to the API narrator,
+        //   so LOCAL + API narrate the same way). Streams live to the user.
+        //   Emits NO brackets (the prose-only contract).
+        //
+        //   Pass 2 — TRACKER: runs SECOND on a FRESH KV (the engine's per-turn
+        //   clear_kv_cache at fable_engine.rs:496 wipes Pass 1's attention
+        //   weights, so the tracker sees ONLY its own bracket-tracker prompt +
+        //   a stateless [Scene]/[Player action]/[Narrator prose] extraction
+        //   block). Its prose is HIDDEN (noop on_chunk); only its brackets are
+        //   applied via the existing apply_phase3_bracket_commands +
+        //   apply_time_command_and_maybe_tick pipeline. The tracker sampler is
+        //   the deterministic profile (tracker_mode=true: temp 0.2, top_p 0.9,
+        //   DRY allowed_length=1) per §11.43.B.
+        //
+        // Why narrator-first (opposite of the API split): the API split runs
+        // the tracker FIRST because the tracker is the silent local agent and
+        // the API is the voice — the API narrator needs the tracker's brackets
+        // applied BEFORE it narrates. Under LOCAL-only the SAME model does
+        // both, so it must narrate FIRST (the tracker needs the narrator's
+        // prose to extract brackets FROM — the §11.38/§11.43.B Finding A fix:
+        // the local narrator reliably writes prose but unreliably emits the
+        // Phase 4 brackets in the same pass; separating the two jobs lets each
+        // pass focus on one thing). The clear-KV between passes is the zero-
+        // contamination guarantee — co-resident prompts would cross-attend
+        // (the narrator's "never emit brackets" would suppress the tracker).
+        //
+        // The user-visible reply is the NARRATOR's. The shared post-gen block
+        // below (bracket parse + apply) sees the narrator's (bracket-free)
+        // output, so its apply calls are no-ops in LOCAL mode now (the tracker
+        // already applied everything) — symmetric with the API-mode no-op.
+        // ─────────────────────────────────────────────────────────────────
+
+        // ── Pass 1: NARRATOR (streams live via real on_chunk) ──
+        let narrator_system_prompt = narrator_prompt::build_api_narrator_system_prompt(
+            &card,
+            world_state.as_deref(),
+            pacing,
+            director_directive.as_deref(),
+            memory_block.as_deref(),
+        );
+        let narrator_prompt = build_narrator_prompt(&narrator_system_prompt, &window);
+        tracing::info!("fable_send: LOCAL mode — narrator pass (pass 1) starting");
+        let narrator_reply: fable_engine::FableReply = {
+            let reply_rx = engine
+                .request_turn(narrator_prompt, on_chunk.clone(), cancel.clone(), false)
+                .map_err(|e| format!("{e:#}"))?;
+            tokio::task::spawn_blocking(move || reply_rx.recv())
+                .await
+                .map_err(|e| format!("game reply join: {e}"))?
+                .map_err(|e| format!("game reply channel: {e}"))?
+        };
+
+        // Short-circuit on narrator failure: if Pass 1 errored, return it
+        // immediately — no point running the tracker on an empty narrator
+        // output (and the post-gen block below surfaces the error to the UI).
+        if !narrator_reply.error.is_empty() {
+            narrator_reply
+        } else {
+            // Extract the narrator's prose for the tracker's extraction block.
+            // The narrator is prose-only, so commands is ~always empty — but
+            // parse it anyway: if the model slipped a bracket through, apply
+            // it now so schema stays consistent before the tracker runs.
+            let cleaned_narrator = schema::extract_reply_channel(&narrator_reply.raw_output);
+            let narrator_parsed = bracket_parser::parse(&cleaned_narrator);
+            if !narrator_parsed.commands.is_empty() {
+                tracing::info!(
+                    cmd_count = narrator_parsed.commands.len(),
+                    "fable_send: LOCAL narrator (prose-only prompt) emitted brackets; applying pre-tracker"
+                );
+                let _ = apply_phase3_bracket_commands(&narrator_parsed, &state).await;
+            }
+            let narrator_prose = stream_filter::truncate_repetition(&narrator_parsed.prose);
+
+            // ── Pass 2: TRACKER (hidden, fresh KV) ──
+            // The tracker gets the full bracket-tracker system prompt
+            // (build_narrator_system_prompt — the Tracker prompt with
+            // BRACKET_PROTOCOL) + the PRE-tracker world_state (the same state
+            // the narrator saw — we do NOT re-render after the narrator,
+            // because the narrator's own brackets, if any, are minor and the
+            // tracker's job is to decide the major mechanical changes from the
+            // prose). NO director_directive (that steers prose; the tracker
+            // owns mechanics, not prose). The narrator's just-written prose is
+            // passed in the stateless extraction block.
+            let tracker_system_prompt = narrator_prompt::build_narrator_system_prompt(
+                &card,
+                world_state.as_deref(),
+                pacing,
+                None,
+                memory_block.as_deref(),
+            );
+            let tracker_prompt =
+                build_tracker_extraction_prompt(&tracker_system_prompt, &text, &narrator_prose);
+            let noop_chunk: llm::ChunkFn = Arc::new(|_: &str| {});
+            tracing::info!("fable_send: LOCAL mode — tracker pass (pass 2) starting");
+            let tracker_reply_opt: Option<fable_engine::FableReply> = match engine
+                .request_turn(tracker_prompt, noop_chunk.clone(), cancel.clone(), true)
+            {
+                Ok(reply_rx) => {
+                    match tokio::task::spawn_blocking(move || reply_rx.recv()).await {
+                        Ok(Ok(r)) => Some(r),
+                        Ok(Err(e)) => {
+                            tracing::warn!(error = %e, "fable_send: LOCAL tracker channel recv failed; skipping tracker pass");
+                            None
+                        }
+                        Err(e) => {
+                            tracing::warn!(error = %e, "fable_send: LOCAL tracker join failed; skipping tracker pass");
+                            None
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(error = %format!("{e:#}"), "fable_send: LOCAL tracker request_turn failed; skipping tracker pass");
+                    None
+                }
+            };
+
+            // Apply the tracker's brackets (mirrors the API tracker block at
+            // 6556-6620). The tracker's prose is discarded — we keep only
+            // parsed.commands. Reject directives are dropped (no live
+            // recipient; the narrator already streamed — same contract as the
+            // historical LOCAL comment below at 6861-6869).
+            if let Some(tracker_reply) = &tracker_reply_opt {
+                if tracker_reply.error.is_empty() {
+                    let cleaned_tracker =
+                        schema::extract_reply_channel(&tracker_reply.raw_output);
+                    let tracker_parsed = bracket_parser::parse(&cleaned_tracker);
+                    if !tracker_parsed.commands.is_empty() {
+                        tracing::info!(
+                            cmd_count = tracker_parsed.commands.len(),
+                            "fable_send: LOCAL tracker emitted bracket commands; applying"
+                        );
+                        // Emit the tracker's SCHEMA-TRACKING scene_events to
+                        // the frontend (Time/Effect/Milestone/Task/Weather/
+                        // Travel/Rumor — state changes the UI surfaces as
+                        // notifications). DROP the UI-EFFECT-ONLY commands
+                        // (CharacterTurn/Object/Fx) per §11.43.A: the LOCAL
+                        // narrator (now prose-only, same as API) produces
+                        // better NPC dialogue + scene description in prose, so
+                        // emitting the tracker's would duplicate or leak the
+                        // local 12B's malformed bracket arguments. The
+                        // apply_phase3 helpers still run on ALL commands below
+                        // — only the frontend notification is gated.
+                        for cmd in &tracker_parsed.commands {
+                            let is_ui_only = matches!(
+                                cmd,
+                                bracket_parser::BracketCommand::CharacterTurn { .. }
+                                    | bracket_parser::BracketCommand::Object { .. }
+                                    | bracket_parser::BracketCommand::Fx { .. }
+                            );
+                            if is_ui_only {
+                                continue;
+                            }
+                            on_event
+                                .send(serde_json::json!({
+                                    "type": "scene_event",
+                                    "command": cmd,
+                                    "source": "tracker",
+                                }))
+                                .map_err(|e| e.to_string())?;
+                        }
+                        // Apply brackets + capture rejects (rejects dropped —
+                        // the narrator already streamed, no live recipient).
+                        let _ = apply_phase3_bracket_commands(&tracker_parsed, &state).await;
+                        apply_time_command_and_maybe_tick(&tracker_parsed, &state).await;
+                    }
+                }
+            }
+
+            // Return the NARRATOR reply — the user sees the narrator's prose.
+            narrator_reply
+        }
     };
 
     // Clear the cancel slot now that the turn is done.
@@ -6809,21 +7660,28 @@ async fn fable_send(
     // milestones when it fires (parallel ordering to the [TIME] consume).
     //
     // Component 3 (2026-07-28): the return tuple's reject directives (e.g.
-    // "[TRAVEL] rejected — non-adjacent") are intentionally DROPPED here in
-    // local mode. The local narrator has already streamed its prose by this
-    // point, so a reject directive has no live recipient — and pushing it to
-    // turn_directives would leak a stale directive ("the move was rejected")
-    // into the NEXT turn's prompt, which is confusing. The `tracing::warn!`
-    // inside the apply helper captures the rejection for forensics. In API
-    // mode (the tracker-stage caller above), the reject directives DO merge
-    // into turn_directives because the API narrator hasn't run yet.
+    // "[TRAVEL] rejected — non-adjacent") are DROPPED here. In LOCAL mode the
+    // tracker (Prong 1, 2026-07-29) already dropped its own rejects inside the
+    // two-pass block above (the narrator already streamed — no live recipient;
+    // pushing a reject would leak a stale directive into the NEXT turn's
+    // prompt). In API mode the tracker-stage caller above (6620) already
+    // merged rejects into turn_directives, so `parsed` here is the API
+    // narrator's bracket-free output → empty commands. Either way this shared
+    // site is a no-op for rejects; it remains the defensive apply site for any
+    // bracket the narrator might have slipped through despite the prose-only
+    // prompt. The `tracing::warn!` inside the apply helper captures rejections
+    // for forensics.
     let _ = apply_phase3_bracket_commands(&parsed, &state).await;
     apply_time_command_and_maybe_tick(&parsed, &state).await;
-    // §11.41: in API mode, the API narrator emits NO brackets — the tracker
-    // stage already applied them above. So `parsed.commands` is empty here and
-    // both apply_* calls are harmless no-ops. The scene_event loop above also
-    // emits nothing (the tracker's commands were already emitted with
-    // source:"tracker"). In LOCAL mode this is the single apply site as before.
+    // §11.41 + Prong 1 (2026-07-29): in BOTH API mode AND LOCAL mode the reply
+    // being parsed here is now the prose-only NARRATOR's output (the universal
+    // build_api_narrator_system_prompt contract). The narrator emits NO
+    // brackets — the tracker (API: stage 1 above; LOCAL: pass 2 above) already
+    // applied them + emitted its scene_events with source:"tracker". So
+    // `parsed.commands` is empty here and both apply_* calls are harmless
+    // no-ops in BOTH modes. The scene_event loop above also emits nothing.
+    // (Pre-Prong-1 LOCAL mode used the bracket-emitting tracker prompt as the
+    // single narrator pass; this shared site was its apply path then.)
 
     // Archive both turns to the card-scoped memory. Best-effort, detached,
     // same pattern as chat_send's pillar-2 archive.
@@ -6856,7 +7714,18 @@ async fn fable_send(
     // narrator turns (the bracket parser doesn't extract a thought channel).
     {
         let mut gs = state.fable_session.lock().await;
-        gs.add_assistant_turn(parsed.prose.clone(), String::new(), reply.raw_output.clone());
+        if reroll {
+            // Swipeable-variant path (2026-07-29): the trailing assistant message
+            // already exists with its prior content stashed into `variants`.
+            // Install the freshly-generated prose as the NEW active variant via
+            // `push_variant` (old content is already a sibling from the stash
+            // above; this sets content=new + active_idx=tail).
+            if let Some(m) = gs.messages.last_mut() {
+                m.push_variant(parsed.prose.clone(), reply.raw_output.clone());
+            }
+        } else {
+            gs.add_assistant_turn(parsed.prose.clone(), String::new(), reply.raw_output.clone());
+        }
     }
 
     // Auto-save (best-effort, fire-and-forget). Every narrator turn writes
@@ -6918,6 +7787,75 @@ async fn fable_send(
             "cancelled": reply.cancelled,
         }))
         .map_err(|e| e.to_string())?;
+
+    // Phase 5B (2026-07-29): spawn the SD scene-image swap OFF the turn's hot
+    // path. The orchestrator runs the full LLM⇄SD⇄LLM cycle (evict LLM →
+    // unload weights → SD gen → reload weights) so it MUST be detached — it
+    // takes seconds, but the `done` emit above already returned the turn's
+    // prose to the user, so the swap hides behind the user reading the
+    // narration. The image event arrives later via an app-wide emit (NOT the
+    // per-turn Channel above, which is closed by the time the swap finishes).
+    //
+    // Gates (in order): the master opt-in `sd_autogen_enabled` (default OFF —
+    // shipping builds never swap), then the orchestrator's own internal gates
+    // (the one-strike latch `sd_autogen_disabled` + the SD model path). A
+    // Skipped/Cancelled outcome emits nothing (normal); a Generated emits
+    // `fable-scene-image` (frontend swaps the backdrop); a Failed emits
+    // `fable-scene-failed` (frontend surfaces a toast — the one-strike latch
+    // is already tripped Rust-side by the orchestrator).
+    if state.sd_autogen_enabled.load(std::sync::atomic::Ordering::Relaxed) {
+        let context_swap = state.context_swap.clone();
+        let sd_engine_slot = state.sd_engine.clone();
+        let sd_model_path = state
+            .pending_sd_model_path
+            .lock()
+            .expect("pending_sd_model_path mutex")
+            .clone();
+        let sd_autogen_disabled = state.sd_autogen_disabled.clone();
+        let active_sd_cancel = state.active_sd_cancel.clone();
+        let schema_arc = state.fable_schema.clone();
+        let llm_model_path = state.pending_model_path.clone();
+        let dest_path = scene_background_path(&app);
+        let app_handle = app.clone();
+        tokio::spawn(async move {
+            run_sd_swap_from_arcs(
+                context_swap,
+                sd_engine_slot,
+                sd_model_path,
+                sd_autogen_disabled,
+                active_sd_cancel,
+                schema_arc,
+                llm_model_path,
+                dest_path,
+                Box::new(move |outcome| {
+                    match outcome {
+                        scene_art::SwapOutcome::Generated(result) => {
+                            tracing::info!(
+                                dest = %result.dest.display(),
+                                "scene-image: generated — emitting fable-scene-image"
+                            );
+                            let _ = app_handle.emit(
+                                "fable-scene-image",
+                                serde_json::json!({ "path": result.dest.to_string_lossy() }),
+                            );
+                        }
+                        scene_art::SwapOutcome::Skipped | scene_art::SwapOutcome::Cancelled => {
+                            // Silent — the normal case (dormant / user navigated away).
+                        }
+                        scene_art::SwapOutcome::Failed(err) => {
+                            tracing::warn!(error = %err, "scene-image: generation failed — auto-gen now latched off");
+                            let _ = app_handle.emit(
+                                "fable-scene-failed",
+                                serde_json::json!({ "message": err.to_string() }),
+                            );
+                        }
+                    }
+                }),
+            )
+            .await;
+        });
+    }
+
     Ok(())
 }
 
@@ -7409,16 +8347,27 @@ const INTERVIEW_CARD_ID: &str = "__interview__";
 struct InterviewDraftSnapshot {
     name: Option<String>,
     core_persona: Option<String>,
+    /// Physical description (import 2026-07-29, Gemini ruling #2: never drop).
+    appearance: Option<String>,
     traits: Vec<String>,
     setting: Option<String>,
     tone: Option<String>,
     opening_scene: Option<String>,
+    /// Alternate opening greetings (imported `alternate_greetings`; the
+    /// swipeable-variant intro extras). Empty for authored-from-scratch cards.
+    introductions: Vec<String>,
     player_name: Option<String>,
     start_npc_ids: Vec<String>,
     declared_activities: Vec<String>,
     world_summary: Option<String>,
     world_entities: std::collections::BTreeMap<String, String>,
     start_node: Option<String>,
+    /// Phase 4 Component 3: authored travel-graph locations (the Scribe's
+    /// `set_locations` output). Carried for forward-compat + the ScribeFact
+    /// diff so the frontend preview can surface a "locations updated" hint.
+    /// The frontend doesn't render the graph yet (the card is correct
+    /// regardless); this field just makes the data available.
+    locations: Vec<interview_draft::DraftNode>,
     player_background: Option<String>,
     starting_condition: Option<String>,
     last_updated_turn: usize,
@@ -7431,16 +8380,19 @@ impl InterviewDraftSnapshot {
         Self {
             name: d.name.clone(),
             core_persona: d.core_persona.clone(),
+            appearance: d.appearance.clone(),
             traits: d.traits.clone(),
             setting: d.setting.clone(),
             tone: d.tone.clone(),
             opening_scene: d.opening_scene.clone(),
+            introductions: d.introductions.clone(),
             player_name: d.player_name.clone(),
             start_npc_ids: d.start_npc_ids.clone(),
             declared_activities: d.declared_activities.clone(),
             world_summary: d.world_summary.clone(),
             world_entities: d.world_entities.clone(),
             start_node: d.start_node.clone(),
+            locations: d.locations.clone(),
             player_background: d.player_background.clone(),
             starting_condition: d.starting_condition.clone(),
             last_updated_turn: d.last_updated_turn,
@@ -7530,19 +8482,19 @@ async fn interview_send(
         s.add_message(session::Role::User, text.clone());
     }
 
-    // 3. Build the GM system prompt: persona (gm.sim) + fable.codex playbook +
+    // 3. Build the GM system prompt: persona (fable.sim) + fable.codex playbook +
     //    current draft state summary.
     //    Persona: mirror chat_send's fable_persona swap. During an interview
     //    there is no seated Fable card (the .sim is produced at finalize), so
-    //    we read gm.sim fresh via the resolver + load_or_fallback. The
+    //    we read fable.sim fresh via the resolver + load_or_fallback. The
     //    fable_persona slot is None until finalize seats a card, so we don't
     //    consult it here (the drawer's chat_send does — different code path).
-    let persona = resolve_gm_sim_path(&app)
+    let persona = resolve_fable_sim_path(&app)
         .map(|p| sim_card::load_or_fallback(&p))
         .filter(|c| c.id != "__wupi_fallback__")
         .map(|c| c.render_for_prompt());
     if persona.is_none() {
-        tracing::info!("interview_send: no gm.sim found — GM runs persona-bare");
+        tracing::info!("interview_send: no fable.sim found — GM runs persona-bare");
     }
 
     // fable.codex playbook retrieval (best-effort, mirror chat_send's retrieval
@@ -8073,7 +9025,12 @@ async fn run_scribe_pass(
             return Ok(None);
         };
 
-        let calls = tools::parse_tool_calls(&result.raw);
+        // The greedy extractor (Gemini Option 3): primary WUPI-tag path +
+        // EOF salvage (truncated closers) + fenced/bare-JSON fallback scoped
+        // to sim_draft (the markdown-fence-bleed failure). The shared chat
+        // agent loop keeps using parse_tool_calls (general-safe); only the
+        // Scribe uses the greedy fallback since sim_draft is its only tool.
+        let calls = tools::parse_scribe_calls(&result.raw);
         if calls.is_empty() {
             break;
         }
@@ -8233,6 +9190,23 @@ impl ScribeFactDiff {
                     action: "set",
                 });
             }
+        }
+        // Locations: SetLocations is an idempotent whole-graph overwrite, so
+        // any difference (node set changed, ordering changed, or a node's
+        // fields changed) surfaces as ONE "set" fact carrying the new node-id
+        // list. Mirrors the whole-graph contract — no per-node diff churn.
+        if after.locations != before.locations {
+            let ids = after
+                .locations
+                .iter()
+                .map(|n| n.id.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            facts.push(ScribeFact {
+                field: "locations".to_string(),
+                value: ids,
+                action: "set",
+            });
         }
 
         Self { facts }
@@ -8491,6 +9465,402 @@ async fn interview_draft_state(
     let g = state.interview_draft.lock().expect("interview_draft mutex");
     Ok(g.as_ref().map(InterviewDraftSnapshot::from_draft))
 }
+
+// ===========================================================================
+// Card import — the "Create vs Import" New Game flow (Slice B, 2026-07-29).
+//
+// When the player drops a card file (PNG with embedded JSON, or a plain JSON
+// character card / lorebook), the frontend sends the file contents here. Rust
+// parses the deterministic structure (`card_import`) + asks the model to
+// rebuild the prose fields into clean WUPI-native text (the fidelity-biased
+// decipher pass). The rebuilt fields seed `interview_draft` so the UNCHANGED
+// refinement loop takes over: the player chats adjustments, the Scribe applies
+// `sim_draft` edits, the preview updates live, and the UNCHANGED
+// `interview_finalize` writes the `.sim`.
+//
+// API-first (GLM-5.2) + seamless local fallback (the resident 12B) — mirrors
+// `generate_interview_opening`. Lorebook entries (if present) split + land in
+// `data/docs/*.md` codex files (the hybrid memory engine), dropping the legacy
+// keyword/trigger%/position/strategy machinery (obsolete under RAG retrieval).
+// Validation gate: before "done", the seeded draft must produce XML that re-
+// parses via `sim_card::parse_from_xml_str` — malformed → error, never corrupt.
+// ===========================================================================
+
+/// The frontend sends an absolute filesystem path (obtained from either the
+/// drag-drop event payload or the folder-picker dialog). Rust reads the file
+/// server-side — this keeps large PNG bytes off the IPC channel boundary and
+/// lets Rust sniff the format by signature (PNG vs JSON) uniformly. The path
+/// is NOT sandboxed to the install: an imported card lives anywhere on the
+/// user's disk (their SillyTavern folder, Downloads, etc.). This is a
+/// read-only, user-initiated action (no write, no denylist concern).
+#[tauri::command]
+async fn import_decipher_card(
+    path: String,
+    on_event: tauri::ipc::Channel<serde_json::Value>,
+    state: tauri::State<'_, AppState>,
+    app: tauri::AppHandle,
+) -> Result<(), String> {
+    // --- Phase 1: read the file + deterministic Rust parse (structure only) ---
+    let parsed = {
+        let p = std::path::PathBuf::from(&path);
+        let bytes = tokio::task::spawn_blocking(move || std::fs::read(&p))
+            .await
+            .map_err(|e| format!("import: read join: {e}"))?
+            .map_err(|e| format!("import: could not read file '{path}': {e}"))?;
+        card_import::parse_import_bytes(&bytes)
+            .map_err(|e| format!("import: could not parse card file: {e}"))?
+    };
+
+    // If it's a lorebook, write the entries to codex now (no model pass needed
+    // — lorebooks are reference lore, not prose to rebuild) + return early.
+    if let card_import::ParsedImport::Lorebook(lb) = parsed {
+        write_lorebook_to_codex(&lb, &app, &state).await?;
+        let _ = on_event.send(serde_json::json!({
+            "type": "done",
+            "kind": "lorebook",
+            "entry_count": lb.entries.len(),
+        }));
+        return Ok(());
+    }
+
+    let raw = match parsed {
+        card_import::ParsedImport::Card(c) => c,
+        card_import::ParsedImport::Lorebook(_) => unreachable!("handled above"),
+    };
+
+    // --- Phase 2: the fidelity-biased AI rebuild pass (prose only) ---
+    let _ = on_event.send(serde_json::json!({ "type": "deciphering" }));
+    let rebuilt = match run_decipher_pass(&raw, &state).await {
+        Ok(r) => r,
+        Err(e) => {
+            let _ = on_event.send(serde_json::json!({
+                "type": "error",
+                "message": format!("Could not decipher the card: {e}"),
+            }));
+            return Err(e);
+        }
+    };
+
+    // --- Phase 3: seed the draft from the rebuilt fields ---
+    let draft = build_draft_from_decipher(&raw, &rebuilt);
+
+    // Validation gate: the seeded draft must produce XML that re-parses.
+    // (Mirrors `interview_finalize`'s contract — never write a corrupt card.)
+    if let Err(e) = draft.to_sim_card_xml() {
+        let msg = format!("import: deciphered card failed validation: {e}");
+        let _ = on_event.send(serde_json::json!({ "type": "error", "message": msg }));
+        return Err(msg);
+    }
+
+    {
+        let mut g = state.interview_draft.lock().expect("interview_draft mutex");
+        *g = Some(draft);
+    }
+
+    let snap = {
+        let g = state.interview_draft.lock().expect("interview_draft mutex");
+        g.as_ref().map(InterviewDraftSnapshot::from_draft)
+    };
+    let _ = on_event.send(serde_json::json!({
+        "type": "done",
+        "kind": "card",
+        "draft": snap,
+    }));
+    Ok(())
+}
+
+/// Run the decipher pass: API-first GLM-5.2, seamless local fallback. Returns
+/// the model's JSON object parsed into a `DecipheredFields` struct (missing
+/// keys = None / empty). Modeled on `generate_interview_opening`.
+async fn run_decipher_pass(
+    raw: &card_import::RawCard,
+    state: &tauri::State<'_, AppState>,
+) -> Result<DecipheredFields, String> {
+    let settings = state.settings.lock().expect("settings mutex").clone();
+    let source = *state.model_source.lock().expect("model_source mutex");
+    let system_prompt = decipher_prompt::build_decipher_system_prompt(raw);
+    let messages: Vec<session::ApiMessage> = vec![
+        session::ApiMessage {
+            role: "system".into(),
+            content: system_prompt,
+            raw_output: String::new(),
+        },
+        session::ApiMessage {
+            role: "user".into(),
+            content: "Rebuild the card. Emit the JSON object now.".into(),
+            raw_output: String::new(),
+        },
+    ];
+
+    let cancel: llm::CancelToken = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let silent_chunk: llm::ChunkFn = Arc::new(|_| {});
+
+    let raw_output = if source == api::ModelSource::Api {
+        let profile_opt = {
+            let cfg = state.api_config.lock().expect("api_config mutex");
+            cfg.active_profile().cloned()
+        };
+        let mut got: Option<String> = None;
+        if let Some(profile) = profile_opt {
+            let http = llm::HttpBackend::new(profile);
+            match http
+                .stream(
+                    messages.clone(),
+                    None,
+                    None,
+                    Vec::new(),
+                    settings.context_size,
+                    silent_chunk.clone(),
+                    cancel.clone(),
+                )
+                .await
+            {
+                Ok(parsed) => got = Some(parsed.content),
+                Err(e) => {
+                    let _ = on_fallback_note(state, format!("api_decipher_failed: {e}")).await;
+                }
+            }
+        }
+        // Local fallback if API was unavailable/errored.
+        if got.is_none() {
+            got = local_decipher(&messages, &settings.context_size, state, silent_chunk, cancel)
+                .await;
+        }
+        got
+    } else {
+        local_decipher(&messages, &settings.context_size, state, silent_chunk, cancel).await
+    };
+
+    let text = raw_output
+        .ok_or_else(|| "decipher: no model output (API unreachable + no local backend)".to_string())?;
+    parse_deciphered_json(&text)
+}
+
+/// Fire a local-only decipher against the resident 12B. Best-effort; None on
+/// any failure (caller surfaces the error).
+async fn local_decipher(
+    messages: &[session::ApiMessage],
+    context_size: &u32,
+    state: &tauri::State<'_, AppState>,
+    chunk: llm::ChunkFn,
+    cancel: llm::CancelToken,
+) -> Option<String> {
+    let backend_opt = state.backend.lock().expect("backend mutex").clone();
+    let backend = backend_opt?;
+    backend
+        .stream(
+            messages.to_vec(),
+            None,
+            None,
+            Vec::new(),
+            *context_size,
+            chunk,
+            cancel,
+        )
+        .await
+        .ok()
+        .map(|p| p.content)
+}
+
+/// No-op helper kept for symmetry with the fallback-event pattern (other
+/// generators emit a `fallback` event on the Channel; the decipher's Channel
+/// is owned by the caller, so we just log here).
+async fn on_fallback_note(_state: &tauri::State<'_, AppState>, reason: String) {
+    tracing::warn!(reason = %reason, "import_decipher_card: falling back to local");
+}
+
+/// The rebuilt fields the model returns. Every field optional (the model omits
+/// keys it has no source for). Used to seed `InterviewDraft`.
+#[derive(Debug, Default)]
+struct DecipheredFields {
+    name: Option<String>,
+    core_persona: Option<String>,
+    appearance: Option<String>,
+    traits: Vec<String>,
+    setting: Option<String>,
+    tone: Option<String>,
+    opening_scene: Option<String>,
+    introductions: Vec<String>,
+    player_background: Option<String>,
+}
+
+/// Parse the model's decipher output into `DecipheredFields`. 3-pass repair
+/// (raw → json_repair → lenient) per the schema-engine fail-proof contract.
+fn parse_deciphered_json(text: &str) -> Result<DecipheredFields, String> {
+    let val = serde_json::from_str::<serde_json::Value>(text)
+        .or_else(|_| {
+            let repaired = json_repair::repair(text);
+            serde_json::from_str::<serde_json::Value>(&repaired)
+        })
+        .map_err(|e| format!("decipher output is not valid JSON (even after repair): {e}"))?;
+    let obj = val
+        .as_object()
+        .ok_or_else(|| "decipher output is not a JSON object".to_string())?;
+    let s = |k: &str| {
+        obj.get(k)
+            .and_then(|v| v.as_str())
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+    };
+    let arr = |k: &str| -> Vec<String> {
+        obj.get(k)
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str())
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    Ok(DecipheredFields {
+        name: s("name"),
+        core_persona: s("core_persona"),
+        appearance: s("appearance"),
+        traits: arr("traits"),
+        setting: s("setting"),
+        tone: s("tone"),
+        opening_scene: s("opening_scene"),
+        introductions: arr("introductions"),
+        player_background: s("player_background"),
+    })
+}
+
+/// Build an `InterviewDraft` from the raw (mechanical) + deciphered (prose)
+/// fields. Mechanical fields come from `raw` (name); prose from `rebuilt`. The
+/// draft then feeds the unchanged refinement loop + `interview_finalize`.
+fn build_draft_from_decipher(
+    raw: &card_import::RawCard,
+    rebuilt: &DecipheredFields,
+) -> interview_draft::InterviewDraft {
+    let mut d = interview_draft::InterviewDraft::default();
+    d.name = rebuilt.name.clone().or_else(|| raw.name.clone());
+    d.core_persona = rebuilt.core_persona.clone();
+    d.appearance = rebuilt.appearance.clone();
+    d.traits = rebuilt.traits.clone();
+    d.setting = rebuilt.setting.clone();
+    d.tone = rebuilt.tone.clone();
+    d.opening_scene = rebuilt.opening_scene.clone();
+    d.introductions = rebuilt.introductions.clone();
+    d.player_background = rebuilt.player_background.clone();
+    d
+}
+
+/// Write a lorebook's entries to `data/docs/*.md` codex files, splitting any
+/// entry >1400 chars into multiple files (the bge-small embedding budget).
+/// Sets `codex_dirty` so the next chat turn re-seeds `__codex__` (same pattern
+/// as the `codex_create` tool). Drops legacy keyword/trigger%/position/strategy
+/// fields — WUPI's hybrid retrieval replaces all of it.
+async fn write_lorebook_to_codex(
+    lb: &card_import::RawLorebook,
+    app: &tauri::AppHandle,
+    state: &tauri::State<'_, AppState>,
+) -> Result<(), String> {
+    let dir = resolve_codex_dir(app)
+        .ok_or_else(|| "import: no codex dir resolved (cannot write lorebook)".to_string())?;
+    let stem_prefix = lb
+        .name
+        .as_deref()
+        .map(|n| codex::sanitize_stem(n))
+        .unwrap_or_default()
+        .unwrap_or_else(|| "lore".to_string());
+
+    let mut written = 0usize;
+    for (i, entry) in lb.entries.iter().enumerate() {
+        // Chunk long content into ≤1400-char pieces (one .md file each) so
+        // bge-small embeddings stay meaningful (the truncation-at-512-tokens
+        // cliff). Each chunk becomes its own codex entry with a (part N) suffix
+        // when split.
+        for (chunk_idx, chunk) in chunk_lorebook_content(&entry.content, 1400)
+            .into_iter()
+            .enumerate()
+        {
+            let title = if chunk_idx == 0 {
+                entry.title.clone()
+            } else {
+                format!("{} (part {})", entry.title, chunk_idx + 1)
+            };
+            let filename = format!("{}-{:03}-{}", stem_prefix, i, chunk_idx);
+            // sanitize_stem is idempotent on an already-clean stem; wrap the
+            // filename to guarantee it's filesystem-safe.
+            let safe = codex::sanitize_stem(&filename)
+                .unwrap_or_else(|| format!("{}-{}", stem_prefix, i));
+            let dir_clone = dir.clone();
+            let title_clone = title.clone();
+            let tags = entry.tags.clone();
+            let chunk_clone = chunk.clone();
+            let res = tokio::task::spawn_blocking(move || {
+                codex::save_file(&dir_clone, &safe, &title_clone, &tags, &chunk_clone)
+            })
+            .await
+            .map_err(|e| format!("lorebook write join: {e}"))?
+            .map_err(|e| format!("lorebook write: {e}"));
+            res?;
+            written += 1;
+        }
+    }
+    // Flag the codex as dirty so the next chat turn re-seeds __codex__.
+    state
+        .codex_dirty
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    tracing::info!(entries = lb.entries.len(), written, "import: lorebook written to codex");
+    Ok(())
+}
+
+/// Split `content` into chunks of at most `cap` chars, breaking on paragraph
+/// or sentence boundaries where possible (fall back to hard char cuts). Always
+/// returns at least one chunk for non-empty input.
+fn chunk_lorebook_content(content: &str, cap: usize) -> Vec<String> {
+    let trimmed = content.trim();
+    if trimmed.is_empty() {
+        return Vec::new();
+    }
+    if trimmed.chars().count() <= cap {
+        return vec![trimmed.to_string()];
+    }
+    let mut chunks = Vec::new();
+    let mut buf = String::new();
+    let mut buf_len = 0usize;
+    // Split on paragraph breaks first, then sentences, accumulating into the
+    // buffer until adding the next piece would exceed the cap.
+    for para in trimmed.split("\n\n") {
+        let para_len = para.chars().count();
+        if buf_len + para_len + 2 > cap && !buf.is_empty() {
+            chunks.push(std::mem::take(&mut buf).trim().to_string());
+            buf_len = 0;
+        }
+        if para_len > cap {
+            // Single paragraph longer than the cap: hard-split on sentence
+            // boundaries, then on char count.
+            for sent in para.split_inclusive(['.', '!', '?']) {
+                let sent_len = sent.chars().count();
+                if buf_len + sent_len > cap && !buf.is_empty() {
+                    chunks.push(std::mem::take(&mut buf).trim().to_string());
+                    buf_len = 0;
+                }
+                buf.push_str(sent);
+                buf_len += sent_len;
+            }
+        } else {
+            if !buf.is_empty() {
+                buf.push_str("\n\n");
+                buf_len += 2;
+            }
+            buf.push_str(para);
+            buf_len += para_len;
+        }
+    }
+    if !buf.trim().is_empty() {
+        chunks.push(buf.trim().to_string());
+    }
+    if chunks.is_empty() {
+        vec![trimmed.to_string()]
+    } else {
+        chunks
+    }
+}
+
 
 // ===========================================================================
 // Crossroads — "Choose a Director" option generator (§11.24, 2026-07-27).
@@ -8983,6 +10353,39 @@ async fn fable_director_clear(state: tauri::State<'_, AppState>) -> Result<(), S
 async fn fable_director_peek(state: tauri::State<'_, AppState>) -> Result<Option<String>, String> {
     let g = state.pending_directive.lock().await;
     Ok(g.clone())
+}
+
+/// Phase 5B (2026-07-29): toggle the master opt-in for per-turn scene-image
+/// generation. Default OFF — the SD swap wiring ships dormant so a shipping
+/// build never evicts/reloads the LLM. The consolidated CDP playtest flips
+/// this on; a future toggle surfaces it to the UI. Independent of the
+/// one-strike latch `sd_autogen_disabled` (set automatically on a runtime
+/// failure); this is the user-facing master switch.
+#[tauri::command]
+async fn fable_set_sd_autogen(
+    enabled: bool,
+    state: tauri::State<'_, AppState>,
+) -> Result<(), String> {
+    state
+        .sd_autogen_enabled
+        .store(enabled, std::sync::atomic::Ordering::Relaxed);
+    tracing::info!(enabled, "sd_autogen_enabled toggled");
+    Ok(())
+}
+
+/// Phase 5B: read the effective scene-image state for the UI (whether gen is
+/// possible at all: enabled AND not latched off). Returns a small struct so
+/// a future toggle can render "on / disabled-after-failure / off".
+#[tauri::command]
+async fn fable_sd_autogen_state(state: tauri::State<'_, AppState>) -> Result<serde_json::Value, String> {
+    use std::sync::atomic::Ordering;
+    Ok(serde_json::json!({
+        "enabled": state.sd_autogen_enabled.load(Ordering::Relaxed),
+        // `disabled` is the one-strike failure latch (true = a generation
+        // OOM'd/errored + auto-gen is now hard-off until a user ack).
+        "disabled": state.sd_autogen_disabled.load(Ordering::Relaxed),
+        "model_present": state.pending_sd_model_path.lock().expect("pending_sd_model_path mutex").is_some(),
+    }))
 }
 
 /// Parse the model's three-block output into a `(SimCard, WorldSchema,
@@ -9545,6 +10948,8 @@ async fn fable_load_save(
                 session::Role::System => "system",
             },
             content: m.content.clone(),
+            variants: m.variants.clone(),
+            active_idx: m.active_idx,
         })
         .collect();
     *state.fable_session.lock().await = save.session;
@@ -9576,10 +10981,20 @@ struct FableLoadResult {
 /// One loaded message, role as a lowercase string (matches `session::Role`'s
 /// `rename_all = "lowercase"` serialization but trimmed to just role+content
 /// so we don't leak `raw_output`/`reasoning`/`id`/`timestamp` to the UI).
+///
+/// `variants` + `active_idx` carry the swipeable-reroll state (2026-07-29) so
+/// the feed can render the `1/N` control + recover older variants on swipe.
+/// `variants` holds the INACTIVE siblings only (parallel to
+/// `session::Message::variants`); `content` is the active variant. Omitted from
+/// serialization when empty so legacy frontends/JSON stay clean.
 #[derive(Debug, Clone, serde::Serialize)]
 struct FableLoadMessage {
     role: &'static str,
     content: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    variants: Vec<String>,
+    #[serde(default)]
+    active_idx: usize,
 }
 
 /// Delete a save slot. Idempotent (Ok if the save is already gone).
@@ -9647,16 +11062,14 @@ fn apply_edit(conv: &mut session::Conversation, index: usize, new_text: String) 
     Ok(())
 }
 
-/// Pop the last message (the assistant turn being re-rolled). Returns `Err`
-/// if the last message isn't an assistant turn (can't reroll a user turn or
-/// an empty conversation). After this the last message is the user turn to
-/// regenerate from.
-fn apply_reroll(conv: &mut session::Conversation) -> Result<(), String> {
+/// Validate that the last message is an assistant turn (the reroll contract).
+/// The actual stashing of the old content into a swipeable variant now happens
+/// inside `fable_send` (the `reroll=true` path) so the generation + variant
+/// install happen atomically in one pass. Returns `Err` if there's nothing to
+/// reroll.
+fn apply_reroll(conv: &session::Conversation) -> Result<(), String> {
     match conv.messages.last() {
-        Some(m) if m.role == session::Role::Assistant => {
-            conv.pop_last_message();
-            Ok(())
-        }
+        Some(m) if m.role == session::Role::Assistant => Ok(()),
         Some(_) => Err("reroll_last_turn: last message is not an assistant turn".into()),
         None => Err("reroll_last_turn: conversation is empty".into()),
     }
@@ -9775,6 +11188,8 @@ fn project_messages(conv: &session::Conversation) -> Vec<FableLoadMessage> {
                 session::Role::System => "system",
             },
             content: m.content.clone(),
+            variants: m.variants.clone(),
+            active_idx: m.active_idx,
         })
         .collect()
 }
@@ -9839,12 +11254,16 @@ async fn edit_message(
     Ok(EditResponse { messages, schema_pop_count: 0 })
 }
 
-/// Regenerate the AI's last response. Pops the last (assistant) message so
-/// the user turn becomes the regeneration seed, persists, returns the new
-/// message list + schema_pop_count = 1 (the caller pops one schema
-/// snapshot to undo the bad turn's world-state mutation). The frontend
-/// then re-invokes `fable_send(text, { regenerate: true })` with the now-
-/// last user message's text.
+/// Validate that the last message is an assistant turn that can be re-rolled.
+/// With swipeable variants (2026-07-29), the reroll no longer POPS the
+/// assistant message — instead the old content is stashed as a swipeable
+/// sibling inside `fable_send` (the `reroll=true` path) so the player keeps
+/// every reroll. So this command is now a pure validation gate; the variant
+/// bookkeeping + fresh generation all happen in the subsequent
+/// `fable_send(text, { reroll: true })` call. Returns the current message
+/// list (unchanged) + schema_pop_count = 0 (a prose re-roll no longer undoes
+/// the turn's world-state mutation — the deterministic mechanics for the turn
+/// stand; only the prose varies across variants).
 #[tauri::command]
 async fn reroll_last_turn(
     state: tauri::State<'_, AppState>,
@@ -9852,12 +11271,48 @@ async fn reroll_last_turn(
 ) -> Result<EditResponse, String> {
     let card_id = active_fable_card_id(&state)?;
     let messages = {
+        let gs = state.fable_session.lock().await;
+        apply_reroll(&gs)?;
+        project_messages(&gs)
+    };
+    // No mutation here (no persist): the state is unchanged until fable_send's
+    // reroll path runs. Persisting now would write identical bytes.
+    let _ = card_id;
+    let _ = app;
+    Ok(EditResponse { messages, schema_pop_count: 0 })
+}
+
+/// Swipe to a different variant of an assistant message (the ‹ 1/N › UX,
+/// 2026-07-29). Swaps the active `content`/`raw_output` with the sibling at
+/// `variant_idx`, persists, returns the new message list + schema_pop_count
+/// = 0 (a swipe changes only which prose is displayed — it does NOT undo
+/// world state). Returns `Err` on a bad index or if the message has only one
+/// variant.
+#[tauri::command]
+async fn swipe_variant(
+    index: usize,
+    variant_idx: usize,
+    state: tauri::State<'_, AppState>,
+    app: tauri::AppHandle,
+) -> Result<EditResponse, String> {
+    let card_id = active_fable_card_id(&state)?;
+    let messages = {
         let mut gs = state.fable_session.lock().await;
-        apply_reroll(&mut gs)?;
+        let len = gs.messages.len();
+        let msg = gs.messages.get_mut(index).ok_or_else(|| {
+            format!("swipe_variant: index {index} out of bounds (len {len})")
+        })?;
+        if variant_idx >= msg.variant_count() {
+            return Err(format!(
+                "swipe_variant: variant_idx {variant_idx} out of range (count {})",
+                msg.variant_count()
+            ));
+        }
+        msg.select_variant(variant_idx);
         project_messages(&gs)
     };
     persist_fable_session(&app, &state, &card_id).await?;
-    Ok(EditResponse { messages, schema_pop_count: 1 })
+    Ok(EditResponse { messages, schema_pop_count: 0 })
 }
 
 /// Branch the timeline: edit a user message from N turns ago. Truncates the
@@ -10377,7 +11832,110 @@ mod tests {
         assert_eq!(effective_local_ctx(api::ModelSource::Api, &settings), 2048);
     }
 
-    /// Phase 3 guard: the narrator prompt builder (`build_narrator_prompt`)
+    // ── most_recent_continue_target (title CONTINUE resume target) ───────
+    // Pins the CONTINUE contract: resume the freshest save for any New Game
+    // world, autosaves included, Quick Play excluded. Builds real save files
+    // via fable_save::write_save / write_quick_save so the test exercises the
+    // same on-disk layout the command reads.
+    fn fake_card_for_continue(id: &str) -> sim_card::SimCard {
+        // Mirrors fable_save.rs's fake_card() (SimCard has no Default derive).
+        sim_card::SimCard {
+            id: id.into(),
+            name: id.into(),
+            card_type: "roleplay".into(),
+            core_persona: String::new(),
+            traits: String::new(),
+            appearance: String::new(),
+            role_instruction: String::new(),
+            responsibilities: String::new(),
+            conversational_rules: String::new(),
+            technical_rules: String::new(),
+            introductions: Vec::new(),
+            setting: Some("A test place.".into()),
+            tone: None,
+            opening_scene: None,
+            start_npc_ids: Vec::new(),
+            declared_activities: Vec::new(),
+            player_name: Some("Tester".into()),
+            locations: Vec::new(),
+            cast: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn continue_target_picks_most_recent_save_across_worlds() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Two New Game worlds, each with a save. The newer one (newer_world)
+        // should win regardless of which card it came from.
+        let older = fake_card_for_continue("older_world");
+        let newer = fake_card_for_continue("newer_world");
+        fable_save::write_save(
+            tmp.path(), &older, "save_a", "A",
+            &session::Conversation::new(), &schema::WorldSchema::default(),
+        ).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        fable_save::write_save(
+            tmp.path(), &newer, "save_b", "B",
+            &session::Conversation::new(), &schema::WorldSchema::default(),
+        ).unwrap();
+
+        let target = most_recent_continue_target(tmp.path()).expect("a target exists");
+        assert_eq!(target.card_id, "newer_world");
+        assert_eq!(target.save_id, "save_b");
+    }
+
+    #[test]
+    fn continue_target_includes_autosaves() {
+        // The freshest save is an autosave. CONTINUE must resume it (the per-
+        // turn checkpoint), not skip it for an older manual save.
+        let tmp = tempfile::tempdir().unwrap();
+        let card = fake_card_for_continue("world_with_auto");
+        fable_save::write_save(
+            tmp.path(), &card, "save_manual", "Manual",
+            &session::Conversation::new(), &schema::WorldSchema::default(),
+        ).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        fable_save::write_save(
+            tmp.path(), &card, fable_save::AUTOSAVE_ID, "Autosave",
+            &session::Conversation::new(), &schema::WorldSchema::default(),
+        ).unwrap();
+
+        let target = most_recent_continue_target(tmp.path()).expect("a target exists");
+        assert_eq!(target.save_id, fable_save::AUTOSAVE_ID);
+        assert!(target.is_autosave);
+    }
+
+    #[test]
+    fn continue_target_excludes_quick_play() {
+        // A Quick Play quicksave is NEWER than a New Game save. CONTINUE must
+        // skip it (Quick Play owns its own resume flow) + return the New Game
+        // save instead.
+        let tmp = tempfile::tempdir().unwrap();
+        let card = fake_card_for_continue("ng_world");
+        fable_save::write_save(
+            tmp.path(), &card, "save_ng", "NG",
+            &session::Conversation::new(), &schema::WorldSchema::default(),
+        ).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        // Quick Play quicksave under the reserved sentinel card_id.
+        let qp_card = fake_card_for_continue("ignored"); // id overridden by write_quick_save
+        fable_save::write_quick_save(
+            tmp.path(), &qp_card,
+            &session::Conversation::new(), &schema::WorldSchema::default(),
+        ).unwrap();
+
+        let target = most_recent_continue_target(tmp.path()).expect("a target exists");
+        assert_eq!(target.card_id, "ng_world");
+        assert_ne!(target.card_id, fable_save::QUICK_PLAY_CARD_ID);
+    }
+
+    #[test]
+    fn continue_target_none_when_no_saves() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(most_recent_continue_target(tmp.path()).is_none());
+    }
+
+
     /// NEVER includes tool declarations. The narrator is creative prose +
     /// bracket commands, never structured tool calls. This test pins the
     /// structural exclusion so a future refactor that accidentally routes
@@ -10433,6 +11991,7 @@ mod tests {
             start_npc_ids: Vec::new(),
             declared_activities: Vec::new(),
             locations: Vec::new(),
+            cast: Vec::new(),
         };
         let pacing = ScenePacing {
             mode: SceneMode::Exploration,
@@ -10824,16 +12383,19 @@ mod tests {
     }
 
     #[test]
-    fn apply_reroll_pops_only_when_last_is_assistant() {
-        let mut c = make_test_conversation();
-        // 6 messages, last is assistant ("door creaks shut").
+    fn apply_reroll_validates_last_is_assistant_without_mutating() {
+        // Swipeable-variant reroll (2026-07-29): apply_reroll is now a pure
+        // validation gate. It does NOT pop the message (the stashing happens
+        // in fable_send's reroll=true path so the old content survives as a
+        // swipeable sibling). The message count is unchanged.
+        let c = make_test_conversation();
         assert_eq!(c.messages.len(), 6);
-        apply_reroll(&mut c).unwrap();
-        assert_eq!(c.messages.len(), 5);
-        // Now the last is the user turn "I leave the room." — the seed
-        // the frontend will regenerate from.
-        assert_eq!(c.messages.last().unwrap().role, session::Role::User);
-        assert_eq!(c.messages.last().unwrap().content, "I leave the room.");
+        apply_reroll(&c).unwrap();
+        assert_eq!(c.messages.len(), 6, "apply_reroll no longer pops");
+        // The last message is still the assistant turn — fable_send rerolls
+        // it in place.
+        assert_eq!(c.messages.last().unwrap().role, session::Role::Assistant);
+        assert_eq!(c.messages.last().unwrap().content, "The door creaks shut.");
     }
 
     #[test]
@@ -10849,6 +12411,66 @@ mod tests {
         let mut c = session::Conversation::new();
         let err = apply_reroll(&mut c).unwrap_err();
         assert!(err.contains("empty"), "got: {err}");
+    }
+
+    // ---- swipe_variant (the ‹ 1/N › UX) ------------------------------------
+    // These test the apply logic the `swipe_variant` IPC uses (select_variant
+    // + bounds checks) without spinning up a full Tauri command harness —
+    // mirroring the apply_edit / apply_reroll test pattern above.
+
+    #[test]
+    fn select_variant_swaps_active_content() {
+        let mut c = make_test_conversation();
+        // The last message ("The door creaks shut.") now has 3 variants after
+        // two simulated rerolls; variant C is active.
+        {
+            let last = c.messages.last_mut().unwrap();
+            last.push_variant("variant B".into(), "<rawB>".into());
+            last.push_variant("variant C".into(), "<rawC>".into());
+            assert_eq!(last.content, "variant C");
+            assert_eq!(last.active_idx, 2);
+        }
+        // Swipe back to variant 0 (the original "door creaks shut").
+        c.messages.last_mut().unwrap().select_variant(0);
+        let last = c.messages.last().unwrap();
+        assert_eq!(last.content, "The door creaks shut.", "swipe restores old text");
+        assert_eq!(last.raw_output, "<raw>door shuts</raw>");
+        assert_eq!(last.active_idx, 0);
+        assert_eq!(last.variant_count(), 3, "all variants still present");
+        // Swipe forward to variant 1.
+        c.messages.last_mut().unwrap().select_variant(1);
+        let last = c.messages.last().unwrap();
+        assert_eq!(last.content, "variant B");
+        assert_eq!(last.active_idx, 1);
+    }
+
+    #[test]
+    fn select_variant_out_of_range_is_noop() {
+        let mut c = make_test_conversation();
+        let last = c.messages.last_mut().unwrap();
+        last.push_variant("variant B".into(), "<rawB>".into());
+        let content_before = last.content.clone();
+        last.select_variant(99);
+        assert_eq!(last.content, content_before, "out-of-range swipe is a no-op");
+    }
+
+    #[test]
+    fn reroll_keeps_variants_across_simulated_reruns() {
+        // The full reroll contract: two push_variants (simulating two rerolls
+        // applied by fable_send's reroll=true path) yield 3 variants, all
+        // retrievable, with the last generated one active.
+        let mut c = make_test_conversation();
+        {
+            let last = c.messages.last_mut().unwrap();
+            last.push_variant("second prose".into(), "<raw2>".into());
+            last.push_variant("third prose".into(), "<raw3>".into());
+        }
+        let last = c.messages.last().unwrap();
+        assert_eq!(last.variant_count(), 3);
+        assert_eq!(last.content, "third prose", "latest reroll is active");
+        assert_eq!(last.variant_at(0), Some("The door creaks shut."));
+        assert_eq!(last.variant_at(1), Some("second prose"));
+        assert_eq!(last.variant_at(2), Some("third prose"));
     }
 
     #[test]
@@ -11082,6 +12704,187 @@ mod tests {
             !serialized.contains("timestamp"),
             "timestamp must NOT leak to UI: {serialized}"
         );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Prong 1 (2026-07-29): build_tracker_extraction_prompt tests. The LOCAL
+    // two-pass flow's Pass-2 tracker prompt builder. Pure fn — no engine.
+    // ─────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn tracker_extraction_prompt_has_protocol_wrapping() {
+        // The tracker prompt must use the <|turn> protocol (system → user →
+        // model cue) so the engine prefills it correctly. Mirrors
+        // build_narrator_prompt's shape.
+        let p = build_tracker_extraction_prompt("SYS", "I move to the cellar.", "The cellar is dark.");
+        assert!(p.starts_with("<|turn>system\n"), "must open with system turn");
+        assert!(p.contains("SYS<turn|>\n"), "system prompt must be wrapped + closed");
+        assert!(p.contains("<|turn>user\n"), "must have a user turn");
+        assert!(p.ends_with("<|turn>model\n"), "must end with the model generation cue");
+    }
+
+    #[test]
+    fn tracker_extraction_prompt_carries_scene_action_prose() {
+        // The blueprint's [Scene]/[Player action]/[Narrator prose] structure —
+        // the tracker needs all three to extract brackets.
+        let p = build_tracker_extraction_prompt(
+            "SYS",
+            "I walk to the cellar.",
+            "The cellar door creaks open, revealing dust.",
+        );
+        assert!(p.contains("[Scene]"), "scene section marker");
+        assert!(p.contains("[Player action]"), "player action marker");
+        assert!(p.contains("I walk to the cellar."), "player action verbatim");
+        assert!(p.contains("[Narrator prose]"), "narrator prose marker");
+        assert!(
+            p.contains("The cellar door creaks open, revealing dust."),
+            "narrator prose verbatim — the tracker must see it to extract brackets"
+        );
+        assert!(
+            p.contains("Emit the tracking brackets"),
+            "must instruct the tracker to emit brackets"
+        );
+    }
+
+    #[test]
+    fn tracker_extraction_prompt_preserves_brackets_in_prose() {
+        // If the narrator slipped a bracket through (rare under prose-only,
+        // but defensive), the tracker must see it verbatim so it can decide
+        // whether to echo/extend — the bracket parser in Pass 1 already
+        // applied it, but the tracker shouldn't be blind to it.
+        let p = build_tracker_extraction_prompt(
+            "SYS",
+            "I descend.",
+            "Stairs wind down. [TIME Day 2, 14:00] The air grows cold.",
+        );
+        assert!(
+            p.contains("[TIME Day 2, 14:00]"),
+            "brackets in narrator prose must be preserved verbatim in the extraction block"
+        );
+    }
+
+    #[test]
+    fn tracker_extraction_prompt_is_stateless_no_window() {
+        // The tracker is stateless (blueprint: "a secondary micro-pass"). It
+        // must NOT carry the windowed history — only the current scene +
+        // action + narrator prose. Prior turns would bloat context + risk
+        // cross-contamination. Assert there's exactly ONE user turn.
+        let p = build_tracker_extraction_prompt("SYS", "act", "prose");
+        let user_turn_count = p.matches("<|turn>user\n").count();
+        assert_eq!(
+            user_turn_count, 1,
+            "exactly one user turn (stateless) — found {user_turn_count}"
+        );
+        assert_eq!(
+            p.matches("<|turn>system\n").count(),
+            1,
+            "exactly one system turn"
+        );
+    }
+
+    // ---- import_decipher_card: pure helpers (parse + chunking) ------------
+
+    #[test]
+    fn parse_deciphered_json_handles_full_object() {
+        let json = r#"{
+            "name": "Mira",
+            "core_persona": "A smuggler.",
+            "appearance": "Raven hair.",
+            "traits": ["brave", "reckless"],
+            "setting": "A cantina.",
+            "tone": "Noir",
+            "opening_scene": "She looks up.",
+            "introductions": ["Greeting one.", "Greeting two."],
+            "player_background": "An exile."
+        }"#;
+        let f = parse_deciphered_json(json).unwrap();
+        assert_eq!(f.name.as_deref(), Some("Mira"));
+        assert_eq!(f.appearance.as_deref(), Some("Raven hair."));
+        assert_eq!(f.traits, vec!["brave", "reckless"]);
+        assert_eq!(f.introductions.len(), 2);
+        assert_eq!(f.player_background.as_deref(), Some("An exile."));
+    }
+
+    #[test]
+    fn parse_deciphered_json_repairs_unquoted_keys() {
+        // Gemma 12B often emits unquoted JSON keys ({name: "X"} vs {"name":"X"}).
+        // The 3-pass repair must recover it (same contract as the schema engine).
+        let malformed = r#"{name: "X", setting: "Y"}"#;
+        let f = parse_deciphered_json(malformed).unwrap();
+        assert_eq!(f.name.as_deref(), Some("X"));
+        assert_eq!(f.setting.as_deref(), Some("Y"));
+    }
+
+    #[test]
+    fn parse_deciphered_json_drops_empty_fields() {
+        let json = r#"{"name": "X", "setting": "   "}"#;
+        let f = parse_deciphered_json(json).unwrap();
+        assert_eq!(f.name.as_deref(), Some("X"));
+        assert!(f.setting.is_none(), "whitespace-only fields drop");
+    }
+
+    #[test]
+    fn parse_deciphered_json_rejects_non_object() {
+        assert!(parse_deciphered_json("[1,2,3]").is_err());
+        assert!(parse_deciphered_json("\"string\"").is_err());
+        assert!(parse_deciphered_json("not json at all").is_err());
+    }
+
+    #[test]
+    fn build_draft_from_decipher_prefers_rebuilt_name_falls_back_to_raw() {
+        // Mechanical name comes from raw; rebuilt name (if present) wins.
+        let raw = card_import::RawCard {
+            name: Some("RawName".into()),
+            ..Default::default()
+        };
+        let rebuilt = DecipheredFields {
+            name: Some("Rebuilt".into()),
+            ..Default::default()
+        };
+        let d = build_draft_from_decipher(&raw, &rebuilt);
+        assert_eq!(d.name.as_deref(), Some("Rebuilt"), "rebuilt name wins");
+        // Fall back to raw when rebuilt is absent.
+        let rebuilt2 = DecipheredFields::default();
+        let d2 = build_draft_from_decipher(&raw, &rebuilt2);
+        assert_eq!(d2.name.as_deref(), Some("RawName"), "raw name fallback");
+    }
+
+    #[test]
+    fn chunk_lorebook_content_short_passes_through() {
+        let chunks = chunk_lorebook_content("Short entry.", 1400);
+        assert_eq!(chunks, vec!["Short entry.".to_string()]);
+    }
+
+    #[test]
+    fn chunk_lorebook_content_empty_yields_nothing() {
+        assert!(chunk_lorebook_content("   ", 1400).is_empty());
+    }
+
+    #[test]
+    fn chunk_lorebook_content_splits_long_entry_on_paragraphs() {
+        let para1 = "x".repeat(800);
+        let para2 = "y".repeat(800);
+        let content = format!("{para1}\n\n{para2}");
+        let chunks = chunk_lorebook_content(&content, 1000);
+        assert_eq!(chunks.len(), 2, "two paragraphs over the cap split into 2");
+        assert!(chunks[0].contains('x'));
+        assert!(chunks[1].contains('y'));
+    }
+
+    #[test]
+    fn chunk_lorebook_content_hard_splits_runaway_paragraph() {
+        // A single paragraph longer than the cap: hard-split on sentences, then
+        // char count. Must not produce a chunk over the cap.
+        let long = "A sentence. ".repeat(200); // ~2400 chars
+        let chunks = chunk_lorebook_content(&long, 1400);
+        assert!(chunks.len() > 1, "must split");
+        for c in &chunks {
+            assert!(
+                c.chars().count() <= 1400,
+                "no chunk exceeds the cap (got {})",
+                c.chars().count()
+            );
+        }
     }
 }
 

@@ -118,6 +118,8 @@ one of:\
 \n- {\"type\":\"set_player_background\",\"value\":\"a traveling herbalist, three days on the road\"}\
 \n- {\"type\":\"set_starting_condition\",\"value\":\"exhausted from the road\"}\
 \n- {\"type\":\"set_start_node\",\"value\":\"tavern\"}  (optional; starting travel-graph node)\
+\n- {\"type\":\"set_locations\",\"nodes\":[{\"id\":\"tavern\",\"name\":\"The Rusty Lantern\",\"setting\":\"indoor\",\"neighbors\":[\"cellar\",\"market\"]},{\"id\":\"cellar\",\"name\":\"The Cellar\",\"setting\":\"indoor\",\"neighbors\":[\"tavern\"]}]}\
+\n  (the WHOLE travel graph in one call — idempotent overwrite; emit ONCE the geography is clear. 2-6 nodes. The FIRST node is where the player starts. `setting` is \"indoor\" or \"outdoor\" — indoor hides the weather line. CRITICAL: edges are NOT auto-symmetrized — if tavern lists cellar as a neighbor, cellar MUST list tavern back, or travel one way will fail.)\
 \n\n\
 If nothing new was established this turn, call sim_draft with an empty-rejecting \
 update OR emit no tool call at all — both are valid. Do not force extractions.";
@@ -129,7 +131,8 @@ you never write XML yourself):\
 - metadata: id (derived from name), type='roleplay'\
 - identity: name, core_persona, traits (bullet list)\
 - scenario: setting, tone, the player's name field (XML tag `<player_name>`, \
-  defaults to 'User'), opening_scene, start_npcs (id list), activities\
+  defaults to 'User'), opening_scene, start_npcs (id list), activities, locations \
+  (the travel graph — what's reachable from where; first node is the player's start)\
 \n\n\
 A great card is specific + sensory + leaves room for the player. Bad cards are \
 stat sheets. See the fable.codex 'Perfect World Card Examples' / 'Perfect \
@@ -139,10 +142,14 @@ const WORLD_ENTITY_NAMESPACES: &str = "\
 World entities follow these namespace conventions (the narrator's renderers \
 key off the prefix):\
 \n\n\
-- loc.<place>     — a location (e.g. loc.tavern = 'warm fire, half-full')\
-- char.<id>.<facet> — an NPC facet (facets: name, role, demeanor, secret)\
-- item.<id>       — a starting item in the player's possession\
-- faction.<id>    — a group with its own agenda\
+- loc.<place>     — a location's ATMOSPHERE (e.g. loc.tavern = 'warm fire, half-full'); freeform flavor\
+\n- char.<id>.<facet> — an NPC facet (facets: name, role, demeanor, secret)\
+\n- item.<id>       — a starting item in the player's possession\
+\n- faction.<id>    — a group with its own agenda\
+\n\n\
+Note: `loc.<place>` entities are FLAVOR. The travel GRAPH (what connects to \
+what, for `[TRAVEL]`/`[RUMOR]`) is a separate thing — author it via \
+`set_locations`, NOT via loc.* entities. Do not duplicate.\
 \n\n\
 3-8 entities is plenty. The world grows via play; do not over-seed.";
 
@@ -154,6 +161,8 @@ TRANSCRIPT EXCERPT:\
 \n  Player: Lower arcology, 3 AM, holo-koi drifting under the ceiling.\
 \n  GM: Who's there when the player walks in?\
 \n  Player: A fixer named Vex. She never looks up.\
+\n  GM: And what else is reachable from the bar?\
+\n  Player: A back office behind a curtain, and the alley out front.\
 \n\n\
 YOUR TOOL CALL:\
 \n  <|tool_call>call:sim_draft{\"updates\":[\
@@ -163,11 +172,18 @@ YOUR TOOL CALL:\
     {\"type\":\"set_field\",\"field\":\"tone\",\"value\":\"Noir, paranoid.\"},\
     {\"type\":\"add_npc\",\"id\":\"vex_the_fixer\"},\
     {\"type\":\"add_entity\",\"key\":\"char.vex_the_fixer.name\",\"state\":\"Vex\"},\
-    {\"type\":\"add_entity\",\"key\":\"char.vex_the_fixer.demeanor\",\"state\":\"never looks up; has seen three corps fall\"}\
+    {\"type\":\"add_entity\",\"key\":\"char.vex_the_fixer.demeanor\",\"state\":\"never looks up; has seen three corps fall\"},\
+    {\"type\":\"set_locations\",\"nodes\":[\
+      {\"id\":\"bar\",\"name\":\"The Neon Dragon Bar\",\"setting\":\"indoor\",\"neighbors\":[\"back_office\",\"alley\"]},\
+      {\"id\":\"back_office\",\"name\":\"The Back Office\",\"setting\":\"indoor\",\"neighbors\":[\"bar\"]},\
+      {\"id\":\"alley\",\"name\":\"The Alley Out Front\",\"setting\":\"outdoor\",\"neighbors\":[\"bar\"]}\
+    ]}\
   ]}<tool_call|>\
 \n\n\
 Note: no player_name extracted (the player never named themselves). No stats. \
-The tone is qualitative. The NPC id is snake_case.";
+The tone is qualitative. The NPC id is snake_case. The graph is bidirectional — \
+bar lists back_office + alley, and EACH lists bar back (edges are not auto-symmetrized). \
+`bar` is first → the player starts there. `alley` is outdoor → the weather line shows there.";
 
 const FINAL_INSTRUCTION: &str = "\
 Read the <interview_transcript>. Extract what the player and GM established \

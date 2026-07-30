@@ -17,6 +17,10 @@ try {
   console.log('  weather     :', JSON.stringify(ws.weather));
   console.log('  travel_graph:', JSON.stringify(ws.travel_graph));
   console.log('  rumors      :', JSON.stringify(ws.rumors));
+  // Phase 5A: NPC presence whitelist (the anti-hallucination gate). Compact
+  // form so a long stance list stays readable.
+  const presences = (ws.presences || []).map(p => `${p.npc_id}: ${p.name} ("${(p.stance||'').slice(0,60)}") ttl=${p.ttl}`);
+  console.log('  presences   :', JSON.stringify(presences));
   console.log('  status_tags :', JSON.stringify(ws.status_tags));
   console.log('  scene_pacing:', JSON.stringify(ws.scene_pacing));
   console.log('  offscreen   :', JSON.stringify(ws.offscreen_tasks));

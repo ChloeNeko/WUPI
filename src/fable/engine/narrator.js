@@ -34,6 +34,11 @@ let onSchemaPop = null;    // hook: (count) => void — the schema-ring-buffer
                            // here so the mutation commands below can hand off
                            // the pop count without narrator.js knowing about
                            // the schema layer.
+let rerolling = false;     // true when the current turn is a swipeable-variant
+                           // reroll (the last beat is being streamed over in
+                           // place). Set in sendFableTurn({reroll:true}), read
+                           // in onDone to update the beat's variant stamp +
+                           // refresh the swipe controls.
 
 export function initNarrator(hooks = {}) {
   onTurnStart = hooks.onTurnStart || null;
@@ -51,27 +56,45 @@ export function initNarrator(hooks = {}) {
 export function resetNarrator() {
   activeBeat = null;
   generating = false;
+  rerolling = false;
 }
 
-// Send a narrator turn. `opts.silent` skips the user bubble (for system-
-// driven turns; not currently used but reserved). `opts.regenerate` is the
-// re-generation flag: when true, the backend SKIPS pushing a fresh user
-// message and generates from the existing last user message in
-// `fable_session` (the mutation commands — rerollLastTurn /
-// rewindAndEditUser — left it there). We also skip the local `addUserBeat`
-// on regenerate since the feed was already rebuilt by the mutation wrapper.
+// Send a narrator turn. Options:
+//   opts.silent      — skip the user bubble (for system-driven turns; reserved).
+//   opts.regenerate  — re-generation after rewind-and-edit: the backend skips
+//                      pushing a fresh user message and generates from the
+//                      existing last user message. We skip the local
+//                      addUserBeat too (the feed was already rebuilt).
+//   opts.reroll      — swipeable-variant reroll (2026-07-29): the last beat is
+//                      an assistant turn whose old prose we KEEP as a swipeable
+//                      sibling. We reuse that beat as `activeBeat` (clearing its
+//                      body so the new variant streams in fresh) and tell the
+//                      backend `reroll: true` so it stashes the old content into
+//                      variants + installs the new prose as the active variant.
+//                      No feed wipe, no flash — the new text streams in place.
 export async function sendFableTurn(text, opts = {}) {
   if (generating) return;
   generating = true;
   if (onTurnStart) onTurnStart();
   const regenerate = !!opts.regenerate;
-  if (!opts.silent && !regenerate) beats.addUserBeat(text);
+  const reroll = !!opts.reroll;
+  if (!opts.silent && !regenerate && !reroll) beats.addUserBeat(text);
+
+  // Reroll: claim the last assistant beat as the streaming target so the new
+  // variant renders in place (the user watches the reroll happen over the old
+  // text, no full feed rebuild). Clear its body; the new text streams in.
+  if (reroll) {
+    rerolling = true;
+    activeBeat = beats.lastNarratorBeat();
+    if (activeBeat) beats.beginReroll(activeBeat);
+    else activeBeat = beats.startNarratorBeat();
+  }
 
   const channel = new Channel();
   channel.onmessage = (msg) => handleEvent(msg);
 
   try {
-    await invoke('fable_send', { text, onEvent: channel, regenerate });
+    await invoke('fable_send', { text, onEvent: channel, regenerate, reroll });
   } catch (err) {
     beats.addErrorBeat(String(err));
     finishTurn();
@@ -128,6 +151,16 @@ function onSceneEvent(cmd) {
 function onDone(finalText, cancelled) {
   if (activeBeat) {
     beats.finalizeBeat(activeBeat, finalText);
+    // After a reroll, this beat now has one more variant (the freshly-
+    // generated one is active; the prior content is a swipeable sibling).
+    // Update the stamp so refreshControls renders the ‹ N/N › bar. The prior
+    // count is on the dataset (stamped at rebuild); the new active is the
+    // new tail = old count.
+    if (rerolling) {
+      const prior = Number.parseInt(activeBeat.dataset.variantCount || '1', 10);
+      const newCount = prior + 1;
+      beats.stampVariants(activeBeat, new Array(newCount - 1).fill(''), newCount - 1);
+    }
     activeBeat = null;
   } else if (finalText) {
     // No chunks arrived (edge case) but we have final prose — render it.
@@ -143,6 +176,7 @@ function onDone(finalText, cancelled) {
 function finishTurn() {
   generating = false;
   activeBeat = null;
+  rerolling = false;
   if (onTurnEnd) onTurnEnd();
 }
 
@@ -196,28 +230,25 @@ export async function editMessage(index, newText) {
   }
 }
 
-// Regenerate the AI's last response. Pops the last assistant message,
-// rebuilds the feed, then re-streams a fresh turn via `fable_send` with
-// `regenerate: true` (the backend generates from the now-last user
-// message without pushing a duplicate). schema_pop_count is 1 — the
-// bad turn's world-state mutation is undone by the onSchemaPop hook.
+// Regenerate the AI's last response as a SWIPEABLE VARIANT (2026-07-29).
+// The old prose is kept as a sibling you can swipe back to; the new prose
+// streams into the SAME beat in place (no feed wipe, no flash). The backend
+// (`fable_send` with `reroll: true`) stashes the old content into the
+// message's `variants` + installs the new prose as the active variant.
+// schema_pop_count is 0 — a prose re-roll no longer undoes the turn's
+// deterministic world-state mutation (the mechanics stand; only the prose
+// varies). We do NOT rebuild the feed: `reroll_last_turn` is now a pure
+// validation gate, and the variant bookkeeping happens entirely in the
+// `sendFableTurn({ reroll: true })` call that follows.
 export async function rerollLastTurn() {
   if (generating) return false;
   generating = true;
   if (onTurnStart) onTurnStart();
-  let seedText = '';
+  // Validate via the gate command (checks the last message is an assistant
+  // turn). No feed rebuild — the last beat stays on screen + gets streamed
+  // over by the reroll.
   try {
     const res = await invoke('reroll_last_turn');
-    if (res && Array.isArray(res.messages)) {
-      beats.rebuildFromMessages(res.messages);
-      // The seed for regeneration is the now-last user message (the reroll
-      // popped the assistant reply that followed it). Grab its text so the
-      // `fable_send` invoke below has a non-empty `text` arg (the backend
-      // ignores it under regenerate=true, but it's the natural payload and
-      // useful for any future logging).
-      const lastUser = [...(res.messages || [])].reverse().find((m) => m.role === 'user');
-      seedText = lastUser ? lastUser.content : '';
-    }
     if (onSchemaPop && typeof res.schema_pop_count === 'number') {
       onSchemaPop(res.schema_pop_count);
     }
@@ -226,14 +257,48 @@ export async function rerollLastTurn() {
     finishTurn();
     return false;
   }
-  // Hand off to the normal streaming path with regenerate=true. We DO NOT
-  // call finishTurn() here — sendFableTurn owns the turn lifecycle from
-  // this point (it set generating=true itself, fires onTurnStart, and
-  // finishTurn runs in its done/error handler). Reset generating first so
-  // sendFableTurn's `if (generating) return` guard doesn't bail.
+  // Hand off to the streaming path with reroll=true. Reset generating first
+  // so sendFableTurn's `if (generating) return` guard doesn't bail.
   generating = false;
-  await sendFableTurn(seedText, { regenerate: true });
+  await sendFableTurn('', { reroll: true });
   return true;
+}
+
+// Swipe to a different variant of an assistant message (the ‹ 1/N › UX).
+// Backend swaps the active `content`/`raw_output` with the sibling at
+// `variantIdx` + persists; we splice the new content into the beat body in
+// place (mirror the §11.29 selective-regenerate splice — no feed rebuild).
+// schema_pop_count is 0 (a swipe is a display change, not a world change).
+export async function swipeVariant(index, variantIdx) {
+  if (generating) return false;
+  generating = true;
+  if (onTurnStart) onTurnStart();
+  try {
+    const res = await invoke('swipe_variant', { index, variantIdx });
+    if (res && Array.isArray(res.messages)) {
+      // Splice the newly-active content into the target beat in place + update
+      // the variant stamp so refreshControls (fired by finishTurn's onTurnEnd)
+      // renders the bar at the new position.
+      const msg = res.messages[index];
+      if (msg) {
+        beats.swapVariantBody(index, msg.content);
+        // Re-stamp: the backend's select_variant updated active_idx; mirror it
+        // onto the DOM. variants length unchanged.
+        const feed = document.querySelector('[data-feed]');
+        const beat = feed && feed.querySelector(`.fable-beat[data-index="${index}"]`);
+        if (beat) beats.stampVariants(beat, msg.variants || [], msg.active_idx || 0);
+      }
+      if (onSchemaPop && typeof res.schema_pop_count === 'number') {
+        onSchemaPop(res.schema_pop_count);
+      }
+    }
+    return true;
+  } catch (err) {
+    beats.addErrorBeat(String(err));
+    return false;
+  } finally {
+    finishTurn();
+  }
 }
 
 // Branch the timeline: edit a user message from N turns ago. Truncates the

@@ -1,17 +1,35 @@
 [package]
 name = "wupi"
-version = "0.12.0"
+version = "0.13.2"
 edition = "2021"
 
 [lib]
 name = "wupi_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
+[features]
+# Phase 5B: local Stable Diffusion scene-image generation (wraps
+# leejet/stable-diffusion.cpp via newfla/diffusion-rs). OFF by default — the
+# NoopImageGenerator stub compiles instantly + exercises the full swap
+# pipeline; enabling this pulls in diffusion-rs + its ~20-40 min CUDA
+# compile. Declared now (as an empty feature) so the `#[cfg(feature =
+# "diffusion-rs")]` impl in scene_art.rs forward-compiles cleanly — Chloe's
+# build-safety procedure (docs/phase5b-diffusion-rs-cargo-procedure.md) adds
+# the optional dep + flips default_sd_backend()'s dispatch. Until then this
+# is a pure flag (no dependency pulled, no code enabled).
+default = []
+diffusion-rs = []
+
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-tauri = { version = "2", features = ["tray-icon"] }
+tauri = { version = "2", features = ["tray-icon", "protocol-asset"] }
+# Native OS file-open dialog for the card-import folder-picker fallback
+# (Slice D of the "Create vs Import" flow, 2026-07-29). The drag-drop path is
+# primary; this is the guaranteed-working fallback for users who prefer a
+# picker. Read-only usage (the import IPC reads the picked path server-side).
+tauri-plugin-dialog = "2"
 # NOTE: tauri-plugin-updater + tauri-plugin-process were removed when WUPI
 # switched to portable distribution. Tauri's updater is installer-only and
 # can't update a portable exe; a custom file-level updater (src/updater.rs)

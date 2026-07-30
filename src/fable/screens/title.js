@@ -3,11 +3,11 @@
 // Pure-DOM: builds the title screen markup, exposes onAction callbacks.
 // Button order (top→bottom): Continue / New Game / Quick Play / Load / Exit.
 //
-// MENU STATE: the 4 menu buttons (Continue / New Game / Quick Play / Load)
-// are currently NO-OPS — their flows are being rebuilt. The buttons stay in
-// the DOM (clickable, but their handlers do nothing) so the title layout is
-// intact for the new UI to wire into. Only EXIT is a real action (closes
-// the app via the lifecycle manager).
+// MENU STATE: all 4 menu buttons (Continue / New Game / Quick Play / Load)
+// are wired to real handlers in fable.js. Continue resumes the freshest New
+// Game save (target stashed by _refreshContinue); Load opens the worlds →
+// saves picker. New Game + Quick Play enter their interview flows. EXIT is
+// the only close path (closes the app via the lifecycle manager).
 //
 // PARTICLES: the floating pollen/spore motes are a canvas particle system
 // (see particles.js) mounted into .fable-title-leaves. It's started when
@@ -80,22 +80,19 @@ export function buildTitle(handlers) {
     <!-- Menu buttons — independent of the wordmark. Positioned via
          .fable-title-actions in fable.css. -->
     <div class="fable-title-actions">
-      <!-- The 4 menu buttons are no-ops for now (their UI is being redone).
-           handlers will be empty functions; the buttons stay clickable so the
-           title layout is intact. Only Exit is a real action.
+      <!-- All 4 menu buttons are wired to handlers in fable.js.
            CONTINUE ships DISABLED by default (the safe state — dim + no
            click) and is only enabled by _refreshContinue once a resume
-           target is confirmed via the fable_continue_target IPC. This is
-           the load-bearing default: in a fresh browser build with no
-           backend, Continue stays dim + unclickable rather than firing
-           a no-op click.
-           NEW GAME is ENABLED (Phase D, 2026-07-28): the New Game interview
-           screen (screens/interview.js) is live. Clicking it routes through
-           fable.js's onNewGameClicked → magical transition → interview screen,
-           which runs the GM conversation + live draft preview + finalize hand-
-           off to the stage. CONTINUE still ships DISABLED by default (only
-           enabled by _refreshContinue once a resume target is confirmed via
-           the fable_continue_target IPC). -->
+           target is confirmed via the fable_continue_target IPC. Clicking a
+           enabled Continue resumes the stashed target (freshest New Game
+           save). This load-bearing default keeps Continue dim + unclickable
+           in a fresh browser build with no backend rather than firing a
+           no-op click.
+           NEW GAME (Phase D): the interview screen is live — GM conversation
+           + live draft preview + finalize hand-off to the stage.
+           QUICK PLAY: void interview authoring (with inline Resume/Start-New
+           when a quicksave exists).
+           LOAD: the worlds → saves picker (resume any New Game save). -->
       <button class="fable-title-btn" data-act="continue" disabled>Continue</button>
       <button class="fable-title-btn" data-act="new">New Game</button>
       <button class="fable-title-btn" data-act="quickplay">Quick Play</button>
@@ -115,19 +112,19 @@ export function buildTitle(handlers) {
   });
 
   // ── CONTINUE enable/disable (the resume-state gate) ───────────────
-  // CONTINUE reads "the very last save you left off on." Per the locked
-  // contract: it is DIMMED (disabled) when the user has no manual or quick
-  // save anywhere (autosaves don't count — `fable_continue_target` excludes
-  // them). The :disabled visual (fade + desaturate + no-hover) already lives
-  // in fable.css; this method just toggles the disabled attribute based on
+  // CONTINUE reads "the very last save you left off on" for a New Game world.
+  // Per the locked contract: it is DIMMED (disabled) when the user has no
+  // save for any New Game world (autosaves DO count — `fable_continue_target`
+  // includes them; Quick Play is excluded since it owns its own Resume). The
+  // :disabled visual (fade + desaturate + no-hover) already lives in
+  // fable.css; this method just toggles the disabled attribute based on
   // whether a resume target exists. Called on every title show via
   // _startAmbient (fresh save state each visit) + best-effort (an IPC error
-  // leaves the button enabled rather than dead-locking the title).
+  // leaves the button disabled rather than dead-locking the title).
   //
-  // NOTE: enabling the button is the ONLY thing wired here. The actual resume
-  // flow (load the target save + enter the stage) is part of the 4 menu flows
-  // being rebuilt — `handlers.continue` is still a no-op in fable.js. This
-  // just makes the button correctly reflect resumability in the meantime.
+  // The stashed target (`root._continueTarget`) carries card_id + save_id; the
+  // continue handler in fable.js (onContinueClicked) resumes it via
+  // fable_start — no second IPC round-trip needed.
   const continueBtn = root.querySelector('[data-act="continue"]');
   root._refreshContinue = async () => {
     if (!continueBtn) return;

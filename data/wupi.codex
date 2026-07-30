@@ -44,12 +44,12 @@ Simulation cards (.sim) are strict XML persona files. CDATA wraps prose so the p
 - Trait two.
     ]]></traits>
   </identity>
-  <appearance><!-- free-form fields, CDATA-wrapped if multiline --></appearance>
+  <appearance><!-- free-form fields, CDATA if multiline --></appearance>
   <role>
     <instruction>What this character does.</instruction>
     <responsibilities><![CDATA[ - Bullet points. ]]></responsibilities>
   </role>
-  <!-- conversational_style, technical_protocols, introductions as needed -->
+  <!-- conversational_style, introductions as needed -->
 </sim_card>
 ```
 
@@ -57,10 +57,11 @@ Simulation cards (.sim) are strict XML persona files. CDATA wraps prose so the p
 
 - The id derives from `<identity><name>` (lowercased). Every card's id is unique.
 - NO `<metadata>` block. Cards are persona-only.
+- NO `<technical_protocols>` block — cards are pure identity + voice; technical protocols are Rust-injected per pass.
 - CDATA for ANY multi-line prose or text with special chars.
 - Roleplay cards persist per-card sessions + schemas; the Wupi-assistant card does not.
 
-Use create_sim_card to commit. Validate XML before committing (parse failures are silent skips).
+Use create_sim_card to commit. Bad XML is a silent skip — validate first.
 
 ---
 title: Authoring Codex Entries

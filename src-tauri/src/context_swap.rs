@@ -60,8 +60,22 @@
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
-/// Which `WUPI.gguf` context is requesting the VRAM lease. The embedder is
-/// NOT a role here — it's a separate model, always resident, exempt.
+/// Which engine is requesting the VRAM lease. The embedder is NOT a role
+/// here — it's a separate model, always resident, exempt.
+///
+/// **Phase 5B (2026-07-29):** `Sd` (Stable Diffusion) is the 4th role. Unlike
+/// the three `WUPI.gguf` contexts (which swap KV caches while sharing the
+/// leaked `SHARED_MODEL` weights), SD is a *different model entirely* — its
+/// teardown must evict the LLM weights from VRAM (the `SHARED_MODEL` leak),
+/// not just a KV context. See `llm::unload_shared_model` /
+/// `reload_shared_model` (the Phase 5B weight-unload lift). The contract for
+/// an `Sd` teardown is heavier: it must (1) unload the shared LLM weights
+/// (~9.8GB), (2) load the SD model, (3) generate. The reverse swap reloads
+/// the LLM weights. The per-turn KV clear (§11.52) means there is NO KV to
+/// preserve across the swap — the only reload cost is the weight file-read
+/// (~5-10s for 12B Q6), hidden behind SD gen time. This is the architectural
+/// fit that makes the LLM⇄SD swap "seamless" — it rides free on work the
+/// engine was already doing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ContextRole {
     /// The Wupi-assistant chat engine (delta-prefill, persistent KV).
@@ -70,6 +84,10 @@ pub enum ContextRole {
     Schema,
     /// The narrator / game engine (one-shot per turn).
     Fable,
+    /// Stable Diffusion image generation (Phase 5B, 2026-07-29). The only
+    /// role whose teardown evicts the shared LLM *weights*, not just a KV
+    /// context. See the module doc + `SceneImageGenerator` in scene_art.rs.
+    Sd,
 }
 
 impl ContextRole {
@@ -78,6 +96,7 @@ impl ContextRole {
             ContextRole::Chat => "chat",
             ContextRole::Schema => "schema",
             ContextRole::Fable => "fable",
+            ContextRole::Sd => "sd",
         }
     }
 }
@@ -403,5 +422,26 @@ mod tests {
         let ok = StdArc::new(AtomicUsize::new(0));
         let _g2 = swap.acquire(ContextRole::Fable, record_teardown(StdArc::clone(&ok))).await;
         assert_eq!(ok.load(Ordering::SeqCst), 0, "fable teardown not fired during its own acquire");
+    }
+
+    #[tokio::test]
+    async fn sd_role_participates_in_swap_rotation() {
+        // Phase 5B (2026-07-29): Sd is the 4th role. Verify it evicts + is
+        // evicted like the others. Fable acquires, Sd acquires (evicting
+        // Fable — this is the LLM→SD swap), then Chat acquires (evicting Sd —
+        // the reverse swap). Each transition fires exactly the prior teardown.
+        let swap = ContextSwap::new();
+        let fable_t = StdArc::new(AtomicUsize::new(0));
+        let sd_t = StdArc::new(AtomicUsize::new(0));
+        let chat_t = StdArc::new(AtomicUsize::new(0));
+        let _g1 = swap.acquire(ContextRole::Fable, record_teardown(StdArc::clone(&fable_t))).await;
+        // LLM → SD swap: Sd evicts Fable.
+        let _g2 = swap.acquire(ContextRole::Sd, record_teardown(StdArc::clone(&sd_t))).await;
+        assert_eq!(fable_t.load(Ordering::SeqCst), 1, "LLM→SD swap must evict Fable (the LLM weights unload)");
+        assert_eq!(sd_t.load(Ordering::SeqCst), 0);
+        // SD → LLM swap: Chat evicts Sd (the reverse swap reloads the LLM).
+        let _g3 = swap.acquire(ContextRole::Chat, record_teardown(StdArc::clone(&chat_t))).await;
+        assert_eq!(sd_t.load(Ordering::SeqCst), 1, "SD→LLM swap must evict Sd");
+        assert_eq!(chat_t.load(Ordering::SeqCst), 0);
     }
 }

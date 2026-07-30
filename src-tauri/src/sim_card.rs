@@ -21,12 +21,6 @@ use std::path::Path;
 
 use rand::seq::IndexedRandom;
 
-/// One Simulation Card, parsed from a `.sim` file. Owned and immutable for the
-/// process lifetime after `setup()` loads it.
-///
-/// `Serialize` + `Deserialize` (added for Quick Play so a generated card can
-/// be bundled inside the quicksave file) — every field is a primitive
-/// `String`/`Option<String>`/`Vec<String>`, so serde handles the round trip
 /// A location node as authored in a `.sim` card's `<scenario><locations>`
 /// block (Fable Phase 4 Component 3, 2026-07-28). Converted to
 /// [`crate::schema::Node`] by `enter_fable_session` at `fable_start`. Kept
@@ -64,6 +58,63 @@ pub struct CardNode {
     pub setting: String,
 }
 
+/// A named NPC as authored in a `.sim` card's `<scenario><cast>` block
+/// (Fable Phase 5A, 2026-07-29). Converted to
+/// [`crate::schema::NpcEntry`] by `enter_fable_session` at `fable_start`.
+/// Kept in `sim_card` (not reusing `schema::NpcEntry` directly) so the card
+/// parser stays decoupled from the schema module — the conversion is a
+/// one-liner at the seed site (mirrors the `CardNode` precedent).
+///
+/// Parsed from:
+/// ```xml
+/// <npc id="mara_the_innkeep" tier="soldier">
+///   <name>Mara</name>
+///   <role>The innkeeper behind the bar</role>
+///   <alias>mara</alias>
+///   <alias>innkeep</alias>
+/// </npc>
+/// ```
+///
+/// The `id` is the load-bearing field: it is the Rust-owned authoritative key
+/// the `[PRESENCE]` bracket validates against (the anti-hallucination gate).
+/// `name` is the diegetic prose label shown to the narrator; `role` is a
+/// one-line vocation/hook; `tier` is forward-compat (feeds the
+/// `select_attacker_tier_from_entities` heuristic later — left optional for
+/// Phase 5A, where the registry's job is the ID whitelist + name only);
+/// `aliases` are alternate surface forms the narrator may emit that the
+/// presence applier normalizes back to `id`.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default)]
+pub struct CardNpc {
+    /// Bare slug ("mara_the_innkeep"). MUST match the ids in `<start_npcs>`
+    /// so the existing narrator-prompt seeding (sim_card.rs start_npc_ids)
+    /// and the new registry agree on canonical keys.
+    pub id: String,
+    /// Diegetic prose label shown to the narrator ("Mara"). This is the prose
+    /// label only; personality/appearance prose lives in the codex lore entry
+    /// that `wire_sim_card` authors from this block.
+    pub name: String,
+    /// One-line vocation/role hint ("The innkeeper behind the bar"). Optional
+    /// flavor; helps the narrator + the image-gen prompt composer.
+    pub role: String,
+    /// Optional combat tier label ("soldier" / "elite" / "boss" / ...).
+    /// Forward-compat for the §11.30 tier heuristic; `None` for non-combat
+    /// NPCs (civilians, vendors, atmosphere characters).
+    #[serde(default)]
+    pub tier: Option<String>,
+    /// Alternate surface forms the narrator may emit ("mara", "innkeep").
+    /// The presence applier normalizes any alias back to `id` so the
+    /// `[PRESENCE mara "..."]` and `[PRESENCE mara_the_innkeep "..."]` forms
+    /// both resolve to the same registry entry.
+    #[serde(default)]
+    pub aliases: Vec<String>,
+}
+
+/// One Simulation Card, parsed from a `.sim` file. Owned and immutable for the
+/// process lifetime after `setup()` loads it.
+///
+/// `Serialize` + `Deserialize` (added for Quick Play so a generated card can
+/// be bundled inside the quicksave file) — every field is a primitive
+/// `String`/`Option<String>`/`Vec<String>`, so serde handles the round trip
 /// with no custom impl. `#[serde(default)]` on the `Option` fields keeps older
 /// save JSON (written before a field existed) loading cleanly.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -80,6 +131,21 @@ pub struct SimCard {
     pub role_instruction: String,
     pub responsibilities: String,
     pub conversational_rules: String,
+    /// Technical/output protocols carried by the card. **Deprecated as a
+    /// persona mechanism (2026-07-29):** technical protocols (tool-call
+    /// formats, file output, bracket syntax, state tracking) are now
+    /// Rust-injected per pass — see `prompts::WUPI_AGENT_PROTOCOL` (the chat
+    /// agent pass) and the narrator/tracker/scribe prompt builders on the
+    /// Fable side. `.sim` cards are now PURE FLAVOR (identity, voice,
+    /// personality, tone, world state).
+    ///
+    /// This field is retained as a **dormant back-compat shim**: it renders
+    /// NOTHING when empty (see `render_for_prompt`), so the shipped `wupi.sim`
+    /// and `fable.sim` cards leave it unset → zero tokens + zero behavior
+    /// change. A user-authored `.sim` card that still includes a
+    /// `<technical_protocols>` block parses and renders it unchanged (graceful
+    /// migration; the field is not ripped to avoid a wide blast radius +
+    /// breakage of existing user cards). Do NOT add new shipped content here.
     pub technical_rules: String,
     /// One greeting string per line in `<introductions>`. Empty if the card
     /// omits the block. Used by [`random_intro`] for the boot flourish.
@@ -145,6 +211,28 @@ pub struct SimCard {
     /// loading cleanly.
     #[serde(default)]
     pub locations: Vec<CardNode>,
+    /// Fable Phase 5A (2026-07-29): the named NPC registry seeded from the
+    /// card's `<scenario><cast>` block. Empty for system cards (Wupi) and for
+    /// roleplay cards that omit the block (stays dormant — no `npc_registry`,
+    /// no `[PRESENCE]` validation, the whitelist is empty so the narrator
+    /// follows the pre-Phase-5 behavior). When non-empty, `enter_fable_session`
+    /// seeds [`crate::schema::WorldSchema::npc_registry`] from this; the
+    /// `[PRESENCE]` bracket's anti-hallucination gate (unknown id → reject)
+    /// keys off the seeded registry.
+    ///
+    /// `Vec<CardNpc>` (not `schema::NpcRegistry` directly) to keep `sim_card`
+    /// free of the `schema` module dependency — `enter_fable_session` does the
+    /// one-line conversion (mirrors the `locations`/`CardNode` precedent).
+    /// `#[serde(default)]` keeps older quicksave JSON (bundled cards written
+    /// before this field existed) loading cleanly.
+    ///
+    /// This is the load-bearing fix for the "teleporting NPC" problem: before
+    /// Phase 5A there was no Rust-owned authoritative NPC id set, so the
+    /// `[PRESENCE]` bracket had nothing to validate against (the same shape
+    /// as the §11.48 travel-graph-was-never-seeded gap). The registry is the
+    /// whitelist the narrator obeys.
+    #[serde(default)]
+    pub cast: Vec<CardNpc>,
 }
 
 impl SimCard {
@@ -264,6 +352,7 @@ pub fn fallback() -> SimCard {
         declared_activities: Vec::new(),
         player_name: None,
         locations: Vec::new(),
+        cast: Vec::new(),
     }
 }
 
@@ -375,6 +464,12 @@ fn parse(xml: &str) -> anyhow::Result<SimCard> {
         .and_then(|n| child_text(n, "rules"))
         .unwrap_or_default();
 
+    // Deprecated as a persona mechanism (2026-07-29): technical protocols are
+    // now Rust-injected per pass (prompts::WUPI_AGENT_PROTOCOL for the chat
+    // agent pass; the narrator/tracker/scribe builders for Fable). Retained as
+    // a dormant back-compat shim — see the field doc on `SimCard.technical_rules`.
+    // Shipped cards (wupi.sim, fable.sim) no longer carry this block; user
+    // cards that still do parse + render it unchanged.
     let technical_rules = first_child(root, "technical_protocols")
         .and_then(|n| child_text(n, "rules"))
         .unwrap_or_default();
@@ -458,6 +553,40 @@ fn parse(xml: &str) -> anyhow::Result<SimCard> {
         })
         .unwrap_or_default();
 
+    // Fable Phase 5A (2026-07-29): optional <cast> block. Each <npc> has an
+    // `id` attribute, an optional `tier` attribute, a <name> child, a <role>
+    // child, and 0+ <alias> children (alternate surface forms). Absent on
+    // system cards + roleplay cards that don't declare a cast → empty Vec
+    // (dormant registry, pre-Phase-5 behavior). This is the load-bearing
+    // source for the `[PRESENCE]` whitelist — without it the bracket has
+    // nothing to validate against (the §11.48-shaped gap).
+    let cast = scenario
+        .and_then(|n| first_child(n, "cast"))
+        .map(|cast_el| {
+            cast_el
+                .children()
+                .filter(|c| c.is_element() && c.has_tag_name("npc"))
+                .map(|npc_el| {
+                    let id = npc_el.attribute("id").unwrap_or("").trim().to_owned();
+                    let tier = npc_el
+                        .attribute("tier")
+                        .map(|s| s.trim().to_owned())
+                        .filter(|s| !s.is_empty());
+                    let name = child_text(npc_el, "name").unwrap_or_default();
+                    let role = child_text(npc_el, "role").unwrap_or_default();
+                    let aliases: Vec<String> = npc_el
+                        .children()
+                        .filter(|c| c.is_element() && c.has_tag_name("alias"))
+                        .map(|n| text_content(n).trim().to_owned())
+                        .filter(|s| !s.is_empty())
+                        .collect();
+                    CardNpc { id, name, role, tier, aliases }
+                })
+                .filter(|n| !n.id.is_empty()) // defensive: drop id-less npcs
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
     Ok(SimCard {
         id,
         name,
@@ -477,6 +606,7 @@ fn parse(xml: &str) -> anyhow::Result<SimCard> {
         declared_activities,
         player_name,
         locations,
+        cast,
     })
 }
 
@@ -556,11 +686,6 @@ mod tests {
 - Use "nya~".
     ]]></rules>
   </conversational_style>
-  <technical_protocols>
-    <rules><![CDATA[
-- Code must be sterile.
-    ]]></rules>
-  </technical_protocols>
   <introductions><![CDATA[
 - "Hello Master~" (=^-ω-^=)
 - "Booted up, nya~" ฅ^>⩊<^ฅ
@@ -580,7 +705,12 @@ mod tests {
         assert_eq!(card.role_instruction, "Help Master manage the system.");
         assert!(card.responsibilities.contains("Manage settings."));
         assert!(card.conversational_rules.contains("nya~"));
-        assert!(card.technical_rules.contains("sterile"));
+        // technical_protocols block was removed from the SAMPLE fixture
+        // (2026-07-29): technical protocols are now Rust-injected per pass,
+        // never authored in a .sim card. The shipped cards leave technical_rules
+        // empty. Back-compat (a card WITH the block still rendering it) is
+        // pinned by `technical_protocols_block_still_renders_for_back_compat`.
+        assert!(card.technical_rules.is_empty());
         assert_eq!(card.introductions.len(), 2);
         assert!(card.introductions[0].contains("Hello Master"));
         // The literal `>` in the emoticon survives (the XML/CDATA contract).
@@ -606,9 +736,43 @@ mod tests {
         assert!(rendered.contains("<appearance>"));
         assert!(rendered.contains("<role>"));
         assert!(rendered.contains("<conversational_style>"));
-        assert!(rendered.contains("<technical_protocols>"));
+        // technical_protocols section is suppressed when empty (the SAMPLE
+        // fixture no longer carries the block). Back-compat rendering is
+        // pinned by `technical_protocols_block_still_renders_for_back_compat`.
+        assert!(!rendered.contains("<technical_protocols>"));
         // Introductions must NOT leak into the model persona block.
         assert!(!rendered.contains("Hello Master"));
+    }
+
+    #[test]
+    fn technical_protocols_block_still_renders_for_back_compat() {
+        // 2026-07-29 deprecation: the `<technical_protocols>` block is no
+        // longer shipped in any card (protocols are Rust-injected per pass),
+        // BUT a user-authored .sim card that still includes one must parse +
+        // render it unchanged — the field is a dormant back-compat shim, not
+        // ripped. This test pins that contract so a future cleanup doesn't
+        // silently break existing user cards.
+        let card_xml = r#"<?xml version="1.0"?>
+<sim_card>
+  <identity>
+    <name>Legacy</name>
+    <core_persona>A card from before the protocol extraction.</core_persona>
+    <traits><![CDATA[ - Old-school. ]]></traits>
+  </identity>
+  <technical_protocols>
+    <rules><![CDATA[
+- Legacy rule that still works.
+    ]]></rules>
+  </technical_protocols>
+</sim_card>"#;
+        let card = parse(card_xml).expect("legacy card with technical_protocols parses");
+        assert!(card.technical_rules.contains("Legacy rule that still works."));
+        let rendered = card.render_for_prompt();
+        assert!(
+            rendered.contains("<technical_protocols>"),
+            "a card carrying the block must still render it (back-compat)"
+        );
+        assert!(rendered.contains("Legacy rule that still works."));
     }
 
     #[test]
@@ -632,6 +796,7 @@ mod tests {
             declared_activities: Vec::new(),
             player_name: None,
             locations: Vec::new(),
+            cast: Vec::new(),
         };
         assert!(card.random_intro().is_none());
     }
@@ -765,6 +930,7 @@ ago. A locked iron chest sits under a table by the hearth.
             declared_activities: vec!["combat".into()],
             player_name: Some("Kaelen".into()),
             locations: Vec::new(),
+            cast: Vec::new(),
         };
         let json = serde_json::to_string(&original).expect("serialize");
         let back: SimCard = serde_json::from_str(&json).expect("deserialize");
@@ -856,6 +1022,8 @@ ago. A locked iron chest sits under a table by the hearth.
         assert!(card.introductions.is_empty());
         // Phase 4 Component 3: locations defaults to empty (backward-compat).
         assert!(card.locations.is_empty());
+        // Phase 5A: cast defaults to empty (backward-compat).
+        assert!(card.cast.is_empty());
     }
 
     /// Phase 4 Component 3 (2026-07-28): a card with no `<locations>` block
@@ -982,5 +1150,131 @@ ago. A locked iron chest sits under a table by the hearth.
 </sim_card>"#;
         let card = parse(xml).expect("card parses");
         assert!(card.locations.is_empty(), "empty <locations> block must yield empty Vec");
+    }
+
+    /// Phase 5A (2026-07-29): a card with no `<cast>` block must parse with
+    /// `cast` empty (the dormant-registry contract — the pre-Phase-5 behavior,
+    /// preserved for every card that doesn't declare a named cast). This is
+    /// the backward-compat invariant (mirrors `card_without_locations_loads_empty`).
+    #[test]
+    fn card_without_cast_loads_empty() {
+        let xml = r#"<sim_card>
+  <metadata><id>nocast</id><type>roleplay</type></metadata>
+  <identity><name>No Cast</name></identity>
+  <scenario>
+    <setting>A setting with no named cast.</setting>
+  </scenario>
+</sim_card>"#;
+        let card = parse(xml).expect("card without <cast> parses");
+        assert!(card.cast.is_empty(), "card without <cast> must have empty cast");
+    }
+
+    /// Phase 5A (2026-07-29): a card WITH a `<cast>` block must parse every
+    /// `<npc>` in document order, capturing the `id`/`tier` attributes,
+    /// `<name>`/`<role>` children, and all `<alias>` children. This pins the
+    /// parser's behavior — the load-bearing path for the `[PRESENCE]`
+    /// whitelist being reachable in live play (the §11.48-shaped fix).
+    #[test]
+    fn card_with_cast_parses_npcs_in_document_order() {
+        let xml = r#"<sim_card>
+  <metadata><id>casted</id><type>roleplay</type></metadata>
+  <identity><name>Casted</name></identity>
+  <scenario>
+    <setting>A setting with a named cast.</setting>
+    <cast>
+      <npc id="mara_the_innkeep" tier="soldier">
+        <name>Mara</name>
+        <role>The innkeeper behind the bar</role>
+        <alias>mara</alias>
+        <alias>innkeep</alias>
+      </npc>
+      <npc id="bard_corin">
+        <name>Corin</name>
+        <role>A traveling bard tuning a lute</role>
+      </npc>
+    </cast>
+  </scenario>
+</sim_card>"#;
+        let card = parse(xml).expect("card with <cast> parses");
+        assert_eq!(card.cast.len(), 2, "expected 2 parsed npcs");
+
+        // Document order preserved.
+        assert_eq!(card.cast[0].id, "mara_the_innkeep");
+        assert_eq!(card.cast[0].name, "Mara");
+        assert_eq!(card.cast[0].role, "The innkeeper behind the bar");
+        assert_eq!(card.cast[0].tier.as_deref(), Some("soldier"));
+        assert_eq!(card.cast[0].aliases, vec!["mara", "innkeep"]);
+
+        assert_eq!(card.cast[1].id, "bard_corin");
+        assert_eq!(card.cast[1].name, "Corin");
+        assert_eq!(card.cast[1].tier, None, "missing tier attribute must default to None");
+        assert!(card.cast[1].aliases.is_empty(), "npc with no <alias> children must have empty aliases");
+    }
+
+    /// Phase 5A (2026-07-29): an `<npc>` with no `id` attribute is defensively
+    /// DROPPED (an id-less npc is unreferenceable — the `[PRESENCE]` bracket
+    /// + the whitelist both key on id). Other valid npcs in the same block
+    /// still parse (mirrors `card_location_node_without_id_is_dropped`).
+    #[test]
+    fn card_cast_npc_without_id_is_dropped() {
+        let xml = r#"<sim_card>
+  <metadata><id>idlesscast</id><type>roleplay</type></metadata>
+  <identity><name>Idless Cast</name></identity>
+  <scenario>
+    <cast>
+      <npc tier="soldier"><name>No Id Here</name></npc>
+      <npc id="valid"><name>Valid Npc</name></npc>
+    </cast>
+  </scenario>
+</sim_card>"#;
+        let card = parse(xml).expect("card parses");
+        assert_eq!(card.cast.len(), 1, "id-less npc must be dropped, valid npc kept");
+        assert_eq!(card.cast[0].id, "valid");
+    }
+
+    /// Phase 5A (2026-07-29): the `<cast>` and `<locations>` blocks are
+    /// independent — a card can declare both, either, or neither. This pins
+    /// that parsing `<cast>` doesn't disturb `<locations>` and vice versa
+    /// (defensive against a future refactor that shares a walk loop).
+    #[test]
+    fn card_cast_and_locations_coexist() {
+        let xml = r#"<sim_card>
+  <metadata><id>both</id><type>roleplay</type></metadata>
+  <identity><name>Both</name></identity>
+  <scenario>
+    <locations>
+      <node id="tavern" setting="indoor"><name>Tavern</name></node>
+    </locations>
+    <cast>
+      <npc id="mara"><name>Mara</name></npc>
+    </cast>
+  </scenario>
+</sim_card>"#;
+        let card = parse(xml).expect("card parses");
+        assert_eq!(card.locations.len(), 1);
+        assert_eq!(card.locations[0].id, "tavern");
+        assert_eq!(card.cast.len(), 1);
+        assert_eq!(card.cast[0].id, "mara");
+    }
+
+    /// Phase 5A (2026-07-29): serde round trip for CardNpc + the cast field
+    /// (Quick Play bundles the card inside quicksave JSON — the round trip
+    /// must survive write + read, same contract as `locations`).
+    #[test]
+    fn card_cast_serializes_roundtrip() {
+        let original = CardNpc {
+            id: "mara_the_innkeep".into(),
+            name: "Mara".into(),
+            role: "The innkeeper".into(),
+            tier: Some("soldier".into()),
+            aliases: vec!["mara".into(), "innkeep".into()],
+        };
+        let json = serde_json::to_string(&original).expect("serialize");
+        let back: CardNpc = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back.id, original.id);
+        assert_eq!(back.name, original.name);
+        assert_eq!(back.role, original.role);
+        assert_eq!(back.tier, original.tier);
+        assert_eq!(back.aliases, original.aliases);
     }
 }

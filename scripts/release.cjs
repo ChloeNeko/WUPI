@@ -328,6 +328,11 @@ if (dryRun) {
 //   data/                         (engine-shipped identity content)
 //   ├── wupi.sim                  (Wupi's ACTIVE persona, lowercase w,
 //   │                              single copy — Chloe's personal content)
+//   ├── fable.sim                 (the Fable/Game-Master persona for the
+//   │                              New Game interview; 2026-07-29 rename of
+//   │                              gm.sim — Game Master identity kept)
+//   ├── wupi.codex                (Wupi's static playbook — engine content)
+//   ├── fable.codex               (the unified Fable playbook — engine content)
 //   └── user.xml                  (EMPTY template — user authors via the
 //                                  User Editor; preserved on update)
 //   (no memory/, models/, apps/ — those are USER DATA, created on first
