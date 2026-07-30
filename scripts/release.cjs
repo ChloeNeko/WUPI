@@ -424,13 +424,19 @@ for (const f of readdirSync(distDir)) {
 // run and preserved across updates by the updater's preserve rule (§8C).
 cpSync(srcDataDir, join(stageWupiDir, 'data'), { recursive: true });
 
-// apps/games/cards/: starter scenario .sim files. The released exe resolves
-// apps/ relative to its own dir, so without this staging the card picker
-// ships empty. Per-card sessions/schemas/saves are user data → created on
-// first run, NOT staged here (matches the §8C preserve rule).
-const srcCardsDir = join(repoRoot, 'apps', 'games', 'cards');
+// apps/fable/cards/: starter scenario .sim files. The released exe resolves
+// apps/ relative to its own dir (resolve_fable_cards_dir → apps/fable/cards/),
+// so without this staging the card picker ships empty. Per-card
+// sessions/schemas/saves are user data → created on first run, NOT staged here
+// (matches the §8C preserve rule).
+//
+// §8C rename note: this was `apps/games/cards/` pre-rename. The path moved to
+// `apps/fable/` when Games→Fable (AGENTS.md §8C); the runtime already resolves
+// from fable/. Staging from the old games/ path shipped an empty card picker
+// (the dir doesn't exist post-rename, so existsSync was false → silent skip).
+const srcCardsDir = join(repoRoot, 'apps', 'fable', 'cards');
 if (existsSync(srcCardsDir)) {
-  const dstCardsDir = join(stageWupiDir, 'apps', 'games', 'cards');
+  const dstCardsDir = join(stageWupiDir, 'apps', 'fable', 'cards');
   mkdirSync(dstCardsDir, { recursive: true });
   let staged = 0;
   for (const f of readdirSync(srcCardsDir)) {
