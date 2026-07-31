@@ -474,6 +474,25 @@
                 </div>
                 <span class="home-app-label">Games</span>
             </div>
+            <!-- Prism (2026-07-31): the image-generation app. Clicking launches
+                 Prism via openWindow('prism'), which the openHook (registered
+                 by initPrism in script.js) redirects to launchPrism() →
+                 AppLifecycle.launchApp('prism'). Drives the shared Stable
+                 Diffusion swap pipeline (scene_art + run_sd_swap_core) with
+                 user-supplied prompt/seed/cfg/sampler. The Glass Vault gallery
+                 + Tag Composer + seed-locked Fork & Edit live under
+                 src/prism/. -->
+            <div class="home-app" data-open="prism" aria-label="Prism">
+                <div class="home-app-icon">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+                        <path d="M6 3h12l3 6-9 12L3 9z"></path>
+                        <path d="M3 9h18"></path>
+                        <path d="M9 3 7.5 9 12 21"></path>
+                        <path d="M15 3l1.5 6L12 21"></path>
+                    </svg>
+                </div>
+                <span class="home-app-label">Prism</span>
+            </div>
             <div class="home-app" data-open="profile">
                 <div class="home-app-icon">
                     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">

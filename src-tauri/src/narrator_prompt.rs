@@ -544,7 +544,7 @@ does not owe the player success."
 }
 
 const BRACKET_PROTOCOL: &str = "\
-Emit bracket commands alongside your prose to track world state. Eleven \
+Emit bracket commands alongside your prose to track world state. Thirteen \
 recognized commands (full semantics + the JSON alternative form + common \
 errors are in the retrieved playbook — consult it on mechanical turns). \
 Each command on its own line, separate from prose. Any other bracket is \
@@ -561,8 +561,10 @@ invalid and leaks as literal text.
 - [MILESTONE <npc_id> <event_id>]  — record a relationship milestone.
 - [TASK <npc_id> <desc> | <difficulty> <suitability> <eta_min>]  — queue an off-screen task.
 - [PRESENCE <npc_id> <stance and micro-location>]  — assert who is on-camera now (one per present NPC).
+- [DISCOVER <node_id> name=<diegetic name> setting=indoor|outdoor neighbors=<csv>]  — register a NEW location the story just established (a town, a ship, a dungeon room). Optional fields; `[DISCOVER shell_town name=\"Shell Town\"]` is enough.
+- [NPC_REGISTER <npc_id> name=<diegetic name> role=<one-line hook> tier=<optional>]  — register a NEW named NPC who now matters (a companion, a recurring rival). Optional fields; `[NPC_REGISTER coby name=Coby role=\"timid Marine recruit\"]` is enough.
 
-Schema-tracking commands (the nine above except CHARACTER_TURN and FX) are \
+Schema-tracking commands (the eleven above except CHARACTER_TURN and FX) are \
 the PRIMARY output — they record what mechanically changed. Ask first: \
 \"What state changed this turn?\" Emit those. CHARACTER_TURN is secondary; \
 many great turns have none. Ground every label in what actually happened — \
@@ -574,7 +576,16 @@ turn, every turn. Re-assert the full on-camera cast each turn (the whitelist \
 refreshes). An NPC you do not re-assert drops after a grace turn — if they \
 left the scene, that is correct; if they are still there, emit them again. \
 Use the npc's id or alias as the first token; the stance is a short phrase \
-of where they stand and what they are doing.";
+of where they stand and what they are doing.
+
+DISCOVER + NPC_REGISTER grow the world: emit them when the story establishes \
+a NEW place or person the player can return to (a named town reached, a ship \
+boarded, a notable NPC met who will recur). Emit DISCOVER once when a place \
+first matters, then use [TRAVEL] to move there afterward. Emit NPC_REGISTER \
+once when a character becomes a named, recurring presence, then [PRESENCE] \
+asserts them each scene they're in. Re-discovering/re-registering is harmless \
+(a no-op) — but emit each genuinely-new place and recurring person the FIRST \
+turn they matter so [TRAVEL], [RUMOR], and [PRESENCE] can reach them.";
 
 
 // ---------------------------------------------------------------------------

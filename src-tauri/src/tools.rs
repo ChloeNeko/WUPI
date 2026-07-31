@@ -146,122 +146,6 @@ pub fn parse_tool_calls(raw: &str) -> Vec<ToolCall> {
     calls
 }
 
-/// The Scribe's greedy extractor: WUPI-tag calls first, then a fenced-JSON /
-/// bare-JSON fallback scoped to `sim_draft` only.
-///
-/// Why a scribe-specific path (NOT baked into the shared `parse_tool_calls`):
-/// the fallback treats any fenced or bare JSON carrying the `sim_draft`
-/// signature (`"updates"` or `"type":"set_"`) as a tool call. That is correct
-/// for the Scribe (whose ONLY tool is `sim_draft` and whose output IS the
-/// extraction payload), but would be WRONG for the general chat agent loop —
-/// a player pasting a code fence containing `"updates"` while chatting with
-/// Wupi must not be parsed as a tool call. Scoping keeps the fallback safe.
-///
-/// Pipeline (Gemini Option 3 — the "Greedy Extractor"):
-///   1. Primary: `parse_tool_calls` (WUPI `<|tool_call>` tags + EOF salvage
-///      for truncated closers).
-///   2. Fallback: if primary found 0 calls, scan the raw output for a
-///      ```` ```json ```` fence OR the first `{`...last `}` span. If that
-///      extracted text carries the `sim_draft` signature, synthesize a
-///      `sim_draft` ToolCall whose args are the extracted JSON (later stages —
-///      `parse_args_lenient` → `json_repair` → `normalize_updates_args` → the
-///      `deserialize_neighbor_ids` salvager — handle truncation, shape
-///      variation, and runaway nesting respectively).
-///
-/// This makes the Rust backend immune to the three most common open-12B
-/// failures: truncated tags (EOF salvage), markdown-fence bleed (this
-/// fallback), and hallucinated nesting (the serde salvager).
-pub fn parse_scribe_calls(raw: &str) -> Vec<ToolCall> {
-    // Primary path: WUPI tags (+ EOF salvage inside).
-    let primary = parse_tool_calls(raw);
-    if !primary.is_empty() {
-        return primary;
-    }
-
-    // Fallback: look for a fenced or bare JSON block carrying the sim_draft
-    // signature. The model sometimes emits the correct payload as a prose
-    // reply with a ```` ```json ```` fence (no `<|tool_call>` marker) — the
-    // 2026-07-29 WEAVER playtest's dominant failure mode.
-    let extracted = extract_json_payload(raw);
-    if let Some(json_span) = extracted {
-        if has_sim_draft_signature(&json_span) {
-            // Synthesize a sim_draft call. parse_args_lenient (→ json_repair)
-            // + normalize_updates_args + the salvager handle the rest.
-            return vec![ToolCall {
-                name: "sim_draft".to_string(),
-                args: parse_args_lenient(&json_span),
-            }];
-        }
-    }
-
-    Vec::new()
-}
-
-/// Extract the first plausible JSON object/array payload from `raw`, in
-/// priority order:
-///   1. The contents of the first ```` ```json ```` / ```` ``` ```` fenced block.
-///   2. Otherwise the span from the first `{` to the last `}` (or first `[` to
-///      last `]`) — tolerant of max_tokens truncation (no closing brace just
-///      means we slice to the last one we DO have; json_repair closes it).
-///
-/// Returns the raw substring (untrimmed of fences) or None if no JSON-like
-/// structure is present.
-fn extract_json_payload(raw: &str) -> Option<String> {
-    // 1. Fenced block (```json ... ``` or ``` ... ```). Tolerant of a missing
-    //    closing fence (truncation): take from the opening fence to EOF.
-    if let Some(fence_start) = raw.find("```") {
-        let after_fence = &raw[fence_start + 3..];
-        // Skip an optional language tag (json/js/etc.) on the fence line.
-        let body_start = after_fence
-            .find('\n')
-            .map(|i| 3 + i + 1)
-            .unwrap_or(3);
-        let body = &raw[fence_start + body_start..];
-        // Find a closing fence; if absent, take to EOF (truncation salvage).
-        let body_end = body.find("```").unwrap_or(body.len());
-        let payload = &body[..body_end];
-        if payload.contains('{') || payload.contains('[') {
-            return Some(payload.to_string());
-        }
-    }
-
-    // 2. Bare JSON: first `{` ... last `}` (or `[` ... `]`). Using LAST closer
-    //    captures the fullest span even if the model emitted trailing prose.
-    //    If there's no closer (truncation), slice to EOF from the opener.
-    if let Some(brace_start) = raw.find('{') {
-        let span = match raw.rfind('}') {
-            Some(brace_end) if brace_end > brace_start => &raw[brace_start..=brace_end],
-            _ => &raw[brace_start..], // no closer → to EOF; json_repair caps it
-        };
-        return Some(span.to_string());
-    }
-    if let Some(bracket_start) = raw.find('[') {
-        let span = match raw.rfind(']') {
-            Some(bracket_end) if bracket_end > bracket_start => &raw[bracket_start..=bracket_end],
-            _ => &raw[bracket_start..],
-        };
-        return Some(span.to_string());
-    }
-
-    None
-}
-
-/// True iff `json_span` carries the `sim_draft` signature — evidence it's a
-/// draft-update payload, not arbitrary JSON the model happened to emit. The
-/// signature is the `updates` wrapper key OR any `set_`/`add_`/`set_locations`
-/// DraftUpdate type tag. Conservative: avoids mis-claiming unrelated JSON.
-fn has_sim_draft_signature(json_span: &str) -> bool {
-    json_span.contains("\"updates\"")
-        || json_span.contains("\"type\": \"set_")
-        || json_span.contains("\"type\":\"set_")
-        || json_span.contains("\"type\": \"add_")
-        || json_span.contains("\"type\":\"add_")
-        || json_span.contains("\"type\": \"set_locations\"")
-        // Unquoted-key form (the model sometimes omits quotes on `type`).
-        || json_span.contains("type:set_")
-        || json_span.contains("type:add_")
-}
-
 /// Parse a single tool's args span as JSON, falling back to a string carrier
 /// on failure. We do NOT silently drop the call: a malformed-args tool call is
 /// exactly the case the 3-pass repair loop is designed to handle, and dropping
@@ -299,33 +183,6 @@ fn parse_args_lenient(span: &str) -> serde_json::Value {
             // surface a helpful error to the repair loop.
             serde_json::json!({ "raw": trimmed })
         }
-    }
-}
-
-/// Normalize a `sim_draft` argument value into a flat `Vec` of update objects,
-/// tolerating three shapes the local 12B may emit (Gemini's robustness
-/// backstop, §11.17). We never burn prompt tokens begging for a specific outer
-/// wrapper — Rust absorbs the variation:
-///
-///   1. Standard:   `{"updates": [...]}`
-///   2. Bare array: `[{"type":"set_field",...}, ...]`
-///   3. Single obj: `{"type":"set_locations", ...}` (no `updates` wrapper)
-///
-/// Returns owned `Vec<Value>` (cloned) so callers can `serde_json::from_value`
-/// each element without borrowing the input. Errors only when none of the
-/// three shapes match — the caller surfaces that to the repair loop.
-fn normalize_updates_args(args: &serde_json::Value) -> Result<Vec<serde_json::Value>, ToolError> {
-    if let Some(arr) = args.get("updates").and_then(|v| v.as_array()) {
-        Ok(arr.clone())
-    } else if let Some(arr) = args.as_array() {
-        Ok(arr.clone())
-    } else if args.is_object() && args.get("type").is_some() && args.get("updates").is_none() {
-        // A bare DraftUpdate object (has "type", no "updates" wrapper).
-        Ok(vec![args.clone()])
-    } else {
-        Err(ToolError::new(
-            "expected {\"updates\":[...]} OR a single update object OR a bare array",
-        ))
     }
 }
 
@@ -537,15 +394,6 @@ pub struct ToolCtx {
     /// (NOT `tokio::sync`). Default `None` → test/standalone unaffected; the
     /// `set_directive` tool errors gracefully if invoked without a slot.
     pub directive_slot: Option<Arc<std::sync::Mutex<Option<String>>>>,
-    /// The interview draft slot (the `sim_draft` tool's write target). A clone
-    /// of `AppState::interview_draft` (`Arc<Mutex<Option<InterviewDraft>>>`).
-    /// The `sim_draft` tool locks it, takes the `InterviewDraft`, applies a
-    /// batch of updates atomically, puts it back. `None` outside an interview
-    /// → `sim_draft` errors gracefully (defensive: the tool spec says
-    /// interview-only, but a model could still emit it). The scribe orchestrator
-    /// in lib.rs snapshots the draft before the agent loop, then reads it again
-    /// after to compute the diff → `interview-fact` events to the frontend.
-    pub interview_draft: Option<Arc<std::sync::Mutex<Option<crate::interview_draft::InterviewDraft>>>>,
 }
 
 impl ToolCtx {
@@ -554,7 +402,6 @@ impl ToolCtx {
             install_root,
             codex_dirty: None,
             directive_slot: None,
-            interview_draft: None,
         }
     }
     /// Attach the shared codex-dirty flag (called once per chat_send from
@@ -569,17 +416,6 @@ impl ToolCtx {
     /// drains the slot into `state.pending_directive`.
     pub fn with_directive_slot(mut self, slot: Arc<std::sync::Mutex<Option<String>>>) -> Self {
         self.directive_slot = Some(slot);
-        self
-    }
-    /// Attach the interview draft slot (called once per interview_send scribe
-    /// turn from lib.rs, before the agent loop iterates). The `sim_draft` tool
-    /// locks + applies updates here; the orchestrator snapshots before + reads
-    /// after to compute the diff for `interview-fact` events.
-    pub fn with_interview_draft(
-        mut self,
-        draft: Arc<std::sync::Mutex<Option<crate::interview_draft::InterviewDraft>>>,
-    ) -> Self {
-        self.interview_draft = Some(draft);
         self
     }
     /// Resolve a sandboxed relative path against the install root.
@@ -644,16 +480,6 @@ pub fn fable_registry() -> Vec<Box<dyn Tool>> {
     vec![Box::new(GenerateOptions), Box::new(SetDirective)]
 }
 
-/// The interview-only tools (the "Scribe" suite): `sim_draft` applies a batch
-/// of incremental updates to the in-progress `InterviewDraft`. Attached to the
-/// agent loop ONLY during a New Game interview scribe turn (`interview_send`
-/// gates this in lib.rs) — invisible to the model outside an interview.
-/// Disjoint from `registry()` and `fable_registry()` (test-pinned like
-/// `fable_registry_specs_disjoint_from_main_registry`).
-pub fn interview_registry() -> Vec<Box<dyn Tool>> {
-    vec![Box::new(SimDraft)]
-}
-
 /// The full tool spec list, ready to hand to `Gemma4Format::render_prompt`.
 pub fn specs() -> Vec<ToolSpec> {
     registry().iter().map(|t| t.spec()).collect()
@@ -663,12 +489,6 @@ pub fn specs() -> Vec<ToolSpec> {
 /// when a Fable session is active (lib.rs).
 pub fn fable_specs() -> Vec<ToolSpec> {
     fable_registry().iter().map(|t| t.spec()).collect()
-}
-
-/// The interview-only tool spec list. `interview_send` passes these to the
-/// scribe's agent loop (lib.rs) so the Scribe can emit `sim_draft` calls.
-pub fn interview_specs() -> Vec<ToolSpec> {
-    interview_registry().iter().map(|t| t.spec()).collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -1440,121 +1260,6 @@ impl Tool for SetDirective {
     }
 }
 
-// --- sim_draft (Scribe tool for the New Game interview) --------------------
-
-/// The Scribe's only tool. Called by the local Gemma 12B scribe after each GM
-/// turn during a New Game interview: extracts facts from the conversation +
-/// emits a batched `{updates: [...]}` that this tool applies to the in-progress
-/// `InterviewDraft` (held in `AppState::interview_draft`).
-///
-/// **Single batched tool per scribe turn** (not granular per-field tools): the
-/// §11.26 finding (Gemma 12B emits unquoted JSON keys, validation failures
-/// WILL happen) made granular tools fragile — one bigger call survives the
-/// 3-pass repair loop better than many small ones. The batch is atomic
-/// (`InterviewDraft::apply_updates` validates the whole batch before any
-/// mutation; one bad update rejects the whole batch, leaving the draft clean).
-///
-/// The tool does NOT emit UI events — the orchestrator in lib.rs snapshots the
-/// draft before the agent loop, reads it after, and emits the diff as
-/// `app.emit("interview-fact", ...)` events to the frontend's preview panel.
-struct SimDraft;
-impl Tool for SimDraft {
-    fn spec(&self) -> ToolSpec {
-        ToolSpec {
-            name: "sim_draft".into(),
-            description: "Apply a batch of incremental updates to the building SimCard draft. \
-                          Called by the Scribe after each GM turn during a New Game interview. \
-                          \
-                          Argument: {\"updates\": [{...}, {...}]}. \
-                          Each update is one of: \
-                          {\"type\":\"set_field\",\"field\":\"name|setting|tone|opening_scene|player_name|core_persona\",\"value\":\"...\"}, \
-                          {\"type\":\"add_trait\",\"value\":\"- Measured.\"}, \
-                          {\"type\":\"add_npc\",\"id\":\"mara_the_innkeep\"}, \
-                          {\"type\":\"add_activity\",\"value\":\"conversation\"}, \
-                          {\"type\":\"add_entity\",\"key\":\"loc.tavern\",\"state\":\"warm, half-full\"}, \
-                          {\"type\":\"set_player_background\",\"value\":\"a traveling herbalist\"}, \
-                          {\"type\":\"set_starting_condition\",\"value\":\"exhausted from the road\"}, \
-                          {\"type\":\"set_locations\",\"nodes\":[{\"id\":\"tavern\",\"name\":\"The Rusty Lantern\",\"setting\":\"indoor\",\"neighbors\":[\"cellar\",\"market\"]},...]}. \
-                          (the WHOLE travel graph in one call — idempotent overwrite; 2-6 nodes; first node is where the player starts; EACH side of an edge must list the other: tavern lists cellar AND cellar lists tavern). \
-                          \
-                          Extract ONLY what the player/GM established; never invent facts. \
-                          Return: a short summary of what was applied.".into(),
-        }
-    }
-    fn validate_args(&self, args: &serde_json::Value) -> Result<(), ToolError> {
-        let updates = normalize_updates_args(args)?;
-        if updates.is_empty() {
-            return Err(ToolError::new("`updates` must not be empty"));
-        }
-        if updates.len() > 40 {
-            return Err(ToolError::new("too many updates (>40); split across turns"));
-        }
-        // Smoke-deserialize each update so `execute` can't fail on a shape
-        // error. Detailed per-field validation happens in
-        // `InterviewDraft::apply_updates`.
-        for (i, u) in updates.iter().enumerate() {
-            serde_json::from_value::<crate::interview_draft::DraftUpdate>(u.clone())
-                .map_err(|e| ToolError::new(format!("updates[{i}] invalid: {e}")))?;
-        }
-        Ok(())
-    }
-    fn execute(&self, args: &serde_json::Value, ctx: &ToolCtx) -> Result<String, ToolError> {
-        let Some(slot) = &ctx.interview_draft else {
-            // No slot = no interview. Defensive: the spec says interview-only.
-            return Err(ToolError::new(
-                "no interview draft available (not in a New Game interview?)",
-            ));
-        };
-        // Re-derive the updates Vec via the same normalization validate_args
-        // used (so the structural tolerance round-trips cleanly — a single-
-        // update or bare-array call validated above executes identically here).
-        let updates_val = normalize_updates_args(args)?;
-        let mut updates: Vec<crate::interview_draft::DraftUpdate> = Vec::with_capacity(updates_val.len());
-        for u in updates_val {
-            updates.push(
-                serde_json::from_value(u.clone())
-                    .map_err(|e| ToolError::new(format!("re-parse failed (bug): {e}")))?,
-            );
-        }
-        let count = updates.len();
-        let mut g = slot
-            .lock()
-            .map_err(|_| ToolError::new("interview draft slot poisoned"))?;
-        let draft_opt = g.take();
-        let mut draft = draft_opt.unwrap_or_default();
-        // apply_updates validates the whole batch before mutating; on failure
-        // we put the unchanged draft back so the preview stays consistent.
-        match draft.apply_updates(updates) {
-            Ok(()) => {
-                // Build a short human-readable summary of the new state.
-                let summary = format!(
-                    "applied {} update{}; draft now {}% complete ({})",
-                    count,
-                    if count == 1 { "" } else { "s" },
-                    draft.completion_pct(),
-                    if draft.is_finalizable() {
-                        "finalizable"
-                    } else {
-                        "missing: "
-                    }
-                );
-                let summary = if draft.is_finalizable() {
-                    summary
-                } else {
-                    format!("{}{}", summary, draft.missing_required().join(", "))
-                };
-                *g = Some(draft);
-                Ok(summary)
-            }
-            Err(e) => {
-                // Put the unchanged draft back, return the model-facing error.
-                *g = Some(draft);
-                Err(ToolError::new(format!("batch rejected: {e}")))
-            }
-        }
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -1668,108 +1373,6 @@ mod tests {
         // `path: broken` — `broken` isn't a valid JSON token → unrepairable.
         assert_eq!(calls[0].args["raw"], "{path: broken}");
     }
-
-    // --- normalize_updates_args: structural tolerance (Gemini's backstop) ---
-
-    #[test]
-    fn normalize_accepts_standard_updates_wrapper() {
-        let args = serde_json::json!({"updates": [{"type":"add_npc","id":"a"}]});
-        let v = normalize_updates_args(&args).unwrap();
-        assert_eq!(v.len(), 1);
-    }
-
-    #[test]
-    fn normalize_accepts_bare_array() {
-        let args = serde_json::json!([{"type":"add_npc","id":"a"},{"type":"add_npc","id":"b"}]);
-        let v = normalize_updates_args(&args).unwrap();
-        assert_eq!(v.len(), 2);
-    }
-
-    #[test]
-    fn normalize_accepts_single_update_object() {
-        // A bare DraftUpdate with no `updates` wrapper.
-        let args = serde_json::json!({"type":"set_locations","nodes":[{"id":"x","name":"X","neighbors":[],"setting":""}]});
-        let v = normalize_updates_args(&args).unwrap();
-        assert_eq!(v.len(), 1);
-        assert_eq!(v[0]["type"], "set_locations");
-    }
-
-    #[test]
-    fn normalize_rejects_unrecognized_shape() {
-        let args = serde_json::json!({"foo":"bar"});
-        assert!(normalize_updates_args(&args).is_err());
-        // A string or number isn't any of the three shapes.
-        assert!(normalize_updates_args(&serde_json::json!("hello")).is_err());
-        assert!(normalize_updates_args(&serde_json::json!(42)).is_err());
-    }
-
-    // --- parse_scribe_calls: the greedy extractor (Gemini Option 3) ---
-
-    /// Primary path passes through: a proper WUPI-tag call is extracted by the
-    /// primary path (the fallback must not double-claim or interfere).
-    #[test]
-    fn scribe_greedy_primary_tag_path_passes_through() {
-        let raw = "<|tool_call>call:sim_draft{\"updates\":[{\"type\":\"add_npc\",\"id\":\"a\"}]}<tool_call|>";
-        let calls = parse_scribe_calls(raw);
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].name, "sim_draft");
-    }
-
-    /// The 2026-07-29 dominant failure: the model emits PERFECT JSON but
-    /// wrapped in a ```json fence with NO <|tool_call> marker. The greedy
-    /// fallback must synthesize a sim_draft call from the fenced block.
-    #[test]
-    fn scribe_greedy_recovers_fenced_json_with_no_marker() {
-        let raw = "<|channel>thought\n<channel|>```json\n{\n  \"updates\": [\n    {\"type\":\"set_field\",\"field\":\"name\",\"value\":\"The Mossy Gate\"}\n  ]\n}\n```";
-        let calls = parse_scribe_calls(raw);
-        assert_eq!(calls.len(), 1, "fenced JSON with sim_draft signature must be claimed");
-        assert_eq!(calls[0].name, "sim_draft");
-        assert!(calls[0].args.get("raw").is_none(), "args parsed, not carried as raw");
-        assert!(calls[0].args.get("updates").is_some(), "updates wrapper recovered");
-    }
-
-    /// EOF salvage (truncated closer): the <|tool_call> opener exists but the
-    /// model hit max_tokens before <tool_call|>. Slice from { to EOF + repair.
-    #[test]
-    fn scribe_greedy_eof_salvage_truncated_closer() {
-        // No closer, raw cut off mid-array. json_repair must close the brackets.
-        let raw = "<|tool_call>call:sim_draft{updates:[{\"type\":\"add_npc\",\"id\":\"a\"},{\"type\":\"add_npc\",\"id\":\"b\"";
-        let calls = parse_scribe_calls(raw);
-        assert_eq!(calls.len(), 1, "truncated opener must be salvaged to EOF");
-        assert_eq!(calls[0].name, "sim_draft");
-        // The repaired args should yield a parseable updates array.
-        let updates = calls[0].args.get("updates").and_then(|v| v.as_array());
-        assert!(updates.is_some(), "json_repair closed the dangling brackets");
-    }
-
-    /// A fenced block WITHOUT the sim_draft signature is NOT claimed — the
-    /// fallback is scoped to draft payloads, not arbitrary JSON. This is the
-    /// safety gate that keeps the greedy path from over-claiming.
-    #[test]
-    fn scribe_greedy_ignores_unrelated_fenced_json() {
-        let raw = "Here's some config:\n```json\n{\"version\": \"1.0\", \"name\": \"not a draft\"}\n```";
-        let calls = parse_scribe_calls(raw);
-        assert!(calls.is_empty(), "non-sim_draft JSON must not be claimed");
-    }
-
-    /// Pure prose with no JSON yields zero calls (the no-op path).
-    #[test]
-    fn scribe_greedy_no_json_yields_empty() {
-        assert!(parse_scribe_calls("Just a normal conversational reply.").is_empty());
-        assert!(parse_scribe_calls("").is_empty());
-    }
-
-    /// Bare JSON (no fence, no marker) carrying the signature is also claimed —
-    /// the model sometimes emits a raw object with no markdown wrapping at all.
-    #[test]
-    fn scribe_greedy_recovers_bare_json_with_signature() {
-        let raw = "Sure! {\"updates\":[{\"type\":\"set_locations\",\"nodes\":[{\"id\":\"x\",\"name\":\"X\",\"neighbors\":[],\"setting\":\"\"}]}]}";
-        let calls = parse_scribe_calls(raw);
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].name, "sim_draft");
-    }
-
-
     // === sandbox_path =======================================================
 
     #[test]
@@ -2043,109 +1646,6 @@ mod tests {
         for s in fable_specs() {
             assert!(!main.contains(&s.name), "fable tool {} also in main registry", s.name);
         }
-    }
-
-    #[test]
-    fn interview_registry_includes_sim_draft() {
-        let names: Vec<String> = interview_specs().iter().map(|s| s.name.clone()).collect();
-        assert!(names.contains(&"sim_draft".to_string()), "have: {names:?}");
-    }
-
-    #[test]
-    fn interview_registry_disjoint_from_main_and_fable() {
-        // sim_draft must never collide with main-registry tools (file_read,
-        // create_sim_card, ...) NOR fable-registry tools (generate_options,
-        // set_directive). Three disjoint suites.
-        let main: std::collections::HashSet<String> =
-            specs().iter().map(|s| s.name.clone()).collect();
-        let fable: std::collections::HashSet<String> =
-            fable_specs().iter().map(|s| s.name.clone()).collect();
-        for s in interview_specs() {
-            assert!(!main.contains(&s.name), "interview tool {} also in main registry", s.name);
-            assert!(!fable.contains(&s.name), "interview tool {} also in fable registry", s.name);
-        }
-    }
-
-    #[test]
-    fn sim_draft_rejects_missing_slot() {
-        // No interview_draft attached → graceful error (defensive; the tool
-        // spec says interview-only, but a model could still emit it).
-        let ctx = ToolCtx::new(PathBuf::from("/tmp"));
-        let err = SimDraft.execute(
-            &args(r#"{"updates":[{"type":"add_trait","value":"x"}]}"#),
-            &ctx,
-        )
-        .unwrap_err();
-        assert!(err.message.contains("interview draft"));
-    }
-
-    #[test]
-    fn sim_draft_rejects_empty_updates() {
-        let err = SimDraft
-            .validate_args(&args(r#"{"updates":[]}"#))
-            .unwrap_err();
-        assert!(err.message.contains("empty"));
-    }
-
-    #[test]
-    fn sim_draft_rejects_bad_update_shape() {
-        // Unknown `type` discriminator → serde fails the smoke-deserialize.
-        let err = SimDraft
-            .validate_args(&args(
-                r#"{"updates":[{"type":"set_hit_points","value":50}]}"#,
-            ))
-            .unwrap_err();
-        assert!(err.message.contains("updates[0]"));
-    }
-
-    #[test]
-    fn sim_draft_applies_valid_batch_to_draft_slot() {
-        use crate::interview_draft::InterviewDraft;
-        let slot: Arc<std::sync::Mutex<Option<InterviewDraft>>> =
-            Arc::new(std::sync::Mutex::new(Some(InterviewDraft::default())));
-        let ctx = ToolCtx::new(PathBuf::from("/tmp")).with_interview_draft(slot.clone());
-        let out = SimDraft
-            .execute(
-                &args(
-                    r#"{"updates":[
-                        {"type":"set_field","field":"name","value":"The Neon Dragon"},
-                        {"type":"set_field","field":"setting","value":"3 AM in the arcology."},
-                        {"type":"add_npc","id":"vex"}
-                    ]}"#,
-                ),
-                &ctx,
-            )
-            .unwrap();
-        assert!(out.contains("applied 3 updates"));
-        let g = slot.lock().unwrap();
-        let draft = g.as_ref().unwrap();
-        assert_eq!(draft.name.as_deref(), Some("The Neon Dragon"));
-        assert!(draft.start_npc_ids.contains(&"vex".to_string()));
-    }
-
-    #[test]
-    fn sim_draft_rejects_atomic_on_partial_invalid() {
-        use crate::interview_draft::InterviewDraft;
-        let slot: Arc<std::sync::Mutex<Option<InterviewDraft>>> =
-            Arc::new(std::sync::Mutex::new(Some(InterviewDraft::default())));
-        let ctx = ToolCtx::new(PathBuf::from("/tmp")).with_interview_draft(slot.clone());
-        // Valid update + invalid (unknown field) → whole batch rejects,
-        // draft untouched.
-        let err = SimDraft
-            .execute(
-                &args(
-                    r#"{"updates":[
-                        {"type":"set_field","field":"name","value":"X"},
-                        {"type":"set_field","field":"bogus","value":"Y"}
-                    ]}"#,
-                ),
-                &ctx,
-            )
-            .unwrap_err();
-        assert!(err.message.contains("batch rejected"));
-        let g = slot.lock().unwrap();
-        let draft = g.as_ref().unwrap();
-        assert!(draft.name.is_none(), "atomic: valid update did NOT apply");
     }
 
     #[test]

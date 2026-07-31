@@ -1,9 +1,16 @@
 // =============================================================
-// SCREEN: PICKER — the card grid (New Game / Continue / Load entry).
+// SCREEN: PICKER — the "pick a world" step of the New Game flow.
+//
+// New Game is now a simple card picker (no interview): list the shipped
+// `.sim` cards, pick one, go straight into the stage at a fresh game.
+// Mirrors the Load flow's worlds.js (same FableCardMeta shape, same
+// .fable-card-grid CSS) but lists EVERY card (not just cards with saves)
+// and its onSelect starts a fresh game rather than resuming a save.
+//
 // Reads FableCardMeta from fable_cards_list:
-//   { id, name, tone, opening_scene_preview, setting_preview,
-//     protagonist_name, has_saves }
-// Empty state points the user at apps/fable/cards/.
+//   { id, name, card_type, setting_preview, tone,
+//     opening_scene_preview, player_name, has_saves }
+// Select a card → handlers.onSelect(card).
 // =============================================================
 
 import { invoke } from '@tauri-apps/api/core';
@@ -21,16 +28,17 @@ export function buildPicker(handlers) {
   root.innerHTML = `
     <header class="fable-screen-header">
       <button class="fable-back-btn" data-act="back">‹ Back</button>
-      <h2 class="fable-screen-title">Choose a World</h2>
+      <h2 class="fable-screen-title">New Game</h2>
     </header>
     <div class="fable-card-grid" data-host></div>
   `;
   root.querySelector('[data-act="back"]').addEventListener('click', () => handlers.back());
-  root.querySelector('[data-host]');
   return root;
 }
 
-export async function renderCards(root, mode, onSelect, onAuthorNew) {
+// Populate the grid. Called each time the screen is shown. `onSelect`
+// receives the chosen FableCardMeta (fable.js starts a fresh game from it).
+export async function renderPicker(root, onSelect) {
   const host = root.querySelector('[data-host]');
   host.innerHTML = '';
   let cards = [];
@@ -40,38 +48,33 @@ export async function renderCards(root, mode, onSelect, onAuthorNew) {
     host.innerHTML = `<div class="fable-card-empty">Couldn't load cards: ${esc(err)}</div>`;
     return;
   }
-  // "Author New World" tile: shown only in 'new' mode (the New Game entry).
-  // Routes to the interview flow (Phase 4b/4d).
-  if (mode === 'new' && onAuthorNew) {
-    const el = document.createElement('button');
-    el.className = 'fable-card fable-card-author';
-    el.innerHTML = `
-      <div class="fable-card-name">+ Author a New World</div>
-      <div class="fable-card-preview">Answer a few questions and Wupi will weave you a scenario from scratch.</div>
-    `;
-    el.addEventListener('click', () => onAuthorNew());
-    host.appendChild(el);
-  }
-  if (!cards.length && !(mode === 'new' && onAuthorNew)) {
+  if (!cards.length) {
     host.innerHTML = `<div class="fable-card-empty">
-      <p>No scenario cards found.</p>
-      <p class="fable-card-empty-hint">Drop <code>.sim</code> files into <code>apps/fable/cards/</code>, or use <strong>New Game → Author a New World</strong>.</p>
+      <p>No scenario cards installed.</p>
+      <p class="fable-card-empty-hint">Drop a <code>.sim</code> file into the cards folder to begin.</p>
     </div>`;
     return;
   }
   for (const card of cards) {
-    const el = document.createElement('button');
-    el.className = 'fable-card';
-    el.innerHTML = `
+    const tile = document.createElement('button');
+    tile.className = 'fable-card';
+    tile.type = 'button';
+    const toneLine = card.tone
+      ? `<div class="fable-card-tone">${esc(card.tone)}</div>`
+      : '';
+    const playerLine = card.player_name
+      ? `<span>${esc(card.player_name)}</span>`
+      : '<span>—</span>';
+    tile.innerHTML = `
       <div class="fable-card-name">${esc(card.name)}</div>
-      ${card.tone ? `<div class="fable-card-tone">${esc(card.tone)}</div>` : ''}
-      <div class="fable-card-preview">${esc(card.opening_scene_preview || card.setting_preview || '')}</div>
+      ${toneLine}
+      <div class="fable-card-preview">${esc(card.setting_preview || card.opening_scene_preview || '')}</div>
       <div class="fable-card-foot">
-        <span>${card.protagonist_name ? esc(card.protagonist_name) : 'User'}</span>
-        ${card.has_saves ? '<span class="fable-card-continue-badge">● saved</span>' : ''}
+        ${playerLine}
+        <span class="fable-card-continue-badge">${card.has_saves ? 'has saves' : 'new'}</span>
       </div>
     `;
-    el.addEventListener('click', () => onSelect(card));
-    host.appendChild(el);
+    tile.addEventListener('click', () => onSelect(card));
+    host.appendChild(tile);
   }
 }

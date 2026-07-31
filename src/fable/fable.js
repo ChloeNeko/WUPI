@@ -20,10 +20,11 @@
 //              destroyed, music removed, chrome restored, OS aurora resumed,
 //              fable_end IPC sent. Nothing survives the close.
 //
-// MENU STATE: all 4 title flows are now wired.
-//   New Game / Quick Play → interview authoring (interview.js / void.js).
-//   Continue              → resume the freshest New Game save (resumeSave).
-//   Load                  → two-level picker: worlds.js → saves.js → resume.
+// MENU STATE: all 3 title flows are wired.
+//   New Game → card picker (screens/picker.js): pick a shipped .sim → straight
+//              into the stage at a fresh game (no interview).
+//   Continue → resume the freshest save (resumeSave).
+//   Load     → two-level picker: worlds.js → saves.js → resume.
 // The working stage + gameplay engine (stage.js, engine/*, fx/*, panels/*)
 // are the destination of every flow.
 // =============================================================
@@ -34,8 +35,7 @@ import './fable.css';
 
 import { buildTitle } from './screens/title.js';
 import { buildStage, wireStage, teardownStage, toast } from './screens/stage.js';
-import { buildVoid, wireVoid, teardownVoid } from './screens/void.js';
-import { buildInterview, wireInterview, teardownInterview } from './screens/interview.js';
+import { buildPicker, renderPicker } from './screens/picker.js';
 import { buildWorlds, renderWorlds } from './screens/worlds.js';
 import { buildSaves, renderSaves } from './screens/saves.js';
 import {
@@ -80,127 +80,32 @@ function showScreen(name) {
   stageActive = (name === 'stage' && !!screens.stage);
 }
 
-// === Quick Play flow (the live authoring path, 2026-07-26) ================
-//
-// Clicking Quick Play on the title screen kicks off the interview-based
-// authoring flow:
-//   - No quicksave exists  → straight into the void interview.
-//   - Quicksave exists     → inline Resume / Start New choice on the title.
-//       Resume    → load the quicksave, enter the stage (magical transition).
-//       Start New → wipe the old quicksave (fable_quick_reset), then interview.
-//
-// The void interview (screens/void.js) is a pure-black infinite-space
-// surface where the user is greeted by fading large text, then asked four
-// fixed questions one at a time (character / setting / plot / extra). The
-// questions fade in/out like magic; the user types + hits Enter (no send
-// button — Enter only, per Chloe's directive). After the last answer the
-// UI disappears and the user sits in the void while the backend runs a
-// SINGLE interview_generate call that produces three tagged blocks: a
-// <sim_card>, a <world_schema>, and a <player_state>. On done, fable_quick_start
-// seats the card + seeds the schema/player state (no .sim on disk; the
-// card is bundled inside the quicksave) → the void fades to black → the
-// stage is revealed with the card's opening scene as the first narrator beat.
-//
-// The interview is MEMORYLESS server-side (interview_generate archives
-// nothing), so the conversation disappears the moment the user begins — by
-// construction, not by erasure. Quick Play is single-slot quicksave only:
-// the manual Save + Load footer buttons are disabled in the stage (driven
-// by isQuickPlay), and starting a new Quick Play wipes the old quicksave +
-// memory entirely.
-//
-// New Game is wired (its dedicated interview is live). Continue resumes the
-// freshest New Game save; Load opens the worlds → saves picker. Both feed
-// into resumeSave (mirrors quickPlayResume but for durable .sim worlds).
-
 // Track whether the engine started for the current stage session, so
 // returnToTitle knows whether to call fable_end (no-op call is wasteful +
 // noisy in logs). Reset to false whenever we leave the stage.
 let engineStarted = false;
 
-// Track whether the current stage session is a Quick Play session, so
-// returnToTitle + closeFable know whether to call teardownVoid (only the
-// Quick Play path enters the void; the manual-card path doesn't). Also
-// drives the wireStage isQuickPlay flag for Save/Load disabling.
-let inQuickPlay = false;
-// Track whether we're currently in the void interview, so closeFable can
-// tear it down cleanly on EXIT mid-interview.
-let inVoid = false;
-// Track whether we're currently in the New Game interview, so closeFable +
-// returnToTitle can tear it down cleanly on EXIT mid-chat. Mirrors inVoid.
-let inInterview = false;
-
-// The Quick Play button on the title screen. Branches on whether a quicksave
-// exists (inline Resume/Start-New choice) or not (straight into the interview).
-async function onQuickPlayClicked() {
-  let exists = false;
-  try {
-    exists = await invoke('fable_quick_exists');
-  } catch (err) {
-    console.error('[fable] fable_quick_exists failed — assuming no quicksave', err);
-    exists = false;
-  }
-  if (exists) {
-    showQuickPlayChoiceOverlay({
-      onResume: quickPlayResume,
-      onStartNew: async () => {
-        try { await invoke('fable_quick_reset'); } catch (err) {
-          console.error('[fable] fable_quick_reset failed (continuing to interview)', err);
-        }
-        enterVoidInterview();
-      },
-    });
-  } else {
-    enterVoidInterview();
-  }
-}
-
-// Resume the existing quicksave: load it server-side, then enter the stage
-// via the magical transition. Mirrors the stage-entry tail (enterStageVia-
-// Transition) but uses fable_quick_resume + sets isQuickPlay.
-async function quickPlayResume() {
-  if (screens.title && screens.title._stopAmbient) screens.title._stopAmbient();
-  stopThemeMusic(fableRoot);
-  try { await invoke('fable_end'); } catch (_) {}
-
-  let openingScene = null;
-  let loadMessages = null;
-  try {
-    const result = await invoke('fable_quick_resume');
-    engineStarted = true;
-    inQuickPlay = true;
-    if (result && result.opening_scene) openingScene = result.opening_scene;
-    if (result && Array.isArray(result.messages) && result.messages.length) {
-      loadMessages = result.messages;
-    }
-  } catch (err) {
-    console.error('[fable] fable_quick_resume failed — entering stage without engine', err);
-    engineStarted = false;
-  }
-
-  enterStageViaTransition(openingScene, loadMessages, /* isQuickPlay */ true);
-}
-
-// === Continue / Load flow (New Game worlds) ===============================
+// === Continue / Load / New Game flows ====================================
 //
-// CONTINUE: resume the freshest save for ANY New Game world (the title's
-// _refreshContinue stashes the target from fable_continue_target). Quick Play
-// is excluded by the backend (it owns its own resume); autosaves are included
-// (the per-turn checkpoint is "where you left off"). The stashed target
-// carries both card_id + save_id, so this is a one-shot resume.
+// CONTINUE: resume the freshest save for ANY world (the title's
+// _refreshContinue stashes the target from fable_continue_target). Autosaves
+// are included (the per-turn checkpoint is "where you left off"). The stashed
+// target carries both card_id + save_id, so this is a one-shot resume.
 //
 // LOAD: a two-level picker — choose a world (screens/worlds.js), then choose
 // a save in that world (screens/saves.js). Both feed into resumeSave.
 //
-// resumeSave mirrors quickPlayResume's shape (stop ambient/music → fable_end →
-// load → enterStageViaTransition) but drives a New Game world via
-// fable_start(cardId, saveId), which re-reads the .sim from disk + resumes the
-// named slot. inQuickPlay stays false so the stage's manual Save/Load footer
-// stays enabled (correct for a durable New Game world, unlike single-slot
-// Quick Play).
+// NEW GAME: a one-level picker — choose a shipped .sim card
+// (screens/picker.js) → start a FRESH game from it. No interview, no draft.
+//
+// resumeSave mirrors the shared stage-entry tail (stop ambient/music →
+// fable_end → load → enterStageViaTransition) and drives a world via
+// fable_start(cardId, saveId), which re-reads the .sim from disk + resumes
+// the named slot.
 
-// Resume a named save for a New Game world. `cardId` resolves the .sim card;
-// `saveId` is the slot to resume. Cold-resume from the title (no game running
-// yet), so fable_start is the entry — NOT fable_load_save (that requires an
+// Resume a named save for a world. `cardId` resolves the .sim card; `saveId`
+// is the slot to resume. Cold-resume from the title (no game running yet),
+// so fable_start is the entry — NOT fable_load_save (that requires an
 // already-running game).
 async function resumeSave(cardId, saveId) {
   if (screens.title && screens.title._stopAmbient) screens.title._stopAmbient();
@@ -212,7 +117,6 @@ async function resumeSave(cardId, saveId) {
   try {
     const result = await invoke('fable_start', { cardId, saveId });
     engineStarted = true;
-    inQuickPlay = false;
     if (result && result.opening_scene) openingScene = result.opening_scene;
     if (result && Array.isArray(result.messages) && result.messages.length) {
       loadMessages = result.messages;
@@ -222,12 +126,12 @@ async function resumeSave(cardId, saveId) {
     engineStarted = false;
   }
 
-  enterStageViaTransition(openingScene, loadMessages, /* isQuickPlay */ false);
+  enterStageViaTransition(openingScene, loadMessages);
 }
 
 // CONTINUE button handler: resume the stashed continue target. The target is
 // refreshed on every title show via _refreshContinue (title.js); if it's null
-// (no New Game save exists) the button is disabled, so a null target here is a
+// (no save exists) the button is disabled, so a null target here is a
 // race/state bug — guard + log rather than crash.
 function onContinueClicked() {
   const target = (screens.title && screens.title._continueTarget) || null;
@@ -253,182 +157,41 @@ function openWorldSaves(card) {
   renderSaves(screens.saves, card.id, (save) => resumeSave(card.id, save.save_id), card.name);
 }
 
-// Enter the void interview: stop the title ambient + music, play the magical
-// transition, swap to the void screen at midpoint, wire it with the begin
-// callback that hands off to quickPlayBegin.
-function enterVoidInterview() {
-  if (screens.title && screens.title._stopAmbient) screens.title._stopAmbient();
-  stopThemeMusic(fableRoot);
-  try { invoke('fable_end').catch(() => {}); } catch (_) {}
-
-  inVoid = true;
-  playMagicalTransition({
-    onMidpoint: () => {
-      showScreen('void');
-      try {
-        if (screens.void) {
-          wireVoid(screens.void, { onBegin: quickPlayBegin });
-        }
-      } catch (e) {
-        console.error('[fable] wireVoid threw', e);
-      }
-    },
-  }).catch((e) => {
-    console.error('[fable] magical transition to void failed, jumping', e);
-    showScreen('void');
-    try {
-      if (screens.void) wireVoid(screens.void, { onBegin: quickPlayBegin });
-    } catch (e) { console.error('[fable] wireVoid threw on fallback', e); }
-  });
-}
-
-// === New Game flow (Phase D, 2026-07-28) =================================
-//
-// Clicking New Game on the title screen enters the interview-based authoring
-// flow (a richer, durable counterpart to Quick Play's void interview):
-//   - Stop the title ambient + music, end any prior engine session.
-//   - Play the magical transition; at midpoint swap to the interview screen
-//     + wire it (wireInterview kicks off interview_start + the opening GM
-//     turn + subscribes to the scribe's interview-fact events).
-//   - The interview's onFinalized hook (interviewFinalized below) fires
-//     after a successful interview_finalize: tear down the interview + swap
-//     to the stage with the loadResult (mirrors quickPlayBegin's structure).
-//
-// The interview screen (screens/interview.js) owns the live sim-card preview
-// (top), the GM chat feed (middle), and the compose + Begin button (bottom).
-// The detached scribe emits facts as they're extracted; the preview renders
-// them as they arrive. Begin commits the draft to a .sim file + hands off
-// to the stage with the seeded world/player state.
-
-// The New Game button handler. Mirrors onQuickPlayClicked's shape: stop
-// title ambient, play the magical transition, swap to the interview screen
-// at midpoint, wire it with the finalize callback.
+// NEW GAME button handler: show the card picker + populate it. Selecting a
+// card starts a FRESH game (no save slot) via startFreshGame.
 function onNewGameClicked() {
+  showScreen('picker');
+  renderPicker(screens.picker, (card) => startFreshGame(card.id));
+}
+
+// Start a fresh game from a card: stop the title ambient + music, end any
+// prior engine session, call fable_start with fresh:true (seats the card +
+// installs the fresh-game default world/player state), then enter the stage.
+async function startFreshGame(cardId) {
   if (screens.title && screens.title._stopAmbient) screens.title._stopAmbient();
   stopThemeMusic(fableRoot);
-  try { invoke('fable_end').catch(() => {}); } catch (_) {}
+  try { await invoke('fable_end'); } catch (_) {}
 
-  inInterview = true;
-  playMagicalTransition({
-    onMidpoint: () => {
-      showScreen('interview');
-      try {
-        if (screens.interview) {
-          wireInterview(screens.interview, { onFinalized: interviewFinalized });
-        }
-      } catch (e) {
-        console.error('[fable] wireInterview threw', e);
-      }
-    },
-  }).catch((e) => {
-    console.error('[fable] magical transition to interview failed, jumping', e);
-    showScreen('interview');
-    try {
-      if (screens.interview) {
-        wireInterview(screens.interview, { onFinalized: interviewFinalized });
-      }
-    } catch (e) { console.error('[fable] wireInterview threw on fallback', e); }
-  });
-}
-
-// The interview's onFinalized callback. By the time this fires, the
-// interview screen has already faded to black + interview_finalize has
-// produced the FableLoadResult { meta, messages, opening_scene }. We tear
-// down the interview (cancel particles, drop the scribe listener, stop any
-// in-flight stream), then swap to the stage + wire it with the load result
-// (the swap is invisible — the interview's overlay is still dimming). The
-// stage is revealed as the overlay undims. Mirrors quickPlayBegin's tail.
-function interviewFinalized(loadResult) {
-  // Tear down the interview FIRST so its particles + scribe listener + the
-  // beats.js feed binding are released before the stage re-binds beats.
-  teardownInterview();
-  inInterview = false;
-
-  const openingScene = (loadResult && loadResult.opening_scene) || null;
-  const loadMessages = (loadResult && Array.isArray(loadResult.messages) && loadResult.messages.length)
-    ? loadResult.messages : null;
-
-  // A New Game is a fresh .sim on disk → NOT Quick Play. Save/Load stay
-  // enabled in the stage (the manual-card path).
-  engineStarted = true;
-  inQuickPlay = false;
-
-  // Swap to the stage INVISIBLY (the interview's overlay is still dimming).
-  // No second transition here — the interview's fade-to-black IS the handoff
-  // (mirrors quickPlayBegin).
-  showScreen('stage');
+  let openingScene = null;
+  let loadMessages = null;
   try {
-    if (screens.stage) {
-      wireStage(screens.stage, {
-        cardContext: null,
-        onExit: returnToTitle,
-        isQuickPlay: false,
-        openingScene,
-        loadMessages,
-      });
-    }
-  } catch (e) {
-    console.error('[fable] wireStage threw after interview finalize', e);
-  }
-}
-
-// The void's onBegin callback. By the time this fires, the void has already
-// faded to black + interview_generate has produced the card + the seeded
-// world/player state. fable_quick_start seats the card server-side
-// (overriding its id to the quickplay sentinel + wiping the prior quick
-// play's state + seeding the world schema + player state from the
-// generation output), then we swap to the stage + wire it (the swap is
-// invisible — the void's overlay is still up). The stage is revealed as
-// the void overlay undims.
-async function quickPlayBegin(card, worldSchema, playerState) {
-  let result = null;
-  try {
-    result = await invoke('fable_quick_start', {
-      card,
-      worldSchema: worldSchema || null,
-      playerState: playerState || null,
-    });
+    const result = await invoke('fable_start', { cardId, fresh: true });
     engineStarted = true;
-    inQuickPlay = true;
+    if (result && result.opening_scene) openingScene = result.opening_scene;
+    if (result && Array.isArray(result.messages) && result.messages.length) {
+      loadMessages = result.messages;
+    }
   } catch (err) {
-    console.error('[fable] fable_quick_start failed', err);
+    console.error('[fable] fable_start (new game) failed — entering stage without engine', err);
     engineStarted = false;
   }
-  // Tear down the void (cancel particles, drop interview history). The void
-  // DOM stays mounted (reused next Quick Play); only its runtime state goes.
-  teardownVoid();
-  inVoid = false;
 
-  const openingScene = (result && result.opening_scene) || null;
-  const loadMessages = (result && Array.isArray(result.messages) && result.messages.length)
-    ? result.messages : null;
-
-  // Swap to the stage INVISIBLY (the void's overlay is still dimming). No
-  // second transition here — the void's fade-to-black IS the handoff.
-  showScreen('stage');
-  try {
-    if (screens.stage) {
-      wireStage(screens.stage, {
-        cardContext: null,
-        onExit: returnToTitle,
-        isQuickPlay: true,
-        openingScene,
-        loadMessages,
-      });
-    }
-  } catch (e) {
-    console.error('[fable] wireStage threw after quick-start', e);
-  }
-  if (!engineStarted) {
-    try { toast('Simulation engine unavailable — chat will not respond.'); } catch (_) {}
-  }
+  enterStageViaTransition(openingScene, loadMessages);
 }
 
 // The shared "play the magical transition + swap to stage + wire it" tail.
-// Used by the Quick Play resume path. The fresh-interview path
-// (quickPlayBegin) skips this because the void's own fade-to-black is its
-// handoff (no second transition).
-function enterStageViaTransition(openingScene, loadMessages, isQuickPlay) {
+// Used by every start/resume path.
+function enterStageViaTransition(openingScene, loadMessages) {
   playMagicalTransition({
     onMidpoint: () => {
       showScreen('stage');
@@ -437,7 +200,6 @@ function enterStageViaTransition(openingScene, loadMessages, isQuickPlay) {
           wireStage(screens.stage, {
             cardContext: null,
             onExit: returnToTitle,
-            isQuickPlay: !!isQuickPlay,
             openingScene,
             loadMessages,
           });
@@ -457,59 +219,11 @@ function enterStageViaTransition(openingScene, loadMessages, isQuickPlay) {
         wireStage(screens.stage, {
           cardContext: null,
           onExit: returnToTitle,
-          isQuickPlay: !!isQuickPlay,
           openingScene,
           loadMessages,
         });
       }
     } catch (e) { console.error('[fable] wireStage threw on fallback', e); }
-  });
-}
-
-// ── Inline Quick Play choice overlay ───────────────────────────────────
-// A small centered modal on the title screen: "Resume your Quick Play?" +
-// two buttons (Resume / Start New). Esc + backdrop dismiss. Built transient
-// (appended to the title screen, removed on choice/dismiss).
-function showQuickPlayChoiceOverlay({ onResume, onStartNew }) {
-  if (!screens.title) { onResume && onResume(); return; }
-  // Remove any prior overlay (idempotent — defensive against a double-click).
-  const prior = screens.title.querySelector('.fable-quick-choice');
-  if (prior) prior.remove();
-
-  const overlay = document.createElement('div');
-  overlay.className = 'fable-quick-choice';
-  overlay.innerHTML = `
-    <div class="fable-quick-choice-backdrop"></div>
-    <div class="fable-quick-choice-modal">
-      <h2 class="fable-quick-choice-title">Resume your Quick Play?</h2>
-      <p class="fable-quick-choice-sub">A Quick Play save exists. Continue it, or start fresh (the old save will be erased).</p>
-      <div class="fable-quick-choice-actions">
-        <button class="fable-quick-choice-btn primary" data-qp-resume>Resume</button>
-        <button class="fable-quick-choice-btn ghost" data-qp-new>Start New</button>
-      </div>
-      <button class="fable-quick-choice-close" data-qp-close aria-label="Close">✕</button>
-    </div>
-  `;
-  screens.title.appendChild(overlay);
-
-  const close = () => overlay.remove();
-  const onKey = (e) => {
-    if (e.key === 'Escape') { close(); document.removeEventListener('keydown', onKey, true); }
-  };
-  document.addEventListener('keydown', onKey, true);
-  overlay.querySelector('.fable-quick-choice-backdrop').addEventListener('click', close);
-  overlay.querySelector('[data-qp-close]').addEventListener('click', () => {
-    close(); document.removeEventListener('keydown', onKey, true);
-  });
-  overlay.querySelector('[data-qp-resume]').addEventListener('click', () => {
-    document.removeEventListener('keydown', onKey, true);
-    overlay.remove();
-    onResume && onResume();
-  });
-  overlay.querySelector('[data-qp-new]').addEventListener('click', () => {
-    document.removeEventListener('keydown', onKey, true);
-    overlay.remove();
-    onStartNew && onStartNew();
   });
 }
 
@@ -525,19 +239,15 @@ async function returnToTitle() {
   // Shut down the FableEngine BEFORE teardown so the narrator thread is gone
   // by the time wireStage nulls its refs. fable_end persists the session +
   // schema per-card first (best-effort), then joins the engine thread +
-  // restores the pre-game active_card_id + resets is_quick_play server-side.
-  // Idempotent + safe if the engine never started (engineStarted gate avoids
-  // a needless IPC round-trip on the no-engine degrade path).
+  // restores the pre-game active_card_id server-side. Idempotent + safe if
+  // the engine never started (engineStarted gate avoids a needless IPC
+  // round-trip on the no-engine degrade path).
   if (engineStarted) {
     try { await invoke('fable_end'); } catch (e) {
       console.error('[fable] fable_end on return-to-title failed', e);
     }
     engineStarted = false;
   }
-  // Reset the Quick Play flag on the frontend mirror too. The Rust side
-  // resets it in fable_end; this keeps the two in sync so the next Quick
-  // Play (or a future manual-card game) starts from a known-clean state.
-  inQuickPlay = false;
   teardownStage();
   showScreen('title');
 }
@@ -572,20 +282,20 @@ function openFable() {
   if (hooks.pauseAurora) hooks.pauseAurora();
   showScreen('title');
 
-  // The ripple aura anchors on the Quick Play button; buttons reveal in
-  // order: Quick Play → New Game → Load → Continue → Exit.
+  // The ripple aura anchors on the New Game button; buttons reveal in
+  // order: New Game → Load → Continue → Exit.
   const q = (act) => screens.title ? screens.title.querySelector(`[data-act="${act}"]`) : null;
   const allButtons = screens.title
     ? Array.from(screens.title.querySelectorAll('.fable-title-btn'))
     : [];
-  const revealOrder = ['quickplay', 'new', 'load', 'continue', 'exit']
+  const revealOrder = ['new', 'load', 'continue', 'exit']
     .map(q)
     .filter(Boolean);
   currentBoot = playBootTransition({
     fableRoot,
     titleScreen: screens.title,
     musicHost: fableRoot,
-    rippleAnchorBtn: q('quickplay'),
+    rippleAnchorBtn: q('new'),
     allButtons,
     revealOrder,
   });
@@ -657,13 +367,6 @@ function closeFable() {
     // from a half-finished prior transition.
     if (currentBoot) { try { currentBoot.cancel(); } catch (_) {} currentBoot = null; }
     teardownStage();
-    // Tear down the void if the user EXITs mid-interview (the void screen's
-    // particles + listeners would leak otherwise). Safe no-op if not in void.
-    if (inVoid) { teardownVoid(); inVoid = false; }
-    // Tear down the New Game interview if the user EXITs mid-chat (its
-    // particles + scribe listener + in-flight stream would leak otherwise).
-    // Safe no-op if not in the interview.
-    if (inInterview) { teardownInterview(); inInterview = false; }
     // Stop the title ambient canvas systems (motes + grass) so their RAF +
     // listeners don't outlive the app (the load-bearing reset against the
     // relaunch bug).
@@ -680,9 +383,6 @@ function closeFable() {
   }
   invoke('fable_end').catch(() => {});
   engineStarted = false;  // mirror the Rust slot clear so returnToTitle's gate stays honest
-  inQuickPlay = false;    // reset the Quick Play flag on full close
-  inVoid = false;
-  inInterview = false;    // reset the New Game interview flag on full close
   stageActive = false;
   fableRoot.classList.remove('show');
   fableRoot.setAttribute('aria-hidden', 'true');
@@ -711,20 +411,15 @@ export function initFable(extHooks = {}) {
   fableRoot.setAttribute('aria-hidden', 'true');
   document.body.appendChild(fableRoot);
 
-  // Build the screens we use. New Game (interview) + Quick Play (void) +
-  // Continue/Load (worlds + saves pickers) are all wired; the stage stays
-  // built (teardownStage needs it on close too).
+  // Build the screens we use. New Game (picker) + Continue/Load
+  // (worlds + saves pickers) are all wired; the stage stays built
+  // (teardownStage needs it on close too).
   screens.title = buildTitle({
-    // NEW GAME (Phase D, 2026-07-28): the New Game interview screen is live.
-    // Routes through onNewGameClicked → magical transition → interview screen
-    // (GM conversation + live draft preview + finalize hand-off to stage).
+    // NEW GAME: the card picker — pick a shipped .sim → straight to the stage
+    // at a fresh game (no interview).
     new: () => onNewGameClicked(),
-    // QUICK PLAY is the live authoring flow: void interview → GM sketch →
-    // Begin → stage. Branches on whether a quicksave exists (inline choice)
-    // or not (straight into the interview).
-    quickplay: () => onQuickPlayClicked(),
-    // CONTINUE: resume the freshest New Game save (autosave-inclusive, Quick
-    // Play excluded by the backend). Target stashed by title._refreshContinue.
+    // CONTINUE: resume the freshest save (autosave-inclusive). Target stashed
+    // by title._refreshContinue.
     continue: () => onContinueClicked(),
     // LOAD: two-level picker — worlds screen → saves screen → resumeSave.
     load: () => onLoadClicked(),
@@ -733,10 +428,9 @@ export function initFable(extHooks = {}) {
     exit: () => AppLifecycle.closeApp('fable'),
   });
   screens.stage = buildStage();
-  screens.void = buildVoid();
-  screens.interview = buildInterview();
-  // The two-level Load picker. Both Back buttons return up the chain:
-  // saves → worlds → title. Hidden until the Load button is clicked.
+  // The New Game card picker + the two-level Load picker. All Back buttons
+  // return to the title. Hidden until their button is clicked.
+  screens.picker = buildPicker({ back: () => showScreen('title') });
   screens.worlds = buildWorlds({ back: () => showScreen('title') });
   screens.saves = buildSaves({ back: () => showScreen('worlds') });
   for (const s of Object.values(screens)) fableRoot.appendChild(s);

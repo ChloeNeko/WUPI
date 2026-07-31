@@ -1,6 +1,6 @@
 [package]
 name = "wupi"
-version = "0.13.2"
+version = "0.13.3"
 edition = "2021"
 
 [lib]
@@ -11,14 +11,22 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 # Phase 5B: local Stable Diffusion scene-image generation (wraps
 # leejet/stable-diffusion.cpp via newfla/diffusion-rs). OFF by default — the
 # NoopImageGenerator stub compiles instantly + exercises the full swap
-# pipeline; enabling this pulls in diffusion-rs + its ~20-40 min CUDA
-# compile. Declared now (as an empty feature) so the `#[cfg(feature =
-# "diffusion-rs")]` impl in scene_art.rs forward-compiles cleanly — Chloe's
-# build-safety procedure (docs/phase5b-diffusion-rs-cargo-procedure.md) adds
-# the optional dep + flips default_sd_backend()'s dispatch. Until then this
-# is a pure flag (no dependency pulled, no code enabled).
+# pipeline; enabling this with `--features diffusion-rs` pulls in the
+# diffusion-rs optional dep + its ~20-40 min one-time CUDA compile. Chloe's
+# build-safety procedure (docs/phase5b-diffusion-rs-cargo-procedure.md) owns
+# the isolated build + the risk flags to watch. The scene_art.rs
+# `#[cfg(feature = "diffusion-rs")]` impl + `default_sd_backend()` dispatch
+# are already wired; without this feature the stub path compiles in seconds.
 default = []
-diffusion-rs = []
+# `diffusion-rs-sys` is gated together with the high-level wrapper so a bare
+# `diffusion-rs = ["dep:diffusion-rs"]` pulls BOTH. We need `-sys` directly to
+# reach `ggml_set_abort_callback` — the symbol that lets us capture the
+# `GGML_ASSERT`/`GGML_ABORT` text inside gen_img BEFORE the uncatchable
+# `abort()` fires (§11.59). The high-level `diffusion-rs` crate does NOT
+# re-export `-sys`, and llama-cpp-sys's ggml is a SEPARATE statically-linked
+# copy (SD vendors its own ggml), so the callback MUST come from this crate.
+# See lib.rs::install_sd_abort_callback for the registration + rationale.
+diffusion-rs = ["dep:diffusion-rs", "dep:diffusion-rs-sys"]
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
@@ -73,6 +81,20 @@ tracing-appender = "0.2"
 #
 # See AGENTS.md §0 (stack), §2 (deps), §11.14 (AMD support).
 llama-cpp-2 = { version = "0.1.151", features = ["sampler", "cuda", "vulkan"] }
+# Phase 5B: local Stable Diffusion (wraps leejet/stable-diffusion.cpp). OFF
+# by default (see [features] above); enabled only with --features diffusion-rs.
+# Same toolchain shape as llama-cpp-2 (Ninja + CUDA_PATH + VULKAN_SDK from
+# .cargo/config.toml); vendors its OWN ggml (no symbol collision with llama's).
+# NOTE: it reads CUDA_COMPUTE_CAP (NOT LLAMA_CMAKE_CUDA_ARCHITECTURES) for its
+# CUDA arch target — set in .cargo/config.toml. The ~20-40 min CUDA compile is
+# isolated by Chloe's build-safety procedure (watch for a /DELAYLOAD:cublas64_13
+# linker interaction — see docs/phase5b-diffusion-rs-cargo-procedure.md).
+diffusion-rs = { version = "0.1.20", optional = true, features = ["cuda", "vulkan"] }
+# Direct dep on the -sys crate (the FFI bindings) so WUPI can call
+# `ggml_set_abort_callback` — the high-level `diffusion-rs` wrapper does not
+# re-export it. The version + features MUST match the high-level crate's
+# transitive `-sys` (Cargo unifies them — same source, single CUDA compile).
+diffusion-rs-sys = { version = "0.1.20", optional = true, features = ["cuda", "vulkan"] }
 encoding_rs = "0.8"
 # Memory engine (Phase 2). `bundled` compiles SQLite from the amalgamation →
 # FTS5 is guaranteed available on Windows without a system SQLite install.
@@ -123,3 +145,19 @@ windows-core = "0.58"
 [dev-dependencies]
 # Temp dirs for unit tests (game_save, etc.). Dev-only — not shipped in the exe.
 tempfile = "3"
+
+# ===========================================================================
+# §11.59 Bug B fix: vendored diffusion-rs-sys (GGUF architecture detection).
+# ===========================================================================
+# A ComfyUI-convention Q8 GGUF UNet stores ONLY diffusion-model tensors under
+# bare input_blocks.* names. sd.cpp's tensor-name-based version detection is a
+# CIRCULAR dependency for this layout (is_unet ← get_sd_version ← needs a CLIP
+# token_embedding that loads after the version check). The vendored copy at
+# vendor/diffusion-rs-sys patches model_loader.cpp to read the GGUF's
+# `general.architecture` metadata (="sdxl") and preset version_ BEFORE the
+# tensor scan, breaking the circle. build.rs is UNCHANGED (still Release —
+# matches llama-cpp-sys, so no LNK2038 RuntimeLibrary mismatch). Only the C++
+# source differs; the Rust + build.rs are unmodified 0.1.20. Requires the
+# ~20-40 min CUDA recompile on first build (Chloe runs it).
+[patch.crates-io]
+diffusion-rs-sys = { path = "vendor/diffusion-rs-sys" }

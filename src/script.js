@@ -2,6 +2,7 @@ import { invoke, Channel } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import { getVersion } from '@tauri-apps/api/app';
 import { initFable } from './fable/fable.js';
+import { initPrism } from './prism/prism.js';
 
 const canvas = document.getElementById('aurora-canvas');
 const ctx = canvas.getContext('2d');
@@ -3484,6 +3485,24 @@ const dropdownMenu = document.getElementById('dropdownMenu');
 // full-screen immersion stage + Simulation Narrative Engine become
 // reachable from the OS desktop for the first time.
 initFable({
+  pauseAurora: () => { paused = true; },
+  resumeAurora: () => { startLoop(); },
+  openHooks: windowOpenHooks,
+  closeHooks: windowCloseHooks,
+  closeWindow,
+});
+
+// === PRISM APP WIRING (2026-07-31) =====================================
+// initPrism builds the #prism app window, registers it with AppLifecycle
+// (onOpen/onClose/onPause/onResume), and bridges the OS window system to
+// the Prism launch — the same shape as initFable above. The hooks mirror
+// Fable's: pauseAurora/resumeAurora freeze the OS canvas RAF while the
+// full-screen Prism stage is up; openHooks/closeHooks bridge the OS
+// window-set bookkeeping; closeWindow lets Prism's own close paths keep
+// the openWindows set in sync. Prism reuses the shared SD swap core for
+// generation (run_sd_swap_core), so no new VRAM plumbing — just the app
+// shell + gallery + Tag Composer + Fork & Edit.
+initPrism({
   pauseAurora: () => { paused = true; },
   resumeAurora: () => { startLoop(); },
   openHooks: windowOpenHooks,

@@ -301,6 +301,40 @@ impl TravelGraph {
         };
         Some(format!("{} [{}] (exits: {})", cur.name, cur.id, exits_str))
     }
+
+    /// Dynamic world-seeding: insert a new node if its id isn't already
+    /// present, else no-op (idempotent — re-discovering an existing location
+    /// is not an error; the tracker may re-emit it). Back-links each named
+    /// neighbor: if a neighbor node already exists, add THIS node's id to its
+    /// `neighbors` (if not already there) so the graph stays undirected —
+    /// matching the rusty_tavern convention where each side lists the other.
+    /// A named neighbor that doesn't exist yet keeps its forward edge here;
+    /// the reverse edge lands when that node is itself discovered (eventually-
+    /// consistent). Returns `true` if a new node was inserted (the caller uses
+    /// this to decide whether to take an undo snapshot + set `mutated`).
+    pub fn upsert_node(&mut self, node: Node) -> bool {
+        if node.id.is_empty() {
+            return false;
+        }
+        if self.find_node(&node.id).is_some() {
+            return false;
+        }
+        let new_id = node.id.clone();
+        let new_neighbors: Vec<String> = node.neighbors.clone();
+        self.nodes.push(node);
+        // Back-link: for each named neighbor that exists, add the new node to
+        // its neighbor list (idempotent — skip if already present). A neighbor
+        // that doesn't exist yet is left as a dangling forward edge; it
+        // resolves when that node is discovered.
+        for n_id in new_neighbors {
+            if let Some(n) = self.nodes.iter_mut().find(|n| n.id == n_id) {
+                if !n.neighbors.iter().any(|x| x == &new_id) {
+                    n.neighbors.push(new_id.clone());
+                }
+            }
+        }
+        true
+    }
 }
 
 /// One named NPC in the Rust-authoritative registry (Fable Phase 5A,
@@ -428,6 +462,25 @@ impl NpcRegistry {
             })
             .collect();
         Some(parts.join(", "))
+    }
+
+    /// Dynamic world-seeding: insert a new entry if its id isn't already
+    /// present, else no-op (idempotent — re-registering an existing NPC is
+    /// not an error; the tracker may re-emit it). Returns `true` if a new
+    /// entry was inserted (the caller uses this to decide whether to take an
+    /// undo snapshot + set `mutated`). The entry's aliases are NOT merged on
+    /// a no-op — a re-registration with new aliases is a deliberate no-op to
+    /// keep the registry stable (the first registration wins, mirroring the
+    /// card-seed's "first writer" semantics).
+    pub fn upsert_entry(&mut self, entry: NpcEntry) -> bool {
+        if entry.id.is_empty() {
+            return false;
+        }
+        if self.find(&entry.id).is_some() {
+            return false;
+        }
+        self.entries.push(entry);
+        true
     }
 }
 
@@ -1923,6 +1976,87 @@ mod tests {
         assert!(g.current_is_indoor());
     }
 
+    // --- upsert_node (dynamic world-seeding, [DISCOVER] applier) ---
+
+    #[test]
+    fn upsert_node_inserts_new_node() {
+        let mut g = TravelGraph::default();
+        let inserted = g.upsert_node(Node {
+            id: "shell_town".into(),
+            name: "Shell Town".into(),
+            neighbors: vec![],
+            setting: "outdoor".into(),
+        });
+        assert!(inserted, "first insert returns true");
+        assert_eq!(g.nodes.len(), 1);
+        assert_eq!(g.find_node("shell_town").unwrap().name, "Shell Town");
+    }
+
+    #[test]
+    fn upsert_node_is_idempotent_on_duplicate_id() {
+        // Re-discovering an existing id is a no-op (the tracker may re-emit it).
+        let mut g = TravelGraph::default();
+        g.upsert_node(Node { id: "shell_town".into(), name: "Shell Town".into(), neighbors: vec![], setting: String::new() });
+        let inserted = g.upsert_node(Node { id: "shell_town".into(), name: "DIFFERENT NAME".into(), neighbors: vec![], setting: String::new() });
+        assert!(!inserted, "duplicate id returns false (no-op)");
+        assert_eq!(g.nodes.len(), 1, "no duplicate node added");
+        // The original entry wins (first writer semantics).
+        assert_eq!(g.find_node("shell_town").unwrap().name, "Shell Town");
+    }
+
+    #[test]
+    fn upsert_node_back_links_existing_neighbors() {
+        // Discover a new node that names an EXISTING neighbor: the existing
+        // node gains a back-edge so the graph stays undirected.
+        let mut g = TravelGraph {
+            nodes: vec![Node { id: "loguetown".into(), name: "Loguetown".into(), neighbors: vec![], setting: String::new() }],
+            current_node: None,
+        };
+        g.upsert_node(Node {
+            id: "shell_town".into(),
+            name: "Shell Town".into(),
+            neighbors: vec!["loguetown".into()],
+            setting: String::new(),
+        });
+        // loguetown should now list shell_town as a neighbor (back-link).
+        assert!(g.find_node("loguetown").unwrap().neighbors.contains(&"shell_town".to_string()),
+            "back-link added to existing neighbor");
+        // And shell_town lists loguetown (the forward edge, as authored).
+        assert!(g.find_node("shell_town").unwrap().neighbors.contains(&"loguetown".to_string()));
+    }
+
+    #[test]
+    fn upsert_node_dangling_forward_edge_kept_for_unknown_neighbor() {
+        // A named neighbor that doesn't exist yet keeps its forward edge; the
+        // reverse lands when that node is itself discovered (eventually-consistent).
+        let mut g = TravelGraph::default();
+        g.upsert_node(Node {
+            id: "shell_town".into(),
+            name: "Shell Town".into(),
+            neighbors: vec!["foosha".into()], // foosha doesn't exist yet
+            setting: String::new(),
+        });
+        assert!(g.find_node("shell_town").unwrap().neighbors.contains(&"foosha".to_string()),
+            "forward edge to unknown neighbor kept");
+        // Now discover foosha naming shell_town — the back-link resolves.
+        g.upsert_node(Node {
+            id: "foosha".into(),
+            name: "Foosha Village".into(),
+            neighbors: vec!["shell_town".into()],
+            setting: String::new(),
+        });
+        assert!(g.find_node("shell_town").unwrap().neighbors.contains(&"foosha".to_string()));
+        assert!(g.find_node("foosha").unwrap().neighbors.contains(&"shell_town".to_string()));
+    }
+
+    #[test]
+    fn upsert_node_empty_id_returns_false() {
+        let mut g = TravelGraph::default();
+        let inserted = g.upsert_node(Node { id: String::new(), name: "X".into(), neighbors: vec![], setting: String::new() });
+        assert!(!inserted);
+        assert!(g.nodes.is_empty());
+    }
+
     #[test]
     fn render_for_prompt_omits_location_when_dormant() {
         // Fresh game (no nodes) → no location line, zero tokens.
@@ -2186,6 +2320,44 @@ mod tests {
             ],
         };
         assert_eq!(reg.render_line().as_deref(), Some("Mara [mara_the_innkeep], [anon]"));
+    }
+
+    // --- upsert_entry (dynamic world-seeding, [NPC_REGISTER] applier) ---
+
+    #[test]
+    fn upsert_entry_inserts_new_npc() {
+        let mut reg = NpcRegistry::default();
+        let inserted = reg.upsert_entry(NpcEntry {
+            id: "coby".into(),
+            name: "Coby".into(),
+            role: "timid Marine recruit".into(),
+            tier: Some("soldier".into()),
+            aliases: vec!["coby".into()],
+        });
+        assert!(inserted);
+        assert_eq!(reg.entries.len(), 1);
+        assert!(reg.resolve("coby").is_some(), "id is its own alias → resolves");
+    }
+
+    #[test]
+    fn upsert_entry_is_idempotent_on_duplicate_id() {
+        // Re-registering an existing id is a no-op (first writer wins).
+        let mut reg = NpcRegistry::default();
+        reg.upsert_entry(NpcEntry { id: "coby".into(), name: "Coby".into(), role: String::new(), tier: None, aliases: vec![] });
+        let inserted = reg.upsert_entry(NpcEntry { id: "coby".into(), name: "DIFFERENT".into(), role: String::new(), tier: None, aliases: vec!["newalias".into()] });
+        assert!(!inserted, "duplicate id returns false");
+        assert_eq!(reg.entries.len(), 1);
+        // Original entry preserved; new alias NOT merged (stable registry).
+        assert_eq!(reg.find("coby").unwrap().name, "Coby");
+        assert!(!reg.resolve("newalias").is_some(), "re-registration does not merge new aliases");
+    }
+
+    #[test]
+    fn upsert_entry_empty_id_returns_false() {
+        let mut reg = NpcRegistry::default();
+        let inserted = reg.upsert_entry(NpcEntry { id: String::new(), name: "X".into(), role: String::new(), tier: None, aliases: vec![] });
+        assert!(!inserted);
+        assert!(reg.entries.is_empty());
     }
 
     /// A pre-Phase-5 save JSON (no "npc_registry"/"presences" fields) must

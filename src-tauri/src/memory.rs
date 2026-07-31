@@ -841,14 +841,27 @@ impl<E: Embedder> MemoryEngine<E> {
                     Vec::new()
                 }
             };
+            // User-authored lore (the __codex__ partition) — added 2026-07-31
+            // so the live-roleplay Codex tab's lore actually reaches the Fable
+            // narrator (mirrors search_wupi_visible, which already fuses __codex__).
+            let sparse_codex = match fts5_top_k(&c, &query_owned, CODEX_CARD_ID, RETRIEVAL_DEPTH) {
+                Ok(ids) => ids,
+                Err(e) => {
+                    tracing::warn!(error = %format!("{e:#}"), "fts5 (fable codex) failed; dense-only");
+                    Vec::new()
+                }
+            };
             let dense_active = vec0_top_k(&c, &embedding, &active_card_owned, RETRIEVAL_DEPTH)?;
             let dense_system = vec0_top_k(&c, &embedding, FABLE_SYSTEM_CARD_ID, RETRIEVAL_DEPTH)?;
+            let dense_codex = vec0_top_k(&c, &embedding, CODEX_CARD_ID, RETRIEVAL_DEPTH)?;
 
             // Merge across partitions (ids unique per card_id; no dedup needed).
             let mut sparse: Vec<(MemoryId, f32)> = sparse_active;
             sparse.extend(sparse_system);
+            sparse.extend(sparse_codex);
             let mut dense: Vec<(MemoryId, f32)> = dense_active;
             dense.extend(dense_system);
+            dense.extend(dense_codex);
 
             let floor = dense_floor.unwrap_or(crate::memory_rrf::DENSE_COSINE_FLOOR);
 
