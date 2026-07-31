@@ -29,7 +29,7 @@
       "assetProtocol": {
         "enable": true,
         "scope": [
-          "$RESOURCE/../apps/fable/backgrounds/**"
+          "$RESOURCE/../apps/prism/gallery/**"
         ]
       }
     },

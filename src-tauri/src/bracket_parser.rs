@@ -93,6 +93,48 @@ pub enum BracketCommand {
     /// `Rumor.label` / `Weather.condition` / `Travel.destination` aren't
     /// named `kind`).
     Presence { npc_id: String, stance: String },
+    /// A new location node is established in the travel graph (dynamic
+    /// world-seeding — the fix for sandbox cards that seed no `<locations>`
+    /// block, so `[TRAVEL]`/`[RUMOR]` are not frozen dead the whole session).
+    /// `node_id` is a bare slug ("shell_town", "loguetown") — the applier
+    /// sanitizes it (lowercase, non-alphanumeric→underscore) so the tracker
+    /// can't inject garbage or collide with the `node.` prefix convention.
+    /// `name` is the diegetic prose label ("Shell Town"); `setting` is the
+    /// free hint ("indoor"/"outdoor"/empty — gates the weather: line like a
+    /// card-seeded node); `neighbors` are bare node ids to link as exits (the
+    /// applier back-links them to keep the graph undirected; a named neighbor
+    /// that doesn't exist yet still records the forward edge, becoming
+    /// eventually-consistent when that node is itself discovered). The
+    /// applier is idempotent + never rejects — re-discovering an existing id
+    /// is a no-op (the point is growth, and rejecting a re-discovery would be
+    /// noise). Named `node_id` (not `kind`) to avoid colliding with this
+    /// enum's `#[serde(tag = "kind")]` external discriminator (same reason
+    /// `Travel.destination` / `Presence.npc_id` aren't named `kind`).
+    Discover {
+        node_id: String,
+        name: String,
+        setting: String,
+        neighbors: Vec<String>,
+    },
+    /// A new NPC is registered into the npc_registry (dynamic world-seeding
+    /// — the fix for sandbox cards that seed no `<cast>` block, so
+    /// `[PRESENCE]` is not frozen dead the whole session). `npc_id` is a bare
+    /// slug sanitized by the applier; `name` is the diegetic label ("Coby");
+    /// `role` is the one-line hook ("a timid Marine recruit"); `tier` is the
+    /// optional threat hint (minion/soldier/elite/boss/legendary — forward-
+    /// compat for the §11.30 heuristic, same as a card-seeded `<cast>` npc).
+    /// The applier is idempotent + never rejects — re-registering an existing
+    /// id is a no-op. `[NPC_REGISTER]` runs BEFORE `[PRESENCE]` in the apply
+    /// pipeline, so a turn that introduces a new NPC can both register it AND
+    /// assert its presence in the same turn. Named `npc_id` (not `kind`) to
+    /// avoid colliding with this enum's `#[serde(tag = "kind")]` external
+    /// discriminator (same reason `Presence.npc_id` isn't named `kind`).
+    NpcRegister {
+        npc_id: String,
+        name: String,
+        role: String,
+        tier: Option<String>,
+    },
     /// The in-world clock advanced. `minutes` is the authoritative value
     /// (minutes since 0001-01-01, parsed by [`parse_in_world_time`]); `raw`
     /// is the verbatim string the narrator emitted (kept for diagnostics +
@@ -360,6 +402,112 @@ fn infer_polarity(label: &str) -> Polarity {
     }
 }
 
+/// Tokenize a `key=value` tail into `(key, value)` pairs, quote-aware. Unlike
+/// a naive `split_whitespace()`, this respects `"quoted values with spaces"` so
+/// `[DISCOVER shell_town name="Shell Town"]` parses the full `"Shell Town"` as
+/// the value (not just `"Shell`). A value may be quoted (internal spaces kept)
+/// or bare (terminated at the next whitespace). The key is everything up to the
+/// first `=`; surrounding quotes are stripped from the value via
+/// `strip_one_quote_pair`. Tokens without `=` are dropped (positional args
+/// aren't part of the discover/npc_register grammar — the id is parsed
+/// separately before this helper runs).
+fn tokenize_kv(tail: &str) -> Vec<(String, String)> {
+    let chars: Vec<char> = tail.chars().collect();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < chars.len() {
+        // Skip whitespace between tokens.
+        while i < chars.len() && chars[i].is_whitespace() {
+            i += 1;
+        }
+        if i >= chars.len() {
+            break;
+        }
+        // Read the key up to '=' (or end of token if no '=' — dropped).
+        let key_start = i;
+        while i < chars.len() && chars[i] != '=' && !chars[i].is_whitespace() {
+            i += 1;
+        }
+        if i >= chars.len() || chars[i] != '=' {
+            // No '=' in this token → skip it (advance to next whitespace).
+            while i < chars.len() && !chars[i].is_whitespace() {
+                i += 1;
+            }
+            continue;
+        }
+        let key: String = chars[key_start..i].iter().collect();
+        i += 1; // consume '='
+        // Read the value. If it starts with '"', read until the closing '"'
+        // (keeping internal spaces). Otherwise read until next whitespace.
+        let mut value = String::new();
+        if i < chars.len() && chars[i] == '"' {
+            i += 1; // consume opening quote
+            while i < chars.len() && chars[i] != '"' {
+                value.push(chars[i]);
+                i += 1;
+            }
+            if i < chars.len() && chars[i] == '"' {
+                i += 1; // consume closing quote
+            }
+        } else {
+            while i < chars.len() && !chars[i].is_whitespace() {
+                value.push(chars[i]);
+                i += 1;
+            }
+        }
+        if !key.is_empty() {
+            out.push((key.to_lowercase(), value));
+        }
+    }
+    out
+}
+
+/// Parse the optional `key=value` tail of a `[DISCOVER node_id ...]` bracket.
+/// Recognized keys: `name` (diegetic label — may contain spaces when quoted),
+/// `setting` (indoor/outdoor hint), `neighbors` (comma-separated node ids).
+/// Unknown keys ignored. Returns `(name, setting, neighbors)`; empty when
+/// absent (the applier defaults name to the node_id when empty). Quote-aware
+/// via `tokenize_kv` so `name="Shell Town"` keeps the full label.
+fn parse_discover_kv(tail: &str) -> (String, String, Vec<String>) {
+    let mut name = String::new();
+    let mut setting = String::new();
+    let mut neighbors = Vec::new();
+    for (k, v) in tokenize_kv(tail) {
+        match k.as_str() {
+            "name" | "label" => name = v,
+            "setting" | "type" => setting = v,
+            "neighbors" | "neighbor" | "exits" => {
+                neighbors = v.split(',').map(|p| p.trim().to_string()).filter(|p| !p.is_empty()).collect();
+            }
+            _ => {}
+        }
+    }
+    (name, setting, neighbors)
+}
+
+/// Parse the optional `key=value` tail of a `[NPC_REGISTER npc_id ...]`
+/// bracket. Recognized keys: `name` (diegetic label), `role` (one-line hook),
+/// `tier` (minion/soldier/elite/boss/legendary). Unknown keys ignored. Returns
+/// `(name, role, tier)`. Quote-aware via `tokenize_kv`.
+fn parse_npc_register_kv(tail: &str) -> (String, String, Option<String>) {
+    let mut name = String::new();
+    let mut role = String::new();
+    let mut tier: Option<String> = None;
+    for (k, v) in tokenize_kv(tail) {
+        match k.as_str() {
+            "name" | "label" => name = v,
+            "role" | "vocation" => role = v,
+            "tier" => {
+                if !v.is_empty() {
+                    tier = Some(v);
+                }
+            }
+            _ => {}
+        }
+    }
+    (name, role, tier)
+}
+
 // ============================================================================
 // Fenced-JSON dual parser (Bug A fix, 2026-07-28).
 //
@@ -533,6 +681,8 @@ fn json_value_to_command(obj: &serde_json::Map<String, serde_json::Value>) -> Op
         "travel" | "move" | "arrive" | "go" => json_to_travel(obj),
         "rumor" | "gossip" | "hearsay" => json_to_rumor(obj),
         "presence" | "onscreen" | "onstage" | "present" => json_to_presence(obj),
+        "discover" | "discover_location" | "new_location" | "establish" => json_to_discover(obj),
+        "npc_register" | "register_npc" | "register" | "introduce_npc" => json_to_npc_register(obj),
         _ => None,
     }
 }
@@ -575,6 +725,20 @@ fn infer_kind_from_fields(obj: &serde_json::Map<String, serde_json::Value>) -> O
     {
         return Some("travel".to_string());
     }
+    // Discover (dynamic world-seeding): `node_id`/`location`/`place` + optional
+    // `neighbors`. Distinguished from travel (which uses `destination`/`to`/
+    // `node`) by `node_id` (the canonical discover key) and by `neighbors`
+    // (unambiguous — only discover carries adjacency edges). Placed right after
+    // travel so a `{"node_id": ...}` body doesn't fall through to weather's
+    // single-`condition` rule. The `location` alias is shared with presence's
+    // stance field, but presence ALSO needs `npc_id`/`npc` (handled below) — a
+    // body with `node_id`/`location` + `neighbors` but no `npc_id` is discover.
+    if keys
+        .iter()
+        .any(|k| matches!(*k, "node_id" | "place" | "neighbors" | "exits"))
+    {
+        return Some("discover".to_string());
+    }
     // Rumor: label / text / gossip / hearsay (Component 4, 2026-07-28). Placed
     // before the weather single-`condition` rule so a `{"label": ...}` body
     // doesn't fall through. None of these keys collide with the richer
@@ -590,6 +754,22 @@ fn infer_kind_from_fields(obj: &serde_json::Map<String, serde_json::Value>) -> O
     // shadow any richer discriminator above (Component 2, 2026-07-28).
     if keys.iter().any(|k| *k == "condition") {
         return Some("weather".to_string());
+    }
+    // NpcRegister (dynamic world-seeding): `npc_id`/`npc` + a distinctive
+    // `role`/`vocation` OR `tier` field. Placed BEFORE the presence arm so a
+    // body with `npc_id` + `role`/`tier` (no stance) routes to register, not
+    // to presence (which needs stance/location/pose). The `tier` field is the
+    // cleanest discriminator — only npc_register and card-seeded cast carry it,
+    // never presence. `role` alone (with npc_id, no stance) is also register.
+    if keys.iter().any(|k| matches!(*k, "npc_id" | "npc" | "id"))
+        && keys
+            .iter()
+            .any(|k| matches!(*k, "role" | "vocation" | "tier"))
+        && !keys
+            .iter()
+            .any(|k| matches!(*k, "stance" | "micro_location" | "pose" | "posture"))
+    {
+        return Some("npc_register".to_string());
     }
     // Presence (Phase 5A, 2026-07-29): npc_id/npc + stance/location/pose, but
     // NO `line` (that's character_turn). Placed after the weather catch-all so
@@ -880,6 +1060,103 @@ fn json_to_presence(obj: &serde_json::Map<String, serde_json::Value>) -> Option<
     Some(BracketCommand::Presence { npc_id, stance })
 }
 
+/// Parse a `{"kind": "discover", ...}` JSON body (dynamic world-seeding).
+/// `node_id` from `node_id`/`location`/`place` (model flexibility); `name`
+/// from `name`/`label`; `setting` from `setting`/`type`; `neighbors` from a
+/// `neighbors` array OR a comma-separated `neighbors` string. Empty node_id
+/// → None. Mirrors `json_to_travel`'s leniency.
+fn json_to_discover(obj: &serde_json::Map<String, serde_json::Value>) -> Option<BracketCommand> {
+    let node_id = obj
+        .get("node_id")
+        .or_else(|| obj.get("location"))
+        .or_else(|| obj.get("place"))
+        .and_then(|v| v.as_str())?
+        .trim()
+        .to_string();
+    if node_id.is_empty() {
+        return None;
+    }
+    let name = obj
+        .get("name")
+        .or_else(|| obj.get("label"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    let setting = obj
+        .get("setting")
+        .or_else(|| obj.get("type"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    // neighbors: accept either a JSON array of strings or a comma-separated
+    // string (model flexibility — the array form is canonical, the string
+    // form is what the bracket parser produces).
+    let neighbors: Vec<String> = match obj.get("neighbors") {
+        Some(serde_json::Value::Array(arr)) => arr
+            .iter()
+            .filter_map(|v| v.as_str().map(|s| s.trim().to_string()))
+            .filter(|s| !s.is_empty())
+            .collect(),
+        Some(serde_json::Value::String(s)) => s
+            .split(',')
+            .map(|p| p.trim().to_string())
+            .filter(|p| !p.is_empty())
+            .collect(),
+        _ => Vec::new(),
+    };
+    Some(BracketCommand::Discover {
+        node_id,
+        name,
+        setting,
+        neighbors,
+    })
+}
+
+/// Parse a `{"kind": "npc_register", ...}` JSON body (dynamic world-seeding).
+/// `npc_id` from `npc_id`/`npc`/`id` (NOT `name` — that's the diegetic label
+/// here, distinct from presence where `name` is an alias of the id); `name`
+/// from `name`/`label`; `role` from `role`/`vocation`; `tier` from `tier`.
+/// Empty npc_id → None. Mirrors `json_to_presence`'s leniency.
+fn json_to_npc_register(obj: &serde_json::Map<String, serde_json::Value>) -> Option<BracketCommand> {
+    let npc_id = obj
+        .get("npc_id")
+        .or_else(|| obj.get("npc"))
+        .or_else(|| obj.get("id"))
+        .and_then(|v| v.as_str())?
+        .trim()
+        .to_string();
+    if npc_id.is_empty() {
+        return None;
+    }
+    let name = obj
+        .get("name")
+        .or_else(|| obj.get("label"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    let role = obj
+        .get("role")
+        .or_else(|| obj.get("vocation"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    let tier = obj
+        .get("tier")
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    Some(BracketCommand::NpcRegister {
+        npc_id,
+        name,
+        role,
+        tier,
+    })
+}
+
 fn parse_one(bracket: &str, text_after: &str) -> Option<(BracketCommand, usize)> {
     let bracket = bracket.trim();
 
@@ -1013,6 +1290,37 @@ fn parse_one(bracket: &str, text_after: &str) -> Option<(BracketCommand, usize)>
         return None;
     }
 
+    // [DISCOVER <node_id> [name=<diegetic name>] [setting=indoor|outdoor]
+    //            [neighbors=<comma-separated node ids>]] — dynamic world-
+    // seeding (the fix for sandbox cards that seed no <locations> block).
+    // The FIRST whitespace-delimited token is the bare node_id; the rest is
+    // optional key=value pairs (the EFFECT pattern, bracket_parser.rs:1093).
+    // `name`/`setting`/`neighbors` all optional — `[DISCOVER shell_town]`
+    // alone is valid (name defaults to the id; no exits yet). `neighbors`
+    // is comma-separated; the applier back-links. Empty node_id → None
+    // (literal prose). Case-insensitive via `strip_prefix_ci`. The JSON form
+    // `{"kind":"discover","node_id":"..."}` is handled by the manual
+    // dispatch in `parse_json_command` (`json_to_discover`).
+    if let Some(rest) = strip_prefix_ci(bracket, "DISCOVER") {
+        let rest = rest.trim();
+        let mut iter = rest.splitn(2, char::is_whitespace);
+        let node_id = iter.next().unwrap_or("").trim().to_string();
+        if node_id.is_empty() {
+            return None;
+        }
+        let tail = iter.next().unwrap_or("").trim();
+        let (name, setting, neighbors) = parse_discover_kv(tail);
+        return Some((
+            BracketCommand::Discover {
+                node_id,
+                name,
+                setting,
+                neighbors,
+            },
+            0,
+        ));
+    }
+
     // [RUMOR <label>] — Fable Phase 4 Component 4 (2026-07-28). Single-region
     // like WEATHER/TRAVEL. The body is a free-form diegetic phrase (spaces
     // allowed: "the stranger paid in gold coins", "the captain is looking for
@@ -1056,6 +1364,36 @@ fn parse_one(bracket: &str, text_after: &str) -> Option<(BracketCommand, usize)>
         // internal quotes are preserved.
         let stance = strip_one_quote_pair(stance_raw).to_string();
         return Some((BracketCommand::Presence { npc_id, stance }, 0));
+    }
+
+    // [NPC_REGISTER <npc_id> [name=<diegetic name>] [role=<one-line hook>]
+    //                 [tier=<minion|soldier|elite|boss|legendary>]] — dynamic
+    // world-seeding (the fix for sandbox cards that seed no <cast> block). The
+    // FIRST whitespace-delimited token is the bare npc_id; the rest is
+    // optional key=value pairs (the EFFECT pattern). All KV fields optional —
+    // `[NPC_REGISTER coby]` alone is valid (name defaults to the id). Empty
+    // npc_id → None. Case-insensitive via `strip_prefix_ci`. Runs BEFORE
+    // [PRESENCE] in the apply pipeline so a turn can register + assert a new
+    // NPC together. The JSON form `{"kind":"npc_register",...}` is handled by
+    // the manual dispatch in `parse_json_command` (`json_to_npc_register`).
+    if let Some(rest) = strip_prefix_ci(bracket, "NPC_REGISTER") {
+        let rest = rest.trim();
+        let mut iter = rest.splitn(2, char::is_whitespace);
+        let npc_id = iter.next().unwrap_or("").trim().to_string();
+        if npc_id.is_empty() {
+            return None;
+        }
+        let tail = iter.next().unwrap_or("").trim();
+        let (name, role, tier) = parse_npc_register_kv(tail);
+        return Some((
+            BracketCommand::NpcRegister {
+                npc_id,
+                name,
+                role,
+                tier,
+            },
+            0,
+        ));
     }
 
     // [TIME <in-world timestamp>] — Seam #4 clock advance. Single-region like
@@ -2900,6 +3238,187 @@ mod tests {
         assert_eq!(parsed.commands.len(), 1);
         assert!(matches!(parsed.commands[0], BracketCommand::CharacterTurn { .. }),
             "npc_id + line is dialogue, not presence");
+    }
+
+    #[test]
+    fn discover_bracket_minimal_parses() {
+        // The minimal form: just a node_id. name defaults to empty (the
+        // applier fills it from the id); setting + neighbors empty.
+        let raw = "[DISCOVER shell_town]";
+        let parsed = parse(raw);
+        assert_eq!(parsed.commands.len(), 1);
+        assert_eq!(
+            parsed.commands[0],
+            BracketCommand::Discover {
+                node_id: "shell_town".into(),
+                name: String::new(),
+                setting: String::new(),
+                neighbors: Vec::new(),
+            }
+        );
+    }
+
+    #[test]
+    fn discover_bracket_full_kv_parses() {
+        // The full key=value form (the EFFECT kv pattern). Quoted name.
+        let raw = "[DISCOVER shell_town name=\"Shell Town\" setting=outdoor neighbors=loguetown,foosha]";
+        let parsed = parse(raw);
+        assert_eq!(parsed.commands.len(), 1);
+        match &parsed.commands[0] {
+            BracketCommand::Discover { node_id, name, setting, neighbors } => {
+                assert_eq!(node_id, "shell_town");
+                assert_eq!(name, "Shell Town");
+                assert_eq!(setting, "outdoor");
+                assert_eq!(neighbors, &vec!["loguetown".to_string(), "foosha".to_string()]);
+            }
+            other => panic!("expected Discover, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn discover_bracket_case_insensitive() {
+        for verb in ["discover", "Discover", "DISCOVER"] {
+            let raw = format!("[{verb} shell_town]");
+            let parsed = parse(&raw);
+            assert_eq!(parsed.commands.len(), 1, "verb={verb}");
+            assert!(matches!(parsed.commands[0], BracketCommand::Discover { .. }));
+        }
+    }
+
+    #[test]
+    fn discover_empty_node_id_is_literal_prose() {
+        let raw = "Text [DISCOVER] more text.";
+        let parsed = parse(raw);
+        assert_eq!(parsed.commands.len(), 0);
+        assert!(parsed.prose.contains("[DISCOVER]"));
+    }
+
+    #[test]
+    fn json_discover_kind_dispatches() {
+        let raw = "```json\n{ \"type\": \"discover\", \"node_id\": \"shell_town\", \"name\": \"Shell Town\", \"setting\": \"outdoor\", \"neighbors\": [\"loguetown\", \"foosha\"] }\n```";
+        let parsed = parse(raw);
+        assert_eq!(parsed.commands.len(), 1);
+        match &parsed.commands[0] {
+            BracketCommand::Discover { node_id, name, setting, neighbors } => {
+                assert_eq!(node_id, "shell_town");
+                assert_eq!(name, "Shell Town");
+                assert_eq!(setting, "outdoor");
+                assert_eq!(neighbors, &vec!["loguetown".to_string(), "foosha".to_string()]);
+            }
+            other => panic!("expected Discover, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn json_discover_neighbors_as_csv_string() {
+        // The model may emit neighbors as a comma-separated string instead
+        // of an array — both forms must parse.
+        let raw = "```json\n{ \"kind\": \"discover\", \"node_id\": \"x\", \"neighbors\": \"a,b,c\" }\n```";
+        let parsed = parse(raw);
+        assert_eq!(parsed.commands.len(), 1);
+        match &parsed.commands[0] {
+            BracketCommand::Discover { neighbors, .. } => {
+                assert_eq!(neighbors, &vec!["a".to_string(), "b".to_string(), "c".to_string()]);
+            }
+            other => panic!("expected Discover, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn json_discover_inferred_from_node_id_field() {
+        // No explicit kind; node_id field alone should infer discover.
+        let raw = "```json\n{ \"node_id\": \"shell_town\", \"name\": \"Shell Town\" }\n```";
+        let parsed = parse(raw);
+        assert_eq!(parsed.commands.len(), 1);
+        assert!(matches!(parsed.commands[0], BracketCommand::Discover { .. }),
+            "node_id without stance/role should infer discover");
+    }
+
+    #[test]
+    fn npc_register_bracket_minimal_parses() {
+        let raw = "[NPC_REGISTER coby]";
+        let parsed = parse(raw);
+        assert_eq!(parsed.commands.len(), 1);
+        assert_eq!(
+            parsed.commands[0],
+            BracketCommand::NpcRegister {
+                npc_id: "coby".into(),
+                name: String::new(),
+                role: String::new(),
+                tier: None,
+            }
+        );
+    }
+
+    #[test]
+    fn npc_register_bracket_full_kv_parses() {
+        let raw = "[NPC_REGISTER coby name=Coby role=\"timid Marine recruit\" tier=elite]";
+        let parsed = parse(raw);
+        assert_eq!(parsed.commands.len(), 1);
+        assert_eq!(
+            parsed.commands[0],
+            BracketCommand::NpcRegister {
+                npc_id: "coby".into(),
+                name: "Coby".into(),
+                role: "timid Marine recruit".into(),
+                tier: Some("elite".into()),
+            }
+        );
+    }
+
+    #[test]
+    fn npc_register_case_insensitive_verb() {
+        for verb in ["npc_register", "Npc_Register", "NPC_REGISTER"] {
+            let raw = format!("[{verb} coby]");
+            let parsed = parse(&raw);
+            assert_eq!(parsed.commands.len(), 1, "verb={verb}");
+            assert!(matches!(parsed.commands[0], BracketCommand::NpcRegister { .. }));
+        }
+    }
+
+    #[test]
+    fn npc_register_empty_id_is_literal_prose() {
+        let raw = "[NPC_REGISTER] trailing.";
+        let parsed = parse(raw);
+        assert_eq!(parsed.commands.len(), 0);
+        assert!(parsed.prose.contains("[NPC_REGISTER]"));
+    }
+
+    #[test]
+    fn json_npc_register_dispatches() {
+        let raw = "```json\n{ \"type\": \"npc_register\", \"npc_id\": \"coby\", \"name\": \"Coby\", \"role\": \"recruit\", \"tier\": \"soldier\" }\n```";
+        let parsed = parse(raw);
+        assert_eq!(parsed.commands.len(), 1);
+        match &parsed.commands[0] {
+            BracketCommand::NpcRegister { npc_id, name, role, tier } => {
+                assert_eq!(npc_id, "coby");
+                assert_eq!(name, "Coby");
+                assert_eq!(role, "recruit");
+                assert_eq!(tier, &Some("soldier".to_string()));
+            }
+            other => panic!("expected NpcRegister, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn json_npc_register_inferred_from_tier_field() {
+        // No explicit kind; npc_id + tier (no stance) should infer npc_register,
+        // NOT presence (which needs stance). Pins the inference ordering.
+        let raw = "```json\n{ \"npc_id\": \"coby\", \"tier\": \"elite\" }\n```";
+        let parsed = parse(raw);
+        assert_eq!(parsed.commands.len(), 1);
+        assert!(matches!(parsed.commands[0], BracketCommand::NpcRegister { .. }),
+            "npc_id + tier (no stance) is npc_register, not presence");
+    }
+
+    #[test]
+    fn npc_register_inference_does_not_shadow_presence() {
+        // npc_id + stance (no role/tier) must stay presence, not npc_register.
+        let raw = "```json\n{ \"npc_id\": \"mara\", \"stance\": \"behind the bar\" }\n```";
+        let parsed = parse(raw);
+        assert_eq!(parsed.commands.len(), 1);
+        assert!(matches!(parsed.commands[0], BracketCommand::Presence { .. }),
+            "npc_id + stance (no role/tier) is presence, not npc_register");
     }
 
     #[test]

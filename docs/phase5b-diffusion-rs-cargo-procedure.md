@@ -67,51 +67,38 @@ diffusion-rs = ["dep:diffusion-rs"]
 diffusion-rs = { version = "0.1.20", optional = true, features = ["cuda", "vulkan"] }
 ```
 
-### 3. `src-tauri/src/scene_art.rs` — flip `default_sd_backend()`
+### 3. `src-tauri/src/scene_art.rs` — DONE (2026-07-30)
 
-The stub is already there (scene_art.rs:623) + the `DiffusionRsGenerator`
-impl is already written behind `#[cfg(feature = "diffusion-rs)]` (scene_art.rs,
-after the stub). Two edits needed once the dep resolves:
+The dispatch is flipped + the `DiffusionRsGenerator` impl is **filled in
+with the confirmed builder API** (no more TODOs). The agent resolved the
+setter names from docs.rs so the first `cargo check --features diffusion-rs`
+(Step 4) should compile clean without a docs-lookup round-trip.
 
-**(a) Flip the dispatch** — replace the stub body with the feature-gated
-dispatch the comment already describes:
+**What's encoded (Stage 1 = no-LoRA SDXL baseline):**
+- `ModelConfigBuilder::default().model(path)` — the confirmed "Path to full
+  model" setter. Held in `model_state` between turns (the weights are the
+  expensive thing to parse). stable-diffusion.cpp auto-detects SD 1.5 vs
+  SDXL from checkpoint headers — no version setter exists.
+- `ConfigBuilder` rebuilt per turn with confirmed setters: `.prompt`,
+  `.negative_prompt`, `.width`, `.height`, `.steps`, `.sampling_method`,
+  `.cfg_scale`, `.output`.
+- **Sampler: `SampleMethod::DPMPP2M_SAMPLE_METHOD`**, 28 steps, CFG 5.0 —
+  the SDXL canonical-clean recipe (NOT SD 1.5 defaults; Euler/a artifacts on
+  SDXL). Request defaults bumped to SDXL-native **1024×576** cinematic.
+- State-holding corrected from the §11.58 scaffold: `ModelConfig` (weights)
+  is held, `Config` (per-turn) is rebuilt. The scaffold held `Config` and
+  rebuilt `ModelConfig::default()` — inverted from `gen_img`'s intent.
 
-```rust
-pub fn default_sd_backend() -> Box<dyn SceneImageGenerator> {
-    #[cfg(feature = "diffusion-rs")]
-    { Box::new(DiffusionRsGenerator::new()) }
-    #[cfg(not(feature = "diffusion-rs"))]
-    { Box::new(NoopImageGenerator) }
-}
-```
+**The crate DOES expose custom-path LoRA** (the original doc's "TODO — may
+not support LoRA" was wrong): `diffusion_rs::api::LoraSpec` + `LoraModeType`
++ the `modifier` module. Stage 2 (acceleration LoRA) uses these. Stage 1
+ships without LoRA on purpose (de-risk the engine first).
 
-**(b) Fill in the `DiffusionRsGenerator` TODOs.** The impl structure is done
-(load/generate/unload lifecycle, interior-mutable state for the `&self`
-trait); only the exact builder field setters are TODO. The confirmed API
-shape (from the newfla/diffusion-rs README + docs.rs/api):
-
-```rust
-use diffusion_rs::{api::gen_img, preset::{Preset, PresetBuilder}};
-// README's preset example (auto-downloads — DON'T use for WUPI):
-let (config, mut model_config) = PresetBuilder::default()
-    .preset(Preset::SDXLTurbo1_0)
-    .prompt("...").build().unwrap();
-gen_img(&config, &mut model_config).unwrap();
-```
-
-WUPI must use the **custom-path** path (NOT `PresetBuilder` — presets
-auto-download, wrong for a portable offline app). Build `ModelConfig` from
-the user's `models/sd/*.safetensors` checkpoint via `ModelConfigBuilder` +
-the top-level `Config` via `ConfigBuilder`. After `cargo doc --features
-diffusion-rs`, the exact setter names are on:
-- `docs.rs/diffusion_rs/latest/diffusion_rs/api/struct.ConfigBuilder.html`
-- `docs.rs/diffusion_rs/latest/diffusion_rs/api/struct.ModelConfigBuilder.html`
-
-Replace the `todo!()`-adjacent `.model_path(...)` / `.width(...)` /
-`.sample_steps(...)` placeholder calls in the impl with the confirmed
-setters. The `gen_img(&Config, &mut ModelConfig)` signature + the `Config`/
-`ModelConfig` types are confirmed; only the builder field names need the
-docs page.
+**Stage 2 hook (not yet built):** `api::LoraSpec` is the custom local-path
+LoRA loader. Add a `.loras(Vec<LoraSpec>)`-style setter to the request when
+wiring LCM/Hyper-SD. Swap `SampleMethod` to `LCM_SAMPLE_METHOD` for LCM-LoRA.
+The `modifier` module's built-in helpers (`lcm_lora_sdxl_base_1_0` etc.)
+auto-download — do NOT use them (same offline-app reasoning as PresetBuilder).
 
 ### 4. The isolated build (keep llama's cache warm)
 
@@ -141,8 +128,20 @@ cargo check --features diffusion-rs
 npm run tauri dev -- --features diffusion-rs
 ```
 
-Then drop an SD checkpoint into `models/sd/` (e.g. an SD 1.5 `.safetensors`),
-flip the opt-in via the IPC (the agent added `fable_set_sd_autogen`):
+Then drop an SD checkpoint into `models/sd/` and flip the opt-in via the
+IPC (the agent added `fable_set_sd_autogen`):
+
+**Model choice (Stage 1 baseline):** target an **SDXL** checkpoint from the
+Illustrious-XL family. Recommended, ranked:
+1. **NoobAI-XL** — strong color/lighting base (great for atmospheric VN
+   backgrounds), full NSFW support. ~6.5 GB fp16 / ~3.5 GB Q8 GGUF.
+2. **WAI-NSFW-Illustrious-SDXL** — the community NSFW workhorse, equally
+   capable, slightly more character-focused. Free — grab both to A/B.
+3. **Animagine XL V4** — skip for now; safety-trained, NSFW unreliable.
+
+`pick_sd_checkpoint` already accepts both `.safetensors` and `.gguf` — a Q8
+GGUF SDXL (~3.5 GB) is the 12 GB VRAM-saver if fp16 OOMs. fp16 fits but
+don't run other GPU-heavy apps during a swap.
 
 ```js
 // From the devtools console once the app is up:
@@ -158,10 +157,160 @@ success the `fable-scene-image` event swaps the PNG into the
 
 - **VRAM budget on 12 GB.** The §11.50 hardstop found the 12B Q6_K + ctx 4096
   is VRAM-bound (raising ctx to 8192 overran). The swap cycle sidesteps this
-  (LLM + SD never co-reside), but the SD model's own footprint + the reload
-  may still stress 12 GB. If SD OOMs, the one-strike latch fires + auto-gen
-  latches off — the game continues (narrator unaffected). A smaller SD model
-  (SD 1.5 over SDXL) is the conservative first choice.
+  (LLM + SD never co-reside), but the SDXL model's own footprint + the reload
+  may still stress 12 GB. SDXL fp16 (~7 GB weights + ~2-3 GB activations)
+  fits but is tight; a Q8 GGUF SDXL (~3.5 GB) is the escape hatch. If SD
+  OOMs, the one-strike latch fires + auto-gen latches off — the game
+  continues (narrator unaffected). The `modifier` module's `vae_tiling` +
+  `offload_params_to_cpu` are the desperate-case fallbacks.
+- **SDXL black-image risk.** stable-diffusion.cpp has documented historical
+  issues with [SDXL producing black images](https://github.com/leejet/stable-
+  diffusion.cpp/issues/167) + [LoRAs producing black images](https://github.
+  com/leejet/stable-diffusion.cpp/issues/242). The crate ships
+  `modifier::sdxl_vae_fp16_fix` ("to avoid black images with xl models") as
+  the known fix — but it auto-downloads, so for a portable app the USER
+  supplies the fp16-fix VAE file path. If Stage 1 produces black images,
+  this VAE is the first thing to add (Stage 2 hook in scene_art.rs).
+- **The roleplay-stall tradeoff (two halves).** (1) Generation time: SDXL at
+  28 steps ≈ 15-40 s on 12 GB; a Stage 2 acceleration LoRA at 4-8 steps cuts
+  this to ~3-8 s. (2) Swap-cycle overhead: the LLM-unload → SD-load →
+  generate → LLM-reload is a FIXED ~12-18 s tax per image regardless of step
+  count. At 4 steps you spend more time loading than generating — the swap
+  design is correct for 12 GB but inherently stop-and-start. This is why
+  Stage 2 (acceleration LoRA) is worth doing, but won't eliminate the stall.
+- **Acceleration LoRA reliability in cpp.** The whole Lightning/Hyper-SD
+  ecosystem is built around ComfyUI/A1111/diffusers. Nobody has verified
+  Lightning/Hyper-SD layered on NoobAI-XL through stable-diffusion.cpp
+  specifically. LCM-LoRA is the safest Stage 2 first attempt (the crate
+  ships a built-in helper for it, signaling maintainer testing). Hyper-SD's
+  8-step LoRA generally beats Lightning's on quality (community consensus).
 - **The dest filename.** Slices 1-5 overwrite a single shared
   `apps/fable/backgrounds/scene.png` each turn (the locked decision). If you
   want per-card scene history later, that's a `scene_background_path` change.
+
+---
+
+## §11.59 update (2026-07-31): CRT-linkage patch + multi-file SDXL layout
+
+Two fixes landed after the §11.58/§11.59 diagnosis was proven WRONG. The
+"GGML_ABORT inside gen_img" theory was never verified (stderr buffering
+destroyed the message); a VEH + SD-log-callback repro harness
+(`src-tauri/examples/sd_repro.rs`) revealed the real bugs.
+
+### Fix A — the debug-CRT popup (the `lowio/read.cpp:381` dialog) — REVERTED
+
+**Symptom:** in debug builds (`cargo run` / `tauri dev`), sd.cpp's model
+load trips the UCRT debug assertion `_osfile(fh) & FOPEN` at
+`lowio/read.cpp:381`, showing a "Debug Assertion Failed" popup. Release
+builds are unaffected (clean errors, no popup).
+
+**Investigation + revert.** An earlier attempt patched `diffusion-rs-sys`'s
+`build.rs` to drive the C++ profile from `cfg!(debug_assertions)` (Debug
+host → Debug C++). It **failed at link with LNK2038**: llama-cpp-sys ALSO
+always compiles Release (`/MD`, `_ITERATOR_DEBUG_LEVEL=0`) even in debug
+builds, and MSVC's image-wide `LNK2038` requires every C++ object to agree
+on `RuntimeLibrary` + `_ITERATOR_DEBUG_LEVEL`. Making sd Debug (`/MDd`,
+IDL=2) while llama is Release (`/MD`, IDL=0) → hard link failure. The
+vendor + `[patch.crates-io]` were removed; sd stays Release like llama.
+
+**Status: NOT FIXED, but non-blocking.** The popup is debug-only. To test
+image generation, use a **Release** build (`cargo run --release --example
+sd_repro` or `npm run build`), which has no popup and surfaces the real
+model-loading errors cleanly. A proper fix would need BOTH sd AND llama to
+switch profiles together — a much larger change (llama's build is owned by
+llama-cpp-sys-2). The real model-load bug (Fix B) was the actual blocker;
+Fix A is a dev-experience wart only.
+
+### Fix B — the model-load failure (NoobAI-XL Q8 GGUF)
+
+**Root cause:** a ComfyUI-convention Q8 GGUF stores ONLY the UNet under
+bare `input_blocks.*` names (no `model.diffusion_model.` prefix, no
+embedded CLIP/VAE). sd.cpp's version detection
+(`model_loader.cpp:503-510`) requires BOTH `model.diffusion_model.input_blocks.*`
+(→ `is_unet`) AND `conditioner.embedders.1` / `cond_stage_model.1`
+(→ `has_multiple_encoders`) to classify a model as SDXL. Passing the GGUF
+as the single `model` field → tensors stay bare → detection fails with
+`get sd version from file failed`. (The original fp16 safetensors had a
+DIFFERENT bug — a tensor name-mapping gap on `conditioner.embedders.0.*`
+that's moot now that we've switched to GGUF.)
+
+**Fix:** `scene_art.rs::DiffusionRsGenerator` now detects a GGUF UNet at
+`load` time (`is_gguf_unet`), resolves sibling CLIP-L / CLIP-G / VAE files
+in the same `models/sd/` dir (`resolve_multi_file_layout`), and in
+`generate` routes to `diffusion_model` + `clip_l` + `clip_g` + `vae`
+setters instead of the single `model` setter. The GGUF is already Q8, so
+NO `weight_type` override (the §11.58 OOM fix #3 is bypassed for GGUF — it
+only applies to the legacy single-file fp16 path, preserved).
+
+### The build (Chloe runs this from the terminal)
+
+Vendored `diffusion-rs-sys` at `src-tauri/vendor/diffusion-rs-sys/` via
+`[patch.crates-io]` in `Cargo.toml`. The vendor carries TWO C++ patches to
+`stable-diffusion.cpp/src/model_loader.cpp` (Bug B + Bug C below); `build.rs`
+is UNCHANGED (still Release — matches llama-cpp-sys, so no LNK2038). Each
+C++ source edit invalidates the cached sd build → the ~20-40 min CUDA
+recompile fires. Run:
+
+```
+cd src-tauri
+cargo build --features diffusion-rs        # or: npm run sd:dev
+```
+
+If a `/DELAYLOAD` linker conflict appears, it's the §11.14 risk — isolate
+before touching llama's cache.
+
+### Bug B patch — GGUF architecture detection (in the vendor)
+
+`init_from_gguf_file` reads `general.architecture` metadata (="sdxl") and
+presets `version_` BEFORE the tensor-name scan; `get_sd_version()` early-
+returns on a preset `version_`. This breaks the circular dependency
+described in Fix B (is_unet ← get_sd_version ← needs CLIP that loads after
+the check). Verified live: prints `gguf general.architecture = 'sdxl'` then
+`Version: SDXL`.
+
+### Bug C patch — ComfyUI orig_shape recovery (in the vendor)
+
+`init_from_gguf_file` reads `comfy.gguf.orig_shape.<tensor>` int32 arrays
+and overwrites each tensor's `ne` (reversed: PyTorch [out,in,kH,kW] → ggml
+ne[0..3]=[kW,kH,in,out]) BEFORE the prefix is applied. Without this, every
+conv/linear weight fails shape validation (`got [256,45,1,1], expected
+[3,3,4,256]`) because ComfyUI GGUFs store quantization-reshaped dims on
+the tensor + the true shape only in metadata (sd.cpp 0.1.20 doesn't read
+it; ComfyUI/A1111 do). Logs `gguf: recovered N original tensor shapes`
+when active.
+
+### The CLIP/VAE files the GGUF needs (Fix B runtime requirement)
+
+Drop these into `src-tauri/models/sd/` alongside `image.gguf`. The resolver
+auto-detects by name (see `resolve_multi_file_layout`):
+
+| File                    | Purpose            | Canonical source |
+|-------------------------|--------------------|------------------|
+| `clip_g.safetensors`    | SDXL CLIP-G (ViT-bigG) — **REQUIRED** for version detection | `laion/CLIP-ViT-bigG-14-laion2B-39B-b160k` (open_clip) or the SDXL `text_encoder_2` |
+| `clip_l.safetensors`    | SDXL CLIP-L (ViT-L) — recommended | `openai/clip-vit-large-patch14` or SDXL `text_encoder` |
+| `sdxl_vae_fp16_fix.safetensors` | fp16-fix VAE — recommended for NoobAI (avoids black images) | `madebyollin/sdxl-vae-fp16-fix` |
+
+CLIP-G is the load-bearing one: without it, `get_sd_version` can't see the
+`conditioner.embedders.1` markers and SDXL detection fails. The harness
+logs a warning at load if it's missing.
+
+### The repro harness (`src-tauri/examples/sd_repro.rs`)
+
+Faithfully replicates `DiffusionRsGenerator::generate` as a standalone CLI
+(no Tauri/IPC/frontend). Install an SD-log callback (so stable-diffusion.cpp
+logs are visible) + a Windows VEH (so the faulting MODULE prints on crash).
+Run from `src-tauri/`:
+
+```
+cargo run --example sd_repro --features diffusion-rs -- \
+    --diffusion-model models/sd/image.gguf \
+    --clip-l models/sd/clip_l.safetensors \
+    --clip-g models/sd/clip_g.safetensors \
+    --vae models/sd/sdxl_vae_fp16_fix.safetensors \
+    --out /tmp/sd.png
+```
+
+The last lines printed before a crash name the failing phase; the VEH
+block names the faulting module (`ucrtbased.dll` vs `ucrtbase.dll` vs a
+CUDA driver DLL). Use release for the cleanest signal (the debug UCRT
+assertion is gone after Fix A, but release avoids the popup entirely).

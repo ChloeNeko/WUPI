@@ -1,5 +1,10 @@
 [env]
 LLAMA_CMAKE_CUDA_ARCHITECTURES = "120"
+# Phase 5B: diffusion-rs (stable-diffusion.cpp) reads THIS var for its CUDA
+# arch target — NOT LLAMA_CMAKE_CUDA_ARCHITECTURES. Same value (12.0 = "120")
+# as llama's so both kernels target the same GPU. See
+# docs/phase5b-diffusion-rs-cargo-procedure.md.
+CUDA_COMPUTE_CAP = "120"
 LIBCLANG_PATH = "C:\\Program Files\\LLVM\\bin"
 CUDA_PATH = "C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v13.3"
 CudaToolkitDir = "C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v13.3"

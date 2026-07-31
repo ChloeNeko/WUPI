@@ -24,16 +24,16 @@
 // a pure black void for ALL games now — Quick Play lands here straight from
 // the void interview, and the manual-card path no longer has a tavern card
 // to source a bg from. Backgrounds + weather will be re-added in a later
-// pass once the new art direction settles. The `<img data-bg>` element
-// stays in the DOM with an empty src (a no-op over the black .fable-stage)
-// so the re-add is a one-line `bg.src = ...` change, not a structural one.
+// pass once the new art direction settles. The `.fable-stage-bg` element
+// stays in the DOM as a no-op over the black .fable-stage so the re-add is a
+// one-line structural change.
 // =============================================================
 
 import * as beats from '../engine/beats.js';
 import * as narrator from '../engine/narrator.js';
 import * as wupiDrawer from '../engine/wupi-drawer.js';
+import * as leftDrawer from '../engine/left-drawer.js';
 import * as selection from '../engine/selection.js';
-import * as sceneImage from '../engine/scene-image.js';
 import { invoke } from '@tauri-apps/api/core';
 // playFX + clearFX were the weather-render hooks pre-stripping; weather is
 // gone now (file header), so only initFX + clearAllFX remain used. The two
@@ -52,14 +52,15 @@ function esc(s) {
     .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }
 
-// Background + atmosphere were stripped (see file header). The bg <img>
-// keeps its data-bg attr but its src stays empty; mapTheme is a static
-// 'fantasy' default so the optional map panel still gets a usable atlas
-// theme without depending on a card tone.
+// Background + atmosphere were stripped (see file header). The bg layer
+// (.fable-stage-bg) is empty; mapTheme is a static 'fantasy' default so the
+// optional map panel still gets a usable atlas theme without depending on a
+// card tone.
 
 let stageRoot = null;
 let toastTimer = null;
 let cardContext = null;  // { card, saveId } for the active session
+let activeCardName = '';  // display name of the seated card (the typing indicator)
 let cornerTrigger = null;   // the right-edge hover zone (Wupi drawer)
 let cornerDwellTimer = null; // 300ms arm-before-open timer (right edge)
 let saveModalClose = null;  // fn: close the save modal (set in wireStage, called by Esc)
@@ -80,10 +81,16 @@ export function buildStage() {
   root.dataset.fableScreen = 'stage';
   root.hidden = true;
   root.innerHTML = `
-    <div class="fable-stage-bg"><img data-bg alt="" /></div>
+    <div class="fable-stage-bg"></div>
     <div class="fable-atmo-layer" data-atmo></div>
     <div class="fable-fx-layer" data-fx></div>
     <div class="fable-dialogue-feed" data-feed></div>
+    <!-- Typing indicator: "(name) is currently typing.." pinned just above the
+         input row while a narrator/character beat streams. Toggled via the
+         .is-visible class from onTurnStart/onTurnEnd hooks. -->
+    <div class="fable-typing-indicator" data-typing-indicator aria-hidden="true">
+      <span class="fable-typing-indicator__text" data-typing-text></span>
+    </div>
     <form class="fable-input-row" data-input-form>
       <!-- The input is a single centered, max-width text box. The send button
            is GONE (2026-07-27): generation is fired by pressing Enter on a
@@ -109,6 +116,11 @@ export function buildStage() {
          is open AND the mouse touches the complete edge. Click toggles the
          lock (color change only). Mirrors the left-edge lock bar. -->
     <div class="fable-edge-lock fable-edge-lock--right" data-wupi-edge-lock aria-hidden="true"></div>
+
+    <!-- LEFT drawer mount point (Card / Tracker / Codex tabs). The element +
+         handle are built by engine/left-drawer.js and injected here in
+         buildStage. Slides in from the left (mirror of the right Wupi drawer). -->
+    <div class="fable-left-drawer-mount" data-left-mount></div>
 
     <aside class="fable-wupi-drawer" data-wupi-drawer>
       <!-- Chloe 2026-07-26: replaced the 🐾 avatar + "Wupi / Game Master"
@@ -168,37 +180,48 @@ export function buildStage() {
 
     <div class="fable-toast" data-toast hidden></div>
   `;
+  // Inject the left drawer (Card / Tracker / Codex) + its edge handle into
+  // the mount point. Built by engine/left-drawer.js; reused across entries.
+  const leftMount = root.querySelector('[data-left-mount]');
+  if (leftMount) {
+    leftMount.appendChild(leftDrawer.buildLeftDrawer());
+    leftMount.appendChild(leftDrawer.buildLeftHandle());
+  }
   return root;
 }
 
 // Wire the stage after it's in the DOM. cardContext: { card, saveId }.
-// `hooks.isQuickPlay` (bool): when true, the manual Save + Load footer
-// buttons are disabled (Quick Play is single-slot quicksave only — Save/Load
-// are irrelevant). The Home button + the Wupi drawer stay enabled either way.
 export function wireStage(root, hooks) {
   stageRoot = root;
   cardContext = hooks.cardContext || null;
-  const isQuickPlay = !!hooks.isQuickPlay;
 
   const feed = root.querySelector('[data-feed]');
   const fxLayer = root.querySelector('[data-fx]');
 
-  // Background + atmosphere stripped (file header). The bg <img> keeps its
-  // data-bg attr but its src stays empty — it paints nothing over the pure
-  // black .fable-stage. Map theme is a static 'fantasy' default so the
-  // optional map panel still works without a card tone.
+  // Background + atmosphere stripped (file header). The bg layer
+  // (.fable-stage-bg) is empty — it paints nothing over the pure black
+  // .fable-stage. Map theme is a static 'fantasy' default so the optional
+  // map panel still works without a card tone.
   setMapTheme('fantasy');
 
   // Engine init (composition root).
   beats.initBeats(feed);
   initFX(fxLayer, root, { onTransient: () => {} });
+  // The typing indicator: shows "(name) is currently typing.." above the input
+  // while a narrator/character beat streams. The card name is fetched once on
+  // stage entry (best-effort — a fetch failure falls back to a generic label).
+  refreshActiveCardName(root);
   narrator.initNarrator({
-    onTurnStart: () => setGenerating(true),
+    onTurnStart: () => {
+      setGenerating(true);
+      showTypingIndicator(root);
+    },
     onTurnEnd: () => {
       setGenerating(false);
+      hideTypingIndicator(root);
       // A narrator turn just finalized → a new assistant beat is now the
-      // last in the feed. Re-stamp controls so the reroll affordance moves
-      // onto it (and the prior last assistant beat loses its reroll button).
+      // last in the feed. Re-stamp controls so the swipe/regenerate affordance
+      // moves onto it (and the prior last assistant beat loses its bar).
       refreshControls();
     },
     npcPretty: hooks.npcPretty || null,
@@ -259,14 +282,6 @@ export function wireStage(root, hooks) {
   // whose Enter fires a narrator turn — passing that textarea here.
   wupiDrawer.setStageRoot(root);
   wupiDrawer.initImpersonateButton(root.querySelector('[data-input]'));
-
-  // Phase 5B: scene-image backdrop subscriber. Listens for the late-arriving
-  // 'fable-scene-image' event (the SD swap runs after the turn's `done`) and
-  // swaps the generated PNG into the dormant `.fable-stage-bg` backdrop via
-  // the asset protocol. The failed-latch toast rides the stage's `toast` fn.
-  // Dormant by default: only fires when `sd_autogen_enabled` is flipped on
-  // (the orchestrator's done-beat spawn is gated on it Rust-side).
-  sceneImage.initSceneImage(root, { onToast: toast });
 
   // Selective regenerate (4th UX chat control): highlight a passage in the
   // last AI beat → "Regenerate" popup → AI rewrites only that slice in-place.
@@ -374,9 +389,11 @@ export function wireStage(root, hooks) {
     });
   }
 
-  // Delegated click handler for the feed controls (reroll + swipe arrows).
-  // Editing is now dblclick (separate listener below), so the `edit` action
-  // is gone from here.
+  // Delegated click handler for the feed controls (the swipe arrows). Editing
+  // is dblclick (separate listener below). The › arrow on the last variant of
+  // the last beat carries `data-action="regenerate"` (a new variant is
+  // generated + appended — unlimited); ‹ / non-last › carry swipe-left/right
+  // (navigate existing variants).
   on(feed, 'click', (e) => {
     const btn = e.target.closest('[data-action]');
     if (!btn) return;
@@ -386,7 +403,8 @@ export function wireStage(root, hooks) {
     const idx = Number.parseInt(beat.dataset.index || '', 10);
     if (!Number.isInteger(idx)) return;
     if (narrator.isGenerating() || selection.isRegenerating()) return;
-    if (action === 'reroll') {
+    if (action === 'regenerate') {
+      // › on the last variant → generate a fresh sibling variant (uncapped).
       narrator.rerollLastTurn();
       return;
     }
@@ -494,19 +512,8 @@ export function wireStage(root, hooks) {
   const footHome = root.querySelector('[data-foot-home]');
 
   // Save icon → open the modal + focus the name input.
-  // DISABLED under Quick Play (2026-07-26): Quick Play is single-slot
-  // quicksave only — manual Save/Load are irrelevant. The button gets a
-  // disabled attr + an .is-disabled class so the existing CSS can grey it;
-  // the click handler short-circuits before opening the modal. Home stays
-  // enabled so the user can still return to the title.
-  if (isQuickPlay) {
-    footSave.disabled = true;
-    footSave.classList.add('is-disabled');
-    footLoad.disabled = true;
-    footLoad.classList.add('is-disabled');
-  }
   on(footSave, 'click', () => {
-    if (isQuickPlay || footSave.disabled) return;
+    if (footSave.disabled) return;
     if (!saveOverlay) return;
     wupiDrawer.closeDrawer();
     saveOverlay.hidden = false;
@@ -546,7 +553,7 @@ export function wireStage(root, hooks) {
   saveModalClose = closeSaveModal;
 
   on(footLoad, 'click', () => {
-    if (isQuickPlay || footLoad.disabled) return;
+    if (footLoad.disabled) return;
     wupiDrawer.closeDrawer();
     if (onLoadHook) onLoadHook();
   });
@@ -619,7 +626,7 @@ function setGenerating(on) {
 
 function onKeyDown(e) {
   if (e.key !== 'Escape') return;
-  // Priority order: save modal → modal panel → wupi drawer.
+  // Priority order: save modal → modal panel → wupi drawer → left drawer.
   // Innermost surface dismisses first so a player with stacked surfaces can
   // Esc them one at a time. The save modal is highest (it's a centered card
   // over everything when open).
@@ -629,6 +636,7 @@ function onKeyDown(e) {
   }
   if (panelActive()) { dismissPanel(); e.preventDefault(); return; }
   if (wupiDrawer.isOpen()) { wupiDrawer.closeDrawer(); e.preventDefault(); return; }
+  if (leftDrawer.isOpenState()) { leftDrawer.closeDrawer(); e.preventDefault(); return; }
 }
 
 // Hover-corner dwell (decision 1: no visible button). Arm a 300ms timer
@@ -673,6 +681,40 @@ export function loadHistory(messages) {
   refreshControls();
 }
 
+// ── Typing indicator ────────────────────────────────────────────────────
+// "(name) is currently typing.." pinned above the input row while a beat
+// streams. The card name is fetched once on stage entry (best-effort) +
+// cached in `activeCardName`; the show/hide toggles are driven by the
+// narrator onTurnStart/onTurnEnd hooks. Generic fallback when no name.
+async function refreshActiveCardName(root) {
+  try {
+    const name = await invoke('fable_active_card_get');
+    activeCardName = (typeof name === 'string' && name) ? name : '';
+  } catch (_) {
+    activeCardName = '';
+  }
+  updateTypingText(root);
+}
+function typingLabel() {
+  // "Game Master" is the neutral fallback (the seated card IS the GM persona
+  // — data/fable.sim). A named card (e.g. "Rusty Tavern") reads as that card.
+  const who = activeCardName || 'Game Master';
+  return `${who} is currently typing..`;
+}
+function updateTypingText(root) {
+  const el = root.querySelector('[data-typing-text]');
+  if (el) el.textContent = typingLabel();
+}
+function showTypingIndicator(root) {
+  updateTypingText(root);
+  const ind = root.querySelector('[data-typing-indicator]');
+  if (ind) ind.classList.add('is-visible');
+}
+function hideTypingIndicator(root) {
+  const ind = root.querySelector('[data-typing-indicator]');
+  if (ind) ind.classList.remove('is-visible');
+}
+
 // Walk the feed and stamp UX chat controls (edit / reroll) on each beat
 // based on its role + position:
 //   - every USER beat: edit (in-place typo fix via `edit_message`).
@@ -694,24 +736,25 @@ function refreshControls() {
   allBeats.forEach((beat, i) => {
     const role = beat.dataset.role;
     // Variant state is stamped on the beat dataset (beats.stampVariants) so
-    // we can render the ‹ 1/N › swipe bar without a message cache. Default
-    // count 1 = no swipe bar.
+    // we can render the ‹ n/N › swipe bar without a message cache. Default
+    // count 1.
     const variantCount = Number.parseInt(beat.dataset.variantCount || '1', 10);
     const activeVariant = Number.parseInt(beat.dataset.activeVariant || '0', 10);
     if (role === 'assistant' && i === lastIdx) {
-      // Last assistant beat: swipe bar (if >1 variant) + reroll.
+      // Last assistant beat: the always-visible swipe bar. › on the last
+      // variant is the regenerate trigger (variants are uncapped).
       beats.renderControls(beat, {
-        canReroll: true,
         variantCount,
         activeVariant,
+        isLastBeat: true,
+        canRegenerate: true,
       });
     } else if (role === 'assistant') {
-      // Earlier assistant beats: swipe bar only (no reroll).
-      beats.renderControls(beat, { canReroll: false, variantCount, activeVariant });
-    } else {
-      // User + system beats: no hover controls (editing is now dblclick).
-      beats.renderControls(beat, { canReroll: false, variantCount: 1 });
+      // Earlier assistant beats: hover-gated swipe bar (navigation only, no
+      // regenerate).
+      beats.renderControls(beat, { variantCount, activeVariant, isLastBeat: false });
     }
+    // User + system beats: no controls (editing is dblclick).
   });
 }
 
@@ -750,15 +793,16 @@ export function teardownStage() {
   // (resetAtmosphere was here pre-stripping — atmosphere is gone now, see
   // file header. beats.clearFeed is the only feed reset needed.)
   beats.clearFeed();
+  // Hide the typing indicator (a close mid-stream could leave it visible).
+  if (stageRoot) hideTypingIndicator(stageRoot);
+  activeCardName = '';
   // Reset the engine module state so a close mid-turn can't leave a stuck
   // `generating` (would no-op the next session's first send) or a dangling
   // activeBeat, and so the Wupi drawer starts fresh next entry.
   narrator.resetNarrator();
   wupiDrawer.resetWupiDrawer();
+  leftDrawer.resetLeftDrawer();
   // Tear down the selection popup + its document-level listeners so re-
   // wireStage binds exactly once (mirrors the stageListeners audit).
   selection.teardownSelection();
-  // Tear down the scene-image listeners so a close mid-generation can't swap
-  // an image into a torn-down backdrop (mirrors the other engine resets).
-  sceneImage.teardownSceneImage();
 }
