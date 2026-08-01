@@ -45,14 +45,12 @@ export function buildLeftDrawer() {
       <div class="fable-left-drawer__tabs" role="tablist">
         <button class="fable-left-drawer__tab is-active" data-tab="card" role="tab">Card</button>
         <button class="fable-left-drawer__tab" data-tab="tracker" role="tab">Tracker</button>
-        <button class="fable-left-drawer__tab" data-tab="codex" role="tab">Codex</button>
       </div>
       <button class="fable-left-drawer__close" data-left-close aria-label="Close panel">✕</button>
     </header>
     <div class="fable-left-drawer__body">
       <section class="fable-left-drawer__panel is-active" data-panel="card"></section>
       <section class="fable-left-drawer__panel" data-panel="tracker"></section>
-      <section class="fable-left-drawer__panel" data-panel="codex"></section>
     </div>
   `;
   tabBtns = Array.from(drawerEl.querySelectorAll('[data-tab]'));
@@ -121,7 +119,8 @@ async function renderTab(key) {
   try {
     if (key === 'card') await renderCard(panel);
     else if (key === 'tracker') await renderTracker(panel);
-    else if (key === 'codex') await renderCodex(panel);
+    // Codex tab removed (codex_save / codex_delete are dead stubs after the
+    // codex lore-RAG module was deleted; codex_list always returns empty).
   } catch (err) {
     panel.innerHTML = `<div class="fable-left-drawer__error">Couldn't load: ${esc(err)}</div>`;
   }
@@ -327,85 +326,11 @@ async function renderTracker(panel) {
   form.querySelector('.fable-left-drawer__actions').appendChild(status);
 }
 
-// ── Codex tab ───────────────────────────────────────────────────────────
-// Add / edit / delete lore entries live. Rides the existing codex IPCs
-// (codex_list / codex_save / codex_delete); new lore lands in the __codex__
-// partition + is re-seeded for retrieval so the narrator sees it this session.
-async function renderCodex(panel) {
-  let entries = [];
-  try {
-    entries = await invoke('codex_list');
-  } catch (err) {
-    panel.innerHTML = `<div class="fable-left-drawer__error">${esc(err)}</div>`;
-    return;
-  }
-  panel.innerHTML = `
-    <div class="fable-left-drawer__codex">
-      <div class="fable-left-drawer__codex-add">
-        <input type="text" class="fable-left-drawer__codex-title" data-cx-title placeholder="Lore entry title…">
-        <textarea class="fable-left-drawer__codex-body" data-cx-body rows="4" placeholder="The lore / world fact to remember…"></textarea>
-        <div class="fable-left-drawer__actions">
-          <button class="fable-left-drawer__btn primary" data-cx-add>Add lore</button>
-        </div>
-      </div>
-      <div class="fable-left-drawer__codex-list" data-cx-list></div>
-    </div>
-  `;
-  const list = panel.querySelector('[data-cx-list]');
-  const status = document.createElement('span');
-  status.className = 'fable-left-drawer__status';
-  panel.querySelector('.fable-left-drawer__actions').appendChild(status);
-
-  const refreshList = () => {
-    list.innerHTML = '';
-    if (!entries.length) {
-      list.innerHTML = `<div class="fable-left-drawer__empty">No lore yet. Add world facts above as you play.</div>`;
-      return;
-    }
-    for (const e of entries) {
-      const item = document.createElement('div');
-      item.className = 'fable-left-drawer__codex-item';
-      item.innerHTML = `
-        <div class="fable-left-drawer__codex-item-title">${esc(e.title || e.filename)}</div>
-        <div class="fable-left-drawer__codex-item-body">${esc((e.body || '').slice(0, 200))}${(e.body || '').length > 200 ? '…' : ''}</div>
-        <button class="fable-left-drawer__codex-del" data-cx-del>Remove</button>
-      `;
-      item.querySelector('[data-cx-del]').addEventListener('click', async () => {
-        try {
-          await invoke('codex_delete', { filename: e.filename });
-          entries = entries.filter((x) => x.filename !== e.filename);
-          refreshList();
-          status.textContent = 'Removed.';
-        } catch (err) {
-          status.textContent = `Failed: ${err}`;
-        }
-      });
-      list.appendChild(item);
-    }
-  };
-  refreshList();
-
-  panel.querySelector('[data-cx-add]').addEventListener('click', async () => {
-    const title = panel.querySelector('[data-cx-title]').value.trim();
-    const body = panel.querySelector('[data-cx-body]').value.trim();
-    if (!title || !body) {
-      status.textContent = 'Title + body required.';
-      return;
-    }
-    status.textContent = 'Adding…';
-    try {
-      const stem = await invoke('codex_save', { filename: title, title, tags: [], body });
-      // Refresh the list from the backend (the stem may differ from the title).
-      entries = await invoke('codex_list');
-      panel.querySelector('[data-cx-title]').value = '';
-      panel.querySelector('[data-cx-body]').value = '';
-      refreshList();
-      status.textContent = 'Added — the narrator can now recall this.';
-    } catch (err) {
-      status.textContent = `Failed: ${err}`;
-    }
-  });
-}
+// ── Codex tab REMOVED (2026-07-31) ───────────────────────────────────────
+// The codex_save / codex_delete IPCs are dead stubs (the codex lore-RAG
+// module was deleted), and codex_list always returns empty. The tab was
+// removed with them. Live lore authoring will return when a new lore
+// surface replaces the deleted RAG layer.
 
 // ── helpers ─────────────────────────────────────────────────────────────
 function splitLines(s) {

@@ -24,8 +24,11 @@
 
 import { invoke, Channel } from '@tauri-apps/api/core';
 import * as savesIo from './saves-io.js';
-import * as crossroads from './crossroads.js';
-import * as ghostwriter from './ghostwriter.js';
+// Crossroads + Ghostwriter were removed (their crossroads_generate /
+// ghostwriter_generate IPCs are dead stubs). The generate_options /
+// set_directive Director tools are still live in Rust (tools.rs) — their
+// tool_call events now fall through to the generic tool chip below instead
+// of opening a dead modal / impersonate pass.
 
 let drawerEl = null;
 let messagesEl = null;
@@ -214,10 +217,8 @@ export function resetWupiDrawer() {
     inputEl.style.height = 'auto';
     inputEl.placeholder = IDLE_PLACEHOLDER;
   }
-  // Close any open Crossroads modal (a generation may have been in flight
-  // when the player exited the stage) + reset the Impersonate button state.
-  crossroads.closeCrossroadsModal?.();
-  impersonateBusy = false;
+  // Crossroads modal + Impersonate button were removed (their IPCs are dead
+  // stubs). No per-session state to reset for them anymore.
 }
 
 function autoGrow(el) {
@@ -295,22 +296,14 @@ function handleEvent(msg, originalText) {
       appendToBubble(activeBubble, msg.text);
       break;
     case 'tool_call':
-      // Director tools (NL-triggered §11.24 refactor): intercept the two
-      // Fable-only tools BEFORE the generic chip renders. generate_options
-      // opens the Crossroads modal (rooted on the stage so it dims the
-      // whole background); set_directive shows a confirmation chip — the
-      // actual arming happens server-side via ToolCtx (chat_send drains the
-      // slot to pending_directive after the agent loop returns).
-      if (msg.name === 'generate_options') {
-        onGenerateOptionsTool(msg.args || {});
-        // Fall through to show the generic chip too — the player should see
-        // "🔧 generate_options…" while the modal loads its options.
-      } else if (msg.name === 'set_directive') {
-        onSetDirectiveTool(msg.args || {});
-      }
       // Tool-calling agent loop (Phase 5): show a chip above the active
       // bubble indicating Wupi is executing a tool. The chip morphs on
-      // tool_result. Lazily created so non-tool turns see nothing.
+      // tool_result. Lazily created so non-tool turns see nothing. The
+      // generate_options / set_directive Director tools (still live in Rust)
+      // now render only this generic chip — the dedicated Crossroads modal
+      // + Impersonate pass that used to intercept them were removed (their
+      // crossroads_generate / ghostwriter_generate IPCs are dead stubs).
+      // set_directive still arms server-side via ToolCtx regardless of UI.
       if (!activeToolChip && messagesEl && activeBubble) {
         activeToolChip = document.createElement('div');
         activeToolChip.className = 'drawer-tool-chip running';
@@ -369,147 +362,11 @@ function onFableStateQuery(focus, stateJson) {
   panelManager.summon(focus || '', entities, schema || {});
 }
 
-// ── Director tool handlers (NL-triggered §11.24) ──────────────────────────
-//
-// These fire when chat_send's agent loop emits a `tool_call` event for one of
-// the two Fable-only tools (generate_options / set_directive). The args have
-// already been Rust-validated (tools.rs::validate_args).
-
-// The stage root — set by stage.js via setStageRoot so the modal mounts on the
-// stage (dims the full background per the UX spec) rather than inside the
-// narrow drawer.
-let stageRootEl = null;
-export function setStageRoot(el) { stageRootEl = el || null; }
-
-function onGenerateOptionsTool(args) {
-  // Insert/Send should land in the DRAWER compose box (the player is
-  // conversing with Wupi — the picked option becomes their next message to
-  // her). Send also submits the drawer form.
-  crossroads.openCrossroadsModal({
-    root: stageRootEl || drawerEl || document.body,
-    lensId: args.lens || 'action',
-    count: args.count || 6,
-    seed: args.seed || '',
-    fillInput: (text) => {
-      if (!inputEl) return;
-      inputEl.value = text;
-      inputEl.dispatchEvent(new Event('input', { bubbles: true }));
-      autoGrow(inputEl);
-    },
-    onSubmit: () => {
-      // Submit the drawer form so the picked option sends to Wupi. Matches
-      // the Enter-to-send path in onInputKeydown.
-      boundForm && boundForm.requestSubmit();
-    },
-  });
-}
-
-function onSetDirectiveTool(args) {
-  // Server-side arming already happened (the set_directive tool wrote to the
-  // directive_slot; chat_send drains it to pending_directive after the loop).
-  // Here we just confirm visually: a chip in the drawer tells the player
-  // their steer is armed for the next narrator turn.
-  const text = String(args.text || '').trim();
-  if (!text || !messagesEl) return;
-  const chip = document.createElement('div');
-  chip.className = 'drawer-tool-chip ok director-armed';
-  // Brief preview of the armed directive (truncated) so the player can
-  // confirm Wupi understood.
-  const preview = text.length > 80 ? text.slice(0, 80) + '…' : text;
-  chip.textContent = `🎯 Director armed — fires next narrator turn: "${preview}"`;
-  messagesEl.appendChild(chip);
-  messagesEl.scrollTop = messagesEl.scrollHeight;
-}
-
-// ── Impersonate ✎ button on the PLAYER'S ROLEPLAY text box ────────────────
-//
-// Chloe 2026-07-27: the pencil was previously mounted on the drawer's own
-// compose box (`.fable-wupi-input`) — wrong field. Impersonate polishes the
-// player's next ROLEPLAY action, so the button belongs on the player's
-// `.fable-input` textarea (the one whose Enter fires a narrator turn), NOT
-// on the Wupi-chat drawer. Moved here. The button is built lazily inside
-// `.fable-input-box` (the wrapper around the player's textarea), pinned to
-// the right edge via absolute positioning (CSS `.fable-impersonate-btn`).
-
-let impersonateBtn = null;
-let impersonateTarget = null;  // the player's roleplay textarea
-let impersonateBusy = false;
-
-export function initImpersonateButton(targetInput) {
-  // Re-mount safety: if called again with a different target (re-wireStage
-  // after a stage rebuild), tear down the old button first so we never
-  // double-mount.
-  if (impersonateBtn) {
-    destroyImpersonateButton();
-  }
-  if (!targetInput) return;
-  // Attach to the .fable-input-box wrapper (position: relative via the
-  // existing .fable-input-group style is on the parent; we want the button
-  // INSIDE the visible box, so anchor to .fable-input-box which wraps the
-  // textarea directly).
-  const box = targetInput.closest('.fable-input-box') || targetInput.parentElement;
-  if (!box) return;
-  // .fable-input-box needs to be a positioning context for the absolute
-  // button. Add position: relative inline if CSS doesn't already set it
-  // (CSS will be updated, but this is defensive — never trust a rebuild).
-  if (getComputedStyle(box).position === 'static') {
-    box.style.position = 'relative';
-  }
-  impersonateTarget = targetInput;
-  impersonateBtn = document.createElement('button');
-  impersonateBtn.className = 'fable-impersonate-btn';
-  impersonateBtn.type = 'button';
-  impersonateBtn.title = 'Impersonate — polish your rough notes into RP prose';
-  impersonateBtn.setAttribute('aria-label', 'Impersonate');
-  impersonateBtn.innerHTML = '<span class="fable-impersonate-glyph">✎</span>';
-  impersonateBtn.addEventListener('click', onImpersonateClick);
-  box.appendChild(impersonateBtn);
-}
-
-function destroyImpersonateButton() {
-  if (impersonateBtn && impersonateBtn.parentNode) {
-    impersonateBtn.parentNode.removeChild(impersonateBtn);
-  }
-  impersonateBtn = null;
-  impersonateTarget = null;
-  impersonateBusy = false;
-}
-
-async function onImpersonateClick() {
-  if (impersonateBusy || !impersonateTarget) return;
-  impersonateBusy = true;
-  impersonateBtn?.classList.add('busy');
-  try {
-    const ran = await ghostwriter.runImpersonateOn(impersonateTarget, {
-      onBusy: () => {}, // we manage the button state locally
-      onError: (msg) => flashDrawerError(msg),
-    });
-    if (!ran && impersonateTarget.value.trim()) {
-      // Empty input — pulse the button as a hint.
-      impersonateBtn?.classList.add('shake');
-      setTimeout(() => impersonateBtn?.classList.remove('shake'), 320);
-    }
-  } finally {
-    impersonateBusy = false;
-    impersonateBtn?.classList.remove('busy');
-  }
-}
-
-function flashDrawerError(message) {
-  // Reuse the .fable-toast if present on the stage; else console.
-  const toast = document.querySelector('.fable-toast');
-  if (toast && !toast.hidden) {
-    setTimeout(() => flashDrawerError(message), 400);
-    return;
-  }
-  if (toast) {
-    toast.textContent = message;
-    toast.hidden = false;
-    setTimeout(() => { toast.hidden = true; }, 3200);
-  } else {
-    console.warn('[wupi-drawer]', message);
-  }
-}
+// ── Impersonate ✎ button REMOVED (2026-07-31) ─────────────────────────────
+// The Impersonate pass rode ghostwriter_generate, which is now a dead stub
+// (the guided_prompt module was deleted). The button was deleted with it.
+// set_directive (the Director steer) still works server-side via its Rust
+// tool — it just renders the generic tool chip now, no special UI.
 
 // Expose save/load shortcuts the pause menu + drawer can call.
 export { savesIo };
