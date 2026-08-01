@@ -362,9 +362,55 @@ fn progress_snapshot(progress: &Arc<std::sync::Mutex<DownloadProgress>>) -> Down
 
 // ── Public entry: download all required files ──────────────────────────────
 
+/// Cap on automatic resume attempts per file within one `download_models`
+/// invocation. A transient failure (network blip, idle-socket drop — which
+/// correlate with the window being hidden/alt-tabbed, since the OS throttles
+/// a non-foreground window's I/O and CDNs reap idle connections) used to
+/// surface as a hard "Download failed", forcing the user to manually retry.
+/// The loop re-hits `/resolve/` for a fresh signed URL + resumes from the
+/// `.part` file each time, so a flaky few minutes self-heals instead of
+/// stranding the user. Permanent errors (401/403/404 — bad token, wrong
+/// repo) are NOT retried; they fail fast via `is_permanent_error`.
+const MAX_RESUME_ATTEMPTS: u32 = 6;
+/// Backoff base (seconds); attempt N waits `BASE * 2^(N-1)`, capped.
+const RESUME_BACKOFF_BASE_SECS: u64 = 2;
+const RESUME_BACKOFF_CAP_SECS: u64 = 30;
+
+/// Classify a `download_one` error string as permanent (do NOT retry —
+/// re-trying can't fix it and would only delay surfacing the real cause) vs
+/// transient (retry with resume). The error strings are produced by
+/// `download_one` above; we match on their stable prefixes.
+///
+/// Permanent:
+///   - "HF returned 4xx ..." — bad/expired token (401/403), wrong repo/file
+///     (404). The Bearer token authenticates the `/resolve/` hop; a 4xx here
+///     is an auth/config problem, not a transient network fault.
+///   - "open ... for write" / "fsync ..." / "rename ..." / "stat existing ..."
+///     / "create models dir ..." — local filesystem failures (disk full,
+///     permissions). Retrying won't change the disk state.
+///   - "byte counter overflow" — u64 overflow; a logic bug, not transient.
+///
+/// Transient (the default): HF resolve/send failures, stream read errors,
+/// and write errors mid-stream — all of which a fresh `/resolve/` + resume
+/// from `.part` can recover from.
+fn is_permanent_error(err: &str) -> bool {
+    err.starts_with("HF returned 4")
+        || err.starts_with("HF returned 5") // server errors may be transient, but a 5xx
+        // on HF's resolve endpoint has repeatedly proven sticky within a single
+        // session; treat as permanent so we surface it rather than burn 6 attempts.
+        || err.contains(" for write: ")
+        || err.starts_with("fsync ")
+        || err.starts_with("rename ")
+        || err.starts_with("stat existing ")
+        || err.starts_with("create models dir ")
+        || err.contains("byte counter overflow")
+}
+
 /// Download every file in `REQUIRED_FILES` into `dest_dir`. Skips files that
 /// already exist at their final path (idempotent re-runs). Updates `progress`
-/// throughout; honors `cancel`.
+/// throughout; honors `cancel`. Transient mid-stream failures (the kind that
+/// correlate with the window being alt-tabbed / hidden) trigger an automatic
+/// resume-from-`.part` retry; permanent errors fail fast.
 pub async fn download_all(
     dest_dir: PathBuf,
     progress: Arc<std::sync::Mutex<DownloadProgress>>,
@@ -385,8 +431,77 @@ pub async fn download_all(
             tracing::info!(file = filename, "already present; skipping");
             continue;
         }
-        download_one(filename, &dest_dir, &client, Arc::clone(&progress), Arc::clone(&cancel), app.clone())
-            .await?;
+
+        // Retry-with-resume loop. Each attempt re-hits `/resolve/` for a fresh
+        // signed CDN URL and resumes from the `.part` file's current length,
+        // so a transient blip a few minutes into a ~10 GB pull doesn't throw
+        // away the bytes already on disk. download_one is already
+        // resume-correct (its resume_offset = existing .part size, append mode),
+        // so a retry is literally a second `download_one` call for the same
+        // file — no special per-attempt state.
+        let mut last_err: Option<String> = None;
+        for attempt in 1..=MAX_RESUME_ATTEMPTS {
+            if cancel.load(Ordering::Relaxed) {
+                return Err("cancelled".to_owned());
+            }
+            match download_one(
+                filename,
+                &dest_dir,
+                &client,
+                Arc::clone(&progress),
+                Arc::clone(&cancel),
+                app.clone(),
+            )
+            .await
+            {
+                Ok(_size) => {
+                    last_err = None;
+                    break;
+                }
+                Err(e) => {
+                    // "cancelled" is user-initiated; propagate immediately
+                    // without surfacing as a failure.
+                    if e.eq_ignore_ascii_case("cancelled") {
+                        return Err(e);
+                    }
+                    if is_permanent_error(&e) || attempt == MAX_RESUME_ATTEMPTS {
+                        last_err = Some(e);
+                        break;
+                    }
+                    // Transient + attempts remaining → back off + retry. Keep
+                    // the phase as Downloading (don't flip to Failed) so the
+                    // UI's bar holds steady; the user sees continuous progress.
+                    tracing::warn!(
+                        file = filename,
+                        attempt,
+                        error = %e,
+                        "transient download error; will resume from .part after backoff"
+                    );
+                    let backoff_secs = std::cmp::min(
+                        RESUME_BACKOFF_BASE_SECS.saturating_mul(1 << (attempt - 1)),
+                        RESUME_BACKOFF_CAP_SECS,
+                    );
+                    // Sleep in 500ms ticks so a Cancel click is honored within
+                    // half a second even mid-backoff (the cancel check at the
+                    // top of the next iteration then exits). Uses
+                    // tokio::time::sleep (NOT std::thread::sleep) so we don't
+                    // block the tokio worker thread — this download task shares
+                    // the runtime with the rest of the app.
+                    let mut waited = 0u64;
+                    while waited < backoff_secs * 1000 {
+                        if cancel.load(Ordering::Relaxed) {
+                            return Err("cancelled".to_owned());
+                        }
+                        let step = std::cmp::min(500, backoff_secs * 1000 - waited);
+                        tokio::time::sleep(std::time::Duration::from_millis(step)).await;
+                        waited += step;
+                    }
+                }
+            }
+        }
+        if let Some(e) = last_err {
+            return Err(e);
+        }
     }
 
     {

@@ -377,22 +377,13 @@ impl ToolError {
 #[derive(Debug, Clone)]
 pub struct ToolCtx {
     pub install_root: PathBuf,
-    /// Codex-dirty flag shared with `AppState::codex_dirty`. Set by the
-    /// `codex_create`/`codex_delete` tools after a successful write/delete so
-    /// `chat_send`'s finalize block re-seeds the `__codex__` partition before
-    /// the next turn (closing the hot-load seam gap: tool writes are otherwise
-    /// invisible to retrieval until reboot — the `codex_save`/`codex_delete`
-    /// IPCs re-seed inline, but `Tool::execute` is sync and has no engine
-    /// handle, so it sets this flag and the async drain happens on the chat
-    /// path). Default empty so test/standalone construction is unaffected.
-    pub codex_dirty: Option<Arc<std::sync::atomic::AtomicBool>>,
     /// Per-turn Director directive slot (the `set_directive` tool's write
     /// target). Minted fresh by `chat_send` per call, drained to
-    /// `AppState::pending_directive` after the agent loop returns — same
-    /// lifetime pattern as `codex_dirty`. `Tool::execute` is sync and the slot
-    /// is never held across an await, so `std::sync::Mutex` is correct here
-    /// (NOT `tokio::sync`). Default `None` → test/standalone unaffected; the
-    /// `set_directive` tool errors gracefully if invoked without a slot.
+    /// `AppState::pending_directive` after the agent loop returns.
+    /// `Tool::execute` is sync and the slot is never held across an await, so
+    /// `std::sync::Mutex` is correct here (NOT `tokio::sync`). Default `None`
+    /// → test/standalone unaffected; the `set_directive` tool errors
+    /// gracefully if invoked without a slot.
     pub directive_slot: Option<Arc<std::sync::Mutex<Option<String>>>>,
 }
 
@@ -400,15 +391,8 @@ impl ToolCtx {
     pub fn new(install_root: PathBuf) -> Self {
         Self {
             install_root,
-            codex_dirty: None,
             directive_slot: None,
         }
-    }
-    /// Attach the shared codex-dirty flag (called once per chat_send from
-    /// lib.rs, before the agent loop iterates).
-    pub fn with_codex_dirty(mut self, flag: Arc<std::sync::atomic::AtomicBool>) -> Self {
-        self.codex_dirty = Some(flag);
-        self
     }
     /// Attach the per-turn directive slot (called once per chat_send from
     /// lib.rs when a Fable session is active, before the agent loop iterates).
@@ -423,13 +407,6 @@ impl ToolCtx {
         let safe = sandbox_path(rel)
             .ok_or_else(|| ToolError::new(format!("unsafe path (absolute or traverses): {rel:?}")))?;
         Ok(self.install_root.join(safe))
-    }
-    /// Mark the codex partition dirty so the chat-path finalize block re-seeds.
-    /// Cheap no-op when no flag is attached (test/standalone ctx).
-    fn mark_codex_dirty(&self) {
-        if let Some(f) = self.codex_dirty.as_ref() {
-            f.store(true, std::sync::atomic::Ordering::Relaxed);
-        }
     }
 }
 
@@ -511,6 +488,22 @@ fn req_str_nonempty(args: &serde_json::Value, key: &str) -> Result<String, ToolE
     }
     Ok(s)
 }
+
+/// Sanitize a user-supplied filename into a safe stem (lowercase alphanumeric
+/// + `-`/`_`, leading/trailing dashes trimmed). Returns None if the result is
+/// empty. Inlined from the removed `codex` module so the card/asset tools that
+/// depend on it keep working without the codex (lore RAG) feature.
+fn sanitize_stem(filename: &str) -> Option<String> {
+    let stem: String = filename
+        .trim()
+        .to_lowercase()
+        .chars()
+        .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '-' })
+        .collect();
+    let stem = stem.trim_matches('-').to_owned();
+    if stem.is_empty() { None } else { Some(stem) }
+}
+
 
 // --- file_read -------------------------------------------------------------
 
@@ -701,7 +694,7 @@ impl Tool for CreateSimCard {
         // apps/fable/cards/<stem>.sim is on the allow-list, but verify the
         // computed path itself (defensive: a filename like ../escape would
         // have been caught by sandbox_path, but be explicit).
-        let stem = crate::codex::sanitize_stem(&filename)
+        let stem = sanitize_stem(&filename)
             .ok_or_else(|| ToolError::new("filename empty after sanitization"))?;
         let rel = format!("apps/fable/cards/{stem}.sim");
         let safe = sandbox_path(&rel)
@@ -722,7 +715,7 @@ impl Tool for CreateSimCard {
     fn execute(&self, args: &serde_json::Value, ctx: &ToolCtx) -> Result<String, ToolError> {
         let filename = req_str(args, "filename")?;
         let xml = req_str(args, "xml")?;
-        let stem = crate::codex::sanitize_stem(&filename)
+        let stem = sanitize_stem(&filename)
             .ok_or_else(|| ToolError::new("filename empty after sanitization"))?;
         let rel = format!("apps/fable/cards/{stem}.sim");
         let path = ctx.resolve(&rel)?;
@@ -749,7 +742,7 @@ impl Tool for DeleteSimCard {
     }
     fn validate_args(&self, args: &serde_json::Value) -> Result<(), ToolError> {
         let filename = req_str_nonempty(args, "filename")?;
-        let stem = crate::codex::sanitize_stem(&filename)
+        let stem = sanitize_stem(&filename)
             .ok_or_else(|| ToolError::new("filename empty after sanitization"))?;
         let rel = format!("apps/fable/cards/{stem}.sim");
         let safe = sandbox_path(&rel)
@@ -761,7 +754,7 @@ impl Tool for DeleteSimCard {
     }
     fn execute(&self, args: &serde_json::Value, ctx: &ToolCtx) -> Result<String, ToolError> {
         let filename = req_str(args, "filename")?;
-        let stem = crate::codex::sanitize_stem(&filename)
+        let stem = sanitize_stem(&filename)
             .ok_or_else(|| ToolError::new("filename empty after sanitization"))?;
         let rel = format!("apps/fable/cards/{stem}.sim");
         let path = ctx.resolve(&rel)?;
@@ -788,8 +781,8 @@ impl Tool for DeleteSimCard {
 // Composition of three existing capabilities (the §11.49 Scribe precedent):
 //   1. sim_card::parse_from_xml_str — read + parse the card (the .sim format).
 //   2. codex::save_file — write each entry (the CodexCreate path).
-//   3. codex_dirty drain — re-seed retrieval so the new entries are visible
-//      on the next narrator turn (the §11.25 hot-load fix).
+//   3. retrieval re-seed — so the new entries are visible on the next
+//      narrator turn (the codex_save IPC re-seeds inline).
 //
 // The entries it authors serve two consumers:
 //   - The narrator: canonical NPC identities + location flavor (the
@@ -820,7 +813,7 @@ impl Tool for WireSimCard {
     }
     fn validate_args(&self, args: &serde_json::Value) -> Result<(), ToolError> {
         let filename = req_str_nonempty(args, "filename")?;
-        let stem = crate::codex::sanitize_stem(&filename)
+        let stem = sanitize_stem(&filename)
             .ok_or_else(|| ToolError::new("filename empty after sanitization"))?;
         // Verify the card path resolves safely + is readable (the read target).
         let card_rel = format!("apps/fable/cards/{stem}.sim");
@@ -841,100 +834,10 @@ impl Tool for WireSimCard {
         Ok(())
     }
     fn execute(&self, args: &serde_json::Value, ctx: &ToolCtx) -> Result<String, ToolError> {
-        let filename = req_str(args, "filename")?;
-        let stem = crate::codex::sanitize_stem(&filename)
-            .ok_or_else(|| ToolError::new("filename empty after sanitization"))?;
-        let card_rel = format!("apps/fable/cards/{stem}.sim");
-        let card_path = ctx.resolve(&card_rel)?;
-        let xml = std::fs::read_to_string(&card_path)
-            .map_err(|e| ToolError::new(format!("read card {card_rel}: {e}")))?;
-        let card = crate::sim_card::parse_from_xml_str(&xml)
-            .map_err(|e| ToolError::new(format!("parse card {card_rel}: {e}")))?;
-        let docs_dir = ctx.resolve("data/docs")?;
-
-        let mut written: Vec<String> = Vec::new();
-        let card_tag = card.name.clone();
-
-        // One entry per NPC in <cast>.
-        for npc in &card.cast {
-            let entry_stem = format!("npc_{}", crate::codex::sanitize_stem(&npc.id).unwrap_or_else(|| "unknown".into()));
-            let title = if npc.name.trim().is_empty() {
-                format!("{} (NPC)", npc.id)
-            } else {
-                format!("{} — {}", npc.name.trim(), npc.role.trim())
-            };
-            let tags = vec!["npc".to_string(), card_tag.clone()]
-                .into_iter()
-                .filter(|t| !t.is_empty())
-                .collect::<Vec<_>>();
-            let mut body = String::new();
-            body.push_str(&format!("**Canonical id:** `{}`\n\n", npc.id));
-            if !npc.name.trim().is_empty() {
-                body.push_str(&format!("**Name:** {}\n\n", npc.name.trim()));
-            }
-            if !npc.role.trim().is_empty() {
-                body.push_str(&format!("**Role:** {}\n\n", npc.role.trim()));
-            }
-            if let Some(tier) = npc.tier.as_ref().filter(|t| !t.trim().is_empty()) {
-                body.push_str(&format!("**Threat tier:** {}\n\n", tier.trim()));
-            }
-            if !npc.aliases.is_empty() {
-                body.push_str(&format!("**Aliases:** {}\n\n", npc.aliases.join(", ")));
-            }
-            body.push_str(&format!(
-                "Canonical identity for `{}` — the Rust-owned registry key. \
-                 Immutable world fact (do not contradict). Seed source: <cast> \
-                 in {}.\n",
-                npc.id, card_rel
-            ));
-            crate::codex::save_file(&docs_dir, &entry_stem, &title, &tags, &body)
-                .map_err(|e| ToolError::new(format!("write {entry_stem}: {e}")))?;
-            written.push(format!("data/docs/{entry_stem}.md"));
-        }
-
-        // One entry per node in <locations>.
-        for node in &card.locations {
-            let entry_stem = format!("loc_{}", crate::codex::sanitize_stem(&node.id).unwrap_or_else(|| "unknown".into()));
-            let title = if node.name.trim().is_empty() {
-                format!("{} (location)", node.id)
-            } else {
-                node.name.trim().to_string()
-            };
-            let tags = vec!["location".to_string(), card_tag.clone()]
-                .into_iter()
-                .filter(|t| !t.is_empty())
-                .collect::<Vec<_>>();
-            let mut body = String::new();
-            body.push_str(&format!("**Node id:** `{}`\n\n", node.id));
-            if !node.name.trim().is_empty() {
-                body.push_str(&format!("**Name:** {}\n\n", node.name.trim()));
-            }
-            if !node.setting.trim().is_empty() {
-                body.push_str(&format!("**Setting:** {}\n\n", node.setting.trim()));
-            }
-            if !node.neighbors.is_empty() {
-                body.push_str(&format!("**Exits:** {}\n\n", node.neighbors.join(", ")));
-            }
-            body.push_str(&format!(
-                "Location node in {}. Aesthetic guide for scene imagery — \
-                 match the palette/architecture/materials of this place. \
-                 Seed source: <locations> in {}.\n",
-                card_tag, card_rel
-            ));
-            crate::codex::save_file(&docs_dir, &entry_stem, &title, &tags, &body)
-                .map_err(|e| ToolError::new(format!("write {entry_stem}: {e}")))?;
-            written.push(format!("data/docs/{entry_stem}.md"));
-        }
-
-        // Re-seed the retrieval index so the new entries are visible next turn.
-        ctx.mark_codex_dirty();
-
-        if written.is_empty() {
-            return Ok(format!(
-                "wired {card_rel} — no <cast> or <locations> blocks found (nothing to write)"
-            ));
-        }
-        Ok(format!("wired {card_rel} — {} entries: {}", written.len(), written.join(", ")))
+        let _ = (args, ctx);
+        Err(ToolError::new(
+            "wire_sim_card is disabled (codex lore-RAG feature removed).",
+        ))
     }
 }
 
@@ -1014,7 +917,7 @@ impl Tool for CodexCreate {
             return Err(ToolError::new("body exceeds 50 KB"));
         }
         let _ = title; // any non-null string is fine
-        let stem = crate::codex::sanitize_stem(&filename)
+        let stem = sanitize_stem(&filename)
             .ok_or_else(|| ToolError::new("filename empty after sanitization"))?;
         let rel = format!("data/docs/{stem}.md");
         let safe = sandbox_path(&rel)
@@ -1025,27 +928,10 @@ impl Tool for CodexCreate {
         Ok(())
     }
     fn execute(&self, args: &serde_json::Value, ctx: &ToolCtx) -> Result<String, ToolError> {
-        let filename = req_str(args, "filename")?;
-        let title = req_str(args, "title")?;
-        let body = req_str(args, "body")?;
-        let tags: Vec<String> = args
-            .get("tags")
-            .and_then(|v| v.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|v| v.as_str().map(String::from))
-                    .collect()
-            })
-            .unwrap_or_default();
-        let dir = ctx.resolve("data/docs")?;
-        let stem = crate::codex::save_file(&dir, &filename, &title, &tags, &body)
-            .map_err(|e| ToolError::new(format!("save codex: {e}")))?;
-        // Mark the codex partition dirty so chat_send's finalize block re-seeds
-        // the retrieval index before the next turn (otherwise the new entry is
-        // invisible to the narrator until reboot — the codex_save IPC re-seeds
-        // inline, but Tool::execute is sync and has no engine handle).
-        ctx.mark_codex_dirty();
-        Ok(format!("wrote data/docs/{stem}.md"))
+        let _ = (args, ctx);
+        Err(ToolError::new(
+            "codex_create is disabled (codex lore-RAG feature removed).",
+        ))
     }
 }
 
@@ -1064,7 +950,7 @@ impl Tool for CodexDelete {
     }
     fn validate_args(&self, args: &serde_json::Value) -> Result<(), ToolError> {
         let filename = req_str_nonempty(args, "filename")?;
-        let stem = crate::codex::sanitize_stem(&filename)
+        let stem = sanitize_stem(&filename)
             .ok_or_else(|| ToolError::new("filename empty after sanitization"))?;
         let rel = format!("data/docs/{stem}.md");
         let safe = sandbox_path(&rel)
@@ -1075,14 +961,10 @@ impl Tool for CodexDelete {
         Ok(())
     }
     fn execute(&self, args: &serde_json::Value, ctx: &ToolCtx) -> Result<String, ToolError> {
-        let filename = req_str(args, "filename")?;
-        let dir = ctx.resolve("data/docs")?;
-        crate::codex::delete_file(&dir, &filename)
-            .map_err(|e| ToolError::new(format!("delete codex: {e}")))?;
-        // Same dirty-flag rationale as codex_create: keep the retrieval index
-        // in sync so the next narrator turn sees the deletion.
-        ctx.mark_codex_dirty();
-        Ok(format!("deleted {}", filename))
+        let _ = (args, ctx);
+        Err(ToolError::new(
+            "codex_delete is disabled (codex lore-RAG feature removed).",
+        ))
     }
 }
 
@@ -1103,24 +985,10 @@ impl Tool for CodexList {
         Ok(())
     }
     fn execute(&self, _args: &serde_json::Value, ctx: &ToolCtx) -> Result<String, ToolError> {
-        let dir = ctx.resolve("data/docs")?;
-        let entries = crate::codex::list_files(&dir)
-            .map_err(|e| ToolError::new(format!("list codex: {e}")))?;
-        if entries.is_empty() {
-            return Ok("(empty)".into());
-        }
-        let lines: Vec<String> = entries
-            .iter()
-            .map(|e| {
-                format!(
-                    "{} | {} | {}",
-                    e.filename,
-                    e.title,
-                    e.tags.join(",")
-                )
-            })
-            .collect();
-        Ok(lines.join("\n"))
+        let _ = ctx;
+        Err(ToolError::new(
+            "codex_list is disabled (codex lore-RAG feature removed).",
+        ))
     }
 }
 
@@ -1163,9 +1031,11 @@ impl Tool for GenerateOptions {
         }
     }
     fn validate_args(&self, args: &serde_json::Value) -> Result<(), ToolError> {
-        // lens: if present, must be one of the 5 valid ids.
+        // lens: if present, must be one of the 5 valid ids. Inlined from the
+        // removed `crossroads_prompt` module so validation still steers the model.
         if let Some(lens) = args.get("lens").and_then(|v| v.as_str()) {
-            if crate::crossroads_prompt::CrossroadsCategory::from_id(lens).is_none() {
+            const VALID_LENS: &[&str] = &["action", "plot", "character", "explicit", "world"];
+            if !VALID_LENS.contains(&lens) {
                 return Err(ToolError::new(format!(
                     "unknown lens {lens:?}; expected one of action|plot|character|explicit|world"
                 )));

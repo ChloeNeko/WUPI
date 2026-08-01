@@ -801,12 +801,9 @@ impl<E: Embedder> MemoryEngine<E> {
     /// Same hybrid retrieval (embedding + FTS5 + RRF fusion), same codex
     /// per-class floor, same graceful FTS5-syntax-error degradation. Only the
     /// system partition differs (`FABLE_SYSTEM_CARD_ID` instead of
-    /// [`WUPI_SYSTEM_CARD_ID`]). Used by BOTH the New Game interview path
-    /// (`gm_prompt::build_gm_system_prompt`) AND the narrator path
-    /// (`narrator_prompt::build_*_system_prompt`) to surface the relevant
-    /// Fable playbook slice contextually — one query/turn serves both
-    /// Fable personas (they share one knowledge base; two personas querying
-    /// two fragmented vector spaces was the pre-unification waste).
+    /// [`WUPI_SYSTEM_CARD_ID`]). Used by the narrator path
+    /// (`build_narrator_system_prompt` / `build_api_narrator_system_prompt`
+    /// in lib.rs) to surface the relevant Fable playbook slice contextually.
     pub async fn search_fable_visible(
         &self,
         query: &str,
