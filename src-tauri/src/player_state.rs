@@ -398,8 +398,8 @@ impl PlayerState {
 /// lethal (the dice + attacker tier + defender condition crossed the
 /// threshold), `lethal` flips true and `directive` carries a hard
 /// `[DIRECTIVE: ...]` line the narrator MUST obey. The lethality judgment
-/// is pure Rust (Slice 1 anti-Oblivion clause in `narrator_prompt.rs`
-/// states the principle; this is where it's enforced mechanically).
+/// is pure Rust (the anti-Oblivion principle: NPC threat does not scale
+/// with the player — enforced mechanically here, not by prompt).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RefereeOutcome {
     pub part: BodyPart,

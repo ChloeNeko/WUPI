@@ -6,7 +6,8 @@
 //! events, not token-level concerns, so they're best extracted once from the
 //! complete text rather than incrementally during streaming.
 //!
-//! # Supported commands (mirror `narrator_prompt::BRACKET_PROTOCOL`)
+//! # Supported commands (mirror the bracket protocol emitted by
+//! `build_narrator_system_prompt` in `lib.rs`)
 //!
 //! - `[CHARACTER_TURN:npc_id]` ... `[CHARACTER_TURN:end]`: an NPC spoke.
 //! - `[OBJECT id=iron_chest state=open]`: an object's state changed.

@@ -3,7 +3,7 @@
 //! pillars and derives a [`SceneMode`] from them. The mode then drives:
 //!
 //! 1. The narrator prose cadence via a `<scene_pacing mode="...">` tag in
-//!    `narrator_prompt::build_narrator_system_prompt`.
+//!    `build_narrator_system_prompt` (lib.rs).
 //! 2. The World Progression tick interval (`SceneMode::progression_interval_hours`).
 //! 3. The skill-check DC modifier (`SceneMode::dc_modifier`).
 //!
