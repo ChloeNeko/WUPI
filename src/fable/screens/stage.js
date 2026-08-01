@@ -33,7 +33,6 @@ import * as beats from '../engine/beats.js';
 import * as narrator from '../engine/narrator.js';
 import * as wupiDrawer from '../engine/wupi-drawer.js';
 import * as leftDrawer from '../engine/left-drawer.js';
-import * as selection from '../engine/selection.js';
 import { invoke } from '@tauri-apps/api/core';
 // playFX + clearFX were the weather-render hooks pre-stripping; weather is
 // gone now (file header), so only initFX + clearAllFX remain used. The two
@@ -271,48 +270,12 @@ export function wireStage(root, hooks) {
     },
   });
 
-  // Crossroads + Ghostwriter moved to NL-triggering via the Wupi drawer
-  // (§11.24 refactor, 2026-07-27). The stage no longer mounts FABs; instead
-  // we hand the drawer the stage root (so the Crossroads modal can dim the
-  // full background when Wupi fires generate_options).
-  //
-  // Chloe 2026-07-27: the Impersonate ✎ button now mounts on the PLAYER'S
-  // ROLEPLAY text box (`.fable-input`), NOT the drawer's compose box. The
-  // button polishes the player's next RP action, so it belongs on the field
-  // whose Enter fires a narrator turn — passing that textarea here.
-  wupiDrawer.setStageRoot(root);
-  wupiDrawer.initImpersonateButton(root.querySelector('[data-input]'));
-
-  // Selective regenerate (4th UX chat control): highlight a passage in the
-  // last AI beat → "Regenerate" popup → AI rewrites only that slice in-place.
-  // Rides the same `setGenerating` hook so the input's "Press Enter to stop…"
-  // placeholder reflects an in-flight regenerate (the empty-Enter stop is
-  // gated on `narrator.isGenerating()` below; this hook is purely cosmetic
-  // for the regenerate path — selective regen is a one-shot, not cancellable).
-  selection.initSelection(root, {
-    onGenerating: (on) => {
-      // Reflect the busy state on the input placeholder (matches setGenerating
-      // for narrator turns). We DO NOT toggle the input's disabled state —
-      // the player can still type, just not submit a new turn until the slice
-      // finishes (gated by `selection.isRegenerating()` in the submit handler).
-      const input = stageRoot && stageRoot.querySelector('[data-input]');
-      if (!input) return;
-      if (on) {
-        input.dataset.idlePlaceholder = input.placeholder;
-        input.placeholder = 'Rewriting selection…';
-      } else if (input.dataset.idlePlaceholder != null) {
-        input.placeholder = input.dataset.idlePlaceholder;
-        delete input.dataset.idlePlaceholder;
-      }
-    },
-    // Chloe 2026-07-27: called after a successful in-place slice splice so
-    // stage.js can re-stamp the edit/reroll controls on the last beat. The
-    // old path (beats.rebuildFromMessages) implicitly stamped controls via
-    // a full feed teardown+rebuild — that caused the flicker. The new path
-    // splices only the changed beat's body in-place (no teardown), so the
-    // controls have to be re-stamped explicitly here.
-    onComplete: () => refreshControls(),
-  });
+  // Crossroads (the option-picker modal) + Ghostwriter (the Impersonate ✎
+  // button) + Selective Regenerate (highlight-to-rewrite) were removed
+  // 2026-07-31: their backend IPCs (crossroads_generate / ghostwriter_generate
+  // / regenerate_slice) are dead stubs after the narrator/codex layer strip.
+  // The generate_options / set_directive Director tools are still live in
+  // Rust and now render only the generic tool chip in the Wupi drawer.
 
   // Input form (narrator turn). All stage-element listeners go through
   // on() so teardownStage removes them — the stage DOM is reused across
@@ -327,10 +290,8 @@ export function wireStage(root, hooks) {
   on(inputForm, 'submit', (e) => {
     e.preventDefault();
     const text = input.value.trim();
-    // Block new turns while a selective regenerate is in flight (the slice
-    // IPC owns the fable_session lock + Chat lease — a concurrent send would
-    // collide on both).
-    if (!text || narrator.isGenerating() || selection.isRegenerating()) return;
+    // Block new turns while a narrator turn is in flight.
+    if (!text || narrator.isGenerating()) return;
     input.value = '';
     input.style.height = 'auto';
     narrator.sendFableTurn(text);
@@ -402,7 +363,7 @@ export function wireStage(root, hooks) {
     const action = btn.dataset.action;
     const idx = Number.parseInt(beat.dataset.index || '', 10);
     if (!Number.isInteger(idx)) return;
-    if (narrator.isGenerating() || selection.isRegenerating()) return;
+    if (narrator.isGenerating()) return;
     if (action === 'regenerate') {
       // › on the last variant → generate a fresh sibling variant (uncapped).
       narrator.rerollLastTurn();
@@ -423,7 +384,7 @@ export function wireStage(root, hooks) {
     const beat = e.target.closest('.fable-beat');
     if (!beat) return;
     if (beat.classList.contains('streaming') || beat.classList.contains('editing')) return;
-    if (narrator.isGenerating() || selection.isRegenerating()) return;
+    if (narrator.isGenerating()) return;
     const role = beat.dataset.role;
     if (role !== 'user' && role !== 'assistant') return; // no editing system beats
     beginEdit(beat);
@@ -802,7 +763,7 @@ export function teardownStage() {
   narrator.resetNarrator();
   wupiDrawer.resetWupiDrawer();
   leftDrawer.resetLeftDrawer();
-  // Tear down the selection popup + its document-level listeners so re-
-  // wireStage binds exactly once (mirrors the stageListeners audit).
-  selection.teardownSelection();
+  // Selection popup teardown removed (the selection module + its regenerate_slice
+  // IPC are dead). The stageListeners loop above already removes every tracked
+  // stage-element listener, so nothing leaks.
 }

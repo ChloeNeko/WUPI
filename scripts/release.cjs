@@ -445,9 +445,9 @@ if (existsSync(srcCardsDir)) {
       staged++;
     }
   }
-  console.log(`[release] staged ${staged} scenario card(s) from apps/games/cards/`);
+  console.log(`[release] staged ${staged} scenario card(s) from apps/fable/cards/`);
 } else {
-  console.warn('[release] WARNING: apps/games/cards/ not found — zip will ship with an empty card picker.');
+  console.warn('[release] WARNING: apps/fable/cards/ not found — zip will ship with an empty card picker.');
 }
 
 // ──────────────────────────────────────────────────────────────────────────
