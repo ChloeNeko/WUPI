@@ -10,6 +10,8 @@ pub mod audio;
 #[cfg(windows)]
 pub mod bluetooth;
 #[cfg(windows)]
+pub mod ethernet;
+#[cfg(windows)]
 pub mod wifi;
 
 #[cfg(windows)]

@@ -1,0 +1,53 @@
+---
+title: System Design
+tags: game, design, mechanic, system, design, homebrew, reputation, sanity, corruption, rules
+---
+
+You design game systems and world rules when User asks. Two layers, opposite rules.
+
+SOFT mechanics are narrative contracts — a reputation tier ladder, a sanity meter, faction standing, a custom ritual. They live as authored lore the narrator treats as its own knowledge and weaves toward naturally. Rust does not enforce them; the narrator plays to the contract. You author these freely.
+
+HARD mechanics are typed Rust seams: HP, gold, the world clock, player_state, relationships, the immutable-keys lock. A human developer authors them. You never write Rust, never edit engine files, never touch data/wupi.sim or data/wupi.codex — those are engine content replaced verbatim on update.
+
+If User wants a mechanic enforced with deterministic math (Rust rolls dice, Rust validates outcomes), say plainly that it is a typed-seam upgrade needing a developer, and offer the soft-mechanic version as the playable prototype.
+
+Workflow: draft the system in conversation first (what it tracks, the tiers or rules, an example). Get User's approval. Then commit it as a codex reference entry so the narrator can internalize it. The narrator obeys authored lore; it does not need Rust to hold a narrative rule.
+
+---
+title: SIM Cards
+tags: sim cards, cards, persona, character, format, xml, rpg, scenario, roleplay, identity
+---
+
+Simulation cards (.sim) are strict XML persona files. CDATA wraps prose so the parser auto-merges smart quotes and literal angle brackets — zero custom escaping.
+
+File locations: roleplay scenario cards (player-playable worlds) live at apps/fable/cards/<name>.sim. Wupi's own persona (data/wupi.sim) and playbook (data/wupi.codex) are engine content — never modify them; they are overwritten verbatim on update.
+
+Required structure (the canonical flat format — world fields are direct children of <sim_card>, no <scenario> wrapper):
+
+<sim_card>
+  <metadata><type>roleplay</type></metadata>
+  <identity>
+    <name>Card Name</name>
+    <persona>One-line identity summary.</persona>
+    <traits><![CDATA[ - Trait one. - Trait two. ]]></traits>
+  </identity>
+  <appearance><!-- free-form fields, CDATA if multiline --></appearance>
+  <setting><![CDATA[ the world premise ]]></setting>
+  <plot><![CDATA[ how the story moves (consequence philosophy) ]]></plot>
+  <tone>grim, atmospheric, slow-burn</tone>
+  <player_name>Alex</player_name>
+  <opening_scene><![CDATA[ the first narrator beat ]]></opening_scene>
+</sim_card>
+
+Rules: the card id derives from <identity><name> lowercased (sanitized: non-alphanumeric becomes dashes), and every card id is unique. <metadata><type>roleplay</type></metadata> is REQUIRED for a card to appear in the New Game picker — system cards (Wupi) omit metadata entirely. A <metadata><id>...</id></metadata> is optional (overrides the derived id when you need a specific slug). No <technical_protocols> block — engine protocols are Rust-injected per pass, never authored into a card. Use CDATA for any multiline prose or text with special characters. Roleplay cards persist per-card sessions and schemas; the Wupi-assistant card does not. The legacy <scenario> wrapper still loads (flat-first parser with fallback) but the flat shape is canonical.
+
+Bad XML is a silent skip in the picker — validate the structure before committing. Use the create_sim_card tool to write it.
+
+---
+title: Codex Entries
+tags: codex, lore, format, knowledge, reference, documentation, writing, entries
+---
+
+Codex entries are reference knowledge — background lore the narrator treats as its own knowledge, not distrusted archival. When a hit lands in retrieval it surfaces under the codex frame: the narrator internalizes it and weaves it in naturally, without prefacing "according to my records."
+
+Format: one topic per entry, title + comma-separated tags, then a blank line, and then the prose body.

@@ -1,6 +1,7 @@
 pub mod api;
 pub mod bracket_parser;
 pub mod chat_format;
+pub mod codex;
 pub mod consequence;
 pub mod context_swap;
 pub mod engine;
@@ -19,13 +20,16 @@ pub mod memory_rrf;
 pub mod model_downloader;
 pub mod offscreen_task;
 pub mod player_state;
+pub mod player;
 pub mod schema;
 pub mod schema_engine;
 pub mod schema_validator;
+pub mod settings;
 pub mod relationship;
 pub mod scene_pacing;
 pub mod scene_art;
 pub mod prism;
+pub mod prompts;
 pub mod session;
 pub mod sim_card;
 pub mod stream_filter;
@@ -51,10 +55,12 @@ use llm::GenerationClient;
 /// methods, manually-desugared `EmbedFuture` instead of `async fn`).
 pub type DynEmbedder = Box<dyn memory_embedder::Embedder + Send + Sync>;
 
-/// Minimal chat settings. The full `prompts` module (system-prompt builder,
-/// OS_DIRECTIVES, WUPI_AGENT_PROTOCOL) was removed; this struct is retained
-/// locally so the chat path + AppState field keep compiling. `build_system_content`
-/// is now an inline trivial string at its call site.
+/// Minimal chat settings. The context-size field is retained for the
+/// AppState field + the `effective_local_ctx` signature, but is no longer the
+/// source of truth for context sizing (2026-07-31): those values now live in
+/// `settings.rs` as named constants. The `context_size` field is read by
+/// nothing on the hot path — see `effective_local_ctx` (returns the
+/// `settings::` constants regardless of this field).
 #[derive(Clone, Default)]
 pub struct WupiSettings {
     pub context_size: u32,
@@ -139,6 +145,23 @@ pub struct AppState {
     /// `get_intro` reads its randomized introduction list. Always `Some`
     /// after `setup()` (the loader falls back to a stub, never `None`).
     pub active_card: Arc<std::sync::OnceLock<sim_card::SimCard>>,
+    /// The authored Fable prompt file (`data/fable.prompt`), loaded ONCE in
+    /// `setup()` and cached for the process lifetime (mirrors `active_card`'s
+    /// cache-once pattern; edit → restart). Holds the narrator + agent prose
+    /// sections. Pure authored voice — NO sampler/context/token config (those
+    /// live in `settings.rs`). The mechanical bracket-command list stays in
+    /// `build_narrator_system_prompt` (Rust), NOT here. Always `Some` after
+    /// `setup()` (the loader falls back to a built-in placeholder, never
+    /// `None`).
+    pub fable_prompts: Arc<std::sync::OnceLock<prompts::FablePrompts>>,
+    /// The authored Wupi-assistant prompt file (`data/wupi.prompt`), loaded
+    /// ONCE in `setup()` and cached for the process lifetime (mirrors
+    /// `fable_prompts`). Single-section prose (role + capabilities +
+    /// workflow + output discipline). The card persona (`wupi.sim`) holds
+    /// identity/voice/personality; this file holds the WHAT — what she does,
+    /// how she serves User. Always `Some` after `setup()` (the loader falls
+    /// back to a built-in placeholder, never `None`).
+    pub wupi_prompts: Arc<std::sync::OnceLock<prompts::WupiPrompts>>,
     /// The resolved path to the user's profile
     /// (`<exe_dir>/data/user.xml`, §8C-renamed from Operator.xml), filled
     /// once in `setup()`. Single copy (no template/live split per §8C):
@@ -232,6 +255,22 @@ pub struct AppState {
     /// because `fable_director_set` (frontend) + the consume site inside
     /// `fable_send` can race; the consume path takes the lock first.
     pub pending_directive: Arc<tokio::sync::Mutex<Option<String>>>,
+    /// One-shot manual player action (§11.30 Left-Drawer Visual HUD, 2026-08-02).
+    /// Armed by the frontend `fable_player_action_set` IPC when the player
+    /// performs a tactile UI action (Consume potion, Equip/Unequip from the
+    /// inventory grid). `fable_send` consumes it (takes + clears, ONE turn
+    /// only) at the top of its schema-lock block — mirrors `pending_directive`
+    /// exactly. Rendered into the narrator prompt as a NEW
+    /// `<player_action type="manual_override">` block at the TOP of
+    /// `assemble_narrator_skeleton` (leads the narrator's attention, before
+    /// `<world_state>`). Visible to the narrator in its Rust-authored prompt
+    /// (NOT a silent context injection — §7 honored). None = no action armed;
+    /// the next `fable_send` emits no block. Held under tokio Mutex because
+    /// `fable_player_action_set` (frontend) + the consume site inside
+    /// `fable_send` can race; the consume path takes the lock first. Distinct
+    /// from `pending_directive` so the manual player-action channel never
+    /// muddies with the LLM/Ghostwriter director channel.
+    pub pending_player_action: Arc<tokio::sync::Mutex<Option<String>>>,
     /// Off-screen task directives emitted by the World Progression tick
     /// (Fable Phase 3 Slice 6 wiring, 2026-07-28). Each tick that resolves
     /// due tasks pushes their directives here; the next `fable_send`
@@ -266,7 +305,8 @@ pub struct AppState {
     /// `FABLE_HISTORY_CAP` WorldSchema snapshots, pushed BEFORE each mutation
     /// to `fable_schema` (so `pop()` restores the prior state). CLEARED on
     /// every wholesale overwrite (`fable_start`, `fable_end`, `fable_load_save`,
-    /// `fable_quick_start`): those are session boundaries, not mutations to
+    /// `fable_quick_play_start`, `fable_quick_play_resume`): those are session
+    /// boundaries, not mutations to
     /// undo. Held under tokio Mutex: `fable_rollback` awaits while restoring.
     /// Mirrors `fable_load_save`'s precedent of bypassing the immutability
     /// lock on user-initiated restore (the §5 contract applies to LLM deltas,
@@ -282,15 +322,6 @@ pub struct AppState {
     /// `fable_start`, cleared on `fable_end`. The narrator prompt builder
     /// reads this each `fable_send` turn.
     pub active_fable_card: Arc<std::sync::Mutex<Option<sim_card::SimCard>>>,
-    /// The Game-Master persona spoken by the Fable drawer's chat_send.
-    /// Loaded from `data/fable.sim` on `fable_start` (mirrors the Wupi-assistant
-    /// `active_card` OnceLock, but held under a Mutex so it can be swapped in/
-    /// out with the game lifetime). When `fable_is_active`, the drawer's
-    /// chat_send renders THIS instead of `active_card` (the OS catgirl): the
-    /// drawer speaks in GM voice inside Fable, the OS chat stays the catgirl
-    /// outside. `None` when no game is running OR when fable.sim is missing/
-    /// malformed (graceful: drawer falls back to the OS catgirl persona).
-    pub fable_persona: Arc<std::sync::Mutex<Option<sim_card::SimCard>>>,
     /// The card id BEFORE a game started, so `fable_end` can restore it. The
     /// system card (`__wupi__`) is the default; games swap to the
     /// roleplay card's id and restore on exit.
@@ -343,6 +374,8 @@ impl AppState {
                 memory::WUPI_CARD_ID.to_owned(),
             )),
             active_card: Arc::new(std::sync::OnceLock::new()),
+            fable_prompts: Arc::new(std::sync::OnceLock::new()),
+            wupi_prompts: Arc::new(std::sync::OnceLock::new()),
             operator_path: Arc::new(std::sync::OnceLock::new()),
             codex_dir: Arc::new(std::sync::OnceLock::new()),
             theme: Arc::new(std::sync::Mutex::new(theme::ThemeSettings::default())),
@@ -357,6 +390,7 @@ impl AppState {
             pending_sd_model_path: Arc::new(std::sync::Mutex::new(None)),
             sd_autogen_disabled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             pending_directive: Arc::new(tokio::sync::Mutex::new(None)),
+            pending_player_action: Arc::new(tokio::sync::Mutex::new(None)),
             pending_tick_directives: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             active_fable_cancel: Arc::new(std::sync::Mutex::new(None)),
             active_slice_cancel: Arc::new(std::sync::Mutex::new(None)),
@@ -367,7 +401,6 @@ impl AppState {
             )),
             fable_session: Arc::new(tokio::sync::Mutex::new(session::Conversation::new())),
             active_fable_card: Arc::new(std::sync::Mutex::new(None)),
-            fable_persona: Arc::new(std::sync::Mutex::new(None)),
             pre_fable_card_id: Arc::new(std::sync::Mutex::new(memory::WUPI_CARD_ID.to_owned())),
             download_progress: Arc::new(std::sync::Mutex::new(
                 model_downloader::DownloadProgress::default(),
@@ -453,6 +486,12 @@ pub fn run() {
             // image, not a per-card history). Created eagerly so the first
             // generation never races a missing dir.
             std::fs::create_dir_all(fable_dir.join("backgrounds")).ok();
+            // Saved Players (2026-08-02): a standalone, reusable player
+            // identity library at apps/fable/players/<id>/. Sibling root to
+            // cards/ — holds authored players that can be attached onto any
+            // sim card at game start. Created eagerly so the first
+            // list/write never races a missing dir.
+            std::fs::create_dir_all(fable_dir.join("players")).ok();
             // Prism (2026-07-31): the image-generation app's per-app state root
             // (sibling of apps/fable/). `gallery/` holds the generated PNGs
             // (timestamp-seed-named); the gallery.sqlite DB lives directly
@@ -569,6 +608,46 @@ pub fn run() {
                 }
             };
             let _ = state.active_card.set(card);
+
+            // Load the Fable prompt file (`data/fable.prompt`) once + cache it
+            // for the process lifetime (mirrors `active_card`'s cache-once
+            // pattern; edit → restart). Holds the authored narrator + agent
+            // prose. `load_fable_prompts` degrades to a built-in placeholder
+            // on any error (missing/malformed), so a missing file never blocks
+            // boot. Pure authored voice — no token/sampler config lives here.
+            let fable_prompts = match resolve_fable_prompt_path(app.handle()) {
+                Some(path) => {
+                    tracing::info!("resolved fable.prompt: {}", path.display());
+                    prompts::load_fable_prompts(&path)
+                }
+                None => {
+                    tracing::warn!(
+                        "no data/fable.prompt path resolved; using built-in fallback prompts"
+                    );
+                    prompts::load_fable_prompts(std::path::Path::new("fable.prompt"))
+                }
+            };
+            let _ = state.fable_prompts.set(fable_prompts);
+
+            // Load the Wupi-assistant prompt file (`data/wupi.prompt`) once +
+            // cache it (mirrors `fable_prompts` above). Single-section prose
+            // (role + capabilities + workflow); `load_wupi_prompts` degrades
+            // to a built-in placeholder on any error, so a missing file never
+            // blocks boot. The card persona (`wupi.sim`) holds identity/
+            // voice; this file holds the WHAT she does.
+            let wupi_prompts = match resolve_wupi_prompt_path(app.handle()) {
+                Some(path) => {
+                    tracing::info!("resolved wupi.prompt: {}", path.display());
+                    prompts::load_wupi_prompts(&path)
+                }
+                None => {
+                    tracing::warn!(
+                        "no data/wupi.prompt path resolved; using built-in fallback prompt"
+                    );
+                    prompts::load_wupi_prompts(std::path::Path::new("wupi.prompt"))
+                }
+            };
+            let _ = state.wupi_prompts.set(wupi_prompts);
 
             // Resolve the user profile path (`data/user.xml`) once and cache
             // it. The CONTENT is re-read fresh each chat_send (hot-reload: a
@@ -698,38 +777,51 @@ pub fn run() {
                     let _ = state.memory.set(Arc::new(engine));
                     tracing::info!(db = %memory_db_path.display(), "memory engine initialized");
 
-                    // Reconcile authored `.md` files in `docs/` against the
-                    // Codex-tagged entries already stored in memory.sqlite.
-                    // Idempotent (hash-based): re-runs against an unchanged
-                    // source set do zero writes. Best-effort: a failed seed
-                    // is logged-and-dropped, never fatal (same contract as the
-                    // embedder fallback). Runs synchronously here (setup is
-                    // allowed to block: it already blocks on the embedder
-                    // readiness channel above).
-                    // (1) User-authored codex from `data/docs/` → CODEX_CARD_ID.
-                    //     The user's blank slate: empty by default, populated
-                    //     only via the codex_* IPC. Pinned to CODEX_CARD_ID
-                    //     (not active_card_id) so editing lore during a game
-                    //     lands in the user's namespace, NOT the active
-                    //     roleplay card (the pre-Phase-2 bug).
+                    // ── Wupi playbook codex seed (RESTORED 2026-08-01).
+                    // Seed `data/wupi.codex` (Wupi's static authoring playbook:
+                    // the .sim card format, the codex-entry format, the SOFT/HARD
+                    // game-mechanic distinction) into the `__wupi_system__`
+                    // partition. The READ side (`search_wupi_visible`) was never
+                    // removed — it queries this partition on every chat turn and
+                    // surfaces hits under the codex frame of `<retrieved_memory>`;
+                    // it just found nothing because the seeder was deleted in
+                    // commit f47a82e. This call fills that hole.
                     //
-                    // (Wupi's non-editable system knowledge seed from
-                    // `cards/wupi_knowledge/` was REMOVED in §8C: those source
-                    // files were deleted pre-session, and the seed path was
-                    // dead code. The WUPI_SYSTEM_CARD_ID sentinel constant +
-                    // search_wupi_visible READ side stay live: a future system-
-                    // knowledge injection path would reuse them.)
-                    // ── Codex/system-codex boot seeding REMOVED.
-                    // The codex (lore RAG) + system_codex (runtime snapshot)
-                    // modules were removed. The four seed paths below — user
-                    // codex (data/docs/), Wupi playbook (data/wupi.codex),
-                    // Fable playbook (data/fable.codex), + the periodic system
-                    // snapshot task — are gone with them. The memory engine
-                    // still initializes (episodic turns, embeddings, RRF); it
-                    // just no longer has the static-authored lore partitions.
-                    // The codex_dir cache + snapshot_system_state helper are
-                    // retained as no-ops for the codex_* IPC stubs below.
-                    let _ = app.handle(); // silence unused-import warnings
+                    // Idempotent (hash-based): an unchanged file does zero
+                    // writes — on a normal boot the reconcile is N hash
+                    // comparisons. Best-effort: a failed seed is logged-and-
+                    // dropped, never fatal (same contract as the embedder
+                    // fallback). `tauri::async_runtime::block_on` is the proven
+                    // async-bridge out of the sync setup closure (it uses
+                    // Tauri's managed runtime, valid here — bare `tokio::spawn`
+                    // would panic: no reactor entered on the event-loop thread).
+                    //
+                    // Out of scope (still dormant, by design): the user-codex
+                    // `data/docs/` → `__codex__` partition (no seeder; the
+                    // `__codex__` read-side in `search_fable_visible` is reserved
+                    // scaffolding for a future user-codex feature) and the Fable
+                    // playbook `data/fable.codex` → `__fable_system__` (sibling
+                    // seeder not yet restored).
+                    let wupi_codex_path = resolve_data_dir(app.handle()).join("wupi.codex");
+                    if let Some(engine) = state.memory.get() {
+                        match tauri::async_runtime::block_on(codex::seed_wupi_codex(
+                            engine,
+                            &wupi_codex_path,
+                            memory::WUPI_SYSTEM_CARD_ID,
+                        )) {
+                            Ok(report) => tracing::info!(
+                                seeded = report.seeded,
+                                updated = report.updated,
+                                purged = report.purged,
+                                unchanged = report.unchanged,
+                                "wupi playbook codex seeded into __wupi_system__"
+                            ),
+                            Err(e) => tracing::warn!(
+                                error = %format!("{e:#}"),
+                                "wupi playbook seed failed; continuing without playbook"
+                            ),
+                        }
+                    }
                 }
                 Err(e) => {
                     // DB open failure is fatal for memory but must not kill
@@ -773,18 +865,13 @@ pub fn run() {
                 if window.app_handle().webview_windows().len() <= 1 {
                     // Last window closing = user is done. Route through the SAME
                     // shutdown path as the tray "Quit" / paw "Shutdown" buttons:
-                    // destroy_tray + 200ms sleep + std::process::exit.
-                    //
-                    // Why not destroy_tray + app.exit(0) (the old shape): the
-                    // shell (explorer.exe, a SEPARATE process) services the
-                    // NIM_DELETE notification asynchronously. `app.exit(0)` runs
-                    // graceful teardown with no yield, so this process frequently
-                    // dies before Explorer pumps the deletion → a "ghost" paw
-                    // icon stays cached in the hidden-icons overflow popover
-                    // until the user hovers it (the well-known Windows quirk).
-                    // Every open/close cycle left one ghost, so they accumulated.
-                    // power_shutdown's 200ms yield + hard exit is empirically
-                    // enough for Explorer to clear the icon on every exit path.
+                    // destroy_tray + app.exit(0) (graceful). Keeping the event
+                    // loop alive during teardown lets the Windows shell reconcile
+                    // the tray's NIM_DELETE before the process goes away — the
+                    // old `std::process::exit` hard-kill starved that handshake
+                    // and left a "ghost" paw cached in the hidden-icons popover
+                    // until the user hovered it. See system_menu::power_shutdown
+                    // for the full history.
                     system_menu::power_shutdown(&window.app_handle());
                 }
             }
@@ -811,9 +898,6 @@ pub fn run() {
             memory_update,
             memory_delete,
             memory_wipe_card,
-            codex_list,
-            codex_save,
-            codex_delete,
             operator_profile_get,
             operator_profile_set,
             api_profiles_list,
@@ -848,6 +932,15 @@ pub fn run() {
             // one-shot. Streams the replacement live, then splices it back.
             regenerate_slice,
             fable_continue_target,
+            // Quick Play (2026-08-01): a single-button "throw me into a
+            // roleplay" path on the title screen. Runs the placeless Narrative
+            // Simulator card (data/fable.sim) under a fixed __quickplay__ id
+            // with ONE quicksave slot (auto-written on fable_end). Invisible
+            // to New Game / Load / Continue. status → does a quicksave exist?
+            // start → fresh run (overwrites); resume → load the quicksave.
+            fable_quick_play_status,
+            fable_quick_play_start,
+            fable_quick_play_resume,
             // Crossroads + Ghostwriter (§11.24, 2026-07-27): memoryless
             // one-shot generators that ride the same interview_generate
             // shape. Crossroads = "Choose a Director" option generator;
@@ -859,6 +952,8 @@ pub fn run() {
             fable_director_set,
             fable_director_clear,
             fable_director_peek,
+            // §11.30 Left-Drawer HUD — manual player-action injection.
+            fable_player_action_set,
             // Prism (image-generation app) IPCs (2026-07-31). prism_generate
             // drives the shared SD swap core with user params (seed/cfg/
             // sampler); the gallery_* IPCs are the Glass Vault CRUD.
@@ -877,6 +972,23 @@ pub fn run() {
             fable_schema_set,
             fable_card_get,
             fable_card_save,
+            fable_card_raw_get,
+            fable_card_raw_set,
+            fable_json_raw_get,
+            fable_json_raw_set,
+            fable_codex_get,
+            fable_codex_raw_set,
+            fable_validate_card_xml,
+            fable_write_card,
+            // Saved Players (2026-08-02): standalone, reusable player
+            // identity library at apps/fable/players/. list/get for the
+            // picker; write/delete for the creator + management; portrait
+            // _upload copies a dialog-picked image into the player folder.
+            fable_players_list,
+            fable_player_get,
+            fable_player_write,
+            fable_player_delete,
+            fable_player_portrait_upload,
             fable_rollback,
             fable_history_depth,
             system_menu::power_shutdown_cmd,
@@ -890,6 +1002,7 @@ pub fn run() {
             hardware::audio::audio_set_volume,
             hardware::audio::audio_list_outputs,
             hardware::audio::audio_set_default_output,
+            hardware::ethernet::ethernet_get_state,
             hardware::wifi::wifi_get_current,
             hardware::wifi::wifi_scan,
             hardware::wifi::wifi_connect,
@@ -1949,19 +2062,84 @@ fn resolve_wupi_sim_path(app: &tauri::AppHandle) -> Option<std::path::PathBuf> {
     None
 }
 
-/// Resolve the Fable persona path (`data/fable.sim`). Mirrors
-/// `resolve_wupi_sim_path` but for the card spoken inside the Fable drawer
-/// (the Game Master during a New Game interview). Only the primary portable
-/// path + its dev-repo mirror are consulted — the legacy `cards/` fallbacks
-/// are NOT (fable.sim is a Fable-v1 artifact with no pre-rename history).
-/// Returns None if absent (graceful: the drawer then falls back to the OS
-/// catgirl persona in chat_send).
+/// Resolve the Fable prompt file path (`data/fable.prompt`). Brand-new file
+/// (no pre-rename legacy), so this is lean: just the portable `<exe_dir>/
+/// data/fable.prompt` + its dev-repo mirror (`<repo>/data/fable.prompt`, for
+/// `cargo run` where exe lives under `target/`). Returns `None` when no file
+/// is found; the caller (`setup`) then loads via `prompts::load_fable_prompts`
+/// with a placeholder path, which degrades to the built-in fallback prompts.
+fn resolve_fable_prompt_path(app: &tauri::AppHandle) -> Option<std::path::PathBuf> {
+    use tauri::Manager;
+
+    let mut candidates: Vec<std::path::PathBuf> = Vec::new();
+    // §8C portable layout: `<exe_dir>/data/fable.prompt`.
+    candidates.push(resolve_data_dir(app).join("fable.prompt"));
+    if let Some(d) = app.path().resource_dir().ok() {
+        candidates.push(d.join("data").join("fable.prompt"));
+    }
+    if let Some(exe) = std::env::current_exe().ok() {
+        if let Some(parent) = exe.parent() {
+            // Dev-repo: exe under target/{release,debug}; repo root is 3 up.
+            if let Some(repo) = parent.parent().and_then(|g| g.parent()) {
+                candidates.push(repo.join("data").join("fable.prompt"));
+            }
+        }
+    }
+
+    for c in &candidates {
+        if c.is_file() {
+            tracing::info!("resolved fable.prompt: {}", c.display());
+            return Some(c.clone());
+        }
+    }
+    None
+}
+
+/// Resolve the Wupi-assistant prompt file path (`data/wupi.prompt`). Mirrors
+/// [`resolve_fable_prompt_path`]: the portable `<exe_dir>/data/wupi.prompt` +
+/// its dev-repo mirror (`<repo>/data/wupi.prompt`, for `cargo run` where exe
+/// lives under `target/`). Returns `None` when no file is found; the caller
+/// (`setup`) then loads via `prompts::load_wupi_prompts` with a placeholder
+/// path, which degrades to the built-in fallback prompt.
+fn resolve_wupi_prompt_path(app: &tauri::AppHandle) -> Option<std::path::PathBuf> {
+    use tauri::Manager;
+
+    let mut candidates: Vec<std::path::PathBuf> = Vec::new();
+    // §8C portable layout: `<exe_dir>/data/wupi.prompt`.
+    candidates.push(resolve_data_dir(app).join("wupi.prompt"));
+    if let Some(d) = app.path().resource_dir().ok() {
+        candidates.push(d.join("data").join("wupi.prompt"));
+    }
+    if let Some(exe) = std::env::current_exe().ok() {
+        if let Some(parent) = exe.parent() {
+            // Dev-repo: exe under target/{release,debug}; repo root is 3 up.
+            if let Some(repo) = parent.parent().and_then(|g| g.parent()) {
+                candidates.push(repo.join("data").join("wupi.prompt"));
+            }
+        }
+    }
+
+    for c in &candidates {
+        if c.is_file() {
+            tracing::info!("resolved wupi.prompt: {}", c.display());
+            return Some(c.clone());
+        }
+    }
+    None
+}
+
+/// Resolve + parse the Quick Play narrator card (`data/fable.sim`). Quick
+/// Play is a single-button "throw me into a roleplay" path: it runs the
+/// placeless Narrative Simulator card that lives OUTSIDE the
+/// `apps/fable/cards/` picker dir (so it never shows in New Game / Load),
+/// under a fixed `__quickplay__` card id with a single quicksave slot.
 ///
-/// 2026-07-29 rename: was `data/gm.sim` + `resolve_gm_sim_path`. The file
-/// was renamed to `fable.sim` to pair with `fable.codex` (the unified Fable
-/// playbook); the Game Master identity (`<name>Game Master</name>`) is
-/// UNCHANGED.
-fn resolve_fable_sim_path(app: &tauri::AppHandle) -> Option<std::path::PathBuf> {
+/// Only the primary portable path + its dev-repo mirror are consulted —
+/// `fable.sim` is a Quick Play narrator card, not a shipped picker card, so
+/// the legacy `cards/` fallbacks don't apply. Returns `Err` with a clear
+/// message if the card is absent or unparseable (Quick Play is unreachable
+/// without it); the frontend surfaces this as a toast.
+fn resolve_quick_play_card(app: &tauri::AppHandle) -> Result<sim_card::SimCard, String> {
     let mut candidates: Vec<std::path::PathBuf> = Vec::new();
     // §8C portable layout: `<exe_dir>/data/fable.sim`.
     candidates.push(resolve_data_dir(app).join("fable.sim"));
@@ -1976,13 +2154,23 @@ fn resolve_fable_sim_path(app: &tauri::AppHandle) -> Option<std::path::PathBuf> 
             }
         }
     }
-    for c in &candidates {
-        if c.is_file() {
-            tracing::info!("resolved fable card: {}", c.display());
-            return Some(c.clone());
-        }
+    let path = candidates
+        .into_iter()
+        .find(|c| c.is_file())
+        .ok_or_else(|| "Quick Play narrator card not found (expected data/fable.sim)".to_string())?;
+    tracing::info!("resolved quick play card: {}", path.display());
+    let card = sim_card::load_or_fallback(&path);
+    // `load_or_fallback` returns a stub with id "__wupi_fallback__" on any
+    // parse/IO failure (the sentinel `fable_cards_list` filters on). Surface
+    // a clear error so the frontend can toast instead of silently running a
+    // stub card.
+    if card.id == "__wupi_fallback__" {
+        return Err(format!(
+            "Quick Play narrator card at {} is missing or malformed",
+            path.display()
+        ));
     }
-    None
+    Ok(card)
 }
 
 /// Resolve the user's profile (`<exe_dir>/data/user.xml`, renamed from
@@ -2864,31 +3052,13 @@ async fn chat_send(
     // is immutable after setup → byte-identical across turns → the persona
     // block is stable and does NOT trigger the §2F cold-reset guard (only the
     // inter-turn memory block does, by design). The fallback card renders to
-    // "" → section suppressed.
-    //
-    // Phase 2 (fable.sim split): when a game is active, the drawer's chat_send
-    // (the `NotACommand` fallthrough) renders the Fable persona
-    // (`fable_persona`, the Game Master from data/fable.sim) instead of
-    // `active_card` (the OS catgirl). So the drawer speaks in GM voice inside
-    // Fable; OS chat outside Fable stays the catgirl. The narrator path
-    // (`fable_send`) reads `active_fable_card` independently and is
-    // unaffected. `fable_persona` is None when fable.sim is missing/malformed
-    // → graceful fallback to the OS catgirl (best-effort, mirrors the
-    // embedder's degradation contract).
-    let persona = if fable_is_active(&state) {
-        state
-            .fable_persona
-            .lock()
-            .ok()
-            .and_then(|guard| guard.clone())
-            .map(|c| c.render_for_prompt())
-            .or_else(|| state.active_card.get().map(|c| c.render_for_prompt()))
-    } else {
-        state
-            .active_card
-            .get()
-            .map(|c| c.render_for_prompt())
-    };
+    // "" → section suppressed. The drawer always speaks in this voice — even
+    // inside Fable (the narrator path, `fable_send`, reads `active_fable_card`
+    // independently for the in-world simulation).
+    let persona = state
+        .active_card
+        .get()
+        .map(|c| c.render_for_prompt());
     // Operator profile: re-read FRESH from disk each turn (hot-reload). The
     // path is cached (stable); only the content refreshes: so a live edit to
     // user.xml (§8C-renamed from Operator.xml) takes effect on the very next
@@ -2925,13 +3095,26 @@ async fn chat_send(
     // narration, no long payloads. 4 messages = 2 user↔assistant exchanges,
     // plenty for a tracking assistant + small talk, fits the 2048 budget).
     let source = *state.model_source.lock().expect("model_source mutex");
-    let visible_window = if source == api::ModelSource::Api { 12 } else { 4 };
+    let visible_window = if source == api::ModelSource::Api { settings::WINDOW_API_CHAT } else { settings::WINDOW_LOCAL_CHAT };
 
-    // System prompt: the `prompts` module (OS_DIRECTIVES + builder) was removed.
-    // Assemble a minimal system prompt inline from persona + user_profile so the
-    // chat path keeps a system turn (the model still gets identity context).
+    // System prompt: assembled inline from the authored copilot directive
+    // (`data/wupi.prompt`) + persona + user_profile. The `.prompt` file holds
+    // WHAT Wupi does (role/capabilities/workflow/output discipline); the card
+    // persona (`wupi.sim`) holds WHO she is (identity/voice/appearance). Both
+    // surfaces reach here: the main OS chat (`script.js`) AND the Fable right
+    // drawer (`wupi-drawer.js`) — the Fable game-manager gate (`classify`
+    // above) returns early for management intents, so this assembly only runs
+    // for the NotACommand fall-through (normal Wupi chat) in either context.
     let effective_ctx = effective_local_ctx(source, &settings);
     let mut sections: Vec<String> = Vec::new();
+    if let Some(w) = state
+        .wupi_prompts
+        .get()
+        .map(|p| p.role.trim())
+        .filter(|s| !s.is_empty())
+    {
+        sections.push(w.to_owned());
+    }
     if let Some(p) = persona.as_deref().filter(|s| !s.trim().is_empty()) {
         sections.push(p.to_owned());
     }
@@ -3206,9 +3389,9 @@ async fn chat_send(
         // under API mode errored instantly with "context too long even
         // after truncation: 2501 tokens, max 1536".
         match run_agent_loop(
-            &state, &app, &on_event, &agent_system_prompt, 6,
+            &state, &app, &on_event, &agent_system_prompt, settings::WINDOW_API_FALLBACK,
             memory_block.clone(), world_state.clone(), chat_tools.clone(),
-            settings.context_size,
+            settings::CTX_FALLBACK_TURN,
             on_chunk.clone(), cancel.clone(), backend_opt.clone(),
             Some(directive_slot.clone()),
         )
@@ -3240,20 +3423,40 @@ async fn chat_send(
                                 // re-run the turn on the local model at the 6-window
                                 // so the user gets a reply and immersion is preserved.
                                 tracing::warn!(error = %e, "chat_send: API stream failed; falling back to local");
+                                // Timeout vs other failure: a TTFT timeout (no
+                                // first token within the deadline) is the case
+                                // you flagged — the provider hung with no
+                                // thinking/nothing. Fire the dedicated
+                                // `api_timeout` event so the frontend shows the
+                                // top-center persistent error bubble (distinct
+                                // from the transient toast for a plain network
+                                // error). The fallback itself is identical.
+                                let is_timeout = e.to_string().contains("API_TIMEOUT");
+                                if is_timeout {
+                                    let _ = on_event.send(serde_json::json!({
+                                        "type": "api_timeout",
+                                        "source": "local",
+                                    }));
+                                }
                                 let _ = on_event.send(serde_json::json!({
                                     "type": "fallback",
-                                    "reason": "api_unreachable",
+                                    "reason": if is_timeout { "api_timeout" } else { "api_unreachable" },
                                     "source": "local",
                                 }));
                                 match run_local_or_echo(
                                     &state,
                                     &on_event,
                                     &system_prompt,
-                                    6,
+                                    settings::WINDOW_API_FALLBACK,
                                     memory_block,
                                     world_state,
                                     Vec::new(),
-                                    settings.context_size,
+                                    // Fallback rebound: this one turn runs the
+                                    // local model at the full 4096 context (not
+                                    // the API-mode 2048) so the user-visible
+                                    // fallback reply carries full history. The
+                                    // next turn's normal path drops back to 2048.
+                                    settings::CTX_FALLBACK_TURN,
                                     on_chunk.clone(),
                                     cancel.clone(),
                                     backend_opt.as_ref(),
@@ -3281,11 +3484,14 @@ async fn chat_send(
                             &state,
                             &on_event,
                             &system_prompt,
-                            6,
+                            settings::WINDOW_API_FALLBACK,
                             memory_block,
                             world_state,
                             Vec::new(),
-                            settings.context_size,
+                            // Same fallback-rebound contract as the stream-error
+                            // path above: this turn runs at full 4096, next turn
+                            // resumes at the API-mode 2048.
+                            settings::CTX_FALLBACK_TURN,
                             on_chunk.clone(),
                             cancel.clone(),
                             backend_opt.as_ref(),
@@ -3317,7 +3523,7 @@ async fn chat_send(
         match run_agent_loop(
             &state, &app, &on_event, &agent_system_prompt, visible_window,
             memory_block, world_state, chat_tools,
-            settings.context_size,
+            settings::CTX_LOCAL_SOLO,
             on_chunk.clone(), cancel.clone(), backend_opt.clone(),
             Some(directive_slot.clone()),
         )
@@ -3944,8 +4150,9 @@ async fn push_fable_history_snapshot(state: &AppState, snapshot: schema::WorldSc
 }
 
 /// Clear the history ring buffer. Called at every session boundary
-/// (`fable_start`, `fable_end`, `fable_load_save`, `fable_quick_start`):
-/// those wholesale-overwrite `fable_schema`, so the prior history is no
+/// (`fable_start`, `fable_end`, `fable_load_save`, `fable_quick_play_start`,
+/// `fable_quick_play_resume`): those wholesale-overwrite `fable_schema`, so
+/// the prior history is no
 /// longer meaningful to undo INTO (it belongs to a different game session).
 async fn clear_fable_history(state: &AppState) {
     state.fable_schema_history.lock().await.clear();
@@ -5183,51 +5390,6 @@ async fn memory_wipe_card(state: tauri::State<'_, AppState>) -> Result<usize, St
         .map_err(|e| format!("{e:#}"))
 }
 
-// The Codex is a library of authored reference "books" (world lore, TV/wiki
-// facts, worldbuilding). Source of truth = `.md` files in the resolved
-// `docs/` dir; the DB is a derived retrieval index re-seeded at boot. These
-// three commands operate on the FILES directly, then re-seed so retrieval
-// stays in sync within the running session. Nothing here touches episodic
-// chat memory: the Codex is a separate, authored-only surface.
-
-/// Minimal codex-file row type. The full `codex` module (lore RAG) was
-/// removed; this struct is retained locally so the codex_list IPC stub keeps
-/// its shape. All three codex_* IPCs now return feature-removed errors.
-#[derive(serde::Serialize, Clone)]
-pub struct CodexFile {
-    pub filename: String,
-    pub title: String,
-    pub tags: Vec<String>,
-    pub body: String,
-}
-
-/// List every Codex entry. STUB: the codex feature was removed.
-#[tauri::command]
-fn codex_list(_state: tauri::State<'_, AppState>) -> Result<Vec<CodexFile>, String> {
-    Ok(Vec::new())
-}
-
-/// Create or overwrite a Codex `.md` file. STUB: the codex feature was removed.
-#[tauri::command]
-async fn codex_save(
-    _filename: String,
-    _title: String,
-    _tags: Vec<String>,
-    _body: String,
-    _state: tauri::State<'_, AppState>,
-) -> Result<String, String> {
-    Err("codex_save is disabled (codex lore-RAG feature removed).".into())
-}
-
-/// Delete a Codex `.md` file. STUB: the codex feature was removed.
-#[tauri::command]
-async fn codex_delete(
-    _filename: String,
-    _state: tauri::State<'_, AppState>,
-) -> Result<(), String> {
-    Err("codex_delete is disabled (codex lore-RAG feature removed).".into())
-}
-
 // Two commands mirror the theme get/set pattern: read fresh from the cached
 // path, write atomically back. Hot-reload is automatic (chat_send re-reads
 // every turn), so a saved profile applies on the next chat turn with no extra
@@ -5446,10 +5608,15 @@ async fn api_connect(
 /// path, api_connect/disconnect re-spawn) MUST read this — otherwise the
 /// swap-lock eviction slow path would silently re-spawn at
 /// `settings.context_size` mid-API-session (the eviction-revert landmine).
-fn effective_local_ctx(source: api::ModelSource, settings: &WupiSettings) -> u32 {
+fn effective_local_ctx(source: api::ModelSource, _settings: &WupiSettings) -> u32 {
+    // 2026-07-31: context sizes now come from `settings.rs` constants, not the
+    // user-tuned `settings.context_size`. The param is retained (callers pass
+    // it; the test exercises the signature) but reads nothing — hence the
+    // `_` prefix. Keeping it avoids rippling every call site + preserves the
+    // historical shape (a future per-user override could read it again).
     match source {
-        api::ModelSource::Api => 2048,
-        api::ModelSource::Local => settings.context_size,
+        api::ModelSource::Api => settings::CTX_LOCAL_WITH_API,
+        api::ModelSource::Local => settings::CTX_LOCAL_SOLO,
     }
 }
 
@@ -5796,10 +5963,13 @@ struct FableCardMeta {
     has_saves: bool,
 }
 
-/// Enumerate every `.sim` file in `apps/games/cards/` (§8C; was
-/// `cards/fable_cards/`) and return parsed metadata. The card-picker UI's data
-/// source. Returns an empty Vec when no cards dir exists (the common case
-/// until cards are authored or imported): graceful, not an error.
+/// Enumerate every `.sim` file in `apps/fable/cards/` and return parsed
+/// metadata. The card-picker UI's data source. Returns an empty Vec when no
+/// cards dir exists (the common case until cards are authored or imported):
+/// graceful, not an error.
+///
+/// **2026-08-01 folder layout:** cards live in per-card folders
+/// (`cards/<id>/<id>.sim`); `iter_card_sim_paths` is the single walker.
 #[tauri::command]
 fn fable_cards_list(app: tauri::AppHandle) -> Result<Vec<FableCardMeta>, String> {
     let dir = resolve_fable_cards_dir(&app);
@@ -5807,12 +5977,7 @@ fn fable_cards_list(app: tauri::AppHandle) -> Result<Vec<FableCardMeta>, String>
         return Ok(Vec::new());
     };
     let mut out = Vec::new();
-    let entries = std::fs::read_dir(&dir).map_err(|e| format!("read fable_cards/: {e}"))?;
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.extension().and_then(|x| x.to_str()) != Some("sim") {
-            continue;
-        }
+    for path in iter_card_sim_paths(&dir) {
         let card = sim_card::load_or_fallback(&path);
         // Skip fallback stubs (a malformed file produced the fallback). The
         // id sentinel is the signal: see sim_card::FALLBACK_ID.
@@ -5821,7 +5986,7 @@ fn fable_cards_list(app: tauri::AppHandle) -> Result<Vec<FableCardMeta>, String>
             continue;
         }
         // Only list roleplay cards in this registry: the system card
-        // (wupi.sim) lives in `data/`, not `apps/games/cards/`, so this is
+        // (wupi.sim) lives in `data/`, not `apps/fable/cards/`, so this is
         // belt-and-suspenders against a misplaced file.
         if card.card_type != "roleplay" {
             continue;
@@ -5864,6 +6029,124 @@ fn card_to_meta(card: &sim_card::SimCard, has_saves: bool) -> FableCardMeta {
     }
 }
 
+/// Slugify a card name into a filesystem-safe stem (lowercase, non-alphanumerics
+/// → dashes, leading/trailing dashes trimmed). Mirrors `tools::sanitize_stem`
+/// but inlined here so the IPC layer doesn't depend on the agent-tool module.
+/// The stem is the `<stem>.sim` filename AND the card's memory/save partition
+/// key, so it must be stable + unique across cards.
+fn slugify_card_stem(name: &str) -> Option<String> {
+    let stem: String = name
+        .trim()
+        .to_lowercase()
+        .chars()
+        .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '-' })
+        .collect();
+    let stem = stem.trim_matches('-').to_owned();
+    if stem.is_empty() { None } else { Some(stem) }
+}
+
+/// Validate a `.sim` card XML string against the real parser. Returns the
+/// parsed card's metadata on success, or an error string on failure. This is
+/// the single validation authority for the Creator's save path AND any
+/// import-existing path — no client-side XML parser is needed, the Rust parser
+/// IS the validator (catches everything: malformed XML, missing `<sim_card>`
+/// root, missing required tags). The error string surfaces to the UI toast.
+///
+/// Added 2026-08-01 for the New Game Creator flow. Mirrors `parse_from_xml_str`
+/// but returns `FableCardMeta` (the shape the frontend already consumes from
+/// `fable_cards_list`) so the Creator can hand off straight to `fable_start`.
+#[tauri::command]
+fn fable_validate_card_xml(xml: String) -> Result<FableCardMeta, String> {
+    let card = sim_card::parse_from_xml_str(&xml)
+        .map_err(|e| format!("Invalid card format: {e}"))?;
+    Ok(card_to_meta(&card, false))
+}
+
+/// Write a Creator-authored card to `apps/fable/cards/<stem>.sim`. Validates
+/// the XML via the real parser first (rejects malformed cards before they hit
+/// disk — the load-bearing safety gate), then writes + re-reads to confirm.
+/// Returns the freshly-written card's metadata so the Creator can start a game
+/// from it immediately. Reuses the path-sanitization discipline from the
+/// `create_sim_card` agent tool but as a direct IPC (no agent loop).
+///
+/// `stem` is the filename (the `.sim` extension is appended; if the caller
+/// includes it, it's stripped first). Slugified to filesystem-safe form. A
+/// stem collision overwrites the existing card (the user is editing their own
+/// authored card — same contract as the agent tool).
+#[tauri::command]
+fn fable_write_card(
+    stem: String,
+    xml: String,
+    app: tauri::AppHandle,
+) -> Result<FableCardMeta, String> {
+    // 1. Validate the XML through the real parser BEFORE any disk touch.
+    //    This is the load-bearing gate: a malformed card never lands on disk.
+    //    The parsed card is intentionally discarded — the authoritative return
+    //    value is the disk re-read below (`reloaded`), which catches any
+    //    encoding quirk the in-memory parse might miss.
+    let _validated = sim_card::parse_from_xml_str(&xml)
+        .map_err(|e| format!("Invalid card format: {e}"))?;
+    if xml.len() > 100_000 {
+        return Err("Card exceeds 100 KB cap".into());
+    }
+
+    // 2. Slugify the stem + resolve the cards dir.
+    let stem = slugify_card_stem(&stem)
+        .ok_or_else(|| "card filename empty after sanitization".to_string())?;
+    // Strip a trailing .sim if the caller included it (ergonomic; the canonical
+    // form appends it below).
+    let stem = stem.strip_suffix(".sim").unwrap_or(&stem).to_owned();
+    let dir = resolve_fable_cards_dir(&app)
+        .ok_or_else(|| "no apps/fable/cards/ dir resolved".to_string())?;
+    // **2026-08-01 folder reorg:** the card lives in a per-card folder
+    // `cards/<stem>/<stem>.sim` (sibling to `<stem>.codex`, world.json, etc.).
+    let card_dir = resolve_card_dir(&dir, &stem);
+    let path = resolve_card_file(&dir, &stem, "sim");
+
+    // 3. Atomic write + re-read to confirm round-trip integrity (the on-disk
+    //    parser path, not the in-memory parse — catches any encoding quirk).
+    //    Atomic (temp+fsync+rename) so a crash mid-write never truncates an
+    //    existing card — same guarantee the schema/session saves have.
+    std::fs::create_dir_all(&card_dir).map_err(|e| format!("mkdir card folder: {e}"))?;
+    write_atomic(&path, xml.as_bytes()).map_err(|e| format!("write card: {e}"))?;
+    let reloaded = sim_card::load_or_fallback(&path);
+    if reloaded.id == "__wupi_fallback__" {
+        // The write succeeded but the re-read produced the fallback stub —
+        // the card is malformed in a way the in-memory parse missed (shouldn't
+        // happen, but defense-in-depth). Remove the bad file so we don't leave
+        // a broken card in the picker. (Sentinel literal matches the two other
+        // check sites at lib.rs:2124 + :5943.)
+        let _ = std::fs::remove_file(&path);
+        return Err("card validated in memory but failed re-read after write".into());
+    }
+    tracing::info!(path = %path.display(), card_id = %reloaded.id, "Creator card written");
+    Ok(card_to_meta(&reloaded, false))
+}
+
+/// Atomic file write (temp + fsync + rename). A crash mid-write leaves the
+/// destination at its prior complete state, never a truncated middle. Shared
+/// by the card/codex writers + the raw-file editor's save path. The temp file
+/// is a sibling `.<name>.tmp` in the same dir so `rename` is atomic on Windows
+/// (`MOVEFILE_REPLACE_EXISTING`). Mirrors `schema::atomic_write_text` /
+/// `session::Conversation::save` / the `file_write` agent tool.
+fn write_atomic(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    let file_name = path
+        .file_name()
+        .map(std::ffi::OsString::from)
+        .unwrap_or_else(|| std::ffi::OsString::from("wupi.tmp"));
+    let mut tmp_name = file_name;
+    tmp_name.push(".tmp");
+    let tmp_path = path.with_file_name(tmp_name);
+    let _ = std::fs::remove_file(&tmp_path); // clear a stale temp from a prior crash
+    {
+        let mut file = std::fs::File::create(&tmp_path)?;
+        std::io::Write::write_all(&mut file, bytes)?;
+        std::io::Write::flush(&mut file)?;
+        let _ = file.sync_all();
+    }
+    std::fs::rename(&tmp_path, path)
+}
+
 /// Start a game: load the roleplay card, spawn the FableEngine (loads
 /// WUPI.gguf as its own isolated context), swap `active_card_id` to the
 /// card's id, and load the initial session/schema state. The
@@ -5882,10 +6165,11 @@ async fn fable_start(
     card_id: String,
     save_id: Option<String>,
     fresh: Option<bool>,
+    player_id: Option<String>,
     app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
 ) -> Result<FableLoadResult, String> {
-    tracing::info!(card_id = %card_id, ?save_id, ?fresh, "fable_start: spawning FableEngine");
+    tracing::info!(card_id = %card_id, ?save_id, ?fresh, ?player_id, "fable_start: spawning FableEngine");
     let card_id_arg = card_id.clone();
 
     // 1. Refuse if a game is already running (the UI shouldn't allow this,
@@ -5911,18 +6195,149 @@ async fn fable_start(
         .ok_or_else(|| "no WUPI.gguf found: cannot start game".to_string())?;
 
     // 4. Hand off to the shared enter helper (also used by Quick Play, 4c).
-    enter_fable_session(card, save_id, fresh.unwrap_or(false), model_path, card_id_arg, &app, &state).await
+    enter_fable_session(card, save_id, fresh.unwrap_or(false), player_id, model_path, card_id_arg, &app, &state).await
 }
 
-/// The shared "spawn engine + swap id + load state + seat card + seat GM
-/// persona" tail of starting a game. `card` is already resolved (loaded from
-/// disk for fable_start). `card_id_for_meta` is the id to report in the
-/// returned meta (identical to card.id but kept explicit so logs are
-/// unambiguous).
+/// Quick Play: report whether a quicksave exists + its metadata. Drives the
+/// title-screen inline choice — if a quicksave is present the user gets
+/// "Start New" (overwrites) vs "Resume Last"; if not, Quick Play goes
+/// straight into a fresh run. `None` (→ JSON null) when no quicksave exists.
+/// Cheap: one path-existence check + an optional metadata read.
+#[tauri::command]
+fn fable_quick_play_status(app: tauri::AppHandle) -> Result<Option<fable_save::SaveMeta>, String> {
+    let fable_root = resolve_apps_dir(&app).join("fable");
+    if !fable_save::quick_save_exists(&fable_root) {
+        return Ok(None);
+    }
+    // The quicksave exists — surface its metadata so the UI can show a
+    // summary/timestamp. A corrupt quicksave still counts as "exists" (the
+    // user should be able to overwrite it with Start New); log + return None.
+    match fable_save::load_quick_save(&fable_root) {
+        Ok(s) => Ok(Some(fable_save::SaveMeta {
+            save_id: s.save_id,
+            card_id: s.card_id,
+            name: s.name,
+            summary: s.summary,
+            timestamp: s.timestamp,
+            is_autosave: s.is_autosave,
+            turn_count: s.session.messages.len(),
+        })),
+        Err(e) => {
+            tracing::warn!(error = %e, "quicksave exists but failed to read metadata");
+            Ok(None)
+        }
+    }
+}
+
+/// Quick Play → "Start New": load the placeless Narrative Simulator card
+/// from `data/fable.sim`, override its id to the `__quickplay__` sentinel (so
+/// the single quicksave slot + the saves/sessions/schemas dirs are stable +
+/// `fable_continue_target` keeps excluding it), wipe any prior quicksave, and
+/// enter a fresh session. The card's `opening_scene` is surfaced as the first
+/// narrator beat. Quick Play is invisible to New Game / Load / Continue by
+/// construction (the card lives in `data/`, not the picker dir; the sentinel
+/// id is skipped by `most_recent_continue_target`).
+#[tauri::command]
+async fn fable_quick_play_start(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+) -> Result<FableLoadResult, String> {
+    tracing::info!("fable_quick_play_start: starting fresh Quick Play");
+    // Refuse if a game is already running (defense-in-depth — the frontend
+    // calls fable_end first, but a stray double-click could race).
+    {
+        let existing = state.fable_engine.lock().expect("fable_engine mutex");
+        if existing.is_some() {
+            return Err("a game is already running: call fable_end first".into());
+        }
+    }
+
+    // Resolve + parse the Quick Play narrator card (data/fable.sim).
+    let mut card = resolve_quick_play_card(&app)?;
+    // Pin the card to the Quick Play sentinel id so all per-card state dirs
+    // (saves/sessions/schemas) are stable across runs.
+    card.id = fable_save::QUICK_PLAY_CARD_ID.to_owned();
+
+    // Wipe any prior quicksave so the new run starts from a clean slate (the
+    // "new overwrites old" contract). Idempotent.
+    let fable_root = resolve_apps_dir(&app).join("fable");
+    let root_clone = fable_root.clone();
+    tokio::task::spawn_blocking(move || fable_save::delete_quick_save(&root_clone))
+        .await
+        .map_err(|e| format!("delete quick save join: {e}"))?
+        .ok(); // best-effort; a missing quicksave is the common case
+
+    let model_path = resolve_model_path(&app)
+        .ok_or_else(|| "no WUPI.gguf found: cannot start game".to_string())?;
+    let card_id_for_meta = card.id.clone();
+    enter_fable_session(
+        card, None, true, None, model_path, card_id_for_meta, &app, &state,
+    )
+    .await
+}
+
+/// Quick Play → "Resume Last": load the single quicksave (bundling the card
+/// captured when it was written), restore its session + schema, and re-seat
+/// the bundled card. The frontend only calls this after `fable_quick_play_
+/// status` reports a quicksave exists, so an absent file surfaces as an
+/// error (not a silent fresh start — that would silently discard the user's
+/// intent to resume).
+#[tauri::command]
+async fn fable_quick_play_resume(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+) -> Result<FableLoadResult, String> {
+    tracing::info!("fable_quick_play_resume: resuming Quick Play quicksave");
+    {
+        let existing = state.fable_engine.lock().expect("fable_engine mutex");
+        if existing.is_some() {
+            return Err("a game is already running: call fable_end first".into());
+        }
+    }
+
+    let fable_root = resolve_apps_dir(&app).join("fable");
+    let root_clone = fable_root.clone();
+    let save = tokio::task::spawn_blocking(move || fable_save::load_quick_save(&root_clone))
+        .await
+        .map_err(|e| format!("load quick save join: {e}"))?
+        .map_err(|e| format!("no Quick Play quicksave to resume: {e}"))?;
+
+    // The quicksave bundles the card at write-time, so resume rebuilds the
+    // narrator prompt without re-reading data/fable.sim (which may have been
+    // edited since). Pin the id to the sentinel for path stability.
+    let mut card = save
+        .card
+        .ok_or_else(|| "quicksave is missing its bundled card (corrupt or pre-Quick Play save)".to_string())?;
+    card.id = fable_save::QUICK_PLAY_CARD_ID.to_owned();
+
+    let model_path = resolve_model_path(&app)
+        .ok_or_else(|| "no WUPI.gguf found: cannot start game".to_string())?;
+    let card_id_for_meta = card.id.clone();
+    // save_id = the quicksave slot, so enter_fable_session loads the bundled
+    // session + schema from the sentinel path.
+    enter_fable_session(
+        card,
+        Some(fable_save::QUICKSAVE_ID.to_owned()),
+        false,
+        None,
+        model_path,
+        card_id_for_meta,
+        &app,
+        &state,
+    )
+    .await
+}
+
+/// The shared "stash model path + swap id + load state + seat card" tail of
+/// starting a game. `card` is already resolved (loaded from disk for
+/// `fable_start`, or from the bundled quicksave for Quick Play resume).
+/// `card_id_for_meta` is the id to report in the returned meta (identical to
+/// card.id but kept explicit so logs are unambiguous).
 async fn enter_fable_session(
-    card: sim_card::SimCard,
+    mut card: sim_card::SimCard,
     save_id: Option<String>,
     fresh: bool,
+    player_id: Option<String>,
     model_path: std::path::PathBuf,
     card_id_for_meta: String,
     app: &tauri::AppHandle,
@@ -5988,6 +6403,48 @@ async fn enter_fable_session(
             .unwrap_or_else(session::Conversation::new);
         (s, c, None)
     };
+    // Saved Player attachment (2026-08-02): when a saved player id was
+    // passed (the New Game flow's Pair 2), load it + override the card's
+    // `player_name` anchor with the saved player's name. The narrator
+    // reads `card.player_name` as the identity anchor (the `<active_
+    // reality>` block), so this is the load-bearing identity injection.
+    // The prose (description/appearance/personality/accessories) lands as
+    // `player.*` schema entities the narrator + retrieval can read —
+    // identity, not gameplay state (no body/wealth mutation). Runs for
+    // ALL three branches (fresh/resume/save) so attaching a player works
+    // regardless of which state-resolution path fired; a None player_id
+    // is a complete no-op (the card's own player_name stands).
+    if let Some(pid) = player_id.as_deref() {
+        let players_root = resolve_fable_players_dir(app);
+        let json_path = players_root.join(pid).join(format!("{pid}.json"));
+        if let Some(sp) = load_player_at(&json_path) {
+            // Override the card's player_name anchor (the load-bearing
+            // identity swap). Only when the saved player has a real name.
+            let name = sp.name.trim();
+            if !name.is_empty() {
+                card.player_name = Some(name.to_owned());
+            }
+            // Stash the prose as schema entities. These read as the
+            // player's authored identity — the narrator + retrieval see
+            // them as ground truth about WHO the player is, decoupled
+            // from the card's world/setting (which stays the card's).
+            if let Some(d) = sp.description.as_deref().filter(|s| !s.trim().is_empty()) {
+                prior_schema.entities.insert("player.description".into(), d.trim().to_owned());
+            }
+            if let Some(a) = sp.appearance.as_deref().filter(|s| !s.trim().is_empty()) {
+                prior_schema.entities.insert("player.appearance".into(), a.trim().to_owned());
+            }
+            if let Some(p) = sp.personality.as_deref().filter(|s| !s.trim().is_empty()) {
+                prior_schema.entities.insert("player.personality".into(), p.trim().to_owned());
+            }
+            if let Some(ac) = sp.accessories.as_deref().filter(|s| !s.trim().is_empty()) {
+                prior_schema.entities.insert("player.accessories".into(), ac.trim().to_owned());
+            }
+            tracing::info!(player_id = pid, player_name = %card.player_name.as_deref().unwrap_or("?"), "attached saved player");
+        } else {
+            tracing::warn!(player_id = pid, "saved player not found at attach time; proceeding with card default");
+        }
+    }
     // Fable Phase 4 Component 3 (2026-07-28): seed the travel graph from the
     // card's `<locations>` block IF the resolved schema has no graph yet.
     // This is the load-bearing fix for Components 3 + 4 being dead in live
@@ -6067,6 +6524,7 @@ async fn enter_fable_session(
             content: m.content.clone(),
             variants: m.variants.clone(),
             active_idx: m.active_idx,
+            timestamp: m.timestamp,
         })
         .collect();
     let turn_count = messages.len();
@@ -6076,16 +6534,6 @@ async fn enter_fable_session(
     // narrator beat on a fresh game without a second IPC round-trip.
     let opening_scene = card.opening_scene.clone();
     *state.active_fable_card.lock().expect("active_fable_card mutex") = Some(card);
-
-    // Phase 2: seat the Fable persona (best-effort; None → OS catgirl fallback).
-    // `data/fable.sim` carries the Game Master identity spoken by the drawer.
-    let fable_persona_card = resolve_fable_sim_path(app)
-        .map(|p| sim_card::load_or_fallback(&p))
-        .filter(|c| c.id != "__wupi_fallback__");
-    if fable_persona_card.is_none() {
-        tracing::info!("fable_start: no fable.sim found — drawer will use the OS catgirl persona");
-    }
-    *state.fable_persona.lock().expect("fable_persona mutex") = fable_persona_card;
 
     tracing::info!(?resumed_save_label, "game started: narrator engine live, memory scoped to card, state loaded");
     Ok(FableLoadResult {
@@ -6137,13 +6585,16 @@ fn fable_continue_target(app: tauri::AppHandle) -> Result<Option<fable_save::Sav
 /// any slot type (autosave + manual). Extracted so the contract (New Game
 /// worlds only; autosaves count) is unit-testable with a tempdir.
 fn most_recent_continue_target(fable_root: &std::path::Path) -> Option<fable_save::SaveMeta> {
-    let saves_dir = fable_root.join("saves");
-    let Ok(entries) = std::fs::read_dir(&saves_dir) else {
+    // 2026-08-01 layout: saves live inside each card's folder at
+    // `cards/<card_id>/saves/`. Walk the cards tree, and for each card folder
+    // that has a `saves/` subdir, list its slots.
+    let cards_dir = fable_root.join("cards");
+    let Ok(entries) = std::fs::read_dir(&cards_dir) else {
         return None;
     };
     let mut best: Option<fable_save::SaveMeta> = None;
     for entry in entries.flatten() {
-        // Each card has its own subdir: saves/<card_id>/. Skip stray files.
+        // Each card has its own folder: cards/<card_id>/. Skip stray files.
         if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
             continue;
         }
@@ -6213,22 +6664,30 @@ fn build_narrator_prompt(system_prompt: &str, window: &[session::Message]) -> St
 /// Render the player's handle for the narrator, falling back to a neutral
 /// "User" when the card carries no player name (mirrors the §11.29
 /// anti-positivity-bias neutral handle — never a title like "protagonist").
-fn card_player_handle(card: &sim_card::SimCard) -> &str {
-    card.player_name.as_deref().filter(|n| !n.trim().is_empty()).unwrap_or("User")
-}
-
 /// Compose the shared system-prompt skeleton (everything except the
 /// tracker-vs-narrator voice/protocol preamble, which the two callers
-/// prepend). The order of the tagged blocks is fixed by the test contract:
-/// `<world_state>` → `<retrieved_knowledge>` → `<scene_pacing>` → director
-/// directive.
+/// prepend). The order of the tagged blocks is:
+/// `<player_action>` → `<world_state>` → `<retrieved_knowledge>` →
+/// `<scene_pacing>` → `<director_directive>`. The manual player_action leads
+/// so the narrator's attention lands on the player's last tactile UI action
+/// (§11.30) before reading the world state.
 fn assemble_narrator_skeleton(
+    player_action: Option<&str>,
     world_state: Option<&str>,
     pacing: schema::ScenePacing,
     director_directive: Option<&str>,
     memory_block: Option<&str>,
 ) -> String {
     let mut out = String::with_capacity(2048);
+
+    // Manual player action (§11.30) — leads the skeleton. Emits the exact
+    // `<player_action type="manual_override">…</player_action>` form the
+    // left-drawer HUD arms via `fable_player_action_set`.
+    if let Some(pa) = player_action.map(str::trim).filter(|s| !s.is_empty()) {
+        out.push_str("<player_action type=\"manual_override\">\n");
+        out.push_str(pa);
+        out.push_str("\n</player_action>\n\n");
+    }
 
     if let Some(ws) = world_state.map(str::trim).filter(|s| !s.is_empty()) {
         out.push_str("<world_state>\n");
@@ -6257,25 +6716,48 @@ fn assemble_narrator_skeleton(
     out
 }
 
-/// Tracker system prompt: the model narrates AND emits bracket commands to
-/// track mechanical state. The bracket list mirrors what
-/// `bracket_parser::parse` recognizes — kept descriptive, not a rules wall.
+/// Tracker system prompt. The tracker reads the **agent** section of the
+/// authored `.prompt` file (its mechanical job), the card identity (name/
+/// setting/tone from the `.sim`), the live per-turn state blocks (assembled
+/// by `assemble_narrator_skeleton`), and the bracket-command list.
+///
+/// **Voice-authoring is gone from Rust.** This function does NOT author any
+/// narrator voice/style/behavior prose — that lives in `fable.prompt`. It only
+/// (a) slots the authored agent prose, (b) slots the card identity, (c) slots
+/// the live data tags, (d) appends the bracket-command protocol reference.
+/// The bracket list stays in Rust (load-bearing: `bracket_parser::parse` keys
+/// off the exact forms; a typo'd bracket in a `.prompt` file would silently
+/// break state tracking with no compile error to catch it).
 fn build_narrator_system_prompt(
+    prompts: &prompts::FablePrompts,
     card: &sim_card::SimCard,
     world_state: Option<&str>,
     pacing: schema::ScenePacing,
     director_directive: Option<&str>,
+    player_action: Option<&str>,
     memory_block: Option<&str>,
 ) -> String {
     let mut out = String::with_capacity(3072);
 
-    // Identity + voice from the card. Pure flavor: setting, tone, persona.
-    out.push_str("You are the Game Master narrating ");
-    out.push_str(&card.name);
-    out.push_str(".\n");
+    // (a) Authored agent/tracker prose (from fable.prompt's AGENT section).
+    let agent = prompts.agent.trim();
+    if !agent.is_empty() {
+        out.push_str(agent);
+        out.push_str("\n\n");
+    }
+
+    // (b) Card identity (from the active .sim scenario card). Pure flavor.
+    out.push_str("Scenario: ");
+    out.push_str(card.name.trim());
+    out.push('\n');
     if let Some(setting) = card.setting.as_deref().filter(|s| !s.trim().is_empty()) {
         out.push_str("Setting: ");
         out.push_str(setting.trim());
+        out.push('\n');
+    }
+    if let Some(plot) = card.plot.as_deref().filter(|s| !s.trim().is_empty()) {
+        out.push_str("Plot: ");
+        out.push_str(plot.trim());
         out.push('\n');
     }
     if let Some(tone) = card.tone.as_deref().filter(|s| !s.trim().is_empty()) {
@@ -6290,14 +6772,16 @@ fn build_narrator_system_prompt(
     }
     out.push('\n');
 
+    // (c) Live per-turn state blocks (world_state, retrieved_knowledge,
+    // scene_pacing, director_directive, player_action). Zero authored prose here.
     out.push_str(&assemble_narrator_skeleton(
-        world_state, pacing, director_directive, memory_block,
+        player_action, world_state, pacing, director_directive, memory_block,
     ));
 
-    // Bracket protocol: the tracker emits these alongside its prose so Rust
-    // can apply the mechanical truth. One line each, the bracket forms
-    // `bracket_parser::parse` accepts.
-    out.push_str("Track mechanical changes by emitting bracket commands in your output. One per line:\n");
+    // (d) Bracket-command protocol reference. The tracker emits these
+    // alongside its prose so Rust can apply the mechanical truth. One line
+    // each, the bracket forms `bracket_parser::parse` accepts. KEPT IN RUST
+    // — these are engine API endpoints, not narrative flavor.
     out.push_str("- [TIME Day N, HH:MM] — advance the in-world clock when time passes.\n");
     out.push_str("- [EFFECT <label> buff|debuff <secs> [kind=disguise]] — apply a status tag.\n");
     out.push_str("- [MILESTONE <npc_id> <event_id>] — record a relationship milestone.\n");
@@ -6305,29 +6789,50 @@ fn build_narrator_system_prompt(
     out.push_str("- [WEATHER <condition>] — change the global weather.\n");
     out.push_str("- [TRAVEL <node_id>] — move the player to an adjacent node.\n");
     out.push_str("- [RUMOR <node_id> <rumor_text>] — seed a rumor at a node.\n");
-    out.push_str("Only emit a bracket when that change genuinely occurred this turn. Embed the rest in prose.\n");
 
     out
 }
 
-/// Prose-only narrator system prompt (the "voice actor"). NO bracket
-/// protocol — the tracker owns mechanics; this model only narrates what
-/// Rust says happened.
+/// Prose-only narrator system prompt. The narrator reads the **narrator**
+/// section of the authored `.prompt` file (its voice), the card identity
+/// (name/setting/tone from the `.sim`), and the live per-turn state blocks.
+/// NO bracket-command list — the tracker (Local Stage-2) owns mechanics;
+/// this model only narrates what Rust says happened.
+///
+/// **Voice-authoring is gone from Rust.** No authored narrator voice/style/
+/// behavior prose lives here — that's `fable.prompt`'s narrator section. This
+/// function is a pure data-slotter: authored prose → card identity → live
+/// state tags. Nothing else.
 fn build_api_narrator_system_prompt(
+    prompts: &prompts::FablePrompts,
     card: &sim_card::SimCard,
     world_state: Option<&str>,
     pacing: schema::ScenePacing,
     director_directive: Option<&str>,
+    player_action: Option<&str>,
     memory_block: Option<&str>,
 ) -> String {
     let mut out = String::with_capacity(2048);
 
-    out.push_str("You are the narrator of ");
-    out.push_str(&card.name);
-    out.push_str(". Narrate the scene in second person, present tense.\n");
+    // (a) Authored narrator prose (from fable.prompt's NARRATOR section).
+    let narrator = prompts.narrator.trim();
+    if !narrator.is_empty() {
+        out.push_str(narrator);
+        out.push_str("\n\n");
+    }
+
+    // (b) Card identity (from the active .sim scenario card).
+    out.push_str("Scenario: ");
+    out.push_str(card.name.trim());
+    out.push('\n');
     if let Some(setting) = card.setting.as_deref().filter(|s| !s.trim().is_empty()) {
         out.push_str("Setting: ");
         out.push_str(setting.trim());
+        out.push('\n');
+    }
+    if let Some(plot) = card.plot.as_deref().filter(|s| !s.trim().is_empty()) {
+        out.push_str("Plot: ");
+        out.push_str(plot.trim());
         out.push('\n');
     }
     if let Some(tone) = card.tone.as_deref().filter(|s| !s.trim().is_empty()) {
@@ -6342,15 +6847,10 @@ fn build_api_narrator_system_prompt(
     }
     out.push('\n');
 
-    out.push_str("The player is ");
-    out.push_str(card_player_handle(card));
-    out.push_str(".\n\n");
-
+    // (c) Live per-turn state blocks. Zero authored prose.
     out.push_str(&assemble_narrator_skeleton(
-        world_state, pacing, director_directive, memory_block,
+        player_action, world_state, pacing, director_directive, memory_block,
     ));
-
-    out.push_str("Narrate only what the world-state above says happened. Do not invent outcomes, stats, or bracket commands — write prose only.\n");
 
     out
 }
@@ -6651,6 +7151,19 @@ async fn fable_send(
         g.take()
     };
 
+    // (0b) Manual player action (§11.30 Left-Drawer HUD, 2026-08-02): mirror
+    // of the directive take above. Consumed + cleared atomically, ONE turn
+    // only. Armed by `fable_player_action_set` when the player clicks
+    // Consume/Equip/Unequip in the left-drawer inventory grid. Rendered as a
+    // new `<player_action type="manual_override">` block at the top of
+    // `assemble_narrator_skeleton` so the narrator acknowledges the tactile UI
+    // action in this turn's prose. Taken BEFORE the schema lock for the same
+    // atomicity reason as the directive.
+    let player_action = {
+        let mut g = state.pending_player_action.lock().await;
+        g.take()
+    };
+
     let (world_state, pacing, mut turn_directives) = {
         let mut s = state.fable_schema.lock().await;
 
@@ -6887,11 +7400,22 @@ async fn fable_send(
         }
     };
 
+    // The authored narrator + agent prose, loaded once in setup() (cache-once
+    // pattern). Passed to the build_* prompt builders so authored voice comes
+    // from fable.prompt, not from Rust. Always Some after setup (loader falls
+    // back to a placeholder).
+    let fable_prompts = state
+        .fable_prompts
+        .get()
+        .expect("fable_prompts is set in setup()");
+
     let system_prompt = build_narrator_system_prompt(
+        fable_prompts,
         &card,
         world_state.as_deref(),
         pacing,
         director_directive.as_deref(),
+        player_action.as_deref(),
         memory_block.as_deref(),
     );
 
@@ -6929,7 +7453,7 @@ async fn fable_send(
     // API window for a consistent "6 beats of recent history" feel across
     // both surfaces.
     let source = *state.model_source.lock().expect("model_source mutex");
-    let fable_visible_window = if source == api::ModelSource::Api { 12 } else { 8 };
+    let fable_visible_window = if source == api::ModelSource::Api { settings::WINDOW_API_FABLE } else { settings::WINDOW_LOCAL_FABLE };
     let regenerate = regenerate.unwrap_or(false);
     let reroll = reroll.unwrap_or(false);
     {
@@ -7168,10 +7692,12 @@ async fn fable_send(
         // serves both Fable stages (the GM/Narrator unification principle
         // extended to the two-stage turn: one codex, one query).
         let narrator_system_prompt = build_api_narrator_system_prompt(
+            fable_prompts,
             &card,
             narrator_world_state.as_deref(),
             pacing,
             director_directive.as_deref(),
+            player_action.as_deref(),
             memory_block.as_deref(),
         );
 
@@ -7322,10 +7848,12 @@ async fn fable_send(
 
         // ── Pass 1: NARRATOR (streams live via real on_chunk) ──
         let narrator_system_prompt = build_api_narrator_system_prompt(
+            fable_prompts,
             &card,
             world_state.as_deref(),
             pacing,
             director_directive.as_deref(),
+            player_action.as_deref(),
             memory_block.as_deref(),
         );
         let narrator_prompt = build_narrator_prompt(&narrator_system_prompt, &window);
@@ -7372,9 +7900,11 @@ async fn fable_send(
             // owns mechanics, not prose). The narrator's just-written prose is
             // passed in the stateless extraction block.
             let tracker_system_prompt = build_narrator_system_prompt(
+                fable_prompts,
                 &card,
                 world_state.as_deref(),
                 pacing,
+                None,
                 None,
                 memory_block.as_deref(),
             );
@@ -7686,14 +8216,44 @@ async fn fable_end(
             .map_err(|e| format!("game engine shutdown join: {e}"))?;
     }
 
-    // 2. Phase 3 per-card persistence: capture the roleplay card id BEFORE
-    //    the restore (step 3 swaps active_card_id back to the system value),
-    //    then save the session + schema under the roleplay id. Both saves are
-    //    best-effort: a failure logs a warning but doesn't block fable_end
-    //    (the in-memory state is cleared regardless; the user just loses the
-    //    resume point on a disk error, not the running game).
+    // 2. Per-card persistence. Two branches share one goal (best-effort:
+    //    a failure logs a warning but doesn't block fable_end — the in-memory
+    //    state is cleared regardless; the user just loses the resume point on
+    //    a disk error, not the running game):
+    //      • Quick Play (active_card_id == QUICK_PLAY_CARD_ID): write the
+    //        single quicksave slot, BUNDLING the seated card so a later resume
+    //        rebuilds the narrator prompt without re-reading data/fable.sim.
+    //        Quick Play owns no sessions/schemas dir — the quicksave IS the
+    //        persistence. The active card is captured BEFORE step 3 clears it.
+    //      • New Game worlds: save session + schema under the roleplay id
+    //        (apps/fable/{sessions,schemas}/<card_id>.json), same as before.
     let roleplay_card_id = state.active_card_id.lock().expect("active_card_id mutex").clone();
-    if roleplay_card_id != memory::WUPI_CARD_ID {
+    let is_quick_play = roleplay_card_id == fable_save::QUICK_PLAY_CARD_ID;
+    if is_quick_play {
+        let card_snapshot = state
+            .active_fable_card
+            .lock()
+            .expect("active_fable_card mutex")
+            .clone();
+        let schema_snapshot = state.fable_schema.lock().await.clone();
+        let session_snapshot = state.fable_session.lock().await.clone();
+        if let Some(card) = card_snapshot {
+            let fable_root = resolve_apps_dir(&app).join("fable");
+            let root_clone = fable_root.clone();
+            let card_clone = card.clone();
+            let schema_clone = schema_snapshot.clone();
+            let session_clone = session_snapshot.clone();
+            match tokio::task::spawn_blocking(move || {
+                fable_save::write_quick_save(&root_clone, &card_clone, &session_clone, &schema_clone)
+            })
+            .await
+            {
+                Ok(Ok(_)) => tracing::info!("quick play quicksave written"),
+                Ok(Err(e)) => tracing::warn!(error = %e, "quick play quicksave write failed"),
+                Err(e) => tracing::warn!(error = %e, "quick play quicksave join failed"),
+            }
+        }
+    } else if roleplay_card_id != memory::WUPI_CARD_ID {
         let schema_snapshot = state.fable_schema.lock().await.clone();
         let session_snapshot = state.fable_session.lock().await.clone();
         save_schema(&app, &roleplay_card_id, &schema_snapshot).await;
@@ -7710,8 +8270,6 @@ async fn fable_end(
     clear_fable_history(&state).await;
     *state.fable_session.lock().await = session::Conversation::new();
     *state.active_fable_card.lock().expect("active_fable_card mutex") = None;
-    // Phase 2: drop the GM persona so OS chat outside Fable stays the catgirl.
-    *state.fable_persona.lock().expect("fable_persona mutex") = None;
 
     // 4. Clear any leftover game cancel token.
     *state.active_fable_cancel.lock().expect("active_fable_cancel mutex") = None;
@@ -7827,6 +8385,49 @@ async fn fable_director_clear(state: tauri::State<'_, AppState>) -> Result<(), S
 async fn fable_director_peek(state: tauri::State<'_, AppState>) -> Result<Option<String>, String> {
     let g = state.pending_directive.lock().await;
     Ok(g.clone())
+}
+
+// ===========================================================================
+// §11.30 Left-Drawer Visual HUD — manual player-action injection pipeline.
+// Mirror of the §11.24 director-directive IPCs above. The frontend
+// `fable_player_action_set` arms a one-shot `<player_action>` string when the
+// player performs a tactile UI action in the left drawer (Consume potion,
+// Equip/Unequip). The next `fable_send` takes + clears it (ONE turn) and
+// renders it as a new `<player_action type="manual_override">` block at the
+// top of `assemble_narrator_skeleton`, leading the narrator's attention.
+// Held under the same tokio Mutex as `pending_directive` for the same race
+// reason (frontend writer vs the consume site inside `fable_send`).
+// ===========================================================================
+
+#[tauri::command]
+async fn fable_player_action_set(
+    text: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<(), String> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        // Empty = clear (treat as cancel, mirror of fable_director_set).
+        let mut g = state.pending_player_action.lock().await;
+        *g = None;
+        return Ok(());
+    }
+    // Hard cap so a runaway UI loop can't bloat the prompt (§1C: shrink the
+    // payload, never raise the context). 500 chars is generous for any
+    // "Player equipped X to Y" line.
+    let capped = if trimmed.len() > 500 {
+        let mut s = trimmed[..500].to_string();
+        // Avoid splitting a multi-byte char — back up to a char boundary.
+        while !s.is_char_boundary(s.len()) {
+            s.pop();
+        }
+        s
+    } else {
+        trimmed.to_string()
+    };
+    let mut g = state.pending_player_action.lock().await;
+    *g = Some(capped);
+    tracing::info!("player action armed (one-shot, will fire on next fable_send)");
+    Ok(())
 }
 
 // ===========================================================================
@@ -8213,9 +8814,10 @@ async fn player_state_get(
     // from the title screen. Use `active_fable_card` (NOT `fable_engine`):
     // under the §2B VRAM swap-lock the engine is evicted whenever chat/schema
     // acquires the lease, so the engine slot is regularly `None` mid-game.
-    // The card, by contrast, is seated on `fable_start` / `fable_quick_start`
-    // and cleared on `fable_end` — the true game-lifetime signal. Same fix
-    // as `fable_is_active` (lib.rs ~2099) and `fable_rollback` below.
+    // The card, by contrast, is seated on `fable_start` /
+    // `fable_quick_play_start` / `fable_quick_play_resume` and cleared on
+    // `fable_end` — the true game-lifetime signal. Same fix as
+    // `fable_is_active` (lib.rs ~2099) and `fable_rollback` below.
     if !fable_is_active(&state) {
         return Err("no fable game active: call fable_start first".to_string());
     }
@@ -8224,16 +8826,27 @@ async fn player_state_get(
         .map_err(|e| format!("serialize player state: {e}"))?)
 }
 
-/// Return the display name of the currently-seated fable card (for the
-/// stage's "(name) is currently typing.." indicator + the left-drawer Card
-/// tab). `None` (serialized as null) when no game is active. Uses the same
-/// `fable_is_active` gate as the other read-only fable queries.
+/// Return the identity of the currently-seated fable card as `{ name,
+/// player_name }` — for the stage's "(name) is currently typing.." indicator
+/// AND the message-header names (card name → narrator beats; player_name →
+/// user beats). `player_name` is the empty string when the card omits
+/// `<player_name>`. `None` (serialized as null) when no game is active.
+///
+/// FRONTEND CONTRACT: the JS consumer (stage.js `refreshActiveCardName`)
+/// accepts BOTH this object shape AND a legacy plain-string shape, so a
+/// frontend built against the older `Option<String>` return still works.
+/// Uses the same `fable_is_active` gate as the other read-only fable queries.
 #[tauri::command]
 fn fable_active_card_get(
     state: tauri::State<'_, AppState>,
-) -> Result<Option<String>, String> {
+) -> Result<Option<serde_json::Value>, String> {
     let guard = state.active_fable_card.lock().expect("active_fable_card mutex");
-    Ok(guard.as_ref().map(|c| c.name.clone()))
+    Ok(guard.as_ref().map(|c| {
+        serde_json::json!({
+            "name": c.name,
+            "player_name": c.player_name.clone().unwrap_or_default(),
+        })
+    }))
 }
 
 /// Return the full live `WorldSchema` as JSON for the Tracker tab (left
@@ -8307,6 +8920,7 @@ fn fable_card_get(
             "name": c.name,
             "core_persona": c.core_persona,
             "setting": c.setting.clone().unwrap_or_default(),
+            "plot": c.plot.clone().unwrap_or_default(),
             "tone": c.tone.clone().unwrap_or_default(),
             "opening_scene": c.opening_scene.clone().unwrap_or_default(),
             "player_name": c.player_name.clone().unwrap_or_default(),
@@ -8316,9 +8930,9 @@ fn fable_card_get(
 
 /// Apply a Card-tab edit to the active card (session-only — see
 /// `fable_card_get`). Updates the editable scalar fields on the in-memory
-/// card + re-seats the GM persona (`fable_persona`) so the next narrator
-/// turn picks up the new voice/setting/first-message. Null/absent fields in
-/// `fields` are left unchanged. The on-disk `.sim` file is NOT modified.
+/// card so the next narrator turn picks up the new voice/setting/first-
+/// message. Null/absent fields in `fields` are left unchanged. The on-disk
+/// `.sim` file is NOT modified.
 #[tauri::command]
 fn fable_card_save(
     fields: serde_json::Value,
@@ -8340,6 +8954,9 @@ fn fable_card_save(
     if let Some(s) = obj.get("setting").and_then(|v| v.as_str()) {
         card.setting = if s.trim().is_empty() { None } else { Some(s.to_string()) };
     }
+    if let Some(p) = obj.get("plot").and_then(|v| v.as_str()) {
+        card.plot = if p.trim().is_empty() { None } else { Some(p.to_string()) };
+    }
     if let Some(t) = obj.get("tone").and_then(|v| v.as_str()) {
         card.tone = if t.trim().is_empty() { None } else { Some(t.to_string()) };
     }
@@ -8349,17 +8966,291 @@ fn fable_card_save(
     if let Some(pn) = obj.get("player_name").and_then(|v| v.as_str()) {
         card.player_name = if pn.trim().is_empty() { None } else { Some(pn.to_string()) };
     }
-    // Re-seat the GM persona from the edited card so the narrator's next turn
-    // uses the updated identity. `fable_persona` is the in-Fable assistant
-    // voice (the Game Master) — a clone of the active card. Drop the lock on
-    // `active_fable_card` before acquiring `fable_persona` (lock-order hygiene:
-    // never nest the two).
-    let persona_clone = guard.clone();
-    drop(guard);
-    if let Some(pc) = persona_clone {
-        *state.fable_persona.lock().expect("fable_persona mutex") = Some(pc);
+    tracing::info!("fable_card_save: session-only Card-tab edit applied");
+    Ok(())
+}
+
+// ── Per-card raw-file IPCs (2026-08-01 Fable tab rail + raw editor) ───────
+// The right-drawer tab rail (Player / Sim Card / Codex / World / NPC) shows
+// each topic's data as friendly prose, and a ✎ icon opens the raw JSON/XML
+// file in a centered modal. These IPCs are the read/write surface for that.
+//
+// All paths resolve under the active card's per-card folder
+// (`cards/<card_id>/...`) via `resolve_card_file` — never accept a caller-
+// supplied path (the raw editor never escapes the card's folder). Writes go
+// through `write_atomic` (temp+fsync+rename) so a crash mid-write never
+// truncates the existing file. JSON files validate via `serde_json::from_str`
+// before write; the `.sim` validates via the real parser (`parse_from_xml_str`).
+
+/// The active roleplay card's id (or `Err` when no game is active). The raw-
+/// file IPCs take this implicitly rather than as an arg so the frontend never
+/// has to track it — same `fable_is_active` gate as the other fable queries.
+fn active_roleplay_card_id(state: &tauri::State<'_, AppState>) -> Result<String, String> {
+    if !fable_is_active(state) {
+        return Err("no fable game active: call fable_start first".to_string());
     }
-    tracing::info!("fable_card_save: session-only Card-tab edit applied (persona re-seated)");
+    Ok(state
+        .active_card_id
+        .lock()
+        .expect("active_card_id mutex")
+        .clone())
+}
+
+/// Read the raw text of the active card's `.sim` file. The raw editor's load
+/// path for the Sim Card tab. Returns the file's full XML text (NotFound →
+/// empty string, though an active game always has a seated card on disk).
+#[tauri::command]
+fn fable_card_raw_get(
+    state: tauri::State<'_, AppState>,
+    app: tauri::AppHandle,
+) -> Result<String, String> {
+    let card_id = active_roleplay_card_id(&state)?;
+    let cards_root = resolve_fable_cards_dir(&app)
+        .ok_or_else(|| "no apps/fable/cards/ dir resolved".to_string())?;
+    let path = resolve_card_file(&cards_root, &card_id, "sim");
+    std::fs::read_to_string(&path).map_err(|e| format!("read card: {e}"))
+}
+
+/// Validate + atomically write the active card's `.sim` file (the raw editor's
+/// save path for the Sim Card tab). Validates through the REAL parser
+/// (`parse_from_xml_str`) before any disk touch — malformed XML is rejected,
+/// the file untouched. Unlike the session-only `fable_card_save`, this writes
+/// the `.sim` to disk (the raw-editor contract: edit the whole file, persist
+/// it). The live narrator card is NOT re-seated here (the next `fable_start`
+/// picks up the edit); a live re-seat is a future enhancement.
+#[tauri::command]
+fn fable_card_raw_set(
+    xml: String,
+    state: tauri::State<'_, AppState>,
+    app: tauri::AppHandle,
+) -> Result<(), String> {
+    let card_id = active_roleplay_card_id(&state)?;
+    if xml.len() > 100_000 {
+        return Err("Card exceeds 100 KB cap".into());
+    }
+    // Validate through the real parser BEFORE any disk touch (same gate as
+    // fable_validate_card_xml / fable_write_card).
+    sim_card::parse_from_xml_str(&xml).map_err(|e| format!("Invalid card format: {e}"))?;
+    let cards_root = resolve_fable_cards_dir(&app)
+        .ok_or_else(|| "no apps/fable/cards/ dir resolved".to_string())?;
+    let card_dir = resolve_card_dir(&cards_root, &card_id);
+    std::fs::create_dir_all(&card_dir).map_err(|e| format!("mkdir card folder: {e}"))?;
+    let path = resolve_card_file(&cards_root, &card_id, "sim");
+    write_atomic(&path, xml.as_bytes()).map_err(|e| format!("write card: {e}"))?;
+    tracing::info!(card_id = %card_id, "fable_card_raw_set: .sim written to disk");
+    Ok(())
+}
+
+/// Read the raw text of one of the active card's JSON files (`world` /
+/// `player` / `npc`). `kind` is one of those three strings. The raw editor's
+/// load path for the World / Player / NPC tabs. NotFound → empty string.
+#[tauri::command]
+fn fable_json_raw_get(
+    kind: String,
+    state: tauri::State<'_, AppState>,
+    app: tauri::AppHandle,
+) -> Result<String, String> {
+    let card_id = active_roleplay_card_id(&state)?;
+    let ext = match kind.as_str() {
+        "world" => "world.json",
+        "player" => "player.json",
+        "npc" => "npc.json",
+        _ => return Err(format!("unknown kind '{kind}' (world|player|npc)")),
+    };
+    let cards_root = resolve_fable_cards_dir(&app)
+        .ok_or_else(|| "no apps/fable/cards/ dir resolved".to_string())?;
+    let path = resolve_card_file(&cards_root, &card_id, ext);
+    match std::fs::read_to_string(&path) {
+        Ok(t) => Ok(t),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
+        Err(e) => Err(format!("read {ext}: {e}")),
+    }
+}
+
+/// Validate + atomically write one of the active card's JSON files, then
+/// recompose it into the LIVE `WorldSchema` so the edit applies immediately
+/// (not just on next reload). `kind` ∈ {world, player, npc}. The raw editor's
+/// save path for the World / Player / NPC tabs.
+///
+/// The recompose: read the live schema, apply the edited slice (overwrite the
+/// matching subtree — `player_state` for player, the npc.* entities +
+/// npc_registry/relationships/presences/offscreen_tasks for npc, everything
+/// else for world), push the prior schema to the undo ring buffer, install,
+/// persist via `save_schema`. Mirrors the trust class of `fable_schema_set`
+/// (user-initiated, bypasses the immutability lock, undoable).
+#[tauri::command]
+async fn fable_json_raw_set(
+    kind: String,
+    json: String,
+    state: tauri::State<'_, AppState>,
+    app: tauri::AppHandle,
+) -> Result<(), String> {
+    let card_id = active_roleplay_card_id(&state)?;
+    let parsed: serde_json::Value =
+        serde_json::from_str(&json).map_err(|e| format!("invalid JSON: {e}"))?;
+
+    // Recompose into the live schema: take the current snapshot, overwrite the
+    // edited slice, push undo, install, persist.
+    let prior = state.fable_schema.lock().await.clone();
+    let mut full = serde_json::to_value(&prior).map_err(|e| format!("serialize schema: {e}"))?;
+    let full_obj = full
+        .as_object_mut()
+        .ok_or_else(|| "live schema serialized to non-object".to_string())?;
+    match kind.as_str() {
+        "world" => {
+            // The world slice carries: all fields EXCEPT player_state + the
+            // npc-grouped fields + npc.* entities. The raw editor shows the
+            // full world.json (which the split wrote), so on save we apply
+            // every key the edited JSON carries (overwriting the live value),
+            // WITHOUT clobbering player_state/npc fields the world slice
+            // doesn't own. Entities is special: world.json's entities are the
+            // non-npc.* ones — replace only those, preserve npc.* in the live
+            // schema.
+            let edited = parsed
+                .as_object()
+                .ok_or_else(|| "world JSON must be an object".to_string())?;
+            for (k, v) in edited {
+                if k == "entities" {
+                    // Replace non-npc.* entities with the edited set; keep npc.*.
+                    let edited_ents = v
+                        .as_object()
+                        .ok_or_else(|| "world entities must be an object".to_string())?;
+                    let live_ents = full_obj
+                        .entry("entities".to_string())
+                        .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+                    let live_map = live_ents
+                        .as_object_mut()
+                        .ok_or_else(|| "live entities not an object".to_string())?;
+                    // Drop the live non-npc.* keys, then re-insert from edited.
+                    live_map.retain(|k, _| k.starts_with("npc."));
+                    for (ek, ev) in edited_ents {
+                        if !ek.starts_with("npc.") {
+                            live_map.insert(ek.clone(), ev.clone());
+                        }
+                    }
+                } else if !matches!(
+                    k.as_str(),
+                    "player_state" | "npc_registry" | "relationships" | "presences"
+                        | "offscreen_tasks"
+                ) {
+                    // A world-slice key: overwrite the live value.
+                    full_obj.insert(k.clone(), v.clone());
+                }
+                // else: a key the world slice doesn't own — ignore (defensive).
+            }
+        }
+        "player" => {
+            // The player slice is `{ "player_state": {...} }`.
+            let ps = parsed
+                .get("player_state")
+                .ok_or_else(|| "player JSON must have a player_state field".to_string())?;
+            full_obj.insert("player_state".to_string(), ps.clone());
+        }
+        "npc" => {
+            // The npc slice carries npc_registry/relationships/presences/
+            // offscreen_tasks + an `entities` object of npc.* keys.
+            let edited = parsed
+                .as_object()
+                .ok_or_else(|| "npc JSON must be an object".to_string())?;
+            for key in ["npc_registry", "relationships", "presences", "offscreen_tasks"] {
+                if let Some(v) = edited.get(key) {
+                    full_obj.insert(key.to_string(), v.clone());
+                }
+            }
+            if let Some(ents_val) = edited.get("entities") {
+                let edited_ents = ents_val
+                    .as_object()
+                    .ok_or_else(|| "npc entities must be an object".to_string())?;
+                let live_ents = full_obj
+                    .entry("entities".to_string())
+                    .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+                let live_map = live_ents
+                    .as_object_mut()
+                    .ok_or_else(|| "live entities not an object".to_string())?;
+                // Drop the live npc.* keys, then re-insert from edited.
+                live_map.retain(|k, _| !k.starts_with("npc."));
+                for (ek, ev) in edited_ents {
+                    live_map.insert(ek.clone(), ev.clone());
+                }
+            }
+        }
+        _ => return Err(format!("unknown kind '{kind}' (world|player|npc)")),
+    }
+
+    let new_schema: schema::WorldSchema = serde_json::from_value(full)
+        .map_err(|e| format!("recompose schema: {e}"))?;
+
+    // Snapshot the prior schema for undo (mirrors fable_schema_set), then install.
+    push_fable_history_snapshot(&state, prior).await;
+    {
+        let mut s = state.fable_schema.lock().await;
+        *s = new_schema;
+    }
+    // Persist the recomposed schema to the three split files + return.
+    save_schema(&app, &card_id, &state.fable_schema.lock().await.clone()).await;
+    tracing::info!(card_id = %card_id, kind = %kind, "fable_json_raw_set: slice recomposed + persisted");
+    Ok(())
+}
+
+/// Read the active card's `.codex` text (raw, for the raw editor) + as parsed
+/// entries (for the prose dropdown). One IPC serves both: the dropdown reads
+/// `entries`, the editor reads `raw`. `raw` is the file's verbatim text
+/// (empty string when no `.codex` exists yet — a fresh card). `entries` is the
+/// parsed `{title, tags, body}` list (empty Vec when none).
+#[derive(serde::Serialize)]
+struct FableCodexRead {
+    raw: String,
+    entries: Vec<FableCodexEntry>,
+}
+#[derive(serde::Serialize)]
+struct FableCodexEntry {
+    title: String,
+    tags: Vec<String>,
+    body: String,
+}
+#[tauri::command]
+fn fable_codex_get(
+    state: tauri::State<'_, AppState>,
+    app: tauri::AppHandle,
+) -> Result<FableCodexRead, String> {
+    let card_id = active_roleplay_card_id(&state)?;
+    let cards_root = resolve_fable_cards_dir(&app)
+        .ok_or_else(|| "no apps/fable/cards/ dir resolved".to_string())?;
+    let path = resolve_card_file(&cards_root, &card_id, "codex");
+    let raw = match std::fs::read_to_string(&path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(format!("read codex: {e}")),
+    };
+    let entries = codex::parse_compound_text(&raw, &card_id)
+        .into_iter()
+        .map(|e| FableCodexEntry {
+            title: e.title,
+            tags: e.tags,
+            body: e.body,
+        })
+        .collect();
+    Ok(FableCodexRead { raw, entries })
+}
+
+/// Atomically write the active card's `.codex` text (the raw editor's save
+/// path for the Codex tab). No structural validation — `.codex` is freeform
+/// authored prose; the parser is tolerant (entries without `---` fences parse
+/// as one body-only entry). Created on first write.
+#[tauri::command]
+fn fable_codex_raw_set(
+    text: String,
+    state: tauri::State<'_, AppState>,
+    app: tauri::AppHandle,
+) -> Result<(), String> {
+    let card_id = active_roleplay_card_id(&state)?;
+    let cards_root = resolve_fable_cards_dir(&app)
+        .ok_or_else(|| "no apps/fable/cards/ dir resolved".to_string())?;
+    let card_dir = resolve_card_dir(&cards_root, &card_id);
+    std::fs::create_dir_all(&card_dir).map_err(|e| format!("mkdir card folder: {e}"))?;
+    let path = resolve_card_file(&cards_root, &card_id, "codex");
+    write_atomic(&path, text.as_bytes()).map_err(|e| format!("write codex: {e}"))?;
+    tracing::info!(card_id = %card_id, "fable_codex_raw_set: .codex written");
     Ok(())
 }
 
@@ -8590,6 +9481,7 @@ async fn fable_load_save(
             content: m.content.clone(),
             variants: m.variants.clone(),
             active_idx: m.active_idx,
+            timestamp: m.timestamp,
         })
         .collect();
     *state.fable_session.lock().await = save.session;
@@ -8620,13 +9512,18 @@ struct FableLoadResult {
 
 /// One loaded message, role as a lowercase string (matches `session::Role`'s
 /// `rename_all = "lowercase"` serialization but trimmed to just role+content
-/// so we don't leak `raw_output`/`reasoning`/`id`/`timestamp` to the UI).
+/// so we don't leak `raw_output`/`reasoning`/`id` to the UI).
 ///
 /// `variants` + `active_idx` carry the swipeable-reroll state (2026-07-29) so
 /// the feed can render the `1/N` control + recover older variants on swipe.
 /// `variants` holds the INACTIVE siblings only (parallel to
 /// `session::Message::variants`); `content` is the active variant. Omitted from
 /// serialization when empty so legacy frontends/JSON stay clean.
+///
+/// `timestamp` (2026-08-01): the message's epoch-millis stamp, surfaced for
+/// the hover-only message header's time line. Decorative-only (the UI omits
+/// the line when 0/absent); never reaches inference. `#[serde(default)]` so a
+/// value built without it (none today, but defensive) serializes cleanly.
 #[derive(Debug, Clone, serde::Serialize)]
 struct FableLoadMessage {
     role: &'static str,
@@ -8635,6 +9532,8 @@ struct FableLoadMessage {
     variants: Vec<String>,
     #[serde(default)]
     active_idx: usize,
+    #[serde(default)]
+    timestamp: i64,
 }
 
 /// Delete a save slot. Idempotent (Ok if the save is already gone).
@@ -8665,7 +9564,7 @@ fn fable_delete_save(
 // (or its successor) that many times after rebuilding the feed.
 //
 // The commands are PURE: no Channel, no engine. After mutating + persisting
-// they return the new `messages[]` (same shape as `fable_quick_resume`) so
+// they return the new `messages[]` (same shape as `fable_quick_play_resume`) so
 // the frontend can rebuild the feed via `loadHistory`, then re-invoke
 // `fable_send(text, { regenerate: true })` for reroll / rewind-and-edit.
 // `edit_message` does NOT re-trigger inference (per spec).
@@ -8752,7 +9651,7 @@ fn apply_rewind_and_edit(
 
 /// Render a snapshot of the conversation as the wire shape the frontend
 /// expects (lowercase role + content, no internals). Mirrors the projection
-/// used by `fable_load_save` / `fable_quick_resume`.
+/// used by `fable_load_save` / `fable_quick_play_resume`.
 fn project_messages(conv: &session::Conversation) -> Vec<FableLoadMessage> {
     conv.messages
         .iter()
@@ -8765,6 +9664,7 @@ fn project_messages(conv: &session::Conversation) -> Vec<FableLoadMessage> {
             content: m.content.clone(),
             variants: m.variants.clone(),
             active_idx: m.active_idx,
+            timestamp: m.timestamp,
         })
         .collect()
 }
@@ -9001,21 +9901,290 @@ fn resolve_fable_cards_dir(app: &tauri::AppHandle) -> Option<std::path::PathBuf>
     None
 }
 
-/// Find a roleplay card by id within `apps/games/cards/` (§8C). Returns an
+/// Find a roleplay card by id within `apps/fable/cards/`. Returns an
 /// error string (not a panic) if no card with that id exists.
+///
+/// **2026-08-01 folder layout:** cards live in per-card folders
+/// (`cards/<id>/<id>.sim`). `iter_card_sim_paths` is the single walker both
+/// enumerators share. First id match wins.
 fn find_card_by_id(dir: &std::path::Path, target_id: &str) -> Result<sim_card::SimCard, String> {
-    let entries = std::fs::read_dir(dir).map_err(|e| format!("read fable_cards/: {e}"))?;
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.extension().and_then(|x| x.to_str()) != Some("sim") {
-            continue;
-        }
+    for path in iter_card_sim_paths(dir) {
         let card = sim_card::load_or_fallback(&path);
         if card.id == target_id && card.card_type == "roleplay" {
             return Ok(card);
         }
     }
     Err(format!("no roleplay card with id '{target_id}' in {}", dir.display()))
+}
+
+/// Enumerate every `.sim` file under a cards root. Each card lives in a
+/// per-card folder `cards/<name>/`, and its namesake card is
+/// `<name>/<name>.sim`. A folder holding a differently-named `.sim` is ignored
+/// (a folder's namesake is its only card — defensive against a hand-edited
+/// tree). Shared by `find_card_by_id` + `fable_cards_list` so the two walkers
+/// can never disagree on what counts as a card. Order is filesystem-dependent
+/// (callers sort).
+fn iter_card_sim_paths(cards_root: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut out = Vec::new();
+    let Ok(entries) = std::fs::read_dir(cards_root) else {
+        return out;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+            continue;
+        }
+        // Per-card folder: the namesake `<name>/<name>.sim`.
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        let sim = path.join(format!("{name}.sim"));
+        if sim.is_file() {
+            out.push(sim);
+        }
+    }
+    out
+}
+
+/// Resolve a card's per-card folder: `cards_root/<card_id>/`. Created on
+/// demand by the writers; readers treat NotFound as "no folder yet".
+fn resolve_card_dir(cards_root: &std::path::Path, card_id: &str) -> std::path::PathBuf {
+    cards_root.join(card_id)
+}
+
+/// Resolve a sibling file inside a card's per-card folder:
+/// `cards_root/<card_id>/<card_id>.<ext>` (e.g. `<id>.sim`, `<id>.codex`).
+fn resolve_card_file(
+    cards_root: &std::path::Path,
+    card_id: &str,
+    ext: &str,
+) -> std::path::PathBuf {
+    resolve_card_dir(cards_root, card_id).join(format!("{card_id}.{ext}"))
+}
+
+// === SAVED PLAYERS (2026-08-02) ===========================================
+// A standalone, reusable player identity library at apps/fable/players/.
+// Mirrors the per-card folder discipline (§6B) at a sibling root. Each
+// player owns a folder `players/<id>/` holding `<id>.json` + an optional
+// portrait image. See `player.rs` for the data model + validation.
+
+/// Resolve the saved-players root: `<install_root>/apps/fable/players/`.
+/// Simpler than `resolve_fable_cards_dir` (no legacy layout — players is
+/// freshly-created user state, no migration surface). The dir is created
+/// eagerly at boot (see the mkdir in setup), so this always resolves.
+fn resolve_fable_players_dir(app: &tauri::AppHandle) -> std::path::PathBuf {
+    resolve_apps_dir(app).join("fable").join("players")
+}
+
+/// Enumerate every saved player's namesake JSON under a players root.
+/// Mirrors `iter_card_sim_paths`: each entry is a per-player folder
+/// `players/<name>/`, and only the namesake file `<name>/<name>.json`
+/// counts (a folder holding a differently-named `.json` is ignored —
+/// defensive against a hand-edited tree). Returns the JSON paths; callers
+/// parse + skip malformed entries.
+fn iter_player_json_paths(players_root: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut out = Vec::new();
+    let Ok(entries) = std::fs::read_dir(players_root) else {
+        return out;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        let json = path.join(format!("{name}.json"));
+        if json.is_file() {
+            out.push(json);
+        }
+    }
+    out
+}
+
+/// Load + parse a SavedPlayer from a namesake JSON path. Returns None on
+/// any read/parse error (malformed entries are skipped by the list IPC,
+// not fatal). Best-effort, mirroring `sim_card::load_or_fallback`'s
+// graceful-degradation intent (but without a fallback stub — a bad
+// player file simply isn't listed).
+fn load_player_at(path: &std::path::Path) -> Option<player::SavedPlayer> {
+    let bytes = std::fs::read(path).ok()?;
+    serde_json::from_slice::<player::SavedPlayer>(&bytes).ok()
+}
+
+/// Enumerate every saved player + return lightweight metadata for the
+/// picker UI. Returns an empty Vec when no players dir exists or it
+/// holds no valid players (the common case until the user authors one):
+/// graceful, not an error. Malformed entries are skipped (logged).
+#[tauri::command]
+fn fable_players_list(app: tauri::AppHandle) -> Result<Vec<player::PlayerMeta>, String> {
+    let dir = resolve_fable_players_dir(&app);
+    let mut out = Vec::new();
+    for path in iter_player_json_paths(&dir) {
+        let player = match load_player_at(&path) {
+            Some(p) => p,
+            None => {
+                tracing::warn!(path = %path.display(), "skipping malformed saved player");
+                continue;
+            }
+        };
+        // Portrait exists? Best-effort: the portrait filename is stored
+        // relative; resolve against the player's folder.
+        let has_portrait = player
+            .portrait
+            .as_deref()
+            .and_then(|fname| path.parent().map(|d| d.join(fname)))
+            .map(|p| p.is_file())
+            .unwrap_or(false);
+        out.push(player::PlayerMeta {
+            id: player.id,
+            name: player.name,
+            has_portrait,
+        });
+    }
+    // Sort by name for stable picker ordering (mirrors fable_cards_list).
+    out.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+    Ok(out)
+}
+
+/// Load a single saved player by id, resolving the portrait to an
+/// absolute path string for the frontend's `convertFileSrc`. Returns an
+/// error string if the player folder/JSON is missing (the picker only
+/// offers existing ids, so this is a stale-state edge case).
+#[tauri::command]
+fn fable_player_get(id: String, app: tauri::AppHandle) -> Result<player::SavedPlayer, String> {
+    let dir = resolve_fable_players_dir(&app);
+    let json_path = dir.join(&id).join(format!("{id}.json"));
+    let mut player = load_player_at(&json_path)
+        .ok_or_else(|| format!("no saved player with id '{id}'"))?;
+    // Resolve the portrait filename to an absolute path so the frontend
+    // can feed it straight to convertFileSrc (the asset-protocol bridge).
+    if let Some(fname) = player.portrait.clone() {
+        let abs = dir.join(&id).join(&fname);
+        if abs.is_file() {
+            player.portrait = Some(abs.to_string_lossy().into_owned());
+        } else {
+            // Stale portrait ref (file deleted manually). Drop it rather
+            // than hand the frontend a broken path.
+            player.portrait = None;
+        }
+    }
+    Ok(player)
+}
+
+/// Write (create or overwrite) a saved player. Validates via
+/// `player::validate_player` BEFORE any disk touch (the load-bearing
+/// gate — a malformed player never lands on disk), slugifies the id,
+/// creates the per-player folder, and atomic-writes the JSON. Returns
+/// the freshly-written player's metadata. Reuses the same validate →
+/// mkdir → atomic-write → resolve discipline as `fable_write_card`.
+///
+/// `id` is the caller-supplied slug (the frontend derives it from the
+/// name via the same slug rule; the backend re-slugs to be defensive).
+#[tauri::command]
+fn fable_player_write(
+    id: String,
+    player: player::SavedPlayer,
+    app: tauri::AppHandle,
+) -> Result<player::PlayerMeta, String> {
+    // 1. Validate structure + content BEFORE any disk touch.
+    player::validate_player(&player)
+        .map_err(|e| format!("Invalid player: {e}"))?;
+    // 2. (Re-)slugify the id from the name. If the caller's slug is
+    //    unusable, derive from the name; if THAT'S unusable, the
+    //    validator already rejected an empty name, so this is a hard
+    //    error only on a logic bug.
+    let slug = player::slugify_player_id(&player.name)
+        .or_else(|| player::slugify_player_id(&id))
+        .ok_or_else(|| "could not derive a valid player id".to_string())?;
+    let dir = resolve_fable_players_dir(&app);
+    let player_dir = dir.join(&slug);
+    let json_path = player_dir.join(format!("{slug}.json"));
+    // 3. If the slug changed (rename), move the existing folder so the
+    //    portrait + JSON stay together. No-op when the slug is unchanged.
+    if slug != id {
+        let old_dir = dir.join(&id);
+        if old_dir.is_dir() && !player_dir.exists() {
+            let _ = std::fs::rename(&old_dir, &player_dir);
+        }
+    }
+    std::fs::create_dir_all(&player_dir)
+        .map_err(|e| format!("could not create player folder: {e}"))?;
+    // 4. Serialize with the resolved slug + timestamp.
+    let mut to_write = player.clone();
+    to_write.id = slug.clone();
+    if to_write.created_at_ms == 0 {
+        to_write.created_at_ms = current_unix_ms_i64();
+    }
+    let bytes = serde_json::to_vec_pretty(&to_write)
+        .map_err(|e| format!("could not serialize player: {e}"))?;
+    write_atomic(&json_path, &bytes)
+        .map_err(|e| format!("could not write player: {e}"))?;
+    // 5. Best-effort portrait flag for the returned meta.
+    let has_portrait = to_write
+        .portrait
+        .as_deref()
+        .map(|fname| player_dir.join(fname).is_file())
+        .unwrap_or(false);
+    Ok(player::PlayerMeta {
+        id: slug,
+        name: to_write.name,
+        has_portrait,
+    })
+}
+
+/// Delete a saved player + its folder (JSON + portrait). Defensive: a
+/// missing folder is a no-op success (idempotent — mirrors the
+/// delete-card agent tool). Never touches anything outside the player's
+/// own folder.
+#[tauri::command]
+fn fable_player_delete(id: String, app: tauri::AppHandle) -> Result<(), String> {
+    let dir = resolve_fable_players_dir(&app);
+    let player_dir = dir.join(&id);
+    if player_dir.is_dir() {
+        std::fs::remove_dir_all(&player_dir)
+            .map_err(|e| format!("could not delete player: {e}"))?;
+    }
+    Ok(())
+}
+
+/// Upload (copy) a portrait image into a player's folder. `src_path` is
+/// an OS-native path from the file dialog (read server-side — the
+/// established WUPI pattern, no plugin-fs dependency). Validates the
+/// image magic bytes BEFORE writing (rejects non-images even if the
+/// dialog filter let one through). Writes via `write_atomic`, updates
+/// the JSON's `portrait` field, returns the absolute portrait path for
+/// `convertFileSrc`.
+#[tauri::command]
+fn fable_player_portrait_upload(
+    id: String,
+    src_path: String,
+    app: tauri::AppHandle,
+) -> Result<String, String> {
+    let dir = resolve_fable_players_dir(&app);
+    let player_dir = dir.join(&id);
+    if !player_dir.is_dir() {
+        return Err(format!("no player folder for id '{id}'"));
+    }
+    // 1. Read the picked file's bytes server-side (no plugin-fs).
+    let bytes = std::fs::read(&src_path)
+        .map_err(|e| format!("could not read portrait: {e}"))?;
+    // 2. Validate magic bytes BEFORE disk touch (the load-bearing gate).
+    let ext = player::validate_image_magic(&bytes)?;
+    let fname = format!("portrait.{ext}");
+    let dest = player_dir.join(&fname);
+    write_atomic(&dest, &bytes)
+        .map_err(|e| format!("could not write portrait: {e}"))?;
+    // 3. Update the JSON's portrait field so get/list reflect the truth.
+    let json_path = player_dir.join(format!("{id}.json"));
+    if let Some(mut p) = load_player_at(&json_path) {
+        p.portrait = Some(fname.clone());
+        if let Ok(b) = serde_json::to_vec_pretty(&p) {
+            let _ = write_atomic(&json_path, &b);
+        }
+    }
+    Ok(dest.to_string_lossy().into_owned())
 }
 
 /// Current time as unix milliseconds. Matches the timestamp convention
@@ -9055,8 +10224,14 @@ async fn save_session(
     card_id: &str,
     conv: &session::Conversation,
 ) {
-    let fable_root = resolve_apps_dir(app).join("fable");
-    let path = resolve_session_path(&fable_root, card_id);
+    let Some(cards_root) = resolve_fable_cards_dir(app) else {
+        tracing::warn!("save_session: no apps/fable/cards/ dir resolved");
+        return;
+    };
+    // Ensure the per-card folder exists (a fresh card may have no folder yet).
+    let card_dir = resolve_card_dir(&cards_root, card_id);
+    let _ = std::fs::create_dir_all(&card_dir);
+    let path = resolve_session_path(&cards_root, card_id);
     // Clone so the closure owns its data (spawn_blocking needs 'static). The
     // Conversation is a Vec of small messages: cheap to clone relative to a
     // disk fsync.
@@ -9076,8 +10251,8 @@ async fn load_session(
     app: &tauri::AppHandle,
     card_id: &str,
 ) -> Option<session::Conversation> {
-    let fable_root = resolve_apps_dir(app).join("fable");
-    let path = resolve_session_path(&fable_root, card_id);
+    let cards_root = resolve_fable_cards_dir(app)?;
+    let path = resolve_session_path(&cards_root, card_id);
     let path_cloned = path.clone();
     tokio::task::spawn_blocking(move || session::Conversation::load(&path_cloned))
         .await
@@ -9086,21 +10261,32 @@ async fn load_session(
 }
 
 /// Persist the world-state schema off the Tokio worker pool. Mirrors
-/// `save_session`: `WorldSchema::save` is atomic (temp + fsync + rename) but
-/// synchronous, so `spawn_blocking` keeps the async runtime free.
+/// `save_session`: `WorldSchema::save_split` is atomic (temp + fsync + rename)
+/// but synchronous, so `spawn_blocking` keeps the async runtime free.
 ///
-/// **Phase 3:** now scoped by `card_id` → `schemas/<card_id>.json`. Only the
-/// active game's schema persists (Wupi-assistant's schema stays ephemeral).
+/// **2026-08-01 folder layout:** the schema now persists as three sibling
+/// files inside the card's folder — `world.json` + `player.json` + `npc.json`
+/// — via `WorldSchema::save_split` (the in-memory struct stays one piece; the
+/// disk form splits so the Player / World / NPC tabs each own a file). Only
+/// the active game's schema persists (Wupi-assistant's schema stays ephemeral).
 async fn save_schema(
     app: &tauri::AppHandle,
     card_id: &str,
     schema: &schema::WorldSchema,
 ) {
-    let fable_root = resolve_apps_dir(app).join("fable");
-    let path = resolve_schema_path(&fable_root, card_id);
+    let cards_root = match resolve_fable_cards_dir(app) {
+        Some(d) => d,
+        None => {
+            tracing::warn!("save_schema: no apps/fable/cards/ dir resolved");
+            return;
+        }
+    };
+    let world_path = resolve_card_file(&cards_root, card_id, "world.json");
+    let player_path = resolve_card_file(&cards_root, card_id, "player.json");
+    let npc_path = resolve_card_file(&cards_root, card_id, "npc.json");
     let schema = schema.clone();
     let _ = tokio::task::spawn_blocking(move || {
-        if let Err(e) = schema.save(&path) {
+        if let Err(e) = schema.save_split(&world_path, &player_path, &npc_path) {
             tracing::warn!(?e, "failed to persist world schema");
         }
     })
@@ -9108,35 +10294,33 @@ async fn save_schema(
 }
 
 /// Load a card-scoped world schema. Returns a fresh default `WorldSchema`
-/// when no saved file exists (the `WorldSchema::load` NotFound path already
-/// does this). Symmetric to `save_schema`.
+/// when no saved files exist (the `WorldSchema::load_split` NotFound path
+/// handles a missing slice as its `#[serde(default)]`). Symmetric to
+/// `save_schema`.
 async fn load_schema(
     app: &tauri::AppHandle,
     card_id: &str,
 ) -> Option<schema::WorldSchema> {
-    let fable_root = resolve_apps_dir(app).join("fable");
-    let path = resolve_schema_path(&fable_root, card_id);
-    let path_cloned = path.clone();
-    tokio::task::spawn_blocking(move || schema::WorldSchema::load(&path_cloned))
-        .await
-        .ok()?
-        .ok()
+    let cards_root = resolve_fable_cards_dir(app)?;
+    let world_path = resolve_card_file(&cards_root, card_id, "world.json");
+    let player_path = resolve_card_file(&cards_root, card_id, "player.json");
+    let npc_path = resolve_card_file(&cards_root, card_id, "npc.json");
+    tokio::task::spawn_blocking(move || {
+        schema::WorldSchema::load_split(&world_path, &player_path, &npc_path)
+    })
+    .await
+    .ok()?
+    .ok()
 }
 
-/// `<fable_root>/sessions/<card_id>.json`. Per §8C roleplay sessions live
-/// under `apps/games/sessions/` (scoped under games/ because only roleplay
-/// game sessions persist today; Wupi-assistant chat stays ephemeral per §5).
-/// The `sessions/` subdir is created once in `setup()`. The card_id is the
-/// filename stem: roleplay card ids are filesystem-safe (lowercased,
-/// derived from `<metadata><id>` in `sim_card.rs`).
-fn resolve_session_path(fable_root: &std::path::Path, card_id: &str) -> std::path::PathBuf {
-    fable_root.join("sessions").join(format!("{card_id}.json"))
-}
-
-/// `<fable_root>/schemas/<card_id>.json`. Sibling to `resolve_session_path`;
-/// same subdir convention + filesystem-safety assumption.
-fn resolve_schema_path(fable_root: &std::path::Path, card_id: &str) -> std::path::PathBuf {
-    fable_root.join("schemas").join(format!("{card_id}.json"))
+/// `<cards_root>/<card_id>/session.json`. The per-card folder layout
+/// (2026-08-01): each card owns its session as a sibling of its `.sim` /
+/// `.codex` / `world.json`. Only roleplay game sessions persist today;
+/// Wupi-assistant chat stays ephemeral per §5. The card_id is the folder name:
+/// roleplay card ids are filesystem-safe (lowercased, derived from
+/// `<metadata><id>` in `sim_card.rs`).
+fn resolve_session_path(cards_root: &std::path::Path, card_id: &str) -> std::path::PathBuf {
+    resolve_card_dir(cards_root, card_id).join("session.json")
 }
 
 #[cfg(test)]
@@ -9144,43 +10328,51 @@ mod tests {
     use super::*;
 
     #[test]
-    fn effective_local_ctx_local_returns_settings() {
+    fn effective_local_ctx_local_returns_solo_constant() {
+        // 2026-07-31: context sizes now come from `settings.rs` (the single
+        // source of truth), not the user-tuned `settings.context_size`. Local
+        // mode (no API connected) returns CTX_LOCAL_SOLO regardless of the
+        // (now-ignored) settings value.
         let settings = WupiSettings {
             context_size: 4000,
             conversation_budget: 16000,
         };
         assert_eq!(
             effective_local_ctx(api::ModelSource::Local, &settings),
-            4000,
-            "Local mode must return the user's tuned settings.context_size"
+            settings::CTX_LOCAL_SOLO,
+            "Local mode must return the CTX_LOCAL_SOLO constant from settings.rs"
         );
     }
 
     #[test]
-    fn effective_local_ctx_api_returns_2048_regardless_of_settings() {
-        // Even if the user has a huge settings.context_size, under API the
-        // local chat backend demotes to 2048 (silent-agent mode). The settings
-        // value must NOT leak through.
+    fn effective_local_ctx_api_returns_with_api_constant_regardless_of_settings() {
+        // Under API the local chat backend demotes to CTX_LOCAL_WITH_API
+        // (silent-agent mode). The (now-ignored) settings value must NOT leak
+        // through.
         let settings = WupiSettings {
             context_size: 8192,
             conversation_budget: 16000,
         };
         assert_eq!(
             effective_local_ctx(api::ModelSource::Api, &settings),
-            2048,
-            "API mode must always return 2048 regardless of settings.context_size"
+            settings::CTX_LOCAL_WITH_API,
+            "API mode must always return CTX_LOCAL_WITH_API regardless of settings.context_size"
         );
     }
 
     #[test]
     fn effective_local_ctx_default_settings() {
-        // Default settings (context_size: 4096 — raised 2026-07-27 from the
-        // 3072 set in §2C; see prompts.rs Default impl for the budget math)
-        // under Local → 4096.
+        // Default settings under Local → CTX_LOCAL_SOLO; under Api →
+        // CT_LOCAL_WITH_API (both constants from settings.rs, not the default).
         let settings = WupiSettings::default();
-        assert_eq!(effective_local_ctx(api::ModelSource::Local, &settings), 4096);
-        // Under Api → 2048 (the constant, not the default).
-        assert_eq!(effective_local_ctx(api::ModelSource::Api, &settings), 2048);
+        assert_eq!(
+            effective_local_ctx(api::ModelSource::Local, &settings),
+            settings::CTX_LOCAL_SOLO
+        );
+        assert_eq!(
+            effective_local_ctx(api::ModelSource::Api, &settings),
+            settings::CTX_LOCAL_WITH_API
+        );
     }
 
     // ── most_recent_continue_target (title CONTINUE resume target) ───────
@@ -9203,6 +10395,7 @@ mod tests {
             technical_rules: String::new(),
             introductions: Vec::new(),
             setting: Some("A test place.".into()),
+            plot: None,
             tone: None,
             opening_scene: None,
             start_npc_ids: Vec::new(),
@@ -9286,6 +10479,78 @@ mod tests {
         assert!(most_recent_continue_target(tmp.path()).is_none());
     }
 
+    // ── Quick Play save lifecycle ───────────────────────────────────────
+    // Pins the Quick Play persistence contract end-to-end via the real save
+    // layer (the IPCs `fable_quick_play_start`/`_resume`/`_status` delegate to
+    // these fns + `enter_fable_session`). The contract:
+    //   1. A new Quick Play wipes the prior quicksave (one slot, overwrite).
+    //   2. The quicksave bundles the card so resume rebuilds the narrator
+    //      prompt without re-reading data/fable.sim.
+    //   3. The quicksave is excluded from CONTINUE (Quick Play owns its own
+    //      resume path) even when it's the newest save on disk.
+
+    #[test]
+    fn quick_play_overwrites_prior_quicksave() {
+        // Two consecutive Quick Play runs write to the SAME slot. The second
+        // must replace the first (one slot, no accumulation).
+        let tmp = tempfile::tempdir().unwrap();
+        let card = fake_card_for_continue("quick_play_card");
+        let mut first_session = session::Conversation::new();
+        first_session.add_message(session::Role::User, "first run action".into());
+        fable_save::write_quick_save(
+            tmp.path(), &card, &first_session, &schema::WorldSchema::default(),
+        ).unwrap();
+        let mut second_session = session::Conversation::new();
+        second_session.add_message(session::Role::User, "second run action".into());
+        second_session.add_message(session::Role::Assistant, "the world reacts".into());
+        fable_save::write_quick_save(
+            tmp.path(), &card, &second_session, &schema::WorldSchema::default(),
+        ).unwrap();
+
+        // Exactly one quicksave file exists + it carries the second run.
+        assert!(fable_save::quick_save_exists(tmp.path()));
+        let loaded = fable_save::load_quick_save(tmp.path()).unwrap();
+        assert_eq!(loaded.session.messages.len(), 2);
+        assert_eq!(loaded.session.messages[0].content, "second run action");
+    }
+
+    #[test]
+    fn quick_play_resume_uses_bundled_card() {
+        // Resume rebuilds the narrator prompt from the card BUNDLED in the
+        // quicksave — not from data/fable.sim. So if the card on disk changed
+        // between save + resume, the resumed run still uses the saved card.
+        let tmp = tempfile::tempdir().unwrap();
+        let card_at_save = {
+            let mut c = fake_card_for_continue("overridden_by_sentinel");
+            c.name = "Saved Card".into();
+            c.core_persona = "The identity at save time.".into();
+            c
+        };
+        let session = session::Conversation::new();
+        fable_save::write_quick_save(
+            tmp.path(), &card_at_save, &session, &schema::WorldSchema::default(),
+        ).unwrap();
+
+        let loaded = fable_save::load_quick_save(tmp.path()).unwrap();
+        let resumed_card = loaded.card.expect("quicksave must bundle the card");
+        assert_eq!(resumed_card.name, "Saved Card");
+        assert_eq!(resumed_card.core_persona, "The identity at save time.");
+    }
+
+    #[test]
+    fn quick_play_status_round_trip() {
+        // The status check (does a quicksave exist?) flips from absent →
+        // present after a write. Mirrors fable_quick_play_status's gate.
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(!fable_save::quick_save_exists(tmp.path()));
+        let card = fake_card_for_continue("quick_play_card");
+        fable_save::write_quick_save(
+            tmp.path(), &card,
+            &session::Conversation::new(), &schema::WorldSchema::default(),
+        ).unwrap();
+        assert!(fable_save::quick_save_exists(tmp.path()));
+    }
+
 
     /// NEVER includes tool declarations. The narrator is creative prose +
     /// bracket commands, never structured tool calls. This test pins the
@@ -9336,6 +10601,7 @@ mod tests {
             technical_rules: String::new(),
             introductions: Vec::new(),
             setting: Some("A test.".to_owned()),
+            plot: None,
             tone: Some("atmospheric".to_owned()),
             opening_scene: None,
             player_name: Some("Kaelen".to_owned()),
@@ -9354,9 +10620,11 @@ mod tests {
 
         // Tracker path: the block must render between <world_state> and <scene_pacing>.
         let tracker_prompt = build_narrator_system_prompt(
+            &prompts::FablePrompts::test_default(),
             &card,
             Some("gold: 100"),
             pacing,
+            None,
             None,
             Some(block),
         );
@@ -9379,9 +10647,11 @@ mod tests {
 
         // None memory_block → no block emitted (zero baseline cost).
         let no_block_prompt = build_narrator_system_prompt(
+            &prompts::FablePrompts::test_default(),
             &card,
             None,
             pacing,
+            None,
             None,
             None,
         );
@@ -9392,9 +10662,11 @@ mod tests {
 
         // API narrator path: same wiring.
         let api_prompt = build_api_narrator_system_prompt(
+            &prompts::FablePrompts::test_default(),
             &card,
             Some("gold: 100"),
             pacing,
+            None,
             None,
             Some(block),
         );

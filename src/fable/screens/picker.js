@@ -14,6 +14,7 @@
 // =============================================================
 
 import { invoke } from '@tauri-apps/api/core';
+import { createEmbers } from './embers.js';
 
 function esc(s) {
   return String(s || '')
@@ -26,13 +27,21 @@ export function buildPicker(handlers) {
   root.dataset.fableScreen = 'picker';
   root.hidden = true;
   root.innerHTML = `
-    <header class="fable-screen-header">
-      <button class="fable-back-btn" data-act="back">‹ Back</button>
-      <h2 class="fable-screen-title">New Game</h2>
-    </header>
+    <div class="fable-void-glow" aria-hidden="true"></div>
+    <div class="fable-ember-host" aria-hidden="true"></div>
     <div class="fable-card-grid" data-host></div>
   `;
-  root.querySelector('[data-act="back"]').addEventListener('click', () => handlers.back());
+  // NOTE: no header bar / Back button — the flow chrome (‹ / ⌂) owns
+  // nav for the whole New Game flow now. handlers.back is still invoked
+  // by the flow controller when ‹ is clicked (wired in fable.js).
+
+  // Ambient ember lifecycle (mirrors newgame-split.js / the title's
+  // particles). Fresh on show, destroyed on hide — no RAF leak.
+  const emberHost = root.querySelector('.fable-ember-host');
+  let embers = null;
+  root._startAmbient = () => { if (!embers) embers = createEmbers(emberHost); };
+  root._stopAmbient = () => { if (embers) { embers.destroy(); embers = null; } };
+
   return root;
 }
 

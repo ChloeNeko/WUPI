@@ -24,6 +24,7 @@
 
 import { invoke, Channel } from '@tauri-apps/api/core';
 import * as savesIo from './saves-io.js';
+import { showApiTimeout, dismissApiTimeout } from '../../api-timeout-bubble.js';
 // Crossroads + Ghostwriter were removed (their crossroads_generate /
 // ghostwriter_generate IPCs are dead stubs). The generate_options /
 // set_directive Director tools are still live in Rust (tools.rs) — their
@@ -335,7 +336,16 @@ function handleEvent(msg, originalText) {
       activeToolChip = null;
       setGenerating(false);
       break;
+    case 'api_timeout':
+      // API TTFT deadline elapsed (no first token in 10s) — the turn is being
+      // handled by Local fallback. Show the persistent top-center error
+      // bubble (shared with the home chat path). The Local reply still streams
+      // normally; this just signals the user why the voice changed.
+      showApiTimeout();
+      break;
     case 'done':
+      // Successful turn — clear any lingering timeout bubble.
+      dismissApiTimeout();
       if (activeBubble) {
         finalizeBubble(activeBubble, msg.final_text);
         activeBubble = null;

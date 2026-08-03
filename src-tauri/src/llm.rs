@@ -319,7 +319,7 @@ impl GenerationClient for HttpBackend {
             // always preserved — it carries OS_DIRECTIVES + persona +
             // memory/world_state. Mirrors the local engine's front-truncation
             // guard (engine.rs).
-            let max_ctx = max_context.unwrap_or(8192);
+            let max_ctx = max_context.unwrap_or(crate::settings::CTX_API);
             let budget_chars = (max_ctx as usize).saturating_mul(4);
             truncate_to_budget(&mut wire_messages, budget_chars);
 
@@ -336,8 +336,8 @@ impl GenerationClient for HttpBackend {
                 "model": model,
                 "messages": wire_messages,
                 "stream": true,
-                "temperature": temperature.unwrap_or(0.85),
-                "top_p": 0.95,
+                "temperature": temperature.unwrap_or(crate::settings::API_TEMP),
+                "top_p": crate::settings::API_TOP_P,
             });
 
             let response = client
@@ -375,11 +375,44 @@ impl GenerationClient for HttpBackend {
             // post-gen firewall would have produced for the same input.
             let mut rep_guard = crate::stream_filter::StreamRepetitionDetector::new();
 
-            while let Some(chunk_res) = stream.next().await {
+            // First-token (TTFT) deadline. The API must deliver its FIRST
+            // content token within `settings::API_FIRST_TOKEN_TIMEOUT_MS`. If
+            // it doesn't, the call is treated as dead (the provider hung on
+            // the request — no thinking, no nothing) and we bail with the
+            // `API_TIMEOUT` sentinel so `chat_send` can fire the top-center
+            // error bubble + fall back to local. Once the first token lands,
+            // the deadline is retired: a slow-but-working stream is NEVER
+            // killed mid-flight.
+            let mut got_first_token = false;
+            let timeout_dur =
+                std::time::Duration::from_millis(crate::settings::API_FIRST_TOKEN_TIMEOUT_MS);
+
+            loop {
                 // Honor cancel: stop reading + return what we have so far.
                 if cancel.load(std::sync::atomic::Ordering::Relaxed) {
                     break;
                 }
+                let chunk_res = if got_first_token {
+                    // Past the deadline window — read normally, no timeout.
+                    stream.next().await
+                } else {
+                    // Still waiting for the first token — wrap in the deadline.
+                    match tokio::time::timeout(timeout_dur, stream.next()).await {
+                        Ok(opt) => opt,
+                        Err(_elapsed) => {
+                            // Deadline elapsed with no first token. Drop the
+                            // stream to sever TCP, return the sentinel error.
+                            // `chat_send` branches on the `API_TIMEOUT` prefix.
+                            buffer.clear();
+                            drop(stream);
+                            return Err(anyhow::anyhow!(
+                                "API_TIMEOUT: no first token within {}ms — provider hung on request",
+                                crate::settings::API_FIRST_TOKEN_TIMEOUT_MS
+                            ));
+                        }
+                    }
+                };
+                let Some(chunk_res) = chunk_res else { break };
                 let bytes = chunk_res.map_err(|e| anyhow::anyhow!("SSE read error: {e}"))?;
                 // The chunk may not be UTF8-aligned at boundaries; lossy-convert
                 // since SSE is ASCII-framed and the JSON payloads are UTF8.
@@ -404,6 +437,10 @@ impl GenerationClient for HttpBackend {
                         if let Some(choice) = parsed.choices.into_iter().next() {
                             if let Some(piece) = choice.delta.content {
                                 if !piece.is_empty() {
+                                    // First content token landed — retire the
+                                    // TTFT deadline window for all subsequent
+                                    // reads (don't kill a slow-but-working stream).
+                                    got_first_token = true;
                                     on_chunk(&piece);
                                     full_content.push_str(&piece);
                                     // §11.43 kill switch: scan the rolling

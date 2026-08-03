@@ -191,8 +191,8 @@ fn parse_args_lenient(span: &str) -> serde_json::Value {
 // ---------------------------------------------------------------------------
 
 /// True iff `path` is safe for a *write* tool (file_write, file_delete,
-/// create_sim_card, delete_sim_card, edit_user_profile, codex_create,
-/// codex_delete) to modify. Read tools bypass this (`file_read`, `file_list`).
+/// create_sim_card, delete_sim_card, edit_user_profile) to modify. Read tools
+/// bypass this (`file_read`, `file_list`).
 ///
 /// Designed-by-predicate rather than capability-string: the install root
 /// resolves at runtime (`resolve_install_root`), so we evaluate against a
@@ -243,11 +243,9 @@ fn is_denied(rel_str: &str) -> bool {
     }
     // Wupi's own persona + playbook (engine content per §8C, replaced on
     // update). She authors USER codex in data/docs/, never her own docs.
-    // Same carve-out for the Game Master persona + the unified Fable
-    // playbook — engine content for the New Game interview flow + the
-    // simulation narrator, never tool-authored. (fable.codex is the
-    // 2026-07-29 unified Fable partition; was gm.codex. fable.sim is the
-    // 2026-07-29 rename of gm.sim.)
+    // Same carve-out for the Quick Play narrator card + the Fable playbook —
+    // engine content (the placeless Narrative Simulator identity for Quick
+    // Play + the simulation narrator reference), never tool-authored.
     if rel_str == "data/wupi.sim"
         || rel_str == "data/wupi.codex"
         || rel_str == "data/fable.sim"
@@ -431,7 +429,7 @@ pub trait Tool: Send + Sync {
 }
 
 /// The full registry of tools Wupi may call. Built once at setup; cloned cheaply
-/// (Arc internals where needed). v1 ships the 8 tools below.
+/// (Arc internals where needed). Ships the 7 tools below.
 pub fn registry() -> Vec<Box<dyn Tool>> {
     vec![
         Box::new(FileRead),
@@ -440,11 +438,7 @@ pub fn registry() -> Vec<Box<dyn Tool>> {
         Box::new(FileList),
         Box::new(CreateSimCard),
         Box::new(DeleteSimCard),
-        Box::new(WireSimCard),
         Box::new(EditUserProfile),
-        Box::new(CodexCreate),
-        Box::new(CodexDelete),
-        Box::new(CodexList),
     ]
 }
 
@@ -682,21 +676,22 @@ impl Tool for CreateSimCard {
             name: "create_sim_card".into(),
             description: "Create or overwrite a Fable scenario card (.sim). \
                           Arguments: {\"filename\": \"my_scenario\", \"xml\": \"<sim>...</sim>\"}. \
-                          Writes to apps/fable/cards/<filename>.sim. The XML must follow the \
-                          .sim format (strict XML, CDATA-wrapped prose). See rusty_tavern.sim \
-                          for the shape."
+                          Writes to apps/fable/cards/<filename>/<filename>.sim (the per-card \
+                          folder holds the .sim + sibling .codex + world/player/npc JSON). The \
+                          XML must follow the .sim format (strict XML, CDATA-wrapped prose). \
+                          See rusty_tavern.sim for the shape."
                 .into(),
         }
     }
     fn validate_args(&self, args: &serde_json::Value) -> Result<(), ToolError> {
         let filename = req_str_nonempty(args, "filename")?;
         let xml = req_str(args, "xml")?;
-        // apps/fable/cards/<stem>.sim is on the allow-list, but verify the
-        // computed path itself (defensive: a filename like ../escape would
+        // apps/fable/cards/<stem>/<stem>.sim is on the allow-list, but verify
+        // the computed path itself (defensive: a filename like ../escape would
         // have been caught by sandbox_path, but be explicit).
         let stem = sanitize_stem(&filename)
             .ok_or_else(|| ToolError::new("filename empty after sanitization"))?;
-        let rel = format!("apps/fable/cards/{stem}.sim");
+        let rel = format!("apps/fable/cards/{stem}/{stem}.sim");
         let safe = sandbox_path(&rel)
             .ok_or_else(|| ToolError::new(format!("unsafe card path: {rel}")))?;
         if !is_writable(&safe) {
@@ -717,7 +712,7 @@ impl Tool for CreateSimCard {
         let xml = req_str(args, "xml")?;
         let stem = sanitize_stem(&filename)
             .ok_or_else(|| ToolError::new("filename empty after sanitization"))?;
-        let rel = format!("apps/fable/cards/{stem}.sim");
+        let rel = format!("apps/fable/cards/{stem}/{stem}.sim");
         let path = ctx.resolve(&rel)?;
         let parent = path.parent().ok_or_else(|| ToolError::new("no parent"))?;
         std::fs::create_dir_all(parent).map_err(|e| ToolError::new(format!("mkdir: {e}")))?;
@@ -736,7 +731,8 @@ impl Tool for DeleteSimCard {
             name: "delete_sim_card".into(),
             description: "Delete a Fable scenario card. \
                           Argument: {\"filename\": \"my_scenario\"}. \
-                          Removes apps/fable/cards/<filename>.sim. No-op if absent."
+                          Removes the per-card folder apps/fable/cards/<filename>/ (the .sim \
+                          + sibling .codex/world/player/npc JSON + saves). No-op if absent."
                 .into(),
         }
     }
@@ -744,7 +740,8 @@ impl Tool for DeleteSimCard {
         let filename = req_str_nonempty(args, "filename")?;
         let stem = sanitize_stem(&filename)
             .ok_or_else(|| ToolError::new("filename empty after sanitization"))?;
-        let rel = format!("apps/fable/cards/{stem}.sim");
+        // Validate the folder path (the delete removes the whole per-card dir).
+        let rel = format!("apps/fable/cards/{stem}");
         let safe = sandbox_path(&rel)
             .ok_or_else(|| ToolError::new(format!("unsafe card path: {rel}")))?;
         if !is_writable(&safe) {
@@ -756,88 +753,15 @@ impl Tool for DeleteSimCard {
         let filename = req_str(args, "filename")?;
         let stem = sanitize_stem(&filename)
             .ok_or_else(|| ToolError::new("filename empty after sanitization"))?;
-        let rel = format!("apps/fable/cards/{stem}.sim");
+        let rel = format!("apps/fable/cards/{stem}");
         let path = ctx.resolve(&rel)?;
-        match std::fs::remove_file(&path) {
+        match std::fs::remove_dir_all(&path) {
             Ok(()) => Ok(format!("deleted {rel}")),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 Ok(format!("already absent: {rel}"))
             }
             Err(e) => Err(ToolError::new(format!("delete {rel}: {e}"))),
         }
-    }
-}
-
-// --- wire_sim_card ---------------------------------------------------------
-// Fable Phase 5A (2026-07-29). Authoring-time assistance: reads an existing
-// .sim card, extracts its <cast> + <locations> blocks, and writes one codex
-// .md entry per NPC + per location so the card is "wired" into the retrieval
-// index without the user hand-authoring each lore entry. This is the user-
-// owned, user-initiated version of codex maintenance (explicitly NOT runtime
-// autonomy — per the §1C discipline, AI must not mutate the codex at runtime;
-// this tool runs only when Wupi is asked to wire a card, and the output is
-// plain .md the user can review/edit via codex list).
-//
-// Composition of three existing capabilities (the §11.49 Scribe precedent):
-//   1. sim_card::parse_from_xml_str — read + parse the card (the .sim format).
-//   2. codex::save_file — write each entry (the CodexCreate path).
-//   3. retrieval re-seed — so the new entries are visible on the next
-//      narrator turn (the codex_save IPC re-seeds inline).
-//
-// The entries it authors serve two consumers:
-//   - The narrator: canonical NPC identities + location flavor (the
-//     `npc.<id>.core` immutable keys the relationship engine + image-gen
-//     parent chain read from).
-//   - The Phase 5B image generator: location lore for the parent-chain style
-//     guide (the Multihog "match the parent's palette" recipe, ported to
-//     codex entries instead of a cloud image API).
-
-struct WireSimCard;
-impl Tool for WireSimCard {
-    fn spec(&self) -> ToolSpec {
-        ToolSpec {
-            name: "wire_sim_card".into(),
-            description: "Wire an existing Fable scenario card into the codex: \
-                          read its <cast> and <locations> blocks and write one \
-                          codex lore entry (.md) per NPC + per location so the \
-                          card is fully retrievable. Argument: \
-                          {\"filename\": \"rusty_tavern\"} (the card stem, no \
-                          .sim extension). Reads apps/fable/cards/<stem>.sim, \
-                          writes data/docs/npc_<id>.md + data/docs/loc_<id>.md. \
-                          Overwrites existing entries with the same stem. Use \
-                          this when the user drops in a new card and wants it \
-                          wired up, or to refresh codex entries after editing a \
-                          card's cast/geography."
-                .into(),
-        }
-    }
-    fn validate_args(&self, args: &serde_json::Value) -> Result<(), ToolError> {
-        let filename = req_str_nonempty(args, "filename")?;
-        let stem = sanitize_stem(&filename)
-            .ok_or_else(|| ToolError::new("filename empty after sanitization"))?;
-        // Verify the card path resolves safely + is readable (the read target).
-        let card_rel = format!("apps/fable/cards/{stem}.sim");
-        let card_safe = sandbox_path(&card_rel)
-            .ok_or_else(|| ToolError::new(format!("unsafe card path: {card_rel}")))?;
-        if !is_writable(&card_safe) {
-            return Err(ToolError::new(format!("card path {card_rel} not accessible")));
-        }
-        // Verify the codex dir is writable (the write targets). We don't
-        // pre-validate each entry path (they're derived from the card's ids
-        // + sanitized); sandbox_path is checked per-write in execute.
-        let docs_rel = "data/docs";
-        let docs_safe = sandbox_path(docs_rel)
-            .ok_or_else(|| ToolError::new(format!("unsafe codex path: {docs_rel}")))?;
-        if !is_writable(&docs_safe) {
-            return Err(ToolError::new(format!("codex path {docs_rel} not writable")));
-        }
-        Ok(())
-    }
-    fn execute(&self, args: &serde_json::Value, ctx: &ToolCtx) -> Result<String, ToolError> {
-        let _ = (args, ctx);
-        Err(ToolError::new(
-            "wire_sim_card is disabled (codex lore-RAG feature removed).",
-        ))
     }
 }
 
@@ -890,104 +814,6 @@ impl Tool for EditUserProfile {
         Ok(format!(
             "updated user profile (name={:?})",
             profile.name
-        ))
-    }
-}
-
-// --- codex_create ----------------------------------------------------------
-
-struct CodexCreate;
-impl Tool for CodexCreate {
-    fn spec(&self) -> ToolSpec {
-        ToolSpec {
-            name: "codex_create".into(),
-            description: "Create or overwrite a user codex reference entry (.md). \
-                          Arguments: {\"filename\": \"lore_elves\", \"title\": \"Elves\", \
-                          \"tags\": [\"fantasy\"], \"body\": \"...\"}. \
-                          Writes to data/docs/<filename>.md. Used to give Wupi \
-                          background knowledge she should treat as her own."
-                .into(),
-        }
-    }
-    fn validate_args(&self, args: &serde_json::Value) -> Result<(), ToolError> {
-        let filename = req_str_nonempty(args, "filename")?;
-        let title = req_str(args, "title")?;
-        let body = req_str(args, "body")?;
-        if body.len() > 50_000 {
-            return Err(ToolError::new("body exceeds 50 KB"));
-        }
-        let _ = title; // any non-null string is fine
-        let stem = sanitize_stem(&filename)
-            .ok_or_else(|| ToolError::new("filename empty after sanitization"))?;
-        let rel = format!("data/docs/{stem}.md");
-        let safe = sandbox_path(&rel)
-            .ok_or_else(|| ToolError::new(format!("unsafe codex path: {rel}")))?;
-        if !is_writable(&safe) {
-            return Err(ToolError::new(format!("codex path {rel} is not writable")));
-        }
-        Ok(())
-    }
-    fn execute(&self, args: &serde_json::Value, ctx: &ToolCtx) -> Result<String, ToolError> {
-        let _ = (args, ctx);
-        Err(ToolError::new(
-            "codex_create is disabled (codex lore-RAG feature removed).",
-        ))
-    }
-}
-
-// --- codex_delete ----------------------------------------------------------
-
-struct CodexDelete;
-impl Tool for CodexDelete {
-    fn spec(&self) -> ToolSpec {
-        ToolSpec {
-            name: "codex_delete".into(),
-            description: "Delete a user codex reference entry. \
-                          Argument: {\"filename\": \"lore_elves\"}. \
-                          Removes data/docs/<filename>.md. No-op if absent."
-                .into(),
-        }
-    }
-    fn validate_args(&self, args: &serde_json::Value) -> Result<(), ToolError> {
-        let filename = req_str_nonempty(args, "filename")?;
-        let stem = sanitize_stem(&filename)
-            .ok_or_else(|| ToolError::new("filename empty after sanitization"))?;
-        let rel = format!("data/docs/{stem}.md");
-        let safe = sandbox_path(&rel)
-            .ok_or_else(|| ToolError::new(format!("unsafe codex path: {rel}")))?;
-        if !is_writable(&safe) {
-            return Err(ToolError::new(format!("codex path {rel} is not writable")));
-        }
-        Ok(())
-    }
-    fn execute(&self, args: &serde_json::Value, ctx: &ToolCtx) -> Result<String, ToolError> {
-        let _ = (args, ctx);
-        Err(ToolError::new(
-            "codex_delete is disabled (codex lore-RAG feature removed).",
-        ))
-    }
-}
-
-// --- codex_list ------------------------------------------------------------
-
-struct CodexList;
-impl Tool for CodexList {
-    fn spec(&self) -> ToolSpec {
-        ToolSpec {
-            name: "codex_list".into(),
-            description: "List the user codex entries (data/docs/). \
-                          No arguments. Returns one entry per line as \
-                          `filename | title | tags`."
-                .into(),
-        }
-    }
-    fn validate_args(&self, _args: &serde_json::Value) -> Result<(), ToolError> {
-        Ok(())
-    }
-    fn execute(&self, _args: &serde_json::Value, ctx: &ToolCtx) -> Result<String, ToolError> {
-        let _ = ctx;
-        Err(ToolError::new(
-            "codex_list is disabled (codex lore-RAG feature removed).",
         ))
     }
 }
@@ -1188,7 +1014,7 @@ mod tests {
         // A bare truncated NAME with no `{` args block has nothing to salvage
         // → still dropped (the salvage only fires when there are args to
         // recover). This pins the conservative edge of the EOF salvage.
-        let raw = "<|tool_call>call:codex_list ... no closer, no braces";
+        let raw = "<|tool_call>call:file_list ... no closer, no braces";
         assert!(parse_tool_calls(raw).is_empty());
     }
 
@@ -1205,10 +1031,10 @@ mod tests {
 
     #[test]
     fn no_args_call_parses_with_null() {
-        let raw = "<|tool_call>call:codex_list<tool_call|>";
+        let raw = "<|tool_call>call:file_list<tool_call|>";
         let calls = parse_tool_calls(raw);
         assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].name, "codex_list");
+        assert_eq!(calls[0].name, "file_list");
         assert!(calls[0].args.is_null());
     }
 
@@ -1346,7 +1172,7 @@ mod tests {
 
     #[test]
     fn file_write_denied_for_engine_file() {
-        let (_guard, ctx) = temp_ctx();
+        let (_guard, _ctx) = temp_ctx();
         let w = FileWrite;
         let err = w
             .validate_args(&args(r#"{"path":"wupi.exe","content":"x"}"#))
@@ -1356,7 +1182,7 @@ mod tests {
 
     #[test]
     fn file_write_rejects_traversal() {
-        let (_guard, ctx) = temp_ctx();
+        let (_guard, _ctx) = temp_ctx();
         let w = FileWrite;
         let err = w
             .validate_args(&args(r#"{"path":"../escape","content":"x"}"#))
@@ -1366,7 +1192,7 @@ mod tests {
 
     #[test]
     fn file_write_rejects_oversized_content() {
-        let (_guard, ctx) = temp_ctx();
+        let (_guard, _ctx) = temp_ctx();
         let big = "x".repeat(200_001);
         let payload = serde_json::json!({
             "path": "data/docs/big.md",
@@ -1420,47 +1246,13 @@ mod tests {
 
     #[test]
     fn create_sim_card_rejects_invalid_xml() {
-        let (_guard, ctx) = temp_ctx();
+        let (_guard, _ctx) = temp_ctx();
         let payload = serde_json::json!({
             "filename": "bad",
             "xml": "not xml <", // malformed
         });
         let err = CreateSimCard.validate_args(&payload).unwrap_err();
         assert!(err.message.contains("XML parse"));
-    }
-
-    #[test]
-    fn codex_create_then_list_round_trip() {
-        let (_guard, ctx) = temp_ctx();
-        std::fs::create_dir_all(ctx.install_root.join("data/docs")).unwrap();
-        let payload = serde_json::json!({
-            "filename": "elves",
-            "title": "Elves of the Wood",
-            "tags": ["fantasy", "lore"],
-            "body": "Elves live long.",
-        });
-        CodexCreate.execute(&payload, &ctx).unwrap();
-        let listed = CodexList.execute(&serde_json::Value::Null, &ctx).unwrap();
-        assert!(listed.contains("elves"));
-        assert!(listed.contains("Elves of the Wood"));
-    }
-
-    #[test]
-    fn codex_delete_after_create() {
-        let (_guard, ctx) = temp_ctx();
-        std::fs::create_dir_all(ctx.install_root.join("data/docs")).unwrap();
-        let payload = serde_json::json!({
-            "filename": "temp",
-            "title": "T",
-            "body": "x",
-        });
-        CodexCreate.execute(&payload, &ctx).unwrap();
-        let path = ctx.resolve("data/docs/temp.md").unwrap();
-        assert!(path.exists());
-        CodexDelete
-            .execute(&args(r#"{"filename":"temp"}"#), &ctx)
-            .unwrap();
-        assert!(!path.exists());
     }
 
     // === Registry shape =====================================================
@@ -1487,9 +1279,6 @@ mod tests {
             "create_sim_card",
             "delete_sim_card",
             "edit_user_profile",
-            "codex_create",
-            "codex_delete",
-            "codex_list",
         ] {
             assert!(
                 names.iter().any(|n| n == expected),
@@ -1674,89 +1463,5 @@ mod tests {
         assert!(err.message.contains("directive slot") || err.message.contains("Fable"));
     }
 
-    // ---------- wire_sim_card (Phase 5A, 2026-07-29) ----------
-
-    #[test]
-    fn wire_sim_card_writes_npc_and_location_entries() {
-        let (_guard, ctx) = temp_ctx();
-        std::fs::create_dir_all(ctx.install_root.join("data/docs")).unwrap();
-        std::fs::create_dir_all(ctx.install_root.join("apps/fable/cards")).unwrap();
-        // Write a card with <cast> + <locations> blocks.
-        let xml = r#"<?xml version="1.0"?>
-<sim_card>
-  <metadata><id>test_cast</id><type>roleplay</type></metadata>
-  <identity><name>Test Tavern</name></identity>
-  <scenario>
-    <locations>
-      <node id="tavern" setting="indoor"><name>The Test Tavern</name><neighbor>cellar</neighbor></node>
-      <node id="cellar" setting="indoor"><name>The Cellar</name><neighbor>tavern</neighbor></node>
-    </locations>
-    <cast>
-      <npc id="mara" tier="soldier"><name>Mara</name><role>innkeep</role><alias>innkeep</alias></npc>
-      <npc id="corin"><name>Corin</name><role>bard</role></npc>
-    </cast>
-  </scenario>
-</sim_card>"#;
-        std::fs::write(
-            ctx.resolve("apps/fable/cards/test_cast.sim").unwrap(),
-            xml.as_bytes(),
-        )
-        .unwrap();
-
-        let result = WireSimCard
-            .execute(&serde_json::json!({ "filename": "test_cast" }), &ctx)
-            .unwrap();
-        // 2 NPCs + 2 locations = 4 entries.
-        assert!(result.contains("4 entries"), "result: {result}");
-
-        // NPC entry exists + carries the canonical id.
-        let npc_path = ctx.resolve("data/docs/npc_mara.md").unwrap();
-        assert!(npc_path.exists(), "npc entry must be written");
-        let npc_md = std::fs::read_to_string(&npc_path).unwrap();
-        assert!(npc_md.contains("**Canonical id:** `mara`"));
-        assert!(npc_md.contains("**Name:** Mara"));
-        assert!(npc_md.contains("**Threat tier:** soldier"));
-
-        // Location entry exists + carries the node id + exits.
-        let loc_path = ctx.resolve("data/docs/loc_tavern.md").unwrap();
-        assert!(loc_path.exists(), "location entry must be written");
-        let loc_md = std::fs::read_to_string(&loc_path).unwrap();
-        assert!(loc_md.contains("**Node id:** `tavern`"));
-        assert!(loc_md.contains("**Exits:** cellar"));
-
-        // An alias-only NPC (corin) gets its own entry too.
-        assert!(ctx.resolve("data/docs/npc_corin.md").unwrap().exists());
-    }
-
-    #[test]
-    fn wire_sim_card_reports_nothing_when_card_has_no_cast_or_locations() {
-        let (_guard, ctx) = temp_ctx();
-        std::fs::create_dir_all(ctx.install_root.join("data/docs")).unwrap();
-        std::fs::create_dir_all(ctx.install_root.join("apps/fable/cards")).unwrap();
-        let xml = r#"<?xml version="1.0"?>
-<sim_card>
-  <identity><name>Bare Card</name></identity>
-</sim_card>"#;
-        std::fs::write(
-            ctx.resolve("apps/fable/cards/bare.sim").unwrap(),
-            xml.as_bytes(),
-        )
-        .unwrap();
-        let result = WireSimCard
-            .execute(&serde_json::json!({ "filename": "bare" }), &ctx)
-            .unwrap();
-        assert!(result.contains("nothing to write"), "result: {result}");
-    }
-
-    #[test]
-    fn wire_sim_card_errors_when_card_missing() {
-        let (_guard, ctx) = temp_ctx();
-        std::fs::create_dir_all(ctx.install_root.join("data/docs")).unwrap();
-        std::fs::create_dir_all(ctx.install_root.join("apps/fable/cards")).unwrap();
-        // validate_args passes (paths are accessible); execute fails on read.
-        let payload = serde_json::json!({ "filename": "nonexistent" });
-        WireSimCard.validate_args(&payload).unwrap();
-        let err = WireSimCard.execute(&payload, &ctx).unwrap_err();
-        assert!(err.message.contains("read card"), "err: {}", err.message);
-    }
 }
+

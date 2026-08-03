@@ -3,11 +3,13 @@
 // Pure-DOM: builds the title screen markup, exposes onAction callbacks.
 // Button order (top→bottom): Continue / New Game / Load / Exit.
 //
-// MENU STATE: all 3 menu buttons (Continue / New Game / Load) are wired to
-// real handlers in fable.js. Continue resumes the freshest save (target
-// stashed by _refreshContinue); Load opens the worlds → saves picker. New
-// Game opens the card picker (pick a shipped .sim → straight to the stage).
-// EXIT is the only close path (closes the app via the lifecycle manager).
+// MENU STATE: all 4 menu buttons (Continue / New Game / Quick Play / Load)
+// are wired to real handlers in fable.js. Continue resumes the freshest New
+// Game save (target stashed by _refreshContinue); New Game opens the card
+// picker; Quick Play throws you straight into the placeless Narrative
+// Simulator (its own single quicksave slot, refreshed on exit — see
+// _refreshQuickPlay); Load opens the worlds → saves picker. EXIT is the
+// only close path (closes the app via the lifecycle manager).
 //
 // PARTICLES: the floating pollen/spore motes are a canvas particle system
 // (see particles.js) mounted into .fable-title-leaves. It's started when
@@ -26,12 +28,37 @@ import { createTitleGrass } from './grass.js';
 import { createWindLeaves } from './leaves.js';
 import { createCloudLayer } from './clouds.js';
 import { createTitleSparkle } from './sparkle.js';
+// The 2s fade-to-black → swap → 2s reveal cinematic. Used to wrap the
+// instant-jump menu buttons (New Game / Load / Exit) so all five share the
+// same fade hand-off.
+import { playMagicalTransition } from '../engine/transition.js';
 // The FABLE wordmark. Moved from public/ (served at /fable_title.png, flat
 // at the install root) into src/fable/assets/ so Vite processes + hashes it
 // into dist/assets/ (matches how paw.png is handled). Keeps the install
 // root clean — only wupi.exe/html + assets/ + bin/ + data/ + msvcp140.dll.
 import fableTitleUrl from '../assets/fable_title.png';
+// The menu-button press SFX — a bundled asset (Vite hashes it into assets/,
+// same idiom as fable_ripple.mp3). Plays on every main-menu button press.
+import BUTTON_SFX_SRC from '../assets/fableButtonSFX.mp3';
 import { invoke } from '@tauri-apps/api/core';
+
+// Play the menu-button SFX on every press. 0.6 volume = 40% lower than the
+// authored full-volume master. One-shot <audio> node that self-removes on
+// ended/error so nothing leaks across presses. Swallows autoplay rejection
+// silently (the button click IS the user gesture, so it will normally play).
+const BUTTON_SFX_VOLUME = 0.6;
+function playButtonSfx() {
+  const audio = document.createElement('audio');
+  audio.src = BUTTON_SFX_SRC;
+  audio.volume = BUTTON_SFX_VOLUME;
+  audio.setAttribute('aria-hidden', 'true');
+  const cleanup = () => { if (audio.parentNode) audio.parentNode.removeChild(audio); };
+  audio.addEventListener('ended', cleanup, { once: true });
+  audio.addEventListener('error', cleanup, { once: true });
+  document.body.appendChild(audio);
+  const p = audio.play();
+  if (p && typeof p.catch === 'function') p.catch(cleanup);
+}
 
 export function buildTitle(handlers) {
   const root = document.createElement('section');
@@ -80,18 +107,23 @@ export function buildTitle(handlers) {
     <!-- Menu buttons — independent of the wordmark. Positioned via
          .fable-title-actions in fable.css. -->
     <div class="fable-title-actions">
-      <!-- All 3 menu buttons are wired to handlers in fable.js.
-           CONTINUE ships DISABLED by default (the safe state — dim + no
-           click) and is only enabled by _refreshContinue once a resume
-           target is confirmed via the fable_continue_target IPC. Clicking an
-           enabled Continue resumes the stashed target (freshest save). This
-           load-bearing default keeps Continue dim + unclickable in a fresh
-           browser build with no backend rather than firing a no-op click.
-           NEW GAME: opens a simple card picker — pick a shipped .sim card
-           and go straight into the stage (no interview).
-           LOAD: the worlds → saves picker (resume any save). -->
+      <!-- All menu buttons are wired to handlers in fable.js.
+           CONTINUE + NEW GAME ship DISABLED by default (the safe state — dim
+           + no click). CONTINUE is enabled by _refreshContinue once a New
+           Game resume target is confirmed via fable_continue_target. NEW
+           GAME is enabled once its handler is wired in fable.js (remove the
+           disabled attr then). This load-bearing default keeps them dim +
+           unclickable in a fresh browser build with no backend rather than
+           firing a no-op click.
+           QUICK PLAY is always enabled: clicking it checks for a quicksave
+           (fable_quick_play_status) — if one exists, an inline Start-New /
+           Resume-Last choice appears; if not, it goes straight into a fresh
+           run. The status is refreshed on every title show via
+           _refreshQuickPlay.
+           LOAD: the worlds → saves picker (resume any New Game save). -->
       <button class="fable-title-btn" data-act="continue" disabled>Continue</button>
       <button class="fable-title-btn" data-act="new">New Game</button>
+      <button class="fable-title-btn" data-act="quickplay">Quick Play</button>
       <button class="fable-title-btn" data-act="load">Load</button>
       <button class="fable-title-btn" data-act="exit">Exit</button>
     </div>
@@ -103,7 +135,28 @@ export function buildTitle(handlers) {
       // but a stray click could still fire; this guard is belt-and-suspenders.
       if (btn.disabled) return;
       const act = btn.dataset.act;
-      handlers[act] && handlers[act]();
+      const handler = handlers[act];
+      if (!handler) return;
+      // Every menu press plays the button SFX (the authored press cue).
+      try { playButtonSfx(); } catch (e) { /* autoplay blocked: silent */ }
+      // NEW GAME owns its OWN transition + audio hand-off inside its handler
+      // (onNewGameClicked — the theme cuts at click, a longer black hold, and
+      // the new tracks start at the reveal). Wrapping it in the title-level
+      // fade here would double-fade + delay the theme cut. So 'new' runs its
+      // handler directly.
+      // LOAD / EXIT jump screens instantly — wrap them in the 2s fade-to-black
+      // → swap → 2s reveal cinematic so they share the same fade hand-off. The
+      // handler runs at peak darkness (the overlay hides the swap). CONTINUE +
+      // QUICK PLAY are left to their own handlers — those internally route
+      // through enterStageViaTransition (which already fades) or show an inline
+      // overlay (Quick Play's Start-New/Resume-Last choice), so a title-level
+      // fade here would either double-fade or wrongly hide the choice card.
+      if (act === 'load' || act === 'exit') {
+        playMagicalTransition({ onMidpoint: () => { try { handler(); } catch (e) { console.error('[fable] title handler "' + act + '" threw', e); } } })
+          .catch((e) => { console.error('[fable] title fade failed, running handler directly', e); try { handler(); } catch (_) {} });
+      } else {
+        handler();
+      }
     });
   });
 
@@ -145,6 +198,26 @@ export function buildTitle(handlers) {
     }
   };
 
+  // ── QUICK PLAY quicksave state (the Start-New/Resume gate) ────────
+  // QUICK PLAY is always clickable; what changes is what a click DOES. This
+  // refresh stashes whether a quicksave exists (+ its metadata) so the click
+  // handler in fable.js (onQuickPlayClicked) can decide: quicksave present →
+  // inline Start-New / Resume-Last choice; absent → straight into a fresh
+  // run. Mirrors _refreshContinue's fire-and-forget pattern (called on every
+  // title show so a quicksave written/loaded since the last visit is picked
+  // up). The button itself stays enabled regardless — a backend error just
+  // means "behave as if no quicksave" (fresh run), never a dead button.
+  root._refreshQuickPlay = async () => {
+    try {
+      const save = await invoke('fable_quick_play_status');
+      // save is null when no quicksave exists → fresh run on click.
+      root._quickPlaySave = save || null;
+    } catch (err) {
+      console.error('[fable] quick-play status check failed, assuming no quicksave', err);
+      root._quickPlaySave = null;
+    }
+  };
+
   // ── Ambient canvas/DOM systems lifecycle ──────────────────
   // All ambient systems (clouds + floating motes + grass blades + wind
   // leaves) are created when the title shows + destroyed when it hides.
@@ -170,10 +243,11 @@ export function buildTitle(handlers) {
     if (!leaves)    leaves    = createWindLeaves(leavesHost);
     if (!clouds)    clouds    = createCloudLayer(cloudHost);
     if (!sparkle)   sparkle   = createTitleSparkle(sparkleHost);
-    // Refresh the CONTINUE button's resume state on every show (a save may
-    // have been written/loaded since the last visit). Fire-and-forget — the
-    // ambient show shouldn't block on the IPC.
+    // Refresh the CONTINUE button's resume state + the QUICK PLAY quicksave
+    // state on every show (a save may have been written/loaded since the last
+    // visit). Fire-and-forget — the ambient show shouldn't block on the IPCs.
     if (root._refreshContinue) root._refreshContinue();
+    if (root._refreshQuickPlay) root._refreshQuickPlay();
   };
   root._stopAmbient = () => {
     if (particles) { particles.destroy(); particles = null; }

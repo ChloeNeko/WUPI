@@ -208,10 +208,15 @@ export function playBootTransition({
       aura = spawnRippleAura(titleScreen, x, y);
     }
     rippleSfx = playLoopedSfx(RIPPLE_SRC, { fadeMs: RIPPLE_SFX_FADE_MS });
-    revealOrder.forEach((b, i) => {
-      if (!b) return;
+    // revealOrder entries may each be a single button OR an array of buttons
+    // (a group revealed together at the same stagger beat). This lets the
+    // reveal radiate outward from the ripple anchor: anchor first, then its
+    // neighbors together, then the outermost together. A plain button entry
+    // is treated as a one-element group (backward compatible).
+    revealOrder.forEach((entry, i) => {
+      const group = Array.isArray(entry) ? entry : [entry];
       staggerTimers.push(setTimeout(() => {
-        b.classList.remove('fable-title-btn--hidden');
+        group.forEach((b) => b && b.classList.remove('fable-title-btn--hidden'));
       }, i * BUTTON_STAGGER_MS));
     });
 

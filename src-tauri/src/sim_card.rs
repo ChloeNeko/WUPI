@@ -90,8 +90,8 @@ pub struct CardNpc {
     /// and the new registry agree on canonical keys.
     pub id: String,
     /// Diegetic prose label shown to the narrator ("Mara"). This is the prose
-    /// label only; personality/appearance prose lives in the codex lore entry
-    /// that `wire_sim_card` authors from this block.
+    /// label only; personality/appearance prose lives in the card's own CDATA
+    /// blocks (authored by the user).
     pub name: String,
     /// One-line vocation/role hint ("The innkeeper behind the bar"). Optional
     /// flavor; helps the narrator + the image-gen prompt composer.
@@ -162,10 +162,26 @@ pub struct SimCard {
     // their `None`/empty defaults instead of failing the load.
     /// The world/setting premise. Injected into the narrator's system prompt
     /// as the ground-truth scenario context. `None` for system cards.
+    ///
+    /// Parsed flat-first (a top-level `<setting>` child of `<sim_card>`) with
+    /// a fallback to the legacy `<scenario><setting>` wrapper so cards authored
+    /// before the flat-format reorg still load. The flat shape is canonical
+    /// (2026-08-01); the scenario-wrapper fallback is back-compat only.
     #[serde(default)]
     pub setting: Option<String>,
+    /// Narrative consequence philosophy — authored prose directing how the
+    /// world moves + how conflict resolves ("drive story through consequence,
+    /// embed clues, let pressure gather"). Sibling to [`setting`]/[`tone`]:
+    /// a flat top-level `<plot>` child. `None` when the card omits it.
+    ///
+    /// Added 2026-08-01 (the flat-format reorg surfaced `<plot>` as a
+    /// first-class card field; previously it lived un-parsed inside setting
+    /// prose). The Creator's World/Scenario tab exposes it.
+    #[serde(default)]
+    pub plot: Option<String>,
     /// Narrative tone directive ("grim, atmospheric, slow-burn"). Guides the
-    /// narrator's voice. `None` for system cards.
+    /// narrator's voice. `None` for system cards. Flat-first parse with a
+    /// `<scenario><tone>` fallback (mirrors [`setting`]).
     #[serde(default)]
     pub tone: Option<String>,
     /// Seed text for the first narrator turn (the opening scene). The
@@ -251,7 +267,7 @@ impl SimCard {
         let mut sections = Vec::new();
 
         sections.push(format!(
-            "<identity>\nname: {}\ncore_persona: {}\ntraits:\n{}\n</identity>",
+            "<identity>\nname: {}\npersona: {}\ntraits:\n{}\n</identity>",
             self.name.trim(),
             self.core_persona.trim(),
             indent(self.traits.trim()),
@@ -346,6 +362,7 @@ pub fn fallback() -> SimCard {
         introductions: Vec::new(),
         // Roleplay-only fields: all empty for the system-card fallback.
         setting: None,
+        plot: None,
         tone: None,
         opening_scene: None,
         start_npc_ids: Vec::new(),
@@ -427,7 +444,7 @@ fn parse(xml: &str) -> anyhow::Result<SimCard> {
 
     let identity = first_child(root, "identity");
     let core_persona = identity
-        .and_then(|n| child_text(n, "core_persona"))
+        .and_then(|n| child_text(n, "persona"))
         .unwrap_or_default();
     let traits = identity
         .and_then(|n| child_text(n, "traits"))
@@ -487,37 +504,41 @@ fn parse(xml: &str) -> anyhow::Result<SimCard> {
         })
         .unwrap_or_default();
 
-    // All fields optional; absent on system cards (Wupi). `setting`/`tone`/
-    // `opening_scene` are nested text children; `start_npcs`/`activities` are
-    // CDATA bullet lists parsed the same way as `introductions`. A missing
-    // `<scenario>` block leaves every field at its default (None / empty) -
-    // `Wupi.sim` parses unchanged.
+    // ── World/scenario fields ──────────────────────────────────────────────
+    // FLAT-FIRST parse (2026-08-01 reorg): `setting`/`plot`/`tone`/
+    // `opening_scene`/`player_name`/`start_npcs`/`activities`/`locations`/
+    // `cast` are read as DIRECT children of `<sim_card>` (the canonical
+    // shape authored by `data/fable.sim` + the Creator). Each falls back to
+    // the legacy `<scenario>` wrapper if the top-level read returns None, so
+    // cards authored before the reorg (e.g. `rusty_tavern.sim` at migration
+    // time, and old user cards in the wild) still load unchanged. The flat
+    // shape is canonical; the scenario-wrapper fallback is back-compat only.
+    //
+    // `field_or` + `field_node_or` are the flat-first helpers (defined below
+    // near `first_child`). All fields optional; absent on system cards
+    // (Wupi) → every field at its default (None / empty).
     let scenario = first_child(root, "scenario");
-    let setting = scenario
-        .and_then(|n| child_text(n, "setting"))
+    let setting = field_or(root, scenario, "setting")
         .filter(|s| !s.is_empty());
-    let tone = scenario
-        .and_then(|n| child_text(n, "tone"))
+    let plot = field_or(root, scenario, "plot")
         .filter(|s| !s.is_empty());
-    let opening_scene = scenario
-        .and_then(|n| child_text(n, "opening_scene"))
+    let tone = field_or(root, scenario, "tone")
         .filter(|s| !s.is_empty());
-    let start_npc_ids = scenario
-        .and_then(|n| first_child(n, "start_npcs"))
+    let opening_scene = field_or(root, scenario, "opening_scene")
+        .filter(|s| !s.is_empty());
+    let start_npc_ids = field_node_or(root, scenario, "start_npcs")
         .map(|n| parse_bullet_list(&text_content(n)))
         .unwrap_or_default();
-    let declared_activities = scenario
-        .and_then(|n| first_child(n, "activities"))
+    let declared_activities = field_node_or(root, scenario, "activities")
         .map(|n| parse_bullet_list(&text_content(n)))
         .unwrap_or_default();
     // Player name (Phase E narrator hardening, 2026-07-18). Optional;
     // absent on system cards and on roleplay cards that don't declare one.
     // Reads `<player_name>` (current); falls back to the legacy tag for old
     // saves authored before the rename. Auto-migration, NOT deletion — old
-    // user .sim files in the wild must still load.
-    let player_name = scenario
-        .and_then(|n| child_text(n, "player_name"))
-        .or_else(|| scenario.and_then(|n| child_text(n, "protagonist")))
+    // user .sim files in the wild must still load. Flat-first like the rest.
+    let player_name = field_or(root, scenario, "player_name")
+        .or_else(|| field_or(root, scenario, "protagonist"))
         .filter(|s| !s.is_empty());
 
     // Fable Phase 4 Component 3 (2026-07-28): optional <locations> block.
@@ -527,8 +548,7 @@ fn parse(xml: &str) -> anyhow::Result<SimCard> {
     // that don't declare geography → empty Vec (dormant graph, pre-Phase-4
     // behavior). This is the load-bearing fix for Components 3 + 4 being
     // dead in live play — see docs/phase4-fix-travel-graph-seeding.md.
-    let locations = scenario
-        .and_then(|n| first_child(n, "locations"))
+    let locations = field_node_or(root, scenario, "locations")
         .map(|loc| {
             loc.children()
                 .filter(|c| c.is_element() && c.has_tag_name("node"))
@@ -560,8 +580,7 @@ fn parse(xml: &str) -> anyhow::Result<SimCard> {
     // (dormant registry, pre-Phase-5 behavior). This is the load-bearing
     // source for the `[PRESENCE]` whitelist — without it the bracket has
     // nothing to validate against (the §11.48-shaped gap).
-    let cast = scenario
-        .and_then(|n| first_child(n, "cast"))
+    let cast = field_node_or(root, scenario, "cast")
         .map(|cast_el| {
             cast_el
                 .children()
@@ -600,6 +619,7 @@ fn parse(xml: &str) -> anyhow::Result<SimCard> {
         technical_rules,
         introductions,
         setting,
+        plot,
         tone,
         opening_scene,
         start_npc_ids,
@@ -651,6 +671,34 @@ fn nested_text(root: roxmltree::Node, parent: &str, child: &str) -> Option<Strin
     first_child(root, parent).and_then(|n| child_text(n, child))
 }
 
+/// FLAT-FIRST text read (2026-08-01 card-format reorg): the trimmed text of a
+/// top-level `<tag>` child of `root`, falling back to `<scenario><tag>` when
+/// the top-level read is absent. The flat shape (direct children of
+/// `<sim_card>`) is canonical; the `<scenario>` wrapper is back-compat for
+/// cards authored before the reorg. `scenario` is the pre-resolved optional
+/// `<scenario>` node (passed in by the caller so it's resolved once, not per
+/// field). Returns `None` when neither location carries the tag — the caller's
+/// `.filter(|s| !s.is_empty())` turns an empty-string hit into None.
+fn field_or(
+    root: roxmltree::Node,
+    scenario: Option<roxmltree::Node>,
+    tag: &str,
+) -> Option<String> {
+    child_text(root, tag).or_else(|| scenario.and_then(|n| child_text(n, tag)))
+}
+
+/// FLAT-FIRST element read: the top-level `<tag>` child node of `root`, or the
+/// `<scenario><tag>` child as fallback. Like [`field_or`] but returns the
+/// *node* (not its text) so callers that walk children (`<locations>`,
+/// `<cast>`, `<start_npcs>`, `<activities>`) can iterate it.
+fn field_node_or<'a, 'input>(
+    root: roxmltree::Node<'a, 'input>,
+    scenario: Option<roxmltree::Node<'a, 'input>>,
+    tag: &str,
+) -> Option<roxmltree::Node<'a, 'input>> {
+    first_child(root, tag).or_else(|| scenario.and_then(|n| first_child(n, tag)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -664,7 +712,7 @@ mod tests {
   </metadata>
   <identity>
     <name>Wupi</name>
-    <core_persona>A cheerful catgirl.</core_persona>
+    <persona>A cheerful catgirl.</persona>
     <traits><![CDATA[
 - Devoted to Master.
 - Clumsy but eager.
@@ -756,7 +804,7 @@ mod tests {
 <sim_card>
   <identity>
     <name>Legacy</name>
-    <core_persona>A card from before the protocol extraction.</core_persona>
+    <persona>A card from before the protocol extraction.</persona>
     <traits><![CDATA[ - Old-school. ]]></traits>
   </identity>
   <technical_protocols>
@@ -790,6 +838,7 @@ mod tests {
             technical_rules: String::new(),
             introductions: Vec::new(),
             setting: None,
+            plot: None,
             tone: None,
             opening_scene: None,
             start_npc_ids: Vec::new(),
@@ -830,7 +879,7 @@ mod tests {
         let no_meta = r#"<sim_card>
   <identity>
     <name>Wupi</name>
-    <core_persona>A catgirl.</core_persona>
+    <persona>A catgirl.</persona>
   </identity>
 </sim_card>"#;
         let card = parse(no_meta).expect("metadata-free card parses");
@@ -856,7 +905,7 @@ mod tests {
   </metadata>
   <identity>
     <name>The Rusty Tankard</name>
-    <core_persona>A one-shot dungeon scenario.</core_persona>
+    <persona>A one-shot dungeon scenario.</persona>
   </identity>
   <scenario>
     <setting><![CDATA[
@@ -888,6 +937,55 @@ ago. A locked iron chest sits under a table by the hearth.
         assert_eq!(card.start_npc_ids, vec!["barkeeper".to_string(), "goblin".to_string()]);
         assert_eq!(card.declared_activities, vec!["combat".to_string()]);
         assert_eq!(card.player_name.as_deref(), Some("Alex"));
+    }
+
+    /// The CANONICAL flat format (2026-08-01 card reorg): `setting`/`plot`/
+    /// `tone`/`opening_scene` as DIRECT children of `<sim_card>` (no
+    /// `<scenario>` wrapper), plus the `<persona>` tag (renamed from
+    /// `<core_persona>`). This is the shape `data/fable.sim` ships + what
+    /// the Creator emits. The `<plot>` field is new to the reorg — it pins
+    /// that top-level `<plot>` parses into `SimCard.plot`.
+    #[test]
+    fn parse_flat_format_top_level_fields() {
+        let flat = r#"<?xml version="1.0"?>
+<sim_card>
+  <identity>
+    <name>Narrator</name>
+    <persona><![CDATA[ An impartial world-simulation engine. ]]></persona>
+  </identity>
+  <setting><![CDATA[ A frontier tavern at the edge of the woods. ]]></setting>
+  <plot><![CDATA[ Drive story through consequence. Let complications grow organically. ]]></plot>
+  <tone><![CDATA[ Atmospheric, grounded, slow-burn. ]]></tone>
+  <opening_scene><![CDATA[ Rain lashes the shutters. ]]></opening_scene>
+</sim_card>"#;
+        let card = parse(flat).expect("flat-format card parses");
+        assert_eq!(card.name, "Narrator");
+        assert_eq!(card.core_persona, "An impartial world-simulation engine.");
+        assert!(card.setting.as_deref().unwrap().contains("frontier tavern"));
+        assert!(
+            card.plot.as_deref().unwrap().contains("Drive story through consequence"),
+            "top-level <plot> must parse into SimCard.plot"
+        );
+        assert!(card.tone.as_deref().unwrap().contains("Atmospheric"));
+        assert!(card.opening_scene.as_deref().unwrap().contains("Rain lashes"));
+    }
+
+    /// Back-compat: the legacy `<scenario>` wrapper STILL loads (the flat-first
+    /// parser falls back to it). A card authored before the 2026-08-01 reorg
+    /// must not break. Pins the `field_or` fallback path.
+    #[test]
+    fn scenario_wrapper_still_loads_via_fallback() {
+        let wrapped = r#"<sim_card>
+  <identity><name>Old Card</name><persona>Legacy.</persona></identity>
+  <scenario>
+    <setting>Wrapped setting.</setting>
+    <tone>Wrapped tone.</tone>
+  </scenario>
+</sim_card>"#;
+        let card = parse(wrapped).expect("scenario-wrapped card parses via fallback");
+        assert_eq!(card.setting.as_deref(), Some("Wrapped setting."));
+        assert_eq!(card.tone.as_deref(), Some("Wrapped tone."));
+        assert!(card.plot.is_none(), "no <plot> in this fixture → None");
     }
 
     /// The system card (Wupi.sim) has NO `<scenario>` block. Every roleplay
@@ -924,6 +1022,7 @@ ago. A locked iron chest sits under a table by the hearth.
             technical_rules: "tr".into(),
             introductions: vec!["hi".into()],
             setting: Some("A test place.".into()),
+            plot: None,
             tone: Some("grim".into()),
             opening_scene: Some("The scene opens.".into()),
             start_npc_ids: vec!["npc_one".into(), "npc_two".into()],

@@ -328,9 +328,9 @@ if (dryRun) {
 //   data/                         (engine-shipped identity content)
 //   ├── wupi.sim                  (Wupi's ACTIVE persona, lowercase w,
 //   │                              single copy — Chloe's personal content)
-//   ├── fable.sim                 (the Fable/Game-Master persona for the
-//   │                              New Game interview; 2026-07-29 rename of
-//   │                              gm.sim — Game Master identity kept)
+//   ├── fable.sim                 (the Quick Play narrator card — the
+//   │                              placeless Narrative Simulator identity;
+//   │                              loaded by fable_quick_play_start)
 //   ├── wupi.codex                (Wupi's static playbook — engine content)
 //   ├── fable.codex               (the unified Fable playbook — engine content)
 //   └── user.xml                  (EMPTY template — user authors via the
@@ -424,25 +424,24 @@ for (const f of readdirSync(distDir)) {
 // run and preserved across updates by the updater's preserve rule (§8C).
 cpSync(srcDataDir, join(stageWupiDir, 'data'), { recursive: true });
 
-// apps/fable/cards/: starter scenario .sim files. The released exe resolves
-// apps/ relative to its own dir (resolve_fable_cards_dir → apps/fable/cards/),
-// so without this staging the card picker ships empty. Per-card
-// sessions/schemas/saves are user data → created on first run, NOT staged here
-// (matches the §8C preserve rule).
-//
-// §8C rename note: this was `apps/games/cards/` pre-rename. The path moved to
-// `apps/fable/` when Games→Fable (AGENTS.md §8C); the runtime already resolves
-// from fable/. Staging from the old games/ path shipped an empty card picker
-// (the dir doesn't exist post-rename, so existsSync was false → silent skip).
+// apps/fable/cards/: starter scenario cards. Each card lives in a per-card
+// folder `<name>/<name>.sim` (+ optional sibling `.codex`); the 2026-08-01
+// folder reorg moved from a flat `<name>.sim` to this per-card layout. The
+// released exe resolves apps/ relative to its own dir
+// (resolve_fable_cards_dir → apps/fable/cards/), so without this staging the
+// card picker ships empty. The whole cards tree is copied RECURSIVELY so the
+// per-card folders + any sibling files ship intact. Per-card session/world/
+// player/npc JSON + saves are user data → created on first run, NOT staged.
 const srcCardsDir = join(repoRoot, 'apps', 'fable', 'cards');
 if (existsSync(srcCardsDir)) {
   const dstCardsDir = join(stageWupiDir, 'apps', 'fable', 'cards');
-  mkdirSync(dstCardsDir, { recursive: true });
+  cpSync(srcCardsDir, dstCardsDir, { recursive: true });
+  // Count the staged cards (one <name>/<name>.sim per folder) for the log line.
   let staged = 0;
-  for (const f of readdirSync(srcCardsDir)) {
-    if (f.toLowerCase().endsWith('.sim')) {
-      copyFileSync(join(srcCardsDir, f), join(dstCardsDir, f));
-      staged++;
+  for (const sub of readdirSync(dstCardsDir, { withFileTypes: true })) {
+    if (sub.isDirectory()) {
+      const sim = join(dstCardsDir, sub.name, `${sub.name}.sim`);
+      if (existsSync(sim)) staged++;
     }
   }
   console.log(`[release] staged ${staged} scenario card(s) from apps/fable/cards/`);

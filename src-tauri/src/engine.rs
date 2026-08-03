@@ -794,10 +794,10 @@ impl EngineRuntime {
         let punct_biases: Vec<LlamaLogitBias> = resolve_punct_biases(self.model);
         let n_vocab = self.model.n_vocab();
         let mut sampler = LlamaSampler::chain_simple([
-            LlamaSampler::temp(0.85),
-            LlamaSampler::top_p(0.95, 1),
-            LlamaSampler::min_p(0.1, 1),
-            LlamaSampler::dry(self.model, 0.8, 1.75, 2, -1, ["\n"]),
+            LlamaSampler::temp(crate::settings::TEMP_NARRATOR),
+            LlamaSampler::top_p(crate::settings::TOP_P_NARRATOR, 1),
+            LlamaSampler::min_p(crate::settings::MIN_P, 1),
+            LlamaSampler::dry(self.model, crate::settings::DRY_MULT, crate::settings::DRY_BASE, crate::settings::DRY_ALLOWED_LEN_NARRATOR, -1, ["\n"]),
             LlamaSampler::logit_bias(n_vocab, &punct_biases),
             LlamaSampler::dist(0),
         ]);

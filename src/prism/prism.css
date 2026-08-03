@@ -1,40 +1,50 @@
 /* =============================================================
-   PRISM — the glassmorphism theme.
-   Deep obsidian surfaces, translucent blur, cyan/violet accent
-   glow. All rules namespaced under .app-window.prism-app so
-   nothing leaks to the OS shell or Fable. Mirrors Fable's CSS
-   discipline (fable.css header: "All fable styles live HERE;
-   nothing in styles.css").
+   PRISM — charcoal & glassmorphism theme.
+   Deepest charcoal surfaces, frosted-glass panels (translucent
+   white tint + backdrop blur + a 1px frosted edge), pure-white
+   type. Strictly monochrome: the ONLY color in the chrome is a
+   single restrained ice-white glow on the Generate button + the
+   active nav tab.
+   All rules namespaced under .app-window.prism-app so nothing
+   leaks to the OS shell or Fable. Mirrors Fable's CSS discipline
+   (fable.css header: "All fable styles live HERE; nothing in
+   styles.css").
    ============================================================= */
 
 :root {
-  /* Surfaces — deep obsidian / charcoal */
-  --prism-void:        #08080d;
-  --prism-surface:     rgba(18, 18, 28, 0.72);
-  --prism-surface-2:   rgba(26, 26, 40, 0.78);
-  --prism-glass:       rgba(255, 255, 255, 0.04);
+  /* Surfaces — deep charcoal void + frosted-glass panels.
+     The surface vars are charcoal-tinted translucencies so panels
+     read as #1E1E1E–#252525 over the void while staying genuinely
+     translucent (the glass effect comes from these + backdrop-filter
+     blur + the 1px frosted border below). */
+  --prism-void:          #121212;                 /* deepest charcoal, app bg */
+  --prism-surface:       rgba(30, 30, 30, 0.65);  /* panel glass — reads ~#1A1A1A over void */
+  --prism-surface-2:     rgba(38, 38, 38, 0.72);  /* elevated glass — reads ~#202020 */
+  --prism-glass:         rgba(255, 255, 255, 0.03); /* faint white tint for hovers/overlays */
+  --prism-surface-solid: #1E1E1E;                 /* fallback solid charcoal */
 
-  /* Accents — cyan + violet */
-  --prism-accent:      #00e5ff;
-  --prism-accent-2:    #a855f7;
-  --prism-accent-glow: rgba(0, 229, 255, 0.45);
-  --prism-accent2-glow: rgba(168, 85, 247, 0.40);
+  /* Accent — a single restrained ice-white glow. Reserved for ONLY the
+     two most critical affordances: the primary Generate button + the
+     active nav tab. Everything else stays pure white / cool gray. */
+  --prism-glow:          rgba(235, 243, 255, 0.45);
+  --prism-glow-soft:     rgba(235, 243, 255, 0.18);
 
-  /* Text */
-  --prism-text:        #e8e8f0;
-  --prism-text-dim:    #9a9ab0;
-  --prism-text-faint:  #5a5a70;
+  /* Text — pure white + opacity steps for secondary/faint copy */
+  --prism-text:          #ffffff;
+  --prism-text-dim:      rgba(255, 255, 255, 0.62);
+  --prism-text-faint:    rgba(255, 255, 255, 0.38);
 
-  /* Lines + borders */
-  --prism-border:      rgba(255, 255, 255, 0.08);
-  --prism-border-glow: rgba(0, 229, 255, 0.35);
+  /* Lines + borders — the frosted-glass edges */
+  --prism-border:        rgba(255, 255, 255, 0.08);
+  --prism-border-strong: rgba(255, 255, 255, 0.14);
+  --prism-border-glow:   rgba(255, 255, 255, 0.22);  /* focus borders — crisp white, not cyan */
 
-  /* Danger */
-  --prism-danger:      #ff5577;
+  /* Danger — functional muted red only (destructive actions), never decorative */
+  --prism-danger:        #ff5577;
 
   /* Geometry */
-  --prism-radius:      14px;
-  --prism-radius-sm:   9px;
+  --prism-radius:        14px;
+  --prism-radius-sm:     9px;
 }
 
 /* The app window — full-screen, borderless, transparent (the OS window is
@@ -43,9 +53,12 @@
   position: fixed;
   inset: 0;
   z-index: 1500;
+  /* Flat charcoal base + two near-invisible white radial washes for depth.
+     Pure monochrome — NO color cast anywhere in the chrome. The washes are
+     kept under 4% opacity so they read as light, not a tint. */
   background:
-    radial-gradient(1200px 800px at 75% -10%, rgba(168, 85, 247, 0.10), transparent 60%),
-    radial-gradient(1000px 700px at 15% 110%, rgba(0, 229, 255, 0.10), transparent 60%),
+    radial-gradient(1100px 760px at 78% -8%, rgba(255, 255, 255, 0.035), transparent 62%),
+    radial-gradient(960px 680px at 12% 112%, rgba(255, 255, 255, 0.028), transparent 60%),
     var(--prism-void);
   color: var(--prism-text);
   font-family: 'Segoe UI', system-ui, sans-serif;
@@ -61,8 +74,8 @@
   justify-content: space-between;
   padding: 14px 22px;
   background: var(--prism-surface);
-  backdrop-filter: blur(20px);
-  -webkit-backdrop-filter: blur(20px);
+  backdrop-filter: blur(12px) saturate(1.1);     /* glassmorphism floor */
+  -webkit-backdrop-filter: blur(12px) saturate(1.1);
   border-bottom: 1px solid var(--prism-border);
   flex: 0 0 auto;
 }
@@ -74,8 +87,8 @@
   letter-spacing: 0.5px;
 }
 .prism-brand-mark {
-  color: var(--prism-accent);
-  text-shadow: 0 0 12px var(--prism-accent-glow);
+  color: var(--prism-text);                       /* pure white — no accent glow */
+  text-shadow: 0 0 10px rgba(255, 255, 255, 0.30);
   font-size: 1.3em;
 }
 .prism-brand-name { font-size: 1.05em; }
@@ -92,11 +105,13 @@
   transition: all 0.15s ease;
 }
 .prism-nav-btn:hover { color: var(--prism-text); background: var(--prism-glass); }
+/* ICE-WHITE GLOW #2 of 2: the active nav tab. White text + a faint white
+   tint + an inset ice glow. The other reserved slot is the Generate button. */
 .prism-nav-btn.is-active {
-  color: var(--prism-accent);
-  background: rgba(0, 229, 255, 0.08);
+  color: var(--prism-text);
+  background: rgba(255, 255, 255, 0.06);
   border-color: var(--prism-border-glow);
-  box-shadow: inset 0 0 12px rgba(0, 229, 255, 0.10);
+  box-shadow: inset 0 0 14px var(--prism-glow-soft);
 }
 .prism-exit {
   background: transparent;
@@ -144,16 +159,16 @@
 }
 .prism-status-banner strong { color: var(--prism-text); }
 .prism-status-retry {
-  background: rgba(0, 229, 255, 0.12);
+  background: rgba(255, 255, 255, 0.08);
   border: 1px solid var(--prism-border-glow);
-  color: var(--prism-accent);
+  color: var(--prism-text);
   padding: 3px 12px;
   border-radius: 14px;
   cursor: pointer;
   font-size: 0.9em;
   margin-left: 8px;
 }
-.prism-status-retry:hover { background: rgba(0, 229, 255, 0.22); }
+.prism-status-retry:hover { background: rgba(255, 255, 255, 0.14); }
 
 /* ── Screens ────────────────────────────────────────────────────────── */
 .prism-screen {
@@ -182,12 +197,12 @@
 }
 .prism-prompt-panel {
   background: var(--prism-surface);
-  backdrop-filter: blur(20px);
-  -webkit-backdrop-filter: blur(20px);
+  backdrop-filter: blur(20px) saturate(1.15);     /* stronger blur — large panel depth */
+  -webkit-backdrop-filter: blur(20px) saturate(1.15);
   border: 1px solid var(--prism-border);
   border-radius: var(--prism-radius);
   padding: 22px;
-  box-shadow: inset 0 1px 0 rgba(255,255,255,0.04);
+  box-shadow: inset 0 1px 0 rgba(255,255,255,0.05);
 }
 
 /* ── Prompt lanes + pills ──────────────────────────────────────────── */
@@ -214,7 +229,7 @@
   display: inline-flex;
   align-items: center;
   gap: 5px;
-  background: rgba(0, 229, 255, 0.10);
+  background: rgba(255, 255, 255, 0.06);          /* glass tint — no cyan */
   border: 1px solid var(--prism-border-glow);
   color: var(--prism-text);
   padding: 4px 8px 4px 10px;
@@ -223,6 +238,7 @@
   cursor: grab;
   user-select: none;
 }
+/* Negative lane keeps a muted red tint — functional signal, not decorative. */
 .prism-pill[data-lane="negative"], .prism-lane[data-lane="negative"] .prism-pill {
   background: rgba(255, 85, 119, 0.10);
   border-color: rgba(255, 85, 119, 0.30);
@@ -252,7 +268,7 @@
 .prism-lane-input:focus {
   outline: none;
   border-color: var(--prism-border-glow);
-  box-shadow: 0 0 0 3px rgba(0, 229, 255, 0.10);
+  box-shadow: 0 0 0 3px rgba(255, 255, 255, 0.10);
 }
 
 /* ── Compose actions ───────────────────────────────────────────────── */
@@ -277,22 +293,25 @@
   color: var(--prism-text-dim);
 }
 .prism-btn-ghost:hover:not(:disabled) { color: var(--prism-text); border-color: var(--prism-border-glow); }
+/* ICE-WHITE GLOW #1 of 2: the Generate button. A monochrome white→cool-gray
+   gradient (dark text for contrast) with the single reserved ice-white glow.
+   On hover the glow blooms — the only place in the chrome that emits light. */
 .prism-btn-primary {
-  background: linear-gradient(135deg, var(--prism-accent), var(--prism-accent-2));
-  color: #06060a;
+  background: linear-gradient(135deg, #ffffff 0%, #d8dde4 100%);
+  color: #141414;
   border-color: transparent;
   font-weight: 600;
-  box-shadow: 0 0 20px var(--prism-accent-glow);
+  box-shadow: 0 0 20px var(--prism-glow);
 }
 .prism-btn-primary:hover:not(:disabled) {
-  box-shadow: 0 0 28px var(--prism-accent-glow), 0 0 16px var(--prism-accent2-glow);
+  box-shadow: 0 0 30px var(--prism-glow), 0 0 14px var(--prism-glow-soft);
 }
 .prism-generate-btn { min-width: 150px; }
 .prism-generate-spinner {
   display: inline-block;
   width: 14px; height: 14px;
-  border: 2px solid rgba(6,6,10,0.3);
-  border-top-color: #06060a;
+  border: 2px solid rgba(20,20,20,0.30);
+  border-top-color: #141414;
   border-radius: 50%;
   animation: prism-spin 0.7s linear infinite;
   margin-left: 8px;
@@ -303,8 +322,8 @@
 /* ── Settings rail ─────────────────────────────────────────────────── */
 .prism-settings-rail {
   background: var(--prism-surface);
-  backdrop-filter: blur(20px);
-  -webkit-backdrop-filter: blur(20px);
+  backdrop-filter: blur(20px) saturate(1.15);     /* stronger blur — large panel */
+  -webkit-backdrop-filter: blur(20px) saturate(1.15);
   border: 1px solid var(--prism-border);
   border-radius: var(--prism-radius);
   padding: 22px;
@@ -319,7 +338,7 @@
   color: var(--prism-text-dim);
   margin-bottom: 6px;
 }
-.prism-field-value { color: var(--prism-accent); font-weight: 600; }
+.prism-field-value { color: var(--prism-text); font-weight: 600; }  /* was cyan accent */
 .prism-select, .prism-input {
   width: 100%;
   background: rgba(0,0,0,0.30);
@@ -336,7 +355,7 @@
 }
 .prism-range {
   width: 100%;
-  accent-color: var(--prism-accent);
+  accent-color: var(--prism-text);                /* white range thumb — no cyan */
 }
 .prism-seed-row { display: flex; gap: 6px; }
 .prism-seed-row .prism-input { flex: 1; }
@@ -374,9 +393,9 @@
 }
 .prism-chip:hover { color: var(--prism-text); }
 .prism-chip.is-active {
-  color: var(--prism-accent);
+  color: var(--prism-text);
   border-color: var(--prism-border-glow);
-  background: rgba(0, 229, 255, 0.08);
+  background: rgba(255, 255, 255, 0.07);
 }
 .prism-gallery-search {
   background: rgba(0,0,0,0.30);
@@ -414,7 +433,7 @@
 }
 .prism-tile:hover {
   border-color: var(--prism-border-glow);
-  box-shadow: 0 0 24px rgba(0, 229, 255, 0.15);
+  box-shadow: 0 0 24px rgba(255, 255, 255, 0.12);
 }
 .prism-tile.is-favorite { border-color: rgba(255, 215, 0, 0.45); }
 .prism-tile-img { display: block; width: 100%; height: auto; }
@@ -446,7 +465,7 @@
   font-size: 0.95em;
   transition: all 0.12s ease;
 }
-.prism-tile-btn:hover { background: rgba(0, 229, 255, 0.25); border-color: var(--prism-border-glow); }
+.prism-tile-btn:hover { background: rgba(255, 255, 255, 0.18); border-color: var(--prism-border-glow); }
 .prism-tile-btn-danger:hover { background: rgba(255, 85, 119, 0.30); border-color: var(--prism-danger); }
 .prism-tile-seed {
   position: absolute;
@@ -522,7 +541,7 @@
   line-height: 1.4;
   word-break: break-word;
 }
-.prism-meta-v.mono { font-family: 'Consolas', monospace; color: var(--prism-accent); }
+.prism-meta-v.mono { font-family: 'Consolas', monospace; color: var(--prism-text); }  /* was cyan */
 .prism-meta-grid {
   display: grid;
   grid-template-columns: 1fr 1fr;
@@ -598,22 +617,22 @@
   position: absolute;
   top: 0; bottom: 0;
   width: 2px;
-  background: var(--prism-accent);
-  box-shadow: 0 0 10px var(--prism-accent-glow);
+  background: var(--prism-text);                  /* white split line — no cyan */
+  box-shadow: 0 0 10px rgba(255, 255, 255, 0.50);
 }
 .prism-fork-grip {
   position: relative;
   background: var(--prism-surface-2);
   backdrop-filter: blur(8px);
   border: 1px solid var(--prism-border-glow);
-  color: var(--prism-accent);
+  color: var(--prism-text);
   width: 34px; height: 34px;
   border-radius: 50%;
   display: flex;
   align-items: center;
   justify-content: center;
   cursor: ew-resize;
-  box-shadow: 0 0 14px var(--prism-accent-glow);
+  box-shadow: 0 0 14px rgba(255, 255, 255, 0.35);
 }
 
 .prism-fork-editor {
@@ -636,7 +655,7 @@
 }
 .prism-textarea:focus { outline: none; border-color: var(--prism-border-glow); }
 .prism-seed-locked { color: gold; font-size: 0.85em; }
-.prism-seed-locked-value { font-family: 'Consolas', monospace; color: var(--prism-accent); padding: 8px 10px; background: rgba(0,0,0,0.25); border-radius: var(--prism-radius-sm); }
+.prism-seed-locked-value { font-family: 'Consolas', monospace; color: var(--prism-text); padding: 8px 10px; background: rgba(0,0,0,0.25); border-radius: var(--prism-radius-sm); }  /* was cyan */
 .prism-fork-actions { display: flex; gap: 8px; margin-top: 16px; }
 .prism-fork-actions .prism-btn { flex: 1; text-align: center; }
 
@@ -649,7 +668,7 @@
   background: var(--prism-surface-2);
   backdrop-filter: blur(20px);
   border: 1px solid var(--prism-border-glow);
-  box-shadow: 0 8px 32px rgba(0,0,0,0.5), 0 0 20px var(--prism-accent-glow);
+  box-shadow: 0 8px 32px rgba(0,0,0,0.5), 0 0 20px rgba(255, 255, 255, 0.18);
   color: var(--prism-text);
   padding: 12px 22px;
   border-radius: 24px;
@@ -664,3 +683,4 @@
   opacity: 1;
   transform: translateX(-50%) translateY(0);
 }
+

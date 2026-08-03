@@ -1,0 +1,233 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Paperdoll hitbox verification</title>
+<style>
+  :root { color-scheme: dark; }
+  body {
+    margin: 0; padding: 20px;
+    background: #0c0a08; color: #e8e0cf;
+    font: 14px/1.5 'Segoe UI', system-ui, sans-serif;
+  }
+  h1 { font-size: 18px; margin: 0 0 4px; }
+  .sub { color: #8a7f6a; font-size: 12px; margin-bottom: 16px; }
+  .row { display: flex; gap: 40px; flex-wrap: wrap; }
+  .panel { background: #15110d; border: 1px solid #3a2f1a; border-radius: 8px; padding: 16px; }
+  .panel h2 { margin: 0 0 8px; font-size: 15px; color: #cba35c; }
+  .stage {
+    position: relative; width: 240px; height: 540px;
+    background:
+      linear-gradient(45deg, #1a1612 25%, transparent 25%) 0 0/20px 20px,
+      linear-gradient(-45deg, #1a1612 25%, transparent 25%) 0 0/20px 20px,
+      linear-gradient(45deg, transparent 75%, #1a1612 75%) 0 0/20px 20px,
+      linear-gradient(-45deg, transparent 75%, #1a1612 75%) 0 0/20px 20px,
+      #221c14;
+    border: 1px solid #000;
+  }
+  .stage img { position: absolute; inset: 0; width: 240px; height: 540px; image-rendering: auto; }
+  .stage svg { position: absolute; inset: 0; width: 240px; height: 540px; }
+  .stage svg polygon {
+    fill: rgba(0, 200, 255, 0.22);
+    stroke: rgba(120, 230, 255, 0.85);
+    stroke-width: 1;
+    transition: fill 120ms;
+    cursor: crosshair;
+  }
+  .stage svg polygon:hover {
+    fill: rgba(255, 220, 0, 0.45);
+    stroke: rgba(255, 240, 120, 1);
+    stroke-width: 1.5;
+  }
+  .label {
+    position: absolute; pointer-events: none;
+    font: 10px/1 'Segoe UI', sans-serif; fill: #ffe; stroke: #000;
+    paint-order: stroke; stroke-width: 2px;
+  }
+  .hud {
+    margin-top: 12px; display: flex; gap: 8px; align-items: center;
+    font-size: 12px; color: #8a7f6a;
+  }
+  .hud code { color: #e6d58a; background: #1d1810; padding: 1px 5px; border-radius: 3px; }
+  .legend {
+    margin-top: 14px; font-size: 11px; color: #6e6552;
+    max-width: 240px;
+  }
+</style>
+</head>
+<body>
+  <h1>Paperdoll hitbox verification</h1>
+  <div class="sub">
+    Cyan polygons = live FEMALE_POLYS (male is x-mirrored at load). Hover to
+    highlight. Click anywhere on a panel to sample that pixel's coords — the
+    readout updates so you can tune polygon points against the real silhouette.
+    The PNG renders at native 240×540; viewBox matches.
+  </div>
+  <div class="row">
+    <div class="panel">
+      <h2>Female</h2>
+      <div class="stage" id="femStage">
+        <img src="../src/fable/assets/paperdoll_female.png" alt="female">
+        <svg id="femSvg" viewBox="0 0 240 540" preserveAspectRatio="xMidYMid meet"></svg>
+      </div>
+      <div class="hud">
+        click → <code id="femXY">—, —</code>
+      </div>
+      <div class="legend">Green check: polygons hug the body. If a polygon
+        floats off the silhouette, note the region id + the sampled anchor
+        pixel, then fix its points in FEMALE_POLYS.</div>
+    </div>
+    <div class="panel">
+      <h2>Male (x-mirror of female)</h2>
+      <div class="stage" id="maleStage">
+        <img src="../src/fable/assets/paperdoll_male.png" alt="male">
+        <svg id="maleSvg" viewBox="0 0 240 540" preserveAspectRatio="xMidYMid meet"></svg>
+      </div>
+      <div class="hud">
+        click → <code id="maleXY">—, —</code>
+      </div>
+      <div class="legend">If the male PNG is NOT a horizontal flip of the
+        female, the mirrored polygons will misalign — hand-author MALE_POLYS
+        instead of mirroring.</div>
+    </div>
+  </div>
+
+<script>
+// === Live copy of FEMALE_POLYS + MALE_POLYS from src/fable/engine/left-drawer.js ===
+// Both INDEPENDENTLY authored (male is NOT a mirror of female). Keep in sync
+// with left-drawer.js when you tune coordinates.
+const FEMALE_POLYS = [
+  // ── axial (no L/R) ────────────────────────────────────────────────────
+  { id: 'head',           reads: 'head',
+    points: '110,19 93,27 85,35 80,43 78,51 76,59 76,67 76,75 163,75 164,67 163,59 161,51 158,43 153,35 144,27 127,19' },
+  { id: 'neck',           reads: 'torso',  // visual fold — schema has no neck
+    points: '104,78 128,78 130,108 102,108' },
+  { id: 'chest',          reads: 'torso',
+    points: '70,108 67,116 63,124 59,132 55,140 51,148 47,156 44,164 42,172 40,180 39,188 40,196 41,204 44,212 52,215 175,215 173,212 170,204 169,196 168,188 174,180 176,172 174,164 168,156 163,148 161,140 158,132 154,124 152,116 151,108' },
+  { id: 'stomach',        reads: 'torso',
+    points: '52,215 54,223 53,231 52,239 52,247 51,255 51,263 50,271 49,279 49,287 47,295 45,303 46,311 49,319 58,327 75,333 173,333 174,327 196,319 200,311 200,303 200,295 197,287 194,279 192,271 189,263 187,255 185,247 183,239 181,231 178,223 175,215' },
+  { id: 'crotch',         reads: 'torso',
+    points: '110,327 138,327 134,341 114,341' },
+  // ── NEAR side (screen-LEFT) ────────────────────────────────────────────
+  { id: 'near_shoulder',  reads: 'self',
+    points: '66,108 59,124 52,138 60,140 70,124 76,108' },
+  { id: 'near_upper_arm', reads: 'self',
+    points: '52,138 45,162 40,178 56,178 60,162 62,138' },
+  { id: 'near_elbow',     reads: 'self',
+    points: '40,178 42,194 44,210 56,210 56,194 56,178' },
+  { id: 'near_forearm',   reads: 'self',
+    points: '44,210 43,230 44,250 48,270 52,290 54,310 54,316 70,316 70,300 68,280 66,260 64,240 62,222 58,210' },
+  { id: 'near_hand',      reads: 'self',
+    points: '54,302 52,310 54,316 70,316 70,310 68,302' },
+  { id: 'near_thigh',     reads: 'self',
+    points: '74,333 72,357 70,381 66,401 62,418 100,418 104,401 110,381 116,357 120,333' },
+  { id: 'near_knee',      reads: 'self',
+    points: '62,418 60,440 58,466 56,488 84,488 88,466 92,440 96,418' },
+  { id: 'near_calf',      reads: 'self',
+    points: '56,488 54,505 52,516 50,524 60,524 62,516 64,505 64,488' },
+  { id: 'near_foot',      reads: 'self',
+    points: '50,516 48,531 64,531 66,524 64,516' },
+  // ── FAR side (screen-RIGHT) ────────────────────────────────────────────
+  { id: 'far_shoulder',   reads: 'self',
+    points: '128,108 132,124 138,138 130,140 120,124 114,108' },
+  { id: 'far_upper_arm',  reads: 'self',
+    points: '138,138 145,162 150,178 134,178 130,162 128,138' },
+  { id: 'far_elbow',      reads: 'self',
+    points: '150,178 148,194 146,210 134,210 134,194 134,178' },
+  { id: 'far_forearm',    reads: 'self',
+    points: '146,210 147,230 146,250 142,270 138,290 136,310 136,316 152,316 152,300 154,280 156,260 158,240 160,222 164,210' },
+  { id: 'far_hand',       reads: 'self',
+    points: '136,302 138,310 136,316 152,316 152,310 154,302' },
+  { id: 'far_thigh',      reads: 'self',
+    points: '124,333 126,357 130,381 134,401 138,418 176,418 172,401 166,381 160,357 156,333' },
+  { id: 'far_knee',       reads: 'self',
+    points: '132,418 130,440 131,462 131,484 165,484 168,462 172,440 176,418' },
+  { id: 'far_calf',       reads: 'self',
+    points: '131,488 130,505 134,516 152,516 175,516 190,508 132,488' },
+  { id: 'far_foot',       reads: 'self',
+    points: '152,516 175,516 192,510 192,516 168,524 150,524' },
+];
+const MALE_POLYS = [
+  // ── axial (no L/R) ────────────────────────────────────────────────────
+  { id: 'head',           reads: 'head',
+    points: '112,12 104,20 87,28 87,36 73,44 79,52 75,60 75,68 81,76 83,84 84,92 156,92 162,84 167,76 170,68 168,60 167,52 167,44 166,36 151,28 150,20 113,12' },
+  { id: 'neck',           reads: 'torso',
+    points: '111,95 135,95 137,125 109,125' },
+  { id: 'chest',          reads: 'torso',
+    points: '89,125 69,133 63,141 60,149 58,157 58,165 56,173 53,181 52,189 51,195 173,195 173,189 171,181 170,173 170,165 170,157 169,149 166,141 157,133 138,125' },
+  { id: 'stomach',        reads: 'torso',
+    points: '51,195 50,203 49,211 47,219 46,227 45,235 45,243 45,251 46,259 47,267 48,275 48,283 49,291 49,299 48,307 50,315 54,323 57,325 186,325 188,323 195,315 197,307 196,299 194,291 193,283 191,275 189,267 188,259 186,251 185,243 184,235 182,227 178,219 175,211 174,203 173,195' },
+  { id: 'crotch',         reads: 'torso',
+    points: '108,319 136,319 132,333 112,333' },
+  // ── NEAR side (screen-LEFT) ────────────────────────────────────────────
+  { id: 'near_shoulder',  reads: 'self',
+    points: '85,125 70,133 60,149 56,157 74,157 82,149 95,141 100,125' },
+  { id: 'near_upper_arm', reads: 'self',
+    points: '56,157 52,171 50,183 49,195 65,195 66,183 68,171 74,157' },
+  { id: 'near_elbow',     reads: 'self',
+    points: '49,195 48,207 47,219 47,231 63,231 64,219 65,207 65,195' },
+  { id: 'near_forearm',   reads: 'self',
+    points: '47,231 47,243 48,255 49,267 50,279 51,291 52,303 52,315 68,315 68,303 67,291 66,279 65,267 64,255 63,243 63,231' },
+  { id: 'near_hand',      reads: 'self',
+    points: '52,303 52,315 68,315 68,303' },
+  { id: 'near_thigh',     reads: 'self',
+    points: '70,325 74,349 76,373 74,397 70,418 108,418 110,397 114,373 118,349 122,325' },
+  { id: 'near_knee',      reads: 'self',
+    points: '70,418 68,440 66,462 64,484 96,484 98,462 100,440 102,418' },
+  { id: 'near_calf',      reads: 'self',
+    points: '64,484 60,502 55,516 52,524 68,524 72,516 74,502 76,484' },
+  { id: 'near_foot',      reads: 'self',
+    points: '52,516 47,531 68,531 72,524 74,516' },
+  // ── FAR side (screen-RIGHT) ────────────────────────────────────────────
+  { id: 'far_shoulder',   reads: 'self',
+    points: '116,125 132,133 145,149 149,157 131,157 122,149 110,141 104,125' },
+  { id: 'far_upper_arm',  reads: 'self',
+    points: '149,157 153,171 155,183 156,195 140,195 139,183 137,171 131,157' },
+  { id: 'far_elbow',      reads: 'self',
+    points: '156,195 157,207 158,219 158,231 142,231 141,219 140,207 140,195' },
+  { id: 'far_forearm',    reads: 'self',
+    points: '158,231 158,243 157,255 156,267 155,279 154,291 153,303 153,315 137,315 137,303 138,291 139,279 140,267 141,255 142,243 142,231' },
+  { id: 'far_hand',       reads: 'self',
+    points: '153,303 153,315 137,315 137,303' },
+  { id: 'far_thigh',      reads: 'self',
+    points: '124,325 126,349 124,373 122,397 118,418 156,418 160,397 164,373 168,349 172,325' },
+  { id: 'far_knee',       reads: 'self',
+    points: '130,418 128,440 130,462 132,484 162,484 166,462 170,440 174,418' },
+  { id: 'far_calf',       reads: 'self',
+    points: '132,484 130,502 134,516 153,516 176,516 192,508 134,484' },
+  { id: 'far_foot',       reads: 'self',
+    points: '153,516 176,516 192,510 192,516 166,524 150,524' },
+];
+
+function render(svgId, polys) {
+  const svg = document.getElementById(svgId);
+  svg.innerHTML = polys.map(p =>
+    `<polygon data-region="${p.id}" points="${p.points}"></polygon>`
+  ).join('') + polys.map(p => {
+    // centroid for the region label
+    const pts = p.points.split(/\s+/).map(c => c.split(',').map(Number));
+    const cx = pts.reduce((a, c) => a + c[0], 0) / pts.length;
+    const cy = pts.reduce((a, c) => a + c[1], 0) / pts.length;
+    return `<text class="label" x="${cx}" y="${cy}" text-anchor="middle">${p.id}</text>`;
+  }).join('');
+}
+render('femSvg', FEMALE_POLYS);
+render('maleSvg', MALE_POLYS);
+
+// Click-to-sample: report the clicked pixel in PNG-native coords.
+function wire(stageId, outId) {
+  const stage = document.getElementById(stageId);
+  const out = document.getElementById(outId);
+  stage.addEventListener('click', (e) => {
+    const r = stage.getBoundingClientRect();
+    // stage is exactly 240×540, so scale is direct.
+    const x = Math.round((e.clientX - r.left) / r.width * 240);
+    const y = Math.round((e.clientY - r.top) / r.height * 540);
+    out.textContent = `${x}, ${y}`;
+  });
+}
+wire('femStage', 'femXY');
+wire('maleStage', 'maleXY');
+</script>
+</body>
+</html>

@@ -93,7 +93,7 @@ use crate::llm::{shared_backend, shared_model, CancelToken, ChunkFn};
 /// The API path uses a wider 16-message window (the cloud model has the
 /// budget). The front-truncation guard below protects against overflow on
 /// the rare turn where the prompt exceeds `FABLE_CTX - FABLE_MAX_TOKENS`.
-const FABLE_CTX: u32 = 4096;
+const FABLE_CTX: u32 = crate::settings::CTX_FABLE;
 const FABLE_BATCH: u32 = 512;
 /// Cap on generated tokens for a single narrator turn.
 ///
@@ -265,23 +265,23 @@ fn resolve_punct_biases(model: &LlamaModel) -> Vec<LlamaLogitBias> {
 fn sampler_config(tracker_mode: bool) -> SamplerConfig {
     if tracker_mode {
         SamplerConfig {
-            temp: 0.2,
-            top_p: 0.9,
-            dry_multiplier: 0.8,
-            dry_base: 1.75,
-            dry_allowed_length: 1,
+            temp: crate::settings::TEMP_TRACKER,
+            top_p: crate::settings::TOP_P_TRACKER,
+            dry_multiplier: crate::settings::DRY_MULT,
+            dry_base: crate::settings::DRY_BASE,
+            dry_allowed_length: crate::settings::DRY_ALLOWED_LEN_TRACKER,
         }
     } else {
-        // The narrator profile. These are the pre-§11.43.B values; the
-        // `sampler_config_returns_narrator_defaults_for_local_mode` test
-        // pins them so any drift is caught. If you change these, update
+        // The narrator profile. Sourced from `settings.rs` (the single source
+        // of truth); the `sampler_config_returns_narrator_defaults_for_local_mode`
+        // test pins them so any drift is caught. If you change these, update
         // the test + AGENTS.md §11.41 + §11.43.B docs together.
         SamplerConfig {
-            temp: 0.85,
-            top_p: 0.95,
-            dry_multiplier: 0.8,
-            dry_base: 1.75,
-            dry_allowed_length: 2,
+            temp: crate::settings::TEMP_NARRATOR,
+            top_p: crate::settings::TOP_P_NARRATOR,
+            dry_multiplier: crate::settings::DRY_MULT,
+            dry_base: crate::settings::DRY_BASE,
+            dry_allowed_length: crate::settings::DRY_ALLOWED_LEN_NARRATOR,
         }
     }
 }
@@ -667,7 +667,7 @@ impl FableRuntime {
             LlamaSampler::chain_simple([
                 LlamaSampler::temp(cfg.temp),
                 LlamaSampler::top_p(cfg.top_p, 1),
-                LlamaSampler::min_p(0.1, 1),
+                LlamaSampler::min_p(crate::settings::MIN_P, 1),
                 LlamaSampler::dry(self.model, cfg.dry_multiplier, cfg.dry_base, cfg.dry_allowed_length, -1, ["\n"]),
                 LlamaSampler::logit_bias(n_vocab, &punct_biases),
                 LlamaSampler::dist(0),
@@ -676,7 +676,7 @@ impl FableRuntime {
             LlamaSampler::chain_simple([
                 LlamaSampler::temp(cfg.temp),
                 LlamaSampler::top_p(cfg.top_p, 1),
-                LlamaSampler::min_p(0.1, 1),
+                LlamaSampler::min_p(crate::settings::MIN_P, 1),
                 LlamaSampler::dry(self.model, cfg.dry_multiplier, cfg.dry_base, cfg.dry_allowed_length, -1, ["\n"]),
                 LlamaSampler::logit_bias(n_vocab, &punct_biases),
                 LlamaSampler::dist(0),

@@ -29,7 +29,8 @@
       "assetProtocol": {
         "enable": true,
         "scope": [
-          "$RESOURCE/../apps/prism/gallery/**"
+          "$RESOURCE/../apps/prism/gallery/**",
+          "$RESOURCE/../apps/fable/players/**"
         ]
       }
     },

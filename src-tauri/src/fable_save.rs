@@ -36,17 +36,19 @@ use crate::sim_card::SimCard;
 pub const AUTOSAVE_ID: &str = "autosave";
 
 /// The reserved save_id for the Quick Play slot. Quick Play is single-slot
-/// persistence: one quicksave at a time, overwritten by each new Quick Play,
-/// bundled with the in-memory card the GM generated during the interview (so
-/// nothing needs to live in `apps/fable/cards/`). Excluded from the
-/// `AUTOSAVE_ID` filter in `fable_continue_target` so the title's CONTINUE
-/// button (and Quick Play's inline Resume) can pick it up.
+/// persistence: one quicksave at a time, auto-written on `fable_end`
+/// (bundling the seated card so resume rebuilds the narrator prompt without
+/// re-reading `data/fable.sim`), overwritten by each new Quick Play start.
+/// Excluded from the `AUTOSAVE_ID` filter in `fable_continue_target` so the
+/// title's CONTINUE button (which is New-Game-only) never collides with
+/// Quick Play's own Resume path.
 pub const QUICKSAVE_ID: &str = "quicksave";
 
 /// The fixed card_id Quick Play always runs under. One slot, no name
-/// collisions — `fable_quick_start` overrides the GM-generated card's id to
-/// this sentinel so the per-card saves/sessions/schemas dirs are stable
-/// across Quick Play runs (and `fable_quick_reset` can wipe them by path).
+/// collisions — `fable_quick_play_start` overrides the card's id to this
+/// sentinel so the per-card saves/sessions/schemas dirs are stable across
+/// Quick Play runs, and `most_recent_continue_target` skips it (Quick Play
+/// owns its own Resume flow).
 pub const QUICK_PLAY_CARD_ID: &str = "__quickplay__";
 
 /// Metadata for the Load Game list. Returned by `list_saves`. Excludes the
@@ -69,9 +71,10 @@ pub struct SaveMeta {
 ///
 /// `card` is `Option<SimCard>` with `#[serde(default)]` so older saves
 /// (written before Quick Play) load with `card=None`. Quick Play is the only
-/// path that sets it: the GM-generated card has no on-disk `.sim` file (per
-/// the locked decision to bundle it inside the save), so the quicksave
-/// carries it. Manual + autosave slots leave `card=None`.
+/// path that sets it: the bundled card lets a later resume rebuild the
+/// narrator prompt without re-reading `data/fable.sim` (which may have been
+/// edited since the quicksave was written). Manual + autosave slots leave
+/// `card=None` (they re-read the on-disk `.sim` from `apps/fable/cards/`).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SaveFile {
     pub card_id: String,
@@ -82,18 +85,25 @@ pub struct SaveFile {
     pub is_autosave: bool,
     pub session: Conversation,
     pub schema: WorldSchema,
-    /// Quick Play only: the card the GM generated during the interview,
-    /// bundled so resume can rebuild the narrator prompt without a `.sim`
-    /// file on disk. `None` on manual/autosave slots and on saves written
-    /// before this field existed.
+    /// Quick Play only: the seated narrator card (loaded from
+    /// `data/fable.sim`), bundled so resume can rebuild the narrator prompt
+    /// without re-reading the file. `None` on manual/autosave slots and on
+    /// saves written before this field existed.
     #[serde(default)]
     pub card: Option<SimCard>,
 }
 
-/// Resolve `<fable_root>/saves/<card_id>/`. The per-card subdir isolates
-/// each scenario's saves so the Load Game list shows only the relevant ones.
+/// Resolve `<cards_root>/<card_id>/saves/` — the per-card saves subdir inside
+/// the card's own folder (2026-08-01 layout: each card owns its `.sim`,
+/// `.codex`, world/player/npc JSON, AND its save slots as siblings). The
+/// subdir isolates each scenario's saves so the Load Game list shows only the
+/// relevant ones.
+///
+/// Takes `fable_root` (= `apps/fable/`) for signature continuity with the many
+/// call sites; the cards tree is `fable_root/cards/`. Quick Play's reserved
+/// card id (`__quickplay__`) gets a folder of its own under the same tree.
 pub fn resolve_saves_dir(fable_root: &Path, card_id: &str) -> PathBuf {
-    fable_root.join("saves").join(card_id)
+    fable_root.join("cards").join(card_id).join("saves")
 }
 
 /// Resolve a single save file's path.
@@ -150,13 +160,15 @@ pub fn write_save(
 }
 
 /// Write the Quick Play quicksave. The single reserved slot under
-/// `saves/__quickplay__/quicksave.json` — overwrites any prior quicksave
-/// (the locked "one slot, overwrite on new Quick Play" contract). Bundles
-/// `card` inside the file so resume can rebuild the narrator prompt without
-/// an on-disk `.sim` (Quick Play cards never touch `apps/fable/cards/`).
+/// `saves/__quickplay__/quicksave.json` — auto-written by `fable_end` (the
+/// "auto on exit" contract: one slot, refreshed on every Home/Exit) and
+/// overwritten by each new Quick Play start. Bundles `card` (the seated
+/// narrator card from `data/fable.sim`) so resume rebuilds the narrator
+/// prompt without re-reading the file.
 ///
-/// `is_autosave = false` so `fable_continue_target` surfaces the quicksave
-/// as a valid resume target (it only excludes the `AUTOSAVE_ID` slot).
+/// `is_autosave = false` (the slot is a real quicksave, not the autosave
+/// sentinel). Quick Play is excluded from `most_recent_continue_target` by
+/// its `__quickplay__` card_id, not by this flag.
 pub fn write_quick_save(
     fable_root: &Path,
     card: &SimCard,
@@ -202,13 +214,15 @@ pub fn load_quick_save(fable_root: &Path) -> std::io::Result<SaveFile> {
 }
 
 /// Whether a Quick Play quicksave exists on disk. Drives the title-screen
-/// inline Resume/Start-New choice (no quicksave → straight into the interview).
+/// inline choice: no quicksave → Quick Play goes straight into a fresh run;
+/// quicksave present → offer Start New (overwrites) vs Resume Last.
 pub fn quick_save_exists(fable_root: &Path) -> bool {
     resolve_save_path(fable_root, QUICK_PLAY_CARD_ID, QUICKSAVE_ID).exists()
 }
 
-/// Wipe the Quick Play quicksave (idempotent). Called by `fable_quick_reset`
-/// before a brand-new interview so the new run starts from a clean slate.
+/// Wipe the Quick Play quicksave (idempotent). Called by
+/// `fable_quick_play_start` before a brand-new run so the new game starts
+/// from a clean slate (the "new overwrites old" contract).
 pub fn delete_quick_save(fable_root: &Path) -> std::io::Result<()> {
     delete_save(fable_root, QUICK_PLAY_CARD_ID, QUICKSAVE_ID)
 }
@@ -346,6 +360,7 @@ mod tests {
             technical_rules: String::new(),
             introductions: Vec::new(),
             setting: Some("A test place.".into()),
+            plot: None,
             tone: None,
             opening_scene: None,
             start_npc_ids: Vec::new(),

@@ -358,7 +358,7 @@ pub struct NpcEntry {
 
     /// Diegetic prose label shown to the narrator + the image-gen prompt
     /// composer ("Mara"). The prose label only; personality/appearance prose
-    /// lives in the codex lore entry that `wire_sim_card` authors.
+    /// lives in the card's own CDATA blocks (authored by the user).
     #[serde(default)]
     pub name: String,
 
@@ -1073,17 +1073,7 @@ impl WorldSchema {
     pub fn save(&self, path: &Path) -> std::io::Result<()> {
         let json = serde_json::to_string_pretty(self)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
-
-        let tmp_path = temp_path_for(path);
-        let _ = std::fs::remove_file(&tmp_path); // clear stale temp
-
-        {
-            let mut file = std::fs::File::create(&tmp_path)?;
-            std::io::Write::write_all(&mut file, json.as_bytes())?;
-            std::io::Write::flush(&mut file)?;
-            let _ = file.sync_all();
-        }
-        std::fs::rename(&tmp_path, path)
+        atomic_write_text(path, &json)
     }
 
     /// Load from `world_schema.json`. Returns an empty schema if the file
@@ -1096,6 +1086,160 @@ impl WorldSchema {
             Err(e) => Err(e),
         }
     }
+
+    /// The per-card split persistence (2026-08-01 Fable folder reorg). The
+    /// in-memory `WorldSchema` stays one struct (the engine + Referees read it
+    /// as such); the disk form splits into three sibling files inside the
+    /// card's folder so the Player / World / NPC tabs each own one file:
+    ///
+    ///   • `world.json`  — world fields + non-npc entities + clock/weather/
+    ///     travel/rumors/scene_pacing/status_tags/immutable_keys.
+    ///   • `player.json` — the `player_state` subtree (body, stamina, wealth,
+    ///     reputation).
+    ///   • `npc.json`    — `npc.*` entities + `npc_registry` + `relationships`
+    ///     + `presences` + `offscreen_tasks`.
+    ///
+    /// Implemented at the `serde_json::Value` level (partition a serialized
+    /// object by key; `entities` is split by the `npc.` prefix). `load_split`
+    /// is the inverse: read three files, deep-merge their `entities`, deserialize
+    /// the merged object back into one `WorldSchema`. A missing file = that
+    /// slice's keys deserialize to their `#[serde(default)]` (so a card with no
+    /// `player.json` yet loads a fully-healthy default body — same contract as
+    /// the old single-file load).
+    pub fn save_split(
+        &self,
+        world_path: &Path,
+        player_path: &Path,
+        npc_path: &Path,
+    ) -> std::io::Result<()> {
+        // Ensure the card folder exists (sibling files share a parent).
+        if let Some(parent) = world_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+
+        let full = serde_json::to_value(self)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        let Some(obj) = full.as_object().cloned() else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "world schema serialized to non-object",
+            ));
+        };
+
+        let mut world = obj;
+        let mut player = serde_json::Map::new();
+        let mut npc = serde_json::Map::new();
+
+        // player_state → player.json
+        if let Some(ps) = world.remove("player_state") {
+            player.insert("player_state".to_string(), ps);
+        }
+
+        // NPC-grouped fields → npc.json
+        for key in ["npc_registry", "relationships", "presences", "offscreen_tasks"] {
+            if let Some(v) = world.remove(key) {
+                npc.insert(key.to_string(), v);
+            }
+        }
+
+        // Partition entities by the `npc.` prefix: npc.* → npc.json, else world.json.
+        if let Some(entities_val) = world.remove("entities") {
+            if let Some(entities) = entities_val.as_object().cloned() {
+                let mut world_ent = serde_json::Map::new();
+                let mut npc_ent = serde_json::Map::new();
+                for (k, v) in entities {
+                    if k.starts_with("npc.") {
+                        npc_ent.insert(k, v);
+                    } else {
+                        world_ent.insert(k, v);
+                    }
+                }
+                // Only re-insert a (possibly empty) entities object when it's
+                // non-empty, so an absent slice deserializes to the default
+                // empty map on load (no `entities: {}` noise on disk).
+                if !world_ent.is_empty() {
+                    world.insert("entities".to_string(), world_ent.into());
+                }
+                if !npc_ent.is_empty() {
+                    npc.insert("entities".to_string(), npc_ent.into());
+                }
+            } else {
+                // entities wasn't an object (shouldn't happen) — preserve as-is.
+                world.insert("entities".to_string(), entities_val);
+            }
+        }
+
+        atomic_write_text(world_path, &serde_json::to_string_pretty(&world)?)?;
+        atomic_write_text(player_path, &serde_json::to_string_pretty(&player)?)?;
+        atomic_write_text(npc_path, &serde_json::to_string_pretty(&npc)?)
+    }
+
+    /// The inverse of [`save_split`]: read the three sibling files, deep-merge
+    /// their `entities` maps, and deserialize the merged object into one
+    /// `WorldSchema`. Any missing file contributes nothing (its keys fall back
+    /// to `#[serde(default)]`), so a pre-split save (only `world.json` exists)
+    /// loads cleanly — the player + npc slices default in.
+    pub fn load_split(
+        world_path: &Path,
+        player_path: &Path,
+        npc_path: &Path,
+    ) -> std::io::Result<Self> {
+        let mut merged: serde_json::Map<String, serde_json::Value> = serde_json::Map::new();
+
+        // Read each file + shallow-merge its keys. `entities` is special-cased:
+        // world.json + npc.json each may carry an `entities` object, and the two
+        // must UNION (deep-merge) rather than overwrite.
+        for path in [world_path, player_path, npc_path] {
+            let text = match std::fs::read_to_string(path) {
+                Ok(t) => t,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(e),
+            };
+            let val: serde_json::Value = serde_json::from_str(&text)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+            let Some(obj) = val.as_object() else {
+                continue; // a non-object file is ignored (defensive; shouldn't happen)
+            };
+            for (k, v) in obj {
+                if k == "entities" {
+                    // Deep-merge: both sides' entities objects union together.
+                    let target = merged
+                        .entry("entities".to_string())
+                        .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+                    if let (Some(target_map), Some(src_map)) =
+                        (target.as_object_mut(), v.as_object())
+                    {
+                        for (ek, ev) in src_map {
+                            target_map.insert(ek.clone(), ev.clone());
+                        }
+                    }
+                } else {
+                    merged.insert(k.clone(), v.clone());
+                }
+            }
+        }
+
+        serde_json::from_value(serde_json::Value::Object(merged))
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+    }
+}
+
+/// Atomic write of arbitrary text (temp + fsync + rename). Shared by the
+/// single-file `WorldSchema::save` and the three-file `save_split`. A crash
+/// mid-write leaves the destination either at its prior complete state or the
+/// new complete state — never a truncated middle (same guarantee as
+/// `session::Conversation::save`). The temp file is a sibling (same dir/volume)
+/// so `rename` is atomic on Windows (`MOVEFILE_REPLACE_EXISTING`).
+fn atomic_write_text(path: &Path, text: &str) -> std::io::Result<()> {
+    let tmp_path = temp_path_for(path);
+    let _ = std::fs::remove_file(&tmp_path); // clear stale temp
+    {
+        let mut file = std::fs::File::create(&tmp_path)?;
+        std::io::Write::write_all(&mut file, text.as_bytes())?;
+        std::io::Write::flush(&mut file)?;
+        let _ = file.sync_all();
+    }
+    std::fs::rename(&tmp_path, path)
 }
 
 /// A micro-delta against [`WorldSchema`]. All fields optional: the model

@@ -21,6 +21,10 @@
     /* Surfaces — rich dark charcoal, almost black. NOT the muddy umber of v1:
        #12100E reads as premium dark fantasy (leather + iron), not brown soup. */
     --fable-void:        #12100E;   /* near-black charcoal (world-space floor) */
+    /* DEEPER void for the New Game flow: a near-pure-black with the faintest
+       warm tint, so the rising fire embers read as the only light source in a
+       true dark void (the standard --fable-void charcoal is too warm/lit). */
+    --fable-void-deep:   #05040a;
     --fable-glass:       rgba(28, 24, 20, 0.94);   /* drawer/panel face */
     --fable-glass-deep:  rgba(20, 17, 14, 0.97);   /* heavier panel body */
     --fable-glass-line:  rgba(90, 76, 40, 0.55);   /* hairline divider */
@@ -725,6 +729,15 @@ body.fable-active.fable-chrome-peek .top-bar { transform: translateY(0); }
     font-weight: 700;
     letter-spacing: 0.04em;
 }
+/* New Game flow screens read as medieval engraving: Cinzel serif + wider
+   tracking on their titles, cohesive with the void + ember restyle. */
+.fable-picker-screen .fable-screen-title,
+.fable-creator-screen .fable-screen-title {
+    font-family: var(--fable-font-serif);
+    font-weight: 600;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+}
 
 /* --- Card picker --- */
 .fable-picker-screen { background: var(--fable-void); }
@@ -759,7 +772,7 @@ body.fable-active.fable-chrome-peek .top-bar { transform: translateY(0); }
 }
 .fable-card:hover { border-color: var(--fable-brass); transform: translateY(-2px); box-shadow: 0 8px 22px rgba(0,0,0,0.5), 0 0 16px var(--fable-brass-glow); }
 .fable-card:hover::before { opacity: 1; }
-.fable-card-name { position: relative; color: var(--fable-text); font-size: 19px; font-weight: 600; margin-bottom: 6px; }
+.fable-card-name { position: relative; color: var(--fable-text); font-family: var(--fable-font-serif); font-size: 19px; font-weight: 600; letter-spacing: 0.04em; margin-bottom: 6px; }
 .fable-card-tone {
     position: relative;
     color: var(--fable-brass);
@@ -948,16 +961,32 @@ body.fable-active.fable-chrome-peek .top-bar { transform: translateY(0); }
 .fable-dialogue-feed::-webkit-scrollbar { width: 0; height: 0; }
 .fable-dialogue-feed::-webkit-scrollbar-thumb { background: transparent; }
 
-/* A beat = the card directly (no avatar row). Under column-reverse, the
-   DEFAULT alignment is LEFT of center (narrator/AI/character/error): the
-   bubble hugs the left with a right auto-margin so it reads as the AI's
-   voice. The .user variant mirrors to the right. max-width caps each bubble
-   at ~74% so neither side stretches across the whole column. New beats
-   animate IN FROM THE BOTTOM (translateY positive → 0) so they appear to
-   rise from the input row + push the older beats upward. */
+/* === CARD-BASED MESSAGE LAYOUT (2026-08-01 overhaul) ======================
+   Each beat is a flex ROW: [avatar] [card], aligned left (AI/narrator/
+   character/error) or right (user, mirrored via row-reverse so the avatar
+   sits on the outer edge). Capped at 85% of the feed width. Tight 10–12px
+   vertical gaps kill the old large empty margins. The card carries a hover-
+   only header (.message-header) with name + time + action controls, so the
+   feed stays completely clean until the user hovers a card.
+
+   The structural contract (consumed by beats.js/narrator.js/stage.js):
+     .fable-beat            = the flex row (alignment + entrance anim here)
+       .message-avatar      = 80×120 portrait box (svg silhouette; img layer)
+       .message-card        = glass card (was .fable-beat-card)
+         .message-header    = hover-only: .msg-name + .msg-time + actions
+         .fable-beat-body   = UNCHANGED — streaming/variant/edit read this
+   .fable-beat-card is retained as a synonym alias of .message-card below so
+   the old selector paths in beats.js keep resolving during the transition;
+   new code targets .message-card directly.
+   ========================================================================= */
 .fable-beat {
-    max-width: 74%;
-    margin: 4px 0 4px auto;   /* left-of-center: right side open */
+    display: flex;
+    align-items: flex-start;
+    gap: 10px;
+    max-width: 85%;
+    margin: 10px 0;            /* tight rhythm — was 4px (killed the big gaps) */
+    margin-left: 0;            /* AI/narrator/character/error: hug the LEFT */
+    margin-right: auto;
     animation: echoRise 300ms cubic-bezier(0.2, 0.8, 0.2, 1) both;
     pointer-events: auto;
 }
@@ -966,55 +995,177 @@ body.fable-active.fable-chrome-peek .top-bar { transform: translateY(0); }
     to   { opacity: 1; transform: translateY(0); }
 }
 
-/* The card face — the ECHO glass bubble. Shared base across all types;
-   per-type rules below set the glass tint + the asymmetric "speech tail"
-   corner radius (borrowed from SillyTavern's Bubble style). */
-.fable-beat-card {
-    padding: 12px 18px;
+/* USER — mirrored to the RIGHT. row-reverse puts the avatar on the outer
+   (right) edge, and the right/left margins swap so the card hugs the right. */
+.fable-beat.user {
+    flex-direction: row-reverse;
+    margin-left: auto;
+    margin-right: 0;
+}
+
+/* --- Avatar (the portrait box) --- */
+/* Fixed 80×120 portrait. The inline-SVG silhouette is the always-present
+   fallback layer; an <img> (if resolveAvatar returns a URL) layers on top.
+   object-fit:cover so portraits never stretch; the svg fills via currentColor
+   so it tints with the message-type accent. A subtle inner ring reads as an
+   integrated frame, not a floating tile. */
+.message-avatar {
+    position: relative;
+    flex: 0 0 80px;
+    width: 80px;
+    height: 120px;
+    border-radius: 10px;
+    overflow: hidden;
+    background: rgba(255, 255, 255, 0.035);
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    box-shadow: inset 0 0 0 1px rgba(0, 0, 0, 0.25), 0 4px 10px rgba(0, 0, 0, 0.35);
+}
+.message-avatar svg {
+    position: absolute;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    color: var(--fable-text-faint);
+    opacity: 0.55;
+}
+.message-avatar img {
+    position: absolute;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+}
+/* Tint the silhouette per message type so avatars carry a hint of identity
+   even without art. AI/narrator → echo blue; user → warm brass. */
+.fable-beat.narrator .message-avatar svg,
+.fable-beat.character .message-avatar svg { color: var(--echo-accent); opacity: 0.6; }
+.fable-beat.user .message-avatar svg { color: var(--fable-brass); opacity: 0.6; }
+
+/* --- Card face (the dark-charcoal glass panel) --- */
+/* Your exact spec: rgba(255,255,255,0.035) + blur(8px) + 1px hairline. The
+   asymmetric tail corner radius (bottom-left for AI / bottom-right for user)
+   is retained from the ECHO layer so the speech-bubble character survives. */
+.message-card {
+    position: relative;
+    flex: 1 1 auto;
+    min-width: 0;             /* allow the prose to shrink so the avatar holds 80px */
+    padding: 12px 16px;
     border-radius: 15px 15px 15px 4px;   /* tail corner bottom-left (AI) */
-    font-size: 16px;
-    line-height: 1.6;
+    background: rgba(255, 255, 255, 0.035);
     backdrop-filter: blur(var(--echo-blur));
     -webkit-backdrop-filter: blur(var(--echo-blur));
+    border: 1px solid rgba(255, 255, 255, 0.08);
     box-shadow: var(--echo-shadow-soft), 0 6px 18px var(--echo-shadow);
-    border: 1px solid transparent;
-}
-
-/* NARRATOR (AI / Game Master) — left of center, the AI glass tint. */
-.fable-beat.narrator .fable-beat-card {
-    background: var(--echo-glass-ai);
+    font-size: 16px;
+    line-height: 1.6;
     color: var(--fable-text);
 }
-
-/* CHARACTER (CHARACTER_TURN NPC line) — same left layout + AI glass; the
-   speaker label sits above the prose. Reads as an NPC speaking in-scene. */
-.fable-beat.character .fable-beat-card {
-    background: var(--echo-glass-ai);
-    color: var(--fable-text);
+.fable-beat.user .message-card {
+    border-radius: 15px 15px 4px 15px;   /* tail corner bottom-right (mirrored) */
 }
-.fable-beat-speaker {
-    color: var(--echo-accent);
+/* Legacy selector alias: keep .fable-beat-card pointing at the same face so
+   the querySelector('.fable-beat-card') sites in beats.js resolve during the
+   class-name transition. New code should target .message-card. */
+.fable-beat .fable-beat-card { /* alias */ }
+
+/* Per-type glass tints (subtle, over the shared charcoal base). */
+.fable-beat.narrator .message-card,
+.fable-beat.character .message-card { background: var(--echo-glass-ai); }
+.fable-beat.user .message-card { background: var(--echo-glass-user); }
+.fable-beat.error .message-card {
+    background: rgba(120, 30, 30, 0.55);
+    border: 1px solid rgba(244, 114, 114, 0.4);
+    border-radius: 10px;
+    color: #f4c4c4;
+    font-size: 15px;
+}
+
+/* --- Hover-only header (name + time + actions) --- */
+/* opacity 0 → 1 on .message-card:hover. Hidden entirely while streaming or
+   editing so a live/in-flight card shows no chrome. Anchored at the top edge
+   of the card (the row above the prose), pushing the body down on reveal. */
+.message-header {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-bottom: 6px;
+    opacity: 0;
+    transition: opacity 0.2s ease;
+    pointer-events: none;     /* the whole header is inert until revealed */
+}
+.message-card:hover .message-header,
+.message-card:focus-within .message-header {
+    opacity: 1;
+    pointer-events: auto;
+}
+.fable-beat.streaming .message-header,
+.fable-beat.editing .message-header {
+    opacity: 0 !important;
+    pointer-events: none !important;
+}
+.msg-name {
     font-size: 12.5px;
     font-weight: 700;
     letter-spacing: 0.06em;
     text-transform: uppercase;
-    margin-bottom: 6px;
+    color: var(--echo-accent);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
 }
+.fable-beat.user .msg-name { color: var(--fable-brass-bright); }
+.msg-time {
+    font-size: 11px;
+    color: var(--fable-text-faint);
+    font-variant-numeric: tabular-nums;
+    white-space: nowrap;
+}
+.message-actions {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    margin-left: auto;        /* push controls to the header's right edge */
+}
+/* Edit trigger (the ✎ icon button in the header). Shares the swipe-btn chrome
+   so the controls read as one family. */
+.msg-action-btn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 22px;
+    height: 22px;
+    padding: 0;
+    background: transparent;
+    border: 1px solid transparent;
+    border-radius: 5px;
+    color: var(--fable-text-faint);
+    cursor: pointer;
+    transition: color 160ms ease, border-color 160ms ease, background 160ms ease;
+}
+.msg-action-btn:hover {
+    color: var(--echo-accent);
+    border-color: rgba(81, 160, 222, 0.4);
+    background: rgba(81, 160, 222, 0.08);
+}
+.msg-action-btn:focus-visible {
+    outline: 1.5px solid var(--echo-accent);
+    outline-offset: 1px;
+}
+.msg-action-btn svg { display: block; width: 14px; height: 14px; }
 
-/* USER — RIGHT of center (mirror of the narrator's left). The mirrored
-   corner radius (tail bottom-right) + the user glass tint. */
-.fable-beat.user {
-    margin: 4px auto 4px 0;   /* right-of-center: left side open */
-}
-.fable-beat.user .fable-beat-card {
-    background: var(--echo-glass-user);
-    border-radius: 15px 15px 4px 15px;   /* tail corner bottom-right */
-    color: var(--fable-text);
+/* --- Dialogue coloring (visual-novel immersion) --- */
+/* Quoted speech (straight or smart quotes) is wrapped in .dialogue by the
+   renderProse pass (beats.js) → rendered accent + italic so spoken lines pop
+   against narration prose. Narration text stays default. */
+.fable-beat-body .dialogue {
+    color: var(--echo-accent-2);
+    font-style: italic;
 }
 
 /* SYSTEM — centered, de-emphasized italic line (object state changes, saves).
-   No card (system beats render a plain text node, no .fable-beat-card). */
+   No card, no avatar (plain text node). Overrides the flex row above. */
 .fable-beat.system {
+    display: block;
     max-width: 560px;
     margin: 6px auto;
     text-align: center;
@@ -1024,15 +1175,6 @@ body.fable-active.fable-chrome-peek .top-bar { transform: translateY(0); }
     letter-spacing: 0.03em;
     opacity: 0.85;
     animation: none;   /* system lines don't rise */
-}
-
-/* ERROR — muted red glass on the left (same layout as narrator). */
-.fable-beat.error .fable-beat-card {
-    background: rgba(120,30,30,0.55);
-    border: 1px solid rgba(244,114,114,0.4);
-    border-radius: 10px;
-    color: #f4c4c4;
-    font-size: 15px;
 }
 .fable-beat-body br { content: ""; display: block; }
 
@@ -1052,36 +1194,21 @@ body.fable-active.fable-chrome-peek .top-bar { transform: translateY(0); }
 }
 
 /* =============================================================
-   UX CHAT CONTROLS — the SillyTavern-style ‹ n/N › swipe bar (ECHO rewrite,
-   2026-07-31). The old circular-arrow regenerate button is GONE. Instead,
-   thin Unicode chevrons flank a counter on the LAST assistant beat:
+   UX CHAT CONTROLS — the SillyTavern-style ‹ n/N › swipe bar.
+   Thin Unicode chevrons flank a counter on assistant beats:
      ‹ (left)  → step back to the previous variant (undo, unlimited).
      › (right) → step forward; if on the LAST variant, REGENERATE (a new
                 variant is generated + appended; variants are uncapped).
-   The bar is ALWAYS VISIBLE on the last beat (low opacity, accenting to
-   the ECHO blue on hover) — not hover-gated, so the affordance is
-   discoverable. Earlier assistant beats show the read-only counter +
-   navigation (no regenerate). Disabled while `.streaming` / `.editing`.
+   2026-08-01: the bar now lives INSIDE .message-actions (the hover-only
+   header), so its visibility is driven by the header's opacity transition
+   above — the feed stays fully clean until a card is hovered. The
+   .is-hidden class (on earlier beats' read-only counter) is retained but
+   no longer toggles opacity itself (the header gate already hides it).
    ============================================================= */
 .fable-beat-controls {
-    display: flex;
-    gap: 4px;
-    margin-top: 6px;
-    opacity: 0.65;
-    transition: opacity 160ms ease;
-    pointer-events: auto;
-}
-.fable-beat-controls.is-hidden {
-    opacity: 0;
-    pointer-events: none;
-}
-.fable-beat:hover:not(.streaming):not(.editing) .fable-beat-controls {
-    opacity: 0.95;
-}
-.fable-beat.streaming .fable-beat-controls,
-.fable-beat.editing .fable-beat-controls {
-    opacity: 0;
-    pointer-events: none;
+    display: inline-flex;
+    align-items: center;
+    gap: 2px;
 }
 
 /* --- Swipeable variants (the ‹ n/N › bar) --- */
@@ -1442,40 +1569,26 @@ body.fable-active.fable-chrome-peek .top-bar { transform: translateY(0); }
 .fable-wupi-drawer.open { transform: translateX(0); }
 
 /* =============================================================
-   LEFT DRAWER — Card / Tracker / Codex authoring panel (ECHO, 2026-07-31).
-   Mirrors the right Wupi drawer's slide on the LEFT edge. A small always-
-   visible handle (the › glyph) on the left edge opens it (discoverability —
-   unlike the right drawer's invisible hover strip, this new panel needs a
-   hint). Three tabs across the top switch the panel content.
+   LEFT DRAWER — Card / Tracker authoring panel (ECHO, 2026-07-31; mirrored
+   to the right drawer 2026-08-01). EXACT MIRROR of the right Wupi drawer:
+   opened by an invisible left-edge hover strip (.fable-corner-trigger--left,
+   below) + pinned by a left edge-lock bar (.fable-edge-lock--left). The old
+   always-visible `›` handle was removed — the two drawers behave identically,
+   just mirrored. Two tabs across the top switch the panel content.
    ============================================================= */
 .fable-left-drawer-mount { position: absolute; inset: 0; pointer-events: none; }
-/* The handle: a slim tab on the left edge, vertically centered. pointer-events
-   auto so it's clickable despite the mount being none. */
-.fable-left-drawer__handle {
+
+/* The LEFT hover strip — mirror of the right .fable-corner-trigger. Sits at
+   left:0, fully transparent, 300ms dwell in stage.js opens the left drawer. */
+.fable-corner-trigger--left {
     position: absolute;
+    top: 0;
     left: 0;
-    top: 50%;
-    transform: translateY(-50%);
-    z-index: 41;
-    pointer-events: auto;
-    width: 22px;
-    height: 64px;
-    border: 1px solid var(--fable-brass-dim);
-    border-left: none;
-    border-radius: 0 8px 8px 0;
-    background: var(--fable-glass);
-    color: var(--fable-brass);
-    cursor: pointer;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    backdrop-filter: blur(16px);
-    transition: opacity 200ms ease, color 160ms ease, background 160ms ease;
-    opacity: 0.55;
+    bottom: 0;
+    width: 192px;  /* ~2 inches at 96dpi — same as the right strip */
+    z-index: 30;
+    background: transparent;
 }
-.fable-left-drawer__handle:hover { opacity: 0.95; color: var(--fable-brass-bright); }
-.fable-left-drawer__handle.is-hidden { opacity: 0; pointer-events: none; }
-.fable-left-drawer__handle-icon { font-size: 18px; line-height: 1; }
 
 .fable-left-drawer {
     position: absolute;
@@ -1495,180 +1608,199 @@ body.fable-active.fable-chrome-peek .top-bar { transform: translateY(0); }
     pointer-events: auto;
 }
 .fable-left-drawer.open { transform: translateX(0); }
-.fable-left-drawer__header {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    padding: 10px 12px 0;
-    border-bottom: 1px solid var(--fable-glass-line);
+
+/* =============================================================
+   LEFT DRAWER — VISUAL HUD (§11.30, 2026-08-02)
+   Three surfaces: paperdoll (§1), ambient time/weather (§2), inventory (§3).
+   The base .fable-left-drawer above owns position + transform + glass face;
+   these rules layer the HUD content + the ambient background tint on top.
+   ============================================================= */
+
+/* §2 — Ambient time-of-day background tint. data-time is set by renderAmbient.
+   Layered OVER the base --fable-glass so the drawer still reads as glass but
+   shifts cool/warm with the in-world clock. */
+.fable-left-drawer[data-time="night"]     { background: #0a0c10; }
+.fable-left-drawer[data-time="twilight"]  { background: #14131a; }
+.fable-left-drawer[data-time="day"]       { background: #181c24; }
+
+/* Weather overlay — a pointer-events:none animation layer above the tint,
+   below the content. Subtle (≤8% opacity) so it never distracts from the
+   paperdoll. data-weather set by renderAmbient. */
+.hud-ambient-layer {
+    position: absolute;
+    inset: 0;
+    pointer-events: none;
+    z-index: 0;
+    opacity: 0;
+    transition: opacity 600ms ease;
 }
-.fable-left-drawer__tabs {
-    display: flex;
-    gap: 2px;
-    flex: 1;
+.fable-left-drawer[data-weather="rain"] .hud-ambient-layer {
+    opacity: 0.06;
+    background: repeating-linear-gradient(115deg,
+        transparent 0 6px, rgba(180,200,230,0.6) 6px 7px);
+    animation: hud-rain 0.6s linear infinite;
 }
-.fable-left-drawer__tab {
-    flex: 1;
-    padding: 8px 6px;
+.fable-left-drawer[data-weather="snow"] .hud-ambient-layer {
+    opacity: 0.05;
+    background-image: radial-gradient(circle, rgba(255,255,255,0.8) 1px, transparent 1.5px);
+    background-size: 32px 32px;
+    animation: hud-snow 6s linear infinite;
+}
+.fable-left-drawer[data-weather="fog"] .hud-ambient-layer {
+    opacity: 0.08;
+    background: radial-gradient(ellipse at 30% 40%, rgba(200,200,210,0.5), transparent 70%),
+                radial-gradient(ellipse at 70% 60%, rgba(180,180,200,0.4), transparent 70%);
+    animation: hud-fog 18s ease-in-out infinite alternate;
+}
+@keyframes hud-rain  { from { background-position: 0 0; } to { background-position: -14px 28px; } }
+@keyframes hud-snow  { from { background-position: 0 0; } to { background-position: 0 32px; } }
+@keyframes hud-fog   { from { transform: translateX(-3%); } to { transform: translateX(3%); } }
+
+/* Two-column master grid (2026-08-02 reorg). Unequal columns: the LEFT
+   column keeps the paperdoll near its original size; the RIGHT column is a
+   ~160px rail holding the Chronos & Climate panel. The drawer's
+   .fable-left-drawer is display:flex column; this grid takes flex:1 so it
+   owns the full drawer height. min-width:0 on the columns is the
+   load-bearing grid-item fix that lets the paperdoll image shrink without
+   overflowing the drawer (otherwise grid items default to min-content). */
+.hud-master-grid {
+    position: relative;
+    z-index: 1;
+    flex: 1 1 auto;
+    display: grid;
+    grid-template-columns: minmax(280px, 1fr) 160px;
+    grid-template-rows: 1fr;
+    height: 100%;
+    gap: 16px;
+    padding: 16px;
+    overflow: hidden;
+}
+.hud-col {
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+    min-height: 0;
+}
+.hud-col--right {
+    /* Right rail holds the env panel at its top; no stretch-fill needed. */
+    justify-content: flex-start;
+}
+
+/* ── §1 PAPERDOLL ────────────────────────────────────────────────────── */
+/* EXACT original positioning (restored 2026-08-03 after the grid reorg
+   broke it): width-driven, capped at 400px, aspect-ratio 4/9 matching the
+   1376x3096 source canvas, with the -70px left margin that eats the PNG's
+   baked-in transparent left canvas + cancels the column padding so the
+   figure pins flush to the glass wall. Vertically centered in the column.
+   The left grid column is sized to FIT this paperdoll, not the other way
+   around — see .hud-master-grid above. */
+.hud-paperdoll-section {
+    height: 100%;
+    display: flex;
+    align-items: center;          /* vertically centered in the column */
+    justify-content: flex-start;  /* flush left */
+}
+.hud-paperdoll-wrap {
+    position: relative;
+    width: 100%;
+    max-width: 400px;
+    aspect-ratio: 4 / 9;          /* matches the source PNG canvas (1376x3096 = 4/9) */
+    /* The -70px cancels the grid column's left padding (16px) AND eats the
+       PNG's own baked-in transparent left canvas (~202px / 1376 ≈ 15% → ~60px
+       at 400px wide). overflow:hidden on .hud-master-grid clips the transparent
+       overflow so the CHARACTER lands flush at the drawer wall with no visible
+       cropping (only transparent pixels lost). This is the original value. */
+    margin: 0 0 0 -70px;
+    pointer-events: none;
+}
+.hud-paperdoll-base {
+    position: absolute;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    object-fit: contain;
+    object-position: top left;    /* flush to the wrap's top-left corner */
+    filter: drop-shadow(0 0 10px rgba(0,0,0,0.6));
+}
+
+/* Gender toggle — minimal glassmorphic pill pinned to the drawer's FAR
+   top-left corner (Chloe 2026-08-02). Direct child of the drawer so it
+   anchors to the drawer's top-left, not the paperdoll wrap. Stays above
+   the figure + scroll content. */
+.hud-gender-toggle {
+    position: absolute;
+    top: 8px;
+    left: 8px;
+    z-index: 5;
+    display: inline-flex;
+    gap: 1px;
+    padding: 1px;
+    background: var(--fable-glass-deep);
+    border: 1px solid var(--fable-glass-line);
+    border-radius: 10px;
+    backdrop-filter: blur(8px);
+}
+.hud-gender-toggle button {
+    min-width: 24px;
+    height: 22px;
+    padding: 0 6px;
     background: transparent;
     border: none;
-    border-bottom: 2px solid transparent;
     color: var(--fable-text-dim);
-    font-family: inherit;
-    font-size: 13.5px;
-    font-weight: 600;
-    letter-spacing: 0.04em;
+    font-size: 13px;
+    line-height: 1;
+    border-radius: 10px;
     cursor: pointer;
-    transition: color 160ms ease, border-color 160ms ease;
+    transition: color 120ms ease, background 120ms ease;
 }
-.fable-left-drawer__tab:hover { color: var(--fable-text); }
-.fable-left-drawer__tab.is-active {
-    color: var(--echo-accent);
-    border-bottom-color: var(--echo-accent);
+.hud-gender-toggle button:hover { color: var(--fable-text); }
+.hud-gender-toggle button[aria-pressed="true"] {
+    color: var(--fable-brass-bright);
+    background: var(--fable-brass-dim);
+    box-shadow: 0 0 6px var(--fable-brass-glow);
 }
-.fable-left-drawer__close {
-    width: 28px; height: 28px;
-    background: transparent; border: none;
-    color: var(--fable-text-faint);
-    font-size: 15px; cursor: pointer;
-    border-radius: 6px;
-    transition: color 160ms ease, background 160ms ease;
-}
-.fable-left-drawer__close:hover { color: var(--fable-text); background: rgba(255,255,255,0.05); }
 
-.fable-left-drawer__body {
-    flex: 1;
-    overflow-y: auto;
-    padding: 14px 16px 20px;
-    scrollbar-width: thin;
-}
-.fable-left-drawer__panel { display: none; }
-.fable-left-drawer__panel.is-active { display: block; }
-
-.fable-left-drawer__form { display: flex; flex-direction: column; gap: 12px; }
-.fable-left-drawer__field { display: flex; flex-direction: column; gap: 4px; }
-.fable-left-drawer__label {
-    font-size: 11px;
-    text-transform: uppercase;
-    letter-spacing: 0.08em;
-    color: var(--fable-text-faint);
-}
-.fable-left-drawer__field input,
-.fable-left-drawer__field textarea {
-    width: 100%;
-    box-sizing: border-box;
-    padding: 8px 10px;
-    background: var(--fable-inset);
-    color: var(--fable-text);
-    border: 1px solid var(--fable-brass-dim);
-    border-radius: 7px;
-    font-family: inherit;
-    font-size: 13.5px;
-    line-height: 1.45;
-    resize: vertical;
-}
-.fable-left-drawer__field input:focus,
-.fable-left-drawer__field textarea:focus {
-    outline: none;
-    border-color: var(--echo-accent);
-}
-.fable-left-drawer__actions {
+/* ── §2 ENVIRONMENT PANEL — Chronos & Climate (right rail top) ──────── */
+/* Minimal glassmorphic card: a small label + crisp gold time/weather line.
+   Sits at the top of the RIGHT grid column; the column is a narrow rail so
+   the panel reads as a compact stat block, not a full-width widget. */
+.hud-environment-panel {
     display: flex;
-    align-items: center;
-    gap: 10px;
-    flex-wrap: wrap;
+    flex-direction: column;
+    gap: 4px;
+    padding: 12px 14px;
+    background: var(--fable-glass-deep);
+    border: 1px solid var(--fable-brass-dim);
+    border-radius: 10px;
+    backdrop-filter: blur(8px);
+}
+.hud-env-label {
+    font-size: 10px;
+    letter-spacing: 1.5px;
+    text-transform: uppercase;
+    color: var(--fable-text-faint);
     margin-top: 4px;
 }
-.fable-left-drawer__btn {
-    padding: 7px 16px;
-    background: transparent;
-    color: var(--fable-text);
-    border: 1px solid var(--fable-brass-dim);
-    border-radius: 7px;
-    font-family: inherit;
+.hud-env-label:first-child { margin-top: 0; }
+.hud-env-time,
+.hud-env-weather {
+    font-size: 14px;
+    line-height: 1.2;
+    color: var(--fable-brass-bright);   /* crisp gold text */
+    letter-spacing: 0.3px;
+    word-break: break-word;
+}
+.hud-env-glyph {
     font-size: 13px;
-    cursor: pointer;
-    transition: color 160ms ease, border-color 160ms ease, background 160ms ease;
+    margin-right: 2px;
 }
-.fable-left-drawer__btn:hover { border-color: var(--fable-brass); color: var(--fable-brass-bright); }
-.fable-left-drawer__btn.primary {
-    background: rgba(81, 160, 222, 0.16);
-    border-color: var(--echo-accent);
-    color: var(--echo-accent);
-}
-.fable-left-drawer__btn.primary:hover { background: rgba(81, 160, 222, 0.28); color: var(--fable-text); }
-.fable-left-drawer__note {
-    font-size: 11px;
-    color: var(--fable-text-faint);
-    font-style: italic;
-}
-.fable-left-drawer__status {
-    font-size: 12px;
-    color: var(--fable-text-dim);
-}
-.fable-left-drawer__empty,
-.fable-left-drawer__error {
-    padding: 24px 8px;
-    color: var(--fable-text-dim);
-    font-style: italic;
-    text-align: center;
-    line-height: 1.5;
-}
-.fable-left-drawer__error { color: #f4a0a0; }
 
-/* Codex tab specifics. */
-.fable-left-drawer__codex { display: flex; flex-direction: column; gap: 16px; }
-.fable-left-drawer__codex-add {
-    display: flex; flex-direction: column; gap: 8px;
-    padding-bottom: 14px;
-    border-bottom: 1px solid var(--fable-glass-line);
-}
-.fable-left-drawer__codex-title,
-.fable-left-drawer__codex-body {
-    width: 100%; box-sizing: border-box;
-    padding: 8px 10px;
-    background: var(--fable-inset);
-    color: var(--fable-text);
-    border: 1px solid var(--fable-brass-dim);
-    border-radius: 7px;
-    font-family: inherit;
-    font-size: 13.5px;
-    line-height: 1.45;
-    resize: vertical;
-}
-.fable-left-drawer__codex-title:focus,
-.fable-left-drawer__codex-body:focus { outline: none; border-color: var(--echo-accent); }
-.fable-left-drawer__codex-list { display: flex; flex-direction: column; gap: 8px; }
-.fable-left-drawer__codex-item {
-    padding: 10px 12px;
-    background: rgba(255,255,255,0.03);
-    border: 1px solid var(--fable-glass-line);
-    border-radius: 8px;
-    position: relative;
-}
-.fable-left-drawer__codex-item-title {
-    font-size: 13px; font-weight: 600;
-    color: var(--fable-text);
-    margin-bottom: 3px;
-}
-.fable-left-drawer__codex-item-body {
-    font-size: 12px; line-height: 1.45;
-    color: var(--fable-text-dim);
-    white-space: pre-wrap;
-}
-.fable-left-drawer__codex-del {
-    margin-top: 6px;
-    padding: 3px 10px;
-    background: transparent;
-    color: var(--fable-text-faint);
-    border: 1px solid var(--fable-glass-line);
-    border-radius: 5px;
-    font-family: inherit;
-    font-size: 11px;
-    cursor: pointer;
-    transition: color 160ms ease, border-color 160ms ease;
-}
-.fable-left-drawer__codex-del:hover { color: #f4a0a0; border-color: rgba(244,160,160,0.4); }
+/* =============================================================
+   RIGHT WUPI DRAWER — header + brand + tab rail (below).
+   The Card/Tracker left-drawer tab CSS was removed (2026-08-01 rework); the
+   left drawer is now an empty shell. The tab rail + prose dropdowns live in
+   the RIGHT drawer under the WUPI brand (see .fable-tab-rail* + .fable-tab-drop*).
+   ============================================================= */
 .fable-wupi-header {
     display: flex;
     align-items: center;
@@ -1698,6 +1830,252 @@ body.fable-active.fable-chrome-peek .top-bar { transform: translateY(0); }
         0 0 24px rgba(181, 166, 66, 0.35);        /* wider soft bloom */
     text-align: center;
 }
+
+/* =============================================================
+   TAB RAIL — the tracked-stat icon rail under the WUPI brand.
+   Five icons (Player / Sim Card / Codex / World / NPC). One active at a time
+   (glowing); clicking toggles a prose dropdown. The dropdown persists across
+   drawer close/reopen (hover-reopen-keeps-active).
+   ============================================================= */
+.fable-tab-rail-wrap { display: flex; flex-direction: column; }
+/* The thin divider beneath the brand, hugging the rail. */
+.fable-tab-rail-divider {
+    height: 1px;
+    margin: 0 14px 8px;
+    background: linear-gradient(90deg, transparent, var(--fable-glass-line), transparent);
+}
+.fable-tab-rail {
+    display: flex;
+    gap: 4px;
+    padding: 0 12px 8px;
+    border-bottom: 1px solid var(--fable-glass-line);
+}
+.fable-tab-rail__btn {
+    flex: 1;
+    height: 38px;
+    display: inline-flex; align-items: center; justify-content: center;
+    background: transparent;
+    border: 1px solid transparent;
+    border-radius: 8px;
+    color: var(--fable-text-faint);
+    cursor: pointer;
+    padding: 0;
+    transition: color 160ms ease, border-color 160ms ease, background 160ms ease, box-shadow 160ms ease;
+}
+.fable-tab-rail__btn svg { width: 20px; height: 20px; display: block; }
+.fable-tab-rail__btn:hover { color: var(--fable-text); border-color: var(--fable-brass-dim); }
+/* Active tab: glowing brass. The glow reads as "this tab is live / pinned". */
+.fable-tab-rail__btn.is-active {
+    color: var(--fable-brass-bright);
+    border-color: var(--fable-brass);
+    background: rgba(197, 179, 88, 0.10);
+    box-shadow: 0 0 10px var(--fable-brass-glow), inset 0 0 6px rgba(230, 213, 138, 0.10);
+}
+
+/* ── Prose dropdown (the toggled panel under the rail) ─────────────────── */
+.fable-tab-dropdown {
+    padding: 12px 16px 14px;
+    border-bottom: 1px solid var(--fable-glass-line);
+    max-height: 42vh;
+    overflow-y: auto;
+    scrollbar-width: thin;
+}
+.fable-tab-dropdown[hidden] { display: none; }
+.fable-tab-drop__head {
+    display: flex; align-items: center; justify-content: space-between;
+    margin-bottom: 10px;
+}
+.fable-tab-drop__title {
+    font-size: 12px; font-weight: 600; letter-spacing: 0.08em;
+    text-transform: uppercase; color: var(--fable-brass);
+}
+.fable-tab-drop__edit {
+    width: 26px; height: 26px;
+    background: transparent; border: 1px solid var(--fable-glass-line);
+    border-radius: 6px; color: var(--fable-text-faint);
+    font-size: 14px; cursor: pointer;
+    transition: color 160ms ease, border-color 160ms ease;
+}
+.fable-tab-drop__edit:hover { color: var(--fable-text); border-color: var(--fable-brass); }
+.fable-tab-drop__body { display: flex; flex-direction: column; gap: 6px; }
+.fable-drop-row {
+    display: flex; justify-content: space-between; align-items: baseline;
+    padding: 5px 0;
+    border-bottom: 1px solid rgba(255,255,255,0.03);
+    font-size: 13.5px; color: var(--fable-text-dim);
+}
+.fable-drop-row:last-child { border-bottom: none; }
+.fable-drop-val { color: var(--fable-text); font-weight: 500; }
+.fable-drop-val.bad { color: #f4a0a0; }
+.fable-drop-val.warn { color: #fbbf24; }
+.fable-drop-val.good { color: #86efac; }
+.fable-drop-muted { color: var(--fable-text-faint); font-style: italic; font-size: 13px; }
+.fable-drop-section {
+    margin-top: 8px; font-size: 11px; text-transform: uppercase;
+    letter-spacing: 0.08em; color: var(--fable-text-faint);
+}
+.fable-drop-empty { padding: 16px 4px; color: var(--fable-text-faint); font-style: italic; text-align: center; }
+.fable-drop-error { color: #f4a0a0; padding: 8px 0; }
+
+/* Form fields (Card + World tabs reuse these). */
+.fable-drop-form { display: flex; flex-direction: column; gap: 9px; }
+.fable-drop-field { display: flex; flex-direction: column; gap: 3px; }
+.fable-drop-label {
+    font-size: 10.5px; text-transform: uppercase; letter-spacing: 0.07em;
+    color: var(--fable-text-faint);
+}
+.fable-drop-field input,
+.fable-drop-field textarea {
+    width: 100%; box-sizing: border-box;
+    padding: 7px 9px;
+    background: var(--fable-inset); color: var(--fable-text);
+    border: 1px solid var(--fable-brass-dim); border-radius: 6px;
+    font-family: inherit; font-size: 13px; line-height: 1.4; resize: vertical;
+}
+.fable-drop-field input:focus,
+.fable-drop-field textarea:focus { outline: none; border-color: var(--fable-brass); }
+.fable-drop-actions { display: flex; align-items: center; gap: 10px; margin-top: 6px; }
+.fable-drop-btn {
+    padding: 6px 14px; background: transparent; color: var(--fable-text);
+    border: 1px solid var(--fable-brass-dim); border-radius: 6px;
+    font-family: inherit; font-size: 12.5px; cursor: pointer;
+    transition: color 160ms ease, border-color 160ms ease;
+}
+.fable-drop-btn:hover { border-color: var(--fable-brass); color: var(--fable-brass-bright); }
+.fable-drop-btn.primary {
+    background: rgba(81, 160, 222, 0.16); border-color: var(--echo-accent); color: var(--echo-accent);
+}
+.fable-drop-btn.primary:hover { background: rgba(81, 160, 222, 0.28); color: var(--fable-text); }
+.fable-drop-status { font-size: 11.5px; color: var(--fable-text-dim); }
+
+/* Codex entries. */
+.fable-codex-add { margin-bottom: 10px; }
+.fable-codex-list { display: flex; flex-direction: column; gap: 8px; margin-bottom: 8px; }
+.fable-codex-item {
+    display: flex; flex-direction: column; gap: 5px;
+    padding: 9px; background: rgba(255,255,255,0.03);
+    border: 1px solid var(--fable-glass-line); border-radius: 7px;
+}
+.fable-codex-title, .fable-codex-tags {
+    width: 100%; box-sizing: border-box; padding: 6px 8px;
+    background: var(--fable-inset); color: var(--fable-text);
+    border: 1px solid var(--fable-brass-dim); border-radius: 5px;
+    font-family: inherit; font-size: 12.5px;
+}
+.fable-codex-body {
+    width: 100%; box-sizing: border-box; padding: 6px 8px;
+    background: var(--fable-inset); color: var(--fable-text);
+    border: 1px solid var(--fable-brass-dim); border-radius: 5px;
+    font-family: inherit; font-size: 12.5px; line-height: 1.4; resize: vertical;
+}
+.fable-codex-title:focus, .fable-codex-tags:focus, .fable-codex-body:focus {
+    outline: none; border-color: var(--fable-brass);
+}
+.fable-codex-del {
+    align-self: flex-start; padding: 3px 9px; background: transparent;
+    color: var(--fable-text-faint); border: 1px solid var(--fable-glass-line);
+    border-radius: 4px; font-family: inherit; font-size: 11px; cursor: pointer;
+}
+.fable-codex-del:hover { color: #f4a0a0; border-color: rgba(244,160,160,0.4); }
+
+/* NPC cards. */
+.fable-npc-list { display: flex; flex-direction: column; gap: 8px; margin-bottom: 8px; }
+.fable-npc-card {
+    display: flex; flex-direction: column; gap: 4px;
+    padding: 8px; background: rgba(255,255,255,0.03);
+    border: 1px solid var(--fable-glass-line); border-left: 3px solid var(--fable-brass);
+    border-radius: 6px;
+}
+.fable-npc-name {
+    width: 100%; box-sizing: border-box; padding: 5px 8px;
+    background: transparent; color: var(--fable-text);
+    border: none; font-family: inherit; font-size: 13px; font-weight: 600;
+}
+.fable-npc-state {
+    width: 100%; box-sizing: border-box; padding: 6px 8px;
+    background: var(--fable-inset); color: var(--fable-text-dim);
+    border: 1px solid var(--fable-brass-dim); border-radius: 5px;
+    font-family: inherit; font-size: 12.5px; line-height: 1.4; resize: vertical;
+}
+.fable-npc-state:focus { outline: none; border-color: var(--fable-brass); }
+
+/* =============================================================
+   RAW EDITOR — the centered, immovable raw-file modal.
+   Darkens the full stage; ✓ / ↻ / ✕ controls; validation lock on invalid.
+   z:47 (above panel=45, save=46). Hand-rolled (no modal factory); mirrors the
+   save-modal pattern.
+   ============================================================= */
+.fable-raw-editor-overlay {
+    position: absolute; inset: 0; z-index: 47;
+    display: flex; align-items: center; justify-content: center;
+}
+.fable-raw-editor-overlay[hidden] { display: none; }
+.fable-raw-editor-backdrop {
+    position: absolute; inset: 0;
+    /* Heavier than the panel backdrop so only the modal is in focus. */
+    background: rgba(2, 4, 10, 0.85);
+    backdrop-filter: blur(8px);
+}
+.fable-raw-editor-modal {
+    position: relative; z-index: 2;
+    width: min(780px, 92vw); height: min(78vh, 760px);
+    display: flex; flex-direction: column;
+    background: linear-gradient(180deg, rgba(38, 26, 16, 0.98), rgba(20, 14, 9, 0.98));
+    border: 1px solid var(--fable-brass-dim);
+    border-radius: 14px;
+    box-shadow: 0 24px 60px rgba(0,0,0,0.7), var(--fable-emboss);
+    overflow: hidden;
+}
+.fable-raw-editor-head {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 12px 16px;
+    border-bottom: 1px solid var(--fable-glass-line);
+}
+.fable-raw-editor-title {
+    font-size: 13px; font-weight: 600; letter-spacing: 0.06em;
+    text-transform: uppercase; color: var(--fable-brass);
+}
+.fable-raw-editor-controls { display: flex; gap: 8px; }
+.fable-raw-btn {
+    width: 34px; height: 34px;
+    display: inline-flex; align-items: center; justify-content: center;
+    background: transparent; border: 1px solid var(--fable-brass-dim);
+    border-radius: 7px; color: var(--fable-text-dim);
+    font-size: 16px; cursor: pointer;
+    transition: color 160ms ease, border-color 160ms ease, background 160ms ease;
+}
+.fable-raw-btn.save { color: #86efac; border-color: rgba(134, 239, 172, 0.4); }
+.fable-raw-btn.save:hover:not(:disabled) { background: rgba(134, 239, 172, 0.14); border-color: #86efac; }
+.fable-raw-btn.revert { color: #fbbf24; border-color: rgba(251, 191, 36, 0.4); }
+.fable-raw-btn.revert:hover { background: rgba(251, 191, 36, 0.14); border-color: #fbbf24; }
+.fable-raw-btn.close { color: #f4a0a0; border-color: rgba(244, 160, 160, 0.4); }
+.fable-raw-btn.close:hover { background: rgba(244, 160, 160, 0.14); border-color: #f4a0a0; }
+.fable-raw-btn:disabled { opacity: 0.35; cursor: not-allowed; }
+.fable-raw-editor-text {
+    flex: 1; width: 100%; box-sizing: border-box;
+    margin: 0; padding: 14px 16px;
+    background: var(--fable-inset); color: var(--fable-text);
+    border: none;
+    font-family: 'Cascadia Code', 'Consolas', 'Courier New', monospace;
+    font-size: 13px; line-height: 1.5;
+    resize: none; tab-size: 2;
+    outline: none;
+}
+.fable-raw-editor-text.invalid { box-shadow: inset 0 0 0 1px #f4a0a0; }
+.fable-raw-editor-text.shake { animation: fable-raw-shake 320ms ease; }
+@keyframes fable-raw-shake {
+    0%, 100% { transform: translateX(0); }
+    25% { transform: translateX(-4px); }
+    75% { transform: translateX(4px); }
+}
+.fable-raw-editor-status {
+    padding: 8px 16px;
+    border-top: 1px solid var(--fable-glass-line);
+    font-size: 12px; color: var(--fable-text-dim);
+    min-height: 30px;
+}
+.fable-raw-editor-status.bad { color: #f4a0a0; }
+
 .fable-wupi-messages {
     flex: 1; overflow-y: auto; padding: 18px;
     scrollbar-width: none; /* hidden scrollbar — still scrollable */
@@ -1805,6 +2183,7 @@ body.fable-active.fable-chrome-peek .top-bar { transform: translateY(0); }
     pointer-events: none;  /* ignore clicks until visible */
 }
 .fable-edge-lock--right { right: 0; }
+.fable-edge-lock--left { left: 0; }   /* mirror of the right edge-lock bar */
 /* Visible state: the bar appears as a clean bright brass line. NO outer
    glow / box-shadow — Chloe 2026-07-26: those caused a dark-rectangle
    artifact on the screen edge (the shadow bled past the 2px bar at rest).
@@ -2137,6 +2516,24 @@ body.fable-active.fable-chrome-peek .top-bar { transform: translateY(0); }
 }
 .fable-save-close:hover { color: var(--fable-text); }
 
+/* --- Quick Play inline choice (Start New / Resume Last) ---
+   Reuses the save-overlay/modal visual language. Appended to the title screen
+   when a quicksave exists, so the player can recognize the saved run before
+   overwriting it. The summary is the quicksave's derived label (the player's
+   last action), styled as quiet body prose between the title + actions. */
+.fable-quickplay-summary {
+    margin: 0 0 20px;
+    color: var(--fable-text-dim);
+    font-family: var(--fable-font-body);
+    font-size: 15px;
+    line-height: 1.5;
+    font-style: italic;
+}
+/* The title screen choice overlay must sit above the title's own content
+   (wordmark + buttons + ambient). z-index 46 matches the in-stage save
+   overlay's stacking, and is well below the toast (70) + panels. */
+.fable-title-screen .fable-quickplay-choice { z-index: 46; }
+
 /* --- Toast --- */
 .fable-toast {
     position: absolute; bottom: 100px; left: 50%; transform: translateX(-50%);
@@ -2194,7 +2591,7 @@ body.fable-active.fable-chrome-peek .top-bar { transform: translateY(0); }
     }
 }
 
-/* --- Magical transition overlay (New Game / Quick Play → stage) ------- */
+/* --- Magical transition overlay (title menu buttons → next screen) ------- */
 /* A full-screen opaque-black layer mounted on document.body (above #fable
    z:4000). Starts transparent; the .dimming class transitions opacity
    0→1 over 2s (title → black), then .clearing transitions 1→0 over 2s
@@ -2222,17 +2619,137 @@ body.fable-active.fable-chrome-peek .top-bar { transform: translateY(0); }
 
 @media (prefers-reduced-motion: reduce) {
     /* Honor the OS reduced-motion preference: collapse the 4s cinematic to
-       a near-instant swap. The chime still plays (audio isn't motion); only
-       the visual dim is shortened. The midpoint scene-swap timing in
-       transition.js stays at 2s+150ms, so the overlay is briefly visible —
-       acceptable since reduced-motion users want minimal animation, and the
-       overlay is a flat black with no motion of its own. */
+       a near-instant swap. The button-press SFX still plays (audio isn't
+       motion); only the visual dim is shortened. The midpoint scene-swap
+       timing in transition.js stays at 2s+150ms, so the overlay is briefly
+       visible — acceptable since reduced-motion users want minimal animation,
+       and the overlay is a flat black with no motion of its own. */
     .fable-magical-overlay,
     .fable-magical-overlay.dimming,
     .fable-magical-overlay.clearing {
         transition: opacity 200ms ease-in-out !important;
     }
 }
+
+/* =============================================================
+   FOG INTRO — the wind-blown fog gate on FABLE entry (re-added 2026-08-01).
+   A full-screen fog overlay mounted on document.body (above #fable z:4000
+   AND the magical overlay z:6000). Holds while wind loops + the fog drifts
+   continuously, then a SLOW SOFT LEFT→RIGHT FEATHERED WIPE reveals the title.
+   The wipe's gradient edge is wide + blurred so there is NO hard vertical cut
+   line — the fog thins out into the menu. Self-cleaned by fog.js.
+   pointer-events:none so it never blocks the underlying UI.
+   All-CSS gradients (no images), GPU-only animation (Prime Directive).
+
+   ARCHITECTURE (fixed 2026-08-02 — the prior version was broken):
+   The overlay is ONE element whose OWN mask is driven by rAF during the clear.
+   The three .fable-fog-bank children are the drifting fog texture; the overlay
+   container sits on top of the menu and is masked as a whole. During HOLD the
+   mask is fully opaque (fog covers everything). During CLEAR fog.js shrinks
+   the opaque span toward the right while a wide blurred feather trails behind,
+   so the ENTIRE fog composite — banks included — thins out left→right and the
+   menu shows through the cleared part. The banks keep drifting rightward
+   throughout, so fog visibly keeps blowing right AS it clears.
+
+   The prior version put a SOLID grey div (.fable-fog-mask) on top of the
+   banks: the banks were hidden behind it during hold (fog "didn't move") and
+   the wipe only revealed the banks (not the menu) — the menu appeared in a
+   single instant snap when the node was removed. That's gone now.
+   ============================================================= */
+.fable-fog-overlay {
+    position: fixed;
+    inset: 0;
+    z-index: 7000;
+    pointer-events: none;
+    overflow: hidden;
+    /* Pale fog base — only seen if banks gap (the banks are semi-transparent
+       so the base fills the seams). */
+    background: #c9cdd2;
+    /* The wipe mask. Default = fully opaque (covers everything). fog.js sets
+       inline mask-image each rAF frame during CLEAR to shrink the opaque span
+       rightward with a wide feathered edge. Applied to THIS element (not a
+       child) so the whole fog composite — base + banks — clears together and
+       the menu underneath is what shows through the transparent part. */
+    -webkit-mask-image: linear-gradient(to right, rgba(0,0,0,1) 0%, rgba(0,0,0,1) 100%);
+    mask-image: linear-gradient(to right, rgba(0,0,0,1) 0%, rgba(0,0,0,1) 100%);
+}
+
+/* The moving fog texture. Three banks, each 200% wide, drifting rightward at
+   different speeds (parallax = depth). Seamless: each bank is duplicated
+   side-by-side inside its node so the loop point has no visible seam. */
+.fable-fog-bank {
+    position: absolute;
+    top: 0;
+    left: 0;
+    width: 200%;
+    height: 100%;
+    will-change: background-position;
+}
+.fable-fog-bank--back {
+    height: 130%;
+    top: -15%;
+    /* clustered soft blobs via repeating-radial — drift via background-position
+       so it loops seamlessly without a transform jump. */
+    background-image:
+        radial-gradient(ellipse 220px 140px at 8% 30%,  rgba(196,201,206,0.95), rgba(196,201,206,0) 60%),
+        radial-gradient(ellipse 300px 170px at 24% 70%, rgba(178,184,190,0.9),  rgba(178,184,190,0) 60%),
+        radial-gradient(ellipse 260px 150px at 40% 25%, rgba(212,216,220,0.9),  rgba(212,216,220,0) 60%),
+        radial-gradient(ellipse 240px 160px at 55% 60%, rgba(170,176,182,0.92), rgba(170,176,182,0) 60%),
+        radial-gradient(ellipse 280px 140px at 70% 35%, rgba(200,205,210,0.9),  rgba(200,205,210,0) 60%),
+        radial-gradient(ellipse 220px 150px at 86% 68%, rgba(186,192,198,0.9),  rgba(186,192,198,0) 60%);
+    background-repeat: repeat-x;
+    background-size: 50% 100%;   /* tile the 6-blob set twice across 200% width */
+    opacity: 0.85;
+    animation: fable-fog-drift 26s linear infinite;
+}
+.fable-fog-bank--mid {
+    height: 120%;
+    top: -10%;
+    background-image:
+        radial-gradient(ellipse 180px 110px at 12% 55%, rgba(222,225,229,0.92), rgba(222,225,229,0) 60%),
+        radial-gradient(ellipse 220px 120px at 30% 25%, rgba(204,208,212,0.9),  rgba(204,208,212,0) 60%),
+        radial-gradient(ellipse 200px 130px at 48% 72%, rgba(228,231,233,0.9),  rgba(228,231,233,0) 60%),
+        radial-gradient(ellipse 240px 110px at 64% 40%, rgba(210,214,218,0.9),  rgba(210,214,218,0) 60%),
+        radial-gradient(ellipse 190px 120px at 80% 60%, rgba(220,223,226,0.9),  rgba(220,223,226,0) 60%),
+        radial-gradient(ellipse 210px 110px at 94% 30%, rgba(198,203,207,0.9),  rgba(198,203,207,0) 60%);
+    background-repeat: repeat-x;
+    background-size: 50% 100%;
+    opacity: 0.8;
+    animation: fable-fog-drift 19s linear infinite;
+}
+.fable-fog-bank--front {
+    height: 110%;
+    top: -5%;
+    background-image:
+        radial-gradient(ellipse 140px 90px at 10% 40%, rgba(238,240,242,0.95), rgba(238,240,242,0) 60%),
+        radial-gradient(ellipse 160px 80px at 28% 65%, rgba(225,228,230,0.9),  rgba(225,228,230,0) 60%),
+        radial-gradient(ellipse 150px 90px at 46% 30%, rgba(242,244,245,0.92), rgba(242,244,245,0) 60%),
+        radial-gradient(ellipse 170px 85px at 62% 55%, rgba(230,232,234,0.9),  rgba(230,232,234,0) 60%),
+        radial-gradient(ellipse 145px 90px at 78% 28%, rgba(236,238,240,0.9),  rgba(236,238,240,0) 60%),
+        radial-gradient(ellipse 160px 85px at 92% 62%, rgba(226,229,231,0.9),  rgba(226,229,231,0) 60%);
+    background-repeat: repeat-x;
+    background-size: 50% 100%;
+    opacity: 0.75;
+    animation: fable-fog-drift 13s linear infinite;
+}
+/* Rightward drift via background-position. The banks are 200% wide with the
+   6-blob set at background-size 50% (so it tiles exactly twice across the
+   node). Moving background-position from 0 → +100% shifts the visible window
+   one full blob-set width to the right; because the set tiles every 50% of
+   the node (= 100% of one set), position 0% and 100% land on identical pixel
+   content → seamless loop. Linear timing = constant wind speed. (The prior
+   version used 0 → -50%, which drifted LEFT — opposite the intended wind.) */
+@keyframes fable-fog-drift {
+    from { background-position: 0% 0; }
+    to   { background-position: 100% 0; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+    /* Freeze the drift; fog.js collapses the wipe to near-instant. Audio still
+       plays. */
+    .fable-fog-bank { animation: none !important; }
+}
+
 
 /* --- Send/Stop button — Fable brass override (Phase 2 v2) --- */
 /* The shared .send-toggle-btn (styles.css) is neon purple (#b534fa) — that's
@@ -2669,3 +3186,376 @@ body.fable-active.fable-chrome-peek .top-bar { transform: translateY(0); }
     font-style: italic;
     line-height: 1.5;
 }
+
+/* ============================================================
+   New Game split screen + Creator (2026-08-01)
+   New Game flow 2026-08-02: the three New Game screens (split +
+   picker + creator) sit in a DEEP dark void with warm fire embers
+   rising subtly in the background (screens/embers.js) + a faint
+   hearth-glow at the floor. The chrome is sleeker + more medieval
+   — Cinzel serif headings, thinner borders, sharper 8px corners —
+   while staying cohesive with the brass palette. Picker/creator
+   reuse the shared header + their own tile/field styles, so the
+   ambiance + the serif headings carry the restyle there.
+   ============================================================ */
+
+/* --- Shared New Game flow ambiance (split / picker / creator) --- */
+/* The deep-void floor replaces --fable-void on these three screens so the
+   embers read as the sole light source. */
+.fable-newgame-split-screen,
+.fable-picker-screen,
+.fable-creator-screen { background: var(--fable-void-deep); }
+
+/* Ember canvas host: sits at the back of the screen, behind all content.
+   The canvas (screens/embers.js) mounts inside this. Overflow hidden so
+   embers never paint outside the screen bounds. pointer-events none is
+   belt-and-suspenders (the canvas is already pointer-events:none). */
+.fable-ember-host {
+    position: absolute;
+    inset: 0;
+    z-index: 0;
+    overflow: hidden;
+    pointer-events: none;
+}
+/* The hearth: a soft warm-orange radial glow hugging the floor, the source
+   the embers appear to rise from. Subtle (low alpha) so it never competes
+   with the UI — it just sells the "fire from below" read. */
+.fable-void-glow {
+    position: absolute;
+    left: 50%;
+    bottom: -10vh;
+    transform: translateX(-50%);
+    width: 120vw;
+    height: 55vh;
+    z-index: 0;
+    pointer-events: none;
+    background: radial-gradient(ellipse at 50% 100%,
+        rgba(255, 120, 40, 0.16) 0%,
+        rgba(255, 90, 30, 0.07) 35%,
+        transparent 72%);
+}
+/* Scope interactive content above the ember layer. The picker/creator screens
+   position their header + body statically, so a relative + z:2 on each lifts
+   them above the absolute z:0 ember/glow hosts. (The newgame-split screen's
+   tiles + home button set their own z-index in their own rules below.) */
+.fable-picker-screen > .fable-screen-header,
+.fable-picker-screen > .fable-card-grid,
+.fable-creator-screen > .fable-screen-header,
+.fable-creator-screen > .fable-creator-tabs,
+.fable-creator-screen > .fable-creator-body,
+.fable-creator-screen > .fable-creator-toast {
+    position: relative;
+    z-index: 2;
+}
+
+/* --- New Game split (two giant logo-only square tiles + home button) --- */
+/* Redesigned 2026-08-02: no header bar. The screen is two giant square tiles
+   centered side by side, each showing ONLY a glyph (no text on the button).
+   On hover the tile pops forward, glows amber, and a glowing amber caption
+   fades in UNDERNEATH it. A small amber ⌂ home button sits in the top-right
+   corner. The shared .fable-screen-header is gone from this screen entirely. */
+
+/* Top-right home button: a minimalist brass house SVG (same icon as the
+   in-game drawer footer's home), glowing softly — NO box/border around it,
+   just the bare glyph tucked into the very corner. Matches the drawer's
+   aged-brass currentColor aesthetic. Sits above the ember layer (z:3).
+   Returns to the title on click. */
+.fable-newgame-home {
+    position: absolute;
+    top: 14px;
+    right: 16px;
+    z-index: 3;
+    width: 38px;
+    height: 38px;
+    padding: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    color: var(--fable-brass);
+    background: transparent;
+    border: none;
+    cursor: pointer;
+    line-height: 0;   /* SVG is the content; kill the inline baseline gap */
+    filter: drop-shadow(0 0 10px rgba(230, 213, 138, 0.45));
+    transition: color 200ms ease, filter 200ms ease, transform 200ms ease;
+}
+.fable-newgame-home svg {
+    width: 30px;
+    height: 30px;
+    display: block;
+}
+.fable-newgame-home:hover {
+    color: var(--fable-brass-bright);
+    transform: translateY(-1px);
+    filter: drop-shadow(0 0 16px rgba(230, 213, 138, 0.8));
+}
+.fable-newgame-home:focus-visible {
+    outline: none;
+    color: var(--fable-brass-bright);
+    filter: drop-shadow(0 0 0 2px var(--fable-brass-dim));
+}
+
+/* The tile row: two giant squares centered in the void. flex (not grid) so the
+   squares stay equal + the captions align under each without grid auto-fit
+   collapsing them on narrow viewports. */
+.fable-newgame-tiles {
+    position: relative;
+    z-index: 2;
+    flex: 1;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: clamp(24px, 5vw, 80px);
+    padding: 48px 28px;
+    width: 100%;
+    max-width: 1100px;
+    margin: 0 auto;
+}
+
+/* Each tile is a giant square. The button carries the glyph; the caption is a
+   child span that sits BELOW the square (positioned via the wrapper the button
+   itself forms — overflow visible so the caption shows outside the square).
+   Logo-only: no text inside the square. */
+.fable-newgame-tile {
+    position: relative;
+    /* Giant square: sized off the viewport but capped so two fit side by side
+       with generous separation. aspect-ratio keeps it a perfect square at any
+       width. */
+    width: clamp(240px, 36vw, 380px);
+    aspect-ratio: 1 / 1;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 0;
+    /* Near-black glass panel of the void, faint warm inner sheen. */
+    background: linear-gradient(180deg, rgba(22, 16, 12, 0.82), rgba(10, 7, 5, 0.9));
+    backdrop-filter: blur(6px);
+    border: 1px solid var(--fable-brass-dim);
+    border-radius: 14px;
+    color: inherit;
+    cursor: pointer;
+    overflow: visible;   /* caption renders below the square */
+    transition: border-color 240ms ease, transform 240ms cubic-bezier(0.2, 0.7, 0.3, 1),
+                box-shadow 240ms ease, background 240ms ease;
+}
+/* Soft inner top sheen, idle-off → lit on hover (the "warming up" read). */
+.fable-newgame-tile::before {
+    content: "";
+    position: absolute;
+    inset: 0;
+    border-radius: inherit;
+    background: radial-gradient(circle at 50% 28%, rgba(230, 180, 90, 0.18), transparent 68%);
+    opacity: 0;
+    transition: opacity 240ms ease;
+    pointer-events: none;
+}
+.fable-newgame-tile:hover {
+    border-color: var(--fable-brass);
+    /* Pop forward toward the viewer + an amber underglow shadow (the
+       "underlining shadow" — a warm glow seated at the tile's base). */
+    transform: translateY(-8px) scale(1.04);
+    background: linear-gradient(180deg, rgba(34, 24, 14, 0.92), rgba(14, 9, 6, 0.95));
+    box-shadow:
+        0 18px 40px rgba(0, 0, 0, 0.65),
+        0 14px 30px rgba(230, 160, 60, 0.28),      /* amber underglow */
+        0 0 30px var(--fable-brass-glow);            /* outer halo */
+}
+.fable-newgame-tile:hover::before { opacity: 1; }
+
+/* The centered glyph — large, amber, softly glowing. Grows slightly + brightens
+   on hover so the tile feels alive. */
+.fable-newgame-tile-glyph {
+    font-size: clamp(120px, 18vw, 220px);
+    line-height: 1;
+    color: var(--fable-brass);
+    text-shadow: 0 0 26px var(--fable-brass-glow), 0 0 12px rgba(230, 213, 138, 0.4);
+    transition: color 240ms ease, text-shadow 240ms ease, transform 240ms ease;
+}
+/* The CREATE SIM CARD (pencil) + LOAD SIM CARD (4-pointed star) SVGs are a
+   matched brass line-art pair. Sized in em so they track the slot's font-size
+   clamp. stroke=currentColor inherits the slot's brass (and the hover-bright
+   swap). */
+.fable-newgame-tile-glyph svg.fable-create-glyph,
+.fable-newgame-tile-glyph svg.fable-scroll-glyph {
+    width: 1em;
+    height: 1em;
+    display: block;
+    margin: 0 auto;
+    filter: drop-shadow(0 0 18px var(--fable-brass-glow));
+    transition: color 240ms ease, filter 240ms ease;
+}
+.fable-newgame-tile:hover .fable-newgame-tile-glyph svg.fable-create-glyph,
+.fable-newgame-tile:hover .fable-newgame-tile-glyph svg.fable-scroll-glyph {
+    filter: drop-shadow(0 0 28px var(--fable-brass-glow));
+}
+.fable-newgame-tile:hover .fable-newgame-tile-glyph {
+    color: var(--fable-brass-bright);
+    transform: scale(1.06);
+    text-shadow: 0 0 40px var(--fable-brass-glow), 0 0 18px rgba(230, 213, 138, 0.6);
+}
+
+/* The caption: glowing amber, Cinzel engraved caps, UNDER the square. Hidden
+   by default, fades + lifts in on hover. Positioned below the tile via
+   absolute positioning so it doesn't push layout. */
+.fable-newgame-tile-caption {
+    position: absolute;
+    top: calc(100% + 22px);     /* sit beneath the square */
+    left: 50%;
+    transform: translateX(-50%) translateY(6px);
+    white-space: nowrap;
+    font-family: var(--fable-font-serif);
+    font-size: clamp(13px, 1.4vw, 16px);
+    font-weight: 600;
+    letter-spacing: 0.22em;
+    text-transform: uppercase;
+    color: var(--fable-brass-bright);
+    text-shadow: 0 0 16px var(--fable-brass-glow), 0 0 8px rgba(230, 213, 138, 0.5);
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity 240ms ease, transform 240ms ease;
+}
+.fable-newgame-tile:hover .fable-newgame-tile-caption {
+    opacity: 1;
+    transform: translateX(-50%) translateY(0);
+}
+
+/* Narrow viewports: stack the two tiles vertically so neither shrinks below the
+   glyph's readable size. The home button stays top-right. */
+@media (max-width: 620px) {
+    .fable-newgame-tiles {
+        flex-direction: column;
+        gap: 56px;   /* extra room for the caption between tiles */
+    }
+}
+
+/* --- New Game split header: serif title flanked by thin ornamental rules --- */
+/* (The .fable-newgame-title rule is retained for legacy compat — the header is
+   no longer rendered on this screen, but the class may be referenced elsewhere
+   during the transition. Harmless if unused.) */
+.fable-newgame-title {
+    font-family: var(--fable-font-serif) !important;
+    font-weight: 600 !important;
+    letter-spacing: 0.12em !important;
+    text-transform: uppercase;
+}
+
+
+/* --- Creator (3-tab form) --- */
+.fable-creator-screen { background: var(--fable-void); }
+.fable-creator-save {
+    margin-left: auto;
+    padding: 8px 18px;
+    background: linear-gradient(180deg, var(--fable-brass), #a89236);
+    color: #1a1308;
+    border: none;
+    border-radius: 6px;
+    cursor: pointer;
+    font-family: var(--fable-font-body);
+    font-size: 15px;
+    font-weight: 700;
+    letter-spacing: 0.04em;
+    transition: filter 180ms ease;
+}
+.fable-creator-save:hover:not(:disabled) { filter: brightness(1.1); }
+.fable-creator-save:disabled { opacity: 0.55; cursor: default; }
+.fable-creator-tabs {
+    display: flex;
+    gap: 4px;
+    padding: 0 28px;
+    border-bottom: 1px solid var(--fable-glass-line);
+    background: rgba(18, 16, 14, 0.6);
+}
+.fable-creator-tab {
+    padding: 12px 22px;
+    background: transparent;
+    color: var(--fable-text-dim);
+    border: none;
+    border-bottom: 2px solid transparent;
+    cursor: pointer;
+    font-family: var(--fable-font-serif);
+    font-size: 15px;
+    font-weight: 600;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    transition: color 180ms ease, border-color 180ms ease;
+    margin-bottom: -1px;
+}
+.fable-creator-tab:hover { color: var(--fable-text); }
+.fable-creator-tab.is-active {
+    color: var(--fable-brass-bright);
+    border-bottom-color: var(--fable-brass);
+}
+.fable-creator-body {
+    flex: 1;
+    overflow-y: auto;
+    padding: 28px;
+    max-width: 760px;
+    margin: 0 auto;
+    width: 100%;
+}
+.fable-creator-pane { display: none; flex-direction: column; gap: 20px; }
+.fable-creator-pane.is-active { display: flex; }
+.fable-creator-field {
+    display: flex;
+    flex-direction: column;
+    gap: 7px;
+}
+.fable-creator-label {
+    color: var(--fable-text-dim);
+    font-size: 14px;
+    font-weight: 600;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+}
+.fable-creator-label em {
+    color: var(--fable-brass);
+    font-style: normal;
+    text-transform: none;
+    font-weight: 400;
+    font-size: 13px;
+}
+.fable-creator-field input,
+.fable-creator-field textarea {
+    padding: 12px 14px;
+    background: rgba(28, 22, 16, 0.7);
+    border: 1px solid var(--fable-glass-line);
+    border-radius: 8px;
+    color: var(--fable-text);
+    font-family: var(--fable-font-body);
+    font-size: 15px;
+    line-height: 1.5;
+    resize: vertical;
+    transition: border-color 180ms ease, box-shadow 180ms ease;
+}
+.fable-creator-field input:focus,
+.fable-creator-field textarea:focus {
+    outline: none;
+    border-color: var(--fable-brass);
+    box-shadow: 0 0 0 1px var(--fable-brass-dim);
+}
+.fable-creator-field input::placeholder,
+.fable-creator-field textarea::placeholder {
+    color: var(--fable-text-faint, #6b6450);
+    font-style: italic;
+}
+
+/* --- Creator toast (self-contained; stage isn't wired on this screen) --- */
+.fable-creator-toast {
+    position: fixed;
+    bottom: 32px;
+    left: 50%;
+    transform: translateX(-50%);
+    padding: 14px 22px;
+    background: rgba(38, 22, 16, 0.96);
+    border: 1px solid var(--fable-brass-dim);
+    border-radius: 8px;
+    color: var(--fable-text);
+    font-family: var(--fable-font-body);
+    font-size: 15px;
+    box-shadow: 0 8px 24px rgba(0,0,0,0.5);
+    z-index: 50;
+    max-width: 80vw;
+    text-align: center;
+    line-height: 1.4;
+}
+.fable-creator-toast[hidden] { display: none; }
