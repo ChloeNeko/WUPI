@@ -8,22 +8,26 @@
 //   system    → small state-change beat (from OBJECT tags + saves).
 //   error     → red beat for generation failures.
 //
-// LAYOUT (ECHO rewrite, 2026-07-31): the feed is a normal top-to-bottom
-// column; new beats append at the bottom (just above the input row) + auto-
-// scroll keeps the newest in view, so older beats get "pushed upward" as the
-// conversation grows. Each new beat's `echoRise` entrance animation
-// (translateY from below) gives the "appears from the bottom" feel.
-// Alignment gives the conversational rhythm:
-//   - narrator/character/error: aligned to the LEFT of center (the AI's voice).
-//   - user: aligned to the RIGHT of center (mirrored via .fable-beat.user).
-//   - system: no card, plain centered italic line.
-// The beat is the card directly (no wrapper).
+// LAYOUT (card-based overhaul, 2026-08-01): each beat is a flex ROW of
+// [avatar] + [card], aligned LEFT (AI/narrator/character/error) or RIGHT
+// (user, mirrored so the avatar sits on the outer edge). Capped at 85% of
+// the feed. The card carries a hover-only .message-header (name + time +
+// action controls) — the feed stays clean until a card is hovered.
 //
 // STREAMING (ECHO rewrite): there is NO blinking caret. appendChunk()
 // tokenizes the incoming delta into words and wraps each newly-arrived word
 // in a .echo-word span that fades + lifts in once — text "pops in" like
 // reading from a live narrative. finalizeBeat() just drops the .streaming
 // class.
+//
+// STRUCTURAL CONTRACT (consumed by narrator.js + stage.js):
+//   .fable-beat[role][data-index]   = the flex row (alignment + entrance anim)
+//     .message-avatar               = 80×120 portrait (svg silhouette; img layer)
+//     .message-card                 = glass card
+//       .message-header             = hover-only: .msg-name + .msg-time + actions
+//       .fable-beat-body             = the prose (streaming/finalize/variant/edit)
+//   .fable-beat-card is kept as a class alias on the card element so the
+//   legacy querySelector('.fable-beat-card') sites keep resolving.
 // =============================================================
 
 let feed = null;  // #fable-dialogue-feed
@@ -36,8 +40,23 @@ let feed = null;  // #fable-dialogue-feed
 // chronological (appendChild), so data-index matches the backend position.
 let nextIndex = 0;
 
+// Identity for the beat headers. Set by the host (stage.js) via
+// setIdentity() from the active card. Card name → AI/narrator beats; player
+// name → user beats. Both fall back gracefully when unset (the header just
+// omits the name line).
+let cardName = '';     // the seated card's display name (the GM persona)
+let playerName = '';   // the protagonist's name (card.player_name)
+
 export function initBeats(feedEl) {
   feed = feedEl;
+}
+
+// Host-side identity setter (called from stage.js once the active card is
+// known). Kept separate from initBeats so a late-arriving name (the
+// fable_active_card_get fetch is async) doesn't race feed init.
+export function setIdentity({ cardName: cn, playerName: pn } = {}) {
+  if (typeof cn === 'string') cardName = cn;
+  if (typeof pn === 'string') playerName = pn;
 }
 
 // Stamp a freshly-created beat with its conversation index + role. Called by
@@ -58,7 +77,30 @@ function esc(s) {
     .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
 }
 
-// Preserve line breaks in prose beats (narrator/character/system).
+// Escape + preserve line breaks + wrap quoted speech in .dialogue spans for
+// the visual-novel coloring (accent + italic). Handles straight quotes ("...")
+// and smart/curly quotes ("..." / '...'). Used by BOTH the streaming renderer
+// and finalizeBeat so a live beat + its finalized form look identical.
+//
+// The dialogue wrap is a single regex pass over the ESCAPED string (so the
+// quotes are already &quot;/&#39; entities and can't break out of the span).
+// We deliberately keep this cheap — one replace, no lookahead stacks.
+function renderProse(s) {
+  const escaped = esc(s);
+  // Straight double quotes: "&quot;...&quot;"  (the most common narrator form).
+  // Smart double quotes (left/right U+201C/U+201D) and single quotes are
+  // handled as their raw chars (they weren't entity-encoded above since esc()
+  // only touches the 5 XML specials).
+  return escaped
+    .replace(/&quot;([^&]*?(?:&(?!quot;)[^&]*?)*)&quot;/g, '<span class="dialogue">&quot;$1&quot;</span>')
+    .replace(/\u201C([^\u201D]*)\u201D/g, '<span class="dialogue">\u201C$1\u201D</span>')
+    .replace(/(^|\s)\u2018([^\u2019]*)\u2019/g, '$1<span class="dialogue">\u2018$2\u2019</span>')
+    .replace(/\n/g, '<br>');
+}
+
+// Back-compat prose() — escapes + newlines only, no dialogue wrap. Kept for
+// the rare path that must NOT colorize (e.g. raw system text already shown
+// in a system beat). The streaming + finalize paths use renderProse.
 function prose(s) {
   return esc(s).replace(/\n/g, '<br>');
 }
@@ -70,19 +112,80 @@ export function scrollDown() {
   feed.scrollTop = feed.scrollHeight;
 }
 
-// Build a beat's inner card markup. `cardInner` is the HTML that goes inside
-// .fable-beat-card. The 2026-07-27 sleek rework dropped the avatar row +
-// .fable-beat-content wrapper — the beat element now holds the card
-// directly, and alignment (left vs right of center) is driven purely by
-// .fable-beat / .fable-beat.user CSS. Returns the innerHTML for the beat.
-function beatCardHtml(cardInner) {
-  return `<div class="fable-beat-card">${cardInner}</div>`;
+// --- Avatar rendering -------------------------------------------------------
+// There is NO portrait art in the project today (cards have no image field;
+// the user profile is name+description only). So every avatar renders the
+// inline-SVG silhouette fallback. The slot is built behind `resolveAvatar`,
+// which returns null today — when art lands later, point it at a URL and the
+// <img> layers over the svg automatically (onerror hides it → svg shows).
+//
+// `variant` picks one of two geometric silhouettes: 'player' (a hooded/
+// traveler bust) vs 'npc' (a broader shoulders bust). Both are pure
+// currentColor paths so they tint with the message-type accent (CSS).
+function resolveAvatar(/* role, identity */) {
+  return null;  // no art yet — the svg fallback always shows.
 }
 
-export function addUserBeat(text) {
+function silhouetteSvg(variant) {
+  // Single-line SVGs (matches the footer-icon convention in stage.js).
+  // viewBox 0 0 24 24, fill none, stroke currentColor, round caps/joins.
+  if (variant === 'player') {
+    // Hooded traveler: a hood + head + shoulders, reads as a protagonist.
+    return '<svg viewBox="0 0 24 24" aria-hidden="true" preserveAspectRatio="xMidYMid slice">'
+      + '<path d="M12 4c-2.8 0-5 2.2-5 5 0 1.7.8 3.1 2 4-2.2.8-4 2.6-4.6 5L4 21h16l-.4-3c-.6-2.4-2.4-4.2-4.6-5 1.2-.9 2-2.3 2-4 0-2.8-2.2-5-5-5z"'
+      + ' fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/></svg>';
+  }
+  // NPC / AI: a broader shoulders + head bust (the GM's neutral silhouette).
+  return '<svg viewBox="0 0 24 24" aria-hidden="true" preserveAspectRatio="xMidYMid slice">'
+    + '<circle cx="12" cy="8.5" r="3.6" fill="none" stroke="currentColor" stroke-width="1.4"/>'
+    + '<path d="M4.5 21c.5-3.6 3.6-6 7.5-6s7 2.4 7.5 6" fill="none" stroke="currentColor'
+    + '" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></svg>';
+}
+
+// Build the avatar block: the always-present svg fallback + an optional img
+// layer (shown only if resolveAvatar returns a URL). The img's onerror hides
+// it so a broken/missing image falls straight back to the svg. `role` is the
+// beat's wire role; `identity` is the name used to resolve art later.
+function avatarMarkup(role, identity) {
+  const variant = role === 'user' ? 'player' : 'npc';
+  const svg = silhouetteSvg(variant);
+  const url = resolveAvatar(role, identity);
+  const img = url ? `<img src="${esc(url)}" alt="" onerror="this.style.display='none'" />` : '';
+  return `<div class="message-avatar" aria-hidden="true">${svg}${img}</div>`;
+}
+
+// Format an epoch-ms timestamp into a short locale time string for the header.
+// Null/0/NaN → '' (the time line is omitted entirely when there's no ts).
+function formatTime(ms) {
+  if (!ms || !Number.isFinite(ms)) return '';
+  try {
+    return new Date(ms).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+  } catch (_) {
+    return '';
+  }
+}
+
+// Build a beat's full innerHTML: avatar + card(header + body). `role` is the
+// wire role ('user' | 'assistant'); `name` is the header name; `ts` is the
+// optional epoch-ms timestamp; `bodyHtml` is the prose HTML for the body.
+// `extraHeader` injects additional header nodes (none today; reserved).
+function beatRowHtml({ role, name, ts, bodyHtml, avatarIdentity }) {
+  const avatar = avatarMarkup(role, avatarIdentity || name);
+  const timeLine = formatTime(ts) ? `<span class="msg-time">${esc(formatTime(ts))}</span>` : '';
+  const nameLine = name ? `<span class="msg-name">${esc(name)}</span>` : '';
+  return `${avatar}<div class="message-card fable-beat-card">`
+    + `<div class="message-header">${nameLine}${timeLine}`
+    + `<span class="message-actions"></span></div>`
+    + `<div class="fable-beat-body">${bodyHtml}</div></div>`;
+}
+
+export function addUserBeat(text, opts = {}) {
   const b = document.createElement('div');
   b.className = 'fable-beat user';
-  b.innerHTML = beatCardHtml(`<div class="fable-beat-body">${prose(text)}</div>`);
+  // Live beats (just sent) get a fresh timestamp; loaded history passes ts.
+  const ts = opts.ts || Date.now();
+  const name = playerName || 'You';
+  b.innerHTML = beatRowHtml({ role: 'user', name, ts, bodyHtml: renderProse(text), avatarIdentity: name });
   feed.appendChild(b);
   scrollDown();
   return stamp(b, 'user');
@@ -91,7 +194,7 @@ export function addUserBeat(text) {
 export function addSystemBeat(text) {
   const b = document.createElement('div');
   b.className = 'fable-beat system';
-  // System beats skip the card — they're de-emphasized status lines.
+  // System beats skip the card + avatar — they're de-emphasized status lines.
   b.innerHTML = `<div class="fable-beat-body">${esc(text)}</div>`;
   feed.appendChild(b);
   scrollDown();
@@ -101,7 +204,8 @@ export function addSystemBeat(text) {
 export function addErrorBeat(text) {
   const b = document.createElement('div');
   b.className = 'fable-beat error';
-  b.innerHTML = beatCardHtml(`<div class="fable-beat-body">${esc(text)}</div>`);
+  const ts = Date.now();
+  b.innerHTML = beatRowHtml({ role: 'assistant', name: 'Error', ts, bodyHtml: esc(text) });
   feed.appendChild(b);
   scrollDown();
   return stamp(b, 'system');
@@ -109,23 +213,25 @@ export function addErrorBeat(text) {
 
 // Start a streaming narrator beat. Returns the beat element so the
 // caller can append chunks and finalize it.
-export function startNarratorBeat() {
+export function startNarratorBeat(opts = {}) {
   const b = document.createElement('div');
   b.className = 'fable-beat narrator streaming';
-  b.innerHTML = beatCardHtml(`<div class="fable-beat-body"></div>`);
+  const ts = opts.ts || Date.now();
+  const name = opts.name || cardName || 'Game Master';
+  b.innerHTML = beatRowHtml({ role: 'assistant', name, ts, bodyHtml: '', avatarIdentity: name });
   feed.appendChild(b);
   scrollDown();
   return stamp(b, 'assistant');
 }
 
-// Start a streaming character beat with a speaker label.
+// Start a streaming character beat with a speaker label. `speakerLabel`
+// becomes the .msg-name (the NPC speaking); the avatar stays the npc
+// silhouette (no per-NPC art yet).
 export function startCharacterBeat(speakerLabel) {
   const b = document.createElement('div');
   b.className = 'fable-beat character streaming';
-  const cardInner =
-    `<div class="fable-beat-speaker">${esc(speakerLabel)}</div>` +
-    `<div class="fable-beat-body"></div>`;
-  b.innerHTML = beatCardHtml(cardInner);
+  const ts = Date.now();
+  b.innerHTML = beatRowHtml({ role: 'assistant', name: speakerLabel, ts, bodyHtml: '', avatarIdentity: speakerLabel });
   feed.appendChild(b);
   scrollDown();
   return stamp(b, 'assistant');
@@ -151,11 +257,17 @@ export function appendChunk(beat, text) {
   });
 }
 
-// Render the streaming body: the already-shown prefix as plain escaped prose,
+// Render the streaming body: the already-shown prefix as plain rendered prose,
 // the new tail words wrapped in .echo-word spans. `_renderedChars` tracks how
 // much of `_raw` has been rendered without animation so we only animate the
 // delta. Tokenization is whitespace-based (split on spaces, keep delimiters);
 // we animate whole words, never fragments.
+//
+// NOTE: the streaming path does NOT run the dialogue-color wrap on the tail
+// (a partial quote mid-stream would flicker as it closes). The prefix uses
+// renderProse so finished dialogue colors as it scrolls out of the tail; the
+// finalize pass re-renders the whole body with renderProse for the clean end
+// state. This keeps streaming cheap + flicker-free.
 function renderStreamingBody(beat) {
   const body = beat.querySelector('.fable-beat-body');
   if (!body) return;
@@ -174,13 +286,13 @@ function renderStreamingBody(beat) {
     if (m[1] != null) parts.push({ space: true, text: m[1] });
     else parts.push({ space: false, text: m[2] });
   }
-  // Build the HTML: escaped prefix (with <br> for newlines) + the tail parts,
+  // Build the HTML: rendered prefix (with <br> for newlines) + the tail parts,
   // each non-space part wrapped in a .echo-word span. Spaces are escaped too
   // (newlines → <br>).
-  let html = prose(prefix);
+  let html = renderProse(prefix);
   for (const p of parts) {
     if (p.space) {
-      html += p.text.includes('\n') ? prose(p.text) : esc(p.text);
+      html += p.text.includes('\n') ? renderProse(p.text) : esc(p.text);
     } else {
       html += `<span class="echo-word">${esc(p.text)}</span>`;
       // Put a space back between animated words (the whitespace run was
@@ -193,8 +305,8 @@ function renderStreamingBody(beat) {
 }
 
 // Finalize: drop the .streaming class + render the final text cleanly (no
-// .echo-word spans — the finished beat is plain prose). Cancels any pending
-// rAF so a late frame can't overwrite the finalized HTML.
+// .echo-word spans — the finished beat is plain prose with dialogue coloring).
+// Cancels any pending rAF so a late frame can't overwrite the finalized HTML.
 export function finalizeBeat(beat, finalText) {
   if (!beat) return;
   if (beat._rafPending) {
@@ -204,10 +316,10 @@ export function finalizeBeat(beat, finalText) {
   const body = beat.querySelector('.fable-beat-body');
   if (!body) return;
   if (finalText != null) {
-    body.innerHTML = prose(finalText);
+    body.innerHTML = renderProse(finalText);
     beat._raw = finalText;
   } else if (beat._raw != null) {
-    body.innerHTML = prose(beat._raw);
+    body.innerHTML = renderProse(beat._raw);
   }
   beat._renderedChars = (beat._raw || '').length;
   scrollDown();
@@ -254,28 +366,33 @@ export function swapVariantBody(index, content) {
   beat._raw = content || '';
   beat._renderedChars = (content || '').length;
   const body = beat.querySelector('.fable-beat-body');
-  if (body) body.innerHTML = prose(content || '');
+  if (body) body.innerHTML = renderProse(content || '');
   scrollDown();
 }
 
 // Re-class a live narrator beat as a character beat when a
-// CHARACTER_TURN bracket arrives mid-stream. Speaker label prepended.
+// CHARACTER_TURN bracket arrives mid-stream. The NPC speaker label becomes
+// the .msg-name (replacing the card name in the header).
 // MVP limitation (AGENTS.md §11.10): a second CHARACTER_TURN in the
 // same narrator turn overwrites the first speaker label.
 export function reclassToCharacter(beat, speakerLabel) {
   if (!beat) return;
   beat.classList.remove('narrator');
   beat.classList.add('character');
-  // Prepend speaker label if absent.
-  const card = beat.querySelector('.fable-beat-card');
+  const card = beat.querySelector('.message-card');
   if (!card) return;
-  if (!card.querySelector('.fable-beat-speaker')) {
-    const lbl = document.createElement('div');
-    lbl.className = 'fable-beat-speaker';
-    lbl.textContent = speakerLabel;
-    card.insertBefore(lbl, card.firstChild);
+  const nameEl = card.querySelector('.msg-name');
+  if (nameEl) {
+    nameEl.textContent = speakerLabel;
   } else {
-    card.querySelector('.fable-beat-speaker').textContent = speakerLabel;
+    // No header name yet (edge: reclass before header built) — inject one.
+    const header = card.querySelector('.message-header');
+    if (header) {
+      const span = document.createElement('span');
+      span.className = 'msg-name';
+      span.textContent = speakerLabel;
+      header.insertBefore(span, header.firstChild);
+    }
   }
 }
 
@@ -294,20 +411,23 @@ export function clearFeed() {
 // server-side mutation and a fresh card load render identically.
 //
 // `messages` is the wire shape: `[{ role: 'user'|'assistant'|'system',
-// content: string }]` (same shape `fable_quick_resume` /
-// `edit_message` / `reroll_last_turn` / `rewind_and_edit_user` return).
-// Assistant messages are finalized narrator beats (no streaming caret,
-// no chunk-by-chunk); the bracket-parser / atmosphere scan do NOT
-// re-fire on a rebuild (those only fire during live streaming).
+// content: string, timestamp?, variants?, active_idx? }]` (same shape
+// `fable_quick_resume` / `edit_message` / `reroll_last_turn` /
+// `rewind_and_edit_user` return). `timestamp` is OPTIONAL on the wire
+// (the Rust FableLoadMessage gains it alongside this UI; until then it's
+// absent → the header just omits the time line). Assistant messages are
+// finalized narrator beats (no streaming caret, no chunk-by-chunk); the
+// bracket-parser / atmosphere scan do NOT re-fire on a rebuild (those only
+// fire during live streaming).
 // =============================================================
 export function rebuildFromMessages(messages) {
   if (!feed) return;
   clearFeed();
   for (const m of messages || []) {
     if (m.role === 'user') {
-      addUserBeat(m.content);
+      addUserBeat(m.content, { ts: m.timestamp });
     } else if (m.role === 'assistant') {
-      const b = startNarratorBeat();
+      const b = startNarratorBeat({ ts: m.timestamp });
       finalizeBeat(b, m.content);
       // Stamp the swipeable-variant state (2026-07-29) so refreshControls can
       // render the ‹ 1/N › bar without a separate message cache. `variants` on
@@ -343,52 +463,69 @@ export function getBeatText(beat) {
 }
 
 // =============================================================
-// UX CHAT CONTROLS — the SillyTavern-style ‹ n/N › swipe bar (ECHO rewrite,
-// 2026-07-31). The old circular-arrow regenerate button is GONE.
+// UX CHAT CONTROLS — the SillyTavern-style ‹ n/N › swipe bar, now folded
+// INTO the hover-only .message-header (2026-08-01 overhaul). The old
+// circular-arrow regenerate button is GONE.
 //
 // `renderControls` injects a `.fable-beat-controls` element (the swipe bar)
-// into the beat's `.fable-beat-card`. The bar is ALWAYS VISIBLE on the last
-// assistant beat (low opacity, accenting on hover) — discoverable, not
-// hover-gated. Each button carries `data-action` so a single delegated click
-// handler on the feed can dispatch (stage.js).
-//
-// The controls live INSIDE the beat because `.fable-dialogue-feed` has
-// `pointer-events: none` (fable.css) — only `.fable-beat` descendants re-
-// enable `pointer-events: auto`, so anything outside a beat is unclickable.
+// into the beat's `.message-actions` slot (inside the header). Because the
+// header is opacity:0 until .message-card:hover, the bar is hover-gated too
+// — the feed stays clean until a card is hovered. Each button carries
+// `data-action` so a single delegated click handler on the feed can dispatch
+// (stage.js).
 //
 // Buttons shown:
-//   - swipe bar (‹ n/N ›): on assistant beats. On the LAST beat it's always
-//     visible + the › arrow is the regenerate trigger when on the last
-//     variant. ‹ steps back (undo — unlimited), › steps forward, and › on
-//     the last variant REGENERATES (a new variant; the Vec is uncapped).
+//   - swipe bar (‹ n/N ›): on assistant beats. ‹ steps back (undo —
+//     unlimited), › steps forward, and › on the last variant REGENERATES
+//     (a new variant; the Vec is uncapped).
 //
-// Editing is DOUBLE-CLICK: a dblclick anywhere on a beat enters edit mode
-// (stage.js wires the listener).
+// Editing is the header's ✎ button (data-action="edit") on user beats +
+// the last assistant beat (stage.js wires the handler). Double-click-to-edit
+// is ALSO kept as a power-user shortcut (same beginEdit routing).
 // =============================================================
 
-// `isLastBeat`: when true, the swipe bar is always visible + the › arrow on
-// the last variant becomes the regenerate action. `canRegenerate`: when true
-// (only meaningful on the last beat), the › arrow at the last variant is
-// armed as a regenerate trigger rather than disabled.
+// `isLastBeat`: when true, the › arrow on the last variant becomes the
+// regenerate action. `canRegenerate`: when true (only meaningful on the last
+// beat), the › arrow at the last variant is armed as a regenerate trigger
+// rather than disabled. `canEdit`: when true, an edit (✎) button is added
+// (user beats + the last assistant beat).
 export function renderControls(beat, {
   variantCount = 1,
   activeVariant = 0,
   isLastBeat = false,
   canRegenerate = false,
+  canEdit = false,
 } = {}) {
   if (!beat) return;
-  const card = beat.querySelector('.fable-beat-card');
+  const card = beat.querySelector('.message-card');
   if (!card) return; // system beats have no card → no controls.
-  // Idempotent: remove any prior controls block before injecting.
-  card.querySelector('.fable-beat-controls')?.remove();
-  // The bar renders whenever there's more than one variant, OR this is the
-  // last beat (so the regenerate › is reachable even on a fresh single-
+  const actions = card.querySelector('.message-actions');
+  if (!actions) return;
+  // Idempotent: clear the actions slot before injecting (so refreshControls
+  // can re-stamp without accumulating).
+  actions.innerHTML = '';
+
+  // Edit button (✎). Present on user beats + the last assistant beat. Shares
+  // the swipe-btn chrome family. The click is dispatched via data-action.
+  if (canEdit) {
+    const edit = document.createElement('button');
+    edit.type = 'button';
+    edit.className = 'msg-action-btn';
+    edit.dataset.action = 'edit';
+    edit.title = 'Edit';
+    edit.setAttribute('aria-label', 'Edit message');
+    edit.innerHTML = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 20l4-1L19 8l-3-3L5 16l-1 4z" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/><path d="M14 7l3 3" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>';
+    actions.appendChild(edit);
+  }
+
+  // The swipe bar renders whenever there's more than one variant, OR this is
+  // the last beat (so the regenerate › is reachable even on a fresh single-
   // variant assistant message — matches SillyTavern's always-present chevrons).
   const showBar = variantCount > 1 || isLastBeat;
   if (!showBar) return;
   const wrap = document.createElement('div');
   wrap.className = 'fable-beat-controls';
-  if (!isLastBeat) wrap.classList.add('is-hidden'); // earlier beats: hover-gated.
+  if (!isLastBeat) wrap.classList.add('is-hidden'); // earlier beats: hover-gated via header.
 
   const bar = document.createElement('div');
   bar.className = 'fable-swipe-bar';
@@ -434,7 +571,7 @@ export function renderControls(beat, {
   bar.appendChild(count);
   bar.appendChild(right);
   wrap.appendChild(bar);
-  card.appendChild(wrap);
+  actions.appendChild(wrap);
 }
 
 // =============================================================
@@ -448,11 +585,11 @@ export function renderControls(beat, {
 // backend's authoritative messages[]).
 //
 // While editing, the beat gets `.editing` (CSS hides the controls + the
-// read-only body) so the textarea is the sole focus.
+// header) so the textarea is the sole focus.
 // =============================================================
 export function enterEditMode(beat, { onSave, onCancel } = {}) {
   if (!beat || beat.classList.contains('editing')) return;
-  const card = beat.querySelector('.fable-beat-card');
+  const card = beat.querySelector('.message-card');
   if (!card) return;
   const body = beat.querySelector('.fable-beat-body');
   if (!body) return;

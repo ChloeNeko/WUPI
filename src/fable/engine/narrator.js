@@ -40,11 +40,21 @@ let rerolling = false;     // true when the current turn is a swipeable-variant
                            // in onDone to update the beat's variant stamp +
                            // refresh the swipe controls.
 
+// Identity for the message headers. cardName → narrator beats; playerName →
+// user beats. Forwarded to beats.setIdentity so the builders pick them up.
+let cardName = '';
+let playerName = '';
+
 export function initNarrator(hooks = {}) {
   onTurnStart = hooks.onTurnStart || null;
   onTurnEnd = hooks.onTurnEnd || null;
   npcPretty = hooks.npcPretty || null;
   onSchemaPop = hooks.onSchemaPop || null;
+  if (typeof hooks.cardName === 'string') cardName = hooks.cardName;
+  if (typeof hooks.playerName === 'string') playerName = hooks.playerName;
+  // Mirror into beats so its builders (addUserBeat/startNarratorBeat) read the
+  // same names. beats.setIdentity only overwrites fields it's handed.
+  beats.setIdentity({ cardName, playerName });
 }
 
 // Hard reset of all module state (Chloe 2026-07-23: the resource-isolation
@@ -122,7 +132,7 @@ function handleEvent(msg) {
 
 function onChunk(text) {
   if (!text) return;
-  if (!activeBeat) activeBeat = beats.startNarratorBeat();
+  if (!activeBeat) activeBeat = beats.startNarratorBeat({ name: cardName });
   beats.appendChunk(activeBeat, text);
 }
 
@@ -164,7 +174,7 @@ function onDone(finalText, cancelled) {
     activeBeat = null;
   } else if (finalText) {
     // No chunks arrived (edge case) but we have final prose — render it.
-    const b = beats.startNarratorBeat();
+    const b = beats.startNarratorBeat({ name: cardName });
     beats.finalizeBeat(b, finalText);
   }
   // Scan the finalized prose for atmosphere cues (time/weather keywords).

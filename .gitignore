@@ -13,6 +13,14 @@ tools/
 .idea/
 *.local
 *.gguf
+*.orig
+
+# Model weights + vendored crates — never source (GB-scale binaries).
+src-tauri/models/
+src-tauri/vendor/
+
+# Python bytecode caches.
+__pycache__/
 
 # Runtime playtest / debug captures (CUDA logs, etc.) — not source.
 logs/

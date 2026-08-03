@@ -141,19 +141,17 @@ pub struct MemoryEntry {
 pub const WUPI_CARD_ID: &str = "__wupi__";
 
 /// Reserved partition for Wupi's non-editable, user-invisible system knowledge
-/// (the OS docs: critical-wall, os-directives-vs-persona, sim-card-format,
-/// user-profile-format). Historically seeded at boot from
-/// `cards/wupi_knowledge/*.md`; that seed path was REMOVED in §8C (the source
-/// files were deleted pre-session). The sentinel constant stays: it's
-/// load-bearing for `search_wupi_visible` (the firewall's read side), and a
-/// future system-knowledge injection path would reuse it.
+/// — her static authoring playbook (`data/wupi.codex`: the `.sim` card format,
+/// the codex-entry format, the SOFT/HARD game-mechanic distinction). Seeded at
+/// boot by `codex::seed_wupi_codex` (idempotent hash-based reconcile); only
+/// reader is [`MemoryEngine::search_wupi_visible`].
 ///
-/// **The firewall:** no user IPC (`codex_save`, `codex_delete`,
-/// `chat_send` archival, `game_send` archival) writes here. The only reader
-/// is [`MemoryEngine::search_wupi_visible`], which lets Wupi retrieve her
-/// system knowledge regardless of which card is active (Wupi always knows her
-/// own OS docs). Roleplay cards never see this partition; cross-card reads
-/// exist only for this one reserved sentinel, by design (AGENTS.md §2AA).
+/// **The firewall:** no user IPC and no episodic archival (`chat_send` /
+/// `game_send` archival) writes here — only the boot seeder does. The only
+/// reader is [`MemoryEngine::search_wupi_visible`], which lets Wupi retrieve
+/// her playbook regardless of which card is active (Wupi always knows her own
+/// authoring reference). Roleplay cards never see this partition; cross-card
+/// reads exist only for this one reserved sentinel, by design (AGENTS.md §2AA).
 pub const WUPI_SYSTEM_CARD_ID: &str = "__wupi_system__";
 
 /// Reserved partition for the unified Fable playbook
@@ -164,10 +162,15 @@ pub const WUPI_SYSTEM_CARD_ID: &str = "__wupi_system__";
 /// firewall contract (Rust constant, never an IPC arg; only reader is
 /// [`MemoryEngine::search_fable_visible`]), separate partition so
 /// Fable-domain knowledge never leaks into the OS catgirl's prompts and
-/// vice versa. Seeded at boot by `codex::seed_fable_codex` (mirrors
-/// `seed_wupi_codex`); surfaced to BOTH the GM interview path AND the
-/// narrator path via `search_fable_visible`, folded into the respective
-/// system prompts (never exposed verbatim to the UI).
+/// vice versa. Surfaced to BOTH the GM interview path AND the narrator path
+/// via `search_fable_visible`, folded into the respective system prompts
+/// (never exposed verbatim to the UI).
+///
+/// **Status: dormant read-side.** The `__fable_system__` partition is queried
+/// by `search_fable_visible` but currently finds nothing — the sibling seeder
+/// (`codex::seed_fable_codex`, mirroring `seed_wupi_codex`) was removed in the
+/// lore-RAG strip and is not yet restored. The retrieval path stays live for
+/// the moment a Fable playbook seeder is re-added.
 ///
 /// **Unification (2026-07-29):** was `GM_SYSTEM_CARD_ID` / `__gm_system__`.
 /// Renamed + unified because the GM and the Narrator are both Fable-domain
@@ -176,16 +179,19 @@ pub const WUPI_SYSTEM_CARD_ID: &str = "__wupi_system__";
 /// model's logic. One Fable partition, one query/turn.
 pub const FABLE_SYSTEM_CARD_ID: &str = "__fable_system__";
 
-/// Reserved partition for user-authored Codex reference lore (the `.md` files
-/// the user creates/edits via the `codex_*` IPC). Pinned to a fixed sentinel
-/// rather than `active_card_id` so editing codex *during a game* lands the lore
-/// in the user's namespace, NOT in the active roleplay card's partition (the
-/// bug found during Phase 2 exploration: pre-fix, `codex_save` re-seeded to
-/// `active_card_id`, leaking user lore into whatever game was running).
+/// Reserved partition for user-authored Codex reference lore. Pinned to a
+/// fixed sentinel rather than `active_card_id` so editing codex *during a
+/// game* would land the lore in the user's namespace, NOT in the active
+/// roleplay card's partition (the bug this prevents: a codex write re-seeding
+/// to `active_card_id`, leaking user lore into whatever game was running).
 ///
-/// Distinct from [`WUPI_SYSTEM_CARD_ID`] (Wupi's docs, non-editable) and from
-/// any roleplay card id (per-scenario episodic + authored lore, if the card
-/// ever grows its own codex). Three disjoint namespaces.
+/// **Status: dormant scaffolding.** The user-codex feature (the `data/docs/`
+/// seeder + the `codex_*` IPCs/tools that wrote here) was removed; nothing
+/// seeds this partition today. The constant + `is_codex` / `codex_ids_among`
+/// read-side stay live because `search_fable_visible` fuses `__codex__` into
+/// its retrieval (it matches nothing until a user-codex seeder is restored).
+/// Distinct from [`WUPI_SYSTEM_CARD_ID`] (Wupi's playbook, boot-seeded) and
+/// from any roleplay card id (per-scenario episodic). Three disjoint namespaces.
 pub const CODEX_CARD_ID: &str = "__codex__";
 
 //

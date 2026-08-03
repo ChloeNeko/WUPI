@@ -63,19 +63,22 @@ pub fn build_tray<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
 }
 
 
-/// Best-effort teardown of the system-tray icon. MUST be called before any
-/// `std::process::exit` path so the Windows shell receives `NIM_DELETE` while
-/// the process is still alive to service it. Without this, `std::process::exit`
-/// skips Tauri's `Drop` for the tray, Windows is never notified, and Explorer
-/// leaves a "ghost" icon cached in the hidden-icons popover until the user
-/// hovers over it (the well-known Windows shell caching quirk).
+/// Best-effort teardown of the system-tray icon. Sends `NIM_DELETE` to the
+/// Windows shell (via the platform `Drop`) so the tray paw is removed before
+/// the process exits. Idempotent + non-fatal.
 ///
 /// `remove_tray_by_id` is the correct Tauri 2 API: it takes the icon out of
 /// Tauri's internal state AND calls `icon.close()` (the platform-level
-/// teardown — `Shell_NotifyIcon(NIM_DELETE)` on Windows). The returned icon
-/// drops at the end of this fn, finalizing the cleanup. Idempotent + non-fatal:
-/// a missing icon (None return) is the normal case on a second call, just
-/// swallowed silently.
+/// teardown — `Shell_NotifyIcon(NIM_DELETE)` on Windows, run synchronously
+/// inside the tray-icon `Drop`). The returned icon drops at the end of this
+/// fn, finalizing the cleanup. A missing icon (None return) is the normal
+/// case on a second call, just swallowed silently.
+///
+/// Called explicitly from `power_shutdown` BEFORE `app.exit(0)` so the
+/// `NIM_DELETE` is sent while the event loop is still pumping — the shell's
+/// UI thread (in explorer.exe) reconciles the deletion asynchronously, and
+/// the graceful exit gives it the message-pump time the old hard-kill
+/// (`std::process::exit`) starved. See `power_shutdown` for the full history.
 pub fn destroy_tray<R: Runtime>(app: &AppHandle<R>) {
     // Returns Option<TrayIcon>; dropping it finalizes the platform cleanup.
     // No error path — `remove_tray_by_id` returns None if the icon doesn't
@@ -83,34 +86,33 @@ pub fn destroy_tray<R: Runtime>(app: &AppHandle<R>) {
     drop(app.remove_tray_by_id("wupi-tray"));
 }
 
-/// Full shutdown: terminate the process unconditionally. We use
-/// `std::process::exit(0)`: an immediate OS-level process kill that bypasses
-/// Tauri's exit flow entirely. `app.exit(0)` runs the graceful window/webview
-/// teardown, which can STALL when a secondary window is open or wedged, forcing
-/// the user to Task Manager. `std::process::exit` kills every window + webview
-/// affiliated with the process in one shot, no waiting. (The terminal window
-/// that originally surfaced this has been removed, but the hard-kill remains
-/// the right call for a power-off action.)
+/// Full shutdown: terminate the process gracefully. We call `app.exit(0)`:
+/// Tauri's graceful exit flow, which keeps the event loop pumping during
+/// teardown so the OS-level tray teardown (the `NIM_DELETE` sent by
+/// `destroy_tray` above) is fully serviced by the Windows shell BEFORE the
+/// process goes away.
 ///
-/// BEFORE the hard exit we explicitly `destroy_tray`: `std::process::exit`
-/// skips Rust destructors, so Tauri's tray `Drop` would never run and Windows
-/// would leave a ghost icon cached. Destroying first sends `NIM_DELETE` while
-/// we're still alive to service it.
+/// This replaced `std::process::exit(0)` (the immediate OS-level kill). The
+/// hard kill was originally chosen because `app.exit`'s window/webview
+/// teardown could stall when a secondary window was wedged — but WUPI is
+/// single-window, so that stall path no longer exists, and the hard kill had
+/// a real cost: `process::exit` skips the live message pump, so this process
+/// frequently died before `explorer.exe` (a SEPARATE process hosting the
+/// tray) reconciled the `NIM_DELETE` on its UI thread. Result: a "ghost" paw
+/// icon cached in the hidden-icons overflow popover until the user hovered it
+/// (the well-known Windows shell caching quirk). The 200ms sleep that used to
+/// live here was a losing race against that; graceful exit fixes it properly
+/// because the loop pumps messages until teardown completes.
+///
+/// `destroy_tray` is still called explicitly first so the `NIM_DELETE` is
+/// sent deterministically while we know the loop is alive (not relying on
+/// Tauri's internal tray Drop ordering). The belt-and-suspenders
+/// `RunEvent::ExitRequested → destroy_tray` in lib.rs is idempotent (a second
+/// `remove_tray_by_id` returns None) so there's no double-free risk.
 pub fn power_shutdown<R: Runtime>(app: &AppHandle<R>) {
     let _ = app.emit(EVT_CANVAS_PAUSE, ());
     destroy_tray(app);
-    // Brief yield so explorer.exe can pump the NIM_DELETE notification
-    // before the process dies. `destroy_tray` sends the deletion correctly,
-    // but `std::process::exit` then kills this process so fast that the
-    // shell (a SEPARATE process hosting the tray) hasn't serviced the
-    // notification yet — leaving a phantom paw cached in the hidden-icons
-    // overflow popover until the user hovers over it (the well-known
-    // Windows shell caching quirk). ~200ms empirically lets Explorer clear
-    // the ghost on every exit path; short enough not to read as a hang.
-    // Lives HERE, not in destroy_tray, so non-exit callers (none today,
-    // defensive) don't pay the latency.
-    std::thread::sleep(std::time::Duration::from_millis(200));
-    std::process::exit(0);
+    app.exit(0);
 }
 
 /// Restart: spawn a fresh copy of this executable, then shut down.
@@ -188,9 +190,11 @@ pub fn power_sleep_cmd<R: Runtime>(app: tauri::AppHandle<R>) -> Result<(), Strin
 /// from freely — the app-lifecycle onPause/onResume framework freezes Fable's
 /// GPU/audio on focus loss so there's no cost to leaving WUPI unfocused, and
 /// forcing on-top would block that alt-tab workflow. The command + IPC are
-/// RETAINED so the first-run download overlay (or a future "kiosk mode")
-/// can still flip on-top at runtime if a use case needs it. Today nothing
-/// in the steady-state boot path calls it.
+/// RETAINED as a runtime hook for a future "kiosk mode" (or any other use
+/// case that needs to flip on-top after boot). Today NOTHING calls it: the
+/// old first-run download overlay callers in script.js were stale (from when
+/// the config default was `true`) and trapped the window on-top for the whole
+/// session after the first download — removed 2026-07-31.
 ///
 /// Custom `#[tauri::command]` (not the Tauri built-in window plugin command):
 /// `core:default` in capabilities/default.json auto-allows custom commands,

@@ -144,6 +144,45 @@ export function stopThemeMusic(host) {
   }
 }
 
+// FADE OUT + remove the theme music over `ms` (default MUSIC_FADE_MS).
+// Ramps the live node's volume to 0 (clearing any in-flight fade-in timer
+// first so the two don't fight), then removes the node + state exactly like
+// stopThemeMusic. Idempotent: no node → no-op.
+//
+// (Currently unused — New Game now hard-stops the theme at click time per
+// Chloe. Kept as a utility: a future flow that wants a soft theme exit can
+// reach for this instead of the hard stop. Delete if it stays unused.)
+export function fadeOutThemeMusic(host, ms = MUSIC_FADE_MS) {
+  if (!host) return;
+  const audio = host.querySelector('#' + MUSIC_ID);
+  if (!audio) return;
+  // Clear any in-flight fade-in timer so it can't fight the fade-out.
+  if (host._wupiMusicFade) {
+    clearInterval(host._wupiMusicFade);
+    host._wupiMusicFade = null;
+  }
+  const startVol = audio.volume;
+  const steps = 8;
+  let i = 0;
+  host._wupiMusicFade = setInterval(() => {
+    i++;
+    if (!audio.parentNode) { clearInterval(host._wupiMusicFade); host._wupiMusicFade = null; return; }
+    audio.volume = Math.max(0, startVol * (1 - i / steps));
+    if (i >= steps) {
+      clearInterval(host._wupiMusicFade);
+      host._wupiMusicFade = null;
+      // Full teardown now that the node is silent.
+      try { audio.pause(); } catch (_) {}
+      audio.remove();
+      if (host._wupiMusicUnlock) {
+        host.removeEventListener('pointerdown', host._wupiMusicUnlock);
+        host.removeEventListener('keydown', host._wupiMusicUnlock);
+        host._wupiMusicUnlock = null;
+      }
+    }
+  }, ms / steps);
+}
+
 // (teardownTitleIgnite was removed in the scratch reset — the wordmark's
 // .igniting class is no longer added anywhere, so there's nothing to clean
 // up. The function lived here as a no-fog teardown helper for fable.js.)

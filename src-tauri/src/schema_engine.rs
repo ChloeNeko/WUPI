@@ -63,7 +63,7 @@ use crate::schema_validator;
 /// pass only needs: system instruction (~150 tokens) + current schema JSON
 /// (~200-800) + last exchange (~100-400) + generation room. 2048 is generous
 /// headroom; the KV cost at Q8_0 is ~75MB.
-const SCHEMA_CTX: u32 = 2048;
+const SCHEMA_CTX: u32 = crate::settings::CTX_SCHEMA;
 const SCHEMA_BATCH: u32 = 512;
 /// Cap on generated tokens for a delta pass. A compliant micro-delta is
 /// 20-100 tokens; 256 is hard headroom before truncation forces the model to
@@ -83,7 +83,7 @@ const SCHEMA_MAX_TOKENS: i32 = 256;
 /// no-op — greedy after temp scaling always picks the top-1 logit, so the
 /// "0.2 lets it consider both" intent was defeated). See the chain
 /// construction in `generate_with_repair`.
-const SCHEMA_TEMP: f32 = 0.2;
+const SCHEMA_TEMP: f32 = crate::settings::TEMP_TRACKER;
 
 /// Maximum number of generation passes per delta attempt (initial + 2
 /// repairs = 3 total). The 4th-and-beyond cliff is empirically steep for
@@ -947,8 +947,8 @@ impl SchemaRuntime {
         // channel protocol). n_cur = next position to decode.
         let mut sampler = LlamaSampler::chain_simple([
             LlamaSampler::temp(SCHEMA_TEMP),
-            LlamaSampler::top_p(0.9, 1),
-            LlamaSampler::min_p(0.1, 1),
+            LlamaSampler::top_p(crate::settings::TOP_P_TRACKER, 1),
+            LlamaSampler::min_p(crate::settings::MIN_P, 1),
             LlamaSampler::dist(0),
         ]);
         let eos = self.model.token_eos();

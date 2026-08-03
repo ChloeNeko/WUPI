@@ -33,6 +33,8 @@ import * as beats from '../engine/beats.js';
 import * as narrator from '../engine/narrator.js';
 import * as wupiDrawer from '../engine/wupi-drawer.js';
 import * as leftDrawer from '../engine/left-drawer.js';
+import { buildTabRail, renderActive, resetTabRail } from '../engine/tab-rail.js';
+import { buildRawEditor, onEsc as rawEditorEsc, resetRawEditor, isOpen as rawEditorOpen } from '../engine/raw-editor.js';
 import { invoke } from '@tauri-apps/api/core';
 // playFX + clearFX were the weather-render hooks pre-stripping; weather is
 // gone now (file header), so only initFX + clearAllFX remain used. The two
@@ -60,8 +62,11 @@ let stageRoot = null;
 let toastTimer = null;
 let cardContext = null;  // { card, saveId } for the active session
 let activeCardName = '';  // display name of the seated card (the typing indicator)
+let activePlayerName = '';  // protagonist name (card.player_name) → user-beat headers
 let cornerTrigger = null;   // the right-edge hover zone (Wupi drawer)
 let cornerDwellTimer = null; // 300ms arm-before-open timer (right edge)
+let leftCornerTrigger = null;   // the left-edge hover zone (Card / Tracker drawer)
+let leftCornerDwellTimer = null; // 300ms arm-before-open timer (left edge)
 let saveModalClose = null;  // fn: close the save modal (set in wireStage, called by Esc)
 const CORNER_DWELL_MS = 300;
 
@@ -116,9 +121,21 @@ export function buildStage() {
          lock (color change only). Mirrors the left-edge lock bar. -->
     <div class="fable-edge-lock fable-edge-lock--right" data-wupi-edge-lock aria-hidden="true"></div>
 
-    <!-- LEFT drawer mount point (Card / Tracker / Codex tabs). The element +
-         handle are built by engine/left-drawer.js and injected here in
-         buildStage. Slides in from the left (mirror of the right Wupi drawer). -->
+    <!-- LEFT-edge LOCK BAR — standalone super-thin strip at the absolute
+         left edge. INVISIBLE by default; only visible when the left drawer
+         is open AND the mouse touches the complete edge. Click toggles the
+         lock (color change only). Exact mirror of the right-edge lock bar. -->
+    <div class="fable-edge-lock fable-edge-lock--left" data-left-edge-lock aria-hidden="true"></div>
+
+    <!-- Invisible LEFT-edge hover zone — the mirror of the right-edge
+         fable-corner-trigger. A 300ms dwell arms on mouseenter → opens the
+         left (Card / Tracker) drawer; mouseleave cancels. -->
+    <div class="fable-corner-trigger fable-corner-trigger--left" data-left-corner-trigger aria-hidden="true"></div>
+
+    <!-- LEFT drawer mount point (Card / Tracker tabs). The element is built
+         by engine/left-drawer.js and injected here in buildStage. Slides in
+         from the left (exact mirror of the right Wupi drawer: hover-to-open
+         + edge-lock, no visible handle). -->
     <div class="fable-left-drawer-mount" data-left-mount></div>
 
     <aside class="fable-wupi-drawer" data-wupi-drawer>
@@ -128,6 +145,12 @@ export function buildStage() {
       <header class="fable-wupi-header">
         <div class="fable-wupi-brand">WUPI</div>
       </header>
+      <!-- The tracked-stat tab rail (Player / Sim Card / Codex / World / NPC).
+           Built by engine/tab-rail.js + injected here in buildStage. Sits
+           between the brand + the chat messages. A toggled tab drops down its
+           prose panel; the dropdown persists across drawer close/reopen (the
+           hover-reopen-keeps-active mechanic). -->
+      <div class="fable-tab-rail-mount" data-tab-rail-mount></div>
       <div class="fable-wupi-messages" data-wupi-messages></div>
       <form class="fable-wupi-input-row" data-wupi-form>
         <textarea class="fable-wupi-input" data-wupi-input rows="1" placeholder="Ask Wupi anything…"></textarea>
@@ -179,18 +202,26 @@ export function buildStage() {
 
     <div class="fable-toast" data-toast hidden></div>
   `;
-  // Inject the left drawer (Card / Tracker / Codex) + its edge handle into
-  // the mount point. Built by engine/left-drawer.js; reused across entries.
+  // Inject the left drawer (now an empty shell) into the mount point. Built by
+  // engine/left-drawer.js; reused across entries. Opens via the left hover
+  // strip (mirrors the right Wupi drawer).
   const leftMount = root.querySelector('[data-left-mount]');
   if (leftMount) {
     leftMount.appendChild(leftDrawer.buildLeftDrawer());
-    leftMount.appendChild(leftDrawer.buildLeftHandle());
   }
+  // Inject the tab rail into the Wupi drawer (between brand + messages) + the
+  // raw-editor overlay onto the stage. Both built once, reused across entries.
+  const railMount = root.querySelector('[data-tab-rail-mount]');
+  if (railMount) railMount.appendChild(buildTabRail());
+  root.appendChild(buildRawEditor());
   return root;
 }
 
 // Wire the stage after it's in the DOM. cardContext: { card, saveId }.
-export function wireStage(root, hooks) {
+// Async because it awaits the active-card identity fetch (so the narrator
+// builders have the card/player names in hand before the first beat could
+// render). Callers fire-and-forget; the return value (a Promise) is unused.
+export async function wireStage(root, hooks) {
   stageRoot = root;
   cardContext = hooks.cardContext || null;
 
@@ -206,10 +237,11 @@ export function wireStage(root, hooks) {
   // Engine init (composition root).
   beats.initBeats(feed);
   initFX(fxLayer, root, { onTransient: () => {} });
-  // The typing indicator: shows "(name) is currently typing.." above the input
-  // while a narrator/character beat streams. The card name is fetched once on
-  // stage entry (best-effort — a fetch failure falls back to a generic label).
-  refreshActiveCardName(root);
+  // The typing indicator + the message-header identity: fetch the active
+  // card's name + player_name ONCE (best-effort) so the narrator/beats
+  // builders can stamp the headers. Awaited so the names are in hand before
+  // initNarrator forwards them (a fetch failure falls back to generic labels).
+  await refreshActiveCardName(root);
   narrator.initNarrator({
     onTurnStart: () => {
       setGenerating(true);
@@ -222,8 +254,16 @@ export function wireStage(root, hooks) {
       // last in the feed. Re-stamp controls so the swipe/regenerate affordance
       // moves onto it (and the prior last assistant beat loses its bar).
       refreshControls();
+      // §11.30 Left-Drawer HUD: a turn may have mutated player body (Combat
+      // Referee), entities (item-grant brackets), clock/weather (TIME/
+      // WEATHER commands). Refresh the paperdoll + ambient + inventory so
+      // the HUD reflects the new ground truth. Best-effort (no await — the
+      // UI re-enable above must not block on IPC latency).
+      leftDrawer.refreshAll();
     },
     npcPretty: hooks.npcPretty || null,
+    cardName: activeCardName,
+    playerName: activePlayerName,
     // Schema-ring-buffer handoff: when a mutation command (reroll / rewind)
     // returns `schema_pop_count`, invoke `fable_rollback` that many times to
     // restore the matching world-state snapshots. `fable_rollback` is the
@@ -350,11 +390,13 @@ export function wireStage(root, hooks) {
     });
   }
 
-  // Delegated click handler for the feed controls (the swipe arrows). Editing
-  // is dblclick (separate listener below). The › arrow on the last variant of
-  // the last beat carries `data-action="regenerate"` (a new variant is
-  // generated + appended — unlimited); ‹ / non-last › carry swipe-left/right
-  // (navigate existing variants).
+  // Delegated click handler for the feed controls (the swipe arrows + the edit
+  // ✎ button in the hover header). The › arrow on the last variant of the last
+  // beat carries `data-action="regenerate"` (a new variant is generated +
+  // appended — unlimited); ‹ / non-last › carry swipe-left/right (navigate
+  // existing variants); `data-action="edit"` enters inline edit mode (same
+  // routing as the dblclick shortcut below). One delegated listener because
+  // `beats.renderControls` rebuilds the actions slot on every mutation.
   on(feed, 'click', (e) => {
     const btn = e.target.closest('[data-action]');
     if (!btn) return;
@@ -364,6 +406,12 @@ export function wireStage(root, hooks) {
     const idx = Number.parseInt(beat.dataset.index || '', 10);
     if (!Number.isInteger(idx)) return;
     if (narrator.isGenerating()) return;
+    if (action === 'edit') {
+      // Header ✎ button → inline edit (same routing as dblclick).
+      if (beat.classList.contains('streaming') || beat.classList.contains('editing')) return;
+      beginEdit(beat);
+      return;
+    }
     if (action === 'regenerate') {
       // › on the last variant → generate a fresh sibling variant (uncapped).
       narrator.rerollLastTurn();
@@ -456,6 +504,42 @@ export function wireStage(root, hooks) {
     syncWupiEdgeLockColor();
   });
 
+  // ── LEFT DRAWER (Card / Tracker) — exact mirror of the right Wupi drawer.
+  // Invisible left-edge hover strip with a 300ms dwell, a left edge-lock bar,
+  // and mouseleave auto-close (suppressed when locked). No visible handle.
+  leftCornerTrigger = root.querySelector('[data-left-corner-trigger]');
+  on(leftCornerTrigger, 'mouseenter', armLeftCornerDwell);
+  on(leftCornerTrigger, 'mouseleave', cancelLeftCornerDwell);
+
+  const leftDrawerEl = root.querySelector('[data-left-drawer]');
+  on(leftDrawerEl, 'mouseleave', () => leftDrawer.onDrawerMouseLeave());
+
+  const leftEdgeLock = root.querySelector('[data-left-edge-lock]');
+  leftDrawer.setEdgeLockProbe(() => leftEdgeLock && leftEdgeLock.classList.contains('visible'));
+
+  function syncLeftEdgeLockColor() {
+    if (leftEdgeLock) leftEdgeLock.classList.toggle('locked', leftDrawer.isLocked());
+  }
+
+  // Extend the stage mousemove handler to also drive the LEFT edge-lock bar.
+  // (The existing onStageMouseMove above handles the right edge; this branch
+  // mirrors it for the left edge.)
+  function onStageMouseMoveLeft(e) {
+    const rect = root.getBoundingClientRect();
+    const fromLeft = e.clientX - rect.left;
+    if (leftEdgeLock) {
+      const show = fromLeft <= EDGE_HIT_PX && leftDrawer.isOpenState();
+      leftEdgeLock.classList.toggle('visible', show);
+    }
+  }
+  on(root, 'mousemove', onStageMouseMoveLeft);
+
+  on(leftEdgeLock, 'click', (e) => {
+    e.stopPropagation();
+    leftDrawer.toggleLock();
+    syncLeftEdgeLockColor();
+  });
+
   // Drawer footer actions. Three ICON buttons (no worded labels):
   //   💾 Save → opens the center save modal (name input + Quick Save / Save)
   //   📂 Load → fires the onLoad hook (save picker, future); closes drawer
@@ -471,6 +555,16 @@ export function wireStage(root, hooks) {
   const footSave = root.querySelector('[data-foot-save]');
   const footLoad = root.querySelector('[data-foot-load]');
   const footHome = root.querySelector('[data-foot-home]');
+
+  // Quick Play mode: the session auto-saves its single quicksave slot on
+  // fable_end (Home/Exit) — there is no manual save list + no load list. Hide
+  // the Save + Load footer buttons so the only affordance is Home (which
+  // triggers the auto-quicksave). The narrator feed, Wupi drawer, and all UX
+  // chat controls stay fully active.
+  if (hooks.isQuickPlay) {
+    if (footSave) footSave.hidden = true;
+    if (footLoad) footLoad.hidden = true;
+  }
 
   // Save icon → open the modal + focus the name input.
   on(footSave, 'click', () => {
@@ -550,9 +644,15 @@ export function wireStage(root, hooks) {
   // §2A "ambient title music" will be re-sourced when audio assets are re-added.
 }
 
+// Auto-grow the composer to fit content, capped at 4 lines (Chloe
+// 2026-08-02: "automatically size the box as you type in more lines with
+// a max limit of 4 lines"). Beyond 4 lines the field scrolls internally
+// (the scrollbar is hidden via CSS — still scrollable, no visual handle).
+// 4 lines × line-height 1.5 × 17px = 102px + 26px vertical padding = 128px.
+const INPUT_MAX_HEIGHT = 128;
 function autoGrow(el) {
   el.style.height = 'auto';
-  el.style.height = Math.min(el.scrollHeight, 160) + 'px';
+  el.style.height = Math.min(el.scrollHeight, INPUT_MAX_HEIGHT) + 'px';
 }
 
 // Track a stage-element listener so teardownStage can remove it (prevents
@@ -587,10 +687,12 @@ function setGenerating(on) {
 
 function onKeyDown(e) {
   if (e.key !== 'Escape') return;
-  // Priority order: save modal → modal panel → wupi drawer → left drawer.
-  // Innermost surface dismisses first so a player with stacked surfaces can
-  // Esc them one at a time. The save modal is highest (it's a centered card
-  // over everything when open).
+  // Priority order: raw editor → save modal → modal panel → wupi drawer →
+  // left drawer. Innermost surface dismisses first so a player with stacked
+  // surfaces can Esc them one at a time. The raw editor is highest (it darkens
+  // the full stage + its validation lock means Esc refuses on invalid — only
+  // ↻ or ✕ escape, so Esc on invalid just flashes the hint, not a close).
+  if (rawEditorOpen() && rawEditorEsc()) { e.preventDefault(); return; }
   if (saveModalClose) {
     const overlay = stageRoot && stageRoot.querySelector('[data-save-overlay]');
     if (overlay && !overlay.hidden) { saveModalClose(); e.preventDefault(); return; }
@@ -609,10 +711,31 @@ function armCornerDwell() {
   cornerDwellTimer = setTimeout(() => {
     cornerDwellTimer = null;
     wupiDrawer.openDrawer();
+    // Hover-reopen-keeps-active: if a tab was active before the drawer
+    // auto-closed on mouseleave, re-render its dropdown now so it reappears
+    // with the tab still glowing. No-op when no tab is active.
+    renderActive();
   }, CORNER_DWELL_MS);
 }
 function cancelCornerDwell() {
   if (cornerDwellTimer) { clearTimeout(cornerDwellTimer); cornerDwellTimer = null; }
+}
+
+// Left-edge dwell — exact mirror of armCornerDwell / cancelCornerDwell above
+// but for the left (Card / Tracker) drawer.
+function armLeftCornerDwell() {
+  if (leftCornerDwellTimer) clearTimeout(leftCornerDwellTimer);
+  leftCornerDwellTimer = setTimeout(() => {
+    leftCornerDwellTimer = null;
+    leftDrawer.openDrawer();
+    // §11.30: refresh the HUD on open so the paperdoll/ambient/inventory
+    // reflect the latest state (mirrors the right rail's renderActive() on
+    // reopen — the drawer's content may be stale from a prior session).
+    leftDrawer.refreshAll();
+  }, CORNER_DWELL_MS);
+}
+function cancelLeftCornerDwell() {
+  if (leftCornerDwellTimer) { clearTimeout(leftCornerDwellTimer); leftCornerDwellTimer = null; }
 }
 
 async function doSave(saveId, name, msg) {
@@ -642,17 +765,34 @@ export function loadHistory(messages) {
   refreshControls();
 }
 
-// ── Typing indicator ────────────────────────────────────────────────────
+// ── Typing indicator + card identity ────────────────────────────────────
 // "(name) is currently typing.." pinned above the input row while a beat
-// streams. The card name is fetched once on stage entry (best-effort) +
-// cached in `activeCardName`; the show/hide toggles are driven by the
-// narrator onTurnStart/onTurnEnd hooks. Generic fallback when no name.
+// streams. The card identity (name + player_name) is fetched once on stage
+// entry (best-effort) + cached in `activeCardName` (the display name for the
+// typing label) + stashed in `activePlayerName` so the initNarrator call
+// (which runs right after this in wireStage) can forward both into the
+// beats builders for the message headers. Generic fallback when no name.
+//
+// DEFENSIVE DUAL-SHAPE: `fable_active_card_get` returns a plain card-name
+// string today; a parallel Rust change widens it to `{name, player_name}`.
+// We accept BOTH shapes so this UI works whether or not that Rust edit has
+// landed yet (a string → name only, player_name stays ''; an object → both).
 async function refreshActiveCardName(root) {
   try {
-    const name = await invoke('fable_active_card_get');
-    activeCardName = (typeof name === 'string' && name) ? name : '';
+    const res = await invoke('fable_active_card_get');
+    if (typeof res === 'string') {
+      activeCardName = res;
+      activePlayerName = '';
+    } else if (res && typeof res === 'object') {
+      activeCardName = typeof res.name === 'string' ? res.name : '';
+      activePlayerName = typeof res.player_name === 'string' ? res.player_name : '';
+    } else {
+      activeCardName = '';
+      activePlayerName = '';
+    }
   } catch (_) {
     activeCardName = '';
+    activePlayerName = '';
   }
   updateTypingText(root);
 }
@@ -702,20 +842,26 @@ function refreshControls() {
     const variantCount = Number.parseInt(beat.dataset.variantCount || '1', 10);
     const activeVariant = Number.parseInt(beat.dataset.activeVariant || '0', 10);
     if (role === 'assistant' && i === lastIdx) {
-      // Last assistant beat: the always-visible swipe bar. › on the last
-      // variant is the regenerate trigger (variants are uncapped).
+      // Last assistant beat: the swipe bar (hover-gated via the header) + the
+      // edit ✎ button. › on the last variant is the regenerate trigger
+      // (variants are uncapped).
       beats.renderControls(beat, {
         variantCount,
         activeVariant,
         isLastBeat: true,
         canRegenerate: true,
+        canEdit: true,
       });
     } else if (role === 'assistant') {
       // Earlier assistant beats: hover-gated swipe bar (navigation only, no
-      // regenerate).
+      // regenerate, no edit — mid-history assistant edits would desync).
       beats.renderControls(beat, { variantCount, activeVariant, isLastBeat: false });
+    } else if (role === 'user') {
+      // User beats: the edit ✎ button only (rewind-and-edit branches the
+      // timeline). No swipe bar (variants are an assistant-only affordance).
+      beats.renderControls(beat, { variantCount: 1, activeVariant: 0, isLastBeat: false, canEdit: true });
     }
-    // User + system beats: no controls (editing is dblclick).
+    // System beats: no controls.
   });
 }
 
@@ -763,6 +909,13 @@ export function teardownStage() {
   narrator.resetNarrator();
   wupiDrawer.resetWupiDrawer();
   leftDrawer.resetLeftDrawer();
+  // Reset the tab rail (clears the active tab so no stale dropdown leaks into
+  // the next session) + the raw editor (closes it if open — a mid-edit exit
+  // discards unsaved textarea edits to the last-good file, same protection as
+  // Alt+F4). The raw editor's atomic-write backend means the file on disk is
+  // always the last successfully-saved state regardless.
+  resetTabRail();
+  resetRawEditor();
   // Selection popup teardown removed (the selection module + its regenerate_slice
   // IPC are dead). The stageListeners loop above already removes every tracked
   // stage-element listener, so nothing leaks.

@@ -1,3 +1,16 @@
+/* ── OS accent palette (theme-driven) ──────────────────────────────
+   The aurora color code selects one triplet of accent vars (set live in
+   script.js applyTheme from each COLOR_CODES entry). Defaults = Vibrant's
+   magenta, so the chrome looks correct before the boot theme_get round-trip
+   lands AND so any surface that never gets re-themed still reads as the
+   original look. Three shades: the mid accent, a brighter tint (CTA fills,
+   glows), and a deeper one (gradient ends, shadows). */
+:root {
+    --ui-accent: #b534fa;
+    --ui-accent-bright: #ff66b2;
+    --ui-accent-deep: #6a0dad;
+}
+
 html, body {
     margin: 0;
     padding: 0;
@@ -169,8 +182,8 @@ body:not(.booting) .top-bar {
     align-items: center;
     justify-content: center;
     background: linear-gradient(180deg,
-        color-mix(in srgb, var(--ui-accent, #b534fa) 92%, #fff 8%),
-        color-mix(in srgb, var(--ui-accent, #b534fa) 68%, #000 32%));
+        color-mix(in srgb, var(--ui-accent-bright) 92%, #fff 8%),
+        var(--ui-accent));
     color: #fff;
     font-size: 9.5px;
     font-weight: 800;
@@ -225,8 +238,8 @@ body:not(.booting) .top-bar {
 }
 
 .status-dot.connected {
-    background: #b534fa;
-    box-shadow: 0 0 8px #b534fa;
+    background: var(--ui-accent);
+    box-shadow: 0 0 8px var(--ui-accent);
 }
 
 .date-display {
@@ -403,9 +416,9 @@ body:not(.booting) .top-bar {
 /* Selected state for theme/colorcode options */
 .dropdown-item.theme-option.selected,
 .dropdown-item.colorcode-option.selected {
-    background: rgba(181, 52, 250, 0.18);
+    background: color-mix(in srgb, var(--ui-accent) 18%, transparent);
     color: #fff;
-    box-shadow: inset 2px 0 0 #b534fa;
+    box-shadow: inset 2px 0 0 var(--ui-accent);
 }
 
 .dropdown-item {
@@ -429,6 +442,24 @@ body:not(.booting) .top-bar {
     color: #ffffff;
 }
 
+/* Ethernet "Connected" status row. Unlike .dropdown-item, this is purely
+   informational (no action on click), so it is centered, non-interactive,
+   and carries no pointer cursor / hover highlight. The wired-link panel is
+   a status readout, not a menu entry. */
+.ethernet-status-row {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 10px;
+    padding: 12px 12px;
+    font-size: 15px;
+    color: rgba(255, 255, 255, 0.92);
+    text-align: center;
+    width: 100%;
+    cursor: default;
+    pointer-events: none; /* the panel is a readout, not a clickable target */
+}
+
 .menu-svg {
     width: 16px;
     height: 16px;
@@ -444,8 +475,8 @@ body:not(.booting) .top-bar {
 /* ── Updates cascade panel (#updatePanel) ──
    Inherits .dropdown-menu + .cascade-panel (positioning, blur, animation).
    This block adds only the panel-local state-row + button styling. The
-   magenta accent matches the connection-panel "pink connect button"
-   aesthetic: #ff66b2 fill, #b534fa deep-magenta shadow. */
+   accent matches the connection-panel "connect button" aesthetic and follows
+   the active theme via the --ui-accent* vars (bright fill, deep shadow). */
 .update-panel { min-width: 220px; }
 
 .update-version-row {
@@ -497,8 +528,8 @@ body:not(.booting) .top-bar {
 /* Green dot for "up to date" reuses .status-dot.connected. The two below
    are panel-specific accent dots. */
 .update-available-dot {
-    background: #ff66b2;
-    box-shadow: 0 0 6px rgba(255, 102, 178, 0.6);
+    background: var(--ui-accent-bright);
+    box-shadow: 0 0 6px color-mix(in srgb, var(--ui-accent-bright) 60%, transparent);
 }
 .update-error-dot {
     background: #ff5a5a;
@@ -519,18 +550,20 @@ body:not(.booting) .top-bar {
 }
 
 .update-install-btn {
-    /* Magenta filled CTA — the visual parallel to the Connect button. */
-    background: linear-gradient(135deg, #ff66b2 0%, #b534fa 100%);
+    /* Accent filled CTA — the visual parallel to the Connect button. */
+    background: linear-gradient(135deg, var(--ui-accent-bright) 0%, var(--ui-accent) 100%);
     color: #ffffff;
     font-weight: 600;
     justify-content: center;
     text-align: center;
-    box-shadow: 0 0 12px rgba(181, 52, 250, 0.35);
+    box-shadow: 0 0 12px color-mix(in srgb, var(--ui-accent) 35%, transparent);
     margin-top: 2px;
 }
 .update-install-btn:hover {
-    background: linear-gradient(135deg, #ff77bb 0%, #c44aff 100%);
-    box-shadow: 0 0 16px rgba(181, 52, 250, 0.55);
+    background: linear-gradient(135deg,
+        color-mix(in srgb, var(--ui-accent-bright) 80%, #fff 20%) 0%,
+        color-mix(in srgb, var(--ui-accent) 85%, #fff 15%) 100%);
+    box-shadow: 0 0 16px color-mix(in srgb, var(--ui-accent) 55%, transparent);
     color: #ffffff;
 }
 
@@ -544,8 +577,8 @@ body:not(.booting) .top-bar {
 }
 .update-progress-bar {
     height: 100%;
-    background: linear-gradient(90deg, #ff66b2 0%, #b534fa 100%);
-    box-shadow: 0 0 6px rgba(255, 102, 178, 0.6);
+    background: linear-gradient(90deg, var(--ui-accent-bright) 0%, var(--ui-accent) 100%);
+    box-shadow: 0 0 6px color-mix(in srgb, var(--ui-accent-bright) 60%, transparent);
     transition: width 0.15s ease-out;
 }
 
@@ -726,9 +759,9 @@ body:not(.booting):not(.loading) .dock-trigger-area {
     width: 14px;
     height: 14px;
     border-radius: 50%;
-    background: #b534fa;
+    background: var(--ui-accent);
     cursor: pointer;
-    box-shadow: 0 0 5px #b534fa;
+    box-shadow: 0 0 5px var(--ui-accent);
     transition: transform 0.1s;
 }
 
@@ -756,12 +789,13 @@ body:not(.booting):not(.loading) .dock-trigger-area {
     z-index: 1000;
     display: none;
     flex-direction: column;
-    background: rgba(20, 10, 35, 0.72);
+    background: color-mix(in srgb, var(--ui-accent-deep) 14%, rgba(5, 3, 12, 0.72));
     backdrop-filter: blur(28px) saturate(1.3);
     -webkit-backdrop-filter: blur(28px) saturate(1.3);
-    border: 1px solid rgba(181, 52, 250, 0.22);
+    border: 1px solid color-mix(in srgb, var(--ui-accent) 22%, transparent);
     border-radius: 18px;
-    box-shadow: 0 24px 70px rgba(0, 0, 0, 0.55), 0 0 60px rgba(181, 52, 250, 0.08) inset;
+    box-shadow: 0 24px 70px rgba(0, 0, 0, 0.55),
+                0 0 60px color-mix(in srgb, var(--ui-accent) 8%, transparent) inset;
     color: rgba(255, 255, 255, 0.9);
     font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
     overflow: hidden;
@@ -786,7 +820,7 @@ body:not(.booting):not(.loading) .dock-trigger-area {
     height: 560px;
     max-width: 90vw;
     max-height: 85vh;
-    background: rgba(20, 10, 35, 0.55);
+    background: color-mix(in srgb, var(--ui-accent-deep) 14%, rgba(5, 3, 12, 0.55));
     resize: both;
     min-width: 340px;
     min-height: 360px;
@@ -888,10 +922,10 @@ body:not(.booting):not(.loading) .dock-trigger-area {
 .app-window-body::-webkit-scrollbar { width: 8px; }
 .app-window-body::-webkit-scrollbar-track { background: transparent; }
 .app-window-body::-webkit-scrollbar-thumb {
-    background: rgba(181, 52, 250, 0.3);
+    background: color-mix(in srgb, var(--ui-accent) 30%, transparent);
     border-radius: 4px;
 }
-.app-window-body::-webkit-scrollbar-thumb:hover { background: rgba(181, 52, 250, 0.5); }
+.app-window-body::-webkit-scrollbar-thumb:hover { background: color-mix(in srgb, var(--ui-accent) 50%, transparent); }
 
 .field-label {
     display: block;
@@ -918,8 +952,8 @@ body:not(.booting):not(.loading) .dock-trigger-area {
     resize: vertical;
 }
 .field-input:focus, .field-textarea:focus {
-    border-color: rgba(181, 52, 250, 0.6);
-    box-shadow: 0 0 0 3px rgba(181, 52, 250, 0.12);
+    border-color: color-mix(in srgb, var(--ui-accent) 60%, transparent);
+    box-shadow: 0 0 0 3px color-mix(in srgb, var(--ui-accent) 12%, transparent);
 }
 /* The native password-reveal "eye" glyph on Windows/WebView2 (::-ms-reveal)
    defaults to a dark gray that's nearly invisible against the dark field
@@ -943,11 +977,11 @@ input[type="password"]::-webkit-credentials-auto-fill-button {
 }
 .field-btn:active { transform: scale(0.97); }
 .field-btn.primary {
-    background: linear-gradient(135deg, #b534fa, #6a0dad);
+    background: linear-gradient(135deg, var(--ui-accent), var(--ui-accent-deep));
     color: #fff;
-    box-shadow: 0 4px 14px rgba(181, 52, 250, 0.35);
+    box-shadow: 0 4px 14px color-mix(in srgb, var(--ui-accent) 35%, transparent);
 }
-.field-btn.primary:hover { box-shadow: 0 6px 20px rgba(181, 52, 250, 0.5); }
+.field-btn.primary:hover { box-shadow: 0 6px 20px color-mix(in srgb, var(--ui-accent) 50%, transparent); }
 .field-btn.danger {
     background: rgba(255, 60, 60, 0.15);
     color: #ff8080;
@@ -1029,10 +1063,11 @@ input[type="password"]::-webkit-credentials-auto-fill-button {
 }
 .ai-mode-box:hover svg { opacity: 0.95; }
 .ai-mode-box.active {
-    border-color: rgba(181, 52, 250, 0.65);
-    background: rgba(181, 52, 250, 0.1);
+    border-color: color-mix(in srgb, var(--ui-accent) 65%, transparent);
+    background: color-mix(in srgb, var(--ui-accent) 10%, transparent);
     color: #ffffff;
-    box-shadow: 0 0 18px rgba(181, 52, 250, 0.25), inset 0 0 12px rgba(181, 52, 250, 0.08);
+    box-shadow: 0 0 18px color-mix(in srgb, var(--ui-accent) 25%, transparent),
+                inset 0 0 12px color-mix(in srgb, var(--ui-accent) 8%, transparent);
 }
 .ai-mode-box.active svg { opacity: 1; }
 
@@ -1056,10 +1091,11 @@ input[type="password"]::-webkit-credentials-auto-fill-button {
     align-items: baseline;
     gap: 10px;
     padding: 18px 36px;
-    border: 1.5px solid rgba(181, 52, 250, 0.5);
+    border: 1.5px solid color-mix(in srgb, var(--ui-accent) 50%, transparent);
     border-radius: 999px;
-    background: rgba(181, 52, 250, 0.1);
-    box-shadow: 0 0 22px rgba(181, 52, 250, 0.4), inset 0 0 14px rgba(181, 52, 250, 0.12);
+    background: color-mix(in srgb, var(--ui-accent) 10%, transparent);
+    box-shadow: 0 0 22px color-mix(in srgb, var(--ui-accent) 40%, transparent),
+                inset 0 0 14px color-mix(in srgb, var(--ui-accent) 12%, transparent);
     color: #ffffff;
     user-select: none;
     transition: transform 0.12s, box-shadow 0.12s;
@@ -1072,7 +1108,8 @@ input[type="password"]::-webkit-credentials-auto-fill-button {
 }
 .ai-local-bubble.can-disconnect:hover {
     transform: scale(1.03);
-    box-shadow: 0 0 30px rgba(181, 52, 250, 0.65), inset 0 0 18px rgba(181, 52, 250, 0.2);
+    box-shadow: 0 0 30px color-mix(in srgb, var(--ui-accent) 65%, transparent),
+                inset 0 0 18px color-mix(in srgb, var(--ui-accent) 20%, transparent);
 }
 .ai-local-bubble.active {
     animation: localGlow 3.5s ease-in-out infinite;
@@ -1089,8 +1126,10 @@ input[type="password"]::-webkit-credentials-auto-fill-button {
     letter-spacing: 1px;
 }
 @keyframes localGlow {
-    0%, 100% { box-shadow: 0 0 16px rgba(181, 52, 250, 0.35), inset 0 0 10px rgba(181, 52, 250, 0.1); }
-    50%      { box-shadow: 0 0 28px rgba(181, 52, 250, 0.6), inset 0 0 16px rgba(181, 52, 250, 0.18); }
+    0%, 100% { box-shadow: 0 0 16px color-mix(in srgb, var(--ui-accent) 35%, transparent),
+                         inset 0 0 10px color-mix(in srgb, var(--ui-accent) 10%, transparent); }
+    50%      { box-shadow: 0 0 28px color-mix(in srgb, var(--ui-accent) 60%, transparent),
+                         inset 0 0 16px color-mix(in srgb, var(--ui-accent) 18%, transparent); }
 }
 .ai-local-hint {
     margin: 14px 0 0;
@@ -1140,7 +1179,7 @@ input[type="password"]::-webkit-credentials-auto-fill-button {
 }
 .ai-select option:checked,
 .ai-select option:hover {
-    background: rgba(181, 52, 250, 0.35);
+    background: color-mix(in srgb, var(--ui-accent) 35%, transparent);
     color: #ffffff;
 }
 
@@ -1162,10 +1201,11 @@ input[type="password"]::-webkit-credentials-auto-fill-button {
     transition: border-color 0.2s, background 0.2s, color 0.2s, box-shadow 0.3s;
 }
 .ai-online-bubble.active {
-    border-color: rgba(181, 52, 250, 0.5);
-    background: rgba(181, 52, 250, 0.1);
+    border-color: color-mix(in srgb, var(--ui-accent) 50%, transparent);
+    background: color-mix(in srgb, var(--ui-accent) 10%, transparent);
     color: #ffffff;
-    box-shadow: 0 0 22px rgba(181, 52, 250, 0.4), inset 0 0 14px rgba(181, 52, 250, 0.12);
+    box-shadow: 0 0 22px color-mix(in srgb, var(--ui-accent) 40%, transparent),
+                inset 0 0 14px color-mix(in srgb, var(--ui-accent) 12%, transparent);
     animation: localGlow 3.5s ease-in-out infinite;
 }
 /* Pending = profile + model picked in the dropdowns but not yet connected.
@@ -1199,7 +1239,7 @@ input[type="password"]::-webkit-credentials-auto-fill-button {
     padding: 12px 28px;
     border: none;
     border-radius: 999px;
-    background: linear-gradient(135deg, #b534fa 0%, #d358ff 100%);
+    background: linear-gradient(135deg, var(--ui-accent) 0%, var(--ui-accent-bright) 100%);
     color: #ffffff;
     font-family: inherit;
     font-size: 14px;
@@ -1207,12 +1247,12 @@ input[type="password"]::-webkit-credentials-auto-fill-button {
     letter-spacing: 2px;
     text-transform: uppercase;
     cursor: pointer;
-    box-shadow: 0 0 18px rgba(181, 52, 250, 0.4);
+    box-shadow: 0 0 18px color-mix(in srgb, var(--ui-accent) 40%, transparent);
     transition: transform 0.12s, box-shadow 0.15s, opacity 0.15s;
 }
 .ai-connect-btn:hover:not(:disabled) {
     transform: translateY(-1px);
-    box-shadow: 0 0 26px rgba(181, 52, 250, 0.65);
+    box-shadow: 0 0 26px color-mix(in srgb, var(--ui-accent) 65%, transparent);
 }
 .ai-connect-btn:active:not(:disabled) {
     transform: translateY(0);
@@ -1257,9 +1297,9 @@ input[type="password"]::-webkit-credentials-auto-fill-button {
     opacity: 0.25;
     cursor: not-allowed;
 }
-.ai-tool-btn.edit { color: #d358ff; }
+.ai-tool-btn.edit { color: var(--ui-accent-bright); }
 .ai-tool-btn.edit:hover:not(:disabled) {
-    background: rgba(181, 52, 250, 0.2);
+    background: color-mix(in srgb, var(--ui-accent) 20%, transparent);
     transform: scale(1.18);
 }
 .ai-tool-btn.del { color: #ff6b6b; }
@@ -1284,12 +1324,15 @@ input[type="password"]::-webkit-credentials-auto-fill-button {
     font-weight: 800;
     line-height: 1;
     cursor: pointer;
-    text-shadow: 0 0 14px rgba(181, 52, 250, 0.9), 0 0 22px rgba(181, 52, 250, 0.5);
+    text-shadow: 0 0 14px color-mix(in srgb, var(--ui-accent) 90%, transparent),
+                 0 0 22px color-mix(in srgb, var(--ui-accent) 50%, transparent);
     transition: transform 0.15s, text-shadow 0.2s;
 }
 .ai-add-btn:hover {
     transform: scale(1.12);
-    text-shadow: 0 0 18px rgba(181, 52, 250, 1), 0 0 30px rgba(181, 52, 250, 0.75), 0 0 44px rgba(181, 52, 250, 0.4);
+    text-shadow: 0 0 18px var(--ui-accent),
+                 0 0 30px color-mix(in srgb, var(--ui-accent) 75%, transparent),
+                 0 0 44px color-mix(in srgb, var(--ui-accent) 40%, transparent);
 }
 .ai-add-btn:active {
     transform: scale(0.96);
@@ -1314,8 +1357,8 @@ input[type="password"]::-webkit-credentials-auto-fill-button {
     background: rgba(255, 255, 255, 0.07);
 }
 .api-profile-row.active {
-    border-color: rgba(181, 52, 250, 0.5);
-    background: rgba(181, 52, 250, 0.08);
+    border-color: color-mix(in srgb, var(--ui-accent) 50%, transparent);
+    background: color-mix(in srgb, var(--ui-accent) 8%, transparent);
 }
 .api-profile-info { min-width: 0; flex: 1; }
 .api-profile-name {
@@ -1345,8 +1388,8 @@ input[type="password"]::-webkit-credentials-auto-fill-button {
     transition: background 0.15s;
 }
 .api-mini-btn:hover { background: rgba(255, 255, 255, 0.18); }
-.api-mini-btn.activate { background: rgba(181, 52, 250, 0.25); }
-.api-mini-btn.activate:hover { background: rgba(181, 52, 250, 0.4); }
+.api-mini-btn.activate { background: color-mix(in srgb, var(--ui-accent) 25%, transparent); }
+.api-mini-btn.activate:hover { background: color-mix(in srgb, var(--ui-accent) 40%, transparent); }
 .api-mini-btn.del:hover { background: rgba(255, 60, 60, 0.25); }
 .api-empty {
     text-align: center;
@@ -1424,8 +1467,8 @@ input[type="password"]::-webkit-credentials-auto-fill-button {
     outline: none;
 }
 .codex-search:focus {
-    border-color: rgba(181, 52, 250, 0.6);
-    box-shadow: 0 0 0 3px rgba(181, 52, 250, 0.12);
+    border-color: color-mix(in srgb, var(--ui-accent) 60%, transparent);
+    box-shadow: 0 0 0 3px color-mix(in srgb, var(--ui-accent) 12%, transparent);
 }
 .codex-add-btn { padding: 8px 12px; font-size: 12px; white-space: nowrap; }
 .codex-list {
@@ -1436,7 +1479,7 @@ input[type="password"]::-webkit-credentials-auto-fill-button {
     gap: 6px;
 }
 .codex-list::-webkit-scrollbar { width: 6px; }
-.codex-list::-webkit-scrollbar-thumb { background: rgba(181, 52, 250, 0.3); border-radius: 3px; }
+.codex-list::-webkit-scrollbar-thumb { background: color-mix(in srgb, var(--ui-accent) 30%, transparent); border-radius: 3px; }
 .codex-row {
     background: rgba(255, 255, 255, 0.04);
     border: 1px solid rgba(255, 255, 255, 0.07);
@@ -1446,8 +1489,8 @@ input[type="password"]::-webkit-credentials-auto-fill-button {
     transition: border-color 0.15s, background 0.15s;
 }
 .codex-row:hover {
-    border-color: rgba(181, 52, 250, 0.35);
-    background: rgba(181, 52, 250, 0.08);
+    border-color: color-mix(in srgb, var(--ui-accent) 35%, transparent);
+    background: color-mix(in srgb, var(--ui-accent) 8%, transparent);
 }
 .codex-row-title {
     font-size: 13px;
@@ -1469,8 +1512,8 @@ input[type="password"]::-webkit-credentials-auto-fill-button {
     border-radius: 5px;
     font-size: 10px;
     font-weight: 600;
-    background: rgba(181, 52, 250, 0.16);
-    color: #d59cff;
+    background: color-mix(in srgb, var(--ui-accent) 16%, transparent);
+    color: color-mix(in srgb, var(--ui-accent-bright) 60%, #fff 40%);
 }
 .codex-status {
     font-size: 11px;
@@ -1495,7 +1538,7 @@ input[type="password"]::-webkit-credentials-auto-fill-button {
     padding: 20px 24px;
 }
 .codex-reader::-webkit-scrollbar { width: 8px; }
-.codex-reader::-webkit-scrollbar-thumb { background: rgba(181, 52, 250, 0.3); border-radius: 4px; }
+.codex-reader::-webkit-scrollbar-thumb { background: color-mix(in srgb, var(--ui-accent) 30%, transparent); border-radius: 4px; }
 .codex-reader-empty {
     color: rgba(255, 255, 255, 0.3);
     font-size: 14px;
@@ -1640,7 +1683,7 @@ input[type="password"]::-webkit-credentials-auto-fill-button {
     transition: filter 0.18s;
 }
 .home-app:hover .home-app-icon svg {
-    filter: drop-shadow(0 0 12px rgba(181, 52, 250, 0.55));
+    filter: drop-shadow(0 0 12px color-mix(in srgb, var(--ui-accent) 55%, transparent));
 }
 .home-app-label {
     font-size: 14px;
@@ -1664,7 +1707,7 @@ input[type="password"]::-webkit-credentials-auto-fill-button {
 }
 .chat-messages::-webkit-scrollbar { width: 8px; }
 .chat-messages::-webkit-scrollbar-track { background: transparent; }
-.chat-messages::-webkit-scrollbar-thumb { background: rgba(181, 52, 250, 0.3); border-radius: 4px; }
+.chat-messages::-webkit-scrollbar-thumb { background: color-mix(in srgb, var(--ui-accent) 30%, transparent); border-radius: 4px; }
 /* Sleek chat bubbles (2026-07-27 rework): profile pictures are gone, so the
    conversational rhythm comes from each bubble sitting slightly off-center —
    wupi (AI) to the LEFT, user to the RIGHT. The column is a flex container
@@ -1702,15 +1745,15 @@ input[type="password"]::-webkit-credentials-auto-fill-button {
 .msg.user {
     align-self: flex-end;
     margin-left: 22%;
-    background: linear-gradient(135deg, #b534fa, #6a0dad);
+    background: linear-gradient(135deg, var(--ui-accent), var(--ui-accent-deep));
     color: #fff;
     border-bottom-right-radius: 4px;
-    box-shadow: 0 4px 12px rgba(181, 52, 250, 0.3);
+    box-shadow: 0 4px 12px color-mix(in srgb, var(--ui-accent) 30%, transparent);
 }
 .msg.wupi.streaming::after {
     content: '▍';
     animation: blink 0.8s infinite;
-    color: rgba(181, 52, 250, 0.8);
+    color: color-mix(in srgb, var(--ui-accent) 80%, transparent);
 }
 @keyframes blink { 50% { opacity: 0; } }
 .msg-reasoning {
@@ -1734,7 +1777,7 @@ input[type="password"]::-webkit-credentials-auto-fill-button {
     line-height: 1.5;
     white-space: pre-wrap;
     padding-left: 12px;
-    border-left: 2px solid rgba(181, 52, 250, 0.25);
+    border-left: 2px solid color-mix(in srgb, var(--ui-accent) 25%, transparent);
 }
 /* Tool-calling agent loop chips (Phase 5). Small monospace status badges
    that appear above the Wupi bubble while tools execute, then settle to a
@@ -1759,9 +1802,9 @@ input[type="password"]::-webkit-credentials-auto-fill-button {
 }
 .msg.tool-chip.running,
 .drawer-tool-chip.running {
-    color: rgba(181, 52, 250, 0.9);
-    border-color: rgba(181, 52, 250, 0.35);
-    background: rgba(181, 52, 250, 0.08);
+    color: color-mix(in srgb, var(--ui-accent) 90%, transparent);
+    border-color: color-mix(in srgb, var(--ui-accent) 35%, transparent);
+    background: color-mix(in srgb, var(--ui-accent) 8%, transparent);
 }
 .msg.tool-chip.ok,
 .drawer-tool-chip.ok {
@@ -1811,8 +1854,8 @@ input[type="password"]::-webkit-credentials-auto-fill-button {
     transition: border-color 0.15s, box-shadow 0.15s;
 }
 .chat-input:focus {
-    border-color: rgba(181, 52, 250, 0.6);
-    box-shadow: 0 0 0 3px rgba(181, 52, 250, 0.12);
+    border-color: color-mix(in srgb, var(--ui-accent) 60%, transparent);
+    box-shadow: 0 0 0 3px color-mix(in srgb, var(--ui-accent) 12%, transparent);
 }
 .chat-input::placeholder { color: rgba(255, 255, 255, 0.3); }
 /* The send/stop buttons + .chat-send-row are GONE (2026-07-27): generation
@@ -1871,7 +1914,7 @@ input[type="password"]::-webkit-credentials-auto-fill-button {
     height: 100%;
     object-fit: contain;
     display: block;
-    filter: drop-shadow(0 0 14px rgba(181, 120, 255, 0.45));
+    filter: drop-shadow(0 0 14px color-mix(in srgb, var(--ui-accent-bright) 45%, transparent));
 }
 
 /* Sparkles: tiny 4-pointed stars. Two contexts:
@@ -1970,13 +2013,16 @@ input[type="password"]::-webkit-credentials-auto-fill-button {
 #boot-loading.show { opacity: 1; }
 #boot-loading.fade-out { opacity: 0; }
 
-/* "LOADING OS . . ." — the central progress text. Sits slightly above
-   viewport center (top: 36%) per spec. Each character is a <span> that
+/* "LOADING OS . . ." — the central progress text. Sits well above
+   viewport center (top: 27%) per spec. Each character is a <span> that
    (a) lights up L→R as progress fills (script.js adds .lit staggered) and
    (b) floats subtly on its own — script.js sets a per-span negative
    animation-delay so the letters shimmer out-of-phase rather than the
-   whole word bobbing in unison. 86px → 120px per spec ("even bigger"),
-   wider letter-spacing so the bigger glyphs breathe. */
+   whole word bobbing in unison. 152px per spec ("even bigger"),
+   wider letter-spacing so the bigger glyphs breathe.
+   A live -webkit-box-reflect below the text casts a fading magenta
+   reflection on the violet void — it mirrors the real rendered element, so
+   the L→R sweep + glow light the pool in lockstep with the word. */
 .boot-loading-text {
     position: absolute;
     top: 36%;
@@ -1986,11 +2032,22 @@ input[type="password"]::-webkit-credentials-auto-fill-button {
        thick at font-weight: 700 even before the webfont caches. */
     font-family: 'Fredoka', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
     font-weight: 700;
-    font-size: 120px;
-    letter-spacing: 8px;
+    font-size: 184px;
+    letter-spacing: 10px;
+    line-height: 1;
     text-transform: uppercase;
     white-space: nowrap;
     user-select: none;
+    /* Neon reflection pool below the title. box-reflect mirrors the LIVE
+       rendered element, so the L→R .lit sweep + its layered glow reflect in
+       real time. line-height:1 tightens the element box to the glyph cap-height
+       so the mirror starts right at the baseline (no line-box gap). The mask is
+       deliberately gentle — it holds near-full opacity through the first third
+       then eases out, so the FULL reflection shows (not cut in half). The long
+       soft fade gives a watery/blurry quality that reads as neon rippling on
+       water. Chromium (WebView2) supports -webkit-box-reflect; WUPI is a
+       Tauri/Chromium-only target so no fallback is needed (one property). */
+    -webkit-box-reflect: below 0px linear-gradient(to bottom, rgba(255,255,255,0.55), rgba(255,255,255,0.40) 30%, rgba(255,255,255,0.20) 60%, transparent 100%);
 }
 .boot-loading-text span {
     display: inline-block;
@@ -2000,20 +2057,20 @@ input[type="password"]::-webkit-credentials-auto-fill-button {
        conflict). script.js sets animation-delay per span so they're
        phase-offset. */
     animation: bootCharFloat 3.4s ease-in-out infinite;
-    /* Unlit: dim violet, no glow. transition so the L→R lighting reads as a
+    /* Unlit: dim accent-deep, no glow. transition so the L→R lighting reads as a
        smooth fill rather than a hard pop per character. */
-    color: #3a1850;
+    color: color-mix(in srgb, var(--ui-accent-deep) 70%, #000 30%);
     text-shadow: none;
     transition: color 0.3s ease, text-shadow 0.3s ease;
 }
 .boot-loading-text span.lit {
-    /* Lit: bright magenta with a layered glow (close + far halo). Glow
+    /* Lit: bright accent with a layered glow (close + far halo). Glow
        radii scaled up for the bigger glyph size. */
-    color: #ff4ecd;
+    color: var(--ui-accent-bright);
     text-shadow:
-        0 0 14px rgba(255, 78, 205, 0.95),
-        0 0 32px rgba(255, 78, 205, 0.65),
-        0 0 60px rgba(181, 52, 250, 0.55);
+        0 0 14px color-mix(in srgb, var(--ui-accent-bright) 95%, transparent),
+        0 0 32px color-mix(in srgb, var(--ui-accent-bright) 65%, transparent),
+        0 0 60px color-mix(in srgb, var(--ui-accent) 55%, transparent);
 }
 @keyframes bootCharFloat {
     0%, 100% { transform: translateY(0) translateX(0); }
@@ -2021,51 +2078,37 @@ input[type="password"]::-webkit-credentials-auto-fill-button {
     70%      { transform: translateY(3px) translateX(-1px); }
 }
 
-/* Terminal stream at the bottom-center: cosmetic OS boot lines + a real
-   "model ready" milestone (script.js). Monospace, dim cyan-green, fades per
-   line. Horizontally centered (text-align: center) so each line reads as
-   floating in the middle of the violet abyss rather than left-aligned. */
+/* Single status line nestled into the bottom-right corner: shows the CURRENT
+   boot line only (one element, replaced each tick) instead of a scrolling
+   stack. The container never grows — it holds exactly one .boot-terminal-line
+   at a time, swapped via a crossfade (script.js replaces the child, the fade-in
+   keyframe runs on the fresh node). Still fed by the cosmetic stream + the
+   real boot-gate + model-status milestone, but they all just overwrite the one
+   line. Small + tucked in the corner so it reads as a quiet status readout,
+   not a centerpiece. */
 .boot-terminal {
     position: absolute;
-    bottom: 80px;
-    left: 50%;
-    transform: translateX(-50%);
-    /* Auto-width so the column hugs its content + stays centered. Cap so
-       very long lines still wrap inside a reasonable reading width. */
-    width: min(720px, 90vw);
-    /* No max-height: let lines pile up naturally as they stream in. The
-       container grows upward from `bottom: 80px` (newest at the bottom via
-       column-reverse) instead of clipping at a 32vh cap, which previously
-       squished the visible text. The 40-line DOM cap in appendTerminalLine
-       is the only limiter — purely a safety bound, well beyond boot reach. */
-    font-family: 'Consolas', 'Monaco', 'Courier New', monospace;
-    font-size: 12px;
-    line-height: 1.55;
-    color: rgba(180, 220, 255, 0.55);
-    text-shadow: 0 0 4px rgba(120, 200, 255, 0.35);
-    /* text-align: center so each line is centered marginally per spec. */
-    text-align: center;
-    /* Newest lines always sit at the bottom edge as they stream in
-       (flex-direction: column-reverse keeps the latest visible without
-       scrolling, and the container grows upward naturally). */
-    display: flex;
-    flex-direction: column-reverse;
-    justify-content: flex-start;
-    align-items: center;
+    bottom: 28px;
+    right: 32px;
+    max-width: min(520px, 50vw);
+    text-align: right;
+    pointer-events: none;
 }
 .boot-terminal-line {
+    /* Small monospace status readout — the cyan glow ties it to the violet-void
+       aesthetic without competing with the LOADING OS title. */
+    font-family: 'Consolas', 'Monaco', 'Courier New', monospace;
+    font-size: 13px;
+    line-height: 1.4;
+    color: rgba(180, 220, 255, 0.62);
+    text-shadow: 0 0 4px rgba(120, 200, 255, 0.35);
+    white-space: nowrap;
     opacity: 0;
-    animation: bootTerminalFadeIn 0.25s ease-out forwards;
-    /* Each line is a centered block (full column width) so the text-align
-       on the parent centers the inline text within it. Truncation removed:
-       the boot lines are authored to fit inside min(720px, 90vw) already,
-       and `nowrap + ellipsis` was a defensive cap that mangled anything
-       slightly long. Lines now render fully and stack naturally. */
-    width: 100%;
+    animation: bootTerminalFadeIn 0.22s ease-out forwards;
 }
 .boot-terminal-line.milestone {
     color: rgba(140, 255, 180, 0.95);
-    text-shadow: 0 0 6px rgba(140, 255, 180, 0.7);
+    text-shadow: 0 0 10px rgba(140, 255, 180, 0.7);
     font-weight: 600;
 }
 @keyframes bootTerminalFadeIn {
@@ -2117,10 +2160,10 @@ input[type="password"]::-webkit-credentials-auto-fill-button {
 .download-title {
     font-size: 42px;
     font-weight: 700;
-    color: #ff4ecd;
+    color: var(--ui-accent-bright);
     text-shadow:
-        0 0 12px rgba(255, 78, 205, 0.85),
-        0 0 28px rgba(181, 52, 250, 0.55);
+        0 0 12px color-mix(in srgb, var(--ui-accent-bright) 85%, transparent),
+        0 0 28px color-mix(in srgb, var(--ui-accent) 55%, transparent);
     letter-spacing: 1.5px;
     margin-bottom: 14px;
 }
@@ -2130,7 +2173,7 @@ input[type="password"]::-webkit-credentials-auto-fill-button {
 .download-subtitle {
     font-size: 17px;
     font-weight: 500;
-    color: #b98ad6;
+    color: color-mix(in srgb, var(--ui-accent-bright) 55%, rgba(255,255,255,0.7) 45%);
     line-height: 1.5;
     margin-bottom: 28px;
 }
@@ -2150,9 +2193,9 @@ input[type="password"]::-webkit-credentials-auto-fill-button {
 .download-progress-bar {
     height: 100%;
     width: 0%;
-    background: linear-gradient(90deg, #ff4ecd 0%, #b534fa 100%);
+    background: linear-gradient(90deg, var(--ui-accent-bright) 0%, var(--ui-accent) 100%);
     border-radius: 6px;
-    box-shadow: 0 0 12px rgba(255, 78, 205, 0.7);
+    box-shadow: 0 0 12px color-mix(in srgb, var(--ui-accent-bright) 70%, transparent);
     /* Width transitions so the bar glides between updates rather than
        stuttering on each poll. 0.4s is smooth without lagging too far
        behind fast bursts. */
@@ -2164,7 +2207,7 @@ input[type="password"]::-webkit-credentials-auto-fill-button {
 .download-stats {
     font-family: 'Consolas', 'Monaco', 'Courier New', monospace;
     font-size: 13px;
-    color: #8a6ba8;
+    color: color-mix(in srgb, var(--ui-accent) 45%, rgba(255,255,255,0.6) 55%);
     margin-bottom: 24px;
     min-height: 18px;
 }
@@ -2188,14 +2231,14 @@ input[type="password"]::-webkit-credentials-auto-fill-button {
     transition: transform 0.15s ease, box-shadow 0.15s ease, background 0.15s ease;
 }
 .download-btn-primary {
-    background: #ff4ecd;
+    background: var(--ui-accent-bright);
     color: #1a0420;
     border: none;
-    box-shadow: 0 0 18px rgba(255, 78, 205, 0.55);
+    box-shadow: 0 0 18px color-mix(in srgb, var(--ui-accent-bright) 55%, transparent);
 }
 .download-btn-primary:hover:not(:disabled) {
     transform: translateY(-1px);
-    box-shadow: 0 0 24px rgba(255, 78, 205, 0.8);
+    box-shadow: 0 0 24px color-mix(in srgb, var(--ui-accent-bright) 80%, transparent);
 }
 .download-btn-primary:disabled {
     opacity: 0.45;
@@ -2203,12 +2246,12 @@ input[type="password"]::-webkit-credentials-auto-fill-button {
 }
 .download-btn-secondary {
     background: transparent;
-    color: #b98ad6;
-    border: 1px solid rgba(185, 138, 214, 0.4);
+    color: color-mix(in srgb, var(--ui-accent-bright) 55%, rgba(255,255,255,0.7) 45%);
+    border: 1px solid color-mix(in srgb, var(--ui-accent-bright) 40%, transparent);
 }
 .download-btn-secondary:hover {
-    background: rgba(185, 138, 214, 0.1);
-    border-color: rgba(185, 138, 214, 0.7);
+    background: color-mix(in srgb, var(--ui-accent-bright) 10%, transparent);
+    border-color: color-mix(in srgb, var(--ui-accent-bright) 70%, transparent);
 }
 
 /* LAUNCH button: shown on the download overlay when the GGUF pull finishes.
@@ -2226,7 +2269,7 @@ input[type="password"]::-webkit-credentials-auto-fill-button {
     padding: 16px 56px;
     border: none;
     border-radius: 999px;
-    background: linear-gradient(135deg, #ff66b2 0%, #b534fa 100%);
+    background: linear-gradient(135deg, var(--ui-accent-bright) 0%, var(--ui-accent) 100%);
     color: #ffffff;
     font-family: 'Fredoka', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
     font-weight: 700;
@@ -2235,8 +2278,8 @@ input[type="password"]::-webkit-credentials-auto-fill-button {
     text-transform: uppercase;
     cursor: pointer;
     box-shadow:
-        0 0 28px rgba(255, 102, 178, 0.6),
-        0 0 60px rgba(181, 52, 250, 0.35),
+        0 0 28px color-mix(in srgb, var(--ui-accent-bright) 60%, transparent),
+        0 0 60px color-mix(in srgb, var(--ui-accent) 35%, transparent),
         inset 0 1px 0 rgba(255, 255, 255, 0.3);
     text-shadow: 0 0 12px rgba(255, 255, 255, 0.6);
     animation: launchGlow 2.2s ease-in-out infinite;
@@ -2255,14 +2298,14 @@ input[type="password"]::-webkit-credentials-auto-fill-button {
 @keyframes launchGlow {
     0%, 100% {
         box-shadow:
-            0 0 22px rgba(255, 102, 178, 0.45),
-            0 0 48px rgba(181, 52, 250, 0.25),
+            0 0 22px color-mix(in srgb, var(--ui-accent-bright) 45%, transparent),
+            0 0 48px color-mix(in srgb, var(--ui-accent) 25%, transparent),
             inset 0 1px 0 rgba(255, 255, 255, 0.3);
     }
     50% {
         box-shadow:
-            0 0 34px rgba(255, 102, 178, 0.8),
-            0 0 72px rgba(181, 52, 250, 0.5),
+            0 0 34px color-mix(in srgb, var(--ui-accent-bright) 80%, transparent),
+            0 0 72px color-mix(in srgb, var(--ui-accent) 50%, transparent),
             inset 0 1px 0 rgba(255, 255, 255, 0.4);
     }
 }
@@ -2274,4 +2317,79 @@ input[type="password"]::-webkit-credentials-auto-fill-button {
     color: #ff6b8a;
     min-height: 18px;
     line-height: 1.5;
+}
+
+/* =============================================================
+   API TIMEOUT BUBBLE — top-center, persistent-until-dismissed error
+   overlay (see api-timeout-bubble.js). Distinct from the transient
+   bottom toast: a TTFT timeout is a real failure worth interrupting
+   for, and the Local fallback handling the turn needs a visible
+   signal. Dark-glass aesthetic to match the ECHO shell.
+   ============================================================= */
+.api-timeout-bubble {
+    position: fixed;
+    top: 24px;
+    left: 50%;
+    transform: translateX(-50%);
+    z-index: 100000; /* above everything (app shells, drawers, modals) */
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    max-width: min(560px, 92vw);
+    padding: 12px 14px 12px 16px;
+    border-radius: 10px;
+    /* Dark-glass surface, ECHO-style. Amber accent (warning, not red-error
+       panic) — the turn still succeeds via Local fallback. */
+    background: rgba(28, 22, 16, 0.92);
+    border: 1px solid rgba(255, 178, 90, 0.45);
+    box-shadow:
+        0 8px 30px rgba(0, 0, 0, 0.55),
+        inset 0 1px 0 rgba(255, 255, 255, 0.06);
+    color: #ffd9a8;
+    font-size: 14px;
+    line-height: 1.4;
+    cursor: pointer; /* click anywhere dismisses */
+    animation: api-timeout-bubble-in 0.18s ease-out;
+    -webkit-backdrop-filter: blur(8px);
+    backdrop-filter: blur(8px);
+}
+
+.api-timeout-bubble__icon {
+    font-size: 18px;
+    color: #ffb25a;
+    flex-shrink: 0;
+}
+
+.api-timeout-bubble__text {
+    flex: 1 1 auto;
+}
+
+.api-timeout-bubble__close {
+    flex-shrink: 0;
+    width: 22px;
+    height: 22px;
+    border: none;
+    background: transparent;
+    color: #ffd9a8;
+    font-size: 20px;
+    line-height: 1;
+    cursor: pointer;
+    border-radius: 4px;
+    opacity: 0.7;
+    transition: opacity 0.12s, background 0.12s;
+}
+.api-timeout-bubble__close:hover {
+    opacity: 1;
+    background: rgba(255, 178, 90, 0.15);
+}
+
+@keyframes api-timeout-bubble-in {
+    from {
+        opacity: 0;
+        transform: translateX(-50%) translateY(-8px);
+    }
+    to {
+        opacity: 1;
+        transform: translateX(-50%) translateY(0);
+    }
 }

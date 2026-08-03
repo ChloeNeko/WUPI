@@ -1,349 +1,284 @@
 // =============================================================
-// FABLE LEFT DRAWER — the Card / Tracker / Codex authoring panel
-// (ECHO rewrite, 2026-07-31).
+// FABLE LEFT DRAWER — Visual HUD
+//   §1  Paperdoll  — a static silhouette PNG (no injury overlay). The per-
+//                     body-part hitbox + injury-coloring system was removed
+//                     to be redone later; the figure is now a plain visual.
+//                     Gender toggle (♂/♀) still swaps the base PNG.
+//   §2  Ambient + Chronos & Climate — time-of-day background tint + weather
+//                     overlay AND a visible gold Time/Weather panel, all
+//                     driven by world_clock + weather.condition from
+//                     fable_schema_get.
 //
-// Mirrors the right-side Wupi drawer's slide mechanism (translateX), but on
-// the LEFT edge, with three tabs across the top:
-//   • Card    — edit the active sim card's info + first message (session-only).
-//   • Tracker — view + manually edit the live tracked world state.
-//   • Codex   — add/edit/delete lore entries live as you roleplay.
+// The INVENTORY section (equip slots, drag-and-drop grid, context menu, and
+// the consume/equip/unequip/drop pipelines) was REMOVED on 2026-08-02 to
+// clean up the drawer for the two-column grid. The Rust schema-tracker
+// machinery it spoke to (pending_player_action slot, fable_player_action_set
+// IPC, <player_action> narrator render) is INTENTIONALLY left intact —
+// dormant scaffolding for a future surface.
 //
-// Opened by a left-edge hover strip (symmetric with the right drawer's corner
-// trigger) OR a small always-visible handle (discoverability — the right
-// drawer is invisible by design, but a brand-new left panel needs a hint).
-// Esc closes it (handled in stage.js's keydown, after the wupi drawer).
-//
-// The drawer is a pure-DOM overlay; all state lives in the Rust backend
-// (fable_card_get/save, fable_schema_get/set, codex_list/save/delete). Each
-// tab fetches its data on open + writes back on save.
+// Layout (2026-08-02): .hud-master-grid is a two-column CSS grid. The LEFT
+// column holds the paperdoll (kept near its original size); the RIGHT column
+// holds the Chronos & Climate panel at its top. The drawer mechanics below
+// are UNCHANGED — stage.js's hover-strip + edge-lock wiring drives this
+// drawer identically to the right Wupi drawer.
 // =============================================================
 
 import { invoke } from '@tauri-apps/api/core';
+import MALE_URL from '../assets/paperdoll_male.png';
+import FEMALE_URL from '../assets/paperdoll_female.png';
 
-let drawerEl = null;     // the .fable-left-drawer root
-let handleEl = null;     // the always-visible left-edge tab handle
-let tabBtns = [];        // the three tab buttons
-let tabPanels = {};      // tab-key → panel element
-let activeTab = 'card';  // the currently-shown tab
+// ─── Drawer mechanics (UNCHANGED from the 2026-08-01 empty shell) ─────────
+let drawerEl = null;
 let isOpen = false;
+let locked = false;
+let edgeLockVisible = () => false;
 
+// ─── HUD state ────────────────────────────────────────────────────────────
+let gender = localStorage.getItem('wupi.paperdoll.gender') || 'male'; // 'male' | 'female'
+
+// ===========================================================================
+// §1  PAPERDOLL — static silhouette (body-part injury overlay REMOVED)
+// ===========================================================================
+// The figure is a plain PNG with a gender toggle. The per-region SVG hitbox
+// overlay, injury-tier coloring, and hover tooltips (head/neck/stomach/etc.)
+// were removed on 2026-08-02 to be redesigned later. The Rust body-part
+// types (PlayerState.body, BodyPart, BodyPartState) remain as dormant
+// scaffolding — this file no longer reads player_state_get for the paperdoll.
+// renderPaperdoll() now just swaps the base image src on gender toggle.
+
+// ===========================================================================
+// AUDIO — soft glass clink (synthesized via the shared AudioContext).
+// Mirror of script.js playLaunchChime: two sine oscillators, short decay.
+// No asset file. Lazily (re)creates window.__wupiAudioCtx if absent (the OS
+// shell owns the canonical singleton, but the Fable stage can be entered
+// before any prior user gesture created it).
+// ===========================================================================
+function playUIClink() {
+  const Ctx = window.AudioContext || window.webkitAudioContext;
+  if (!Ctx) return;
+  let ctx = window.__wupiAudioCtx;
+  if (!ctx) {
+    try { ctx = new Ctx(); window.__wupiAudioCtx = ctx; }
+    catch (e) { return; }
+  }
+  if (ctx.state === 'suspended') ctx.resume().catch(() => {});
+  const now = ctx.currentTime;
+  // Two-tone clink: 880Hz then 1318.51Hz (A5 → E6), short attack, exp decay.
+  [{ f: 880.0, t: 0.0 }, { f: 1318.51, t: 0.06 }].forEach(({ f, t }) => {
+    const osc = ctx.createOscillator();
+    const gain = ctx.createGain();
+    osc.type = 'sine';
+    osc.frequency.value = f;
+    gain.gain.setValueAtTime(0, now + t);
+    gain.gain.linearRampToValueAtTime(0.14, now + t + 0.01);
+    gain.gain.exponentialRampToValueAtTime(0.0001, now + t + 0.32);
+    osc.connect(gain).connect(ctx.destination);
+    osc.start(now + t);
+    osc.stop(now + t + 0.36);
+  });
+}
+
+// ===========================================================================
+// ESCAPE — shared with tab-rail.js convention (defensive, never trust raw
+// schema strings as HTML).
+// ===========================================================================
 function esc(s) {
-  return String(s || '')
+  return String(s ?? '')
     .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
     .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
 }
 
-// Build the drawer DOM. Called once from stage.js buildStage (the element is
-// reused across stage entries). Returns the drawer element.
+// ===========================================================================
+// BUILD — populate the drawer shell. Called once from stage.js buildStage.
+// ===========================================================================
 export function buildLeftDrawer() {
   drawerEl = document.createElement('aside');
   drawerEl.className = 'fable-left-drawer';
   drawerEl.dataset.leftDrawer = '';
   drawerEl.setAttribute('aria-hidden', 'true');
+  drawerEl.dataset.gender = gender; // drives ambient + paperdoll theming
   drawerEl.innerHTML = `
-    <header class="fable-left-drawer__header">
-      <div class="fable-left-drawer__tabs" role="tablist">
-        <button class="fable-left-drawer__tab is-active" data-tab="card" role="tab">Card</button>
-        <button class="fable-left-drawer__tab" data-tab="tracker" role="tab">Tracker</button>
+    <div class="hud-ambient-layer" data-ambient aria-hidden="true"></div>
+    <div class="hud-gender-toggle" role="group" aria-label="Silhouette base">
+      <button type="button" data-gender-btn="male" aria-pressed="${gender === 'male'}" title="Male silhouette">♂</button>
+      <button type="button" data-gender-btn="female" aria-pressed="${gender === 'female'}" title="Female silhouette">♀</button>
+    </div>
+    <div class="hud-master-grid">
+      <div class="hud-col hud-col--left">
+        <section class="hud-paperdoll-section" aria-label="Character condition">
+          <div class="hud-paperdoll-wrap" data-paperdoll>
+            <img class="hud-paperdoll-base" data-paperdoll-img alt="" aria-hidden="true">
+          </div>
+        </section>
       </div>
-      <button class="fable-left-drawer__close" data-left-close aria-label="Close panel">✕</button>
-    </header>
-    <div class="fable-left-drawer__body">
-      <section class="fable-left-drawer__panel is-active" data-panel="card"></section>
-      <section class="fable-left-drawer__panel" data-panel="tracker"></section>
+      <div class="hud-col hud-col--right">
+        <div class="hud-environment-panel" aria-label="Time and weather">
+          <div class="hud-env-label">Chronos</div>
+          <div class="hud-env-time" data-env-time>—</div>
+          <div class="hud-env-label">Climate</div>
+          <div class="hud-env-weather" data-env-weather>—</div>
+        </div>
+      </div>
     </div>
   `;
-  tabBtns = Array.from(drawerEl.querySelectorAll('[data-tab]'));
-  for (const btn of tabBtns) {
-    btn.addEventListener('click', () => switchTab(btn.dataset.tab));
-  }
-  drawerEl.querySelector('[data-left-close]').addEventListener('click', closeDrawer);
-  for (const panel of drawerEl.querySelectorAll('[data-panel]')) {
-    tabPanels[panel.dataset.panel] = panel;
-  }
-
-  // The always-visible handle (a slim tab on the left edge). Clicking opens.
-  handleEl = document.createElement('button');
-  handleEl.className = 'fable-left-drawer__handle';
-  handleEl.dataset.leftHandle = '';
-  handleEl.setAttribute('aria-label', 'Open card panel');
-  handleEl.innerHTML = '<span class="fable-left-drawer__handle-icon">›</span>';
-  handleEl.addEventListener('click', () => (isOpen ? closeDrawer() : openDrawer()));
-
+  wireInteractions(drawerEl);
   return drawerEl;
 }
 
-// Return the handle element so stage.js can mount it.
-export function buildLeftHandle() {
-  return handleEl;
+// ===========================================================================
+// WIRE — bind all interactions once (the drawer element is reused across
+// stage entries, so bind in buildLeftDrawer, not on every refresh).
+// ===========================================================================
+function wireInteractions(root) {
+  // ── Gender toggle ────────────────────────────────────────────────────
+  root.querySelectorAll('[data-gender-btn]').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      const g = btn.dataset.genderBtn;
+      if (g === gender) return;
+      playUIClink();
+      gender = g;
+      localStorage.setItem('wupi.paperdoll.gender', g);
+      drawerEl.dataset.gender = g;
+      root.querySelectorAll('[data-gender-btn]').forEach((b) => {
+        b.setAttribute('aria-pressed', String(b.dataset.genderBtn === g));
+      });
+      renderPaperdoll(); // swap base PNG + hitbox coordinate set
+    });
+  });
 }
 
+// ===========================================================================
+// RENDERERS — each is async + idempotent (safe to call repeatedly).
+// ===========================================================================
+
+// §1 — paperdoll. Swaps the base silhouette PNG for the active gender.
+// (The injury hitbox overlay was removed; this is now a plain static image.)
+function renderPaperdoll() {
+  if (!drawerEl) return;
+  const img = drawerEl.querySelector('[data-paperdoll-img]');
+  if (img) img.src = gender === 'female' ? FEMALE_URL : MALE_URL;
+}
+
+// §2 — ambient + Chronos & Climate panel. Reads the live clock + weather:
+//   • sets drawer data attributes (data-time, data-weather) the CSS keys off
+//     for the background tint + weather animation layer (unchanged), AND
+//   • writes a human-readable Time + Weather into the env panel.
+// If no active game, leaves the panel at its em-dash dormant default.
+async function renderAmbient() {
+  if (!drawerEl) return;
+  let schema;
+  try {
+    schema = await invoke('fable_schema_get');
+  } catch (err) {
+    return; // no active game — leave ambient at default + panel dormant
+  }
+  const minutes = (schema.world_clock && schema.world_clock.current_minutes) || 0;
+  const hasClock = minutes > 0;   // 0 = dormant (no [TIME] emitted yet)
+  const intoDay = (minutes % 1440 + 1440) % 1440; // minutes since midnight
+  const hour = hasClock ? Math.floor(intoDay / 60) : 10;   // default 10:00 when dormant
+  const minute = hasClock ? (intoDay % 60) : 0;
+  // 22:00–05:00 night · 05:00–08:00 & 17:00–20:00 twilight · else day.
+  // When dormant, force 'day' so the drawer tints warm + the panel reads Noon.
+  let timeOfDay = 'day';
+  if (hasClock) {
+    if (hour >= 22 || hour < 5) timeOfDay = 'night';
+    else if (hour < 8 || hour >= 17) timeOfDay = 'twilight';
+  }
+  drawerEl.dataset.time = timeOfDay;
+
+  // Time panel: HH:MM (wall-clock) + a crisp period word. current_minutes is
+  // epoch minutes since 0001-01-01; with no canonical "day 1" anchor in the
+  // JS-visible schema, we show wall-clock + period rather than a "Day N".
+  // When the clock is dormant we show a sunny "10:00 · Day" DEFAULT so the
+  // panel is populated for review on a fresh game; it's overwritten the
+  // moment the first [TIME] lands.
+  const clockStr = `${String(hour).padStart(2, '0')}:${String(minute).padStart(2, '0')}`;
+  const periodWord = timeOfDay === 'night' ? 'Night'
+    : timeOfDay === 'twilight' ? 'Twilight' : 'Day';
+  const timeEl = drawerEl.querySelector('[data-env-time]');
+  if (timeEl) {
+    timeEl.textContent = `${clockStr}  ·  ${periodWord}`;
+  }
+
+  // Weather: classify for the background attr (rain/snow/fog/clear — reuses
+  // the fx/atmosphere category set), then render a readable condition line.
+  // When dormant, default to Sunny so the panel + the clear-sky tint show.
+  const rawCondition = hasClock
+    ? String((schema.weather && schema.weather.condition) || '')
+    : 'Sunny';
+  const condition = rawCondition.toLowerCase();
+  let weather = 'clear';
+  if (/rain|drizzle|downpour|storm|thunder/.test(condition)) weather = 'rain';
+  else if (/snow|hail|blizzard|frost/.test(condition)) weather = 'snow';
+  else if (/fog|mist|haze|overcast/.test(condition)) weather = 'fog';
+  drawerEl.dataset.weather = weather;
+
+  const weatherEl = drawerEl.querySelector('[data-env-weather]');
+  if (weatherEl) {
+    const glyph = weather === 'rain' ? '⛈'
+      : weather === 'snow' ? '❄'
+      : weather === 'fog' ? '🌫'
+      : '☀';
+    const label = titleCase(rawCondition || 'Sunny');
+    weatherEl.innerHTML = `<span class="hud-env-glyph" aria-hidden="true">${glyph}</span> ${esc(label)}`;
+  }
+}
+
+// Title Case a weather condition for display ("heavy rain" → "Heavy Rain").
+function titleCase(s) {
+  return s.replace(/\b\w/g, (c) => c.toUpperCase());
+}
+
+// ===========================================================================
+// PUBLIC — re-render everything from live IPC data.
+// Called by stage.js on drawer-open + after each narrator turn.
+// ===========================================================================
+export async function refreshAll() {
+  if (!drawerEl) return;
+  // The paperdoll no longer reads player_state_get (body-part overlay removed).
+  // Only the ambient/env-panel needs live schema data now.
+  renderPaperdoll();
+  await renderAmbient();
+}
+
+// ===========================================================================
+// Drawer mechanics — UNCHANGED. stage.js drives these.
+// ===========================================================================
 export function openDrawer() {
   if (!drawerEl) return;
   isOpen = true;
   drawerEl.classList.add('open');
   drawerEl.setAttribute('aria-hidden', 'false');
-  if (handleEl) handleEl.classList.add('is-hidden');
-  // Refresh the active tab's data on every open (state may have changed).
-  renderTab(activeTab);
 }
-
 export function closeDrawer() {
   if (!drawerEl) return;
   isOpen = false;
   drawerEl.classList.remove('open');
   drawerEl.setAttribute('aria-hidden', 'true');
-  if (handleEl) handleEl.classList.remove('is-hidden');
 }
-
-export function isOpenState() {
-  return isOpen;
+export function isOpenState() { return isOpen; }
+export function isLocked() { return locked; }
+export function toggleLock() {
+  locked = !locked;
+  if (drawerEl) drawerEl.classList.toggle('locked', locked);
+  return locked;
 }
-
-function switchTab(key) {
-  activeTab = key;
-  for (const btn of tabBtns) {
-    btn.classList.toggle('is-active', btn.dataset.tab === key);
-  }
-  for (const [k, panel] of Object.entries(tabPanels)) {
-    panel.classList.toggle('is-active', k === key);
-  }
-  renderTab(key);
+export function setEdgeLockProbe(probe) {
+  edgeLockVisible = typeof probe === 'function' ? probe : () => false;
 }
-
-// Dispatch the active tab's render. Each render is async (fetches from the
-// backend); failures show an inline error rather than crashing the panel.
-async function renderTab(key) {
-  const panel = tabPanels[key];
-  if (!panel) return;
-  try {
-    if (key === 'card') await renderCard(panel);
-    else if (key === 'tracker') await renderTracker(panel);
-    // Codex tab removed (codex_save / codex_delete are dead stubs after the
-    // codex lore-RAG module was deleted; codex_list always returns empty).
-  } catch (err) {
-    panel.innerHTML = `<div class="fable-left-drawer__error">Couldn't load: ${esc(err)}</div>`;
-  }
-}
-
-// ── Card tab ────────────────────────────────────────────────────────────
-// Edit the active card's name / persona / setting / tone / first message /
-// player name. Session-only (fable_card_save updates the in-memory card +
-// re-seats the persona; the .sim file on disk is not modified).
-async function renderCard(panel) {
-  let card = null;
-  try {
-    card = await invoke('fable_card_get');
-  } catch (err) {
-    panel.innerHTML = `<div class="fable-left-drawer__error">${esc(err)}</div>`;
-    return;
-  }
-  if (!card) {
-    panel.innerHTML = `<div class="fable-left-drawer__empty">No active card. Start a game to edit its info.</div>`;
-    return;
-  }
-  panel.innerHTML = `
-    <div class="fable-left-drawer__form" data-card-form>
-      <label class="fable-left-drawer__field">
-        <span class="fable-left-drawer__label">Name</span>
-        <input type="text" data-card-name value="${esc(card.name || '')}">
-      </label>
-      <label class="fable-left-drawer__field">
-        <span class="fable-left-drawer__label">Player name</span>
-        <input type="text" data-card-player value="${esc(card.player_name || '')}">
-      </label>
-      <label class="fable-left-drawer__field">
-        <span class="fable-left-drawer__label">Setting</span>
-        <textarea data-card-setting rows="3">${esc(card.setting || '')}</textarea>
-      </label>
-      <label class="fable-left-drawer__field">
-        <span class="fable-left-drawer__label">Tone</span>
-        <input type="text" data-card-tone value="${esc(card.tone || '')}">
-      </label>
-      <label class="fable-left-drawer__field">
-        <span class="fable-left-drawer__label">Core persona</span>
-        <textarea data-card-persona rows="4">${esc(card.core_persona || '')}</textarea>
-      </label>
-      <label class="fable-left-drawer__field">
-        <span class="fable-left-drawer__label">First message (opening scene)</span>
-        <textarea data-card-opening rows="5">${esc(card.opening_scene || '')}</textarea>
-      </label>
-      <div class="fable-left-drawer__actions">
-        <button class="fable-left-drawer__btn primary" data-card-save>Save (live)</button>
-        <span class="fable-left-drawer__note">Session-only — applies to the next turn, not saved to disk.</span>
-      </div>
-    </div>
-  `;
-  const form = panel.querySelector('[data-card-form]');
-  const status = document.createElement('span');
-  status.className = 'fable-left-drawer__status';
-  form.querySelector('[data-card-save]').addEventListener('click', async () => {
-    const fields = {
-      name: form.querySelector('[data-card-name]').value,
-      player_name: form.querySelector('[data-card-player]').value,
-      setting: form.querySelector('[data-card-setting]').value,
-      tone: form.querySelector('[data-card-tone]').value,
-      core_persona: form.querySelector('[data-card-persona]').value,
-      opening_scene: form.querySelector('[data-card-opening]').value,
-    };
-    status.textContent = 'Saving…';
-    try {
-      await invoke('fable_card_save', { fields });
-      status.textContent = 'Saved — applies to the next turn.';
-    } catch (err) {
-      status.textContent = `Failed: ${err}`;
-    }
-  });
-  form.querySelector('.fable-left-drawer__actions').appendChild(status);
-}
-
-// ── Tracker tab ─────────────────────────────────────────────────────────
-// View + edit the live WorldSchema. The full schema is large, so we surface
-// the core human-meaningful fields as editable inputs: summary, the entities
-// map (one textarea, `key: value` per line), the world clock, weather
-// condition, current location, active rumors, and recent events. Saving
-// rebuilds the full schema (preserving the unedited typed fields) + writes it
-// back via fable_schema_set.
-async function renderTracker(panel) {
-  let schema = null;
-  try {
-    schema = await invoke('fable_schema_get');
-  } catch (err) {
-    panel.innerHTML = `<div class="fable-left-drawer__error">${esc(err)}</div>`;
-    return;
-  }
-  if (!schema) {
-    panel.innerHTML = `<div class="fable-left-drawer__empty">No active game.</div>`;
-    return;
-  }
-  // Flatten the editable fields for the form.
-  const summary = schema.summary || '';
-  const entities = schema.entities || {};
-  const entityText = Object.entries(entities).map(([k, v]) => `${k}: ${v}`).join('\n');
-  const clock = schema.world_clock || {};
-  const weather = (schema.weather && schema.weather.condition) || '';
-  const graph = schema.travel_graph || {};
-  const currentNode = graph.current_node || '';
-  const rumors = Array.isArray(schema.rumors) ? schema.rumors : [];
-  const rumorText = rumors.map((r) => (r && r.label) ? r.label : '').filter(Boolean).join('\n');
-  const events = Array.isArray(schema.recent_events) ? schema.recent_events.join('\n') : '';
-
-  panel.innerHTML = `
-    <div class="fable-left-drawer__form" data-tracker-form>
-      <label class="fable-left-drawer__field">
-        <span class="fable-left-drawer__label">Summary</span>
-        <textarea data-trk-summary rows="3">${esc(summary)}</textarea>
-      </label>
-      <label class="fable-left-drawer__field">
-        <span class="fable-left-drawer__label">Entities (key: value, one per line)</span>
-        <textarea data-trk-entities rows="6">${esc(entityText)}</textarea>
-      </label>
-      <label class="fable-left-drawer__field">
-        <span class="fable-left-drawer__label">Time — day</span>
-        <input type="number" data-trk-day value="${esc(String(clock.day ?? 1))}">
-      </label>
-      <label class="fable-left-drawer__field">
-        <span class="fable-left-drawer__label">Time — minutes (0–1439)</span>
-        <input type="number" data-trk-minutes value="${esc(String(clock.current_minutes ?? 0))}">
-      </label>
-      <label class="fable-left-drawer__field">
-        <span class="fable-left-drawer__label">Weather</span>
-        <input type="text" data-trk-weather value="${esc(weather)}">
-      </label>
-      <label class="fable-left-drawer__field">
-        <span class="fable-left-drawer__label">Current location (node id)</span>
-        <input type="text" data-trk-location value="${esc(currentNode)}">
-      </label>
-      <label class="fable-left-drawer__field">
-        <span class="fable-left-drawer__label">Rumors (one per line)</span>
-        <textarea data-trk-rumors rows="4">${esc(rumorText)}</textarea>
-      </label>
-      <label class="fable-left-drawer__field">
-        <span class="fable-left-drawer__label">Recent events (one per line)</span>
-        <textarea data-trk-events rows="4">${esc(events)}</textarea>
-      </label>
-      <div class="fable-left-drawer__actions">
-        <button class="fable-left-drawer__btn primary" data-trk-save>Save</button>
-        <span class="fable-left-drawer__note">Edits the live world state. Undoable via the history ring buffer.</span>
-      </div>
-    </div>
-  `;
-  const form = panel.querySelector('[data-tracker-form]');
-  const status = document.createElement('span');
-  status.className = 'fable-left-drawer__status';
-  form.querySelector('[data-trk-save]').addEventListener('click', async () => {
-    status.textContent = 'Saving…';
-    try {
-      const next = JSON.parse(JSON.stringify(schema)); // preserve typed fields
-      next.summary = form.querySelector('[data-trk-summary]').value;
-      next.recent_events = splitLines(form.querySelector('[data-trk-events]').value);
-      // Rebuild the entities map from the textarea.
-      const entText = form.querySelector('[data-trk-entities]').value;
-      const ent = {};
-      for (const line of splitLines(entText)) {
-        const i = line.indexOf(':');
-        if (i > 0) {
-          const k = line.slice(0, i).trim();
-          const v = line.slice(i + 1).trim();
-          if (k) ent[k] = v;
-        }
-      }
-      next.entities = ent;
-      // Clock.
-      if (!next.world_clock) next.world_clock = {};
-      next.world_clock.day = numOr(form.querySelector('[data-trk-day]').value, 1);
-      next.world_clock.current_minutes = numOr(form.querySelector('[data-trk-minutes]').value, 0);
-      // Weather.
-      const w = form.querySelector('[data-trk-weather]').value.trim();
-      if (w) {
-        if (!next.weather) next.weather = {};
-        next.weather.condition = w;
-      } else if (next.weather) {
-        next.weather.condition = '';
-      }
-      // Current location.
-      if (next.travel_graph) {
-        next.travel_graph.current_node = form.querySelector('[data-trk-location]').value.trim() || null;
-      }
-      // Rumors: rebuild as bare labels rooted at the current node (the simplest
-      // faithful representation; the full Rumor struct is preserved for
-      // existing rumors whose label is unchanged).
-      const newLabels = splitLines(form.querySelector('[data-trk-rumors]').value);
-      const existingByLabel = new Map((rumors || []).filter(r => r && r.label).map(r => [r.label, r]));
-      const root = next.travel_graph && next.travel_graph.current_node;
-      next.rumors = newLabels.map((label) => existingByLabel.get(label) || {
-        label,
-        origin_node: root,
-        known_nodes: root ? [root] : [],
-        born_minutes: next.world_clock.current_minutes || 0,
-      });
-      await invoke('fable_schema_set', { schemaJson: next });
-      status.textContent = 'Saved.';
-    } catch (err) {
-      status.textContent = `Failed: ${err}`;
-    }
-  });
-  form.querySelector('.fable-left-drawer__actions').appendChild(status);
-}
-
-// ── Codex tab REMOVED (2026-07-31) ───────────────────────────────────────
-// The codex_save / codex_delete IPCs are dead stubs (the codex lore-RAG
-// module was deleted), and codex_list always returns empty. The tab was
-// removed with them. Live lore authoring will return when a new lore
-// surface replaces the deleted RAG layer.
-
-// ── helpers ─────────────────────────────────────────────────────────────
-function splitLines(s) {
-  return String(s || '').split('\n').map((l) => l.trim()).filter(Boolean);
-}
-function numOr(s, fallback) {
-  const n = Number.parseInt(String(s || ''), 10);
-  return Number.isFinite(n) ? n : fallback;
-}
-
-// Hard reset (called from teardownStage on stage exit so a close mid-edit
-// can't leave the drawer open or stale on the next session).
-export function resetLeftDrawer() {
+export function onDrawerMouseLeave() {
+  if (locked) return;
+  if (edgeLockVisible()) return;
   closeDrawer();
-  activeTab = 'card';
+}
+// Hard reset (called from teardownStage on stage exit). Wipes HUD state too
+// so a stale paperdoll/panel from the prior session can't flash on re-entry.
+export function resetLeftDrawer() {
+  locked = false;
+  if (drawerEl) {
+    drawerEl.classList.remove('locked');
+    delete drawerEl.dataset.time;
+    delete drawerEl.dataset.weather;
+  }
+  closeDrawer();
 }

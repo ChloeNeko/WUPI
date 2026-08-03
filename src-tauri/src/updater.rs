@@ -567,11 +567,9 @@ fn apply_extracted(extracted: &Path, exe_dir: &Path) -> Result<(), String> {
 /// be overwritten by an update (user data). The engine-content exceptions
 /// (shipped in the zip, replaced verbatim on update) are:
 /// - `data/wupi.sim` + `data/wupi.codex` — Wupi's persona + her static playbook.
-/// - `data/fable.sim` + `data/fable.codex` — the Fable persona (the Game Master
-///   for the New Game interview) + the unified Fable playbook (shared by the
-///   interview persona AND the simulation narrator; fable.codex is the
-///   2026-07-29 unification, was gm.codex; fable.sim is the 2026-07-29 rename
-///   of gm.sim).
+/// - `data/fable.sim` + `data/fable.codex` — the Quick Play narrator card (the
+///   placeless Narrative Simulator identity, loaded by fable_quick_play_start)
+///   + the unified Fable playbook (engine content).
 ///
 /// `rel` is the file's path relative to the extract root (e.g. `data/user.xml`,
 /// `memory/memory.sqlite`, `wupi.exe`).

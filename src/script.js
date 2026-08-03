@@ -1,76 +1,121 @@
 import { invoke, Channel } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import { getVersion } from '@tauri-apps/api/app';
-import { initFable } from './fable/fable.js';
+import { initFable, launchFable } from './fable/fable.js';
 import { initPrism } from './prism/prism.js';
+import { showApiTimeout, dismissApiTimeout } from './api-timeout-bubble.js';
+// Boot-paw sound design ships as authored .mp3 assets (Vite-bundled into
+// assets/). Three voices, one each for the three motion classes:
+//   INTRO_MOVE_SRC   — the fairy-tour + corner-flight whoosh (movement)
+//   INTRO_HOP_SRC    — both hops baked into one clip (hop-1 at ~0.07s,
+//                      hop-2 at ~0.78s — the choreography syncs to these)
+//   INTRO_FINISH_SRC — the magical landing finale
+import INTRO_MOVE_SRC from './assets/introMoveSFX.mp3';
+import INTRO_HOP_SRC from './assets/introHopSFX.mp3';
+import INTRO_FINISH_SRC from './assets/introFinishSFX.mp3';
 
 const canvas = document.getElementById('aurora-canvas');
 const ctx = canvas.getContext('2d');
 
 // Each color code defines the aurora's sky gradient (top→bottom CSS color
-// stops) and the curtain hue generator (base hue ± range). The animate() loop
-// reads `currentPalette`: switching color codes re-paints on the next frame.
+// stops), the per-curtain hue/saturation/lightness generators, and a dark UI
+// accent triplet (recolors the OS chrome via the --ui-accent* CSS vars — see
+// applyTheme). The animate() loop reads `currentPalette`: switching color codes
+// re-paints on the next frame.
 //
-// "Vibrant" reproduces the original hardcoded values (the project default).
-// New color codes = add entries here + a matching swatch in styles.css.
+// Curtain color math (solid mode):
+//   hue   = hueBase + i*hueStep + sin(time + i) * hueRange
+//   light = lightness + (i - 2) * lightStep      // i = curtain 0..4
+// A palette may instead give explicit per-strip arrays `curtainHues[5]` +
+// `curtainLights[5]` to plant each of the 5 strips on a genuinely different
+// shade (the themed palettes do; Vibrant/Rainbow keep the arithmetic above,
+// which is byte-identical to the original hardcoded aurora). Either way the
+// strips slowly breathe within hueRange. Rainbow mode gives
+// every strip its own ROYGBIV band and drifts them together through the full
+// 360° over ~90 s. "Vibrant" reproduces the ORIGINAL hardcoded aurora
+// exactly (hueStep 0, lightStep 0, sat 100, light 65 → byte-identical hsla);
+// it stays visually untouched. New color codes = add an entry here + a
+// matching .swatch-* in styles.css.
 const COLOR_CODES = {
   Red: {
-    skyGradient: ['#070204', '#100406', '#170608', '#1f0709', '#240a0c'],
+    // Each strip starts on a different shade of red/pink/red-orange: deep
+    // blood red → bright red → crimson pink → vivid pink → red-orange.
+    // The bottom two sky stops are dark themed reds so the curtain glow
+    // blends into the horizon like Vibrant — NO separate light strip.
+    skyGradient: ['#0a0203', '#140406', '#1d0607', '#370c11', '#49121a'],
     mode: 'solid',
-    hueBase: 358,
-    hueRange: 40,
-    saturation: 80,
-    lightness: 58,
-    uiAccent: '#b8334a',
+    hueBase: 356, hueRange: 8,
+    saturation: 82,
+    curtainHues:  [348, 358, 332, 320, 12],   // dark-red, red, crimson, pink, red-orange
+    curtainLights:[42, 56, 50, 66, 60],
+    uiAccent: '#9b2d3f', uiAccentBright: '#d65a72', uiAccentDeep: '#5e1822',
   },
   Green: {
-    skyGradient: ['#030503', '#070d07', '#0a130b', '#0d190e', '#102012'],
+    // Each strip starts on a different green: forest → chartreuse → sea/turquoise
+    // → spring/lawn → olive-gold. Hue spans ~46°, lightness ~36%, so the aurora
+    // reads as a living canopy rather than one flat green. The bottom two sky
+    // stops are dark themed greens so the curtain glow blends into the horizon
+    // like Vibrant — NO separate light strip.
+    skyGradient: ['#030503', '#070d07', '#0a130b', '#0f331e', '#164128'],
     mode: 'solid',
-    hueBase: 138,
-    hueRange: 50,
+    hueBase: 140, hueRange: 8,
     saturation: 78,
-    lightness: 58,
-    uiAccent: '#3aa15a',
+    curtainHues:  [140, 90, 165, 150, 70],    // forest, chartreuse, sea/turquoise, spring/lawn, olive
+    curtainLights:[40, 58, 52, 66, 50],
+    uiAccent: '#2d7340', uiAccentBright: '#5ec878', uiAccentDeep: '#1a4828',
   },
   Blue: {
-    skyGradient: ['#020308', '#04081a', '#060b24', '#080e30', '#0a1138'],
+    // Each strip starts on a different blue/purple: midnight → royal/sapphire
+    // → cerulean/cornflower → baby/sky → violet. Mixes blues with purple
+    // accents per the brief; all 5 strips clearly distinct. The bottom two sky
+    // stops are dark themed blues so the curtain glow blends into the horizon
+    // like Vibrant — NO separate light strip.
+    skyGradient: ['#020308', '#04081a', '#060b24', '#0c163b', '#131f4e'],
     mode: 'solid',
-    hueBase: 218,
-    hueRange: 45,
-    saturation: 82,
-    lightness: 60,
-    uiAccent: '#3d6fd6',
+    hueBase: 220, hueRange: 8,
+    saturation: 84,
+    curtainHues:  [232, 220, 205, 200, 275],  // midnight, royal/sapphire, cerulean/cornflower, baby/sky, violet
+    curtainLights:[42, 56, 62, 70, 50],
+    uiAccent: '#3458a8', uiAccentBright: '#6e9ce8', uiAccentDeep: '#1e3370',
   },
   Neutral: {
-    skyGradient: ['#020203', '#050507', '#0a0a0d', '#0f0f13', '#000000'],
+    // Grayscale only (saturation 0): a mixture of white, dark grays, and
+    // black. The 5 strips span a wide lightness band (near-white → near-black)
+    // so each starts on a clearly different shade. The bottom sky stops are
+    // dark grays (~13%/19%) so the curtain glow blends into the horizon like
+    // Vibrant — NO separate light strip.
+    skyGradient: ['#020203', '#050507', '#0a0a0d', '#222229', '#31313a'],
     mode: 'solid',
-    hueBase: 0,
-    hueRange: 0,
+    hueBase: 0, hueRange: 0,
     saturation: 0,
-    lightness: 60,
-    grayCurtains: true,
-    uiAccent: '#3a3a42',
+    curtainHues:  [0, 0, 0, 0, 0],            // grayscale — hue is irrelevant at sat 0; kept for branch consistency
+    curtainLights:[72, 54, 38, 22, 10],       // light gray → near black, each strip distinct
+    uiAccent: '#3a3a42', uiAccentBright: '#8a8a96', uiAccentDeep: '#202024',
   },
   Vibrant: {
+    // Reproduces the ORIGINAL hardcoded aurora EXACTLY — do not change these
+    // values. Vibrant is the project default + the untouched reference look,
+    // so it deliberately keeps hueStep/lightStep of 0. Every other color code
+    // mirrors this same horizon treatment (curtain glow blends into the bottom
+    // skyGradient stops — no separate light band).
     skyGradient: ['#02040a', '#060a17', '#150524', '#2b0b36', '#4a173d'],
     mode: 'solid',
-    hueBase: 305,
-    hueRange: 45,
-    saturation: 100,
-    lightness: 65,
-    uiAccent: '#b534fa',
+    hueBase: 305, hueRange: 45, hueStep: 0,
+    saturation: 100, lightness: 65, lightStep: 0,
+    uiAccent: '#b534fa', uiAccentBright: '#ff66b2', uiAccentDeep: '#6a0dad',
   },
   Rainbow: {
-    skyGradient: ['#040308', '#080612', '#0c0920', '#100c2c', '#14102e'],
+    // Each curtain starts on a different ROYGBIV band; all bands drift
+    // together through the full 360° over ~90 s (slow + subtle). The hue
+    // jitter (hueRange) keeps adjacent strips from blending flat. The bottom
+    // two sky stops are a dark neutral violet so the curtain glow blends into
+    // the horizon like Vibrant — NO separate light strip.
+    skyGradient: ['#040308', '#080612', '#0c0920', '#181236', '#201943'],
     mode: 'rainbow',
-    rainbowBands: [0, 50, 120, 210, 280],
-    saturation: 100,
-    lightness: 64,
-    uiAccent: '#8367d8',
-    horizonShift: true,
-    horizonSaturation: 35,
-    horizonLightness: 8,
-    horizonDriftSpeed: 1.5,
+    hueBands: [0, 60, 120, 220, 280],
+    hueRange: 9, hueDrift: 26.7,
+    saturation: 84, lightness: 62, lightStep: 3,
+    uiAccent: '#7878a8', uiAccentBright: '#a6a6d4', uiAccentDeep: '#4a4a66',
   },
 };
 
@@ -294,6 +339,13 @@ function animate() {
     // by the interpolated blur radius (10→30) AND by alpha. The wipe then
     // sweeps the composite left-to-right.
     const a = 0.18 * auroraIntensity;
+    const pal = currentPalette;
+    const sat = pal.saturation;
+    const isRainbow = pal.mode === 'rainbow';
+    // Rainbow drift: the bands rotate through the full 360° together. `time`
+    // advances 0.0025/frame ≈ 0.15/s, so a full cycle = 360 / (hueDrift*0.15)
+    // ≈ 90 s at hueDrift 26.7 — slow + subtle.
+    const rainbowDrift = isRainbow ? (time * pal.hueDrift) : 0;
     for (let i = 0; i < curtains; i++) {
       const speed = time * (0.1 + i * 0.04);
       const thickness = 45 + i * 15;
@@ -318,10 +370,36 @@ function animate() {
       }
       auroraBufCtx.closePath();
 
-      const hue = currentPalette.hueBase + Math.sin(time * 1.0 + i) * currentPalette.hueRange;
-      auroraBufCtx.fillStyle = `hsla(${hue}, 100%, 65%, ${a})`;
+      // Per-curtain color. Each strip must start on a DIFFERENT shade and
+      // breathe slowly within hueRange:
+      //  - solid: a palette may pin each strip via `curtainHues[i]` +
+      //    `curtainLights[i]` (the themed palettes do — distinct shades). When
+      //    it doesn't, the arithmetic fallback runs (base + i*step), which for
+      //    Vibrant (hueStep 0 + lightStep 0 + sat 100 + light 65) collapses to
+      //    the ORIGINAL hardcoded hsla byte-for-byte. Either way a slow sin
+      //    jitter rides on top.
+      //  - rainbow: each strip's own ROYGBIV band, all drifting together.
+      let hue, light;
+      if (isRainbow) {
+        hue = (pal.hueBands[i] + rainbowDrift + Math.sin(time * 1.0 + i) * pal.hueRange + 720) % 360;
+        light = pal.lightness + (i - 2) * pal.lightStep;
+      } else if (pal.curtainHues) {
+        hue = (pal.curtainHues[i] + Math.sin(time * 1.0 + i) * pal.hueRange + 720) % 360;
+        light = pal.curtainLights[i];
+      } else {
+        hue = (pal.hueBase + i * pal.hueStep + Math.sin(time * 1.0 + i) * pal.hueRange + 720) % 360;
+        light = pal.lightness + (i - 2) * pal.lightStep;
+      }
+      auroraBufCtx.fillStyle = `hsla(${hue}, ${sat}%, ${light}%, ${a})`;
       auroraBufCtx.fill();
     }
+
+    // ── Bottom horizon. No separate glow band is drawn — every theme now
+    //    takes the Vibrant approach: the curtain glow blends into the bottom
+    //    skyGradient stops (dark themed hues, L≈13%→19%), which the sky pass
+    //    already painted in `source-over`. No per-palette `horizon` key exists
+    //    anymore; the old near-white strip-of-light band was removed for every
+    //    non-Vibrant color code.
 
     // ── Pass 2: blit the composite with ONE interpolated blur pass.
     // Gaussian cost ~ radius², so scaling the radius 10→30 with intensity
@@ -368,6 +446,38 @@ function animate() {
 // Resume mirrors all three. The animate() loop self-gates on `paused`.
 let paused = true;
 let bootDone = false;
+
+// ── DEV SHORTCUT: ?dev=fable ──────────────────────────────────
+// Visiting the app at .../wupi.html?dev=fable (e.g. the Vite dev server at
+// localhost:1420) SKIPS the entire OS boot ceremony — the 1s blank, the paw
+// entry/hop/flight animation, the 8s loading screen, the aurora reveal — and
+// launches straight into Fable, also skipping Fable's own fog gate + boot
+// transition (see openFable's DEV shortcut branch). The net effect: refresh
+// lands on Fable's title screen in well under a second, so iterating on the
+// Fable UI doesn't cost ~16s of unskippable cinematics per change.
+//
+// Production is UNAFFECTED: Tauri loads wupi.html with no query string under
+// its custom protocol, so this is false in shipped builds. There is no Rust,
+// no feature flag, no build change — delete this const + its 3 call sites to
+// fully remove the shortcut. The model still loads (boot_load_model fires
+// here) + the canvas gate opens (bootDone flips here); only the cinematic
+// choreography is bypassed.
+//
+// Trigger forms (either works): ?dev=fable (query) or #dev=fable (hash). The
+// hash form lets you use it under Tauri dev by setting devUrl to
+// "http://localhost:1420/wupi.html#dev=fable" (some Tauri versions strip a
+// query on devUrl but preserve the hash). Production loads wupi.html with
+// neither → false.
+const DEV_FABLE_SHORTCUT = (() => {
+  try {
+    const q = new URLSearchParams(window.location.search).get('dev');
+    if (q === 'fable') return true;
+    // Hash form: #dev=fable (no leading ?). Parse the substring after '#'.
+    const h = window.location.hash.replace(/^#/, '');
+    return new URLSearchParams(h).get('dev') === 'fable';
+  } catch (_) { return false; }
+})();
+
 // The running app version, resolved by runBootGate() via getVersion() before
 // the cosmetic terminal stream starts. Referenced by the first TERMINAL_LINES
 // entry so the boot banner reflects the real version instead of a hardcoded
@@ -519,6 +629,45 @@ function getAudioCtx() {
   return window.__wupiAudioCtx;
 }
 
+// ─── Boot-paw sound design (authored .mp3 assets) ──────────────────────────
+// Three voices ship as .mp3 files (imported above, Vite-bundled), each voiced
+// for one motion class. Played via a one-shot <audio> at BOOT_SFX_VOLUME so
+// the visuals + audio share one authored sound world:
+//
+//   INTRO_MOVE_SRC   — the fairy-tour + corner-flight whoosh. Fires at every
+//                      dart segment + the corner flight.
+//   INTRO_HOP_SRC    — BOTH hops baked into one ~1.3s clip (hop-1 attack at
+//                      ~0.07s, hop-2 attack at ~0.78s, inter-hop rest ~0.65–
+//                      0.80s). Played ONCE at hop-1 launch; the choreography
+//                      syncs the two visual hops to those two attacks.
+//   INTRO_FINISH_SRC — the magical landing finale when the paw settles home.
+//
+// 0.6 volume = 40% lower than the authored full-volume masters.
+//
+// AUTOMUTE: the boot paw flies before any user gesture, so browsers may block
+// autoplay. The visual boot carries regardless — sound is a bonus when live.
+// Each playback creates a transient <audio> node that self-removes on end.
+const BOOT_SFX_VOLUME = 0.6;
+
+// Play a one-shot sound effect at BOOT_SFX_VOLUME. Creates a transient
+// <audio> element, starts it, and removes it on ended/error so nothing leaks.
+// Swallows autoplay rejection silently (the boot visual carries alone then).
+function playSfx(src, opts) {
+  const audio = document.createElement('audio');
+  audio.src = src;
+  audio.volume = BOOT_SFX_VOLUME;
+  // Optional playbackRate (used to quicken the baked-in two-hop clip).
+  if (opts && opts.playbackRate) audio.playbackRate = opts.playbackRate;
+  audio.setAttribute('aria-hidden', 'true');
+  // Self-clean on natural end OR error (errors fire under autoplay policy).
+  const cleanup = () => { if (audio.parentNode) audio.parentNode.removeChild(audio); };
+  audio.addEventListener('ended', cleanup, { once: true });
+  audio.addEventListener('error', cleanup, { once: true });
+  document.body.appendChild(audio);
+  const p = audio.play();
+  if (p && typeof p.catch === 'function') p.catch(cleanup);
+}
+
 // Two-ascending-note chime (A5 → E6) — a soft "ready" cue. Sine waves with
 // a quick attack + exponential decay so it reads as a bell-like ping rather
 // than a beep. Total duration ~0.55s. Synthesized = no asset file ships.
@@ -547,7 +696,7 @@ function playLaunchChime() {
 // Show the LAUNCH button on the download overlay. Hides the Start/Cancel
 // buttons, fills the progress bar to 100%, then mounts the LAUNCH button
 // below the stats. The button's click handler plays the chime, spawns a
-// sparkle burst, restores always-on-top, and reloads.
+// sparkle burst, and reloads.
 function showLaunchButton(overlay, startBtn, cancelBtn, subtitle, stats, bar) {
   // Freeze the progress display at "complete" so the LAUNCH button reads as
   // the natural next step (no half-filled bar).
@@ -585,9 +734,12 @@ function showLaunchButton(overlay, startBtn, cancelBtn, subtitle, stats, bar) {
     // Spawn a sparkle burst around the button center (reuses the boot-paw
     // sparkle aesthetic: .boot-sparkle CSS + the spawnSparkles pattern).
     spawnLaunchSparkles(launchBtn);
-    // Restore always-on-top for the normal OS UX, then reload so setup()
-    // re-runs with WUPI.gguf present + the boot choreography plays.
-    invoke('set_always_on_top', { on: true }).catch(() => {});
+    // Reload so setup() re-runs with WUPI.gguf present + the boot
+    // choreography plays. (The window boots non-on-top per tauri.conf.json —
+    // the 2026-07-23 locked decision — so there's nothing to "restore" here.
+    // An earlier build flipped always-on-top on at this point; that call was
+    // stale from when the config default was true and trapped the window on
+    // top for the whole session. Removed.)
     // Tiny delay so the sparkle + chime land before the reload kills them.
     setTimeout(() => location.reload(), 350);
   });
@@ -655,17 +807,6 @@ function spawnLaunchSparkles(parent, count = 18) {
   // Take over the screen immediately (before the paw animation can show
   // through). The overlay's CSS fade-in (0.8s) gives a soft reveal.
   overlay.classList.add('show');
-
-  // Drop always-on-top so the user can alt-tab away during the long GGUF
-  // pull (~10 GB, several minutes on a fast connection). The window's
-  // default is alwaysOnTop:true (tauri.conf.json) — that's the right steady
-  // state for normal OS use, but a first-run download is a wait, not an OS
-  // session. Restored to ON when the user clicks LAUNCH ( success path ).
-  // Best-effort: if the IPC fails the download still works, just stays
-  // on-top (the user's not stranded).
-  invoke('set_always_on_top', { on: false }).catch((e) =>
-    console.warn('[Wupi] set_always_on_top(false) failed; overlay will stay on-top', e)
-  );
 
   // Human-readable byte formatting for the stats line.
   const fmtBytes = (n) => {
@@ -809,9 +950,8 @@ function spawnLaunchSparkles(parent, count = 18) {
 })();
 
 // ─── Boot paw → fly home → staged reveal ────────────────────────────────────
-// The OS window boots transparent + always-on-top (tauri.conf.json) and STAYS
-// transparent for its lifetime. What controls desktop bleed-through is the
-// BODY background-color:
+// The OS window boots transparent (tauri.conf.json) and STAYS transparent for
+// its lifetime. What controls desktop bleed-through is the BODY background-color:
 //   - body.booting         → transparent (CSS) → desktop shows through.
 //   - body:not(.booting)   → #02040a (CSS)     → solid black covers desktop.
 //
@@ -851,6 +991,53 @@ function spawnLaunchSparkles(parent, count = 18) {
 // listener above keeps its title-indicator job; this is a SEPARATE listener
 // so the title's `typing` no-op guard can't swallow the wake signal.
 (async function setupBootSplash() {
+  // ── DEV SHORTCUT (?dev=fable): skip the entire OS boot ceremony. ──
+  // When the shortcut is active, the paw hops, the 8s loading screen, and the
+  // aurora reveal are all bypassed. We instead: tear down the boot DOM nodes
+  // (so they can't cover Fable), drop the body boot classes (so the OS chrome
+  // behaves as already-revealed), fire boot_load_model (so the Fable narrator
+  // has its model — without this the engine never spawns), and flip bootDone
+  // (so the canvas gate is open for when the user later EXITS Fable back to
+  // the OS desktop). The actual Fable launch is wired later, after initFable()
+  // runs (see the DEV_FABLE_SHORTCUT block in the app wiring). We still honor
+  // check_models: on first-run (models missing) we let the download overlay do
+  // its job and bail just like the normal path.
+  if (DEV_FABLE_SHORTCUT) {
+    try {
+      const status = await invoke('check_models');
+      if (status?.wupi === 'missing' || status?.embed === 'missing') {
+        console.log('[Wupi] dev-fable shortcut: models missing, deferring to download overlay');
+        return;
+      }
+    } catch (err) {
+      console.warn('[Wupi] dev-fable shortcut: check_models failed, proceeding', err);
+    }
+    // Remove the boot DOM so it can't sit on top of Fable.
+    document.getElementById('boot-paw')?.remove();
+    document.getElementById('boot-loading')?.remove();
+    // Drop the boot body classes: .booting keeps the top-bar/dock hidden + body
+    // transparent; .loading (if present) holds the dock back. Clearing both
+    // mirrors what revealAfterLand() + endLoadingScreen() leave behind.
+    document.body.classList.remove('booting', 'loading');
+    // Open the canvas gate so the desktop can paint later. We do NOT call
+    // startLoop() here: by the time this await resumes, launchFable() (fired
+    // during module eval, before the IPC resolved) has already run openFable →
+    // pauseAurora → paused=true, and Fable's full-screen overlay owns the
+    // screen. Forcing startLoop() now would un-pause the canvas behind Fable
+    // (wasted GPU) and fight pauseAurora. Instead we just flip bootDone so the
+    // gate is open; when the user EXITS Fable, resumeAurora() → startLoop()
+    // succeeds (bootDone gates startLoop) and the desktop paints correctly.
+    bootDone = true;
+    // Fire the model spawn exactly as the normal loading screen does. The
+    // Fable narrator's first turn needs the WUPI.gguf load to have started;
+    // without this the engine thread never spawns in dev mode.
+    invoke('boot_load_model').catch((e) => {
+      console.error('[Wupi] boot_load_model failed (dev-fable shortcut)', e);
+    });
+    console.log('[Wupi] dev-fable shortcut active — skipping OS boot, launching Fable');
+    return;
+  }
+
   // First-run gate: if the GGUFs are missing, DON'T play the paw animation.
   // The download overlay (setupModelDownloadGate) takes over the screen and
   // any paw motion underneath it creates a weird visual bug (the paw flies
@@ -869,24 +1056,85 @@ function spawnLaunchSparkles(parent, count = 18) {
     console.warn('[Wupi] check_models failed during boot gate; proceeding with paw', err);
   }
 
+  // ── Warm the SFX buffers during the blank 1s pause. Each intro clip is
+  //    played via a transient <audio> element created at play time; the FIRST
+  //    play of any source incurs decode + buffer-setup latency (the "first
+  //    move sound lags behind" symptom — the 2nd/3rd move sounds are fine
+  //    because the decoded frames are then cached). preload='auto' only buffers
+  //    the BYTES; it defers the expensive PCM decode lazily to the first play,
+  //    so a bare preload does NOT eliminate the first-play lag. The fix: force
+  //    the decode here by actually calling .play() (muted + volume 0 + seeked
+  //    back to 0 immediately), driving each clip through the full
+  //    load → decode → ready pipeline during the blank second. playSfx() then
+  //    makes its own fresh nodes that hit the now-cached decoded frames
+  //    near-instantly. (The muted warm node is paused + discarded once it has
+  //    started; the decoded frames persist in the media cache.)
+  for (const src of [INTRO_MOVE_SRC, INTRO_HOP_SRC, INTRO_FINISH_SRC]) {
+    try {
+      const warm = document.createElement('audio');
+      warm.src = src;
+      warm.muted = true;            // muted so the warm pass is silent
+      warm.volume = 0;
+      warm.setAttribute('aria-hidden', 'true');
+      const tearDown = () => {
+        try { warm.pause(); } catch (_) {}
+        if (warm.parentNode) warm.parentNode.removeChild(warm);
+      };
+      // As soon as the clip is playable, kick a muted micro-play to force the
+      // decode, then tear it down. 'canplay' (not 'canplaythrough') fires as
+      // soon as the first frames are decoded — enough to populate the cache.
+      warm.addEventListener('canplay', () => {
+        const p = warm.play();
+        if (p && typeof p.then === 'function') {
+          p.then(() => { try { warm.currentTime = 0; } catch (_) {} tearDown(); })
+           .catch(tearDown);
+        } else {
+          tearDown();
+        }
+      }, { once: true });
+      warm.addEventListener('error', tearDown, { once: true });
+      document.body.appendChild(warm);
+    } catch (e) { /* warm is best-effort */ }
+  }
+
   // Timing constants (ms).
   const ENTRY_DELAY = 1000;       // blank screen before paw enters (1s per spec)
   // Fairy-tour choreography: RISE STRAIGHT TO TOP-LEFT MIDDLE → dart to
   // TOP-RIGHT MIDDLE → dart to CENTER. Each dart is a hard ZOOM_EASE in/out
-  // so the paw reads as a fairy teleporting with momentum. Holds at each
-  // stop are ~0.6s per spec. The rise from the bottom is paced slower than
-  // the darts (per spec: "when it flies from the bottom it moves a bit too
-  // quick") — that's encoded in the rise getting a longer slice of the
-  // total duration than the dart segments.
-  // Total ≈ 0.6 rise + 0.6 hold + 0.4 dart + 0.6 hold + 0.4 dart + 0.6 hold = 3.2s.
-  const ENTRY_DURATION = 3200;
+  // so the paw reads as a fairy teleporting with momentum. The rise gets the
+  // biggest slice (longest distance). The TOTAL duration is LOAD-BEARING for
+  // audio sync: the three move-whooshes fire at the rise/dart-right/dart-
+  // center keyframe offsets (0 / 0.39 / 0.78), so at this duration they land
+  // at 0 / 1092 / 2184ms — ~1.09s apart, enough for each ~1.25s whoosh's
+  // decay to clear before the next fires (the prior 1.65s entry fired all
+  // three within 1.2s → full overlap → the "out of sync" muddy wash). Slowed
+  // back down from the over-tightened 1.65s per the "moves too fast + audio
+  // out of sync" pass. If you retune ENTRY_DURATION, keep the whoosh fire
+  // offsets ≥1.0s apart or the overlap roar returns.
+  const ENTRY_DURATION = 2800;
   // Sharp accel + sharp decel — the "fairy dart" easing. Most of the
   // motion happens in the middle of the segment, with hard start/stop.
   const ZOOM_EASE = 'cubic-bezier(0.65, 0, 0.35, 1)';
-  const HOP_DURATION = 320;       // each hop (up + down) — quick per spec
+  // Hop cadence is SYNCED TO INTRO_HOP_SRC: the clip has both hops baked in
+  // (hop-1 attack ~0.07s, hop-2 attack ~0.78s). hop-1 launches at clip-start,
+  // hop-2 launches HOP_2_DELAY_MS into the clip so its visual apex lands on
+  // the clip's second attack. Each hop's up+down is HOP_DURATION; the gap
+  // between hop-1 landing and hop-2 launching is the clip's inter-hop rest.
+  const HOP_DURATION = 175;       // each hop (up + down) — slowed a touch (was 150)
   const HOP_APEX = HOP_DURATION / 2;
   const HOP_HEIGHT = 70;          // px the inner img rises per hop
-  const PAUSE_BETWEEN_HOPS = 80;  // tight rest between hop 1 and hop 2
+  // hop-2 launch offset WITHIN THE CLIP at the current playback rate (matches
+  // the clip's second attack). hop-1 launches at clip-start; hop-2 launches
+  // HOP_2_DELAY_MS into the (rate-adjusted) clip so its apex lands on the
+  // rate-adjusted second attack. Recomputed whenever HOP_PLAYBACK_RATE changes:
+  // 2nd attack is 0.78s at 1× → 0.78 / 1.7 ≈ 0.46s = 460ms.
+  const HOP_2_DELAY_MS = 460;
+  // The clip plays at 1.7× (slowed from 2×): the doubled rate felt too fast
+  // AND made the fixed playSfx() decode/play latency a larger fraction of each
+  // compressed hop, so the sound perceptually lagged. 1.7× gives more temporal
+  // room → tighter felt sync + a less-pitched "hop-hop". The two attacks
+  // (~0.07s + ~0.78s at 1×) become ~0.04s + ~0.46s at this rate.
+  const HOP_PLAYBACK_RATE = 1.7;
   // Sparkle trail: a sparkle spawns every TRAIL_INTERVAL ms along the paw's
   // path during entry + flight (NOT during hops — those get the escalating
   // bursts). Tuned for perf: tighter interval was creating ~150 concurrent
@@ -897,14 +1145,16 @@ function spawnLaunchSparkles(parent, count = 18) {
   // smaller"), still prominent in the middle of the screen during the hops.
   const PAW_BOOT_SCALE = 2.8;
   const PAW_REST_SIZE = 45;
-  // Loiter after hop 2 before the corner flight fires. Per spec: "after the
-  // 2nd hop let it loiter for .5 seconds before moving."
-  const POST_HOP_LOITER_MS = 500;
+  // Loiter after hop 2 before the corner flight fires. ~1s gives the hop-2
+  // sparkle burst its spotlight before the paw lifts off for the corner.
+  const POST_HOP_LOITER_MS = 1000;
   // Straight-line corner flight: fires after the post-hop loiter. Per spec
   // ("just make it a straight line, you aren't curving it correctly") the
-  // flight is now a single CSS transition to the corner — no WAAPI arc.
-  // Slowed from 650ms to 800ms per spec ("fly a little slower").
-  const FLIGHT_DURATION_MS = 800;
+  // flight is a single CSS transition to the corner — no WAAPI arc. ~720ms
+  // so the move-whoosh (~1.25s) has room to breathe under the motion and the
+  // finish-SFX lead-in (fired FLIGHT - 120ms before land) lands its attack on
+  // touchdown, not after. Slowed back from the over-tightened 480ms.
+  const FLIGHT_DURATION_MS = 720;
   // Staged-reveal delays (ms) measured from flight-land (transitionend).
   // Top-bar fade is 0.6s in CSS; aurora wipe arms AFTER it finishes so the
   // two blur costs never overlap.
@@ -914,7 +1164,7 @@ function spawnLaunchSparkles(parent, count = 18) {
   // Min-dwell is no longer a flight gate (the choreography's built-in 1s
   // holds + hop durations define the length). Kept as a backstop in case
   // a future regression needs a floor; not currently read for flight.
-  const MIN_DWELL_MS = ENTRY_DELAY + ENTRY_DURATION + 2 * HOP_DURATION + PAUSE_BETWEEN_HOPS + 200;
+  const MIN_DWELL_MS = ENTRY_DELAY + ENTRY_DURATION + HOP_2_DELAY_MS + HOP_DURATION + 200;
   // Loading screen (runs AFTER the paw lands, BEFORE the staged reveal).
   // 8s per spec — adjustable. The text spans light L→R across this window;
   // the terminal streams fake boot lines + the real "model ready" milestone.
@@ -1030,6 +1280,19 @@ function spawnLaunchSparkles(parent, count = 18) {
     // Start the sparkle trail — it follows the paw through the fairy-zoom.
     startTrail();
 
+    // Movement SFX #1: plays as the paw lifts off for its first flight (the
+    // rise to top-left). Schedules the two dart move sounds to fire at the
+    // exact WAAPI offsets where those segments begin (dart-right + dart-center
+    // keyframes below) so each "flight" cue lands on its motion. The offsets
+    // are spaced ≥1.0s apart so the ~1.25s whoosh tails don't stack into a
+    // muddy roar (the prior 0.41/0.73 split on a 1.65s entry fired all three
+    // within 1.2s → full overlap → the "out of sync" wash).
+    try { playSfx(INTRO_MOVE_SRC); } catch (e) { /* autoplay blocked: silent */ }
+    const dartRightAt = ENTRY_DURATION * 0.39;  // ~1092ms
+    const dartCenterAt = ENTRY_DURATION * 0.78; // ~2184ms
+    setTimeout(() => { try { playSfx(INTRO_MOVE_SRC); } catch (e) {} }, dartRightAt);
+    setTimeout(() => { try { playSfx(INTRO_MOVE_SRC); } catch (e) {} }, dartCenterAt);
+
     // Entry path: RISE STRAIGHT TO TOP-LEFT MIDDLE → dart to TOP-RIGHT
     // MIDDLE → dart to CENTER. The "fairy-tour": each dart is a hard
     // ZOOM_EASE so the paw reads as a fairy teleporting with momentum.
@@ -1048,28 +1311,29 @@ function spawnLaunchSparkles(parent, count = 18) {
 
     const entryAnim = bootPaw.animate(
       [
-        // 0 → 0.22: rise from below STRAIGHT TO TOP-LEFT MIDDLE (no center).
-        // The rise gets a bigger slice of the duration than the darts so
-        // it reads as a graceful arrival rather than a snap upward (per
-        // spec: "when it flies from the bottom it moves a bit too quick").
+        // 0 → 0.30: rise from below STRAIGHT TO TOP-LEFT MIDDLE (no center).
+        // The rise gets the biggest slice — it covers the most distance and
+        // should read as a graceful arrival, not a snap upward (per spec:
+        // "when it flies from the bottom it moves a bit too quick").
         // easeOutQuint so it decelerates as it approaches the corner.
         { transform: `translate(${restCx}px, ${parkCy}px) scale(${PAW_BOOT_SCALE})`,
           offset: 0, easing: 'cubic-bezier(0.22, 1, 0.36, 1)' },
         { transform: `translate(${leftX}px, ${topY}px) scale(${PAW_BOOT_SCALE})`,
-          offset: 0.22, easing: 'linear' },
-        // 0.22 → 0.41: HOLD at TOP-LEFT for ~0.6s (same coord).
+          offset: 0.30, easing: 'linear' },
+        // 0.30 → 0.39: HOLD at TOP-LEFT (~0.25s).
         { transform: `translate(${leftX}px, ${topY}px) scale(${PAW_BOOT_SCALE})`,
-          offset: 0.41, easing: ZOOM_EASE },
-        // 0.41 → 0.54: dart to TOP-RIGHT MIDDLE (crosses the whole top).
+          offset: 0.39, easing: ZOOM_EASE },
+        // 0.39 → 0.53: dart to TOP-RIGHT MIDDLE (crosses the whole top).
         { transform: `translate(${rightX}px, ${topY}px) scale(${PAW_BOOT_SCALE})`,
-          offset: 0.54, easing: 'linear' },
-        // 0.54 → 0.73: HOLD at TOP-RIGHT for ~0.6s (same coord).
+          offset: 0.53, easing: 'linear' },
+        // 0.53 → 0.78: HOLD at TOP-RIGHT (~0.70s — long enough for the
+        // dart-right whoosh tail to decay before dart-center fires).
         { transform: `translate(${rightX}px, ${topY}px) scale(${PAW_BOOT_SCALE})`,
-          offset: 0.73, easing: ZOOM_EASE },
-        // 0.73 → 0.83: dart down to CENTER.
+          offset: 0.78, easing: ZOOM_EASE },
+        // 0.78 → 0.90: dart down to CENTER.
         { transform: `translate(${restCx}px, ${restCy}px) scale(${PAW_BOOT_SCALE})`,
-          offset: 0.83, easing: 'linear' },
-        // 0.83 → 1.0: HOLD at CENTER for ~0.6s (same coord).
+          offset: 0.90, easing: 'linear' },
+        // 0.90 → 1.0: HOLD at CENTER (~0.28s before hops begin).
         { transform: `translate(${restCx}px, ${restCy}px) scale(${PAW_BOOT_SCALE})`,
           offset: 1, easing: 'linear' },
       ],
@@ -1086,6 +1350,11 @@ function spawnLaunchSparkles(parent, count = 18) {
 
   function runHops() {
     if (!bootPawImg) { hopsDone = true; maybeFly(); return; }
+    // INTRO_HOP_SRC has BOTH hops baked into one clip (hop-1 attack ~0.07s,
+    // hop-2 attack ~0.78s). Play it ONCE here; the two visual hops sync to
+    // the clip's two attacks — hop-2 launches HOP_2_DELAY_MS into the clip
+    // so it leaves the ground exactly when the second attack hits.
+    try { playSfx(INTRO_HOP_SRC, { playbackRate: HOP_PLAYBACK_RATE }); } catch (e) { /* autoplay blocked: silent */ }
     let hop = 0;
     const doHop = () => {
       hop++;
@@ -1105,14 +1374,17 @@ function spawnLaunchSparkles(parent, count = 18) {
       }, HOP_APEX);
       a.onfinish = () => {
         if (hop < 2) {
-          setTimeout(doHop, PAUSE_BETWEEN_HOPS);
+          // hop-2 launches HOP_2_DELAY_MS into the clip (synced to its second
+          // attack). hop-1 landed at HOP_DURATION; the wait here is the
+          // remainder of the clip's inter-hop rest, NOT a fixed pause — that
+          // keeps the visual hop-2 launch locked to the audio attack.
+          setTimeout(doHop, HOP_2_DELAY_MS - HOP_DURATION);
         } else {
           a.commitStyles();
           a.cancel();
           hopsDone = true;
-          // 0.5s loiter after hop 2 before the corner flight fires.
-          // Per spec: "after the 2nd hop let it loiter for .5 seconds
-          // before moving."
+          // 1s STALL after hop 2 before the corner flight fires (per spec: the
+          // paw holds still for a beat, then moves into the top-left).
           setTimeout(maybeFly, POST_HOP_LOITER_MS);
         }
       };
@@ -1149,6 +1421,19 @@ function spawnLaunchSparkles(parent, count = 18) {
     flightApproved = true;
     if (!bootPaw) { startLoadingScreen(); return; }
 
+    // Movement SFX: the corner flight. Fires now (liftoff). The finish SFX is
+    // triggered just before landing (see the pre-land timer below) so its
+    // tail rings out through + past touchdown rather than starting cold at the
+    // transitionend instant. playSfx appends the node to document.body + self
+    // cleans on 'ended', so the paw removal in onLand never truncates it —
+    // the clip plays in full regardless of the boot paw's lifecycle.
+    try { playSfx(INTRO_MOVE_SRC); } catch (e) { /* autoplay blocked: silent */ }
+    // Pre-land lead-in for the finish SFX: trigger it ~120ms before touchdown
+    // so the finale's attack lands as the paw settles, not after.
+    setTimeout(() => {
+      try { playSfx(INTRO_FINISH_SRC); } catch (e) { /* autoplay blocked: silent */ }
+    }, Math.max(0, FLIGHT_DURATION_MS - 120));
+
     // Read the real paw's resting rect. During boot the top-bar is at
     // opacity:0 but still laid out (NOT display:none), so getBoundingClientRect
     // returns the true home coordinates.
@@ -1171,6 +1456,8 @@ function spawnLaunchSparkles(parent, count = 18) {
       bootPaw.removeEventListener('transitionend', onLand);
       stopTrail();
       // One final big burst on landing — a celebratory capstone.
+      // (Finish SFX already fired via the pre-land timer in flyPawHome so its
+      // tail rings out through landing — no duplicate play here.)
       spawnSparkles(14, 1);
       // Drop .booting NOW so the top bar fades in immediately and stays
       // visible through the loading screen (the loading screen sits BELOW
@@ -1430,16 +1717,17 @@ function spawnLaunchSparkles(parent, count = 18) {
 
   function appendTerminalLine(text, isMilestone) {
     if (!bootTerminal) return;
+    // Single-line status readout: REPLACE whatever line is showing instead of
+    // stacking. The CSS fade-in keyframe runs on the fresh node each swap, so
+    // each new boot line crossfades in over the last. No accumulation, no DOM
+    // cap needed — the container holds exactly one .boot-terminal-line at a
+    // time. All three sources (cosmetic drip, boot-gate, model-status) funnel
+    // through here, so they all just overwrite the same one line.
+    bootTerminal.innerHTML = '';
     const line = document.createElement('div');
     line.className = 'boot-terminal-line' + (isMilestone ? ' milestone' : '');
     line.textContent = text;
-    // flex-direction: column-reverse on .boot-terminal means prepend = newest
-    // at the bottom. insertBefore(firstChild) achieves the same effect.
-    bootTerminal.insertBefore(line, bootTerminal.firstChild);
-    // Cap the line count so very long boots don't accumulate DOM forever.
-    while (bootTerminal.children.length > 40) {
-      bootTerminal.removeChild(bootTerminal.lastChild);
-    }
+    bootTerminal.appendChild(line);
   }
 
   function startTerminalStream() {
@@ -1776,6 +2064,18 @@ const dropdownMenu = document.getElementById('dropdownMenu');
   // silently fall back to Vibrant so a stale theme.json can't break the loop.
   function applyTheme(theme, colorCode) {
     currentPalette = COLOR_CODES[colorCode] || COLOR_CODES.Vibrant;
+    // Sky gradient is palette-specific; invalidate the cache so the next
+    // frame rebuilds it from the new skyGradient stops (skyGradient()).
+    cachedSkyGrad = null;
+    // Recolor the OS chrome live via the --ui-accent* CSS vars (consumed in
+    // styles.css). Vibrant's triplet = the original hardcoded magenta, so its
+    // accent is unchanged; every other code swaps in a darker, muted variant
+    // of its aurora hue so accents follow the theme without going neon.
+    const p = currentPalette;
+    const root = document.documentElement.style;
+    root.setProperty('--ui-accent', p.uiAccent);
+    root.setProperty('--ui-accent-bright', p.uiAccentBright);
+    root.setProperty('--ui-accent-deep', p.uiAccentDeep);
     // Mark the selected option in each panel (the `.selected` highlight).
     document.querySelectorAll('.theme-option').forEach((el) => {
       el.classList.toggle('selected', el.dataset.theme === theme);
@@ -1839,22 +2139,63 @@ const dropdownMenu = document.getElementById('dropdownMenu');
     updatePanel?.classList.remove('show');
   });
 
-  const wifiToggle = document.querySelector('.wifi-toggle-row');
   const wifiIcon = wifiBtn.querySelector('.status-icon');
 
-  function refreshWifi() {
+  // Wired (Ethernet) detection: when a physical cabled NIC is up, it replaces
+  // the Wi-Fi indicator entirely — the icon swaps to the wired glyph and the
+  // dropdown becomes a simple "Connected" panel. Ethernet takes precedence
+  // over Wi-Fi in the status bar.
+  function showEthernetMode(name) {
+    const wifiGlyph = wifiIcon.querySelector('.wifi-glyph');
+    const ethGlyph = wifiIcon.querySelector('.ethernet-glyph');
+    if (wifiGlyph) wifiGlyph.style.display = 'none';
+    if (ethGlyph) ethGlyph.style.display = '';
+    wifiIcon.classList.remove('disabled');
+    // Rebuild the dropdown as a centered, NON-interactive status panel. The
+    // adapter `name` from NDIS is a verbose Windows device string
+    // ("Intel(R) Ethernet Connection (17) I219-LM") — noisy and useless here,
+    // so it is dropped from the UI. Just a centered "Connected" status.
+    wifiDropdownMenu.innerHTML = '';
+    const title = document.createElement('div');
+    title.className = 'dropdown-status-title';
+    title.textContent = 'Ethernet';
+    wifiDropdownMenu.appendChild(title);
+    wifiDropdownMenu.appendChild(document.createElement('div')).className = 'dropdown-divider';
+    const row = document.createElement('div');
+    row.className = 'ethernet-status-row';
+    row.innerHTML = `<span class="status-dot connected"></span><span class="ethernet-status-text">Connected</span>`;
+    wifiDropdownMenu.appendChild(row);
+  }
+
+  function showWifiMode() {
+    // Restore the Wi-Fi glyph; the dropdown is repopulated by refreshWifiWifi().
+    const wifiGlyph = wifiIcon.querySelector('.wifi-glyph');
+    const ethGlyph = wifiIcon.querySelector('.ethernet-glyph');
+    if (wifiGlyph) wifiGlyph.style.display = '';
+    if (ethGlyph) ethGlyph.style.display = 'none';
+    // Reset to the base markup the Wi-Fi logic expects.
+    wifiDropdownMenu.innerHTML =
+      '<div class="dropdown-status-title">Wi-Fi Network</div>' +
+      '<div class="dropdown-divider"></div>' +
+      '<button class="dropdown-item wifi-toggle-row">' +
+      '<span class="status-dot"></span>' +
+      '<span class="toggle-text">Turn Wi-Fi On</span>' +
+      '</button>';
+  }
+
+  function refreshWifiWifi() {
     // Current connection.
     invoke('wifi_get_current')
       .then((s) => {
         const dot = wifiDropdownMenu.querySelector('.wifi-toggle-row .status-dot');
-        const toggleText = wifiToggle.querySelector('.toggle-text');
+        const toggleText = wifiDropdownMenu.querySelector('.wifi-toggle-row .toggle-text');
         if (s && s.connected) {
           dot?.classList.add('connected');
           wifiIcon.classList.remove('disabled');
-          toggleText.textContent = `Connected: ${s.ssid || '(unnamed)'}`;
+          if (toggleText) toggleText.textContent = `Connected: ${s.ssid || '(unnamed)'}`;
         } else {
           dot?.classList.remove('connected');
-          toggleText.textContent = 'Turn Wi-Fi On';
+          if (toggleText) toggleText.textContent = 'Turn Wi-Fi On';
         }
       })
       .catch((e) => console.warn('[Wupi] wifi_get_current failed', e));
@@ -1892,12 +2233,40 @@ const dropdownMenu = document.getElementById('dropdownMenu');
       .catch((e) => console.warn('[Wupi] wifi_scan failed', e));
   }
 
+  function refreshWifi() {
+    // Ethernet takes precedence: when a cabled NIC is up, show the wired
+    // panel and skip the Wi-Fi logic entirely. Otherwise fall through to the
+    // normal Wi-Fi indicator + scan list.
+    invoke('ethernet_get_state')
+      .then((eth) => {
+        if (eth && eth.connected) {
+          showEthernetMode(eth.name);
+        } else {
+          showWifiMode();
+          refreshWifiWifi();
+        }
+      })
+      .catch((e) => {
+        // Backend unavailable (e.g. non-Windows) — fall back to Wi-Fi.
+        console.warn('[Wupi] ethernet_get_state failed', e);
+        showWifiMode();
+        refreshWifiWifi();
+      });
+  }
+
+  // Refresh the active-link indicator once on load so the status icon reflects
+  // Ethernet immediately, before the dropdown is ever opened.
+  refreshWifi();
+
   // The Wi-Fi toggle row: disconnects when connected, connects (toggles radio)
   // when off. Windows exposes Wi-Fi radio via the WinRT Radio API (same as
-  // Bluetooth), so we route through wifi_toggle_radio.
-  wifiToggle.addEventListener('click', (e) => {
+  // Bluetooth), so we route through wifi_toggle_radio. Delegated on the menu
+  // (not a captured element ref) because the row is rebuilt each refresh.
+  wifiDropdownMenu.addEventListener('click', (e) => {
+    const row = e.target.closest('.wifi-toggle-row');
+    if (!row) return;
     e.stopPropagation();
-    const dot = wifiToggle.querySelector('.status-dot');
+    const dot = row.querySelector('.status-dot');
     const isOn = dot?.classList.contains('connected');
     invoke('wifi_toggle_radio', { on: !isOn })
       .then(() => refreshWifi())
@@ -3026,12 +3395,15 @@ const dropdownMenu = document.getElementById('dropdownMenu');
               : `✗ ${e.name || 'tool'}: ${e.output || 'failed'}`;
             scrollBottom();
           }
-        } else if (e.type === 'error') {
-          setGenerating(false);
-          // Replace the partial bubble with an error notice.
-          bubble.remove();
-          addErrorBubble(e.message || 'Generation failed.');
+        } else if (e.type === 'api_timeout') {
+          // API TTFT deadline elapsed (no first token in 10s) — the turn is
+          // being handled by Local fallback. Show the persistent top-center
+          // error bubble; it dismisses on click or on the next successful
+          // turn (see the 'done' branch below).
+          showApiTimeout();
         } else if (e.type === 'done') {
+          // Successful turn — clear any lingering timeout bubble.
+          dismissApiTimeout();
           setGenerating(false);
           const finalText = e.final_text != null ? e.final_text : streamed;
           finalizeWupiBubble(bubble, finalText, e.reasoning || '');
@@ -3116,6 +3488,19 @@ initFable({
   closeHooks: windowCloseHooks,
   closeWindow,
 });
+
+// DEV SHORTCUT (?dev=fable): now that Fable is registered + its openHook is
+// wired, launch it immediately. openFable() (fired by launchFable →
+// AppLifecycle.launchApp) shows #fable, activates chrome, and would normally
+// play the fog gate + boot transition — but its DEV shortcut branch (see
+// openFable in fable.js) skips those cinematics too, so the title screen
+// lands in well under a second. Production builds never hit this (the param
+// is absent under Tauri's custom protocol).
+if (DEV_FABLE_SHORTCUT) {
+  try { launchFable(); } catch (e) {
+    console.error('[Wupi] dev-fable auto-launch failed', e);
+  }
+}
 
 // === PRISM APP WIRING (2026-07-31) =====================================
 // initPrism builds the #prism app window, registers it with AppLifecycle
