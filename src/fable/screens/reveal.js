@@ -19,9 +19,10 @@ import THEME_MUSIC_SRC from '../assets/fable_theme.mp3';
 const MUSIC_ID = 'fable-theme-music';      // the <audio> element id
 
 // ── Theme music ──────────────────────────────────────────────
-// fable_theme.mp3 — bundled asset (Issue 1). 30% volume (lowered
-// substantially per Chloe 2026-07-23 — 0.8 → 0.6 → 0.3; it was far too
-// loud), looped. The <audio> element is created fresh per Fable session
+// fable_theme.mp3 — bundled asset (Issue 1). 40% volume (history: 0.8 → 0.6
+// → 0.3 per Chloe 2026-07-23, far too loud at the top of that range; raised
+// 0.3 → 0.4 per Chloe 2026-08-03, "make the main menu music a bit louder"),
+// looped. The <audio> element is created fresh per Fable session
 // and removed on teardown — never a module-level singleton, so it can't
 // leak or double-up across exit/relaunch cycles. Audio playback is
 // subject to the autoplay gesture policy; if blocked, startThemeMusic
@@ -33,7 +34,7 @@ const MUSIC_ID = 'fable-theme-music';      // the <audio> element id
 // (8 steps × ~190ms) on the plain <audio>.volume — avoids a Web Audio
 // graph for what's a one-time ramp, matching the plain-<audio> pattern
 // this module already uses everywhere else.
-const MUSIC_VOLUME = 0.3;
+const MUSIC_VOLUME = 0.4;
 const MUSIC_FADE_MS = 1500;
 export function startThemeMusic(host, opts = {}) {
   if (!host) return;

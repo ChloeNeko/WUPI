@@ -1163,14 +1163,14 @@ mod tests {
     #[test]
     fn derive_condition_medium_wound_is_wounded() {
         let mut wounds = HashMap::new();
-        wounds.insert(BodyPart::LeftBicep, BodyPartState::Orange);
+        wounds.insert(BodyPart::LeftUpperArm, BodyPartState::Orange);
         assert_eq!(derive_condition(&wounds, 0, 0), Condition::Wounded);
     }
 
     #[test]
     fn derive_condition_heavy_wound_is_battered() {
         let mut wounds = HashMap::new();
-        wounds.insert(BodyPart::Torso, BodyPartState::Red);
+        wounds.insert(BodyPart::UpperTorso, BodyPartState::Red);
         assert_eq!(derive_condition(&wounds, 0, 0), Condition::Battered);
     }
 
@@ -1195,7 +1195,7 @@ mod tests {
         // An amputation + a Heavy wound → Downed (the body can't sustain it).
         let mut wounds = HashMap::new();
         wounds.insert(BodyPart::LeftHand, BodyPartState::Black);
-        wounds.insert(BodyPart::Torso, BodyPartState::Red);
+        wounds.insert(BodyPart::UpperTorso, BodyPartState::Red);
         assert_eq!(derive_condition(&wounds, 0, 0), Condition::Downed);
     }
 
@@ -1204,8 +1204,8 @@ mod tests {
         // System shock: three Red-or-worse wounds = Downed regardless of amputation.
         let mut wounds = HashMap::new();
         wounds.insert(BodyPart::Head, BodyPartState::Red);
-        wounds.insert(BodyPart::Torso, BodyPartState::Red);
-        wounds.insert(BodyPart::LeftThigh, BodyPartState::Red);
+        wounds.insert(BodyPart::UpperTorso, BodyPartState::Red);
+        wounds.insert(BodyPart::LeftUpperLeg, BodyPartState::Red);
         assert_eq!(derive_condition(&wounds, 0, 0), Condition::Downed);
     }
 

@@ -1,6 +1,6 @@
 [package]
 name = "wupi"
-version = "0.14.0"
+version = "0.15.0"
 edition = "2021"
 
 [lib]
@@ -38,6 +38,15 @@ tauri = { version = "2", features = ["tray-icon", "protocol-asset"] }
 # primary; this is the guaranteed-working fallback for users who prefer a
 # picker. Read-only usage (the import IPC reads the picked path server-side).
 tauri-plugin-dialog = "2"
+# Single-instance lock: launching wupi.exe a second time focuses the existing
+# window (show + set_focus via system_menu::power_wake) instead of booting a
+# duplicate (which would re-run all of setup(), re-load the 9.8 GB model, and
+# create a second tray paw). Uses a per-app named mutex on Windows. The
+# restart path opts out via the WUPI_RESTART_SPAWN env sentinel (see
+# system_menu::power_restart + the gate in lib.rs run()) so the freshly-spawned
+# child isn't seen as a "second instance" while the parent is still shutting
+# down.
+tauri-plugin-single-instance = "2"
 # NOTE: tauri-plugin-updater + tauri-plugin-process were removed when WUPI
 # switched to portable distribution. Tauri's updater is installer-only and
 # can't update a portable exe; a custom file-level updater (src/updater.rs)

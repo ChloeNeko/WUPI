@@ -151,7 +151,11 @@ impl StreamFilter {
         //   [PRESENCE npc_id stance]       (Phase 5A, 2026-07-29)
         //   [DISCOVER node_id ...]         (dynamic world-seeding)
         //   [NPC_REGISTER npc_id ...]      (dynamic world-seeding)
-        let pattern = r"\[(?:CHARACTER_TURN:(?:end|[A-Za-z0-9_-]+)|OBJECT\s+[^\]]+|FX\s+[^\]]+|TIME\s+[^\]]+|WEATHER\s+[^\]]+|TRAVEL\s+[^\]]+|EFFECT\s+[^\]]+|MILESTONE\s+[^\]]+|TASK\s+[^\]]+|RUMOR\s+[^\]]+|PRESENCE\s+[^\]]+|DISCOVER\s+[^\]]+|NPC_REGISTER\s+[^\]]+)\]";
+        //   [APPEARANCE key=value]         (Phase 4 Component 5, 2026-08-04)
+        //   [EQUIP slot=... name=...]      (inventory, 2026-08-07)
+        //   [BELT name=...]                (inventory, 2026-08-07)
+        //   [PACK name=...]                (inventory, 2026-08-07)
+        let pattern = r"\[(?:CHARACTER_TURN:(?:end|[A-Za-z0-9_-]+)|OBJECT\s+[^\]]+|FX\s+[^\]]+|TIME\s+[^\]]+|WEATHER\s+[^\]]+|TRAVEL\s+[^\]]+|EFFECT\s+[^\]]+|MILESTONE\s+[^\]]+|TASK\s+[^\]]+|RUMOR\s+[^\]]+|PRESENCE\s+[^\]]+|DISCOVER\s+[^\]]+|NPC_REGISTER\s+[^\]]+|APPEARANCE\s+[^\]]+|EQUIP\s+[^\]]+|BELT\s+[^\]]+|PACK\s+[^\]]+)\]";
         self.bracket_re = Some(Regex::new(pattern).expect("bracket regex always compiles"));
         // Longest realistic bracket: `[TASK npc.marcus scout the bandit camp |
         // challenging adequate 1440]` ≈ 70 chars; an EFFECT with a long label

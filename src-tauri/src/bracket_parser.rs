@@ -16,6 +16,12 @@
 //!   Parsed to minutes-since-epoch via [`parse_in_world_time`] below; the
 //!   resulting `i64` is the authoritative clock value (Rust owns it, never
 //!   the LLM). Drives the World Progression tick gate in `fable_send`.
+//! - `[APPEARANCE key=value]`: a dynamic change to the player's appearance
+//!   mid-session (Phase 4 Component 5, 2026-08-04). `key` ∈ a small
+//!   allowlist (hair_color / outfit / eye_color / scars / disguise / ...);
+//!   empty value clears. Rust writes ONLY into
+//!   `PlayerState::current_appearance_deltas` — the SavedPlayer identity
+//!   baseline is never touched.
 //!
 //! # Design
 //!
@@ -29,6 +35,7 @@
 //! narrator is a 12B model; we tolerate noisy output.
 
 use crate::consequence::Polarity;
+use crate::equipment;
 use serde::Serialize;
 
 /// One bracket command extracted from narrator output.
@@ -188,6 +195,56 @@ pub enum BracketCommand {
         difficulty: String,
         suitability: String,
         eta_minutes: i64,
+    },
+    /// A dynamic change to the player's appearance mid-session (Phase 4
+    /// Component 5, 2026-08-04). `key` is a stable trait id
+    /// ("hair_color", "outfit", "eye_color", "scars", "wounds", "tattoos",
+    /// "disguise", "breast_size", "ears", "tail", ...) and `value` is the
+    /// diegetic new state the narrator just established in prose. Empty
+    /// `value` is the clear sentinel for that key.
+    ///
+    /// Single-region like WEATHER/TRAVEL. Named `value` (not `kind`) to
+    /// avoid colliding with this enum's `#[serde(tag = "kind")]` external
+    /// discriminator (same reason `Weather.condition` / `Effect.tag_kind`
+    /// aren't named `kind`). Rust is the SOLE authority: the applier writes
+    /// ONLY into `PlayerState::current_appearance_deltas` — the SavedPlayer
+    /// identity baseline is never touched (it's the reusable cross-card
+    /// layer; deltas are the per-run live layer).
+    Appearance { key: String, value: String },
+
+    /// Equip (or unequip) a worn item into one of six body-anchored slots.
+    /// `slot` is a canonical `EquipSlot` id (`"main_hand"`); `layer` defaults
+    /// to Outer (narrator-visible). A bare `[EQUIP slot]` (no `name=`) is the
+    /// unequip form — `item_name` is `None` then. Named `slot`/`layer`/
+    /// `item_name`/`item_stats` to avoid the `kind` discriminator (see the
+    /// enum-level note). See `equipment.rs` for the layering model.
+    Equip {
+        slot: equipment::EquipSlot,
+        layer: equipment::ItemLayer,
+        item_name: Option<String>,
+        item_stats: Option<String>,
+    },
+
+    /// Add to (or remove from) the quick-access belt — a fixed 4-slot rack
+    /// (FIFO eviction at the applier). `qty` defaults to 1. The remove form is
+    /// `[BELT -name]` → `remove: true`, `qty: 0` (drop the whole stack). Named
+    /// `item_name`/`item_stats`/`qty`/`remove` to avoid `kind`.
+    Belt {
+        item_name: String,
+        qty: u32,
+        item_stats: Option<String>,
+        remove: bool,
+    },
+
+    /// Add to (or remove from) the deep-storage pack (weight-bounded for
+    /// encumbrance). `qty` defaults to 1, `weight` to 1.0 lbs. The remove form
+    /// is `[PACK -name]`. Same field-naming discipline as `Belt`.
+    Pack {
+        item_name: String,
+        qty: u32,
+        weight: f32,
+        item_stats: Option<String>,
+        remove: bool,
     },
 }
 
@@ -509,18 +566,307 @@ fn parse_npc_register_kv(tail: &str) -> (String, String, Option<String>) {
     (name, role, tier)
 }
 
+/// The allowlist of stable trait keys the `[APPEARANCE key=value]` command
+/// may target. Sourced from the Player Creator's structured slide fields
+/// PLUS a few tracker-only keys that emerge mid-session (scars, wounds,
+/// tattoos, disguise — there's no Creator slide for these; the narrator
+/// invents them in play). Keep sorted for the test pin. A small fixed list
+/// is the rejection authority: it stops the narrator from injecting
+/// arbitrary keys (e.g. "name", "wealth") that would collide with other
+/// state. The Player Creator's slide ids mirror these exactly.
+const APPEARANCE_KEYS: &[&str] = &[
+    "body_type",
+    "breast_size",
+    "disguise",
+    "ears",
+    "eye_color",
+    "hair_color",
+    "hair_length",
+    "hair_style",
+    "outfit",
+    "scars",
+    "skin_complexion",
+    "tail",
+    "tattoos",
+    "wounds",
+];
+
+/// Per-value cap for `[APPEARANCE key=value]`. Tighter than the schema
+/// prose cap — these are trait labels, not paragraphs. Generous enough for
+/// a multi-garment outfit line ("bloodstained leather, travel cloak,
+/// muddy boots").
+const APPEARANCE_VALUE_MAX: usize = 200;
+
+/// Parse the `key=value` (or bare `key`) tail of an `[APPEARANCE ...]`
+/// bracket. Returns `None` for unknown keys, empty keys, or contaminated /
+/// oversize values (dropped silently — same leniency as every other parser).
+/// Key matching is case-insensitive + normalized to canonical lowercase.
+/// Bare form (`[APPEARANCE key]` with no `=`) → empty value → clear that key.
+fn parse_appearance_kv(rest: &str) -> Option<BracketCommand> {
+    let rest = rest.trim();
+    if rest.is_empty() {
+        return None;
+    }
+    // Split on the FIRST `=` so values may themselves contain `=` (rare but
+    // cheap to handle correctly). No-`=` → bare clear form.
+    let (key_raw, value) = match rest.split_once('=') {
+        Some((k, v)) => (k.trim(), v.trim().to_string()),
+        None => (rest.trim(), String::new()),
+    };
+    if key_raw.is_empty() {
+        return None;
+    }
+    // Normalize + allowlist the key (case-insensitive).
+    let key_norm = key_raw.to_lowercase();
+    let key = APPEARANCE_KEYS.iter().find(|k| **k == key_norm)?;
+    // Reject control chars + oversize values. Empty value is the clear
+    // sentinel — explicitly allowed through.
+    if !value.is_empty() {
+        if value.len() > APPEARANCE_VALUE_MAX {
+            return None;
+        }
+        if value.chars().any(|c| {
+            let code = c as u32;
+            (code <= 0x08) || code == 0x0B || code == 0x0C || (0x0E..=0x1F).contains(&code)
+        }) {
+            return None;
+        }
+    }
+    Some(BracketCommand::Appearance {
+        key: (*key).to_string(),
+        value,
+    })
+}
+
 // ============================================================================
-// Fenced-JSON dual parser (Bug A fix, 2026-07-28).
+// [EQUIP] / [BELT] / [PACK] parsers (Fable inventory, 2026-08-07).
 //
-// Modern instruct-tuned models (Gemma 12B in particular) reach for JSON when
-// they see structured schema-ish fields in the system prompt, ignoring the
-// bracket protocol and emitting `{"effect_name": "..."}` blocks instead.
-// Rather than fight the training (the rejected "Iron Fist" logit-bias plan),
-// we accept BOTH shapes: brackets remain the legacy path, fenced JSON is the
-// new canonical path. Both map to the same `BracketCommand` enum, so every
-// downstream consumer (apply_phase3_bracket_commands, scene_event emission,
-// the World Progression tick) is unchanged.
+// Three single-region brackets, each with a `key=value` tail parsed via the
+// shared quote-aware `tokenize_kv` helper (the same one DISCOVER/NPC_REGISTER
+// use). Grammar mirrors the established bracket discipline: an allowlist
+// rejects unknown slot ids silently (dropped, same leniency as every parser);
+// value caps reuse the appearance prose discipline.
 //
+//   [EQUIP slot=<slot> name=<item> (layer=inner) (stats=<...>)]   equip
+//   [EQUIP slot=<slot>]                                           unequip
+//   [BELT name=<item> (qty=N) (stats=<...>)]                      add
+//   [BELT -name]                                                  remove
+//   [PACK name=<item> (qty=N) (weight=W) (stats=<...>)]           add
+//   [PACK -name]                                                  remove
+//
+// Slots: head, chest, main_hand, off_hand, legs, feet (case-insensitive).
+// ============================================================================
+
+/// Per-field value caps for the inventory brackets. Names cap at the trait cap
+/// (a weapon name is a short label); stats cap at the appearance-value cap (a
+/// flavor line, not a paragraph).
+const INV_NAME_MAX: usize = 80;
+const INV_STATS_MAX: usize = APPEARANCE_VALUE_MAX; // 200
+
+/// Reject control chars (defense shared by every value-bearing parser here).
+/// Matches the `parse_appearance_kv` contamination check.
+fn has_control_chars(s: &str) -> bool {
+    s.chars().any(|c| {
+        let code = c as u32;
+        (code <= 0x08) || code == 0x0B || code == 0x0C || (0x0E..=0x1F).contains(&code)
+    })
+}
+
+/// `[EQUIP slot=<slot> name=<item> (layer=inner) (stats=<...>)]` (equip) or
+/// `[EQUIP slot=<slot>]` (unequip — no `name=`). Returns `None` for unknown
+/// slots, oversize/contaminated values, or a missing slot. Default layer is
+/// Outer. The applier owns the equip-vs-unequip branch via `item_name.is_none()`.
+fn parse_equip(rest: &str) -> Option<BracketCommand> {
+    let kvs = tokenize_kv(rest);
+    let mut slot_id = String::new();
+    let mut name = String::new();
+    let mut layer_str = String::new();
+    let mut stats = String::new();
+    for (k, v) in kvs {
+        match k.as_str() {
+            "slot" | "where" => slot_id = v,
+            "name" | "item" => name = v,
+            "layer" => layer_str = v.to_lowercase(),
+            "stats" | "stat" => stats = v,
+            _ => {}
+        }
+    }
+    let slot = equipment::EquipSlot::from_id(&slot_id)?;
+    // No `name=` → unequip form.
+    let layer = if layer_str == "inner" || layer_str == "under" {
+        equipment::ItemLayer::Inner
+    } else {
+        equipment::ItemLayer::Outer
+    };
+    let item_name = if name.trim().is_empty() {
+        None
+    } else {
+        // Name caps + control-char reject (equip is the one inventory bracket
+        // that writes a name into the worn-item model, so validate it).
+        let n = name.trim();
+        if n.len() > INV_NAME_MAX || has_control_chars(n) {
+            return None;
+        }
+        Some(n.to_string())
+    };
+    let item_stats = if stats.trim().is_empty() {
+        None
+    } else {
+        let s = stats.trim();
+        if s.len() > INV_STATS_MAX || has_control_chars(s) {
+            return None;
+        }
+        Some(s.to_string())
+    };
+    Some(BracketCommand::Equip {
+        slot,
+        layer,
+        item_name,
+        item_stats,
+    })
+}
+
+/// `[BELT name=<item> (qty=N) (stats=<...>)]` (add) or `[BELT -name]` (remove).
+/// The remove form is a leading `-` on the name token. qty defaults to 1; an
+/// explicit 0 is treated as remove (the applier routes it through the remove
+/// path). Returns `None` for an empty name or oversize/contaminated values.
+fn parse_belt(rest: &str) -> Option<BracketCommand> {
+    let rest = rest.trim();
+    if rest.is_empty() {
+        return None;
+    }
+    // Remove form: a leading `-` then the name.
+    let (remove, body) = if let Some(stripped) = rest.strip_prefix('-') {
+        (true, stripped.trim())
+    } else {
+        (false, rest)
+    };
+    // For the remove form there's no kv tail — the body is the bare name.
+    if remove {
+        let name = body.trim();
+        if name.is_empty() || name.len() > INV_NAME_MAX || has_control_chars(name) {
+            return None;
+        }
+        return Some(BracketCommand::Belt {
+            item_name: name.to_string(),
+            qty: 0,
+            item_stats: None,
+            remove: true,
+        });
+    }
+    // Add form: kv tail. `name=` is required; tolerate a bare leading name
+    // token for ergonomics (`[BELT lockpick]` == `[BELT name=lockpick]`).
+    let kvs = tokenize_kv(body);
+    let mut name = String::new();
+    let mut qty: u32 = 1;
+    let mut stats = String::new();
+    for (k, v) in kvs {
+        match k.as_str() {
+            "name" | "item" => name = v,
+            "qty" | "count" | "n" => qty = v.parse::<u32>().unwrap_or(1).max(1),
+            "stats" | "stat" => stats = v,
+            _ => {}
+        }
+    }
+    // Bare-name fallback: if no `name=` key but the body has a leading bare
+    // token, treat it as the name (`[BELT health_potion qty=2]`).
+    if name.is_empty() {
+        let first_token = body.split_whitespace().next().unwrap_or("");
+        // Only adopt if it doesn't look like a kv key (no `=`).
+        if !first_token.is_empty() && !first_token.contains('=') {
+            name = first_token.to_string();
+        }
+    }
+    let n = name.trim();
+    if n.is_empty() || n.len() > INV_NAME_MAX || has_control_chars(n) {
+        return None;
+    }
+    let item_stats = if stats.trim().is_empty() {
+        None
+    } else {
+        let s = stats.trim();
+        if s.len() > INV_STATS_MAX || has_control_chars(s) {
+            return None;
+        }
+        Some(s.to_string())
+    };
+    Some(BracketCommand::Belt {
+        item_name: n.to_string(),
+        qty,
+        item_stats,
+        remove: false,
+    })
+}
+
+/// `[PACK name=<item> (qty=N) (weight=W) (stats=<...>)]` (add) or
+/// `[PACK -name]` (remove). Same shape as `parse_belt` plus a `weight` field
+/// (lbs, default 1.0). Returns `None` for an empty name or bad values.
+fn parse_pack(rest: &str) -> Option<BracketCommand> {
+    let rest = rest.trim();
+    if rest.is_empty() {
+        return None;
+    }
+    let (remove, body) = if let Some(stripped) = rest.strip_prefix('-') {
+        (true, stripped.trim())
+    } else {
+        (false, rest)
+    };
+    if remove {
+        let name = body.trim();
+        if name.is_empty() || name.len() > INV_NAME_MAX || has_control_chars(name) {
+            return None;
+        }
+        return Some(BracketCommand::Pack {
+            item_name: name.to_string(),
+            qty: 0,
+            weight: 0.0,
+            item_stats: None,
+            remove: true,
+        });
+    }
+    let kvs = tokenize_kv(body);
+    let mut name = String::new();
+    let mut qty: u32 = 1;
+    let mut weight: f32 = 1.0;
+    let mut stats = String::new();
+    for (k, v) in kvs {
+        match k.as_str() {
+            "name" | "item" => name = v,
+            "qty" | "count" | "n" => qty = v.parse::<u32>().unwrap_or(1).max(1),
+            "weight" | "lbs" | "w" => weight = v.parse::<f32>().unwrap_or(1.0).max(0.0),
+            "stats" | "stat" => stats = v,
+            _ => {}
+        }
+    }
+    if name.is_empty() {
+        let first_token = body.split_whitespace().next().unwrap_or("");
+        if !first_token.is_empty() && !first_token.contains('=') {
+            name = first_token.to_string();
+        }
+    }
+    let n = name.trim();
+    if n.is_empty() || n.len() > INV_NAME_MAX || has_control_chars(n) {
+        return None;
+    }
+    let item_stats = if stats.trim().is_empty() {
+        None
+    } else {
+        let s = stats.trim();
+        if s.len() > INV_STATS_MAX || has_control_chars(s) {
+            return None;
+        }
+        Some(s.to_string())
+    };
+    Some(BracketCommand::Pack {
+        item_name: n.to_string(),
+        qty,
+        weight,
+        item_stats,
+        remove: false,
+    })
+}
+
+
 // The two-path-sync contract (stream_filter::with_brackets regex MUST mirror
 // parse_one's recognized prefixes — the documented 2026-07-28 drift-leak
 // lesson) extends to JSON too: a `fence_re` was added alongside the bracket
@@ -684,6 +1030,10 @@ fn json_value_to_command(obj: &serde_json::Map<String, serde_json::Value>) -> Op
         "presence" | "onscreen" | "onstage" | "present" => json_to_presence(obj),
         "discover" | "discover_location" | "new_location" | "establish" => json_to_discover(obj),
         "npc_register" | "register_npc" | "register" | "introduce_npc" => json_to_npc_register(obj),
+        "appearance" | "look" | "outfit_change" => json_to_appearance(obj),
+        "equip" | "equipment" | "wear" => json_to_equip(obj),
+        "belt" | "quick" | "quick_slot" => json_to_belt(obj),
+        "pack" | "backpack" | "inventory" => json_to_pack(obj),
         _ => None,
     }
 }
@@ -715,11 +1065,31 @@ fn infer_kind_from_fields(obj: &serde_json::Map<String, serde_json::Value>) -> O
     if keys.iter().any(|k| *k == "state") {
         return Some("object".to_string());
     }
+    // Appearance (Phase 4 Component 5, 2026-08-04): `appearance_key`/`trait`
+    // is the unambiguous key + `new_look` is the unambiguous value alias.
+    // MUST run BEFORE the Travel inference below: the appearance-value alias
+    // `to` / `now` collides with travel's `to` / `node` aliases (see
+    // json_to_appearance + json_to_travel — both read `to` as a value). A body
+    // like `{"appearance_key":"disguise","to":"guard captain"}` would otherwise
+    // mis-route to travel. The appearance-key discriminators
+    // (`appearance_key`/`trait`/`new_look`) appear in NO other variant's
+    // grammar, so checking them first is unambiguous + lets `to` keep meaning
+    // "appearance value" when an appearance key is present. The fix for the
+    // appearance_json_aliases_resolved regression.
+    if keys
+        .iter()
+        .any(|k| matches!(*k, "appearance_key" | "trait" | "new_look"))
+    {
+        return Some("appearance".to_string());
+    }
     // Travel: destination / to / node (Component 3, 2026-07-28). Placed before
     // the weather single-field rule so a `{"destination": ...}` body doesn't
     // fall through to `condition`-based weather inference. None of these keys
     // collide with the richer discriminators above (effect_*/event_id/eta/
-    // clock/npc+line/state), so order relative to those is safe.
+    // clock/npc+line/state), so order relative to those is safe. NOTE: `to` is
+    // ALSO an appearance-value alias — the Appearance inference above runs
+    // first to resolve that ambiguity (an appearance body always carries one
+    // of appearance_key/trait/new_look; a pure travel body never does).
     if keys
         .iter()
         .any(|k| matches!(*k, "destination" | "to" | "node"))
@@ -985,6 +1355,214 @@ fn json_to_weather(obj: &serde_json::Map<String, serde_json::Value>) -> Option<B
     Some(BracketCommand::Weather { condition })
 }
 
+/// Parse a `{"kind": "appearance", ...}` JSON body into
+/// `BracketCommand::Appearance` (Phase 4 Component 5, 2026-08-04). `key`
+/// read from `key` / `appearance_key` / `trait` / `field`; `value` from
+/// `value` / `new_look` / `to` / `now`. Same allowlist + caps as the text
+/// form (`parse_appearance_kv`). Missing key / unknown key / oversize → None.
+fn json_to_appearance(obj: &serde_json::Map<String, serde_json::Value>) -> Option<BracketCommand> {
+    let key_raw = obj
+        .get("key")
+        .or_else(|| obj.get("appearance_key"))
+        .or_else(|| obj.get("trait"))
+        .or_else(|| obj.get("field"))
+        .and_then(|v| v.as_str())?
+        .trim()
+        .to_lowercase();
+    if key_raw.is_empty() {
+        return None;
+    }
+    let key = APPEARANCE_KEYS.iter().find(|k| **k == key_raw)?;
+    let value = obj
+        .get("value")
+        .or_else(|| obj.get("new_look"))
+        .or_else(|| obj.get("to"))
+        .or_else(|| obj.get("now"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    if !value.is_empty() {
+        if value.len() > APPEARANCE_VALUE_MAX {
+            return None;
+        }
+        if value.chars().any(|c| {
+            let code = c as u32;
+            (code <= 0x08) || code == 0x0B || code == 0x0C || (0x0E..=0x1F).contains(&code)
+        }) {
+            return None;
+        }
+    }
+    Some(BracketCommand::Appearance {
+        key: (*key).to_string(),
+        value,
+    })
+}
+
+/// Parse a `{"kind": "equip", ...}` JSON body (2026-08-07). Mirrors the text
+/// form (`parse_equip`): `slot` read from `slot`/`where`; `name` from
+/// `name`/`item` (absent → unequip); `layer` from `layer` (inner/under →
+/// Inner, else Outer); `stats` from `stats`/`stat`. Same caps + control-char
+/// reject. Unknown slot / bad values → None.
+fn json_to_equip(obj: &serde_json::Map<String, serde_json::Value>) -> Option<BracketCommand> {
+    let slot_id = obj
+        .get("slot")
+        .or_else(|| obj.get("where"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_lowercase();
+    let slot = equipment::EquipSlot::from_id(&slot_id)?;
+    let layer_str = obj
+        .get("layer")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_lowercase();
+    let layer = if layer_str == "inner" || layer_str == "under" {
+        equipment::ItemLayer::Inner
+    } else {
+        equipment::ItemLayer::Outer
+    };
+    let name_raw = obj
+        .get("name")
+        .or_else(|| obj.get("item"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    let item_name = if name_raw.is_empty() {
+        None
+    } else {
+        if name_raw.len() > INV_NAME_MAX || has_control_chars(&name_raw) {
+            return None;
+        }
+        Some(name_raw)
+    };
+    let stats_raw = obj
+        .get("stats")
+        .or_else(|| obj.get("stat"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    let item_stats = if stats_raw.is_empty() {
+        None
+    } else {
+        if stats_raw.len() > INV_STATS_MAX || has_control_chars(&stats_raw) {
+            return None;
+        }
+        Some(stats_raw)
+    };
+    Some(BracketCommand::Equip {
+        slot,
+        layer,
+        item_name,
+        item_stats,
+    })
+}
+
+/// Parse a `{"kind": "belt", ...}` JSON body. `name`/`item` (required);
+/// `qty`/`count` (default 1); `stats`/`stat`; `remove` (bool) or a leading `-`
+/// on the name. Same caps + reject as the text form.
+fn json_to_belt(obj: &serde_json::Map<String, serde_json::Value>) -> Option<BracketCommand> {
+    let remove = obj
+        .get("remove")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let mut name = obj
+        .get("name")
+        .or_else(|| obj.get("item"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    // Leading `-` on the name also signals remove (parity with the text form).
+    if name.starts_with('-') {
+        name = name[1..].trim().to_string();
+    }
+    if name.is_empty() || name.len() > INV_NAME_MAX || has_control_chars(&name) {
+        return None;
+    }
+    let qty = obj
+        .get("qty")
+        .or_else(|| obj.get("count"))
+        .and_then(|v| v.as_u64())
+        .map(|n| (n as u32).max(1))
+        .unwrap_or(1);
+    let stats_raw = obj
+        .get("stats")
+        .or_else(|| obj.get("stat"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    let item_stats = if stats_raw.is_empty() || stats_raw.len() > INV_STATS_MAX || has_control_chars(&stats_raw) {
+        None
+    } else {
+        Some(stats_raw)
+    };
+    Some(BracketCommand::Belt {
+        item_name: name,
+        qty,
+        item_stats,
+        remove,
+    })
+}
+
+/// Parse a `{"kind": "pack", ...}` JSON body. Same shape as `json_to_belt`
+/// plus a `weight`/`lbs` field (default 1.0, clamped ≥0).
+fn json_to_pack(obj: &serde_json::Map<String, serde_json::Value>) -> Option<BracketCommand> {
+    let remove = obj
+        .get("remove")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let mut name = obj
+        .get("name")
+        .or_else(|| obj.get("item"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    if name.starts_with('-') {
+        name = name[1..].trim().to_string();
+    }
+    if name.is_empty() || name.len() > INV_NAME_MAX || has_control_chars(&name) {
+        return None;
+    }
+    let qty = obj
+        .get("qty")
+        .or_else(|| obj.get("count"))
+        .and_then(|v| v.as_u64())
+        .map(|n| (n as u32).max(1))
+        .unwrap_or(1);
+    let weight = obj
+        .get("weight")
+        .or_else(|| obj.get("lbs"))
+        .and_then(|v| v.as_f64())
+        .map(|f| (f as f32).max(0.0))
+        .unwrap_or(1.0);
+    let stats_raw = obj
+        .get("stats")
+        .or_else(|| obj.get("stat"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    let item_stats = if stats_raw.is_empty() || stats_raw.len() > INV_STATS_MAX || has_control_chars(&stats_raw) {
+        None
+    } else {
+        Some(stats_raw)
+    };
+    Some(BracketCommand::Pack {
+        item_name: name,
+        qty,
+        weight,
+        item_stats,
+        remove,
+    })
+}
+
 /// Parse a `{"kind": "travel", ...}` JSON body (Component 3, 2026-07-28).
 /// Destination is read from `destination` / `to` / `node` (model flexibility —
 /// the field name is unstable across models). An optional `node.` prefix the
@@ -1247,6 +1825,58 @@ fn parse_one(bracket: &str, text_after: &str) -> Option<(BracketCommand, usize)>
         let effect = rest.trim().to_string();
         if !effect.is_empty() {
             return Some((BracketCommand::Fx { effect }, 0));
+        }
+        return None;
+    }
+
+    // [APPEARANCE key=value] / [APPEARANCE key] — Phase 4 Component 5
+    // (2026-08-04). Single-region. `key` is a stable trait id drawn from a
+    // small allowlist (hair_color / hair_length / hair_style / outfit /
+    // eye_color / body_type / skin_complexion / scars / wounds / tattoos /
+    // disguise / breast_size / ears / tail); `value` is the diegetic new
+    // state. The bare form `[APPEARANCE key]` (no `=`) clears that key.
+    // Unknown keys + oversize/contaminated values drop silently (same
+    // leniency as every other parser — the narrator is a 12B model, we
+    // tolerate noise). Case-insensitive verb via `strip_prefix_ci`; the
+    // KEY is matched case-insensitively too + normalized to the canonical
+    // lowercase form (so `Hair_Color` → `hair_color`). The JSON form
+    // `{"kind":"appearance","key":"...","value":"..."}` is handled by the
+    // manual dispatch in `parse_json_command` (`json_to_appearance`).
+    if let Some(rest) = strip_prefix_ci(bracket, "APPEARANCE") {
+        if let Some(cmd) = parse_appearance_kv(rest) {
+            return Some((cmd, 0));
+        }
+        return None;
+    }
+
+    // [EQUIP slot=<slot> name=<item> (layer=inner) (stats=<...>)] — equip a
+    // worn item into a body-anchored slot. Bare `[EQUIP slot=<slot>]` (no
+    // name=) is the unequip form. Slots: head/chest/main_hand/off_hand/legs/
+    // feet (case-insensitive). Unknown slots + bad values drop to None (literal
+    // prose). See `parse_equip` for the full grammar. Case-insensitive via
+    // strip_prefix_ci (ASCII-safe — "EQUIP" is ASCII).
+    if let Some(rest) = strip_prefix_ci(bracket, "EQUIP") {
+        if let Some(cmd) = parse_equip(rest) {
+            return Some((cmd, 0));
+        }
+        return None;
+    }
+
+    // [BELT name=<item> (qty=N) (stats=<...>)] / [BELT -name] — quick-access
+    // belt add/remove. The applier enforces the 4-slot FIFO cap. See
+    // `parse_belt`.
+    if let Some(rest) = strip_prefix_ci(bracket, "BELT") {
+        if let Some(cmd) = parse_belt(rest) {
+            return Some((cmd, 0));
+        }
+        return None;
+    }
+
+    // [PACK name=<item> (qty=N) (weight=W) (stats=<...>)] / [PACK -name] —
+    // deep-storage pack add/remove (weight feeds encumbrance). See `parse_pack`.
+    if let Some(rest) = strip_prefix_ci(bracket, "PACK") {
+        if let Some(cmd) = parse_pack(rest) {
+            return Some((cmd, 0));
         }
         return None;
     }
@@ -3432,5 +4062,297 @@ mod tests {
         assert_eq!(strip_one_quote_pair("\""), "\"", "single quote unchanged (lone)");
         assert_eq!(strip_one_quote_pair("\"unclosed"), "\"unclosed", "unclosed pair unchanged");
         assert_eq!(strip_one_quote_pair("\"a \"b\" c\""), "a \"b\" c", "only outermost pair stripped");
+    }
+
+    // ---- [APPEARANCE] bracket (Phase 4 Component 5, 2026-08-04) --------
+
+    #[test]
+    fn appearance_bracket_text_kv_parses() {
+        let parsed = parse("[APPEARANCE hair_color=raven black]");
+        assert_eq!(parsed.commands.len(), 1);
+        match &parsed.commands[0] {
+            BracketCommand::Appearance { key, value } => {
+                assert_eq!(key, "hair_color");
+                assert_eq!(value, "raven black");
+            }
+            other => panic!("expected Appearance, got {:?}", other),
+        }
+        // Brackets stripped from prose.
+        assert_eq!(parsed.prose.trim(), "");
+    }
+
+    #[test]
+    fn appearance_bracket_case_insensitive_verb_and_key() {
+        let parsed = parse("[appearance Hair_Color=flaxen]");
+        match &parsed.commands[0] {
+            BracketCommand::Appearance { key, value } => {
+                assert_eq!(key, "hair_color", "key normalized to canonical lowercase");
+                assert_eq!(value, "flaxen");
+            }
+            other => panic!("expected Appearance, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn appearance_bracket_bare_form_clears_key() {
+        // [APPEARANCE key] with no `=` → empty value → clear sentinel.
+        let parsed = parse("[APPEARANCE disguise]");
+        match &parsed.commands[0] {
+            BracketCommand::Appearance { key, value } => {
+                assert_eq!(key, "disguise");
+                assert_eq!(value, "");
+            }
+            other => panic!("expected Appearance, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn appearance_bracket_unknown_key_dropped() {
+        // "name" is NOT in the allowlist (would collide with identity).
+        let parsed = parse("[APPEARANCE name=impostor]");
+        assert!(parsed.commands.is_empty(), "unknown key should drop to literal prose");
+    }
+
+    #[test]
+    fn appearance_bracket_empty_key_dropped() {
+        let parsed = parse("[APPEARANCE =something]");
+        assert!(parsed.commands.is_empty());
+    }
+
+    #[test]
+    fn appearance_bracket_oversize_value_dropped() {
+        let huge = "x".repeat(201);
+        let raw = format!("[APPEARANCE outfit={}]", huge);
+        assert!(parse(&raw).commands.is_empty());
+    }
+
+    #[test]
+    fn appearance_bracket_control_char_value_dropped() {
+        let raw = "[APPEARANCE outfit=leather\0cloak]";
+        assert!(parse(raw).commands.is_empty());
+    }
+
+    #[test]
+    fn appearance_bracket_value_may_contain_equals() {
+        // split_once on the FIRST '=' → value keeps the rest.
+        let parsed = parse("[APPEARANCE scars=brand=x on the shoulder]");
+        match &parsed.commands[0] {
+            BracketCommand::Appearance { key, value } => {
+                assert_eq!(key, "scars");
+                assert_eq!(value, "brand=x on the shoulder");
+            }
+            other => panic!("expected Appearance, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn appearance_json_explicit_kind_dispatches() {
+        let body = r#"```json
+{"kind":"appearance","key":"outfit","value":"bloodstained leather, travel cloak"}
+```"#;
+        let parsed = parse(body);
+        assert_eq!(parsed.commands.len(), 1);
+        match &parsed.commands[0] {
+            BracketCommand::Appearance { key, value } => {
+                assert_eq!(key, "outfit");
+                assert_eq!(value, "bloodstained leather, travel cloak");
+            }
+            other => panic!("expected Appearance, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn appearance_json_inferred_from_trait_field() {
+        // No explicit discriminator — inferred from `trait` + `new_look`.
+        let body = r#"```json
+{"trait":"eye_color","new_look":"one gold, one blue"}
+```"#;
+        let parsed = parse(body);
+        assert_eq!(parsed.commands.len(), 1);
+        assert!(matches!(parsed.commands[0], BracketCommand::Appearance { .. }));
+    }
+
+    #[test]
+    fn appearance_json_aliases_resolved() {
+        let body = r#"```json
+{"appearance_key":"disguise","to":"guard captain"}
+```"#;
+        let parsed = parse(body);
+        match &parsed.commands[0] {
+            BracketCommand::Appearance { key, value } => {
+                assert_eq!(key, "disguise");
+                assert_eq!(value, "guard captain");
+            }
+            other => panic!("expected Appearance, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn appearance_json_empty_value_is_clear() {
+        let body = r#"```json
+{"kind":"appearance","key":"disguise"}
+```"#;
+        let parsed = parse(body);
+        match &parsed.commands[0] {
+            BracketCommand::Appearance { key, value } => {
+                assert_eq!(key, "disguise");
+                assert_eq!(value, "");
+            }
+            other => panic!("expected Appearance, got {:?}", other),
+        }
+    }
+
+    // ---- [EQUIP] / [BELT] / [PACK] brackets (inventory, 2026-08-07) ------
+
+    #[test]
+    fn equip_bracket_basic_outer() {
+        // Multi-word values require quotes (the DISCOVER/NPC_REGISTER kv
+        // convention — bare values terminate at whitespace).
+        let parsed = parse("[EQUIP slot=main_hand name=\"Iron Sword\" stats=\"+2 ATK\"]");
+        assert_eq!(parsed.commands.len(), 1);
+        match &parsed.commands[0] {
+            BracketCommand::Equip { slot, layer, item_name, item_stats } => {
+                assert_eq!(*slot, equipment::EquipSlot::MainHand);
+                assert_eq!(*layer, equipment::ItemLayer::Outer, "default layer is Outer");
+                assert_eq!(item_name.as_deref(), Some("Iron Sword"));
+                assert_eq!(item_stats.as_deref(), Some("+2 ATK"));
+            }
+            other => panic!("expected Equip, got {:?}", other),
+        }
+        assert!(parsed.prose.is_empty(), "bracket stripped from prose");
+    }
+
+    #[test]
+    fn equip_bracket_inner_layer() {
+        let parsed = parse("[EQUIP slot=chest name=\"Linen Shirt\" layer=inner]");
+        match &parsed.commands[0] {
+            BracketCommand::Equip { slot, layer, item_name, .. } => {
+                assert_eq!(*slot, equipment::EquipSlot::Chest);
+                assert_eq!(*layer, equipment::ItemLayer::Inner);
+                assert_eq!(item_name.as_deref(), Some("Linen Shirt"));
+            }
+            other => panic!("expected Equip, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn equip_bracket_bare_form_is_unequip() {
+        let parsed = parse("[EQUIP slot=head]");
+        match &parsed.commands[0] {
+            BracketCommand::Equip { slot, item_name, .. } => {
+                assert_eq!(*slot, equipment::EquipSlot::Head);
+                assert!(item_name.is_none(), "bare form (no name=) is unequip");
+            }
+            other => panic!("expected Equip, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn equip_bracket_unknown_slot_dropped() {
+        let parsed = parse("[EQUIP slot=weapon name=Sword]");
+        assert_eq!(parsed.commands.len(), 0, "unknown slot → dropped (literal prose)");
+        assert!(parsed.prose.contains("[EQUIP slot=weapon name=Sword]"));
+    }
+
+    #[test]
+    fn equip_bracket_oversize_name_dropped() {
+        let huge = "x".repeat(81);
+        let parsed = parse(&format!("[EQUIP slot=head name={}]", huge));
+        assert_eq!(parsed.commands.len(), 0, "name over INV_NAME_MAX → dropped");
+    }
+
+    #[test]
+    fn belt_bracket_add_with_qty() {
+        let parsed = parse("[BELT name=Lockpick qty=5]");
+        match &parsed.commands[0] {
+            BracketCommand::Belt { item_name, qty, remove, .. } => {
+                assert_eq!(item_name, "Lockpick");
+                assert_eq!(*qty, 5);
+                assert!(!*remove);
+            }
+            other => panic!("expected Belt, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn belt_bracket_bare_name_fallback() {
+        let parsed = parse("[BELT health_potion]");
+        match &parsed.commands[0] {
+            BracketCommand::Belt { item_name, qty, .. } => {
+                assert_eq!(item_name, "health_potion", "bare leading token adopted as name");
+                assert_eq!(*qty, 1, "default qty");
+            }
+            other => panic!("expected Belt, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn belt_bracket_remove_form() {
+        let parsed = parse("[BELT -Lockpick]");
+        match &parsed.commands[0] {
+            BracketCommand::Belt { item_name, remove, qty, .. } => {
+                assert_eq!(item_name, "Lockpick");
+                assert!(*remove, "leading '-' signals remove");
+                assert_eq!(*qty, 0);
+            }
+            other => panic!("expected Belt, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn pack_bracket_add_with_weight() {
+        let parsed = parse("[PACK name=\"Iron Rations\" qty=3 weight=0.5]");
+        match &parsed.commands[0] {
+            BracketCommand::Pack { item_name, qty, weight, .. } => {
+                assert_eq!(item_name, "Iron Rations");
+                assert_eq!(*qty, 3);
+                assert!((weight - 0.5).abs() < 1e-6);
+            }
+            other => panic!("expected Pack, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn pack_bracket_remove_form() {
+        let parsed = parse("[PACK -Old Map]");
+        match &parsed.commands[0] {
+            BracketCommand::Pack { item_name, remove, .. } => {
+                assert_eq!(item_name, "Old Map");
+                assert!(*remove);
+            }
+            other => panic!("expected Pack, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn equip_json_explicit_kind_dispatches() {
+        let body = r#"```json
+{"kind":"equip","slot":"off_hand","name":"Round Shield"}
+```"#;
+        let parsed = parse(body);
+        match &parsed.commands[0] {
+            BracketCommand::Equip { slot, layer, item_name, .. } => {
+                assert_eq!(*slot, equipment::EquipSlot::OffHand);
+                assert_eq!(*layer, equipment::ItemLayer::Outer);
+                assert_eq!(item_name.as_deref(), Some("Round Shield"));
+            }
+            other => panic!("expected Equip from JSON, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn pack_json_weight_field_parsed() {
+        let body = r#"```json
+{"kind":"pack","name":"Tent","qty":1,"weight":4.5}
+```"#;
+        let parsed = parse(body);
+        match &parsed.commands[0] {
+            BracketCommand::Pack { item_name, weight, qty, .. } => {
+                assert_eq!(item_name, "Tent");
+                assert!((weight - 4.5).abs() < 1e-6);
+                assert_eq!(*qty, 1);
+            }
+            other => panic!("expected Pack from JSON, got {:?}", other),
+        }
     }
 }

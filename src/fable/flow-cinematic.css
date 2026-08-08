@@ -65,6 +65,18 @@
     pointer-events: none;
     transform: translateX(-6px);
 }
+/* Quick Play variant (2026-08-05): the home button reads as a bright WHITE
+   glyph over the void instead of the New Game flow's aged brass. The ‹ back
+   button keeps the brass treatment (it shares the screen with the void-form
+   which has no other chrome). Applied via setVariant('quickplay'). */
+.fable-flow-chrome--quickplay .fable-flow-chrome__btn--home {
+    color: #f4f1ef;
+    filter: drop-shadow(0 0 10px rgba(244, 241, 239, 0.45));
+}
+.fable-flow-chrome--quickplay .fable-flow-chrome__btn--home:hover {
+    color: #ffffff;
+    filter: drop-shadow(0 0 16px rgba(244, 241, 239, 0.9));
+}
 
 /* --- Burn transition: the overlay twin + hot edge ---------------- */
 /* The twin is a fixed-position clone of a button, placed exactly over
@@ -266,9 +278,12 @@
 }
 /* Each gate inherits the full .fable-newgame-tile giant-square styling
    (added in markup). This rule just tunes the size so THREE fit in a
-   row comfortably — slightly smaller than the 2-tile menu squares. */
+   row comfortably — slightly smaller than the 2-tile menu squares.
+   BIGGER (Chloe 2026-08-03): was clamp(200px, 26vw, 320px) →
+   clamp(240px, 30vw, 360px). Three across at 360px + gaps still fits a
+   ~1280px-wide stage; the gates shrink fluidly below that. */
 .fable-creator-gates--horizontal .fable-creator-gate.fable-newgame-tile {
-    width: clamp(200px, 26vw, 320px);
+    width: clamp(240px, 30vw, 360px);
     flex: none;
 }
 .fable-creator-gate.is-survivor {
@@ -490,34 +505,65 @@
     line-height: 1;
     pointer-events: none;
 }
-.fable-portrait-slot__hint {
-    position: absolute;
-    bottom: 6px;
-    left: 50%;
-    transform: translateX(-50%);
-    font-size: 10px;
-    letter-spacing: 0.1em;
-    text-transform: uppercase;
-    color: var(--fable-brass);
-    background: rgba(0,0,0,0.6);
-    padding: 2px 8px;
-    border-radius: 8px;
-    pointer-events: none;
-}
 
-/* The player picker grid — mirrors .fable-card-grid but tuned for
-   portrait tiles. */
+/* The player picker grid — a 5×2 pattern (5 columns, 2 rows = 10 cards)
+   centered on screen. 2026-08-05 Chloe pass: the cards are compact (portrait
+   + name + glyph only) so 10 fit cleanly in the viewport. auto-rows keep the
+   row height uniform; the grid is capped at 5 cols + centered with a tight
+   max-width so it never stretches edge-to-edge. */
 .fable-player-grid {
     position: relative;
     z-index: 2;
     display: grid;
-    grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+    grid-template-columns: repeat(5, minmax(0, 1fr));
+    auto-rows: 1fr;
     gap: 18px;
     padding: 32px 28px 100px;
-    max-width: 1100px;
+    /* 2026-08-05: widened (was 1200px) so the bigger 260px mini-cards breathe. */
+    max-width: 1400px;
     margin: 0 auto;
     width: 100%;
+    align-content: center;
+    justify-items: center;
 }
+/* Each card caps its width so 5 across still leave gutters on wide screens + the
+   portrait stays a tidy rectangle.
+   2026-08-05 overhaul: cards BIGGER + WIDER (was 210px) per Chloe — more room
+   for the name+glyph row + a larger portrait. The grid's 5-col layout still
+   holds; max-width on the grid container was widened to keep gutters. */
+.fable-player-mini-card { width: 100%; max-width: 260px; }
+
+/* --- Worlds (Load menu) modal content (2026-08-05) ----------------------
+   The Load menu reuses the Player Picker's `.fable-player-grid` +
+   `.fable-player-mini-card` verbatim (identical look). Only the MODAL body
+   differs: a card shows a setting/intro blurb + tone/player/saves rows
+   alongside the portrait. These style that card-specific content. */
+.fable-world-modal-blurb {
+    margin: 8px 0 12px;
+    color: var(--fable-text-dim);
+    font-size: 14px;
+    line-height: 1.55;
+    font-style: italic;
+}
+.fable-world-modal-rows {
+    display: grid;
+    grid-template-columns: auto 1fr;
+    gap: 4px 14px;
+    margin: 0;
+}
+.fable-world-modal-rows dt {
+    color: var(--fable-brass);
+    font-size: 13px;
+    letter-spacing: 0.04em;
+}
+.fable-world-modal-rows dd {
+    margin: 0;
+    color: var(--fable-text);
+    font-size: 14px;
+}
+/* The worlds modal widens a touch so the blurb + rows breathe alongside the
+   portrait. */
+.fable-world-modal-card { width: 100%; }
 .fable-player-card {
     display: flex;
     flex-direction: column;
@@ -601,15 +647,1360 @@
     opacity: 0.7;
 }
 
-/* Validation status line (the Player Creator's structural checker
-   feedback — mirrors raw-editor.js's setValid status). */
+/* Validation status line (the Player Creator's structural checker feedback).
+   2026-08-04 restyle per Chloe: italicized + GRAYED (not red), bigger + bolder,
+   positioned at the TOP-CENTER of the input bubble (the slide's stage). It is
+   only revealed after the user actually presses the Next arrow (the .is-attempted
+   class is toggled by the wizard on first failed advance); until then it stays
+   invisible so a blank field doesn't nag on entry. Hidden entirely when empty.
+   2026-08-05: FIXED HEIGHT reserved always (min-height = one line + line-height
+   pinned). The wizard is a vertically-centered flex column (justify-content:
+   center; height:100vh), so ANY element whose height changes between keystrokes
+   re-centers the whole group → the title/stage "jump down a couple pixels" while
+   typing. The status element was the culprit: on slide entry it held a hidden
+   "X is required." line (tall), and the first valid keystroke emptied it (0
+   height) → the group shrank → re-centered → UI shifted. Reserving the line's
+   space always (empty or not) kills the shift entirely. */
 .fable-player-status {
-    min-height: 18px;
-    font-size: 13px;
-    color: rgba(220, 60, 40, 0.9);
+    min-height: 1.4em;
+    line-height: 1.4em;
+    margin: 0 0 6px;
+    font-size: clamp(17px, 1.5vw, 21px);
+    font-weight: 800;
+    font-style: italic;
+    color: rgba(180, 180, 188, 0.85);
     text-align: center;
     font-family: var(--fable-font-body);
+    letter-spacing: 0.01em;
+    opacity: 0;
+    transition: opacity 180ms ease;
+    pointer-events: none;
 }
-.fable-player-status.is-valid {
+.fable-player-status.is-attempted { opacity: 1; }
+.fable-player-status:empty { opacity: 0; }
+.fable-player-status.is-valid { opacity: 0; }
+
+/* ============================================================
+ * PLAYER CREATION SUITE OVERHAUL (2026-08-04)
+ * Slide-by-slide wizard + SIM-card review + grid-to-modal picker.
+ * All tokens (--fable-brass, --fable-glass, --echo-blur, etc.) are
+ * inherited from fable.css :root; this block only adds the structural
+ * + themed rules for the new surfaces.
+ * ============================================================ */
+
+/* --- Wizard shell --------------------------------------------------------- */
+/* Scaled to fill the stage: 80vw / max 1000px / min 600px tall. The prior
+   560px box floated tiny in the middle of the void.
+   2026-08-04: pushed DOWN (top padding + justify-content: flex-start with a
+   large top gap) so the slide content sits lower in the frame, and the whole
+   suite renders larger.
+   2026-08-04 Chloe pass #3: whole wizard pushed down ~1 inch more (top padding
+   96 → 192px) so the title clears the top chrome with breathing room. The
+   slide title sits directly above the input/portrait (the stage gap + the
+   field's own top margin are tight), so for text/portrait slides the title
+   reads as a header on the field directly below it. */
+.fable-player-wizard {
+    /* 2026-08-04 Chloe pass #8: title + divider + content center as ONE GROUP
+       in the viewport. justify-content:center vertically centers the whole
+       stack, so a short slide (Name) centers its textbox AND a tall slide
+       (Portrait) centers its picture — and in BOTH the title stays tight with
+       its content (no big gap, no floating high). The nav arrows are
+       absolute-positioned at the bottom (out of the centering flow) so they
+       don't push the group off-center. Replaces the fixed-20vh title offset
+       that made every slide start at the same spot regardless of height. */
+    position: relative;
+    z-index: 2;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;       /* center the title+divider+content group vertically */
+    width: 80vw;
+    max-width: 1000px;
+    height: 100vh;
+    margin: 0 auto;
+    padding: 24px 32px 140px;      /* bottom padding clears the absolute-positioned nav */
+    gap: 0;
+    box-sizing: border-box;
+}
+.fable-wizard-slide-title {
+    /* 2026-08-04 Chloe pass #8: no fixed top offset (margin-top 0) — the title
+       moves with the centered group (wizard justify-content:center). Title sits
+       ON the divider (margin-bottom 0 → meets the divider's top). */
+    margin: 0;
+    font-family: 'Almendra', var(--fable-font-serif);
+    font-weight: 700;
+    font-size: clamp(104px, 8.4vw, 104px);
+    color: var(--fable-brass-bright);
+    text-shadow: 0 0 22px var(--fable-brass-glow), 0 0 12px rgba(230, 213, 138, 0.55);
+    letter-spacing: 0.06em;
+    text-align: center;
+    text-transform: uppercase;     /* slide LABEL — always uppercase */
+    line-height: 1;
+}
+.fable-wizard-slide-title.is-review-title { font-size: clamp(48px, 6vw, 72px); margin: 6vh 0 0; line-height: 1; }
+/* Glowing amber divider under EVERY slide title. The title sits ON the divider
+   (margin-top 0 → the divider's top meets the title's bottom). margin-bottom
+   60px holds the content a clear step below the divider. */
+.fable-wizard-slide-divider {
+    width: clamp(280px, 26vw, 400px);
+    height: 6px;
+    margin: 0 auto 60px;          /* title sits ON top; content sits 60px below */
+    border-radius: 0px;
+    background: linear-gradient(90deg, transparent, var(--fable-brass) 18%, var(--fable-brass-bright) 50%, var(--fable-brass) 82%, transparent);
+    box-shadow: 0 0 12px rgba(230, 213, 138, 0.85), 0 0 24px rgba(230, 213, 138, 0.5);
+    animation: slideDividerPulse 2.8s ease-in-out infinite;
+}
+/* REVIEW exception (2026-08-04 Chloe pass #8): the divider sits DIRECTLY on
+   the ID card — margin-bottom 0 (not 60px) so the card touches the divider. */
+.fable-wizard-slide-title.is-review-title + .fable-wizard-slide-divider {
+    margin-bottom: 0;
+}
+@keyframes slideDividerPulse {
+    0%, 100% { opacity: 0.85; box-shadow: 0 0 10px rgba(230, 213, 138, 0.7), 0 0 20px rgba(230, 213, 138, 0.4); }
+    50%      { opacity: 1;    box-shadow: 0 0 16px rgba(230, 213, 138, 1.0), 0 0 30px rgba(230, 213, 138, 0.6); }
+}
+/* The stage holds the active slide's content. Synchronous swap (the async
+   crossfade was the stale-DOM root cause); a light opacity transition on
+   the stage itself carries the slide-to-slide aesthetic. */
+.fable-wizard-stage {
+    /* 2026-08-04 Chloe pass #6c: content stacks from the top (flex-start) so the
+       textbox/card/portrait sits directly under + touching the divider (NOT
+       overlapping it — the prior -6px margin pulled the box over the line).
+       margin-top 0 + the divider's margin-bottom 0 = the content's top edge
+       meets the divider's bottom edge flush. The title's margin-top places the
+       divider in the upper portion of the viewport; nav arrows stay at bottom. */
+    width: 100%;
+    flex: 0 1 auto;                /* don't consume all leftover height → nav sits close under content */
+    min-height: 0;                 /* allow shrink so tall slides don't overflow the viewport */
+    display: flex;
+    flex-direction: column;
+    align-items: stretch;
+    justify-content: flex-start;  /* content hugs the divider, not centered */
+    gap: 10px;
+    margin-top: 0;
+    transition: opacity 160ms ease-in-out;
+}
+/* REVIEW MODE — bottom-anchored, card grows UPWARD (2026-08-05 overhaul, Chloe).
+   The wizard's content group (title + divider + stage) is anchored to the BOTTOM
+   so CREATE + back arrow stay put; as clothing chips stack the card extends
+   UPWARD toward the title. HARD CAP: the stage is max-height-bounded so a tall
+   wardrobe can NEVER push the title off the top of the screen — when the cap is
+   hit the clothing chip cluster scrolls internally (hidden scrollbar, per Chloe:
+   "visible scrolls are a thing of the past"). The title's review top margin is
+   zeroed so it sits flush under the viewport top, giving the card maximum room. */
+.fable-player-wizard.is-review-mode {
+    justify-content: flex-end;
+    /* The base wizard reserves 140px bottom padding for the slide nav arrows,
+       but review mode HIDES the nav (the review has its own CREATE + back).
+       Drop that reservation so CREATE + the card get the full viewport height.
+       Widen the wizard so the wider 1060px review card fits (base is 1000px). */
+    padding-bottom: 24px;
+    width: 80vw;
+    max-width: 1100px;
+}
+.fable-player-wizard.is-review-mode .fable-wizard-slide-title.is-review-title {
+    /* Nudge the whole review group down (Chloe: "move the review + create + whole
+       UI down more"). The wizard is flex-end anchored, so a top margin on the
+       title pushes the entire title+divider+card+create stack down uniformly. */
+    margin-top: 4vh;
+}
+.fable-player-wizard.is-review-mode .fable-wizard-stage {
+    flex: 0 1 auto;
+    min-height: 0;
+    /* No cap here — the CARD inside owns its own cap (below). Capping the stage
+       hid CREATE (a stage sibling) when the card overflowed. The card cap + the
+       card's own overflow handling keeps CREATE visible below it. */
+}
+
+/* --- Form fields — thick regal fantasy inputs --------------------------- */
+/* Single-trait fields (Name/Age/Height/...) are capped + centered so a lone
+   input doesn't stretch across the full 1000px wizard frame. Multi-field
+   stacks (the Hair triple) + clothing leave the cap alone to fill width. */
+.fable-wizard-field {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;                /* tighter: label hugs its textbox (was 10px) */
+    width: 100%;
+    max-width: 520px;
+    margin: 0 auto;
+}
+.fable-wizard-triple .fable-wizard-field { max-width: 280px; }
+.fable-wizard-conditional-value { max-width: 520px; margin: 0 auto; }
+.fable-wizard-sublabel {
+    font-size: 16px;
+    text-transform: uppercase;
+    letter-spacing: 0.1em;
+    color: var(--fable-text-faint);
+    text-align: center;
+}
+/* HAIR triple (2026-08-04 Chloe pass #9): Color/Length/Style each centered
+   with their own MINI divider (much darker than the main amber one) under the
+   label. Sublabel text +6px (16 → 22px), centered. The three fields are more
+   separated vertically (triple gap below). The whole field is centered. */
+.fable-wizard-field--hair {
+    align-items: center;
+}
+.fable-wizard-field--hair .fable-wizard-sublabel {
+    font-size: 22px;               /* +6px (was 16) */
+    text-align: center;
+}
+.fable-wizard-mini-divider {
+    width: 120px;
+    height: 2px;
+    margin: 4px auto 6px;
+    border-radius: 2px;
+    /* Much darker than the main amber divider: a dim brass rule with a faint
+       glow so it reads as a subtle separator, not a bright filament. */
+    background: linear-gradient(90deg, transparent, rgba(197, 179, 88, 0.35) 30%, rgba(197, 179, 88, 0.5) 50%, rgba(197, 179, 88, 0.35) 70%, transparent);
+    box-shadow: 0 0 4px rgba(197, 179, 88, 0.2);
+}
+.fable-wizard-field input,
+.fable-wizard-chip-input {
+    /* 2026-08-04 Chloe pass #4: text CENTERED (was left-aligned) + font +2px
+       (1.25rem → 1.375rem). Normal case (uppercase is ONLY for the review ID
+       card labels/values, not these inputs).
+       2026-08-05: line-height pinned to match font-size + height fixed
+       (1.375rem + 32px vertical padding + 2px borders = a stable box). Without
+       a pinned line-height, an EMPTY input used the placeholder's line box and
+       a FILLED input used the font's real line box — those differed by ~2px,
+       so the first keystroke shifted the input's height + propagated up the
+       flex column, "bringing the whole UI down 2px" on every empty-box type.
+       Pinning both kills the shift entirely. */
+    width: 100%;
+    box-sizing: border-box;
+    padding: 16px 24px;
+    height: calc(1.375rem + 32px + 2px);   /* line + vertical pad + 2 borders — stable empty or filled */
+    background: rgba(28, 22, 16, 0.7);
+    border: 1px solid var(--fable-glass-line);
+    border-radius: 6px;
+    color: var(--fable-text);
+    font-family: var(--fable-font-body);
+    font-size: 1.375rem;
+    line-height: 1.375rem;                  /* anchor the content box — no placeholder/typed delta */
+    text-align: center;
+    outline: none;
+    transition: border-color 160ms ease, box-shadow 160ms ease;
+}
+.fable-wizard-field input:focus,
+.fable-wizard-chip-input:focus {
+    border-color: var(--fable-brass);
+    box-shadow: var(--fable-emboss-strong);
+}
+/* Clothing casing (Chloe 2026-08-05): NO uppercasing anywhere on clothing —
+   what the user types is what renders + what's stored. The prior
+   text-transform: uppercase rules (display-only on the input + the wizard
+   chips + the review chips) are removed. The ID-card dt/dd LABELS + VALUES
+   stay uppercase (that's the separate ID-card look). */
+.fable-wizard-triple {
+    display: flex;
+    flex-direction: column;
+    gap: 24px;               /* more vertical separation between the three hair boxes (Chloe pass #9) */
+    margin-top: -20px;       /* nudge the HAIR group up a bit so the taller triple centers nicely */
+}
+
+/* --- Gender + Yes/No toggle pills ---------------------------------------
+   2026-08-04: the Yes/No variant is rebuilt as borderless outline text that
+   FILLS IN + glows on select (no circular pill, no background, no border).
+   The base .fable-wizard-toggle now only lays out the row; the per-variant
+   look lives in the --yesno block below. The --gender block (further down)
+   carries its own transparent-hit-area styling. */
+.fable-wizard-toggle {
+    display: flex;
+    gap: 18px;
+    justify-content: center;
+}
+/* Yes/No: large outlined ALL-CAPS text, no chrome. Selected = filled + glow. */
+.fable-wizard-toggle--yesno {
+    gap: 56px;
+}
+.fable-wizard-toggle--yesno button {
+    flex: 0 0 auto;
+    min-width: 120px;
+    padding: 14px 28px;
+    background: transparent;
+    border: none;
+    border-radius: 0;
+    color: var(--fable-text-dim);
+    font-family: 'Almendra', var(--fable-font-serif);
+    font-weight: 800;
+    font-size: clamp(28px, 3.4vw, 40px);
+    letter-spacing: 0.16em;
+    cursor: pointer;
+    text-shadow: none;
+    transition: color 160ms ease, text-shadow 160ms ease, transform 160ms ease;
+    -webkit-text-stroke: 1px var(--fable-brass-dim);
+}
+.fable-wizard-toggle--yesno button:hover {
+    color: var(--fable-brass);
+    transform: translateY(-2px);
+}
+.fable-wizard-toggle--yesno button[aria-pressed="true"] {
+    color: var(--fable-brass-bright);
+    -webkit-text-stroke: 1px var(--fable-brass);
+    text-shadow: 0 0 18px var(--fable-brass-glow), 0 0 10px rgba(230, 213, 138, 0.6);
+}
+/* Gender toggle: Mars/Venus glyphs as sharp inline SVG paths (NO text glyphs,
+   NO circular border, NO bubbles). 2026-08-04 redesign → Chloe pass #3:
+   - BIGGER: button box widened (150-220 → 180-260). Stroke geometry in the SVG
+     is already large; the bigger box scales the whole glyph up.
+   - SHARP: thicker stroke (8) with MITER joins + BUTT caps (no rounded corners).
+   - NO FILL EVER — outline + glow ONLY. The prior pass FILLED the glyph on
+     select, which read as a "weird filled circle in the sign" after clicking.
+     Now the selected state keeps fill:none — ONLY the OUTLINE lights up (color
+     shift + drop-shadow halo). The center stays empty at all times.
+   - POP OUT + STAY: hover scales the glyph up; the selected state KEEPS the
+     pop (scale persists on [aria-pressed="true"]).
+   - COLORS: keep the Scarlet Red ♀; the Male ♂ is a dark navy. */
+.fable-wizard-toggle--gender {
+    gap: 100px;
+    max-width: 720px;
+    margin: 0 auto;
+}
+.fable-wizard-toggle--gender button {
+    flex: 0 0 auto;
+    width: clamp(135px, 18vw, 195px);   /* 25% smaller (was 180-260) */
+    aspect-ratio: 3 / 4;
+    border-radius: 0;
+    background: transparent;
+    border: none;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 0;
+    /* The pop-out scale lives on the BUTTON (transform on the svg wrapper would
+       fight the drop-shadow filter stacking context). Both hover + selected
+       drive the same scale → "stay popped out when selected." */
+    transition: transform 180ms cubic-bezier(0.2, 0.8, 0.2, 1);
+}
+/* POP OUT on hover, and STAY popped when selected. transform combines the
+   scale with a small lift. */
+.fable-wizard-toggle--gender button:hover,
+.fable-wizard-toggle--gender button[aria-pressed="true"] {
+    transform: scale(1.1) translateY(-4px);
+}
+.fable-wizard-glyph-svg {
+    width: 100%;
+    height: 100%;
+    display: block;
+    /* Outline-only resting state: solid opaque brass stroke, NO fill. */
+    color: var(--fable-brass);
+    /* No filter here at rest (resting = clean, no glow). Outline glow is added
+       on hover/selected below so ONLY the lit outline glows. */
+}
+.fable-wizard-glyph-svg .glyph-stroke {
+    fill: none;                 /* NEVER fill — outline only, every state */
+    stroke: currentColor;
+    stroke-width: 12;            /* thicker → bigger + bolder read */
+    stroke-linecap: butt;       /* sharp ends (no rounded caps) */
+    stroke-linejoin: miter;     /* sharp corners at the arrowhead + joins */
+    stroke-miterlimit: 4;
+    transition: stroke 160ms ease;
+}
+/* Hover: the outline brightens + the OUTLINE glows (drop-shadow on the svg
+   wrapper = a halo around the strokes only; center stays empty). */
+.fable-wizard-toggle--gender button:hover .fable-wizard-glyph-svg {
+    color: var(--fable-brass-bright);
+    filter: drop-shadow(0 0 12px rgba(230, 213, 138, 0.6));
+}
+/* Dark Navy (♂) selected — OUTLINE + GLOW ONLY (fill stays none, so no filled
+   circle). The stroke shifts to navy + a blue halo lights the outline. */
+.fable-wizard-toggle--gender button[data-glyph="male"][aria-pressed="true"] .fable-wizard-glyph-svg {
+    color: #1B3A8F;
+    filter: drop-shadow(0 0 22px rgba(40, 80, 200, 0.95));
+}
+.fable-wizard-toggle--gender button[data-glyph="male"][aria-pressed="true"] .glyph-stroke {
+    stroke: #2E54B5;            /* navy outline; fill stays none (no filled circle) */
+}
+/* Scarlet Red (♀) selected — OUTLINE + GLOW ONLY. */
+.fable-wizard-toggle--gender button[data-glyph="female"][aria-pressed="true"] .fable-wizard-glyph-svg {
+    color: #DC143C;
+    filter: drop-shadow(0 0 22px rgba(220, 20, 60, 0.95));
+}
+.fable-wizard-toggle--gender button[data-glyph="female"][aria-pressed="true"] .glyph-stroke {
+    stroke: #F04A6A;            /* scarlet outline; fill stays none */
+}
+
+/* --- Conditional slide (Yes/No reveal) ---------------------------------- */
+.fable-wizard-conditional {
+    display: flex;
+    flex-direction: column;
+    gap: 0px;
+    align-items: stretch;
+}
+.fable-wizard-conditional .fable-wizard-toggle { max-width: 360px; margin: 0 auto; }
+.fable-wizard-conditional-value.is-hidden { display: none; }
+
+/* --- Clothing chip list -------------------------------------------------- */
+.fable-wizard-clothing {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    width: 100%;
+    max-width: 620px;
+    margin: 0 auto;
+    /* 2026-08-05 Chloe pass: cap the clothing slide's height so a large
+       wardrobe can't grow the stage unboundedly. The wizard is a vertically-
+       CENTERED flex column (height:100vh), so without a cap a tall chip list
+       pushes the stage past the viewport → the title/divider drift up + the
+       nav arrows (absolute at bottom:40px) collide with the chips, and on the
+       REVIEW the card pushes CREATE off-screen. min-height:0 lets it shrink. */
+    min-height: 0;
+}
+.fable-wizard-chips {
+    display: flex;
+    flex-wrap: wrap;
+    /* 2026-08-05 Chloe pass: CENTER the garment chips under the textbox (was
+       left-aligned / default flex-start). justify-content:center packs them
+       to the middle row by row as they wrap. */
+    justify-content: center;
+    gap: 10px;            /* a touch more so the bigger rectangles breathe */
+    min-height: 8px;
+    /* 2026-08-05: cap the chip area + scroll internally so a big wardrobe
+       never grows the stage past the viewport. The scrollbar is HIDDEN
+       (Chloe: "visible scrolls are a thing of the past") — scroll still works
+       via wheel/drag, just no chrome. align-content:flex-start keeps chips
+       top-aligned within the scroll area. */
+    max-height: 38vh;
+    overflow-y: auto;
+    align-content: flex-start;
+    padding-right: 4px;             /* breath so chips don't kiss the edge */
+    scrollbar-width: none;          /* Firefox + WebView2-Chrome (standard) */
+}
+.fable-wizard-chips::-webkit-scrollbar {
+    display: none;                  /* WebKit/Chromium */
+}
+.fable-wizard-chip {
+    /* 2026-08-05 Chloe pass: 20% SMALLER (padding 12/22 → 10/18, font 1.6 →
+       1.28, remove-× 30 → 24). Sharp rectangles retained.
+       Long-word guard: a chip can't grow its column. max-width + word-break
+       + overflow-wrap so a single long unbroken garment name wraps inside the
+       chip instead of inflating it past the clothing column's 220px width
+       (which previously forced the clothing section to grow → the whole card
+       reflowed + the section dropped below the portrait). The chip itself
+       becomes multi-line if needed; the column never moves. */
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    padding: 10px 18px;
+    max-width: 100%;
+    overflow-wrap: anywhere;
+    word-break: break-word;
+    background: rgba(197, 179, 88, 0.12);
+    border: 1px solid var(--fable-brass-dim);
+    border-radius: 0;                 /* sharp rectangle — no rounded corners */
+    color: var(--fable-brass-bright);
+    font-size: 1.28rem;
+    font-family: var(--fable-font-body);
+}
+/* Display-only chips in the review card + load modal (no remove × button) are
+   TIGHTER (less padding, smaller font) so 2 full rows fit in the clothing
+   section without scrolling on standard viewports (Chloe: "2nd row is being cut
+   out"). Scoped to the review-card context so the editor chips (clothing slide)
+   stay tappable at their larger size. */
+.fable-player-review-card .fable-wizard-chip {
+    padding: 6px 14px;
+    font-size: 1.08rem;
+}
+.fable-wizard-chip button {
+    /* The remove × — AMBER with an amber glow (was red). */
+    background: none;
+    border: none;
+    color: var(--fable-brass);
+    cursor: pointer;
+    font-size: 24px;
+    line-height: 1;
+    padding: 0;
+    transition: color 160ms ease, filter 160ms ease, text-shadow 160ms ease;
+}
+.fable-wizard-chip button:hover {
+    color: var(--fable-brass-bright);
+    filter: drop-shadow(0 0 8px rgba(230, 213, 138, 0.8));
+    text-shadow: 0 0 10px rgba(230, 213, 138, 0.9);   /* amber glow on hover */
+}
+
+/* --- Portrait slot (slide 1) — vertical rectangle -----------------------
+   2026-08-04: enlarged (280×380 → 320×440) so the portrait reads larger in the
+   pushed-down wizard frame. The cropper modal shares the 2:3 aspect. */
+.fable-wizard-portrait {
+    width: 340px;
+    height: 460px;
+    margin: -20px auto 0;          /* nudged up a tiny bit closer to the divider (Chloe pass #9) */
+    border: 2px solid var(--fable-brass-dim);
+    border-radius: 16px;
+    background: rgba(20, 16, 12, 0.8);
+    cursor: pointer;
+    position: relative;
+    overflow: hidden;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    transition: border-color 160ms ease, box-shadow 160ms ease;
+}
+.fable-wizard-portrait:hover { border-color: var(--fable-brass); box-shadow: var(--fable-emboss-strong); }
+.fable-wizard-portrait img { width: 100%; height: 100%; object-fit: cover; }
+/* Default silhouette (inline SVG) shown when no portrait is picked — keeps the
+   slot from reading as an empty void. 2026-08-04. */
+.fable-wizard-portrait .fable-portrait-silhouette {
+    width: 60%;
+    height: auto;
+    max-height: 80%;
     color: var(--fable-brass-dim);
+    opacity: 0.55;
+}
+.fable-wizard-portrait .fable-portrait-slot__placeholder {
+    display: none;
+}
+
+/* --- The nav arrows — medieval arrows (2026-08-04 redesign) --------------
+   No circular border, no background pill. A full arrow — barbed arrowhead +
+   shaft + swept fletching feathers — rendered as an inline SVG, brass fill +
+   glow on hover. The art is laid out symmetric about the viewBox centerline so
+   the arrow renders dead-center in its box (the old tip-only arrow sat a few
+   px off to the right). The same SVG is reused for the review's small back
+   arrow. */
+.fable-wizard-nav {
+    /* 2026-08-04 Chloe pass #8: absolute-positioned at the bottom so the nav is
+       OUT of the wizard's centering flow (doesn't push the title+content group
+       off-center). Anchored ~40px up from the bottom edge, centered.
+       pass #9: gap a tiny bit more (140 → 170). */
+    position: absolute;
+    left: 50%;
+    transform: translateX(-50%);
+    bottom: 40px;
+    display: flex;
+    align-items: center;
+    gap: 170px;
+    margin-top: 0;
+}
+.fable-wizard-nav.is-hidden { display: none; }
+/* Individual arrow hide — used by the ‹ Back arrow on slide 0 (it would be
+   non-functional chrome: nothing before the first slide). Hidden via display
+   rather than the :disabled route so it's fully gone, not a faint ghost. */
+.fable-wizard-arrow.is-hidden { display: none; }
+.fable-wizard-arrow {
+    /* 2026-08-04 Chloe pass #7: bigger (was 62-83 × 41-54) → 96-130 × 64-86. */
+    width: clamp(96px, 10vw, 130px);
+    height: clamp(64px, 6.6vw, 86px);
+    border-radius: 0;
+    background: transparent;
+    border: none;
+    color: var(--fable-brass);
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    filter: drop-shadow(0 0 8px rgba(230, 213, 138, 0.25));
+    transition: filter 160ms ease, transform 160ms ease;
+    padding: 0;
+}
+.fable-wizard-arrow svg {
+    width: 100%;
+    height: 100%;
+    display: block;
+}
+.fable-wizard-arrow:hover:not(:disabled) {
+    color: var(--fable-brass-bright);
+    transform: translateY(-4px);
+    filter: drop-shadow(0 0 16px rgba(230, 213, 138, 0.7));
+}
+.fable-wizard-arrow:disabled {
+    opacity: 0.18;
+    cursor: not-allowed;
+    pointer-events: none;
+}
+
+/* --- The SIM-card review (slide 16) -------------------------------------
+   2026-08-04 restructure: the card holds portrait + traits; CREATE + back arrow
+   live in a centered column wrapper beneath it.
+   2026-08-04 Chloe pass #4: the review was TALLER than the viewport (title +
+   430px portrait + CREATE + arrow stacked past the bottom → CREATE + arrow fell
+   off-screen, and the card overlapped the title). Fixes: the wizard top padding
+   is now 48px (pass #4 above) so the review starts near the top; the card
+   portrait height is capped so the whole stack fits; the create-wrap margin is
+   kept tight. The dd trait VALUES are now UPPERCASE too (Chloe: uppercase only
+   in the ID card) — inputs + slide values stay normal-case. */
+.fable-player-review-card {
+    /* 2026-08-05 overhaul (Chloe): the card is a VERTICAL stack — a TOP row
+       (portrait LEFT, Identity + Appearance body centered to its right) with
+       Clothing as its OWN centered entity BELOW. No more side-by-side clothing
+       column (it kept collapsing under the portrait).
+       HEIGHT CAP: the card is capped (viewport-relative) so a tall wardrobe
+       can NEVER push the title off the top NOR hide CREATE (which sits below
+       the card as a stage sibling). The TOP row (portrait + traits) is fixed;
+       clothing's chip cluster flexes to absorb overflow + scrolls internally
+       (hidden scrollbar). The cap is fixed-pixel against the viewport — the
+       earlier `max-height: 100%` resolved against an indeterminate stage and
+       collapsed clothing to 0px. */
+    display: flex;
+    flex-direction: column;
+    gap: 12px;                    /* tight (was 22): frees room so 2 clothing rows show */
+    padding: 24px;
+    background: rgba(255, 255, 255, 0.035);
+    backdrop-filter: blur(var(--echo-blur));
+    -webkit-backdrop-filter: blur(var(--echo-blur));
+    border: 1px solid rgba(230, 213, 138, 0.28);
+    border-radius: 16px;
+    box-shadow: 0 8px 28px rgba(0, 0, 0, 0.55), 0 0 24px rgba(230, 213, 138, 0.12);
+    text-align: left;
+    width: 1060px;                /* a touch wider (was 1000) for breathing room */
+    max-width: 100%;
+    /* In the Creator review, cap so title (above) + CREATE (below) stay on-
+       screen; clothing scrolls inside. The Load modal reuses this class but
+       runs in its own scroll container, so the cap is scoped to review mode. */
+    margin: 0 auto;
+    box-sizing: border-box;
+}
+/* Review-mode-only card cap (the Load modal reuses .fable-player-review-card but
+   is not inside .is-review-mode, so it's unaffected + scrolls its own panel).
+   flex-shrink:0 so the flex-end wizard doesn't compress the card below its cap —
+   the card takes its natural content height (up to the cap), and clothing scrolls
+   internally when the cap is hit. Without this, flex-shrink:1 crushed the card,
+   collapsing clothing to ~2px. */
+.fable-player-wizard.is-review-mode .fable-player-review-card {
+    flex-shrink: 0;
+    /* Clearance: title (~100) + divider (~6) + create-wrap (~193) + wizard
+       padding (48) → ~347, round to 360. The card caps so CREATE (below) +
+       title (above) stay pinned on any viewport. The card is a flex column:
+       the top row (portrait + traits) is fixed, clothing flexes + its chip
+       cluster scrolls internally (hidden scrollbar) when the wardrobe is large.
+       overflow:hidden so clothing's scroll (not the card's) absorbs overflow. */
+    max-height: calc(100vh - 360px);
+    min-height: 0;
+    overflow: hidden;
+}
+/* The TOP row: portrait on the LEFT, Identity + Appearance centered in the
+   remaining space. 2026-08-05 fix: the traits (Name/Race/Height/Hair/Skin) sit
+   CLOSE to the portrait now — a tight 18px gap (was 36px) so they read as one
+   grouped ID block beside the portrait, not floating off to the far edge. The
+   body column's content is then CENTERED within the body's own width. */
+.fable-player-review-top {
+    display: flex;
+    flex-direction: row;
+    align-items: flex-start;
+    gap: 50px;                    /* breathing room between portrait + Identity/Appearance */
+    width: 100%;
+}
+.fable-player-review-portrait {
+    flex: 0 0 auto;
+    width: 312px;               /* 2026-08-05: ~4% bigger (was 300×420) */
+    height: 437px;
+    border-radius: 12px;
+    background: rgba(255, 255, 255, 0.035);
+    border: 1px solid rgba(230, 213, 138, 0.25);
+    overflow: hidden;
+    position: relative;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}
+/* Review-mode portrait is viewport-responsive (2026-08-05): the Creator review
+   caps the card so CREATE + title stay pinned. The portrait is TALL (Chloe
+   2026-08-05: "needs to be taller, it's too short now") — clamps high. The Load
+   modal reuses this class but is NOT in .is-review-mode → keeps 437. */
+.fable-player-wizard.is-review-mode .fable-player-review-portrait {
+    height: clamp(340px, 42vh, 420px);
+}
+.fable-player-review-portrait img { width: 100%; height: 100%; object-fit: cover; }
+.fable-player-review-portrait-fallback {
+    position: absolute; inset: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    color: var(--fable-brass-dim);
+}
+.fable-player-review-portrait-fallback svg { width: 55%; height: auto; opacity: 0.5; }
+/* The Identity/Appearance body column. 2026-08-05 (Chloe): the trait blocks sit
+   LEFT — hugging the portrait (align-items:flex-start), shifted ~an inch left of
+   centered so Identity + Appearance + their dividers read tight beside the
+   portrait, not floating toward the card's far edge. Each section is width-
+   constrained (520px) so the 2-col trait grids stay a tidy block. */
+.fable-player-review-body {
+    flex: 1 1 auto;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;      /* LEFT-align the trait blocks beside the portrait */
+    justify-content: flex-start;
+    gap: 18px;
+    padding-top: 4px;
+}
+/* Trait sections are width-constrained so the 2-col trait grids read as a tidy
+   block beside the portrait. Left-aligned within the body column. */
+.fable-player-review-body .fable-player-review-section {
+    width: 100%;
+    max-width: 520px;
+}
+/* Clothing is its OWN entity, centered UNDER the top row (2026-08-05 overhaul).
+   Full card width, centered heading + chips. ONE divider (under the heading
+   only — Chloe: "only needs one underneath divider"), and it's WIDE (was 200px,
+   now ~820px). The section flexes to absorb leftover card height + the chip
+   cluster scrolls internally (hidden scrollbar) when the card cap is hit — so
+   CREATE (below the card) is never pushed off-screen, and the title never goes
+   off the top. This requires the card to have a concrete max-height (set above
+   for review mode); without it, flex:1 collapses clothing to 0. */
+.fable-player-review-clothing {
+    /* In review mode the card is a flex column with a concrete max-height; here
+       clothing flexes to fill leftover space + the chip cluster scrolls
+       internally (hidden scrollbar) when the wardrobe is large. The top row
+       (portrait + traits) stays fixed above it.
+       2026-08-05 (Chloe): a LONG full-width divider cuts clothing away from the
+       rest of the card (see ::before below). Tight spacing: clothing hugs the
+       divider above (margin-top small) + chips hug the heading (gap small) so 2
+       full chip rows show without being cut. */
+    flex: 1 1 auto;
+    min-height: 120px;            /* guarantee clothing always shows ~2 rows before scroll kicks in */
+    width: 100%;
+    display: flex;
+    flex-direction: column;
+    align-items: center;          /* center the heading + chip cluster */
+    gap: 6px;                     /* tight: chips hug the heading (was 14) so 2 full rows show */
+    padding-top: 0;
+    margin-top: 6px;              /* tight: clothing hugs the divider above (was 4 + 14 padding) */
+    border-top: none;             /* the ::before is the divider; no double line */
+    box-shadow: none;
+    position: relative;
+}
+/* The full-width divider above clothing (Chloe: "long divider cutting away
+   clothing from the rest of the card"). 2026-08-05 tweaks: WIDER (spans past
+   the card padding via negative left/right), THINNER (1px, was 2), DARKER
+   (dimmer amber, was bright 0.8). Still a glowing filament but more recessed. */
+.fable-player-review-clothing::before {
+    content: '';
+    position: absolute;
+    top: 0;
+    left: -24px;                  /* bleed past card padding → full card-edge width */
+    right: -24px;
+    height: 1px;                  /* thinner (was 2px) */
+    background: linear-gradient(90deg, transparent, rgba(140, 120, 50, 0.55) 12%, rgba(168, 144, 64, 0.7) 50%, rgba(140, 120, 50, 0.55) 88%, transparent);
+    box-shadow: 0 0 4px rgba(168, 144, 64, 0.3);
+    pointer-events: none;
+}
+.fable-player-review-clothing .fable-player-review-chips {
+    flex: 1 1 auto;
+    min-height: 0;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 10px;
+    justify-content: center;      /* chips center-cluster, wrap to next line as they grow */
+    width: 100%;
+    max-width: 880px;             /* generous horizontal room — Chloe: clothing boxes need "plenty of space horizontally" */
+    padding: 4px 8px 6px;
+    box-sizing: border-box;
+    overflow-y: auto;             /* scroll when the wardrobe exceeds the available clothing space */
+    align-content: flex-start;
+    scrollbar-width: none;        /* hidden scrollbar (Chloe: no visible scrolls) */
+}
+.fable-player-review-clothing .fable-player-review-chips::-webkit-scrollbar {
+    display: none;                /* WebKit/Chromium */
+}
+.fable-player-review-chips-empty {
+    color: var(--fable-text-faint);
+    font-size: 0.95rem;
+    font-style: italic;
+}
+.fable-player-review-section h3 {
+    /* 2026-08-05 Chloe pass: dividers BOTH above + below the heading (was below
+       only), and BOTH shrunk to 70% width (cut by 30% — was full-width). The
+       heading text itself stays full-size; only the rule lines are shorter.
+       2026-08-05: Identity/Appearance are LEFT-aligned against the portrait —
+       heading text + dividers anchor LEFT (Chloe: "uncenter it, make it left
+       aligned"). The clothing section override below keeps its centered look
+       (clothing is its own centered entity). */
+    margin: 0 0 10px;
+    padding: 9px 0 7px;
+    font-family: 'Almendra', var(--fable-font-serif);
+    font-weight: 700;
+    font-size: 28px;
+    color: var(--fable-brass);
+    text-transform: uppercase;
+    letter-spacing: 0.12em;
+    text-align: left;              /* heading text LEFT-aligned */
+    border-top: 1px solid transparent;
+    border-bottom: 1px solid transparent;
+    background:
+        linear-gradient(rgba(197, 179, 88, 0.28), rgba(197, 179, 88, 0.28)) top left / 40% 1px no-repeat,
+        linear-gradient(rgba(197, 179, 88, 0.28), rgba(197, 179, 88, 0.28)) bottom left / 40% 1px no-repeat;
+}
+/* Clothing section override (2026-08-05 overhaul, Chloe): centered (its own
+   entity), so its heading anchors CENTER. ONE divider — UNDER the heading only
+   (was two: above + below; Chloe: "only needs one underneath divider"). WIDE:
+   ~820px (was 200px — Chloe: "it's too small make it a lot wider"). The single
+   rule sits flush with the trait-grid divider widths so all three sections read
+   consistent. */
+.fable-player-review-clothing h3 {
+    text-align: center;
+    border-top: none;             /* no top divider */
+    margin-bottom: 4px;           /* tight: chips hug the heading so 2 rows fit */
+    background:
+        linear-gradient(rgba(197, 179, 88, 0.28), rgba(197, 179, 88, 0.28)) bottom center / 880px 1px no-repeat;
+}
+/* Two-column trait grid — the dl renders as a 2-col grid so the trait pairs
+   pack side-by-side instead of one tall column. */
+.fable-player-review-section dl {
+    margin: 0;
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 9px 70px;                /* column gap 70px → right column traits sit further right; row gap 9px */
+    font-size: 1.05rem;
+}
+.fable-player-review-section dl > div {
+    display: flex;
+    flex-direction: column;
+    gap: 0px;
+}
+.fable-player-review-section dt { color: var(--fable-text-faint); font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.06em; }
+.fable-player-review-section dd { margin: 0; color: var(--fable-text); font-size: 1.05rem; text-transform: uppercase; line-height: 1.15; }   /* ID-card values uppercase */
+/* Clothing chips render in the user's original casing (Chloe 2026-08-05: no
+   uppercasing on clothing anywhere). The chip cluster layout lives in the
+   .fable-player-review-clothing .fable-player-review-chips rule above. */
+
+/* CREATE + back wrapper — centered column BELOW the card. CREATE uses the
+   medieval Almendra font; the back is a small medieval arrow SVG centered
+   under CREATE. */
+.fable-player-review-create-wrap {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 10px;
+    margin-top: 16px;
+}
+.fable-player-review-create {
+    /* Sized to stay ON-SCREEN: the prior 3.2rem/130px push + the wider card
+       overflowed the viewport. Back to 2.6rem with slightly tighter padding. */
+    padding: 22px 92px;
+    background: linear-gradient(180deg, rgba(197, 179, 88, 0.35), rgba(140, 120, 50, 0.22));
+    border: 2px solid var(--fable-brass);
+    border-radius: 12px;
+    color: var(--fable-brass-bright);
+    font-family: 'Almendra', var(--fable-font-serif);
+    font-weight: 700;
+    font-size: 2.6rem;
+    letter-spacing: 0.18em;
+    cursor: pointer;
+    text-shadow: 0 0 12px var(--fable-brass-glow);
+    box-shadow: 0 0 28px rgba(230, 213, 138, 0.5), inset 0 0 14px rgba(230, 213, 138, 0.18);
+    transition: all 160ms ease;
+}
+.fable-player-review-create:hover:not(:disabled) {
+    color: #FFF6D6;
+    box-shadow: 0 0 40px rgba(230, 213, 138, 0.75), inset 0 0 18px rgba(230, 213, 138, 0.28);
+    transform: translateY(-1px);
+}
+.fable-player-review-create:disabled {
+    opacity: 0.4;
+    cursor: not-allowed;
+}
+/* Small medieval back-arrow centered under CREATE — same SVG as the nav arrows.
+   2026-08-04 Chloe pass #8: bigger (66 → 84). */
+.fable-player-review-back {
+    width: 84px;
+    height: 84px;
+    background: transparent;
+    border: none;
+    color: var(--fable-brass-dim);
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 0;
+    transition: color 160ms ease, transform 160ms ease, filter 160ms ease;
+}
+.fable-player-review-back svg { width: 100%; height: 100%; display: block; }
+.fable-player-review-back:hover {
+    color: var(--fable-brass-bright);
+    transform: translateY(-2px);
+    filter: drop-shadow(0 0 12px rgba(230, 213, 138, 0.6));
+}
+
+/* --- Picker grid mini-cards ---------------------------------------------
+   2026-08-05 Chloe pass: the grid fits a 5×2 pattern of compact cards in the
+   screen's center. Each card shows ONLY portrait + a thin themed divider
+   (60% width) + name + the sharp Mars/Venus SVG glyph (matching the Player
+   Creator's gender toggle). The race/age/height/weight identity strip is GONE
+   — the full identity surfaces in the centered modal on click. */
+.fable-player-mini-card {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 12px;
+    padding: 14px;
+    background: linear-gradient(180deg, rgba(38, 26, 16, 0.85), rgba(22, 15, 9, 0.85));
+    border: 1px solid var(--fable-brass-dim);
+    border-radius: 12px;
+    cursor: pointer;
+    text-align: center;
+    transition: transform 160ms ease, box-shadow 160ms ease, border-color 160ms ease;
+}
+.fable-player-mini-card:hover {
+    transform: translateY(-2px);
+    border-color: var(--fable-brass);
+    box-shadow: var(--fable-emboss);
+}
+.fable-player-mini-portrait {
+    width: 100%;
+    aspect-ratio: 3 / 4;
+    border-radius: 8px;
+    background: rgba(197, 179, 88, 0.1);
+    overflow: hidden;
+    position: relative;
+}
+.fable-player-mini-portrait--placeholder::after {
+    content: '';
+    position: absolute; inset: 30%;
+    border-radius: 50%;
+    background: rgba(197, 179, 88, 0.18);
+}
+.fable-player-mini-portrait-img { width: 100%; height: 100%; object-fit: cover; }
+/* Thin themed divider under the portrait — matching the amber filament
+   aesthetic (same gradient + glow family as the wizard divider, just thinner).
+   2026-08-05 overhaul: WIDER (was 60%) so it spans the bigger card. */
+.fable-player-mini-divider {
+    width: 82%;
+    height: 2px;
+    border-radius: 2px;
+    background: linear-gradient(90deg, transparent, rgba(197, 179, 88, 0.5) 30%, rgba(230, 213, 138, 0.7) 50%, rgba(197, 179, 88, 0.5) 70%, transparent);
+    box-shadow: 0 0 6px rgba(230, 213, 138, 0.35);
+}
+/* 2026-08-05 overhaul: name + gender glyph on ONE HORIZONTAL ROW (gender to the
+   RIGHT of the name). The row centers as a unit; a long name truncates (with
+   ellipsis) instead of wrapping under the glyph — Chloe: "it can't go
+   underneath the name." Row-aligned, nowrap, gap between name + glyph. */
+.fable-player-mini-info {
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    justify-content: center;
+    gap: 10px;
+    width: 100%;
+    padding: 0 6px;
+    box-sizing: border-box;
+}
+.fable-player-mini-name {
+    /* 2026-08-05 overhaul: slightly smaller (34 → 30px) + nowrap + ellipsis so a
+       long name shares the row with the glyph instead of wrapping beneath it. */
+    font-family: 'Almendra', var(--fable-font-serif);
+    font-weight: 700;
+    font-size: 30px;
+    color: var(--fable-text);
+    line-height: 1.05;
+    text-align: center;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    flex: 1 1 auto;
+    min-width: 0;
+}
+/* Gender glyph wrap — the sharp Mars/Venus SVG (same geometry as the Creator).
+   A fixed-size flex-shrink:0 box keeps the glyph's scale compact + guarantees
+   it never gets squeezed off the row by a long name. Sits RIGHT of the name. */
+.fable-player-mini-gender-wrap {
+    display: block;
+    flex: 0 0 auto;
+    width: 30px;
+    height: 36px;
+}
+.fable-player-mini-glyph {
+    width: 100%;
+    height: 100%;
+    display: block;
+    color: var(--fable-brass);
+}
+.fable-player-mini-glyph .glyph-stroke {
+    fill: none;
+    stroke: currentColor;
+    stroke-width: 12;
+    stroke-linecap: butt;
+    stroke-linejoin: miter;
+    stroke-miterlimit: 4;
+}
+/* Tint the glyph the same navy/scarlet as the Creator's selected state so the
+   read matches (a male card shows a navy outline, a female card a scarlet one). */
+.fable-player-mini-card[data-gender="male"] .fable-player-mini-glyph { color: #2E54B5; }
+.fable-player-mini-card[data-gender="female"] .fable-player-mini-glyph { color: #F04A6A; }
+
+/* --- The expand-to-center modal -----------------------------------------
+   2026-08-05 Chloe pass: the modal body is now the SAME .fable-player-review-card
+   the Player Creator's review slide emits (so a clicked card looks EXACTLY like
+   the review card). The modal widens to seat that card; the three action
+   buttons (LOAD/EDIT/DELETE) sit in a centered row BELOW the card (mirrors the
+   CREATE/back layout under the review card). */
+.fable-player-modal-overlay {
+    position: absolute;
+    inset: 0;
+    z-index: 46;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding-bottom: 6vh;          /* nudge the modal up a tiny bit (Chloe) */
+    opacity: 0;
+    transition: opacity 240ms ease;
+    pointer-events: none;
+}
+.fable-player-modal-overlay[hidden] { display: none; }
+.fable-player-modal-overlay.is-open { opacity: 1; pointer-events: auto; }
+.fable-player-modal-backdrop {
+    position: absolute;
+    inset: 0;
+    background: rgba(2, 4, 10, 0.85);
+    backdrop-filter: blur(8px);
+    -webkit-backdrop-filter: blur(8px);
+}
+.fable-player-modal {
+    position: relative;
+    z-index: 2;
+    /* Tight modal: hugs the ~1007px card (5% smaller) with trimmed padding (was
+       28px → 16px) so there's no excess empty side/top space. Cap by viewport. */
+    width: min(1040px, 94vw);
+    max-height: 90vh;
+    overflow-y: auto;
+    padding: 16px 16px 22px;      /* trimmed: top/sides 16 (was 28), bottom a touch more for the action row */
+    background: linear-gradient(180deg, rgba(38, 26, 16, 0.98), rgba(20, 14, 9, 0.98));
+    border: 1px solid var(--fable-brass-dim);
+    border-radius: 12px;
+    box-shadow: 0 24px 60px rgba(0, 0, 0, 0.7), var(--fable-emboss);
+    transform: scale(0.92);
+    transition: transform 240ms cubic-bezier(0.2, 0.8, 0.2, 1);
+}
+.fable-player-modal-overlay.is-open .fable-player-modal { transform: scale(1); }
+.fable-player-modal-loading,
+.fable-player-modal-empty {
+    text-align: center;
+    color: var(--fable-text-faint);
+    padding: 40px 0;
+}
+/* The review card inside the modal drops its own outer chrome (the modal already
+   provides the panel + shadow) so it reads as the card content, not a nested box.
+   2026-08-05: 5% smaller in the modal (Chloe) — 1060 → 1007px — + no padding so
+   the tight modal hugs it. */
+.fable-player-modal .fable-player-review-card {
+    width: 1007px;
+    padding: 0;                   /* the modal's own padding frames the card now */
+    background: transparent;
+    border: none;
+    box-shadow: none;
+    backdrop-filter: none;
+    -webkit-backdrop-filter: none;
+}
+/* Action buttons — a centered row BELOW the card (Chloe: "appear underneath the
+   centered ID card"). Sized to match the review CREATE button family. */
+.fable-player-modal-actions {
+    display: flex;
+    gap: 14px;
+    justify-content: center;
+    margin-top: 20px;
+    padding-top: 18px;
+    border-top: 1px solid var(--fable-glass-line);
+}
+.fable-player-modal-btn {
+    min-width: 130px;
+    padding: 12px 22px;
+    border-radius: 8px;
+    border: 1px solid var(--fable-brass-dim);
+    background: rgba(28, 22, 16, 0.6);
+    color: var(--fable-brass-bright);
+    font-family: 'Almendra', var(--fable-font-serif);
+    font-weight: 700;
+    font-size: 1.25rem;
+    letter-spacing: 0.1em;
+    cursor: pointer;
+    transition: all 160ms ease;
+}
+.fable-player-modal-btn:hover { border-color: var(--fable-brass); box-shadow: var(--fable-emboss); }
+.fable-player-modal-btn--load { background: rgba(197, 179, 88, 0.22); }
+.fable-player-modal-btn--delete { color: rgba(220, 90, 70, 0.95); border-color: rgba(220, 90, 70, 0.45); }
+.fable-player-modal-btn--delete:hover { border-color: rgba(220, 90, 70, 0.9); box-shadow: 0 0 12px rgba(220, 90, 70, 0.35); }
+.fable-player-modal-error {
+    margin-top: 12px;
+    padding: 8px;
+    text-align: center;
+    color: rgba(220, 60, 40, 0.95);
+    font-size: 13px;
+}
+
+/* --- The delete confirmation dialog ------------------------------------- */
+.fable-player-confirm {
+    position: absolute;
+    inset: 0;
+    z-index: 48;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    opacity: 0;
+    transition: opacity 200ms ease;
+    pointer-events: none;
+}
+.fable-player-confirm[hidden] { display: none; }
+.fable-player-confirm.is-open { opacity: 1; pointer-events: auto; }
+.fable-player-confirm::before {
+    content: '';
+    position: absolute; inset: 0;
+    background: rgba(2, 4, 10, 0.7);
+    backdrop-filter: blur(4px);
+}
+.fable-player-confirm-card {
+    position: relative;
+    z-index: 2;
+    width: min(360px, 88vw);
+    padding: 22px;
+    background: linear-gradient(180deg, rgba(38, 26, 16, 0.98), rgba(20, 14, 9, 0.98));
+    border: 1px solid var(--fable-brass-dim);
+    border-radius: 10px;
+    box-shadow: 0 18px 50px rgba(0, 0, 0, 0.7);
+    text-align: center;
+}
+.fable-player-confirm-card p { margin: 0 0 16px; color: var(--fable-text); font-size: 15px; }
+.fable-player-confirm-actions { display: flex; gap: 10px; justify-content: center; }
+.fable-player-confirm-actions button {
+    flex: 1;
+    padding: 9px 14px;
+    border-radius: 6px;
+    border: 1px solid var(--fable-brass-dim);
+    background: rgba(28, 22, 16, 0.6);
+    color: var(--fable-text);
+    font-family: var(--fable-font-body);
+    font-size: 14px;
+    cursor: pointer;
+    transition: all 160ms ease;
+}
+.fable-player-confirm-actions button:first-child {
+    color: rgba(220, 90, 70, 0.95);
+    border-color: rgba(220, 90, 70, 0.5);
+}
+.fable-player-confirm-actions button:hover { border-color: var(--fable-brass); }
+
+/* --- Portrait cropper modal (2026-08-04) --------------------------------
+   Centered over a darkened stage. The image fills a fixed-aspect 2:3 frame;
+   a draggable/resizable crop rectangle (the .crop-rect) selects the region.
+   Confirm → canvas drawImage → cropped bytes uploaded via the bytes IPC. */
+.fable-crop-overlay {
+    position: fixed;
+    inset: 0;
+    z-index: 60;
+    background: rgba(0, 0, 0, 0.82);
+    backdrop-filter: blur(6px);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    opacity: 0;
+    transition: opacity 200ms ease;
+}
+.fable-crop-overlay.is-open { opacity: 1; }
+.fable-crop-modal {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 18px;
+    padding: 28px;
+    transform: scale(0.96);
+    transition: transform 200ms ease;
+}
+.fable-crop-overlay.is-open .fable-crop-modal { transform: scale(1); }
+.fable-crop-title {
+    margin: 0;
+    font-family: 'Almendra', var(--fable-font-serif);
+    font-weight: 800;
+    font-size: clamp(24px, 2.6vw, 32px);
+    color: var(--fable-brass-bright);
+    text-shadow: 0 0 16px var(--fable-brass-glow);
+    letter-spacing: 0.04em;
+}
+.fable-crop-stage {
+    position: relative;
+    width: min(440px, 70vh);
+    aspect-ratio: 2 / 3;
+    border: 1px solid var(--fable-brass-dim);
+    border-radius: 8px;
+    overflow: hidden;
+    background: #000;
+    touch-action: none;
+    user-select: none;
+}
+.fable-crop-img {
+    position: absolute;
+    top: 0; left: 0;
+    width: 100%; height: 100%;
+    object-fit: cover;
+    pointer-events: none;
+}
+.fable-crop-mask {
+    position: absolute;
+    inset: 0;
+    background: rgba(0, 0, 0, 0.6);
+    pointer-events: none;
+}
+/* The crop rectangle carves a window out of the mask via 4 box-shadow blocks
+   that cover everything except the rect (the clip-path on the mask hides the
+   rect's area). Drag the rect to reposition; corner handles resize. */
+.fable-crop-rect {
+    position: absolute;
+    border: 2px solid var(--fable-brass-bright);
+    box-shadow: 0 0 14px rgba(230, 213, 138, 0.7);
+    cursor: move;
+    box-sizing: border-box;
+}
+.fable-crop-rect::before {
+    /* Re-show the underlying image inside the rect (above the mask). */
+    content: '';
+    position: absolute;
+    inset: -2px;
+    border: 2px solid transparent;
+}
+.fable-crop-handle {
+    position: absolute;
+    width: 16px;
+    height: 16px;
+    background: var(--fable-brass-bright);
+    border: 1px solid #1a140d;
+    border-radius: 2px;
+    box-shadow: 0 0 6px rgba(230, 213, 138, 0.8);
+}
+.fable-crop-handle[data-h="nw"] { top: -9px; left: -9px; cursor: nwse-resize; }
+.fable-crop-handle[data-h="ne"] { top: -9px; right: -9px; cursor: nesw-resize; }
+.fable-crop-handle[data-h="sw"] { bottom: -9px; left: -9px; cursor: nesw-resize; }
+.fable-crop-handle[data-h="se"] { bottom: -9px; right: -9px; cursor: nwse-resize; }
+.fable-crop-actions {
+    display: flex;
+    gap: 18px;
+    align-items: center;
+}
+.fable-crop-btn {
+    padding: 10px 24px;
+    background: rgba(28, 22, 16, 0.7);
+    border: 1px solid var(--fable-brass-dim);
+    border-radius: 8px;
+    color: var(--fable-text);
+    font-family: var(--fable-font-body);
+    font-size: 15px;
+    cursor: pointer;
+    transition: all 160ms ease;
+}
+.fable-crop-btn:hover { border-color: var(--fable-brass); color: var(--fable-brass-bright); }
+.fable-crop-btn--confirm {
+    background: linear-gradient(180deg, rgba(197, 179, 88, 0.35), rgba(140, 120, 50, 0.22));
+    border-color: var(--fable-brass);
+    color: var(--fable-brass-bright);
+    font-weight: 700;
+}
+
+/* --- Reduced motion: collapse the slide transition + modal transitions -- */
+@media (prefers-reduced-motion: reduce) {
+    .fable-wizard-stage,
+    .fable-player-modal-overlay,
+    .fable-player-modal,
+    .fable-player-confirm { transition: none !important; }
+    .fable-player-modal { transform: none !important; }
+}
+
+/* =======================================================================
+   UNIVERSAL SIM CARD CREATOR SUITE (2026-08-05) — shared additions.
+   The generic wizard-engine.js reuses every .fable-wizard-* + .fable-player-
+   review-* rule above verbatim (no restyling). The rules below cover ONLY the
+   new surfaces: the textarea slide, the SillyTavern import button on slide 1,
+   + the Attach Codex slide. They mirror the existing aesthetic (brass border,
+   emboss-on-focus, Almendra headings) so the four creators look identical to
+   the Player Creator they were abstracted from.
+   ======================================================================= */
+
+/* Textarea slide — for prose fields (Directive/Setting/Tone/Personality/
+   Backstory/Intro). Mirrors .fable-wizard-field input's brass border + emboss
+   on focus, but taller (driven by rows) + left-aligned text (prose, not a
+   label). resize: vertical so a long backstory can be expanded. */
+.fable-wizard-field--prose {
+    max-width: 720px;              /* wider than the 520px single-trait cap — prose needs room */
+}
+.fable-wizard-field--prose textarea {
+    width: 100%;
+    box-sizing: border-box;
+    padding: 16px 24px;
+    min-height: 140px;
+    background: rgba(28, 22, 16, 0.7);
+    border: 1px solid var(--fable-glass-line);
+    border-radius: 6px;
+    color: var(--fable-text);
+    font-family: var(--fable-font-body);
+    font-size: 1.125rem;
+    line-height: 1.5;
+    text-align: left;             /* prose reads left-aligned, not centered */
+    outline: none;
+    resize: vertical;
+    transition: border-color 160ms ease, box-shadow 160ms ease;
+}
+.fable-wizard-field--prose textarea:focus {
+    border-color: var(--fable-brass);
+    box-shadow: var(--fable-emboss-strong);
+}
+.fable-wizard-field--prose textarea::placeholder {
+    color: var(--fable-text-faint);
+    font-style: italic;
+}
+
+/* SillyTavern import button — a large secondary button rendered BELOW the
+   portrait slot on slide 1 of every creator. Styled like the CREATE button
+   but smaller + more recessed (it's a secondary affordance, not the primary
+   action). Brass outline + glow on hover, Almendra type. */
+.fable-wizard-import-btn {
+    display: block;
+    margin: 28px auto 0;
+    padding: 14px 36px;
+    background: transparent;
+    border: 1px solid var(--fable-brass-dim);
+    border-radius: 10px;
+    color: var(--fable-brass);
+    font-family: 'Almendra', var(--fable-font-serif);
+    font-weight: 700;
+    font-size: 1.05rem;
+    letter-spacing: 0.1em;
+    cursor: pointer;
+    text-shadow: 0 0 8px rgba(230, 213, 138, 0.25);
+    transition: all 160ms ease;
+}
+.fable-wizard-import-btn:hover {
+    color: var(--fable-brass-bright);
+    border-color: var(--fable-brass);
+    box-shadow: 0 0 18px rgba(230, 213, 138, 0.4), inset 0 0 10px rgba(230, 213, 138, 0.1);
+    transform: translateY(-1px);
+}
+
+/* Attach Codex slide — a large "Attach Codex (JSON lorebook)" button (same
+   brass-outline look as the import button) + the chip cluster of attached
+   entries below. Reuses .fable-wizard-chips for the chip cluster layout. */
+.fable-wizard-codex-attach {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 24px;
+    width: 100%;
+    max-width: 720px;
+    margin: 0 auto;
+}
+.fable-wizard-codex-btn {
+    padding: 16px 40px;
+    background: transparent;
+    border: 1px solid var(--fable-brass-dim);
+    border-radius: 10px;
+    color: var(--fable-brass);
+    font-family: 'Almendra', var(--fable-font-serif);
+    font-weight: 700;
+    font-size: 1.1rem;
+    letter-spacing: 0.1em;
+    cursor: pointer;
+    text-shadow: 0 0 8px rgba(230, 213, 138, 0.25);
+    transition: all 160ms ease;
+}
+.fable-wizard-codex-btn:hover {
+    color: var(--fable-brass-bright);
+    border-color: var(--fable-brass);
+    box-shadow: 0 0 18px rgba(230, 213, 138, 0.4), inset 0 0 10px rgba(230, 213, 138, 0.1);
+    transform: translateY(-1px);
+}
+.fable-wizard-codex-empty {
+    color: var(--fable-text-faint);
+    font-size: 0.95rem;
+    font-style: italic;
+}
+/* The chip cluster under the codex button reuses .fable-wizard-chips (defined
+   above) — give it the same width + centering as the clothing chip host. */
+.fable-wizard-codex-attach .fable-wizard-chips {
+    justify-content: center;
+    max-width: 100%;
 }

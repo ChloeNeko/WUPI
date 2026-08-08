@@ -87,8 +87,7 @@
     50%      { opacity: 0.85; }
 }
 
-/* Spotlight: a single warm pool of light (radial gradient that
-   follows the cursor via atmosphere.js parallax, but static-safe). */
+/* Spotlight: a single warm pool of light (static radial gradient). */
 .fable-fx-spotlight {
     background: radial-gradient(circle at 50% 45%, rgba(255, 230, 180, 0.18) 0%, rgba(255, 220, 160, 0.08) 18%, transparent 38%);
     mix-blend-mode: screen;

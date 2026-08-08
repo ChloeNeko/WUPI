@@ -1,29 +1,24 @@
 // =============================================================
-// BOOT TRANSITION — the 2s-paused welcome that reveals Fable's title.
+// BOOT TRANSITION — the welcome that reveals Fable's title menu.
 //
-// ARCHITECTURE (fog-free, per Chloe 2026-07-26):
-// The user clicks the Fable tile → Fable opens immediately (no fog, no
-// wind, no parting clouds) → the title screen paints at full opacity but
-// the MENU BUTTONS STAY HIDDEN for a deliberate 2-second beat (the title
-// art + ambient scene get to breathe on their own). At t=2s the welcome
-// arrives: theme music fades in, the magical ripple aura blooms on the
-// Quick Play button, the ripple SFX plays, and the buttons cascade in
-// (Quick Play → New Game → Load → Continue → Exit). Then the aura fades
-// and the ripple SFX tails off.
+// ARCHITECTURE:
+// playBootTransition is fired by openFable AFTER the fog gate clears (the fog
+// covers the OS→Fable swap; see screens/fog.js). When this runs, Fable's title
+// screen is already visible but the MENU BUTTONS STAY HIDDEN for a deliberate
+// beat (REVEAL_DELAY_MS) so the title art + ambient scene get to breathe on
+// their own. Then the welcome arrives: theme music fades in, the magical
+// ripple aura blooms on the Quick Play button, the ripple SFX plays, and the
+// buttons cascade in (Quick Play → New Game → Load → Continue → Exit). Then
+// the aura fades and the ripple SFX tails off.
 //
-// The prior fog-gate design (2s OS-layer fog buildup → handoff → HOLD →
-// 5.5s cloud part → ripple) was removed wholesale: the fog node, the wind
-// audio, the parting panels, the convert-in-place handoff, all gone. What
-// remains is the ripple aura + button stagger, which were always the
-// actual "welcome" — the fog was a separate preamble that's no longer
-// wanted.
-//
-// TIMELINE (relative to playBootTransition being called = ~the click):
+// TIMELINE (relative to playBootTransition being called = fog just cleared):
 //   t=0.0s   Buttons hidden. Title screen + ambient visible, no menu.
-//   t=2.0s   Music fade-in starts. Ripple Aura spawns on Quick Play.
+//   t=1.0s   Music fade-in starts. Ripple Aura spawns on Quick Play.
 //            Buttons stagger-reveal (Quick Play → … → Exit).
-//   t=3.5s   Aura removed (2s + 1.5s life).
-//   t=4.0s   Ripple SFX fades out.
+//   t=2.5s   Aura removed (1s + 1.5s life).
+//   t=3.0s   Ripple SFX fades out.
+//   (Chloe 2026-08-03: REVEAL_DELAY lowered 2s → 1s so the welcome arrives
+//   1s sooner after the fog clears.)
 //
 // CANCEL: closeFable calls cancel() FIRST — removes the aura, stops the
 // SFX, force-reveals the buttons. Idempotent + safe mid-sequence.
@@ -39,13 +34,15 @@ import RIPPLE_SRC from '../assets/fable_ripple.mp3';
 // --- Tunable timing (ms) --------------------------------------
 // The deliberate pause between the click and the welcome. The title
 // screen is visible (art + ambient) but the buttons stay hidden for this
-// whole window — a beat of stillness before the magic arrives.
-const REVEAL_DELAY_MS     = 2000;
+// whole window — a beat of stillness before the magic arrives. (Chloe
+// 2026-08-03: lowered from 2000 → 1000 so the ripple aura + theme music +
+// button cascade arrive 1s sooner after the fog clears.)
+const REVEAL_DELAY_MS     = 1000;
 // Buttons cascade deliberately so each settles before the next begins.
 const BUTTON_STAGGER_MS   = 180;
 const RIPPLE_AURA_LIFE_MS = 1500;
 // Aura is removed REVEAL_DELAY_MS + RIPPLE_AURA_LIFE_MS after the click.
-const AURA_REMOVE_MS      = REVEAL_DELAY_MS + RIPPLE_AURA_LIFE_MS;  // 3500
+const AURA_REMOVE_MS      = REVEAL_DELAY_MS + RIPPLE_AURA_LIFE_MS;  // 2500
 const RIPPLE_SFX_FADE_MS  = 400;
 
 // --- SFX ------------------------------------------------------

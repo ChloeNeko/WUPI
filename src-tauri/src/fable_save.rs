@@ -362,7 +362,6 @@ mod tests {
             setting: Some("A test place.".into()),
             plot: None,
             tone: None,
-            opening_scene: None,
             start_npc_ids: Vec::new(),
             declared_activities: Vec::new(),
             player_name: Some("Tester".into()),

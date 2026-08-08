@@ -1,9 +1,10 @@
 // =============================================================
 // NEW GAME MUSIC — the dual-track ambience for the New Game flow.
 //
-// When the user clicks "New Game" the title theme hard-stops and these TWO
-// tracks fade in together (starting at the transition midpoint) and play at
-// the exact same time:
+// When the user clicks "New Game" the title theme fades out and these TWO
+// tracks fade in together — KICKED OFF at the transition midpoint so the
+// slow 3s fade-in blooms while the screen undims, and the pair is partly
+// audible as the New Game scene reveals. They play at the exact same time:
 //   • newgame.mp3 — the melodic/atmospheric bed (0.2).
 //   • fire.mp3    — the crackling-fire layer that sits under it (0.1).
 // Each has its OWN target volume so the fire bed doesn't compete with the
@@ -30,7 +31,13 @@ import FIRE_SRC from '../assets/fire.mp3';
 // different levels so the fire bed doesn't compete with the melodic track).
 const NEWGAME_VOLUME = 0.2;
 const FIRE_VOLUME = 0.1;
-const FADE_MS = 1500;   // fade duration (in + out) — a slow, smooth crossfade
+// Fade-IN is longer than fade-OUT (Chloe 2026-08-03: "add more of a fade in
+// for the audio"). A slow 3s ramp lets the fire + music bloom gradually as
+// the New Game scene reveals, instead of the prior 1.5s that came in too
+// hot. Fade-out stays at the snappier 1.5s so backing out / exiting the
+// flow doesn't drag.
+const FADE_IN_MS = 3000;
+const FADE_OUT_MS = 1500;
 
 const NEWGAME_ID = 'fable-newgame-music';
 const FIRE_ID = 'fable-newgame-fire';
@@ -68,7 +75,7 @@ function fadeVolume(audio, from, to, ms, host) {
   return timer;
 }
 
-// ── Start: fade both tracks in together from 0 → TARGET over FADE_MS. ──
+// ── Start: fade both tracks in together from 0 → TARGET over FADE_IN_MS. ──
 // Idempotent: if a pair is already playing on this host, leave it (no double).
 // The caller (fable.js onNewGameClicked) hard-stops the theme at click time
 // and fires this at the transition midpoint so the tracks bloom in as the
@@ -105,8 +112,8 @@ export function startNewGameMusic(host, opts = {}) {
     if (began) return;
     began = true;
     if (fadeIn) {
-      state.fadeTimers.push(fadeVolume(ng, 0, NEWGAME_VOLUME, FADE_MS, host));
-      state.fadeTimers.push(fadeVolume(fire, 0, FIRE_VOLUME, FADE_MS, host));
+      state.fadeTimers.push(fadeVolume(ng, 0, NEWGAME_VOLUME, FADE_IN_MS, host));
+      state.fadeTimers.push(fadeVolume(fire, 0, FIRE_VOLUME, FADE_IN_MS, host));
     }
   };
   // Start both; play() on each is independent but they begin within the same
@@ -132,7 +139,7 @@ export function startNewGameMusic(host, opts = {}) {
   else begin();
 }
 
-// ── Stop: fade both out to 0 over FADE_MS, then remove the nodes. ──
+// ── Stop: fade both out to 0 over FADE_OUT_MS, then remove the nodes. ──
 // Returns immediately; the fade + removal is async. Idempotent: no state →
 // no-op. If `opts.immediate` is true, skip the fade and tear down now (used
 // by closeFable on EXIT so there's no lingering fade after the app is gone).
@@ -167,10 +174,10 @@ export function stopNewGameMusic(host, opts = {}) {
 
   // Fade both to 0 in lockstep (identical ramp), then remove the nodes after
   // the ramp completes. One trailing timer (not per-track): both ramps share
-  // the same FADE_MS so they reach 0 together.
+  // the same FADE_OUT_MS so they reach 0 together.
   state.tracks.forEach((audio) => {
     if (audio.parentNode) {
-      state.fadeTimers.push(fadeVolume(audio, audio.volume, 0, FADE_MS, host));
+      state.fadeTimers.push(fadeVolume(audio, audio.volume, 0, FADE_OUT_MS, host));
     }
   });
   setTimeout(() => {
@@ -179,7 +186,7 @@ export function stopNewGameMusic(host, opts = {}) {
       try { a.pause(); } catch (_) {}
       if (a.parentNode) a.remove();
     });
-  }, FADE_MS + 60);
+  }, FADE_OUT_MS + 60);
 }
 
 // ── Pause/Resume (app-lifecycle focus loss). Mirrors reveal.js. ──

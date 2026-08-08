@@ -1,69 +1,48 @@
 // =============================================================
-// FABLE FOG INTRO — the wind-blown fog gate on FABLE entry.
-// (Re-added 2026-08-01; the prior fog intro was removed 2026-07-26.)
+// FOG INTRO — the simple fog gate on FABLE entry.
+// (Rewritten 2026-08-03: plain opacity fade. No canvas, no sweep, no rAF.)
 //
-// When the user clicks the Fable tile, a full-screen fog overlay covers the
-// app for a short hold while wind.mp3 loops at a LOW volume AND the fog
-// texture drifts continuously (it looks alive, not a static slab). Then a
-// SLOW SOFT LEFT→RIGHT FEATHERED WIPE reveals the title: the wipe line moves
-// left→right with a WIDE blurred feather at its edge, so fog thins out into
-// the menu — there is NO hard vertical cut line, and the banks keep drifting
-// throughout so it genuinely reads as wind blowing the fog away.
+// One full-screen overlay. It fogs UP over 2s, STAYS fully foggy for 2s, then
+// UNFOGS over 2s. The screen swap (OS desktop → Fable title) happens during
+// the 2s hold, when the overlay is at 100% opacity — so the swap is invisible.
 //
-// Why rAF instead of a CSS transition: the mask's reveal position must
-// interpolate smoothly, and CSS can't transition an unregistered custom
-// property's value reliably across engines. A tiny rAF loop rebuilding a
-// linear-gradient mask each frame is cheap (one style write), robust
-// everywhere, and gives precise eased control over the feathered edge.
+// Total: 6s. The whole thing is driven by a single CSS opacity transition on
+// one element (GPU-composited), so there's no per-frame JS at all — JS just
+// flips classes at the phase boundaries.
 //
-// ARCHITECTURE (fixed 2026-08-02): the overlay is ONE element. The three
-// .fable-fog-bank children are the drifting texture; the wipe mask is applied
-// to the OVERLAY ITSELF, so the whole composite (base + banks) clears
-// left→right together and the menu underneath shows through. The prior
-// version drove the mask on a separate SOLID child div stacked above the
-// banks — that hid the drifting banks during hold ("fog doesn't move") and
-// only revealed the banks (not the menu) during the wipe, so the menu
-// appeared in an instant snap when the node was removed. Driving the overlay's
-// own mask fixes both.
-//
-// Patterns mirrored from siblings:
-//   • wind.mp3 is a Vite-bundled asset import (same as fable_theme.mp3 /
-//     fable_ripple.mp3 in reveal.js / boot.js).
-//   • playLoopedSfx + its fade-out stop() are lifted from boot.js.
-//   • The autoplay-gesture unlock pattern is lifted from reveal.js.
-//   • The overlay is a standalone <div> on document.body, self-cleaned on
-//     completion — same discipline as .fable-magical-overlay (transition.js).
-//
-// Prime Directive: the banks animate via background-position (compositor),
-// the wipe rebuilds one mask string per frame (no layout thrash), and there
-// is exactly one rAF loop. Honors prefers-reduced-motion (freeze drift +
-// collapse the wipe to a near-instant fade).
+//   t=0s     Mount overlay at opacity 0, then add .fog-in → opacity ramps to 1
+//            over 2s (the fog-up).
+//   t=2s     Overlay is fully foggy. The 2s hold begins.
+//   t=3s     onSwap fires — swap the underlying DOM here (mid-hold, fully
+//            foggy, invisible).
+//   t=4s     Add .fog-out → opacity ramps back to 0 over 2s (the unfog).
+//   t=6s     transitionend → remove the overlay.
 // =============================================================
 
 import WIND_SRC from '../assets/wind.mp3';
 
-// --- Tunable timing (ms) --------------------------------------
-const HOLD_MS  = 1400;  // fog fully covers the screen, wind looping, drifting
-const CLEAR_MS = 2600;  // slow soft left→right feathered wipe reveals the menu
-// Feather width as a fraction of the viewport width. Wide = softer edge, no
-// visible vertical cut line. 0.45 means the gradient transition spans ~45% of
-// the screen — a broad, diffuse edge that reads as fog thinning, not a wipe.
-const FEATHER  = 0.45;
+// --- Timing (ms) — must match the CSS transitions in fable.css -----------
+// TIMELINE (absolute from the click):
+//   0–2s    FOG_UP_MS    fog-up    (opacity 0 → 1)
+//   2–4s    HOLD_MS      hold      (opacity 1) — swap fires at 3s (SWAP_AT_MS)
+//   4–6s    FOG_DOWN_MS  unfog     (opacity 1 → 0)
+const FOG_UP_MS   = 2000;  // fog-up duration (0 → 2s)
+const HOLD_MS     = 2000;  // hold duration (2 → 4s)
+const FOG_DOWN_MS = 2000;  // unfog duration (4 → 6s)
+// Absolute time (from the click) when the seamless scene swap fires — 3s,
+// midway through the hold so the fog is rock-solid when the DOM swaps.
+const SWAP_AT_MS  = FOG_UP_MS + 1000;   // 3000ms
 
-// Wind volume — LOWERED per Chloe (well under SFX_VOLUME 0.2 / MUSIC 0.3).
+// Wind volume — low, atmospheric.
 const WIND_VOLUME = 0.15;
-
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 function reducedMotion() {
   return window.matchMedia &&
          window.matchMedia('(prefers-reduced-motion: reduce)').matches;
 }
 
-// Play wind.mp3 looped at WIND_VOLUME. Returns { stop(fadeMs) } that fades
-// the volume to 0 then pauses + removes the node. Mirrors boot.js's
-// playLoopedSfx. Includes the reveal.js autoplay-gesture unlock pattern so a
-// blocked autoplay degrades gracefully (silent fog) rather than throwing.
+// Play wind.mp3 looped. Returns { stop(fadeMs) } that fades out + removes the
+// node. Degrades gracefully if autoplay is blocked (silent fog).
 function playWind() {
   const audio = document.createElement('audio');
   audio.src = WIND_SRC;
@@ -75,7 +54,7 @@ function playWind() {
   let fadeTimer = null;
   let stopped = false;
 
-  const stop = (fadeMs = CLEAR_MS) => {
+  const stop = (fadeMs = FOG_DOWN_MS) => {
     if (stopped) return;
     stopped = true;
     if (fadeTimer) { clearInterval(fadeTimer); fadeTimer = null; }
@@ -96,127 +75,122 @@ function playWind() {
 
   const p = audio.play();
   if (p && typeof p.catch === 'function') {
-    // Autoplay blocked — strip the node silently. The fog still plays
-    // visually; wind just won't be heard until a gesture unlocks audio
-    // (acceptable degradation; we do NOT block the intro on it).
     p.catch(() => { if (!stopped && audio.parentNode) audio.parentNode.removeChild(audio); });
   }
   return { node: audio, stop };
 }
 
-// Build the fog overlay DOM: three parallax fog banks (continuous drift via
-// CSS background-position animation). NO separate mask child — the wipe mask
-// is applied to the overlay element itself (see clearFog), so the whole
-// composite clears left→right together and the menu shows through.
-function buildFogOverlay() {
+// =============================================================
+// PUBLIC: play the fog intro.
+//
+//   onSwap: () => void   — called mid-hold (fully foggy). Swap the underlying
+//                          DOM/UI right here (invisible).
+//
+// Returns { cancel(), done: Promise<void> }.
+//   • done     resolves once the overlay fades out + is removed (~6s).
+//   • cancel() tears the overlay + audio down immediately (closeFable's
+//              EXIT-mid-fog path).
+//
+// The overlay is a standalone node on document.body, self-cleaned on
+// transitionend — re-triggerable fresh each click.
+// =============================================================
+export function playFogIntro({ onSwap: onSwapArg } = {}) {
   const overlay = document.createElement('div');
   overlay.className = 'fable-fog-overlay';
   overlay.setAttribute('aria-hidden', 'true');
-  overlay.innerHTML = `
-    <div class="fable-fog-bank fable-fog-bank--back"></div>
-    <div class="fable-fog-bank fable-fog-bank--mid"></div>
-    <div class="fable-fog-bank fable-fog-bank--front"></div>
-  `;
-  return overlay;
-}
-
-// Drive the feathered left→right wipe via rAF. reveal goes 0→1 (eased);
-// each frame rebuilds the overlay's mask gradient so fog covers everything
-// right of the wipe line with a WIDE blurred feather at the line. reveal=1
-// means the menu is 100% visible (fully transparent mask) BEFORE the overlay
-// is removed — no snap. Returns a Promise that resolves when the wipe
-// completes.
-function clearFog(overlay, durationMs) {
-  return new Promise((resolve) => {
-    // ease-out (quad): starts promptly so the menu begins emerging quickly,
-    // then slows as the last wisps trail off — reads as wind dying down.
-    // (A symmetric ease-in-out left the first ~700ms feeling like nothing was
-    // happening; ease-out puts motion on screen immediately.)
-    const easeOut = (t) => 1 - (1 - t) * (1 - t);
-    // The reveal value drives the opaque stop's position. We overshoot to
-    // (1 + FEATHER) so that at t=1 the opaque stop sits BEYOND the right edge
-    // — the entire feather has cleared the viewport, the mask is fully
-    // transparent everywhere, and the menu is 100% visible BEFORE the overlay
-    // is removed. Without the overshoot, removing the node at t=1 would snap
-    // away the last ~FEATHER of still-partially-opaque fog on the right edge.
-    const REVEAL_MAX = 1 + FEATHER;
-    const start = performance.now();
-    let raf = 0;
-    const setMask = (reveal) => {
-      // Three-stop gradient. Left of the feather = transparent (menu shows),
-      // the feather itself transitions transparent→opaque across FEATHER width
-      // (wide + soft — NO hard vertical cut), right of the feather = opaque
-      // (fog still covers). Once reveal passes 1.0, the opaque stop is off the
-      // right edge and the whole viewport is in the transparent/clearing span.
-      const featherStart = Math.max(0, reveal - FEATHER);
-      const grad = `linear-gradient(to right, rgba(0,0,0,0) 0%, rgba(0,0,0,0) ${featherStart * 100}%, rgba(0,0,0,1) ${Math.min(100, reveal * 100)}%)`;
-      overlay.style.webkitMaskImage = grad;
-      overlay.style.maskImage = grad;
-    };
-    const tick = (now) => {
-      const t = Math.min(1, (now - start) / durationMs);
-      setMask(easeOut(t) * REVEAL_MAX);
-      if (t < 1) {
-        raf = requestAnimationFrame(tick);
-      } else {
-        resolve();
-      }
-    };
-    raf = requestAnimationFrame(tick);
-  });
-}
-
-// =============================================================
-// PUBLIC: play the fog intro. Returns { cancel(), done: Promise<void> }.
-// `done` resolves once the fog has cleared (so the caller can chain the
-// boot transition). cancel() tears everything down immediately (used on
-// teardown / rapid re-entry).
-// =============================================================
-export function playFogIntro() {
-  const overlay = buildFogOverlay();
   document.body.appendChild(overlay);
+
   const wind = playWind();
 
   let cancelled = false;
+  let swapFired = false;
+  let onSwapCb = onSwapArg || null;
   let resolveDone = null;
   const done = new Promise((r) => { resolveDone = r; });
+  let swapTimer = null;
+  let outTimer = null;
+  let safetyTimer = null;
 
   const cleanup = () => {
     if (overlay.parentNode) overlay.parentNode.removeChild(overlay);
   };
 
-  (async () => {
-    // HOLD: fog fully covers the screen, wind looping, banks drifting.
-    if (reducedMotion()) {
-      await sleep(300);
-    } else {
-      await sleep(HOLD_MS);
+  // The unfog is the LAST transition; transitionend on it means we're done.
+  const onTransitionEnd = (e) => {
+    if (e.target !== overlay) return;
+    // Only react to the opacity property reaching 0 (the unfog finishing).
+    // The fog-up transition also fires transitionend at opacity 1 — ignore it.
+    if (parseFloat(getComputedStyle(overlay).opacity) > 0.1) return;
+    overlay.removeEventListener('transitionend', onTransitionEnd);
+    cleanup();
+    resolveDone();
+  };
+  overlay.addEventListener('transitionend', onTransitionEnd);
+
+  const fireSwap = () => {
+    if (swapFired || cancelled) return;
+    swapFired = true;
+    try { if (onSwapCb) onSwapCb(); } catch (e) {
+      console.error('[fable/fog] swap callback threw', e);
     }
-    if (cancelled) { resolveDone(); return; }
-    // CLEAR: slow soft left→right feathered wipe. The wind fades over a slightly
-    // longer window than the wipe so the audio tails off naturally as the last
-    // fog wisps clear; the banks keep drifting throughout (CSS animation), so
-    // it reads as continuous wind blowing the fog away, not a static slab.
-    const wipeMs = reducedMotion() ? 250 : CLEAR_MS;
-    wind.stop(wipeMs + 400);
-    await clearFog(overlay, wipeMs);
-    if (cancelled) { resolveDone(); return; }
-    cleanup();
-    resolveDone();
-  })().catch((err) => {
-    console.error('[fable/fog] intro threw, forcing cleanup', err);
-    cleanup();
-    resolveDone();
-  });
+  };
+
+  // Safety net: if transitionend never fires, still resolve + clean up.
+  safetyTimer = setTimeout(() => {
+    if (!cancelled) {
+      overlay.removeEventListener('transitionend', onTransitionEnd);
+      cleanup();
+      resolveDone();
+    }
+  }, FOG_UP_MS + HOLD_MS + FOG_DOWN_MS + 500);
+
+  if (reducedMotion()) {
+    // Reduced motion: skip the fades. Swap immediately, remove next tick.
+    fireSwap();
+    setTimeout(() => {
+      if (cancelled) return;
+      overlay.removeEventListener('transitionend', onTransitionEnd);
+      cleanup();
+      resolveDone();
+    }, 16);
+  } else {
+    // Phase 1 — fog up: force a reflow so opacity:0 takes, then .fog-in ramps
+    // it to 1 over FOG_UP_MS.
+    void overlay.offsetWidth;
+    overlay.classList.add('fog-in');
+
+    // Phase 2 — hold: the overlay is fully foggy from t=FOG_UP_MS onward.
+    // Fire the seamless swap at SWAP_AT_MS (3s, mid-hold — fog rock-solid).
+    swapTimer = setTimeout(fireSwap, SWAP_AT_MS);
+
+    // Phase 3 — unfog: at t = FOG_UP_MS + HOLD_MS (4s) start the fade back to
+    // 0. transitionend fires cleanup at 6s when it hits 0.
+    outTimer = setTimeout(() => {
+      if (cancelled) return;
+      overlay.classList.remove('fog-in');
+      overlay.classList.add('fog-out');
+    }, FOG_UP_MS + HOLD_MS);
+  }
 
   const cancel = () => {
     if (cancelled) return;
     cancelled = true;
-    wind.stop(reducedMotion() ? 200 : 400);
+    if (swapTimer) { clearTimeout(swapTimer); swapTimer = null; }
+    if (outTimer) { clearTimeout(outTimer); outTimer = null; }
+    if (safetyTimer) { clearTimeout(safetyTimer); safetyTimer = null; }
+    overlay.removeEventListener('transitionend', onTransitionEnd);
+    wind.stop(400);
     cleanup();
     resolveDone();
   };
 
+  // Cut the wind shortly after the fog finishes. The fog transition ends at
+  // t = FOG_UP_MS + HOLD_MS + FOG_DOWN_MS (= 6s); a short 500ms fade started
+  // then reaches silence at 6.5s total — a hair of tail so it doesn't hard-
+  // stop the instant the overlay vanishes, but no longer lingering past the
+  // fog. (The prior version chained wind.stop(FOG_DOWN_MS=2000) off done,
+  // which kept fading until t=8s — 2s of wind noise after the fog was gone.)
+  done.then(() => wind.stop(500));
+
   return { cancel, done };
 }
-

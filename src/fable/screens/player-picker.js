@@ -1,25 +1,65 @@
 // =============================================================
-// SCREEN: PLAYER PICKER — pick a saved player (Pair 2 → Load Player).
+// SCREEN: PLAYER PICKER — grid of mini SIM cards + expand-to-center modal.
 //
-// Mirrors picker.js's structure (enumerate via IPC, render tiles, onSelect)
-// but lists SavedPlayers (fable_players_list) instead of cards. Each tile
-// shows name + portrait (convertFileSrc) or a silhouette fallback.
+// REWRITE 2026-08-04: replaced the portrait-only tile grid with a mini-SIM-
+// card grid (portrait + Name + Race + ♂/♀ glyph, straight off PlayerMeta —
+// no per-tile fable_player_get). Clicking a mini-card expands it into the
+// dead center of the screen (CSS scale/transform, dimmed backdrop); the
+// modal loads the full SavedPlayer via fable_player_get + renders the
+// complete Appearance data, with three brass action buttons at the bottom
+// center: LOAD · EDIT · DELETE.
+//
+//   LOAD   → handlers.onSelect(player) → advanceAfterPlayer(id) (existing).
+//   EDIT   → handlers.onEdit(player) → fable.js routes to the Player Creator
+//            seeded with editFrom (the loaded JSON).
+//   DELETE → confirmation → fable_player_delete IPC → re-render the grid.
 //
 // EMPTY STATE: fully interactive (no disabled buttons). If the player has
-// no saved players yet, an empty-state message invites them to create one
-// — the ‹ / ⌂ chrome stays clickable. Per Chloe: "don't make the button
-// unclickable or whatever."
+// no saved players yet, an empty-state message invites them to create one —
+// the ‹ / ⌂ chrome stays clickable. Per Chloe: "don't make the button
+// unclickable."
 //
 // The chrome (‹ / ⌂) is owned by the flow controller; there is no header
-// bar here.
+// bar here. The modal is a centered overlay (z under the OS top bar).
 // =============================================================
 
 import { invoke, convertFileSrc } from '@tauri-apps/api/core';
 import { createEmbers } from './embers.js';
+import { openPortraitCropper } from './portrait-cropper.js';
+import { bytesToBase64 } from './wizard-engine.js';
+import { open as openDialog } from '@tauri-apps/plugin-dialog';
 
 function esc(s) {
   return String(s || '')
-    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
+}
+
+// Mars (♂) + Venus (♀) symbols as inline SVG paths — the SAME sharp outline
+// geometry used by the Player Creator's gender toggle (player-creator.js).
+// Kept in sync so the load-card glyph reads identically to the creator glyph.
+// Outline-only (fill:none), MITER joins + BUTT caps — matches the creator's
+// .fable-wizard-glyph-svg / .glyph-stroke styling.
+const MARS_SVG = `<svg class="fable-player-mini-glyph" viewBox="0 0 100 120" aria-hidden="true" focusable="false">
+  <g class="glyph-stroke">
+    <circle cx="36" cy="80" r="28"/>
+    <line x1="56" y1="60" x2="94" y2="22"/>
+    <polyline points="72,22 94,22 94,44"/>
+  </g>
+</svg>`;
+const VENUS_SVG = `<svg class="fable-player-mini-glyph" viewBox="0 0 100 120" aria-hidden="true" focusable="false">
+  <g class="glyph-stroke">
+    <circle cx="50" cy="38" r="28"/>
+    <line x1="50" y1="66" x2="50" y2="110"/>
+    <polyline points="30,92 50,110 70,92"/>
+  </g>
+</svg>`;
+
+function genderSVG(g) {
+  const v = (g || '').toLowerCase();
+  if (v === 'male') return MARS_SVG;
+  if (v === 'female') return VENUS_SVG;
+  return '';
 }
 
 export function buildPlayerPicker(handlers) {
@@ -28,9 +68,21 @@ export function buildPlayerPicker(handlers) {
   root.dataset.fableScreen = 'player-picker';
   root.hidden = true;
   root.innerHTML = `
-    <div class="fable-void-glow" aria-hidden="true"></div>
     <div class="fable-ember-host" aria-hidden="true"></div>
     <div class="fable-player-grid" data-host></div>
+    <div class="fable-player-modal-overlay" data-modal hidden>
+      <div class="fable-player-modal-backdrop" data-modal-backdrop></div>
+      <div class="fable-player-modal" data-modal-card role="dialog" aria-modal="true"></div>
+    </div>
+    <div class="fable-player-confirm" data-confirm hidden>
+      <div class="fable-player-confirm-card">
+        <p data-confirm-msg></p>
+        <div class="fable-player-confirm-actions">
+          <button type="button" data-confirm-yes>Delete</button>
+          <button type="button" data-confirm-no>Cancel</button>
+        </div>
+      </div>
+    </div>
   `;
   // Ambient embers.
   const emberHost = root.querySelector('.fable-ember-host');
@@ -40,11 +92,13 @@ export function buildPlayerPicker(handlers) {
   return root;
 }
 
-// Populate the grid. Called each time the screen is shown. `onSelect`
-// receives the chosen player's id (fable.js attaches it at game start).
-export async function renderPlayerPicker(root, onSelect) {
+// Populate the grid. Called each time the screen is shown. `handlers`
+// carries onSelect (LOAD), onEdit (EDIT), and the DELETE path is internal.
+export async function renderPlayerPicker(root, handlers) {
+  root._handlers = handlers || {};
   const host = root.querySelector('[data-host]');
   host.innerHTML = '';
+  closeModal(root);
   let players = [];
   try {
     players = await invoke('fable_players_list');
@@ -53,8 +107,6 @@ export async function renderPlayerPicker(root, onSelect) {
     return;
   }
   if (!players.length) {
-    // Empty state — fully interactive (chrome handles nav). No text on
-    // the load tiles themselves; this is just the empty-state message.
     host.innerHTML = `<div class="fable-flow-empty">
       <p>No saved players yet.</p>
       <p class="fable-flow-empty-hint">Use ‹ to go back and Create a Player.</p>
@@ -63,18 +115,32 @@ export async function renderPlayerPicker(root, onSelect) {
   }
   for (const p of players) {
     const tile = document.createElement('button');
-    tile.className = 'fable-player-card';
+    tile.className = 'fable-player-mini-card';
     tile.type = 'button';
-    // Portrait-ONLY — no name/text on the tile (Chloe: "remove all text
-    // from the load part"). The portrait (or a silhouette placeholder)
-    // is the entire tile. title/aria carry the name for accessibility.
+    tile.dataset.playerId = p.id;
+    const gkey = (p.gender || '').toLowerCase();
+    if (gkey === 'male' || gkey === 'female') tile.dataset.gender = gkey;
     tile.title = p.name;
-    tile.setAttribute('aria-label', `Load player ${p.name}`);
+    tile.setAttribute('aria-label', `View player ${p.name}`);
     const portraitHTML = p.has_portrait
-      ? `<div class="fable-player-card__portrait-placeholder" data-lazy-portrait="${esc(p.id)}"></div>`
-      : `<div class="fable-player-card__portrait-placeholder" aria-hidden="true"></div>`;
-    tile.innerHTML = portraitHTML;
-    tile.addEventListener('click', () => onSelect(p));
+      ? `<div class="fable-player-mini-portrait" data-lazy-portrait="${esc(p.id)}"></div>`
+      : `<div class="fable-player-mini-portrait fable-player-mini-portrait--placeholder" aria-hidden="true"></div>`;
+    // 2026-08-05 Chloe pass: the card shows ONLY portrait + name + gender SVG
+    // + a thin themed divider. The race/age/height/weight strip is GONE — the
+    // full identity surfaces in the centered modal on click.
+    // 2026-08-05 overhaul: name + gender glyph share ONE HORIZONTAL row (gender
+    // on the RIGHT of the name, never underneath). The info row is a flex row
+    // that centers as a unit; a long name truncates so it never wraps under the
+    // glyph. Divider widened to match the new card width.
+    const glyph = genderSVG(p.gender);
+    tile.innerHTML = `
+      ${portraitHTML}
+      <div class="fable-player-mini-divider" aria-hidden="true"></div>
+      <div class="fable-player-mini-info">
+        <span class="fable-player-mini-name">${esc(p.name)}</span>
+        ${glyph ? `<span class="fable-player-mini-gender-wrap">${glyph}</span>` : ''}
+      </div>`;
+    tile.addEventListener('click', () => openModal(root, p));
     host.appendChild(tile);
   }
   // Lazy-resolve portraits (one get per portrait-bearing player).
@@ -84,11 +150,250 @@ export async function renderPlayerPicker(root, onSelect) {
       const full = await invoke('fable_player_get', { id });
       if (full.portrait) {
         const img = document.createElement('img');
-        img.className = 'fable-player-card__portrait';
+        img.className = 'fable-player-mini-portrait-img';
         img.src = convertFileSrc(full.portrait);
         img.alt = '';
-        el.replaceWith(img);
+        img.onerror = () => { /* leave placeholder */ };
+        el.classList.remove('fable-player-mini-portrait--placeholder');
+        el.appendChild(img);
       }
     } catch (_) { /* leave placeholder */ }
   });
+}
+
+// --- The expand-to-center modal -----------------------------------------
+async function openModal(root, meta) {
+  // Guard against a rapid double-click on a mini-card firing two opens (the
+  // central flowBusy guard covers transitions, but modal-open itself isn't a
+  // transition — this local gate prevents the double-fetch + double-mount).
+  if (root._modalOpen) return;
+  root._modalOpen = true;
+  const overlay = root.querySelector('[data-modal]');
+  const card = root.querySelector('[data-modal-card]');
+  // Loading state while we fetch the full player.
+  card.innerHTML = `<div class="fable-player-modal-loading">Loading…</div>`;
+  overlay.hidden = false;
+  // Force reflow so the .is-open transition runs.
+  void overlay.offsetWidth;
+  overlay.classList.add('is-open');
+
+  // ── Click-outside-to-close + Esc-to-close (2026-08-05) ────────────────
+  // Chloe: "allow the player to click outside the card to X out of it." A
+  // click on the backdrop/overlay (NOT the card itself) closes the modal; Esc
+  // closes it too. Registered once per open, cleaned up on close so no
+  // listener stacks across re-opens.
+  const onBackdropClick = (e) => {
+    // Only close when the click landed on the overlay or the dedicated
+    // backdrop — NOT the card or any of its descendants.
+    if (e.target === overlay || e.target.classList.contains('fable-player-modal-backdrop')) {
+      closeModal(root);
+    }
+  };
+  const onEsc = (e) => {
+    if (e.key === 'Escape') { e.stopPropagation(); closeModal(root); }
+  };
+  overlay.addEventListener('click', onBackdropClick);
+  // Esc on the document (capture so it wins over the stage's own chain while
+  // the modal is up). Removed on close.
+  document.addEventListener('keydown', onEsc, { capture: true });
+  root._modalCleanup = () => {
+    overlay.removeEventListener('click', onBackdropClick);
+    document.removeEventListener('keydown', onEsc, { capture: true });
+    root._modalCleanup = null;
+  };
+
+  let full;
+  try {
+    full = await invoke('fable_player_get', { id: meta.id });
+  } catch (err) {
+    card.innerHTML = `<div class="fable-player-modal-loading">Couldn't load: ${esc(err)}</div>`;
+    return;
+  }
+  card.innerHTML = renderModalCard(full);
+
+  // ── Portrait click → cropper → re-save the portrait (2026-08-05) ──────
+  // Chloe: "allow the user to change their picture ... when they click on the
+  // card and you see the image on the left, allow it to be clickable so when
+  // someone clicks on it, the same exact image cropping thing pops." The
+  // portrait slot opens a file picker → the 2:3 cropper → upload_bytes. A
+  // successful crop refreshes the modal portrait in place.
+  const portraitSlot = card.querySelector('[data-modal-portrait]');
+  if (portraitSlot) {
+    portraitSlot.style.cursor = 'pointer';
+    portraitSlot.title = 'Change portrait';
+    portraitSlot.addEventListener('click', async () => {
+      try {
+        const picked = await openDialog({
+          multiple: false,
+          filters: [{ name: 'Images', extensions: ['png', 'jpg', 'jpeg'] }],
+        });
+        if (!picked) return;
+        // The cropper takes a URL the browser can paint. Read the picked
+        // file's bytes as a data URL via the existing portrait-bytes IPC
+        // (server-side read + magic-byte validation).
+        const srcPath = typeof picked === 'string' ? picked : picked.path;
+        let dataUrl = null;
+        try {
+          dataUrl = await invoke('fable_player_portrait_read_bytes', { srcPath });
+        } catch (_) { dataUrl = null; }
+        if (!dataUrl) return;
+        const cropped = await openPortraitCropper(root, dataUrl);
+        if (!cropped || !cropped.bytes) return;
+        await invoke('fable_player_portrait_upload_bytes', {
+          id: full.id,
+          bytesB64: bytesToBase64(cropped.bytes),
+        });
+        // Reflect the new portrait immediately (cache-bust via timestamp).
+        full.portrait = `portrait.${cropped.ext === 'jpeg' ? 'jpg' : cropped.ext}`;
+        const img = portraitSlot.querySelector('img');
+        const freshSrc = `${convertFileSrc(full.portrait)}?t=${Date.now()}`;
+        if (img) img.src = freshSrc;
+        else portraitSlot.innerHTML = `<img src="${esc(freshSrc)}" alt="" onerror="this.style.display='none'">`;
+      } catch (err) {
+        console.error('[fable] player portrait change failed', err);
+      }
+    });
+  }
+
+  // Bind the three action buttons.
+  card.querySelector('[data-modal-load]').addEventListener('click', () => {
+    closeModal(root);
+    if (root._handlers.onSelect) root._handlers.onSelect(full);
+  });
+  card.querySelector('[data-modal-edit]').addEventListener('click', () => {
+    closeModal(root);
+    if (root._handlers.onEdit) root._handlers.onEdit(full);
+  });
+  card.querySelector('[data-modal-delete]').addEventListener('click', () => {
+    confirmDelete(root, full);
+  });
+}
+
+function closeModal(root) {
+  const overlay = root.querySelector('[data-modal]');
+  if (!overlay || overlay.hidden) return;
+  // Tear down the backdrop/Esc listeners registered in openModal.
+  if (root._modalCleanup) root._modalCleanup();
+  overlay.classList.remove('is-open');
+  // Hide after the transition completes (or a fallback).
+  const finish = () => { overlay.hidden = true; };
+  overlay.addEventListener('transitionend', finish, { once: true });
+  setTimeout(() => { overlay.hidden = true; }, 260);
+  // Release the double-open guard.
+  root._modalOpen = false;
+}
+
+// The same default silhouette SVG the Player Creator uses for an empty
+// portrait slot (player-creator.js::SILHOUETTE_SVG). Reused here so the
+// modal's empty portrait reads identically to the creator's review card.
+const SILHOUETTE_SVG = `<svg class="fable-portrait-silhouette" viewBox="0 0 120 160" aria-hidden="true" focusable="false">
+  <path fill="currentColor" d="M60 16c-13 0-23 11-23 25 0 9 4 16 11 21-15 6-27 19-30 36-1 6 4 12 11 12h62c7 0 12-6 11-12-3-17-15-30-30-36 7-5 11-12 11-21 0-14-10-25-23-25z"/>
+</svg>`;
+
+// 2026-08-05 overhaul (Chloe): the modal renders the SAME ID-card markup the
+// Player Creator's review (slide 16) emits — .fable-player-review-card with a
+// .fable-player-review-top row (portrait + Identity/Appearance body) and the
+// .fable-player-review-clothing section centered BELOW. Same classes → same
+// CSS → pixel-identical look. The three action buttons live in a centered
+// wrapper BELOW the card (mirrors the CREATE/back layout under the review).
+function renderModalCard(sp) {
+  const portraitHTML = sp.portrait
+    ? `<img src="${esc(convertFileSrc(sp.portrait))}" alt="" onerror="this.style.display='none'">`
+    : `<span class="fable-player-review-portrait-fallback" aria-hidden="true">${SILHOUETTE_SVG}</span>`;
+  const identityRows = [
+    ['Name', sp.name],
+    ['Gender', sp.gender],
+    ['Race', sp.race],
+    ['Age', sp.age],
+    ['Height', sp.height],
+    ['Weight', sp.weight],
+  ].filter(([, v]) => (v || '').toString().trim());
+  const appearanceRows = [
+    ['Hair Color', sp.hair_color],
+    ['Hair Length', sp.hair_length],
+    ['Hair Style', sp.hair_style],
+    ['Body', sp.body_type],
+    ['Skin', sp.skin_complexion],
+    ['Eyes', sp.eye_color],
+    ['Breast', sp.breast_size],
+    ['Ears', sp.ears],
+    ['Tail', sp.tail],
+  ].filter(([, v]) => (v || '').toString().trim());
+  const clothing = Array.isArray(sp.clothing) && sp.clothing.length ? sp.clothing : null;
+
+  // Each trait wraps in a <div> so the dl's 2-col grid treats one trait as
+  // one grid cell — mirrors the creator's renderReview exactly.
+  const pair = ([k, v]) => `<div><dt>${esc(k)}</dt><dd>${esc(v)}</dd></div>`;
+  const identityHTML = identityRows.length
+    ? `<section class="fable-player-review-section"><h3>Identity</h3><dl>${identityRows.map(pair).join('')}</dl></section>`
+    : '';
+  const appearanceHTML = appearanceRows.length
+    ? `<section class="fable-player-review-section"><h3>Appearance</h3><dl>${appearanceRows.map(pair).join('')}</dl></section>`
+    : '';
+  // Clothing is its OWN entity, centered UNDERNEATH the portrait+ID/Appearance
+  // row (2026-08-05 overhaul) — same structure as the review card.
+  const clothingHTML = `<section class="fable-player-review-section fable-player-review-clothing">
+    <h3>Clothing</h3>
+    <div class="fable-player-review-chips">${clothing ? clothing.map((c) => `<span class="fable-wizard-chip">${esc(c)}</span>`).join('') : '<span class="fable-player-review-chips-empty">No garments</span>'}</div>
+  </section>`;
+
+  return `
+    <div class="fable-player-review-card">
+      <div class="fable-player-review-top">
+        <div class="fable-player-review-portrait" data-modal-portrait>${portraitHTML}</div>
+        <div class="fable-player-review-body">
+          ${identityHTML}${appearanceHTML}
+        </div>
+      </div>
+      ${clothingHTML}
+    </div>
+    <div class="fable-player-modal-actions">
+      <button type="button" class="fable-player-modal-btn fable-player-modal-btn--load" data-modal-load>LOAD</button>
+      <button type="button" class="fable-player-modal-btn fable-player-modal-btn--edit" data-modal-edit>EDIT</button>
+      <button type="button" class="fable-player-modal-btn fable-player-modal-btn--delete" data-modal-delete>DELETE</button>
+    </div>
+  `;
+}
+
+// --- Delete confirmation (the one irreversible action) -------------------
+function confirmDelete(root, sp) {
+  const confirmEl = root.querySelector('[data-confirm]');
+  const msg = root.querySelector('[data-confirm-msg]');
+  const yes = root.querySelector('[data-confirm-yes]');
+  const no = root.querySelector('[data-confirm-no]');
+  msg.textContent = `Delete ${sp.name}? This cannot be undone.`;
+  confirmEl.hidden = false;
+  void confirmEl.offsetWidth;
+  confirmEl.classList.add('is-open');
+
+  const close = () => {
+    confirmEl.classList.remove('is-open');
+    const finish = () => { confirmEl.hidden = true; };
+    confirmEl.addEventListener('transitionend', finish, { once: true });
+    setTimeout(() => { confirmEl.hidden = true; }, 200);
+  };
+
+  const onYes = async () => {
+    cleanup();
+    close();
+    try {
+      await invoke('fable_player_delete', { id: sp.id });
+      // Re-render the grid (reflects the deletion + closes the modal).
+      renderPlayerPicker(root, root._handlers);
+    } catch (err) {
+      // Surface inline — keep the modal open so the user sees the failure.
+      const card = root.querySelector('[data-modal-card]');
+      const note = document.createElement('p');
+      note.className = 'fable-player-modal-error';
+      note.textContent = `Delete failed: ${err}`;
+      card.appendChild(note);
+    }
+  };
+  const onNo = () => { cleanup(); close(); };
+  function cleanup() {
+    yes.removeEventListener('click', onYes);
+    no.removeEventListener('click', onNo);
+  }
+  yes.addEventListener('click', onYes);
+  no.addEventListener('click', onNo);
 }

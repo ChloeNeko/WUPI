@@ -138,6 +138,11 @@ pub fn render_translation_prompt(
     let mut out = String::with_capacity(1024);
     out.push_str("<|turn>system\n");
     out.push_str(TRANSLATION_INSTRUCTION);
+    // Always-on thinking: inject `<|think|>` so the translation pass always
+    // reasons before emitting JSON. Output flows through schema_engine's
+    // generate_with_repair, which strips the thought before parsing (see
+    // schema_engine.rs generate_with_repair + extract_reply_channel).
+    out.push_str("<|think|>");
     out.push_str("<turn|>\n");
     out.push_str("<|turn>user\n");
     out.push_str("Current world state:\n");
@@ -170,6 +175,78 @@ pub fn render_translation_prompt(
     out.push_str("<|turn>model\n");
     out
 }
+
+/// Render the Quick Play SEED prompt (2026-08-05): fold three free-text
+/// descriptions (player / scenario / desire) into an initial `SchemaDelta`
+/// against an EMPTY world. This is a sibling of `render_translation_prompt`
+/// but framed for world-creation, not mid-game mutation — the translation
+/// instruction tells the model to emit `{}` for anything that "cannot be
+/// expressed as a state change," which would no-op most free-form prose
+/// ("describe what you desire" is rarely a discrete mutation). The seed
+/// framing instead treats the three descriptions as the genesis of the
+/// world and asks for a populated delta.
+///
+/// Same rigid JSON-delta contract + flat-string entity rule as translation.
+/// Generic angle-bracket templates only (anti-pattern #4: no concrete
+/// copyable worked examples). `current_state_json` is the empty `{}` for a
+/// fresh Quick Play run, but is threaded through for symmetry + so a future
+/// re-seed over an existing world diffs cleanly.
+pub fn render_quick_play_seed_prompt(
+    player_desc: &str,
+    scenario_desc: &str,
+    desire_desc: &str,
+    current_state_json: &str,
+) -> String {
+    let mut out = String::with_capacity(1024);
+    out.push_str("<|turn>system\n");
+    out.push_str(SEED_INSTRUCTION);
+    // Always-on thinking (translation prompt above documents the pipeline).
+    out.push_str("<|think|>");
+    out.push_str("<turn|>\n");
+    out.push_str("<|turn>user\n");
+    out.push_str("Current world state (empty — you are seeding it):\n");
+    out.push_str(current_state_json);
+    out.push_str("\n\nPlayer description:\n");
+    out.push_str(player_desc);
+    out.push_str("\n\nScenario description:\n");
+    out.push_str(scenario_desc);
+    out.push_str("\n\nWhat the player desires from this story:\n");
+    out.push_str(desire_desc);
+    out.push_str("\n\nEmit ONLY the JSON delta object that seeds this world from the above. Flatten every concept into descriptive snake_case entity keys. If a description gives nothing usable, omit it rather than emitting empty strings.\n");
+    out.push_str("<turn|>\n");
+    out.push_str("<|turn>model\n");
+    out
+}
+
+const SEED_INSTRUCTION: &str = "\
+You are seeding an EMPTY roleplay world from three free-text descriptions.
+The world_state is a JSON object with three top-level keys: summary (string),
+recent_events (array of strings), entities (object of key -> flat string).
+
+ Emit the SEED as a JSON delta with this EXACT shape:
+{
+  \"summary\": \"...\" (a one-to-two sentence premise drawn from the scenario + desire),
+  \"recent_events\": [\"...\"] (optional, 0-2 opening circumstances),
+  \"entities\": {\"key\": \"value\"} (the bulk of the seed — see below)
+}
+
+ CRITICAL — entity value type rule:
+   Every entity value MUST be a single flat STRING. Numbers MUST be quoted
+   (\"50\", not 50). NEVER use nested objects, arrays, or numbers.
+   WRONG:  {\"entities\": {\"player\": {\"name\": \"Kael\"}}}        // nested
+   RIGHT:  {\"entities\": {\"player_name\": \"Kael\"}}               // flat string
+
+ Use descriptive snake_case keys. Flatten structured concepts into keys like:
+   <character_trait>, <npc_name_mood>, <location_feature>, <inventory_item>,
+   <relationship_player_npc>, <world_rule>, <player_goal>, <tone_flavor>.
+   Player identity from the player description lands as player_* keys
+   (player_name, player_appearance, player_archetype, ...). Scenario facts
+   land as world_* / location_* / faction_* keys. The desire becomes a
+   player_goal / world_arc key.
+
+ Emit the FULL seed (this is a fresh empty world, so every key is a change).
+ Do NOT wrap the JSON in markdown fences. Do NOT include <|channel> protocol
+ markers — emit raw JSON only.";
 
 const TRANSLATION_INSTRUCTION: &str = "\
 You are translating a player's natural-language request into a state delta

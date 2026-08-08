@@ -1219,8 +1219,42 @@ impl WorldSchema {
             }
         }
 
-        serde_json::from_value(serde_json::Value::Object(merged))
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+        // Clean-delete safety net (2026-08-07): the 22-part `BodyPart` set
+        // REPLACED the old 16-part set outright — `Torso`, `LeftBicep`,
+        // `LeftThigh`, `LeftAnkle` + mirrors no longer name a real variant.
+        // A pre-reorg `player.json` carrying those dead keys would ERROR on
+        // the deserialize below (serde rejects unknown enum variants). Filter
+        // the `player_state.body` object to ONLY the 22 known PascalCase wire
+        // keys before deserializing — dead-part injury data simply vanishes
+        // (the part no longer exists), no remap, no crash. Best-effort: if the
+        // shape isn't the expected nested object, leave it untouched + let the
+        // deserialize surface the real error.
+        if let Some(ps) = merged.get_mut("player_state").and_then(|v| v.as_object_mut()) {
+            if let Some(body) = ps.get_mut("body").and_then(|v| v.as_object_mut()) {
+                let known = crate::player_state::BodyPart::wire_keys();
+                body.retain(|key, _| known.contains(key.as_str()));
+            }
+        }
+
+        let mut schema: WorldSchema = serde_json::from_value(serde_json::Value::Object(merged))
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+
+        // Legacy item migration (2026-08-07): absorb freeform `item_*`/`inv_*`
+        // entity keys (the deleted `panels/inventory.js` convention) into the
+        // typed equipment/belt/pack model. Idempotent — a second load finds no
+        // legacy keys → no-op. Runs AFTER deserialize so the typed migration
+        // helper (`equipment::migrate_legacy_items`) works against real Rust
+        // types rather than JSON values. The entities map shrinks as items
+        // leave it; the typed model grows by the same amount.
+        if !schema.entities.is_empty() {
+            crate::equipment::migrate_legacy_items(
+                &mut schema.entities,
+                &mut schema.player_state.equipment,
+                &mut schema.player_state.pack,
+            );
+        }
+
+        Ok(schema)
     }
 }
 
@@ -1624,12 +1658,12 @@ mod tests {
         schema
             .player_state
             .body
-            .insert(crate::player_state::BodyPart::LeftBicep, crate::player_state::BodyPartState::Orange);
+            .insert(crate::player_state::BodyPart::LeftUpperArm, crate::player_state::BodyPartState::Orange);
         schema.player_state.stamina = crate::player_state::Stamina::Winded;
         let rendered = schema.render_for_prompt();
         assert!(rendered.contains("player_state:"), "player_state block must appear");
         assert!(rendered.contains("stamina: Winded"));
-        assert!(rendered.contains("Left Bicep (Medium Injury)"));
+        assert!(rendered.contains("Left Upper Arm (Medium Injury)"));
     }
 
     /// A schema with ONLY a default player state + nothing else renders to
@@ -1669,6 +1703,60 @@ mod tests {
         assert!(loaded.summary.is_empty());
         assert!(loaded.recent_events.is_empty());
         assert!(loaded.entities.is_empty());
+    }
+
+    #[test]
+    fn load_split_drops_legacy_body_part_keys() {
+        // 2026-08-07 clean-delete safety net. A pre-reorg player.json carries
+        // the deleted 16-part keys (Torso, LeftBicep, LeftThigh, LeftAnkle, …)
+        // alongside — in principle — the new 22-part keys. The load seam MUST
+        // drop the dead keys before deserializing, else serde errors on the
+        // unknown variant. After load: the known key survived at its severity,
+        // the dead keys vanished (no panic, no remap), and the body has exactly
+        // the entries the save carried for live parts.
+        use crate::player_state::{BodyPart, BodyPartState};
+        let dir = std::env::temp_dir();
+        let world = dir.join("wupi_loadsplit_drop_world.json");
+        let player = dir.join("wupi_loadsplit_drop_player.json");
+        let npc = dir.join("wupi_loadsplit_drop_npc.json");
+        for p in [&world, &player, &npc] {
+            let _ = std::fs::remove_file(p);
+        }
+        // world.json + npc.json empty; player.json carries a mix of live +
+        // dead body keys.
+        let legacy_player = r#"{
+            "player_state": {
+                "body": {
+                    "LeftUpperArm": "Orange",
+                    "Torso": "Red",
+                    "LeftBicep": "Red",
+                    "LeftThigh": "Purple",
+                    "LeftAnkle": "Yellow"
+                },
+                "stamina": "Winded"
+            }
+        }"#;
+        std::fs::write(&player, legacy_player).unwrap();
+        std::fs::write(&world, "{}").unwrap();
+        std::fs::write(&npc, "{}").unwrap();
+
+        let schema = WorldSchema::load_split(&world, &player, &npc).unwrap();
+        // The one live key survived at its severity.
+        assert_eq!(
+            schema.player_state.body.get(&BodyPart::LeftUpperArm).copied(),
+            Some(BodyPartState::Orange),
+        );
+        // Stamina came through too (the filter only touched `body`).
+        assert_eq!(
+            schema.player_state.stamina,
+            crate::player_state::Stamina::Winded,
+        );
+        // The body map has EXACTLY one entry — the four dead keys were
+        // dropped, not remapped onto new parts.
+        assert_eq!(schema.player_state.body.len(), 1);
+        for p in [&world, &player, &npc] {
+            let _ = std::fs::remove_file(p);
+        }
     }
 
     #[test]

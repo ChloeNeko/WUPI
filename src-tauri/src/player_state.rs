@@ -32,6 +32,8 @@
 
 use std::collections::HashMap;
 
+use crate::equipment;
+
 // ---------------------------------------------------------------------------
 // Body part state (the mannequin color states)
 // ---------------------------------------------------------------------------
@@ -153,100 +155,183 @@ impl Stamina {
 }
 
 // ---------------------------------------------------------------------------
-// Body parts (the 16 from the spec)
+// Body parts (the 22 mannequin zones — LOCKED to the frontend hitbox layer)
 // ---------------------------------------------------------------------------
 
-/// The 16 mannequin body parts. The `id()` is the stable wire format
-/// (`"left_bicep"`) used in JSON + prompt; `display()` is the UI label
-/// (`"Left Bicep"`). Order is anatomical, head→foot, left before right
-/// within each pair — this is the iteration order the mannequin renderer
-/// + the prompt's injury list use.
+/// The 22 mannequin body parts. This set is LOCKED 1:1 with the frontend
+/// paperdoll hitbox layer (`src/fable/engine/body-parts.js` PARTS +
+/// `src/fable/data/paperdoll-hitboxes.json`) — the paperdoll heatmap renders
+/// an injury on the exact zone the Referee injures here, so the two MUST
+/// never drift. The old 16-part set (Torso / LeftBicep / LeftThigh / LeftAnkle
+/// + mirrors) was DELETED on 2026-08-07 — not renamed, not remapped.
+///
+/// `id()` is the stable snake_case key (`"left_upper_arm"`) shared verbatim
+/// with the frontend's PARTS ids (the source of truth lives there); serde
+/// serializes the PascalCase variant name (`"LeftUpperArm"`) on the wire.
+/// `display()` is the human UI label (`"Left Upper Arm"`). Order is
+/// anatomical, head→foot, left before right within each pair — matches the
+/// frontend PARTS order so iteration lands in the same sequence on both
+/// sides.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize, Debug)]
 pub enum BodyPart {
     Head,
-    Torso,
-    LeftBicep,
-    LeftForearm,
+    Neck,
+    UpperTorso,
+    LowerTorso,
+    LeftShoulder,
+    RightShoulder,
+    LeftUpperArm,
+    RightUpperArm,
+    LeftElbow,
+    RightElbow,
+    LeftLowerArm,
+    RightLowerArm,
     LeftHand,
-    RightBicep,
-    RightForearm,
     RightHand,
-    LeftThigh,
-    LeftCalf,
-    LeftAnkle,
+    LeftUpperLeg,
+    RightUpperLeg,
+    LeftKnee,
+    RightKnee,
+    LeftLowerLeg,
+    RightLowerLeg,
     LeftFoot,
-    RightThigh,
-    RightCalf,
-    RightAnkle,
     RightFoot,
 }
 
 impl BodyPart {
-    /// All 16 parts in canonical (anatomical) order.
+    /// All 22 parts in canonical (anatomical) order — head→foot, left before
+    /// right within each pair. This is the single iteration order the Default
+    /// seeding, the prompt injury-list, and the Referee candidate pool use.
     pub fn all() -> &'static [BodyPart] {
         &[
             BodyPart::Head,
-            BodyPart::Torso,
-            BodyPart::LeftBicep,
-            BodyPart::LeftForearm,
+            BodyPart::Neck,
+            BodyPart::UpperTorso,
+            BodyPart::LowerTorso,
+            BodyPart::LeftShoulder,
+            BodyPart::RightShoulder,
+            BodyPart::LeftUpperArm,
+            BodyPart::RightUpperArm,
+            BodyPart::LeftElbow,
+            BodyPart::RightElbow,
+            BodyPart::LeftLowerArm,
+            BodyPart::RightLowerArm,
             BodyPart::LeftHand,
-            BodyPart::RightBicep,
-            BodyPart::RightForearm,
             BodyPart::RightHand,
-            BodyPart::LeftThigh,
-            BodyPart::LeftCalf,
-            BodyPart::LeftAnkle,
+            BodyPart::LeftUpperLeg,
+            BodyPart::RightUpperLeg,
+            BodyPart::LeftKnee,
+            BodyPart::RightKnee,
+            BodyPart::LeftLowerLeg,
+            BodyPart::RightLowerLeg,
             BodyPart::LeftFoot,
-            BodyPart::RightThigh,
-            BodyPart::RightCalf,
-            BodyPart::RightAnkle,
             BodyPart::RightFoot,
         ]
     }
 
-    /// Stable wire id (`"left_bicep"`). Used in JSON + the prompt's injury
-    /// list. Lowercase snake_case so it survives any case-folding.
+    /// Stable snake_case id (`"left_upper_arm"`). Identical to the frontend
+    /// `body-parts.js` PARTS ids — the single shared key space. Used in the
+    /// prompt's injury list + as the Rust-internal identifier. Note the serde
+    /// WIRE format is the PascalCase variant name, not this id (kept distinct
+    /// so the frontend seam resolves the two at one place).
     pub fn id(&self) -> &'static str {
         match self {
             BodyPart::Head => "head",
-            BodyPart::Torso => "torso",
-            BodyPart::LeftBicep => "left_bicep",
-            BodyPart::LeftForearm => "left_forearm",
+            BodyPart::Neck => "neck",
+            BodyPart::UpperTorso => "upper_torso",
+            BodyPart::LowerTorso => "lower_torso",
+            BodyPart::LeftShoulder => "left_shoulder",
+            BodyPart::RightShoulder => "right_shoulder",
+            BodyPart::LeftUpperArm => "left_upper_arm",
+            BodyPart::RightUpperArm => "right_upper_arm",
+            BodyPart::LeftElbow => "left_elbow",
+            BodyPart::RightElbow => "right_elbow",
+            BodyPart::LeftLowerArm => "left_lower_arm",
+            BodyPart::RightLowerArm => "right_lower_arm",
             BodyPart::LeftHand => "left_hand",
-            BodyPart::RightBicep => "right_bicep",
-            BodyPart::RightForearm => "right_forearm",
             BodyPart::RightHand => "right_hand",
-            BodyPart::LeftThigh => "left_thigh",
-            BodyPart::LeftCalf => "left_calf",
-            BodyPart::LeftAnkle => "left_ankle",
+            BodyPart::LeftUpperLeg => "left_upper_leg",
+            BodyPart::RightUpperLeg => "right_upper_leg",
+            BodyPart::LeftKnee => "left_knee",
+            BodyPart::RightKnee => "right_knee",
+            BodyPart::LeftLowerLeg => "left_lower_leg",
+            BodyPart::RightLowerLeg => "right_lower_leg",
             BodyPart::LeftFoot => "left_foot",
-            BodyPart::RightThigh => "right_thigh",
-            BodyPart::RightCalf => "right_calf",
-            BodyPart::RightAnkle => "right_ankle",
             BodyPart::RightFoot => "right_foot",
         }
     }
 
-    /// UI label (`"Left Bicep"`). Title-case with spaces.
+    /// UI label (`"Left Upper Arm"`). Title-case with spaces.
     pub fn display(&self) -> &'static str {
         match self {
             BodyPart::Head => "Head",
-            BodyPart::Torso => "Torso",
-            BodyPart::LeftBicep => "Left Bicep",
-            BodyPart::LeftForearm => "Left Forearm",
+            BodyPart::Neck => "Neck",
+            BodyPart::UpperTorso => "Upper Torso",
+            BodyPart::LowerTorso => "Lower Torso",
+            BodyPart::LeftShoulder => "Left Shoulder",
+            BodyPart::RightShoulder => "Right Shoulder",
+            BodyPart::LeftUpperArm => "Left Upper Arm",
+            BodyPart::RightUpperArm => "Right Upper Arm",
+            BodyPart::LeftElbow => "Left Elbow",
+            BodyPart::RightElbow => "Right Elbow",
+            BodyPart::LeftLowerArm => "Left Lower Arm",
+            BodyPart::RightLowerArm => "Right Lower Arm",
             BodyPart::LeftHand => "Left Hand",
-            BodyPart::RightBicep => "Right Bicep",
-            BodyPart::RightForearm => "Right Forearm",
             BodyPart::RightHand => "Right Hand",
-            BodyPart::LeftThigh => "Left Thigh",
-            BodyPart::LeftCalf => "Left Calf",
-            BodyPart::LeftAnkle => "Left Ankle",
+            BodyPart::LeftUpperLeg => "Left Upper Leg",
+            BodyPart::RightUpperLeg => "Right Upper Leg",
+            BodyPart::LeftKnee => "Left Knee",
+            BodyPart::RightKnee => "Right Knee",
+            BodyPart::LeftLowerLeg => "Left Lower Leg",
+            BodyPart::RightLowerLeg => "Right Lower Leg",
             BodyPart::LeftFoot => "Left Foot",
-            BodyPart::RightThigh => "Right Thigh",
-            BodyPart::RightCalf => "Right Calf",
-            BodyPart::RightAnkle => "Right Ankle",
             BodyPart::RightFoot => "Right Foot",
         }
+    }
+
+    /// The set of PascalCase serde wire keys the 22 variants serialize as
+    /// (`"LeftUpperArm"`, `"UpperTorso"`, …). Used by the save-load seam
+    /// (`WorldSchema::load_split`) to DROP unknown body keys before
+    /// deserializing `player_state` — the clean-delete safety net. A pre-
+    /// 2026-08-07 save carries the deleted 16-part keys (`Torso`, `LeftBicep`,
+    /// `LeftThigh`, `LeftAnkle`, …); those no longer name a real variant, so
+    /// a raw `serde_json::from_value` would ERROR on them. Filtering the
+    /// `body` object to only these 22 keys first makes the clean delete
+    /// save-safe: dead-part injury data simply vanishes (the part no longer
+    /// exists), no remap, no crash. Built once from `all()` so it can't drift
+    /// from the enum.
+    pub fn wire_keys() -> std::collections::HashSet<&'static str> {
+        let mut set = std::collections::HashSet::with_capacity(22);
+        for part in BodyPart::all() {
+            // serde's default for a unit enum variant is the variant's name
+            // (PascalCase). We avoid re-listing the 22 strings by deriving
+            // each key from the variant via a tiny match — keeps one source.
+            set.insert(match part {
+                BodyPart::Head => "Head",
+                BodyPart::Neck => "Neck",
+                BodyPart::UpperTorso => "UpperTorso",
+                BodyPart::LowerTorso => "LowerTorso",
+                BodyPart::LeftShoulder => "LeftShoulder",
+                BodyPart::RightShoulder => "RightShoulder",
+                BodyPart::LeftUpperArm => "LeftUpperArm",
+                BodyPart::RightUpperArm => "RightUpperArm",
+                BodyPart::LeftElbow => "LeftElbow",
+                BodyPart::RightElbow => "RightElbow",
+                BodyPart::LeftLowerArm => "LeftLowerArm",
+                BodyPart::RightLowerArm => "RightLowerArm",
+                BodyPart::LeftHand => "LeftHand",
+                BodyPart::RightHand => "RightHand",
+                BodyPart::LeftUpperLeg => "LeftUpperLeg",
+                BodyPart::RightUpperLeg => "RightUpperLeg",
+                BodyPart::LeftKnee => "LeftKnee",
+                BodyPart::RightKnee => "RightKnee",
+                BodyPart::LeftLowerLeg => "LeftLowerLeg",
+                BodyPart::RightLowerLeg => "RightLowerLeg",
+                BodyPart::LeftFoot => "LeftFoot",
+                BodyPart::RightFoot => "RightFoot",
+            });
+        }
+        set
     }
 }
 
@@ -277,6 +362,51 @@ pub struct PlayerState {
     /// Default 0.
     #[serde(default)]
     pub reputation: i32,
+
+    /// Live appearance deltas applied ON TOP of the SavedPlayer's authored
+    /// identity during play (2026-08-04 overhaul). A stable-keyed map so the
+    /// `[APPEARANCE key=value]` bracket pipeline can mutate individual traits
+    /// on the fly — outfit changes, cut hair, fresh scars, a disguise donned.
+    /// Empty value (`""`) is the clear sentinel for that key.
+    ///
+    /// Seeded once from the SavedPlayer's structured traits at game attach
+    /// (lib.rs `enter_fable_session`); every subsequent `[APPEARANCE]` bracket
+    /// mutates this map — the SavedPlayer identity is never touched (it's the
+    /// reusable cross-card baseline; this is the per-run live layer).
+    /// Rides `save_split` → `<card_id>.player.json` for free (nested in
+    /// `player_state`).
+    #[serde(default)]
+    pub current_appearance_deltas: HashMap<String, String>,
+
+    /// Worn equipment — six slots (Head/Chest/MainHand/OffHand/Legs/Feet),
+    /// each a two-layer stack (Outer narrator-visible, Inner hidden). Mutated
+    /// by the `[EQUIP]` bracket; only present slots are keyed. Empty by
+    /// default. See `equipment.rs`. Rides `save_split` → `<card_id>.player.json`.
+    #[serde(default)]
+    pub equipment: equipment::Equipment,
+
+    /// Quick-access belt — a fixed 4-slot rack (`BELT_MAX`) for potions,
+    /// lockpicks, throwables. Mutated by the `[BELT]` bracket. Never
+    /// appearance-visible (carried, not worn).
+    #[serde(default)]
+    pub belt: Vec<equipment::StackItem>,
+
+    /// Deep-storage pack — weight-bounded (`pack_capacity_lbs`) for everything
+    /// else. Mutated by the `[PACK]` bracket. The encumbrance UI divides
+    /// `stack_weight(&pack)` by `pack_capacity_lbs`. Never appearance-visible.
+    #[serde(default)]
+    pub pack: Vec<equipment::StackItem>,
+
+    /// Pack carry capacity in pounds. Per-card overridable; defaults to
+    /// `PACK_DEFAULT_CAPACITY_LBS` (20.0). Drives the encumbrance fill bar.
+    #[serde(default = "equipment_default_pack_capacity")]
+    pub pack_capacity_lbs: f32,
+}
+
+/// Default pack capacity for serde `#[serde(default = ...)]`. Wraps the const
+/// so the attribute can name a fn (serde requires a fn path, not a const).
+fn equipment_default_pack_capacity() -> f32 {
+    equipment::PACK_DEFAULT_CAPACITY_LBS
 }
 
 impl Default for PlayerState {
@@ -285,7 +415,7 @@ impl Default for PlayerState {
         // empty, which would read as "no body" — we want "fully healthy
         // body" so the mannequin renders correctly + referee_injureable
         // has the full part list to pick from.
-        let mut body = HashMap::with_capacity(16);
+        let mut body = HashMap::with_capacity(22);
         for part in BodyPart::all() {
             body.insert(*part, BodyPartState::Transparent);
         }
@@ -294,20 +424,32 @@ impl Default for PlayerState {
             stamina: Stamina::Fresh,
             wealth: 0,
             reputation: 0,
+            current_appearance_deltas: HashMap::new(),
+            equipment: HashMap::new(),
+            belt: Vec::new(),
+            pack: Vec::new(),
+            pack_capacity_lbs: equipment::PACK_DEFAULT_CAPACITY_LBS,
         }
     }
 }
 
 impl PlayerState {
     /// True when the state is the fresh-default (no injuries, full stamina,
-    /// zero wealth/reputation). Used to OMIT the `<player_state>` block
-    /// entirely on a brand-new game — same empty-skip pattern as
-    /// `WorldSchema::render_for_prompt`.
+    /// zero wealth/reputation, no live appearance deltas). Used to OMIT the
+    /// `<player_state>` block entirely on a brand-new game with no attached
+    /// player — same empty-skip pattern as `WorldSchema::render_for_prompt`.
+    /// A seeded appearance (from a SavedPlayer attach) makes this false so
+    /// the block renders even at full health.
     pub fn is_default(&self) -> bool {
         self.stamina == Stamina::Fresh
             && self.wealth == 0
             && self.reputation == 0
             && self.body.values().all(|s| *s == BodyPartState::Transparent)
+            && self.current_appearance_deltas.is_empty()
+            && self.equipment.is_empty()
+            && self.belt.is_empty()
+            && self.pack.is_empty()
+            && self.pack_capacity_lbs == equipment::PACK_DEFAULT_CAPACITY_LBS
     }
 
     /// Render the semantic block injected into the narrator prompt. Returns
@@ -317,19 +459,30 @@ impl PlayerState {
     /// Format (when non-default):
     /// ```text
     /// stamina: Winded
-    /// injuries: Left Bicep (Medium Injury), Right Thigh (Heavy Injury)
+    /// injuries: Left Upper Arm (Medium Injury), Right Upper Leg (Heavy Injury)
     /// amputated: Left Hand
     /// wealth: 12
     /// reputation: -3
+    /// appearance:
+    ///   hair_color: raven black
+    ///   outfit: bloodstained leather, travel cloak
+    /// equipped:
+    ///   Main Hand: Iron Sword (+2 ATK)
+    ///   Chest: Heavy Cloak
     /// ```
-    /// Lines are omitted when empty (no injuries → no `injuries:` line).
-    /// This is the fact block the narrator reads as hard truth.
+    /// Lines are omitted when empty (no injuries → no `injuries:` line). The
+    /// `appearance:` block is emitted LAST so the model reads the character's
+    /// current look right before generating prose — the diegetic ground truth
+    /// that must stay consistent turn to turn. This is the fact block the
+    /// narrator reads as hard truth. The `equipped:` block (Outer-layer items
+    /// only — Inner layers are hidden from the narrator) follows appearance so
+    /// the visible garments + readied weapons read as one cohesive look.
     pub fn render_for_prompt(&self) -> Option<String> {
         if self.is_default() {
             return None;
         }
 
-        let mut lines: Vec<String> = Vec::with_capacity(5);
+        let mut lines: Vec<String> = Vec::with_capacity(8);
 
         // Stamina always (when non-default state); the model needs to know
         // fatigue even at full health if injured.
@@ -375,6 +528,51 @@ impl PlayerState {
         }
         if self.reputation != 0 {
             lines.push(format!("reputation: {}", self.reputation));
+        }
+
+        // Live appearance deltas: emitted LAST (loudest signal) so the model
+        // reads the character's current look right before it writes prose.
+        // Stable, alphabetically-sorted keys for token-deterministic output
+        // (matches the entities-render discipline in schema.rs). The two-space
+        // indent nests cleanly under the caller's `player_state:` wrapper.
+        if !self.current_appearance_deltas.is_empty() {
+            let mut entries: Vec<(&String, &String)> = self.current_appearance_deltas.iter().collect();
+            entries.sort_by(|a, b| a.0.cmp(b.0));
+            let body = entries
+                .iter()
+                .map(|(k, v)| format!("  {}: {}", k, v))
+                .collect::<Vec<_>>()
+                .join("\n");
+            lines.push(format!("appearance:\n{}", body));
+        }
+
+        // Equipped items — Outer layer ONLY. The narrator sees what an observer
+        // sees: a Heavy Cloak (Outer) over a Linen Shirt (Inner) reads as just
+        // the cloak. Inner layers are hidden by design (concealed garments,
+        // hidden armor). Iterated in canonical slot order (Head→Feet) so the
+        // readied weapon + visible garments read head-to-foot as one look. Belt
+        // + pack are NEVER here — they're carried, not worn.
+        if !self.equipment.is_empty() {
+            let equipped_lines: Vec<String> = equipment::EquipSlot::all()
+                .iter()
+                .filter_map(|slot| {
+                    self.equipment.get(slot).and_then(|layers| {
+                        layers.visible().map(|item| {
+                            // "Main Hand: Iron Sword" — append stats in parens
+                            // if present ("Main Hand: Iron Sword (+2 ATK)").
+                            match &item.stats {
+                                Some(s) if !s.trim().is_empty() => {
+                                    format!("  {}: {} ({})", slot.label(), item.name, s)
+                                }
+                                _ => format!("  {}: {}", slot.label(), item.name),
+                            }
+                        })
+                    })
+                })
+                .collect();
+            if !equipped_lines.is_empty() {
+                lines.push(format!("equipped:\n{}", equipped_lines.join("\n")));
+            }
         }
 
         Some(lines.join("\n"))
@@ -1243,15 +1441,16 @@ mod tests {
     }
 
     #[test]
-    fn body_part_all_has_16_in_anatomical_order() {
+    fn body_part_all_has_22_in_anatomical_order() {
         let all = BodyPart::all();
-        assert_eq!(all.len(), 16, "spec mandates exactly 16 body parts");
+        assert_eq!(all.len(), 22, "spec mandates exactly 22 body parts");
         assert_eq!(all[0], BodyPart::Head, "head first");
-        assert_eq!(all[1], BodyPart::Torso, "torso second");
+        assert_eq!(all[1], BodyPart::Neck, "neck second");
+        assert_eq!(all[2], BodyPart::UpperTorso, "upper torso third");
         // Left before right within a pair (the spec order).
-        assert_eq!(all[2], BodyPart::LeftBicep);
-        assert_eq!(all[5], BodyPart::RightBicep);
-        assert_eq!(all[15], BodyPart::RightFoot, "right foot last");
+        assert_eq!(all[4], BodyPart::LeftShoulder);
+        assert_eq!(all[5], BodyPart::RightShoulder);
+        assert_eq!(all[21], BodyPart::RightFoot, "right foot last");
     }
 
     #[test]
@@ -1294,7 +1493,7 @@ mod tests {
         let s = fresh_state();
         assert!(s.is_default(), "fresh state must be default");
         assert_eq!(s.stamina, Stamina::Fresh);
-        assert_eq!(s.body.len(), 16);
+        assert_eq!(s.body.len(), 22);
         for part in BodyPart::all() {
             assert_eq!(
                 s.body.get(part).copied().unwrap_or_default(),
@@ -1314,11 +1513,11 @@ mod tests {
     #[test]
     fn player_state_render_some_when_injured() {
         let mut s = fresh_state();
-        s.body.insert(BodyPart::LeftBicep, BodyPartState::Orange);
+        s.body.insert(BodyPart::LeftUpperArm, BodyPartState::Orange);
         s.stamina = Stamina::Winded;
         let rendered = s.render_for_prompt().expect("non-default renders");
         assert!(rendered.contains("stamina: Winded"));
-        assert!(rendered.contains("injuries: Left Bicep (Medium Injury)"));
+        assert!(rendered.contains("injuries: Left Upper Arm (Medium Injury)"));
         // No amputated line when none amputated.
         assert!(!rendered.contains("amputated:"));
     }
@@ -1327,10 +1526,10 @@ mod tests {
     fn player_state_render_lists_amputated_separately() {
         let mut s = fresh_state();
         s.body.insert(BodyPart::LeftHand, BodyPartState::Black);
-        s.body.insert(BodyPart::RightThigh, BodyPartState::Red);
+        s.body.insert(BodyPart::RightUpperLeg, BodyPartState::Red);
         let rendered = s.render_for_prompt().expect("non-default renders");
         // Injuries line excludes the amputated part.
-        assert!(rendered.contains("injuries: Right Thigh (Heavy Injury)"));
+        assert!(rendered.contains("injuries: Right Upper Leg (Heavy Injury)"));
         assert!(!rendered.contains("Left Hand (Amputated)"));
         // Amputated gets its own line.
         assert!(rendered.contains("amputated: Left Hand"));
@@ -1377,16 +1576,39 @@ mod tests {
 
     #[test]
     fn player_state_serde_partial_body_defaults_missing_parts() {
-        // A save that only persisted one injured part must load the other 15
+        // A save that only persisted one injured part must load the other 21
         // as Healthy when accessed via the getter (the getter uses
         // unwrap_or_default).
-        let json = r#"{"body":{"LeftBicep":"Orange"},"stamina":"Active"}"#;
+        let json = r#"{"body":{"LeftUpperArm":"Orange"},"stamina":"Active"}"#;
         let s: PlayerState = serde_json::from_str(json).unwrap();
-        assert_eq!(s.body.get(&BodyPart::LeftBicep).copied().unwrap(), BodyPartState::Orange);
+        assert_eq!(s.body.get(&BodyPart::LeftUpperArm).copied().unwrap(), BodyPartState::Orange);
         assert_eq!(
             s.body.get(&BodyPart::Head).copied().unwrap_or_default(),
             BodyPartState::Transparent,
         );
+    }
+
+    #[test]
+    fn player_state_serde_drops_legacy_body_keys() {
+        // A pre-2026-08-07 save carries the deleted 16-part keys (Torso,
+        // LeftBicep, LeftThigh, LeftAnkle, ...). The clean-delete contract:
+        // those keys no longer name a real body part, so the load seam in
+        // WorldSchema::load_split filters them out BEFORE deserializing
+        // player_state. This test proves the post-filter JSON deserializes
+        // cleanly with zero injuries from the dead keys (the raw PlayerState
+        // deserializer itself would panic on an unknown variant; the seam is
+        // what makes the clean delete save-safe).
+        let filtered = r#"{"body":{"LeftUpperArm":"Orange"},"stamina":"Active"}"#;
+        let s: PlayerState = serde_json::from_str(filtered).unwrap();
+        assert_eq!(s.body.len(), 1, "only the one known key survived the seam filter");
+        assert_eq!(
+            s.body.get(&BodyPart::LeftUpperArm).copied().unwrap(),
+            BodyPartState::Orange,
+        );
+        // And an unknown legacy key MUST fail raw deserialization (the seam is
+        // the guard, not the deserializer) — this pins why the seam exists.
+        let legacy = r#"{"body":{"LeftBicep":"Red"}}"#;
+        assert!(serde_json::from_str::<PlayerState>(legacy).is_err());
     }
 
     // --- Referee ---
@@ -1434,14 +1656,14 @@ mod tests {
     fn referee_skips_amputated_parts_when_picking() {
         // Amputate the left arm; the referee must never pick it.
         let mut s = fresh_state();
-        s.body.insert(BodyPart::LeftBicep, BodyPartState::Black);
+        s.body.insert(BodyPart::LeftUpperArm, BodyPartState::Black);
         // Run many turns with varied text to exercise the RNG across the
         // candidate pool.
         for i in 0..64 {
             let text = format!("I attack the goblin number {}", i);
             let outcome = referee_evaluate(&text, &s).expect("should fire");
             assert_ne!(
-                outcome.part, BodyPart::LeftBicep,
+                outcome.part, BodyPart::LeftUpperArm,
                 "referee must not pick an amputated part",
             );
             // The outcome should be a valid non-Black state.
@@ -1453,14 +1675,14 @@ mod tests {
     fn referee_new_state_never_downgrades_current() {
         // A part already Heavy (Red) shouldn't roll down to Yellow.
         let mut s = fresh_state();
-        s.body.insert(BodyPart::Torso, BodyPartState::Red);
+        s.body.insert(BodyPart::UpperTorso, BodyPartState::Red);
         for i in 0..32 {
             let text = format!("I strike the ogre {}", i);
             let outcome = referee_evaluate(&text, &s).expect("should fire");
-            if outcome.part == BodyPart::Torso {
+            if outcome.part == BodyPart::UpperTorso {
                 assert!(
                     outcome.new_state.rank() >= BodyPartState::Red.rank(),
-                    "Torso roll ({:?}) must not downgrade from Red",
+                    "Upper Torso roll ({:?}) must not downgrade from Red",
                     outcome.new_state,
                 );
             }
@@ -1497,7 +1719,7 @@ mod tests {
     fn apply_outcome_mutates_state() {
         let mut s = fresh_state();
         let outcome = RefereeOutcome {
-            part: BodyPart::RightThigh,
+            part: BodyPart::RightUpperLeg,
             new_state: BodyPartState::Orange,
             stamina_after: Stamina::Winded,
             narrative_hint: "test".into(),
@@ -1505,7 +1727,7 @@ mod tests {
             directive: String::new(),
         };
         apply_outcome(&mut s, &outcome);
-        assert_eq!(s.body.get(&BodyPart::RightThigh).copied().unwrap(), BodyPartState::Orange);
+        assert_eq!(s.body.get(&BodyPart::RightUpperLeg).copied().unwrap(), BodyPartState::Orange);
         assert_eq!(s.stamina, Stamina::Winded);
         assert!(!s.is_default());
     }
@@ -1832,7 +2054,7 @@ mod tests {
         // broken or the condition penalty weren't applied.
         let mut s = fresh_state();
         // Battered: one Heavy wound.
-        s.body.insert(BodyPart::Torso, BodyPartState::Red);
+        s.body.insert(BodyPart::UpperTorso, BodyPartState::Red);
         let mut lethal_count = 0;
         for i in 0..64 {
             let text = format!("I attack the dragon again, turn {i}");
@@ -1884,29 +2106,29 @@ mod tests {
     #[test]
     fn referee_same_part_repeat_hit_escalates() {
         // Architect directive Slice 3: a second hit to an already-wounded
-        // part always escalates, never downgrades. Pre-wound the Torso to
-        // Orange; subsequent Torso hits must land at Red or worse.
+        // part always escalates, never downgrades. Pre-wound the Upper Torso
+        // to Orange; subsequent Upper Torso hits must land at Red or worse.
         let mut s = fresh_state();
-        s.body.insert(BodyPart::Torso, BodyPartState::Orange);
-        let mut toro_hits = 0;
+        s.body.insert(BodyPart::UpperTorso, BodyPartState::Orange);
+        let mut torso_hits = 0;
         for i in 0..200 {
             // Vary the text to spread the RNG across parts.
             let text = format!("I strike the bandit, exchange {i}");
             if let Some(o) = referee_evaluate_with_tier(&text, &s, AttackerTier::Elite) {
-                if o.part == BodyPart::Torso {
-                    toro_hits += 1;
+                if o.part == BodyPart::UpperTorso {
+                    torso_hits += 1;
                     assert!(
                         o.new_state.rank() >= BodyPartState::Orange.rank(),
-                        "Torso repeat-hit must not downgrade from Orange (got {:?})",
+                        "Upper Torso repeat-hit must not downgrade from Orange (got {:?})",
                         o.new_state
                     );
                 }
             }
         }
-        // Sanity: across 200 trials the Torso should have been hit at least
-        // a few times (1/16 parts = ~12 expected). If it's 0 the test is
+        // Sanity: across 200 trials the Upper Torso should have been hit at
+        // least a few times (1/22 parts = ~9 expected). If it's 0 the test is
         // meaningless; assert we actually exercised the path.
-        assert!(toro_hits > 0, "Torso must be hit at least once in 200 trials");
+        assert!(torso_hits > 0, "Upper Torso must be hit at least once in 200 trials");
     }
 
     #[test]

@@ -90,6 +90,31 @@ pub(crate) async fn seed_wupi_codex<E: Embedder>(
     seed_compound_codex(engine, path, card_id, WUPI_SYSTEM_NAMESPACE).await
 }
 
+/// Origin tag for per-card lore seeded from a roleplay card's own `.codex`
+/// (`cards/<card_id>/<card_id>.codex`). Distinct from the global Fable
+/// playbook (`wupi_system`) so per-card lore is queryable/auditable apart
+/// from the shared reference. The render pipeline treats all codex entries
+/// the same regardless of namespace (codex frame, lower dense floor).
+pub(crate) const FABLE_CARD_NAMESPACE: &str = "fable_card";
+
+/// Seed a roleplay card's authored `.codex` into the card's OWN memory
+/// partition (keyed by `card_id`). Mirrors [`seed_wupi_codex`] over the
+/// generic [`seed_compound_codex`], pinning the per-card namespace.
+///
+/// Called from `enter_fable_session` on game start so the card's lore is
+/// live for `search_fable_visible` (which already queries `active_card_id`
+/// as a partition). Idempotent: a re-entry with an unchanged `.codex` does
+/// zero writes (title-keyed, hash-detected reconcile); edits to the file
+/// propagate on the next `fable_start`. Missing file → empty report
+/// (graceful; most cards ship without a `.codex`).
+pub(crate) async fn seed_fable_card_codex<E: Embedder>(
+    engine: &MemoryEngine<E>,
+    path: &Path,
+    card_id: &str,
+) -> anyhow::Result<ReconcileReport> {
+    seed_compound_codex(engine, path, card_id, FABLE_CARD_NAMESPACE).await
+}
+
 /// Parse the compound file, reconcile against the entries already stored in
 /// the partition, and apply the minimal set of inserts/updates/deletes.
 ///

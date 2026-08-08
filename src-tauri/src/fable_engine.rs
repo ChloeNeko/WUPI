@@ -740,17 +740,35 @@ impl FableRuntime {
         ])
         .with_brackets();
 
+        // ThoughtGate: holds the variable-length thought channel
+        // (`<|channel>thought ... <channel|>`) out of the streamed prose so the
+        // reasoning body never leaks to the UI (the marker_filter above strips
+        // the MARKERS but not the body between them). Same pattern as the chat
+        // engine (engine.rs). No-op when the model doesn't think: Detecting→Reply
+        // passes through with only a tiny first-token peek (the length of the
+        // opening marker). The raw `out` still accumulates the FULL verbatim
+        // output (incl. thought) so chat_format::extract_reasoning_channel can
+        // pull the reasoning out end-of-turn + bracket parsing sees the reply.
+        let mut thought_gate = crate::chat_format::ThoughtGate::new();
+
         for _ in 0..max_tokens {
             // Cancellation check at the TOP of the loop (between tokens,
             // never mid-decode: same KV-consistency contract as the chat
             // engine, §2C).
             if req.cancel.load(std::sync::atomic::Ordering::Relaxed) {
                 tracing::debug!("game turn cancelled by request");
-                // Flush any held-back text so the partial reply is complete
-                // up to the cancel point (mirrors the chat engine's flush).
+                // Flush both filters so the partial reply is complete up to
+                // the cancel point (mirrors the chat engine's flush order:
+                // thought_gate first, then marker_filter).
+                let gate_tail = thought_gate.flush();
+                if !gate_tail.is_empty() {
+                    let cleaned = marker_filter.feed(&gate_tail);
+                    if !cleaned.is_empty() {
+                        (req.on_chunk)(&cleaned);
+                    }
+                }
                 let tail = marker_filter.flush();
                 if !tail.is_empty() {
-                    out.push_str(&tail);
                     (req.on_chunk)(&tail);
                 }
                 return Err(GenerationOutcome::Cancelled(out));
@@ -776,12 +794,18 @@ impl FableRuntime {
                 })?;
             if !piece.is_empty() {
                 out.push_str(&piece);
-                // Feed through the marker filter: only the safe-to-emit
-                // slice reaches the UI. The filter holds back any partial
-                // marker prefix straddling the chunk boundary.
-                let safe = marker_filter.feed(&piece);
-                if !safe.is_empty() {
-                    (req.on_chunk)(&safe);
+                // Pipeline mirrors the chat engine (engine.rs:884-892):
+                // thought_gate holds the thought body + emits clean reply,
+                // then marker_filter strips the remaining protocol/bracket
+                // markers. Only the safe slice reaches the UI. The raw `out`
+                // keeps the full verbatim piece for end-of-turn reasoning
+                // extraction + bracket parsing.
+                let (gate_output, _is_thinking) = thought_gate.feed(&piece);
+                if !gate_output.is_empty() {
+                    let cleaned = marker_filter.feed(&gate_output);
+                    if !cleaned.is_empty() {
+                        (req.on_chunk)(&cleaned);
+                    }
                 }
             }
 
@@ -800,9 +824,16 @@ impl FableRuntime {
             n_cur += 1;
         }
 
-        // Flush any held-back tail (partial marker prefix, or text inside
-        // the trailing window at EOG). Same contract as the chat engine's
-        // post-loop flush.
+        // Flush both filters (thought_gate first, then marker_filter) — same
+        // order + contract as the chat engine's post-loop flush
+        // (engine.rs:940-950). Emits any held-back reply tail at EOG.
+        let gate_tail = thought_gate.flush();
+        if !gate_tail.is_empty() {
+            let cleaned = marker_filter.feed(&gate_tail);
+            if !cleaned.is_empty() {
+                (req.on_chunk)(&cleaned);
+            }
+        }
         let tail = marker_filter.flush();
         if !tail.is_empty() {
             out.push_str(&tail);

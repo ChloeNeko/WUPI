@@ -19,6 +19,11 @@ tools/
 src-tauri/models/
 src-tauri/vendor/
 
+# Paperdoll hitbox coordinate data — hand-authored via src/hitbox-editor.html,
+# local-only. The shipped loader body-parts.js imports it at build time, so a
+# fresh clone must re-author it before the frontend builds.
+src/fable/data/
+
 # Python bytecode caches.
 __pycache__/
 
