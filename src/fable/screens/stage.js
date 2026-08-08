@@ -18,15 +18,15 @@
 // shelved pending the rest of the UI settling. See stats-panel.js +
 // mannequin.js in git history when the left side is revisited.)
 //
-// BACKGROUND + WEATHER STRIPPED (2026-07-26, Quick Play rewrite): the bg
-// <img>, the tone-keyword bg picker, the atmosphere layer (time-of-day
-// filter + weather), and the mouse parallax were all removed. The stage is
-// a pure black void for ALL games now — Quick Play lands here straight from
-// the void interview, and the manual-card path no longer has a tavern card
-// to source a bg from. Backgrounds + weather will be re-added in a later
-// pass once the new art direction settles. The `.fable-stage-bg` element
-// stays in the DOM as a no-op over the black .fable-stage so the re-add is a
-// one-line structural change.
+// BACKGROUND + WEATHER STRIPPED: the bg <img>, the tone-keyword bg picker,
+// and (2026-08-03) the entire atmosphere system (time-of-day background
+// filter, keyword-scan weather particles, and mouse parallax) were all
+// removed. The stage is a pure black void for ALL games now — Quick Play
+// lands here straight from the void interview, and the manual-card path no
+// longer has a tavern card to source a bg from. The `.fable-stage-bg`
+// element stays in the DOM as a no-op over the black .fable-stage so a
+// future bg re-add is a one-line structural change. Explicit narrator
+// [FX ...] brackets still drive fx/effects.js (a separate, opt-in path).
 // =============================================================
 
 import * as beats from '../engine/beats.js';
@@ -55,11 +55,17 @@ function esc(s) {
 
 // Background + atmosphere were stripped (see file header). The bg layer
 // (.fable-stage-bg) is empty; mapTheme is a static 'fantasy' default so the
-// optional map panel still gets a usable atlas theme without depending on a
-// card tone.
+// optional map panel still gets a usable atlas theme without depending on
+// a card tone.
 
 let stageRoot = null;
 let toastTimer = null;
+// API-lost composer lock (2026-08-07 override): when the API narrator dies
+// mid-session there's no local fallback. The composer greys out, shows a red
+// "API LOST CONNECTION" message, + Enter becomes a retry probe. The pending
+// turn text is stashed so a successful retry re-sends it.
+let composerLocked = false;
+let pendingTurnText = '';
 let cardContext = null;  // { card, saveId } for the active session
 let activeCardName = '';  // display name of the seated card (the typing indicator)
 let activePlayerName = '';  // protagonist name (card.player_name) → user-beat headers
@@ -86,7 +92,6 @@ export function buildStage() {
   root.hidden = true;
   root.innerHTML = `
     <div class="fable-stage-bg"></div>
-    <div class="fable-atmo-layer" data-atmo></div>
     <div class="fable-fx-layer" data-fx></div>
     <div class="fable-dialogue-feed" data-feed></div>
     <!-- Typing indicator: "(name) is currently typing.." pinned just above the
@@ -228,10 +233,10 @@ export async function wireStage(root, hooks) {
   const feed = root.querySelector('[data-feed]');
   const fxLayer = root.querySelector('[data-fx]');
 
-  // Background + atmosphere stripped (file header). The bg layer
-  // (.fable-stage-bg) is empty — it paints nothing over the pure black
-  // .fable-stage. Map theme is a static 'fantasy' default so the optional
-  // map panel still works without a card tone.
+  // Background stripped (file header). The bg layer (.fable-stage-bg) is
+  // empty — it paints nothing over the pure black .fable-stage. Map theme
+  // is a static 'fantasy' default so the optional map panel still works
+  // without a card tone.
   setMapTheme('fantasy');
 
   // Engine init (composition root).
@@ -282,6 +287,12 @@ export async function wireStage(root, hooks) {
         }
       }
     },
+    // 2026-08-07 override: the API narrator died mid-session (no local fallback).
+    // Lock the composer with the red "API LOST CONNECTION" state + surface a
+    // retry affordance. The player reconnects via the OS Settings AI panel.
+    onApiLost: (message) => {
+      lockComposer(message);
+    },
   });
 
   // Panel manager: overlay + host. onDismiss hides the overlay element.
@@ -310,13 +321,6 @@ export async function wireStage(root, hooks) {
     },
   });
 
-  // Crossroads (the option-picker modal) + Ghostwriter (the Impersonate ✎
-  // button) + Selective Regenerate (highlight-to-rewrite) were removed
-  // 2026-07-31: their backend IPCs (crossroads_generate / ghostwriter_generate
-  // / regenerate_slice) are dead stubs after the narrator/codex layer strip.
-  // The generate_options / set_directive Director tools are still live in
-  // Rust and now render only the generic tool chip in the Wupi drawer.
-
   // Input form (narrator turn). All stage-element listeners go through
   // on() so teardownStage removes them — the stage DOM is reused across
   // entries, so a raw addEventListener would double-bind on re-wireStage.
@@ -339,6 +343,12 @@ export async function wireStage(root, hooks) {
   on(input, 'keydown', (e) => {
     if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault();
+      // API-locked composer (2026-08-07): Enter re-checks the connection. If
+      // the API is back, unlock + re-send the pending turn; otherwise re-toast.
+      if (composerLocked) {
+        retryIfApiReady();
+        return;
+      }
       if (narrator.isGenerating() && !input.value.trim()) {
         // Empty Enter mid-generation → stop. The seamless stop affordance.
         narrator.stopFableTurn();
@@ -540,6 +550,62 @@ export async function wireStage(root, hooks) {
     syncLeftEdgeLockColor();
   });
 
+  // ── Edge-lock "stuck visible" guard (Chloe 2026-08-06) ────────────────
+  // The edge-lock bars are shown/hidden ONLY by onStageMouseMove (it toggles
+  // `.visible` based on the pointer's distance from the screen edge). That
+  // handler only runs while the mouse is MOVING over the stage. Three cases
+  // leave a bar stuck `.visible` with no further mousemove to clear it:
+  //   1. The pointer leaves the window entirely (alt-tab, clicking another
+  //      monitor, a fullscreen hand-off). The last mousemove armed the bar;
+  //      nothing fires to disarm it.
+  //   2. A viewport RESIZE — fullscreen toggle, display-resolution change,
+  //      DPR shift, dock auto-hide. The stage rect changes size, so the
+  //      pointer's stored screen position is suddenly "at the edge" relative
+  //      to the NEW (smaller) rect, but no mousemove arrives to recompute.
+  //   3. The window loses focus (blur) mid-hover.
+  // A stuck `.visible` edge lock permanently suppresses the drawer's
+  // mouseleave auto-close (onDrawerMouseLeave's `edgeLockVisible()` probe
+  // returns true forever) → the drawer is stuck OPEN, which the user
+  // experiences as "the right drawer stays infinitely open / the left drawer
+  // breaks / the text box looks pushed left" (the open drawer overlaps the
+  // centered input). Toggling the lock doesn't help because the bar is still
+  // `.visible`; only a hard refresh cleared it.
+  // FIX: dismiss BOTH edge-lock bars whenever the pointer leaves the window,
+  // the window blurs, or the viewport resizes — AND close any un-locked
+  // drawer that was held open only by the now-cleared lock (its mouseleave
+  // auto-close was suppressed by the stale `.visible` state, so without this
+  // it would stay open until the next manual interaction). A resize while
+  // genuinely hovering the edge re-arms the bar on the very next mousemove
+  // (the mousemove handler is authoritative for the visible state), so this
+  // only ever clears STALE state — never a live hover. Tracked via on() so it
+  // tears down with the stage.
+  function dismissStaleEdgeLocks() {
+    if (wupiEdgeLock) wupiEdgeLock.classList.remove('visible');
+    if (leftEdgeLock) leftEdgeLock.classList.remove('visible');
+    // Close any drawer held open only by the stale lock. Locked drawers stay
+    // (the user pinned them deliberately); generating drawers stay (don't
+    // yank mid-stream). This mirrors onDrawerMouseLeave's own guards.
+    if (wupiDrawer.isOpen() && !wupiDrawer.isLocked() && !wupiDrawer.isGenerating()) {
+      wupiDrawer.closeDrawer();
+    }
+    if (leftDrawer.isOpenState() && !leftDrawer.isLocked()) {
+      leftDrawer.closeDrawer();
+    }
+  }
+  // mouseout on document with no relatedTarget = pointer left the viewport
+  // (the robust cross-browser "mouse exited window" signal). window blur
+  // covers the focus-loss case.
+  on(document, 'mouseout', (e) => {
+    if (!e.relatedTarget && !e.toElement) dismissStaleEdgeLocks();
+  });
+  on(window, 'blur', dismissStaleEdgeLocks);
+  on(window, 'resize', dismissStaleEdgeLocks);
+  // visibilitychange (tab hidden / window minimized via Win+D) covers cases
+  // resize+blur miss on some Windows builds.
+  on(document, 'visibilitychange', () => {
+    if (document.hidden) dismissStaleEdgeLocks();
+  });
+
   // Drawer footer actions. Three ICON buttons (no worded labels):
   //   💾 Save → opens the center save modal (name input + Quick Save / Save)
   //   📂 Load → fires the onLoad hook (save picker, future); closes drawer
@@ -682,6 +748,70 @@ function setGenerating(on) {
       delete input.dataset.idlePlaceholder;
     }
     input.focus();
+  }
+}
+
+// Lock the narrator composer when the API dies mid-session (2026-08-07). The
+// input greys out + a red glowing "API LOST CONNECTION" message replaces the
+// placeholder. The user is told to reconnect via Settings; pressing Enter
+// probes the connection (retryIfApiReady) and re-sends the pending turn if the
+// API is back. The Wupi-drawer chat (local model) is unaffected — only the
+// narrator composer locks.
+function lockComposer(message) {
+  const inputRow = stageRoot && stageRoot.querySelector('[data-input-form]');
+  const input = stageRoot && stageRoot.querySelector('[data-input]');
+  if (!inputRow || !input) return;
+  // Stash the text the player was trying to send so a retry re-sends it. The
+  // backend already aborted the turn WITHOUT consuming the user message (the
+  // api_lost path returns before add_message on the assistant side, but the
+  // user turn WAS pushed at the top of fable_send — so on a successful retry
+  // we send a fresh copy; the duplicate user turn is benign because the
+  // retried narration reads the window, not a strict turn-count).
+  pendingTurnText = input.value && input.value.trim();
+  input.value = '';
+  input.style.height = 'auto';
+  input.disabled = true;
+  // The red glowing placeholder IS the in-box error message.
+  input.placeholder = 'API LOST CONNECTION';
+  inputRow.classList.add('is-api-lost');
+  composerLocked = true;
+  toast(message || 'API connection lost — reconnect via Settings, then press Enter to retry.');
+}
+
+function unlockComposer() {
+  const inputRow = stageRoot && stageRoot.querySelector('[data-input-form]');
+  const input = stageRoot && stageRoot.querySelector('[data-input]');
+  if (!inputRow || !input) return;
+  inputRow.classList.remove('is-api-lost');
+  input.disabled = false;
+  // Restore the original idle placeholder (setGenerating stashes it, but the
+  // lock overwrote it directly — reset to the default).
+  input.placeholder = 'Type a message...';
+  composerLocked = false;
+  input.focus();
+}
+
+// Probes whether the API is back; if so, unlocks + re-sends the pending turn.
+// Called when the player presses Enter on the locked composer. A failure or a
+// still-down API re-toasts so the player knows to keep trying.
+async function retryIfApiReady() {
+  let extra;
+  try {
+    extra = await invoke('model_source_get');
+  } catch (e) {
+    toast('Still no API connection — check Settings.');
+    return;
+  }
+  const apiReady = !!(extra && extra.source === 'api' && extra.apiReady);
+  if (!apiReady) {
+    toast('Still no API connection — reconnect in Settings, then press Enter.');
+    return;
+  }
+  const text = pendingTurnText;
+  pendingTurnText = '';
+  unlockComposer();
+  if (text && !narrator.isGenerating()) {
+    narrator.sendFableTurn(text);
   }
 }
 
@@ -876,8 +1006,7 @@ function refreshControls() {
 //   - resets narrator + wupi-drawer module state (clears a stuck
 //     `generating` flag from a close mid-turn, nulls dangling beat refs,
 //     wipes the Wupi transcript + reseeds the greeting for next entry),
-//   - tears down the FX timers + atmosphere (RAF + window listener) +
-//     clears the dialogue feed.
+//   - tears down the FX timers + clears the dialogue feed.
 // No RAF, no interval, no listener, no flag survives this.
 export function teardownStage() {
   document.removeEventListener('keydown', onKeyDown, true);
@@ -890,6 +1019,9 @@ export function teardownStage() {
   cancelCornerDwell();
   cornerTrigger = null;
   saveModalClose = null;
+  // Reset the API-lost composer lock so a re-entry isn't stuck greyed out.
+  composerLocked = false;
+  pendingTurnText = '';
   // Clear the toast timer so it can't fire into a torn-down element after
   // close (was a residual-state gap — harmless but not clean).
   if (toastTimer) { clearTimeout(toastTimer); toastTimer = null; }
@@ -897,8 +1029,6 @@ export function teardownStage() {
   // content don't persist into the next session.
   if (panelActive()) dismissPanel();
   clearAllFX();
-  // (resetAtmosphere was here pre-stripping — atmosphere is gone now, see
-  // file header. beats.clearFeed is the only feed reset needed.)
   beats.clearFeed();
   // Hide the typing indicator (a close mid-stream could leave it visible).
   if (stageRoot) hideTypingIndicator(stageRoot);

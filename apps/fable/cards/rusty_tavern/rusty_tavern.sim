@@ -19,9 +19,11 @@ The wider world: Ashford sits at the frontier of charted lands; beyond the King'
 Atmospheric, grounded, slow-burn. The tavern feels real before anything happens. Sensory detail first (firelight, rain, the smell of woodsmoke and spilled ale), then character. NPCs are people with their own concerns, not quest dispensers. Danger, when it comes, should feel earned — never gratuitous. Leave room for the player to set the pace.
   ]]></tone>
   <player_name><![CDATA[Kaelen]]></player_name>
-  <opening_scene><![CDATA[
-The door of the Rusty Lantern swings shut behind you, cutting off the cold rain. Warmth and the smell of woodsmoke roll over you; the low murmur of conversation dips for a moment as a few patrons glance your way, then returns. Water drips from your cloak onto the flagstones. Behind the bar, Mara looks up from the tankard she's polishing and gives you a measured nod — neither welcoming nor unwelcoming, just... assessing. "Traveler," she says, loud enough to carry. "Kitchen's closed, but the ale's warm and the fire's free. Sit where you like." The dice game by the hearth resumes; the hooded figure in the corner doesn't look up at all. What do you do?
-  ]]></opening_scene>
+  <!-- NOTE: the opening beat now lives in the sibling rusty_tavern.intro file
+       (2026-08-05). It was moved out of the cached <sim_card> because it's a
+       one-shot first-turn seed, not per-turn context — baking it here would
+       inflate every turn's KV cache (a prime-directive violation). The intro
+       is read ONCE at game start + surfaced on FableLoadResult.intro. -->
   <start_npcs><![CDATA[
 - mara_the_innkeep
 - the_hooded_stranger

@@ -1,5 +1,9 @@
 <!DOCTYPE html>
-<html lang="en">
+<html lang="en" data-colorcode="Vibrant">
+    <!-- data-colorcode mirrors the active color code (synced in script.js
+         applyTheme). Ships as "Vibrant" because that's the project default,
+         so CSS can scope Vibrant-specific overrides (e.g. the LOADING OS
+         text's magenta tint) before the boot theme_get IPC lands. -->
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
@@ -11,7 +15,7 @@
          before the webfont caches. -->
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-    <link href="https://fonts.googleapis.com/css2?family=Fredoka:wght@500;600;700&display=swap" rel="stylesheet">
+    <link href="https://fonts.googleapis.com/css2?family=Fredoka:wght@500;600;700&family=Uncial+Antiqua&family=Almendra:wght@700;800&display=swap" rel="stylesheet">
 </head>
 <body class="booting">
     <!-- Boot phase: the OS window is transparent (tauri.conf.json) and STAYS
@@ -460,28 +464,25 @@
                 </div>
                 <span class="home-app-label">AI</span>
             </div>
-            <!-- Games → Fable. Clicking launches the Fable app via
-                 openWindow('fable'), which the openHook (registered by
-                 initFable in script.js) redirects to launchFable() →
-                 AppLifecycle.launchApp('fable'). The 2s paused welcome
-                 (music + ripple + button reveal) runs inside boot.js once
-                 the app is open.
-                 Phase 2 wiring (2026-07-26): the full-screen immersion
-                 shell + Simulation Narrative Engine are live; this tile
-                 was the last inert gate. -->
-            <div class="home-app" data-open="fable" aria-label="Games">
+            <!-- FABLE. Clicking launches the Fable app. The tile is
+                 special-cased in script.js's home-app handler (it short-
+                 circuits straight to launchFable() rather than
+                 openWindow('fable')) because Fable's "Cloud Bank Sweep"
+                 transition plays OVER the OS desktop and swaps to the title
+                 at its midpoint (when the solid fog core covers the screen) —
+                 so the home grid must stay open + visible until that swap.
+                 openFable's fog onSwap callback owns the swap (show #fable +
+                 dismiss the home grid), fired invisibly under the solid fog.
+                 Icon: a white OUTLINED uppercase "F" in Uncial Antiqua, with
+                 a transparent interior (matches Fable's medieval-fantasy
+                 identity; the title wordmark is also Uncial-Antiqua-styled).
+                 2026-08-03: renamed label "Games" → "FABLE" + replaced the
+                 prior game-controller SVG with this glyph. -->
+            <div class="home-app" data-open="fable" aria-label="FABLE">
                 <div class="home-app-icon">
-                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
-                        <line x1="6" y1="11" x2="10" y2="11"></line>
-                        <line x1="8" y1="9" x2="8" y2="13"></line>
-                        <line x1="15" y1="12" x2="15.01" y2="12"></line>
-                        <line x1="18" y1="10" x2="18.01" y2="10"></line>
-                        <line x1="17" y1="14.5" x2="17.01" y2="14.5"></line>
-                        <line x1="16.5" y1="12.5" x2="16.51" y2="12.5"></line>
-                        <path d="M17.32 5H6.68a4 4 0 0 0-3.978 3.59c-.006.052-.01.101-.017.152C2.604 9.416 2 14.456 2 16a3 3 0 0 0 3 3c1 0 1.5-.5 2-1l1.414-1.414A2 2 0 0 1 9.828 16h4.344a2 2 0 0 1 1.414.586L17 18c.5.5 1 1 2 1a3 3 0 0 0 3-3c0-1.545-.604-6.584-.685-7.258A4 4 0 0 0 17.32 5z"></path>
-                    </svg>
+                    <span class="fable-glyph" aria-hidden="true">F</span>
                 </div>
-                <span class="home-app-label">Games</span>
+                <span class="home-app-label">FABLE</span>
             </div>
             <!-- Prism (2026-07-31): the image-generation app. Clicking launches
                  Prism via openWindow('prism'), which the openHook (registered
@@ -491,7 +492,7 @@
                  user-supplied prompt/seed/cfg/sampler. The Glass Vault gallery
                  + Tag Composer + seed-locked Fork & Edit live under
                  src/prism/. -->
-            <div class="home-app" data-open="prism" aria-label="Prism">
+            <div class="home-app" data-open="prism" aria-label="PRISM">
                 <div class="home-app-icon">
                     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
                         <path d="M6 3h12l3 6-9 12L3 9z"></path>
@@ -500,7 +501,7 @@
                         <path d="M15 3l1.5 6L12 21"></path>
                     </svg>
                 </div>
-                <span class="home-app-label">Prism</span>
+                <span class="home-app-label">PRISM</span>
             </div>
             <div class="home-app" data-open="profile">
                 <div class="home-app-icon">

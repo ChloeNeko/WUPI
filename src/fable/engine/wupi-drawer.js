@@ -4,7 +4,9 @@
 // A slide-out drawer (right edge, 420px) wired to chat_send. Because
 // a game is active, the backend auto-routes through fable_command::
 // classify (lib.rs). So the player asks Wupi in natural language:
-//   "show me my inventory"   → QueryWorldState → panel opens
+//   "show me my inventory"   → QueryWorldState → Wupi narrates the typed
+//                              inventory (equipment/belt/pack); the paperdoll
+//                              HUD (left drawer) is the visual source of truth
 //   "make the barkeeper angry" → MutateWorldState → schema delta
 //   "tell me a joke"         → NotACommand → normal Wupi chat
 //
@@ -15,9 +17,16 @@
 //   confirms in her drawer ("Here's your inventory."). The player
 //   never leaves immersion; panels are summoned, never persistent.
 //
+//   NOTE (2026-08-07): the inventory panel was RETIRED — items now live
+//   in the typed player_state.{equipment,belt,pack} model + are surfaced
+//   via the paperdoll HUD. An inventory focus no longer opens a modal;
+//   route_to_fable_query (lib.rs) renders a typed-model summary for Wupi
+//   to narrate. The panel seam still serves the other foci (map/skills/
+//   party/craft/codex).
+//
 // Channel event shapes (from chat_send, the manager-routing variants):
 //   { type: 'chunk',            text }
-//   { type: 'fable_state_query', focus, state }   → opens a panel
+//   { type: 'fable_state_query', focus, state }   → opens a panel (non-inventory)
 //   { type: 'error',            message }
 //   { type: 'done',             final_text, fable_manager?, reasoning? }
 // =============================================================
@@ -25,11 +34,7 @@
 import { invoke, Channel } from '@tauri-apps/api/core';
 import * as savesIo from './saves-io.js';
 import { showApiTimeout, dismissApiTimeout } from '../../api-timeout-bubble.js';
-// Crossroads + Ghostwriter were removed (their crossroads_generate /
-// ghostwriter_generate IPCs are dead stubs). The generate_options /
-// set_directive Director tools are still live in Rust (tools.rs) — their
-// tool_call events now fall through to the generic tool chip below instead
-// of opening a dead modal / impersonate pass.
+import { resetTabRail } from './tab-rail.js';
 
 let drawerEl = null;
 let messagesEl = null;
@@ -171,6 +176,11 @@ export function closeDrawer() {
   if (!drawerEl) return;
   drawerEl.classList.remove('open');
   open = false;
+  // Collapse any open tab dropdown + deactivate its icon so nothing persists
+  // behind the closed drawer (Chloe 2026-08-06: match the left drawer's reset-
+  // on-close). Touches ONLY the tab rail — the Wupi chat history (messagesEl)
+  // is a separate element + is never cleared here.
+  resetTabRail();
 }
 
 // Set the edge-lock visibility probe. stage.js calls this with a fn that
@@ -218,8 +228,6 @@ export function resetWupiDrawer() {
     inputEl.style.height = 'auto';
     inputEl.placeholder = IDLE_PLACEHOLDER;
   }
-  // Crossroads modal + Impersonate button were removed (their IPCs are dead
-  // stubs). No per-session state to reset for them anymore.
 }
 
 function autoGrow(el) {
@@ -261,7 +269,10 @@ function appendToBubble(bubble, text) {
   messagesEl.scrollTop = messagesEl.scrollHeight;
 }
 
-function finalizeBubble(bubble, finalText) {
+function finalizeBubble(bubble, finalText, reasoning) {
+  // `reasoning` is unused post-2026-08-07 override (the player-facing reasoning
+  // UI was removed; the local model still thinks internally).
+  void reasoning;
   if (!bubble) return;
   bubble.classList.remove('streaming');
   if (finalText != null) bubble.querySelector('.fable-wupi-msg-body').innerHTML = prose(finalText);
@@ -299,12 +310,7 @@ function handleEvent(msg, originalText) {
     case 'tool_call':
       // Tool-calling agent loop (Phase 5): show a chip above the active
       // bubble indicating Wupi is executing a tool. The chip morphs on
-      // tool_result. Lazily created so non-tool turns see nothing. The
-      // generate_options / set_directive Director tools (still live in Rust)
-      // now render only this generic chip — the dedicated Crossroads modal
-      // + Impersonate pass that used to intercept them were removed (their
-      // crossroads_generate / ghostwriter_generate IPCs are dead stubs).
-      // set_directive still arms server-side via ToolCtx regardless of UI.
+      // tool_result. Lazily created so non-tool turns see nothing.
       if (!activeToolChip && messagesEl && activeBubble) {
         activeToolChip = document.createElement('div');
         activeToolChip.className = 'drawer-tool-chip running';
@@ -371,12 +377,6 @@ function onFableStateQuery(focus, stateJson) {
   const entities = (schema && schema.entities) || {};
   panelManager.summon(focus || '', entities, schema || {});
 }
-
-// ── Impersonate ✎ button REMOVED (2026-07-31) ─────────────────────────────
-// The Impersonate pass rode ghostwriter_generate, which is now a dead stub
-// (the guided_prompt module was deleted). The button was deleted with it.
-// set_directive (the Director steer) still works server-side via its Rust
-// tool — it just renders the generic tool chip now, no special UI.
 
 // Expose save/load shortcuts the pause menu + drawer can call.
 export { savesIo };

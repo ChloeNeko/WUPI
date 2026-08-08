@@ -36,8 +36,9 @@ Required structure (the canonical flat format — world fields are direct childr
   <plot><![CDATA[ how the story moves (consequence philosophy) ]]></plot>
   <tone>grim, atmospheric, slow-burn</tone>
   <player_name>Alex</player_name>
-  <opening_scene><![CDATA[ the first narrator beat ]]></opening_scene>
 </sim_card>
+
+The opening narrator beat (the first-turn seed) does NOT live in the .sim — it lives in a SIBLING .intro file (cards/<id>/<id>.intro), as plain text. The intro is a one-shot first-turn seed, not per-turn context: baking it into the cached <sim_card> system prompt would inflate every turn's KV cache with text only relevant to turn 1 (a prime-directive violation). The .intro is read ONCE at game start + surfaced on FableLoadResult.intro; it is never injected into the cached prompt.
 
 Rules: the card id derives from <identity><name> lowercased (sanitized: non-alphanumeric becomes dashes), and every card id is unique. <metadata><type>roleplay</type></metadata> is REQUIRED for a card to appear in the New Game picker — system cards (Wupi) omit metadata entirely. A <metadata><id>...</id></metadata> is optional (overrides the derived id when you need a specific slug). No <technical_protocols> block — engine protocols are Rust-injected per pass, never authored into a card. Use CDATA for any multiline prose or text with special characters. Roleplay cards persist per-card sessions and schemas; the Wupi-assistant card does not. The legacy <scenario> wrapper still loads (flat-first parser with fallback) but the flat shape is canonical.
 

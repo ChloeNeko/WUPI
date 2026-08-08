@@ -181,6 +181,19 @@ impl ChatFormat for Gemma4Format {
                 push_escaped(&mut out, &t.description);
                 out.push_str("\"}<tool|>");
             }
+            // Always-on thinking: the Gemma4 `<|think|>` control token that
+            // activates the model's thought channel. Injected at the END of the
+            // system turn so the model emits `<|channel>thought ... <channel|>`
+            // before its reply. Protocol-level (like `<|turn>`), NOT prompt
+            // text — does not bloat the prose. Thinking is a CORE engine
+            // requirement for coherence with the crafted .prompt files, NOT a
+            // debug toggle: the model always reasons over the turn before it
+            // answers. The thought body is held out of streamed prose by
+            // ThoughtGate (engine.rs) + captured end-of-turn by parse_output.
+            // The StreamFilter strips `<|think|>` if the model echoes it.
+            // (Local-only — the API chat path is OpenAI format, no control
+            // tokens; the Fable narrator is also API-only and never thinks.)
+            out.push_str("<|think|>");
             out.push_str("<turn|>\n");
         }
 
@@ -203,8 +216,20 @@ impl ChatFormat for Gemma4Format {
                 // Legacy turns (no raw_output) fall back to strip_thinking.
                 // Tool-call turns (raw contains `<|tool_call>`) are included
                 // automatically — the markers are part of the verbatim raw.
+                //
+                // ALWAYS-ON THINKING carve-out: a thought-enabled turn's
+                // raw_output carries its own `<|channel>thought ... <channel|>`
+                // block. Re-rendering that verbatim would feed the model's past
+                // reasoning back to it as literal content next turn — context
+                // pollution. So ALWAYS strip the thought from the re-rendered
+                // raw (thinking is always on; the strip must be too). Trade-off:
+                // the rendered tokens no longer byte-match the resident KV → the
+                // structural-divergence guard fires → thought-bearing chat turns
+                // cold-reset (full re-prefill). Accepted cost (Memory-enabled
+                // turns already pay it; §3). The narrative/referee precision the
+                // thought channel buys is worth one cold-reset per turn.
                 if !m.raw_output.is_empty() {
-                    out.push_str(&m.raw_output);
+                    out.push_str(&strip_thinking(&m.raw_output));
                 } else {
                     out.push_str(&strip_thinking(&m.content));
                 }
@@ -325,6 +350,39 @@ fn strip_thinking(text: &str) -> String {
         }
     }
     out.trim().to_string()
+}
+
+/// Extract ONLY the thought channel from Gemma4 protocol-wrapped model output,
+/// mirroring the reasoning capture in `parse_output` but as a standalone pure
+/// fn the Fable path can call (the Fable engine does not go through
+/// `Gemma4Format::parse_output` — it keeps the raw output for bracket parsing
+/// and strips the reply separately via `schema::extract_reply_channel`). This
+/// sibling fn pulls everything inside `<|channel>thought ... <channel|>`
+/// blocks, so the chat path's reasoning can be captured for the `ParsedOutput.
+/// reasoning` field. Returns "" only when the turn produced no thought channel
+/// (rare — thinking is always injected on local passes, but the model may
+/// still occasionally skip it). Local-only: the API chat path + the Fable
+/// narrator (API) never emit a thought channel. The player-facing reasoning UI
+/// was removed in the 2026-08-07 override; this fn stays for internal capture.
+pub fn extract_reasoning_channel(raw: &str) -> String {
+    let mut reasoning = String::new();
+    for part in raw.split("<channel|>") {
+        if part.contains("<|channel>") {
+            let thought = part
+                .split("<|channel>")
+                .last()
+                .unwrap_or("")
+                .trim_start_matches("thought")
+                .trim();
+            if !thought.is_empty() {
+                if !reasoning.is_empty() {
+                    reasoning.push('\n');
+                }
+                reasoning.push_str(thought);
+            }
+        }
+    }
+    reasoning.trim().to_string()
 }
 
 /// Minimal JSON-string escaping for embedding values into the Gemma 4 tool
@@ -939,15 +997,29 @@ mod tests {
 
     #[test]
     fn gemma4_renders_model_turn_from_raw_output_when_present() {
-        // Bug #3: when raw_output is present, the formatter renders it verbatim
-        // (cache-coherent) instead of stripping thinking from cleaned content.
+        // Always-on thinking invariant: a prior turn's raw_output carries its
+        // own `<|channel>thought ... <channel|>` block. Re-rendering that
+        // verbatim would feed the model's past reasoning back to it as literal
+        // content next turn (context pollution). So the raw_output branch MUST
+        // strip the thought — only the reply reaches the next prompt. The
+        // KV-cache divergence this induces is handled by the structural-
+        // divergence guard in engine.rs (cold-reset). This test pins the
+        // invariant so a future change can't silently re-introduce the leak.
         let f = Gemma4Format;
         let mut m = msg("assistant", "visible reply");
         m.raw_output = "<|channel>thought\nsecret\n<channel|>visible reply".into();
         let out = f.render_prompt("", &[m], &[], None, None, false);
         assert!(
-            out.contains("<|channel>thought\nsecret\n<channel|>visible reply"),
-            "raw_output should be rendered verbatim for cache coherence, got: {out}"
+            !out.contains("secret"),
+            "prior thought body must NOT re-enter the prompt, got: {out}"
+        );
+        assert!(
+            !out.contains("<|channel>thought"),
+            "prior thought opener must be stripped, got: {out}"
+        );
+        assert!(
+            out.contains("visible reply"),
+            "reply must survive the strip, got: {out}"
         );
     }
 

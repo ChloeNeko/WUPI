@@ -899,9 +899,9 @@ body.fable-active.fable-chrome-peek .top-bar { transform: translateY(0); }
        GONE. The stage is now a PURE BLACK VOID for all games — Quick Play
        lands here straight from the void interview (no tavern card to source
        a bg from anymore), and the manual-card path has no bg either.
-       Backgrounds + atmosphere will be re-added in a later pass once the
-       new art direction settles. Re-adding = restore the background-image
-       stack here (one edit, no structural change). */
+       Backgrounds will be re-added in a later pass once the new art
+       direction settles. Re-adding = restore the background-image stack
+       here (one edit, no structural change). */
     background-color: #000;
     background-image: none;
 }
@@ -913,21 +913,6 @@ body.fable-active.fable-chrome-peek .top-bar { transform: translateY(0); }
        the inner <img> is gone. Stream C re-tints this as the dark ECHO base.
        Hidden until art returns so a stray layer never flashes. */
     display: none;
-}
-@keyframes fableBreathe {
-    from { transform: translate(var(--parallax-x,0), var(--parallax-y,0)) scale(1.05); }
-    to   { transform: translate(var(--parallax-x,0), var(--parallax-y,0)) scale(1.09); }
-}
-/* .fable-atmo-layer is retained in the DOM (the buildStage template still
-   emits it) but with the atmosphere system stripped it's an empty
-   no-op layer. Kept here so re-adding atmosphere = wiring initAtmosphere
-   in stage.js, not a CSS change. */
-.fable-atmo-layer {
-    position: absolute;
-    inset: 0;
-    z-index: 10;
-    pointer-events: none;
-    transition: filter 1.5s ease;
 }
 /* The fx-layer z-index + classes live in fx/fx.css. */
 
@@ -1486,11 +1471,11 @@ body.fable-active.fable-chrome-peek .top-bar { transform: translateY(0); }
     box-sizing: border-box;
     resize: none;
     /* Explicit height (Chloe 2026-07-26): pins the field's box so the
-       rendering is stable. Chloe 2026-07-27: right padding bumped 18→44px
-       to reserve room for the Impersonate ✎ button that now floats inside
-       the right edge of the box (see .fable-impersonate-btn). The BOX SIZE
-       IS UNCHANGED (still 54px tall) — only the inner right padding moves,
-       so the field does not resize (per Chloe's standing instruction). */
+       rendering is stable. Right padding 44px (historical: was 18, bumped to
+       reserve room for a since-removed inline button; kept at 44 as a stable
+       no-op — no element floats there now). The BOX SIZE IS UNCHANGED (still
+       54px tall) — only the inner right padding, so the field does not resize
+       (per Chloe's standing instruction). */
     height: 54px;
     padding: 13px 44px 13px 18px;
     /* Recessed well: dark umber floor, NOT cold navy. */
@@ -1525,6 +1510,47 @@ body.fable-active.fable-chrome-peek .top-bar { transform: translateY(0); }
         0 0 0 1px var(--fable-brass-dim);
 }
 
+/* API-lost composer lock (2026-08-07 override). When the API narrator dies
+   mid-session there's no local fallback: the input greys out + a red glowing
+   "API LOST CONNECTION" message takes the placeholder. Enter probes the
+   connection + re-sends the pending turn once the API is back. */
+.fable-input-row.is-api-lost .fable-input {
+    opacity: 0.45;
+    cursor: not-allowed;
+    border-color: rgba(255, 59, 59, 0.55);
+    box-shadow:
+        inset 0 0 0 1px rgba(0, 0, 0, 0.25),
+        0 0 14px rgba(255, 59, 59, 0.25);
+}
+.fable-input-row.is-api-lost .fable-input::placeholder {
+    color: #ff5a5a;
+    font-style: normal;
+    text-shadow: 0 0 8px rgba(255, 59, 59, 0.85), 0 0 18px rgba(255, 59, 59, 0.45);
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    font-size: 0.92em;
+    animation: fable-api-lost-pulse 2.4s ease-in-out infinite;
+}
+@keyframes fable-api-lost-pulse {
+    0%, 100% { opacity: 0.78; }
+    50%      { opacity: 1; }
+}
+
+/* API-required launch popup (2026-08-07). Body-mounted (Fable isn't open
+   yet), so fixed-position. Mirrors the Quick Play resume popup's glass card. */
+.fable-api-required-popup {
+    position: fixed;
+    inset: 0;
+    z-index: 1000;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: rgba(0, 0, 0, 0.62);
+    opacity: 0;
+    transition: opacity 260ms ease;
+}
+.fable-api-required-popup.is-open { opacity: 1; }
+
 /* --- Wupi trigger: invisible right-edge hover strip (Phase 1, decision 1).
      No visible button. A WIDER strip (~2 inches) down the right edge; the
      300ms dwell (wired in stage.js) opens the Wupi drawer. The wider zone
@@ -1552,7 +1578,17 @@ body.fable-active.fable-chrome-peek .top-bar { transform: translateY(0); }
     top: 0;
     right: 0;
     bottom: 0;
-    width: 460px;          /* widened from 420 (Chloe 2026-07-26) */
+    width: clamp(440px, 27vw, 640px);  /* FLUID v3 (Chloe 2026-08-07): drawer
+       keeps a CONSTANT ~27% of viewport WIDTH. CORRECTED from v2's 40vw — that
+       was tuned to a WRONG width: the 1152 Chloe measured had DevTools docked
+       on the side (which shrinks innerWidth). Her TRUE fullscreen CSS viewport
+       is ~1707 wide (2560 physical ÷ 1.5 DPR), so 27vw of 1707 = 460.9 ≈ the
+       hand-tuned 460 → byte-identical on her screen. On a wider CSS viewport
+       (ultrawide ~2293) it grows toward the 640px cap so the drawer reads as a
+       proper panel; 440px floor covers laptops. NOTE the dock dividers
+       (background % stops at .hud-dock) are tuned to ~460px inner width, so
+       they only stay aligned near Chloe's reference — ultrawide drift is a
+       known follow-up. */
     max-width: 90vw;
     background: var(--fable-glass);
     border-left: 1px solid var(--fable-brass-dim);
@@ -1595,7 +1631,13 @@ body.fable-active.fable-chrome-peek .top-bar { transform: translateY(0); }
     top: 0;
     left: 0;
     bottom: 0;
-    width: 460px;
+    width: clamp(440px, 27vw, 640px);  /* FLUID v3 (Chloe 2026-08-07): mirrors
+       the right Wupi drawer. 27vw of Chloe's TRUE fullscreen CSS viewport
+       (~1707w = 2560 physical ÷ 1.5 DPR) = 460.9 ≈ the hand-tuned 460 →
+       byte-identical on her screen. (v2 used 40vw, which was tuned against a
+       DevTools-narrowed 1152w measurement — wrong, made the drawer hit its
+       640px cap on her real screen.) Grows toward 640px cap on wider
+       viewports; 440px floor on laptops. */
     max-width: 90vw;
     background: var(--fable-glass);
     border-right: 1px solid var(--fable-brass-dim);
@@ -1606,193 +1648,1039 @@ body.fable-active.fable-chrome-peek .top-bar { transform: translateY(0); }
     flex-direction: column;
     backdrop-filter: blur(16px);
     pointer-events: auto;
+    /* Clip painted filter halos (the Sun/Moon drop-shadow glows, ~6px) to the
+       drawer's bounds. Without this the Moon's glow bleeds ~6px past the right
+       edge — visible as a faint glow at the screen's left edge when the drawer
+       is translated off-screen (closed). Safe here: every drawer child is meant
+       to be contained (the paperdoll section already clips its own overflow). */
+    overflow: hidden;
 }
 .fable-left-drawer.open { transform: translateX(0); }
 
 /* =============================================================
-   LEFT DRAWER — VISUAL HUD (§11.30, 2026-08-02)
-   Three surfaces: paperdoll (§1), ambient time/weather (§2), inventory (§3).
-   The base .fable-left-drawer above owns position + transform + glass face;
-   these rules layer the HUD content + the ambient background tint on top.
+   LEFT DRAWER — VISUAL HUD
+   One surface: paperdoll (§1). The ambient time-of-day tint + Chronos &
+   Climate panel (old §2) and the inventory (old §3) were removed to be
+   redone later. The base .fable-left-drawer above owns position +
+   transform + glass face; these rules layer the paperdoll on top.
    ============================================================= */
 
-/* §2 — Ambient time-of-day background tint. data-time is set by renderAmbient.
-   Layered OVER the base --fable-glass so the drawer still reads as glass but
-   shifts cool/warm with the in-world clock. */
-.fable-left-drawer[data-time="night"]     { background: #0a0c10; }
-.fable-left-drawer[data-time="twilight"]  { background: #14131a; }
-.fable-left-drawer[data-time="day"]       { background: #181c24; }
+/* ── TIME SCRUBBER (2026-08-06 redesign — replaced the semi-circle astrolabe) ─
+   Top-half world-stats widget. A SLEEK HORIZONTAL TIME SCRUBBER, stacked
+   top→bottom:
+     .astrolabe-header     gold Cinzel text row (e.g. DAY 14 • AUTUMN EQUINOX),
+                            RETAINED centered ABOVE the scrubber line
+     .time-scrubber        a flex row: [Sun] ── line ── [diamond] ── [Moon]
+       .scrubber-sun       LEFT endcap — burning amber Sun glyph
+       .scrubber-track     the thin brass horizontal line + the diamond child
+         .scrubber-diamond the position indicator (rides left:% along the line)
+       .scrubber-moon      RIGHT endcap — midnight white Moon glyph
 
-/* Weather overlay — a pointer-events:none animation layer above the tint,
-   below the content. Subtle (≤8% opacity) so it never distracts from the
-   paperdoll. data-weather set by renderAmbient. */
-.hud-ambient-layer {
+   POSITIONING RULE: this widget lives in the TOP half of the left drawer
+   (above the paperdoll, which starts at y≈410). It is absolutely positioned
+   so it does NOT disturb the bottom half — the paperdoll (.hud-paperdoll-base),
+   the gender toggle (.hud-gender-toggle), and the backpack (.hud-backpack)
+   are ALL absolute + unchanged. The container dimensions + offsets here are
+   deliberately independent of (and do not reference) any of those elements.
+   ────────────────────────────────────────────────────────────────────── */
+.time-scrubber {
+    /* Direct child of .fable-left-drawer. Absolute so it occupies the top
+       region without affecting the flex column or the absolute siblings.
+       NOTE: the header is independently positioned (see .astrolabe-header) —
+       this top anchors the SCRUBBER LINE, not the title. */
     position: absolute;
-    inset: 0;
+    top: clamp(48px, 7.5vh, 120px);   /* FLUID v2 (Chloe 2026-08-07): scrubber
+       TOP tracks viewport height. 7.5vh of 1067px = 80px → byte-identical to
+       the hand-tuned value on Chloe's screen. 48px floor keeps it clear of
+       the 40px name header on short screens; 120px cap on tall viewports. */
+    left: 50%;
+    transform: translateX(-50%);   /* horizontally centered in the drawer */
+    margin-left: -1px;              /* whole bar shifted 1px left (was 0) — applies to sun/moon/circles/line/backdrop uniformly; gradient internals untouched */
+    width: 90%;                     /* widened a touch more (was 88) per Chloe 2026-08-06 */
+    /* Flex row: Sun endcap | track (grows) | Moon endcap, vertically centered. */
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 3px;                       /* tight — sun/moon hug the line ends (was 10) */
+    z-index: 4;                    /* below gender toggle (5) + backpack (6) */
+    pointer-events: none;          /* display-only for now */
+}
+
+/* ── Day/night backdrop ─────────────────────────────────────────────── */
+/* A horizontal gradient bar spanning the FULL scrubber row (behind the Sun
+   endcap, the brass line, AND the Moon endcap). As tall as the endcap buttons
+   (60px) + vertically centered on the row, so the Sun + Moon discs sit inside
+   it. Sits at z-index:0 — BEHIND the brass line (.scrubber-track, default
+   z:auto which stacks above z:0 siblings in DOM order) and behind the endcaps
+   (.scrubber-sun/-moon are z:2). The gradient shifts left→right from a warm
+   yellow (the day/Sun side) to a midnight purple (the night/Moon side) — a
+   soft day→night sky band reading as ambient color behind the controls.
+   Rounded ends mirror the orb-like endcaps; pointer-events:none so it never
+   captures the drawer's hover.
+   2026-08-06: height + border-radius scaled up with the 60px orbs (were
+   45px / 24px at the 48px size). */
+.scrubber-backdrop {
+    position: absolute;
+    /* Extend BEYOND the scrubber container's edges to reach behind the Sun +
+       Moon glyphs, which overhang outward via negative margins (Sun -18px left,
+       Moon -21px right). Scaled out a few px past each glyph so the bar fully
+       wraps behind both endcaps. */
+    left: -8px;                      /* shifted +2px right (was -10) so the yellow band sits centered under the Sun/Moon glyphs */
+    right: -12px;                    /* was -10 — compensates so the total span is unchanged, just translated right */
+    top: 52%;
+    height: 40px;                    /* slimmed (was 51) per Chloe 2026-08-06 — a tight sky band the orbs rise above/below */
+    transform: translateY(-50%);    /* vertically center on the row */
+    background: linear-gradient(
+        to right,
+        /* Midnight purple flanks a continuous YELLOW band spanning the 2nd
+           notch (~25%) through the 6th notch (~65%). The outer purple fades
+           INTO the yellow at notch 2, the yellow holds steady across notches
+           3/4/5, then fades back OUT to purple at notch 6. The fade zones were
+           softened per Chloe 2026-08-06: tightened from 10% → 6% so the
+           yellow↔purple transition is a touch less gradual (sharper edges). */
+        rgba(58, 38, 88, 0.16) 0%,           /* midnight purple (lightened a touch more 2026-08-07) — left edge */
+        rgba(58, 38, 88, 0.16) 20%,          /* still purple — 5% fade zone starts here */
+        rgba(255, 200, 80, 0.16) 25%,        /* fade UP to yellow — notch 2 (band starts); 5% fade */
+        rgba(255, 200, 80, 0.16) 65%,        /* yellow holds across notches 3, 4, 5 → notch 6 */
+        rgba(58, 38, 88, 0.16) 70%,          /* fade DOWN to purple (lightened) — 5% fade */
+        rgba(58, 38, 88, 0.16) 100%);        /* midnight purple (lightened) — right edge */
+    border-radius: 20px;            /* pill shape — half of the 40px height, soft rounded ends */
+    pointer-events: none;
+    z-index: 0;                     /* behind the line + endcaps */
+}
+
+/* ── Top header row (gold Cinzel serif) ─────────────────────────────── */
+/* Styled as a brass PLAQUE: thin top + bottom hairline borders + horizontal
+   padding so the header reads as an engraved plate, not floating text. The
+   side borders are intentionally omitted (open plaque) so it stays airy.
+   WIDTH (2026-08-06): the plaque is pinned to a fixed width so the brass
+   hairlines span the SAME distance they did when the header read the long
+   "DAY 14 • AUTUMN EQUINOX" stamp (~98% of the drawer). Repurposing the
+   header to the player's name (typically far shorter) would otherwise shrink
+   the plaque to the name's content width → the divider lines would look
+   truncated. width:98% + box-sizing:border-box keeps the hairline span
+   invariant across short + long names; the text stays centered inside. */
+.astrolabe-header {
+    /* DIRECT child of .fable-left-drawer so its vertical position is fully
+       INDEPENDENT of the scrubber. Anchored to the drawer's top; centered via
+       left:50% + translateX(-50%). */
+    position: absolute;
+    top: 6px;                        /* nudged down 6px from the top edge */
+    left: 50%;
+    transform: translateX(-50%);
+    width: 98%;                      /* pin the divider span to the original width */
+    box-sizing: border-box;          /* padding + borders stay INSIDE the 98% */
+    font-family: var(--fable-font-serif);   /* Cinzel — engraved serif */
+    font-size: 40px;
+    font-weight: 600;
+    letter-spacing: 0.08em;                  /* tightened (was 0.16em) — closer caps now the name is bigger */
+    color: var(--fable-brass-bright);
+    text-transform: uppercase;
+    text-align: center;
+    line-height: 1.2;
+    text-shadow: 0 0 6px var(--fable-brass-glow);
+    /* Brass plaque: thin gold hairlines top + bottom, side padding scaled up. */
+    border-top: 1px solid rgba(212, 175, 55, 0.3);
+    border-bottom: 1px solid rgba(212, 175, 55, 0.3);
+    padding: 8px 18px;
+    /* min-height keeps the layout stable when the header text is cleared. */
+    min-height: 26px;
+    white-space: nowrap;
+    overflow: hidden;                /* a too-long name clips cleanly inside the plaque */
+    text-overflow: ellipsis;         /* rather than overflowing/wrapping past 98% */
+}
+
+/* ── The track line + the diamond indicator ──────────────────────────── */
+/* The track is the flex-grow element between the two endcaps: a thin 1px brass
+   horizontal line. position:relative so the absolutely-positioned diamond child
+   rides along it via left:% (0% = flush to the Sun/left, 100% = flush to the
+   Moon/right). The line height is 1px per spec; vertical-align is handled by
+   the parent flex row's align-items:center. */
+.scrubber-track {
+    position: relative;             /* anchor for the diamond's left:% + the hour ticks */
+    flex: 1 1 auto;                 /* grow to fill the space between endcaps */
+    height: 3px;                    /* +1px thickness (was 2) per Chloe 2026-08-06 */
+    background: rgb(168, 130, 45);  /* darker bronze, fully opaque (was soft brass 0.6) per Chloe 2026-08-06 */
+    min-width: 40px;                /* never collapse to nothing on narrow drawers */
+}
+
+/* 8 graduation ticks INSET from the line ends (markers, not labels). The tick
+   band is shrunk AWAY from the track's two ends (left:6% + width:88% → a 6%
+   travel gap at each end) so the notch can slide PAST the endmost tick into
+   that gap — the band "shifts" conceptually when time falls in the gap hours.
+   Within the inset band, 8 ticks span it: one at each end of the band (0% +
+   100% of the band) + 6 evenly between, i.e. the band divides into 7 EQUAL
+   segments → ticks at 0, 1/7, … 7/7 of the band.
+   A single ::before pseudo draws them as vertical 2px brass strokes. Two
+   background LAYERS do it (repeating gradients can't place a tick AT the
+   final 100% edge of the band — the last cell's end is never a new cell's
+   start):
+     layer 1 (top): repeating gradient → ticks at 0, 1/7, … 6/7 of the band (7)
+     layer 2 (bottom): plain linear gradient → a 2px tick flush at the band's right end (8th)
+   The pseudo is taller than the 2px line (12px) + centered on it so the ticks
+   STRADDLE the line (5px each side), reading as engraved graduations.
+   NOTE: the diamond's travel is the FULL track (0–100% of the TRACK, not the
+   band) — left:% in left-drawer.js keys off the track, so the notch rides
+   through the end gaps as intended. z-index:0 keeps the ticks BEHIND the
+   diamond (z:1) + the line. */
+.scrubber-track::before {
+    content: "";
+    position: absolute;
+    top: 50%;                       /* vertically center on the 2px line */
+    left: 6%;                       /* INSET: 6% gap at the left end */
+    width: 88%;                     /* INSET: 6% gap at the right end (100% − 6% − 6%) */
+    height: 10px;                   /* straddles the line (4px each side) */
+    transform: translateY(-50%);
+    background-image:
+        /* 7 evenly-spaced MINOR ticks at 0, 1/7, … 6/7 of the band. A repeating
+           gradient with cell width calc(100%/7) places a 2px bronze tick at the
+           left edge of each of 7 cells. The 8th tick (100% / 7/7) is NO longer
+           drawn here — ::after owns it now (as a bigger violet major), so the
+           old bronze tick that used to peek out behind it is gone (Chloe
+           2026-08-07: "I see the old tick behind the 8th tick"). */
+        repeating-linear-gradient(
+            to right,
+            rgb(168, 130, 45) 0,
+            rgb(168, 130, 45) 2px,
+            transparent 2px,
+            transparent calc(100% / 7)
+        );
     pointer-events: none;
     z-index: 0;
-    opacity: 0;
-    transition: opacity 600ms ease;
-}
-.fable-left-drawer[data-weather="rain"] .hud-ambient-layer {
-    opacity: 0.06;
-    background: repeating-linear-gradient(115deg,
-        transparent 0 6px, rgba(180,200,230,0.6) 6px 7px);
-    animation: hud-rain 0.6s linear infinite;
-}
-.fable-left-drawer[data-weather="snow"] .hud-ambient-layer {
-    opacity: 0.05;
-    background-image: radial-gradient(circle, rgba(255,255,255,0.8) 1px, transparent 1.5px);
-    background-size: 32px 32px;
-    animation: hud-snow 6s linear infinite;
-}
-.fable-left-drawer[data-weather="fog"] .hud-ambient-layer {
-    opacity: 0.08;
-    background: radial-gradient(ellipse at 30% 40%, rgba(200,200,210,0.5), transparent 70%),
-                radial-gradient(ellipse at 70% 60%, rgba(180,180,200,0.4), transparent 70%);
-    animation: hud-fog 18s ease-in-out infinite alternate;
-}
-@keyframes hud-rain  { from { background-position: 0 0; } to { background-position: -14px 28px; } }
-@keyframes hud-snow  { from { background-position: 0 0; } to { background-position: 0 32px; } }
-@keyframes hud-fog   { from { transform: translateX(-3%); } to { transform: translateX(3%); } }
-
-/* Two-column master grid (2026-08-02 reorg). Unequal columns: the LEFT
-   column keeps the paperdoll near its original size; the RIGHT column is a
-   ~160px rail holding the Chronos & Climate panel. The drawer's
-   .fable-left-drawer is display:flex column; this grid takes flex:1 so it
-   owns the full drawer height. min-width:0 on the columns is the
-   load-bearing grid-item fix that lets the paperdoll image shrink without
-   overflowing the drawer (otherwise grid items default to min-content). */
-.hud-master-grid {
-    position: relative;
-    z-index: 1;
-    flex: 1 1 auto;
-    display: grid;
-    grid-template-columns: minmax(280px, 1fr) 160px;
-    grid-template-rows: 1fr;
-    height: 100%;
-    gap: 16px;
-    padding: 16px;
-    overflow: hidden;
-}
-.hud-col {
-    display: flex;
-    flex-direction: column;
-    min-width: 0;
-    min-height: 0;
-}
-.hud-col--right {
-    /* Right rail holds the env panel at its top; no stretch-fill needed. */
-    justify-content: flex-start;
 }
 
-/* ── §1 PAPERDOLL ────────────────────────────────────────────────────── */
-/* EXACT original positioning (restored 2026-08-03 after the grid reorg
-   broke it): width-driven, capped at 400px, aspect-ratio 4/9 matching the
-   1376x3096 source canvas, with the -70px left margin that eats the PNG's
-   baked-in transparent left canvas + cancels the column padding so the
-   figure pins flush to the glass wall. Vertically centered in the column.
-   The left grid column is sized to FIT this paperdoll, not the other way
-   around — see .hud-master-grid above. */
-.hud-paperdoll-section {
-    height: 100%;
-    display: flex;
-    align-items: center;          /* vertically centered in the column */
-    justify-content: flex-start;  /* flush left */
-}
-.hud-paperdoll-wrap {
-    position: relative;
-    width: 100%;
-    max-width: 400px;
-    aspect-ratio: 4 / 9;          /* matches the source PNG canvas (1376x3096 = 4/9) */
-    /* The -70px cancels the grid column's left padding (16px) AND eats the
-       PNG's own baked-in transparent left canvas (~202px / 1376 ≈ 15% → ~60px
-       at 400px wide). overflow:hidden on .hud-master-grid clips the transparent
-       overflow so the CHARACTER lands flush at the drawer wall with no visible
-       cropping (only transparent pixels lost). This is the original value. */
-    margin: 0 0 0 -70px;
+/* MAJOR ticks — the 4th + the 8th, bigger (18px tall, 4px wide) than the 10px /
+   2px minors, so they read as the primary graduations. ::after draws ONLY those
+   two, on top of ::before's minor ticks. Same inset band (left:6% + width:88%)
+   so its % map matches ::before's. The 4th sits at 3/7 of the band; the 8th at
+   the band's right edge (7/7). Both are 4px bands. The 8th is CENTERED on the
+   band's right edge (extends 2px past + 2px before it) so it's the SAME size as
+   the 4th (Chloe 2026-08-07: "the 8th tick looks smaller than the 4th" — the
+   edge-flush version was clipping). The band's overflow:hidden (parent track)
+   catches the 2px overhang. */
+.scrubber-track::after {
+    content: "";
+    position: absolute;
+    top: 50%;
+    left: 6%;                       /* match ::before's band inset */
+    width: 88%;
+    height: 16px;                   /* −1px each end (was 18) per Chloe 2026-08-07 */
+    transform: translateY(-50%);
+    background-image: linear-gradient(
+        to right,
+        /* the 4th tick ONLY now — warm gold (255,240,160), 4px band centered
+           on 3/7 of the band. The 8th tick moved to its own element
+           (.scrubber-major-8) so the two can be sized independently (Chloe
+           2026-08-07: the shared pseudo made them impossible to tune apart). */
+        transparent calc(100% / 7 * 3 - 2px),
+        rgb(255, 240, 160) calc(100% / 7 * 3 - 2px),
+        rgb(255, 240, 160) calc(100% / 7 * 3 + 2px),
+        transparent calc(100% / 7 * 3 + 2px)
+    );
     pointer-events: none;
+    z-index: 1;                     /* above ::before (z:0) so majors overdraw minors */
+}
+
+/* The 8th tick — its OWN element (decoupled from ::after so it can be sized
+   independently of the 4th). Sits at the band's right edge: the band is the
+   inset 6%→94% region, so its right edge = 94% of the track. Centered there via
+   left:94% + translateX(-50%). 4px wide × 18px tall to match the 4th tick, in
+   violet (100,0,100). Tweak this WITHOUT touching the 4th. */
+.scrubber-major-8 {
+    position: absolute;
+    top: 50%;
+    /* Right edge anchored at the band's right edge + 1px (Chloe 2026-08-07:
+       nudged right 1px). translateX(-100%) puts the element's RIGHT edge at
+       this point. */
+    left: calc(94% + 1px);
+    width: 4px;                     /* back to 4px */
+    height: 17px;                   /* −1px each end (was 19) — 8th only, 4th untouched */
+    transform: translate(-100%, -50%);
+    background: rgb(100, 0, 100);
+    pointer-events: none;
+    z-index: 1;                     /* above ::before's minor ticks */
+}
+
+/* The position indicator — a small diamond riding along the track. 8×8 per
+   spec, rotated 45deg to read as a diamond. Positioned via left:% (set by
+   setScrubberPercent / setScrubberMinutes in left-drawer.js); translateX(-50%)
+   centers the diamond ON its left:% point so 0% sits its center at the left
+   edge + 100% at the right edge. top:50% + translateY(-50%) vertically center
+   it on the 1px line. z-index:1 lifts it above the line. */
+.scrubber-diamond {
+    position: absolute;
+    top: 50%;
+    left: 0%;                       /* updated to left:% by JS (0–100) */
+    width: 9px;
+    height: 26px;
+    /* The diamond SHAPE is drawn via an inline SVG background (a vertical
+       diamond/lozenge, points at top/bottom/left/right), NOT clip-path.
+       REASON: clip-path on an element clips its ::before/::after pseudos too,
+       which made the glow + shadow pseudos get cut to the diamond silhouette
+       (turning the notch green instead of showing a halo when tested).
+       background-image does NOT clip descendant/pseudo content, so the glow
+       + shadow pseudos below can render fully outside the diamond shape. */
+    background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 9 26'><polygon points='4.5,0 9,13 4.5,26 0,13' fill='%23FFFFFF'/></svg>");
+    background-repeat: no-repeat;
+    background-position: center;
+    background-size: 100% 100%;
+    transform: translate(-50%, -50%);  /* center the diamond on its left:% point (no rotate) */
+    z-index: 2;                      /* above the glow ::before (z:1) + shadow ::after (z:0) */
+}
+/* NOTE: BOTH pseudo layers (the white glow ::before AND the dark shadow
+   ::after) were REMOVED. The white glow read as a gray haze ringing the white
+   diamond (white-on-dark blurred = perceptually gray); the dark shadow was a
+   black circle behind the notch that darkened it further. Together they kept
+   making the pure-white notch look gray/dark no matter its fill. The notch is
+   now JUST the crisp pure-white SVG diamond — no blurred layers behind it. */
+
+/* ── Sun / Moon endcap glyphs ───────────────────────────────────────── */
+/* The two celestial icons bookending the track — the Sun at the LEFT end (dawn,
+   0%), the Moon at the RIGHT end (dusk, 100%). Each is a fixed-size flex item
+   (flex:0 0 auto so the track does the growing); they host an authored inline
+   SVG (SUN_SVG / MOON_SVG in left-drawer.js) that recolors via currentColor.
+   The Sun is burning amber, the Moon crisp midnight white — mirroring the old
+   arc-end glyphs' recolor. Both glow softly via a drop-shadow. */
+.scrubber-sun,
+.scrubber-moon {
+    flex: 0 0 auto;                 /* fixed-size endcaps; the track grows, not these */
+    width: 64px;                    /* bumped +4 (was 60) per Chloe 2026-08-06 */
+    height: 64px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    pointer-events: none;
+    /* NEGATIVE outer margins: each endcap overhangs OUTWARD by ~half its width
+       so the glyphs sit centered ON the line's ends but the LINE itself extends
+       outward underneath them, reaching much closer to the drawer's side edges.
+       Scaled up with the 64px box (were -18/-21 at 60px). */
+    z-index: 2;                     /* glyphs sit above the line */
+    position: relative;             /* establish stacking for the overhang */
+}
+.scrubber-sun {
+    margin-left: -20px;             /* overhang +1px (was -19) per Chloe 2026-08-06 — pushes the sun outward, widening the line's reach */
+    color: #ffaa00;                 /* burning amber */
+    /* Subtle yellow ambient glow around the whole endcap (glyph + brass disc) —
+       reads as the sun's warm light bleeding into the day/night backdrop. A
+       parent-level filter so it wraps both the SVG glyph + the ::before disc. */
+    filter: drop-shadow(0 0 6px rgba(255, 210, 90, 0.55));
+}
+.scrubber-moon {
+    margin-right: -23px;            /* overhang +1px (was -22) per Chloe 2026-08-06 — pushes the moon outward, widening the line's reach */
+    color: #e2e8f0;                 /* crisp midnight white */
+    /* Subtle white ambient glow around the whole endcap (glyph + brass disc) —
+       reads as the moon's cool light bleeding into the day/night backdrop. */
+    filter: drop-shadow(0 0 6px rgba(230, 235, 245, 0.5));
+}
+/* Metallic brass discs behind each glyph. A ::before paints a radial-gradient
+   circle clipped by border-radius:50% (so nothing bleeds past the edge — no
+   glow). The gradient's highlight is off-center top-left, fading through the
+   brass-bright tone (the header color, #E6D58A) down to a dark bronze rim —
+   reading as a polished metal button lit from the upper left. The Sun + Moon
+   share the same metallic spec; the Moon's disc keeps its -2px left shift.
+   z-index:0 puts the disc BEHIND the glyph's SVG child (position:relative +
+   z-index:1 on the > * rule); the glyph's own dark drop-shadow still applies
+   on top. */
+.scrubber-sun::before,
+.scrubber-moon::before {
+    content: "";
+    position: absolute;
+    top: 50%;
+    left: 50%;
+    width: 80%;                     /* smaller than the 48px box (≈38px disc) */
+    height: 80%;
+    border-radius: 50%;
+    transform: translate(-50%, -50%);   /* dead-centered behind the glyph */
+    pointer-events: none;
+    z-index: 0;                     /* behind the glyph SVG */
+    background: radial-gradient(
+        circle at 32% 28%,                        /* specular highlight upper-left */
+        #E8D8A0 0%,                                /* hot-spot — between the original #FBF1C7 and the dark pass */
+        #C5B370 38%,                               /* brass — lighter than the dark #A89456, still below the original #E6D58A */
+        #9A8842 68%,                               /* mid bronze — lighter than #7E6E34 */
+        #524628 100%);                             /* rim — lighter than #3A3014 */
+    border: 2px solid #D8D8E0;      /* bright silver rim — reverted (kept the prominent bezel) */
+}
+.scrubber-sun::before {
+    /* Uses the shared metallic gradient above. Sun-only outline override:
+       dark bronze instead of the shared silver (the Moon keeps silver). */
+    border-color: #5A4820;          /* dark bronze rim (was the shared silver #D8D8E0) */
+}
+.scrubber-moon::before {
+    /* Shift the disc 1px LEFT of dead-center (keeps the -50% centering, adds -1px X). */
+    transform: translate(calc(-50% - 1px), -50%);
+    border-color: #2A1838;          /* midnight purple rim (was the shared silver #D8D8E0) */
+}
+.scrubber-sun > *,
+.scrubber-sun > *,
+.scrubber-moon > * {
+    width: 100%;
+    height: 100%;
+    display: block;
+    pointer-events: none;
+    position: relative;             /* establish stacking so z-index applies */
+    z-index: 1;                     /* sit above the ::before disc (z:0) */
+    /* Pitch-black OUTLINE tracing every part of the glyph's actual shape (the
+       sun's disc + each ray, the moon's crescent) — NOT a bounding box. Done
+       via 4 stacked drop-shadow filters with 0 blur at a 0.5px offset in the
+       4 CARDINAL directions only (no diagonals). Diagonal passes at 1px add
+       ~0.4px extra width on the corners → uneven + too thick; the cardinal-only
+       0.5px set is uniform + centered. Zero blur = each casts a crisp edge;
+       stacked in 4 directions they merge into a thin symmetric outline hugging
+       the silhouette. drop-shadow follows the rendered alpha shape, so it
+       outlines every ray + curve individually. The glyph's fill colors stay
+       intact (unlike an SVG stroke, which would recolor the sun's ray-lines).
+       Set on > * so it applies to the SVG only, not the brass ::before disc. */
+    filter:
+        drop-shadow(1.35px 0 0 #000) drop-shadow(-0.66px 0 0 #000)
+        drop-shadow(0 2px 0 #000) drop-shadow(0 -0.6px 0 #000);
+}
+/* Sun glyph only — shrunk uniformly via scale (transform doesn't affect layout,
+   so the 64px endcap box, the centered ::before brass disc, + the line all stay
+   exactly where they are; only the painted sun glyph shrinks). The filter above
+   is inherited. 2026-08-06: scale(0.85) per Chloe — shrinks the whole sun (disc
+   + rays together) without touching the brass disc behind it. */
+.scrubber-sun > * {
+    transform: scale(0.80);
+}
+/* Moon glyph only — scaled up a touch via transform + nudged. transform does NOT
+   affect layout, so the 64px endcap box, the centered ::before disc, + the line
+   all stay exactly where they are; only the painted moon grows + shifts. The
+   filter above is inherited (not redeclared here). Order matters: translate
+   first (moves the glyph), then scale (grows symmetrically around its center).
+   2026-08-06: translateX nudged right per Chloe (5→7→10) — shifts the crescent
+   glyph itself right without moving the brass disc behind it. */
+.scrubber-moon > * {
+    transform: translate(6px, 0px) scale(1.0);
+}
+
+/* ── §1 PAPERDOLL — 2026-08-06 full overhaul ────────────────────────────
+   The figure is absolutely positioned + ALWAYS ON TOP (z-index above the
+   dock + backpack). It intentionally overlaps the 4-icon dock at the bottom
+   by design — the paperdoll's toes render OVER the dock so the icons never
+   cut into the figure (Chloe 2026-08-06: "make sure the paperdoll always
+   stays on top because the icons are cutting part of the paperdoll's toes").
+   SIZE: 800px tall (~53% of the 1510px intrinsic). Positioned 10px down +
+   20px left of horizontal-center so it sits slightly off-center toward the
+   left, head landing just below the time bar. The section itself is just a
+   positioning anchor (no clipping — overflow visible so the figure can paint
+   over the dock). */
+.hud-paperdoll-section {
+    position: absolute;
+    top: 0;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    z-index: 7;                      /* ABOVE the dock (6) + backpack (6) so toes aren't cut */
+    overflow: visible;               /* figure paints over the dock, not clipped */
+    pointer-events: none;            /* the section never blocks icon clicks */
 }
 .hud-paperdoll-base {
     position: absolute;
-    inset: 0;
-    width: 100%;
-    height: 100%;
-    object-fit: contain;
-    object-position: top left;    /* flush to the wrap's top-left corner */
+    /* 10px down from the time bar, 20px LEFT of horizontal center.
+       left:calc(50% - 20px) + translateX(-50%) centers the figure THEN shifts
+       it 20px left — without the translateX the left edge (not the center)
+       would land at that point + the wide image would sprawl right over the
+       backpack. With it, a 238px-wide figure centered at ~210px spans
+       ~91–329px, leaving the right ~130px clear for the backpack. */
+    top: clamp(86px, 15vh, 240px);   /* FLUID v2 (Chloe 2026-08-07): figure TOP
+       tracks viewport HEIGHT. 15vh of Chloe's real 1067px CSS canvas = 160px
+       → byte-identical to the hand-tuned value on her screen. (Tuned against
+       1067 DPI-scaled CSS px, NOT 1600 physical.) Grows up to 240px cap on
+       tall viewports; 86px floor keeps the head clear of the 40px name
+       header + scrubber on short screens. */
+    left: calc(50% - 85px);          /* center anchor, 20px left of drawer center */
+    transform: translateX(-50%);     /* center the figure ON that anchor point */
+    display: block;
+    width: auto;
+    height: clamp(510px, 76.85vh, 1200px);  /* FLUID v2 (Chloe 2026-08-07):
+       figure HEIGHT tracks viewport height. 76.85vh of 1067px = 820px →
+       byte-identical on Chloe's screen. Grows up to 1200px cap so the PNG
+       scales UP on tall viewports (source has headroom, stays sharp); 510px
+       floor preserves the silhouette on small windows. */
     filter: drop-shadow(0 0 10px rgba(0,0,0,0.6));
+    pointer-events: none;
 }
 
-/* Gender toggle — minimal glassmorphic pill pinned to the drawer's FAR
-   top-left corner (Chloe 2026-08-02). Direct child of the drawer so it
-   anchors to the drawer's top-left, not the paperdoll wrap. Stays above
-   the figure + scroll content. */
-.hud-gender-toggle {
+/* ── BODY-PARTS DEBUG OVERLAY (engine/body-parts.js §4) ─────────────────────
+   A DEV-ONLY SVG layer painted over the paperdoll so a developer can verify
+   the hand-placed hitbox polygons line up with the silhouette. NEVER visible
+   to end users — there is no toggle in the shipped UI. The runtime injury
+   display (deferred) will reuse the same polygons via getHitbox().
+   SIZING: the SVG's pixel size + position are set INLINE by paintDebugOverlay
+   after measuring the paperdoll <img>'s rendered rect (getBoundingClientRect).
+   This is load-bearing — an SVG with width:auto does NOT inherit an <img>'s
+   aspect ratio the way another <img> would; it collapses to its default box,
+   which squashes the viewBox 0 0 100 100 + stretches every polygon's X.
+   Measuring the image + matching its box exactly is the only correct path.
+   viewBox 0 0 100 100 + preserveAspectRatio=none then maps the stored %-coords
+   straight onto the figure with no distortion. */
+.body-parts-debug-overlay {
     position: absolute;
-    top: 8px;
-    left: 8px;
-    z-index: 5;
-    display: inline-flex;
-    gap: 1px;
-    padding: 1px;
-    background: var(--fable-glass-deep);
-    border: 1px solid var(--fable-glass-line);
-    border-radius: 10px;
-    backdrop-filter: blur(8px);
+    pointer-events: none;
+    z-index: 8;                      /* above the paperdoll (7), below modals */
+    opacity: 0.9;
+    filter: drop-shadow(0 0 2px rgba(0,0,0,0.8));
 }
-.hud-gender-toggle button {
-    min-width: 24px;
-    height: 22px;
-    padding: 0 6px;
+
+/* ─── INJURY HEATMAP OVERLAY (engine/injury-heatmap.js) ─────────────────────
+   The localized paperdoll injury layer. HEALTHY = completely invisible: the
+   renderer emits NO polygon for a healthy part, so there is nothing to hide.
+   Only injured parts get a <polygon> with class .is-injured, painted with a
+   per-part <radialGradient> (a soft "bruise" that peaks at the bbox center
+   + fades to 0 alpha before the line-art boundary) — or a flat dark fill
+   for amputated parts. The polygons are CLICK-THROUGH unless injured, so
+   the paperdoll's other interactions never break.
+   POSITIONING: the SVG's width/height/left/top are set INLINE at paint time
+   by measuring the paperdoll <img>'s rendered box (mirrors body-parts.js's
+   debug overlay alignment). This rule sets ONLY position + z-index + the
+   pointer-events default — geometry comes from the JS measurement, NOT here
+   (hardcoding CSS geometry would drift from the <img> on resize/gender-swap).
+────────────────────────────────────────────────────────────────────────── */
+.injury-heatmap-overlay {
+    position: absolute;
+    pointer-events: none;            /* the SVG itself never eats clicks; only
+                                        injured polygons re-enable them below */
+    z-index: 8;                      /* above the paperdoll (7), below modals */
+    overflow: visible;
+}
+/* Default polygon state: invisible + click-through. The renderer only emits
+   polygons for INJURED parts, but this rule is the belt-and-braces default
+   + drives the fade-IN transition when a part flips to injured. opacity:0
+   (not display:none) so the 220ms ease-out transition has a start state. */
+.injury-heatmap-overlay polygon {
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity 220ms ease-out;
+}
+/* An injured part: visible + hoverable. cursor:help signals "there's
+   something to read here" (the tooltip names the exact injury). */
+.injury-heatmap-overlay polygon.is-injured {
+    opacity: 1;
+    pointer-events: auto;
+    cursor: help;
+}
+/* The injury tooltip — reuses the UNIFIED dark-gold badge aesthetic from
+   .hud-tooltip (fable.css ~line 2289): same #0d0d0d bg, brass-hairline
+   border, Cinzel serif, brass text, soft shadow. The only differences from
+   .hud-tooltip are anchoring (this one is JS-anchored to the injured zone's
+   center via left/top, not CSS-translated above a dock icon) + the reveal
+   trigger (JS .is-visible from a delegated mouseenter, not :hover on a
+   parent). Kept as its own rule rather than reusing .hud-tooltip so the two
+   reveal mechanisms can't couple (a future .hud-tooltip tweak must not
+   change how an injury tooltip anchors). */
+.injury-heatmap-tooltip {
+    position: absolute;
+    transform: translate(-50%, -50%); /* center the badge ON the anchor point
+                                         set by JS (left/top = zone center) */
+    background: #0d0d0d;
+    border: 1px solid rgba(212, 175, 55, 0.4);
+    padding: 4px 10px;
+    border-radius: 4px;
+    font-size: 0.8rem;
+    font-family: var(--fable-font-serif, 'Cinzel', serif);
+    color: var(--fable-brass-bright, #E6D58A);
+    white-space: nowrap;
+    text-align: center;
+    line-height: 1.35;
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity 180ms ease;
+    box-shadow: 0 4px 10px rgba(0, 0, 0, 0.55), 0 0 6px rgba(212, 175, 55, 0.08);
+    z-index: 9;                      /* above the heatmap (8) + paperdoll (7) */
+}
+.injury-heatmap-tooltip.is-visible {
+    opacity: 1;
+}
+
+/* =============================================================
+   INVENTORY HUD OVERLAY (REMOVED 2026-08-07)
+   The equipment-node paperdoll overlay (equipment-overlay.js), the belt
+   diamond + pack panel widgets (inventory-widgets.js), + all their CSS
+   below were REMOVED — the canvas was cluttered with empty debug circles
+   + the pack/belt interaction model was wrong. The typed Rust inventory
+   model (equipment.rs) + the [EQUIP]/[BELT]/[PACK] bracket commands stay
+   intact; only the visualization layers are gone (to be rebuilt later).
+   The standalone CLICKABLE backpack button (.hud-backpack, below) STAYS
+   as the inventory affordance anchor.
+   ============================================================= */
+
+/* ── §2  THE 5-ICON DOCK (Gender · Calendar · Weather · Location · Inventory)
+   2026-08-06 full overhaul. A horizontal flex row pinned to the drawer's
+   BOTTOM, holding all 5 HUD controls as uniform .hud-dock-btn buttons. Every
+   button uses the SAME size + the SAME backpack-style resting/hover/active
+   treatment (drop-shadow ground at rest → pop-out lift + amber glow + brighten
+   on hover → tactile press on active) so the dock reads as one cohesive bar.
+   The line-art SVG icons (calendar/weather/location) + the gender glyph (♂/♀)
+   fill the button via currentColor; the inventory button keeps its PNG <img>.
+────────────────────────────────────────────────────────────────────────── */
+.hud-dock {
+    position: absolute;
+    left: 0;
+    right: 0;
+    bottom: 0px;                     /* moved down 4px more (was 4) per Chloe 2026-08-06 — dock + icons + dividers all flush to the bottom edge */
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    justify-content: center;
+    gap: clamp(18px, 2.8vh, 30px);   /* FLUID (Chloe 2026-08-07): gap shrinks on
+       short screens so the 5-button row fits the narrower drawer. 2.8vh of
+       Chloe's 1067px = ~30px → byte-identical on her screen. 18px floor on
+       laptops keeps the icons visually separated; 30px cap = tuned value. */
+    z-index: 6;                      /* above the paperdoll */
+    padding: 0 10px;
+    box-sizing: border-box;
+}
+.hud-dock-btn {
+    position: relative;              /* anchor for the upward .hud-tooltip */
+    flex: 0 0 auto;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    /* Uniform button face size — the SAME hit box for all 5 (PNG + SVGs).
+       2026-08-06: bumped 20% (64→77px) per Chloe.
+       2026-08-07 FLUID: scales with viewport HEIGHT so the dock shrinks on
+       short screens (1080p laptops @125% = 864h) to give the paperdoll room
+       — otherwise the figure's toes overlap the dock by ~16px. 8vh of
+       Chloe's 1067px = 85.4 ≈ 86 → byte-identical on her screen + bigger
+       screens (capped at 86). 70px floor = minimum tap target on laptops. */
+    width: clamp(70px, 8vh, 86px);   /* bigger (was 77) per Chloe 2026-08-06 */
+    height: clamp(70px, 8vh, 86px);
+    padding: 0;
     background: transparent;
     border: none;
-    color: var(--fable-text-dim);
-    font-size: 13px;
-    line-height: 1;
-    border-radius: 10px;
+    border-radius: 12px;
     cursor: pointer;
-    transition: color 120ms ease, background 120ms ease;
+    color: rgba(212, 175, 55, 1);   /* full-opacity brass resting — matches the gender glyph's solid color weight (Chloe 2026-08-06: was 0.72, made icons look washed out) */
+    transition: transform 220ms cubic-bezier(0.2, 0.8, 0.2, 1),
+                filter 220ms ease, color 220ms ease;
 }
-.hud-gender-toggle button:hover { color: var(--fable-text); }
-.hud-gender-toggle button[aria-pressed="true"] {
-    color: var(--fable-brass-bright);
-    background: var(--fable-brass-dim);
-    box-shadow: 0 0 6px var(--fable-brass-glow);
+.hud-dock-btn:hover {
+    /* Pop-out + lift — exactly the backpack idiom. */
+    transform: scale(1.06) translateY(-5px);
+    color: var(--fable-brass-bright, #E6D58A);
+}
+.hud-dock-btn:active {
+    transform: scale(1.04) translateY(-1px);   /* tactile press */
+}
+.hud-dock-btn:focus-visible {
+    outline: 2px solid var(--fable-brass-bright, #E6D58A);
+    outline-offset: 3px;
 }
 
-/* ── §2 ENVIRONMENT PANEL — Chronos & Climate (right rail top) ──────── */
-/* Minimal glassmorphic card: a small label + crisp gold time/weather line.
-   Sits at the top of the RIGHT grid column; the column is a narrow rail so
-   the panel reads as a compact stat block, not a full-width widget. */
-.hud-environment-panel {
+/* ── The 3 thin bronze dividers between the dock icons (2026-08-06) ──────
+   3 dividers between the 4 icons. Generated via ::before on every button
+   that FOLLOWS another button (.hud-dock-btn + .hud-dock-btn) — i.e. the
+   2nd, 3rd, + 4th buttons (calendar/weather/location). The first (gender)
+   has no preceding icon so it gets no divider. The divider is a 1px-wide,
+   44px-tall (most of the 77px button height, centered) hairline in dim
+   bronze that reads as a subtle separator, not a hard bar. The gap Chloe
+   tuned is untouched (the divider sits inside it via left:-15px).
+   pointer-events:none so it never steals clicks. */
+/* ── The 3 thin bronze dividers between the dock icons (2026-08-06) ──────
+   3 STATIC dividers between the 4 icons. Painted as a multi-stop background
+   on the .hud-dock container (NOT on the buttons) so they never inherit the
+   hover scale/lift transform the way a button's ::before would — they stay
+   perfectly still while the icons pop. The background is one linear-gradient
+   layer: 3 vertical 1px bronze hairlines, each 44px tall, vertically
+   centered in the 77px-tall dock row, positioned at the centers of the 3 gaps
+   between the 4 buttons. The hairline color is the same dim bronze as the
+   original ::before approach.
+   POSITIONS: the dock is justify-content:center with 4 × 77px buttons + 3 ×
+   30px gaps = 398px content, centered in the ~441px inner width (461px drawer
+   − 2×10px padding). The 3 gap centers land at 1/4, 1/2, 3/4 of that content
+   span measured from the content's left edge — computed here as percentages
+   of the container width (close enough given the centering; sub-pixel drift
+   is imperceptible on a 1px line). Each stop pair draws one hairline (color
+   ON for 1px, then transparent). */
+.hud-dock {
+    background-image:
+        linear-gradient(
+            to right,
+            transparent calc(25% - 0.5px),
+            rgba(212, 175, 55, 0.28) calc(25% - 0.5px),
+            rgba(212, 175, 55, 0.28) calc(25% + 0.5px),
+            transparent calc(25% + 0.5px)
+        ),
+        linear-gradient(
+            to right,
+            transparent calc(50% - 0.5px),
+            rgba(212, 175, 55, 0.28) calc(50% - 0.5px),
+            rgba(212, 175, 55, 0.28) calc(50% + 0.5px),
+            transparent calc(50% + 0.5px)
+        ),
+        linear-gradient(
+            to right,
+            transparent calc(75% - 0.5px),
+            rgba(212, 175, 55, 0.28) calc(75% - 0.5px),
+            rgba(212, 175, 55, 0.28) calc(75% + 0.5px),
+            transparent calc(75% + 0.5px)
+        );
+    background-repeat: no-repeat;
+    background-position: 0 center;
+    background-size: 100% 50px;       /* each hairline layer is full-width × 50px tall, vertically centered — scaled up (was 44) to match the bigger 86px buttons */
+}
+
+/* The SVG icon span (calendar/weather/location) fills the button + recolors
+   via currentColor. */
+.hud-dock-icon {
     display: flex;
-    flex-direction: column;
-    gap: 4px;
-    padding: 12px 14px;
-    background: var(--fable-glass-deep);
-    border: 1px solid var(--fable-brass-dim);
-    border-radius: 10px;
-    backdrop-filter: blur(8px);
+    align-items: center;
+    justify-content: center;
+    width: 100%;
+    height: 100%;
+    pointer-events: none;
+    /* NO resting drop-shadow — it blurred around every stroke of the line-art
+       icons + made them read as thick/fat (Chloe 2026-08-06). The gender glyph
+       stays clean because its SVG is a direct child of the button (not wrapped
+       in this span), so it never inherited this filter. Keeping this filterless
+       so all 3 line-art icons match the gender glyph's clean stroke. The amber
+       glow on hover is still applied below. */
+    transition: filter 220ms ease;
 }
-.hud-env-label {
-    font-size: 10px;
-    letter-spacing: 1.5px;
-    text-transform: uppercase;
-    color: var(--fable-text-faint);
+.hud-dock-icon .hud-status-svg {
+    width: 54px;                     /* bigger (was 48) with the 86px button bump */
+    height: 54px;
+    display: block;
+}
+/* Weather icon only — a touch bigger + nudged up (Chloe 2026-08-06). The other
+   line-art icons (calendar/location) stay at the shared 54px size. */
+[data-weather-icon] .hud-status-svg {
+    width: 58px;                     /* bigger (was 52) with the button bump */
+    height: 58px;
+    transform: translateY(-5px);
+}
+.hud-dock-btn:hover .hud-dock-icon {
+    /* Amber glow on hover — same filter stack as the backpack img. */
+    filter:
+        drop-shadow(0 0 2px var(--fable-brass-glow))
+        drop-shadow(0 4px 4px rgba(0,0,0,0.6))
+        brightness(1.1) saturate(1.1);
+}
+
+/* ── BACKPACK (standalone, bottom-right next to the paperdoll) ──────────
+   2026-08-06: pulled OUT of the dock per Chloe — the dock now holds the 4
+   line-art icons (gender/calendar/weather/location); the backpack sits on its
+   own in the bottom-RIGHT corner, next to the paperdoll's feet. Same pop-out
+   + amber-glow hover idiom as the dock buttons (kept uniform), but positioned
+   independently. z-index BELOW the paperdoll (7) so the figure's feet paint
+   over it if they overlap; above the dock (6) so it stays clear of the icons. */
+.hud-backpack {
+    position: absolute;
+    right: 18px;
+    bottom: clamp(96px, 15vh, 240px);  /* FLUID v2 (Chloe 2026-08-07): backpack
+       BOTTOM offset tracks viewport height. 15vh of 1067px = 160px →
+       byte-identical to the hand-tuned value on Chloe's screen. 96px floor =
+       dock (~86px) + breathing room on short screens; 240px cap on tall. */
+    z-index: 6;
+    padding: 0;
+    background: transparent;
+    border: none;
+    border-radius: 12px;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    transition: transform 220ms cubic-bezier(0.2, 0.8, 0.2, 1),
+                filter 220ms ease;
+}
+.hud-backpack-img {
+    display: block;
+    width: clamp(160px, 11.72vw, 270px);  /* FLUID v3 (Chloe 2026-08-07):
+       backpack PNG scales with viewport WIDTH. CORRECTED from v2's 17.36vw
+       (tuned to the DevTools-narrowed 1152w). 11.72vw of the TRUE ~1707w CSS
+       viewport = 200px → byte-identical to the hand-tuned value on Chloe's
+       screen. Grows up to 270px cap on wide viewports (PNG has headroom);
+       160px floor on laptops. height:auto preserves aspect ratio. */
+    height: auto;
+    pointer-events: none;
+    filter: drop-shadow(0 2px 4px rgba(0,0,0,0.55));
+    transition: filter 220ms ease;
+}
+.hud-backpack:hover {
+    transform: scale(1.06) translateY(-5px);   /* pop out + lift — matches the dock buttons */
+}
+.hud-backpack:hover .hud-backpack-img {
+    filter:
+        drop-shadow(0 0 2px var(--fable-brass-glow))
+        drop-shadow(0 4px 4px rgba(0,0,0,0.6))
+        brightness(1.1) saturate(1.1);
+}
+.hud-backpack:focus-visible {
+    outline: 2px solid var(--fable-brass-bright, #E6D58A);
+    outline-offset: 3px;
+}
+.hud-backpack:active {
+    transform: scale(1.04) translateY(-1px);
+}
+
+/* The gender (♂/♀) glyph — the shared wizard-engine SVG (.fable-wizard-glyph-svg
+   + .glyph-stroke, outline-only via currentColor). Sized to fill the button +
+   colored per gender. The hover pop-out + glow are inherited from .hud-dock-btn
+   above; the glyph itself gets the same drop-shadow ground as the other icons
+   via the .hud-dock-icon rule (it's wrapped in nothing here — the SVG is a
+   direct child — so apply the resting filter on the svg directly). */
+.hud-dock-btn[data-gender-btn] .fable-wizard-glyph-svg {
+    width: 42px;                     /* bigger (was 38) with the 86px button bump */
+    height: 42px;
+    display: block;
+    pointer-events: none;
+    filter: drop-shadow(0 2px 4px rgba(0,0,0,0.55));
+    transition: filter 220ms ease, stroke 220ms ease;
+}
+.hud-dock-btn[data-gender-btn]:hover .fable-wizard-glyph-svg {
+    filter:
+        drop-shadow(0 0 2px var(--fable-brass-glow))
+        drop-shadow(0 4px 4px rgba(0,0,0,0.6))
+        brightness(1.1);
+}
+.hud-dock-btn[data-gender-btn] .fable-wizard-glyph-svg .glyph-stroke {
+    fill: none;
+    stroke: currentColor;
+    stroke-width: 12;
+    stroke-linecap: butt;
+    stroke-linejoin: miter;
+    stroke-miterlimit: 4;
+}
+/* Male (♂) — royal blue; Female (♀) — scarlet. Matches the Player Creator. */
+.hud-dock-btn[data-gender="male"] { color: #2E54B5; }
+.hud-dock-btn[data-gender="male"] .glyph-stroke { stroke: #2E54B5; }
+.hud-dock-btn[data-gender="female"] { color: #F04A6A; }
+.hud-dock-btn[data-gender="female"] .glyph-stroke { stroke: #F04A6A; }
+
+/* ── The shared tooltip badge (now flipped UPWARD — dock is at the bottom) ──
+   Same dark, gold-bordered spec styling as before, but positioned ABOVE its
+   button (the dock hugs the bottom edge, so a below-button tooltip would clip
+   off-screen). Fades in on hover/focus; pointer-events:none so it never
+   steals the hover. */
+.hud-tooltip {
+    position: absolute;
+    bottom: calc(100% + 8px);        /* 8px gap ABOVE the icon (was top, now bottom) */
+    left: 50%;
+    transform: translate(-50%, 2px); /* start 2px high, settle down on show */
+    background: #0d0d0d;
+    border: 1px solid rgba(212, 175, 55, 0.4);
+    padding: 4px 10px;
+    border-radius: 4px;
+    font-size: 0.8rem;
+    font-family: var(--fable-font-serif, 'Cinzel', serif);
+    color: var(--fable-brass-bright, #E6D58A);
+    white-space: nowrap;
+    text-align: center;
+    line-height: 1.35;
+    opacity: 0;
+    visibility: hidden;
+    pointer-events: none;
+    transition: opacity 180ms ease, transform 180ms ease, visibility 0s linear 180ms;
+    box-shadow: 0 4px 10px rgba(0, 0, 0, 0.55), 0 0 6px rgba(212, 175, 55, 0.08);
+    z-index: 8;
+}
+.hud-dock-btn:hover .hud-tooltip,
+.hud-dock-btn:focus-visible .hud-tooltip {
+    opacity: 1;
+    visibility: visible;
+    transform: translate(-50%, 0);
+    transition: opacity 180ms ease, transform 180ms ease, visibility 0s;
+}
+.hud-tooltip-line { display: block; }
+.hud-tooltip-line + .hud-tooltip-line { margin-top: 1px; }
+.hud-tooltip-dim { opacity: 0.62; font-style: italic; }
+
+/* =============================================================
+   LEFT DRAWER — INTERACTION WIRING (2026-08-06)
+   Three systems layered onto the locked visual layout:
+     §A  Time-scrubber notch hover → time bubble (smooth fade + scale)
+     §B  Calendar day overlay on the icon (.hud-dock-day)
+     §C  Slide-up info card (.info-card-container) above the dock
+   No element repositioning of the existing layout — pure interaction states.
+   ============================================================= */
+
+/* ── §A  TIME-SCRUBBER NOTCH HOVER + TIME BUBBLE ──────────────────────────
+   HYSTERESIS design (Chloe 2026-08-07): the time dropdown should only TRIGGER
+   when the mouse is on the notch (a tight 30×48 box), but once active it must
+   not vanish the instant the mouse drifts off — a larger keep-alive zone
+   (2× the trigger) holds it lit until the mouse leaves that bigger area. Pure
+   CSS :hover can't do this, so the reveal is JS-driven: mouseenter on the small
+   .scrubber-hit → track gets .is-notch-active; mouseleave on the large
+   .scrubber-keepalive wrapper → removes it. The CSS below keys the notch scale
+   + bubble fade off .is-notch-active (NOT :hover). The track itself is
+   pointer-events:none; the keepalive (auto) is the only capture surface, with
+   the trigger nested inside it so the small box sits on top (higher z). */
+.scrubber-track { pointer-events: none; }
+.scrubber-keepalive {
+    position: absolute;
+    top: 50%;
+    left: 0%;                        /* synced to the notch's left:% by JS */
+    width: 60px;                     /* 2× the trigger — the keep-alive zone */
+    height: 96px;                    /* 2× the trigger height (48 → 96) */
+    transform: translate(-50%, -50%); /* center on the notch's left:% */
+    pointer-events: auto;            /* the sole capture surface (mouseleave fires here) */
+    background: transparent;
+    z-index: 1;                      /* below the diamond (z:2) + bubble (z:9) */
+}
+.scrubber-hit {
+    position: absolute;
+    top: 50%;
+    left: 0%;                        /* synced to the notch's left:% by JS */
+    width: 30px;                     /* tight trigger — mouse must be ON the notch */
+    height: 48px;                    /* +4px vertical per Chloe 2026-08-07 (was 44) */
+    transform: translate(-50%, -50%); /* center on the notch's left:% */
+    pointer-events: auto;            /* nested inside keepalive; sits on top via z */
+    background: transparent;         /* invisible — a hit area only */
+    z-index: 2;                      /* above the keepalive so it gets mouseenter first */
+}
+/* The notch scales up smoothly on activation. The base .scrubber-diamond
+   transform is translate(-50%,-50%) (centers it on the left:% point); the
+   .is-notch-active state compounds a scale(1.3) WITHOUT overriding the
+   centering. transition on transform only. */
+.scrubber-diamond {
+    transition: transform 0.2s ease-out;
+}
+.scrubber-track.is-notch-active .scrubber-diamond {
+    transform: translate(-50%, -50%) scale(1.3);
+}
+/* The time bubble ("7:08 PM") sits BELOW the notch, fades + lifts in on hover.
+   left:% is synced to the diamond's by JS (setScrubberPercent); translateX(-50%)
+   centers the bubble ON that % point. Default hidden (opacity:0, no pointer
+   events) so it never intercepts the drawer hover. On :hover both the notch
+   scale + the bubble fade are driven by the same .scrubber-track:hover — leaving
+   the hit box lets both ease back smoothly (no abrupt snap).
+   2026-08-06: bubble font set to 18px + moved down 4 more notches (gap below
+   the notch 14→30px, i.e. +16px) per Chloe. */
+.scrubber-time-bubble {
+    position: absolute;
+    top: calc(100% + 23px);          /* 23px gap BELOW the notch (−1px higher per Chloe 2026-08-07) */
+    left: 0%;                        /* synced to the diamond's left:% by JS */
+    transform: translate(-50%, 4px); /* start 4px low, settle on show */
+    background: #0d0d0d;
+    border: 1px solid rgba(212, 175, 55, 0.4);
+    padding: 2px 4px;                /* −2px each side (was 4px 6px) — border hugs the text tightly */
+    border-radius: 5px;
+    font-family: var(--fable-font-serif, 'Cinzel', serif);
+    font-size: 22px;                 /* +4px per Chloe 2026-08-06 (was 18px) */
+    font-weight: 500;
+    letter-spacing: 0.04em;
+    color: var(--fable-brass-bright, #E6D58A);
+    white-space: nowrap;
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity 0.2s ease-in, transform 0.2s ease-out;
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.6), 0 0 8px rgba(212, 175, 55, 0.12);
+    z-index: 9;                      /* above the notch + ticks */
+}
+.scrubber-track.is-notch-active .scrubber-time-bubble {
+    opacity: 1;
+    transform: translate(-50%, 0);
+}
+
+/* ── §B  CALENDAR DAY OVERLAY ────────────────────────────────────────────
+   A small bold brass number centered over the calendar icon's date area. Sits
+   inside the .hud-dock-btn (position:relative) on top of the SVG. Hidden
+   (.is-empty) when no live clock — renderStatusRow toggles the class. */
+.hud-dock-day {
+    position: absolute;
+    /* Centered on the calendar's lower body (the rect's date area). The icon
+       SVG fills the button; the day number lands just below center. */
+    top: 58%;
+    left: 50%;
+    transform: translate(-50%, -50%);
+    font-family: var(--fable-font-serif, 'Cinzel', serif);
+    font-size: 0.95rem;
+    font-weight: 700;
+    color: var(--fable-brass-bright, #E6D58A);
+    text-shadow: 0 1px 2px rgba(0, 0, 0, 0.8);
+    pointer-events: none;            /* never block the icon click */
+    z-index: 2;                      /* above the SVG icon (z:auto) */
+}
+.hud-dock-day.is-empty { display: none; }
+
+/* ── §C  SLIDE-UP INFO CARD ──────────────────────────────────────────────
+   A single container above the dock holding one of three bodies (calendar /
+   weather / location). Closed state: opacity 0 + translateY(20px) so it reads
+   as sliding up from behind the footer icons. cubic-bezier easing for the
+   premium slide. ONE card open at a time (JS enforces exclusivity). */
+.info-card-container {
+    position: absolute;
+    left: 16px;
+    right: 16px;
+    /* Dock is 86px tall flush to the bottom. Card sits above the dock; moved
+       DOWN per Chloe 2026-08-06 (bottom 100→88px) → 2px gap to dock. */
+    bottom: 88px;
+    height: 26%;                     /* 26% of drawer height per Chloe (grown up 2 from 24%) */
+    box-sizing: border-box;
+    background: #121212;
+    /* Faint radial dark-gold glow + the premium gold outline. */
+    background-image: radial-gradient(
+        ellipse at 50% 0%,
+        rgba(212, 175, 55, 0.06) 0%,
+        transparent 70%
+    );
+    border: 1px solid rgba(212, 175, 55, 0.4);
+    border-radius: 6px;
+    padding: 12px 16px;
+    overflow: hidden;
+    /* Closed (default): translated down + transparent, no pointer events. */
+    opacity: 0;
+    transform: translateY(20px);
+    pointer-events: none;
+    transition: opacity 0.3s cubic-bezier(0.25, 0.8, 0.25, 1),
+                transform 0.3s cubic-bezier(0.25, 0.8, 0.25, 1);
+    z-index: 8;                      /* above the paperdoll (7) so text is readable */
+    /* Flex-center the body so a 1-line headline reads cleanly. */
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}
+.info-card-container.is-open {
+    opacity: 1;
+    transform: translateY(0);
+    pointer-events: auto;
+}
+/* Card body typography — Cinzel brass headline, optional dim/tag subtext. */
+.info-card-headline {
+    font-family: var(--fable-font-serif, 'Cinzel', serif);
+    font-size: 1.15rem;
+    font-weight: 500;
+    letter-spacing: 0.05em;
+    color: var(--fable-brass-bright, #E6D58A);
+    text-align: center;
+    line-height: 1.3;
+    text-shadow: 0 0 6px var(--fable-brass-glow, rgba(230, 213, 138, 0.45));
+}
+.info-card-headline.info-card-dim {
+    color: rgba(212, 175, 55, 0.55);
+    font-style: italic;
+    font-weight: 400;
+    text-shadow: none;
+}
+.info-card-sep {
+    opacity: 0.6;
+    margin: 0 2px;
+}
+.info-card-tag {
     margin-top: 4px;
+    font-family: var(--fable-font-serif, 'Cinzel', serif);
+    font-size: 0.82rem;
+    letter-spacing: 0.08em;
+    font-style: italic;
+    color: rgba(212, 175, 55, 0.6);
+    text-align: center;
 }
-.hud-env-label:first-child { margin-top: 0; }
-.hud-env-time,
-.hud-env-weather {
-    font-size: 14px;
-    line-height: 1.2;
-    color: var(--fable-brass-bright);   /* crisp gold text */
-    letter-spacing: 0.3px;
-    word-break: break-word;
+
+/* ── DOCK ICON ACTIVE STATE (when its card is open) ──────────────────────
+   Mirrors the hover treatment (pop-out + glow + brighter) but persistent while
+   the card is open, so the user sees which icon the card belongs to. Sits
+   BELOW :hover in specificity (both apply :hover-like styles) so mousing off
+   the active icon keeps it lit. */
+.hud-dock-btn.is-active {
+    transform: scale(1.06) translateY(-5px);
+    color: var(--fable-brass-bright, #E6D58A);
 }
-.hud-env-glyph {
-    font-size: 13px;
-    margin-right: 2px;
+.hud-dock-btn.is-active .hud-dock-icon {
+    filter:
+        drop-shadow(0 0 2px var(--fable-brass-glow, rgba(230, 213, 138, 0.45)))
+        drop-shadow(0 4px 4px rgba(0,0,0,0.6))
+        brightness(1.1) saturate(1.1);
 }
 
 /* =============================================================
@@ -2115,46 +3003,6 @@ body.fable-active.fable-chrome-peek .top-bar { transform: translateY(0); }
     font-size: 16px; font-family: inherit; line-height: 1.4;
 }
 .fable-wupi-input:focus { outline: none; border-color: var(--fable-brass); box-shadow: 0 0 0 1px var(--fable-brass-dim); }
-
-/* Impersonate ✎ button — floats inside the RIGHT edge of the player's
- * roleplay text box (.fable-input-box). Chloe 2026-07-27: MOVED here from
- * the drawer compose row (it polishes the player's next RP action, so it
- * belongs on the field whose Enter fires a narrator turn, NOT the Wupi-
- * chat drawer). BORDERLESS + transparent bg per Chloe's instruction: the
- * pencil glyph floats directly on the textarea's inset background.
- *
- * Position: absolute, pinned right + vertically centered inside the box.
- * The textarea's right padding (44px) reserves the room so typed text
- * never runs under the glyph. The box itself does not resize.
- */
-.fable-impersonate-btn {
-    position: absolute;
-    right: 10px;
-    top: 50%;
-    transform: translateY(-50%);
-    z-index: 4;
-    width: 30px; height: 30px;
-    display: inline-flex; align-items: center; justify-content: center;
-    background: transparent;
-    color: var(--fable-brass);
-    border: none;
-    border-radius: 6px;
-    cursor: pointer;
-    padding: 0;
-    transition: color 160ms ease, transform 100ms ease;
-}
-.fable-impersonate-btn:hover { color: var(--fable-text); }
-.fable-impersonate-btn:active { transform: translateY(-50%) scale(0.94); }
-.fable-impersonate-btn:focus-visible { outline: none; box-shadow: 0 0 0 2px var(--fable-brass-dim); }
-.fable-impersonate-btn .fable-impersonate-glyph { font-size: 17px; line-height: 1; }
-.fable-impersonate-btn.busy { opacity: 0.6; pointer-events: none; }
-.fable-impersonate-btn.shake { animation: fable-fab-shake 320ms ease; }
-/* Director-armed chip in the drawer message list (set_directive tool fired). */
-.drawer-tool-chip.director-armed {
-    background: var(--fable-inset);
-    border-color: var(--fable-brass);
-    color: var(--fable-text);
-}
 .fable-wupi-input::placeholder { color: var(--fable-text-faint); }
 /* The drawer's send/stop toggle uses the shared .send-toggle-btn style
    (defined in styles.css). No per-surface button style needed here. */
@@ -2516,24 +3364,6 @@ body.fable-active.fable-chrome-peek .top-bar { transform: translateY(0); }
 }
 .fable-save-close:hover { color: var(--fable-text); }
 
-/* --- Quick Play inline choice (Start New / Resume Last) ---
-   Reuses the save-overlay/modal visual language. Appended to the title screen
-   when a quicksave exists, so the player can recognize the saved run before
-   overwriting it. The summary is the quicksave's derived label (the player's
-   last action), styled as quiet body prose between the title + actions. */
-.fable-quickplay-summary {
-    margin: 0 0 20px;
-    color: var(--fable-text-dim);
-    font-family: var(--fable-font-body);
-    font-size: 15px;
-    line-height: 1.5;
-    font-style: italic;
-}
-/* The title screen choice overlay must sit above the title's own content
-   (wordmark + buttons + ambient). z-index 46 matches the in-stage save
-   overlay's stacking, and is well below the toast (70) + panels. */
-.fable-title-screen .fable-quickplay-choice { z-index: 46; }
-
 /* --- Toast --- */
 .fable-toast {
     position: absolute; bottom: 100px; left: 50%; transform: translateX(-50%);
@@ -2632,124 +3462,46 @@ body.fable-active.fable-chrome-peek .top-bar { transform: translateY(0); }
 }
 
 /* =============================================================
-   FOG INTRO — the wind-blown fog gate on FABLE entry (re-added 2026-08-01).
-   A full-screen fog overlay mounted on document.body (above #fable z:4000
-   AND the magical overlay z:6000). Holds while wind loops + the fog drifts
-   continuously, then a SLOW SOFT LEFT→RIGHT FEATHERED WIPE reveals the title.
-   The wipe's gradient edge is wide + blurred so there is NO hard vertical cut
-   line — the fog thins out into the menu. Self-cleaned by fog.js.
-   pointer-events:none so it never blocks the underlying UI.
-   All-CSS gradients (no images), GPU-only animation (Prime Directive).
+   FOG INTRO — the simple fog gate on FABLE entry.
+   One full-screen overlay. fog.js mounts it at opacity:0, then toggles classes
+   to fade it up (2s), hold it fully opaque, and fade it back down (2s). The
+   screen swap happens during the hold (opacity 1), so it's invisible.
 
-   ARCHITECTURE (fixed 2026-08-02 — the prior version was broken):
-   The overlay is ONE element whose OWN mask is driven by rAF during the clear.
-   The three .fable-fog-bank children are the drifting fog texture; the overlay
-   container sits on top of the menu and is masked as a whole. During HOLD the
-   mask is fully opaque (fog covers everything). During CLEAR fog.js shrinks
-   the opaque span toward the right while a wide blurred feather trails behind,
-   so the ENTIRE fog composite — banks included — thins out left→right and the
-   menu shows through the cleared part. The banks keep drifting rightward
-   throughout, so fog visibly keeps blowing right AS it clears.
+   TIMELINE (per Chloe 2026-08-03):
+     0–2s   fog-up   (opacity 0 → 1)
+     2–4s   hold     (opacity 1) — the seamless scene swap fires at ~3s
+     4–6s   unfog    (opacity 1 → 0)
 
-   The prior version put a SOLID grey div (.fable-fog-mask) on top of the
-   banks: the banks were hidden behind it during hold (fog "didn't move") and
-   the wipe only revealed the banks (not the menu) — the menu appeared in a
-   single instant snap when the node was removed. That's gone now.
+   THE TRANSITION LIVES ON THE BASE ELEMENT, not on .fog-in/.fog-out. This is
+   load-bearing: if the transition were only on .fog-in/.fog-out, removing
+   .fog-in (to start the unfog) would momentarily drop the element back to the
+   base rule which has NO transition → the opacity would snap to 0 before
+   .fog-out's transition could engage. Keeping the transition on the base means
+   opacity changes animate regardless of which class is present. The classes
+   only set the target opacity (1 for fog-in, 0 for fog-out).
    ============================================================= */
 .fable-fog-overlay {
     position: fixed;
     inset: 0;
     z-index: 7000;
     pointer-events: none;
-    overflow: hidden;
-    /* Pale fog base — only seen if banks gap (the banks are semi-transparent
-       so the base fills the seams). */
-    background: #c9cdd2;
-    /* The wipe mask. Default = fully opaque (covers everything). fog.js sets
-       inline mask-image each rAF frame during CLEAR to shrink the opaque span
-       rightward with a wide feathered edge. Applied to THIS element (not a
-       child) so the whole fog composite — base + banks — clears together and
-       the menu underneath is what shows through the transparent part. */
-    -webkit-mask-image: linear-gradient(to right, rgba(0,0,0,1) 0%, rgba(0,0,0,1) 100%);
-    mask-image: linear-gradient(to right, rgba(0,0,0,1) 0%, rgba(0,0,0,1) 100%);
+    background: #cdd1d6;
+    opacity: 0;
+    will-change: opacity;
+    /* The transition is ALWAYS on. fog.js just toggles classes to change the
+       target opacity; the transition animates the change either direction. */
+    transition: opacity 2000ms ease-in-out;
 }
-
-/* The moving fog texture. Three banks, each 200% wide, drifting rightward at
-   different speeds (parallax = depth). Seamless: each bank is duplicated
-   side-by-side inside its node so the loop point has no visible seam. */
-.fable-fog-bank {
-    position: absolute;
-    top: 0;
-    left: 0;
-    width: 200%;
-    height: 100%;
-    will-change: background-position;
+/* .fog-in: target opacity 1 (the fog-up: 0 → 1). */
+.fable-fog-overlay.fog-in {
+    opacity: 1;
 }
-.fable-fog-bank--back {
-    height: 130%;
-    top: -15%;
-    /* clustered soft blobs via repeating-radial — drift via background-position
-       so it loops seamlessly without a transform jump. */
-    background-image:
-        radial-gradient(ellipse 220px 140px at 8% 30%,  rgba(196,201,206,0.95), rgba(196,201,206,0) 60%),
-        radial-gradient(ellipse 300px 170px at 24% 70%, rgba(178,184,190,0.9),  rgba(178,184,190,0) 60%),
-        radial-gradient(ellipse 260px 150px at 40% 25%, rgba(212,216,220,0.9),  rgba(212,216,220,0) 60%),
-        radial-gradient(ellipse 240px 160px at 55% 60%, rgba(170,176,182,0.92), rgba(170,176,182,0) 60%),
-        radial-gradient(ellipse 280px 140px at 70% 35%, rgba(200,205,210,0.9),  rgba(200,205,210,0) 60%),
-        radial-gradient(ellipse 220px 150px at 86% 68%, rgba(186,192,198,0.9),  rgba(186,192,198,0) 60%);
-    background-repeat: repeat-x;
-    background-size: 50% 100%;   /* tile the 6-blob set twice across 200% width */
-    opacity: 0.85;
-    animation: fable-fog-drift 26s linear infinite;
+/* .fog-out: target opacity 0 (the unfog: 1 → 0). fog.js removes .fog-in and
+   adds .fog-out together; because the transition is on the base element the
+   opacity animates down instead of snapping. */
+.fable-fog-overlay.fog-out {
+    opacity: 0;
 }
-.fable-fog-bank--mid {
-    height: 120%;
-    top: -10%;
-    background-image:
-        radial-gradient(ellipse 180px 110px at 12% 55%, rgba(222,225,229,0.92), rgba(222,225,229,0) 60%),
-        radial-gradient(ellipse 220px 120px at 30% 25%, rgba(204,208,212,0.9),  rgba(204,208,212,0) 60%),
-        radial-gradient(ellipse 200px 130px at 48% 72%, rgba(228,231,233,0.9),  rgba(228,231,233,0) 60%),
-        radial-gradient(ellipse 240px 110px at 64% 40%, rgba(210,214,218,0.9),  rgba(210,214,218,0) 60%),
-        radial-gradient(ellipse 190px 120px at 80% 60%, rgba(220,223,226,0.9),  rgba(220,223,226,0) 60%),
-        radial-gradient(ellipse 210px 110px at 94% 30%, rgba(198,203,207,0.9),  rgba(198,203,207,0) 60%);
-    background-repeat: repeat-x;
-    background-size: 50% 100%;
-    opacity: 0.8;
-    animation: fable-fog-drift 19s linear infinite;
-}
-.fable-fog-bank--front {
-    height: 110%;
-    top: -5%;
-    background-image:
-        radial-gradient(ellipse 140px 90px at 10% 40%, rgba(238,240,242,0.95), rgba(238,240,242,0) 60%),
-        radial-gradient(ellipse 160px 80px at 28% 65%, rgba(225,228,230,0.9),  rgba(225,228,230,0) 60%),
-        radial-gradient(ellipse 150px 90px at 46% 30%, rgba(242,244,245,0.92), rgba(242,244,245,0) 60%),
-        radial-gradient(ellipse 170px 85px at 62% 55%, rgba(230,232,234,0.9),  rgba(230,232,234,0) 60%),
-        radial-gradient(ellipse 145px 90px at 78% 28%, rgba(236,238,240,0.9),  rgba(236,238,240,0) 60%),
-        radial-gradient(ellipse 160px 85px at 92% 62%, rgba(226,229,231,0.9),  rgba(226,229,231,0) 60%);
-    background-repeat: repeat-x;
-    background-size: 50% 100%;
-    opacity: 0.75;
-    animation: fable-fog-drift 13s linear infinite;
-}
-/* Rightward drift via background-position. The banks are 200% wide with the
-   6-blob set at background-size 50% (so it tiles exactly twice across the
-   node). Moving background-position from 0 → +100% shifts the visible window
-   one full blob-set width to the right; because the set tiles every 50% of
-   the node (= 100% of one set), position 0% and 100% land on identical pixel
-   content → seamless loop. Linear timing = constant wind speed. (The prior
-   version used 0 → -50%, which drifted LEFT — opposite the intended wind.) */
-@keyframes fable-fog-drift {
-    from { background-position: 0% 0; }
-    to   { background-position: 100% 0; }
-}
-
-@media (prefers-reduced-motion: reduce) {
-    /* Freeze the drift; fog.js collapses the wipe to near-instant. Audio still
-       plays. */
-    .fable-fog-bank { animation: none !important; }
-}
-
 
 /* --- Send/Stop button — Fable brass override (Phase 2 v2) --- */
 /* The shared .send-toggle-btn (styles.css) is neon purple (#b534fa) — that's
@@ -2768,425 +3520,6 @@ body.fable-active.fable-chrome-peek .top-bar { transform: translateY(0); }
 .fable-app .send-toggle-btn.is-stop { color: #ff5050; }
 .fable-app .send-toggle-btn.is-stop:hover { color: #ff7a7a; }
 
-
-/* =========================================================== */
-/* CROSSROADS + GHOSTWRITER FAB cluster (§11.24, 2026-07-27)   */
-/* =========================================================== */
-/* Two floating action buttons anchored bottom-right of the    */
-/* stage, ABOVE the input row. Sits OUTSIDE the input box per  */
-/* the locked-feedback-memory rule (input dimensions are never */
-/* affected). Brass-SVG aesthetic matches .fable-foot-icon.    */
-
-.fable-fab-cluster {
-    position: absolute;
-    right: 28px;
-    /* Above the input row. The input row's height is ~64-90px; the FABs
-       sit just above it, clear of the corner-trigger + drawer. */
-    bottom: 108px;
-    z-index: 35;
-    display: flex;
-    flex-direction: column;
-    align-items: flex-end;
-    gap: 10px;
-    pointer-events: none;  /* the cluster itself is invisible to clicks; children re-enable */
-}
-.fable-fab-cluster > * { pointer-events: auto; }
-
-/* The two FAB buttons (✦ Crossroads, ✎ Ghostwriter). Round, brass-edged. */
-.fable-fab {
-    position: relative;
-    width: 46px;
-    height: 46px;
-    border-radius: 50%;
-    background: var(--fable-glass-deep);
-    color: var(--fable-brass);
-    border: 1px solid var(--fable-brass-dim);
-    cursor: pointer;
-    padding: 0;
-    line-height: 0;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    transition: background 160ms ease, border-color 160ms ease, color 160ms ease,
-                transform 160ms ease, box-shadow 160ms ease;
-    box-shadow: 0 4px 12px rgba(0,0,0,0.4), var(--fable-emboss);
-    user-select: none;
-}
-.fable-fab-glyph {
-    font-size: 20px;
-    line-height: 1;
-    /* Disable text-selection caret on the glyph (it's an icon, not text). */
-    pointer-events: none;
-}
-.fable-fab:hover {
-    background: rgba(48, 32, 16, 0.85);
-    color: var(--fable-brass-bright);
-    border-color: var(--fable-brass);
-    transform: translateY(-1px);
-    box-shadow: 0 6px 16px rgba(0,0,0,0.5), 0 0 14px var(--fable-brass-glow);
-}
-.fable-fab:active { transform: translateY(0); }
-.fable-fab:focus-visible {
-    outline: none;
-    border-color: var(--fable-brass-bright);
-    box-shadow: 0 0 0 2px var(--fable-brass-dim), var(--fable-emboss);
-}
-.fable-fab.busy {
-    opacity: 0.7;
-    cursor: progress;
-    animation: fable-fab-pulse 1.4s ease-in-out infinite;
-}
-@keyframes fable-fab-pulse {
-    0%, 100% { box-shadow: 0 4px 12px rgba(0,0,0,0.4), 0 0 6px var(--fable-brass-glow); }
-    50%      { box-shadow: 0 4px 12px rgba(0,0,0,0.4), 0 0 18px var(--fable-brass-glow); }
-}
-.fable-fab.shake { animation: fable-fab-shake 320ms ease; }
-@keyframes fable-fab-shake {
-    0%, 100% { transform: translateX(0); }
-    20%, 60% { transform: translateX(-4px); }
-    40%, 80% { transform: translateX(4px); }
-}
-
-/* Director-armed badge on the Ghostwriter FAB. Small dot at top-right. */
-.fable-fab-badge {
-    position: absolute;
-    top: -2px;
-    right: -2px;
-    min-width: 18px;
-    height: 18px;
-    padding: 0 4px;
-    border-radius: 9px;
-    background: var(--fable-brass-bright);
-    color: #1a120a;
-    font-size: 11px;
-    font-weight: 700;
-    line-height: 18px;
-    text-align: center;
-    box-shadow: 0 0 8px var(--fable-brass-glow);
-}
-.fable-fab-badge[hidden] { display: none; }
-
-/* --- Crossroads popover ("Choose a Director") --- */
-.fable-fab-popover {
-    position: absolute;
-    /* Sits to the LEFT of the FAB column so it doesn't overflow the right
-       screen edge. Anchored to the cluster's top-right (the FAB column's
-       upper end). */
-    right: 56px;
-    top: 0;
-    width: 280px;
-    background: linear-gradient(180deg, rgba(38, 26, 16, 0.97), rgba(20, 14, 9, 0.97));
-    border: 1px solid var(--fable-brass-dim);
-    border-radius: 12px;
-    padding: 14px;
-    box-shadow: 0 16px 40px rgba(0,0,0,0.55), var(--fable-emboss);
-    z-index: 36;
-    color: var(--fable-text);
-    font-family: var(--fable-font-body);
-}
-.fable-fab-popover[hidden] { display: none; }
-.fable-fab-popover-title {
-    font-size: 14px;
-    font-weight: 700;
-    color: var(--fable-brass-bright);
-    letter-spacing: 0.04em;
-    text-transform: uppercase;
-    margin-bottom: 10px;
-    text-align: center;
-}
-.fable-fab-lens-grid {
-    display: flex;
-    flex-direction: column;
-    gap: 6px;
-    margin-bottom: 10px;
-}
-.fable-fab-lens {
-    display: flex;
-    align-items: center;
-    gap: 10px;
-    padding: 8px 10px;
-    background: var(--fable-inset);
-    border: 1px solid var(--fable-glass-line);
-    border-radius: 8px;
-    color: var(--fable-text);
-    cursor: pointer;
-    text-align: left;
-    transition: background 140ms ease, border-color 140ms ease, transform 140ms ease;
-}
-.fable-fab-lens:hover {
-    background: rgba(48, 32, 16, 0.7);
-    border-color: var(--fable-brass);
-    transform: translateX(-2px);
-}
-.fable-fab-lens-glyph {
-    font-size: 20px;
-    color: var(--fable-brass-bright);
-    line-height: 1;
-    flex-shrink: 0;
-}
-.fable-fab-lens-body {
-    display: flex;
-    flex-direction: column;
-    gap: 1px;
-}
-.fable-fab-lens-name {
-    font-size: 14px;
-    font-weight: 600;
-}
-.fable-fab-lens-hint {
-    font-size: 11px;
-    color: var(--fable-text-dim);
-    line-height: 1.25;
-}
-.fable-fab-seed-row { display: flex; }
-.fable-fab-seed-input {
-    flex: 1;
-    width: 100%;
-    padding: 7px 10px;
-    background: var(--fable-inset);
-    border: 1px solid var(--fable-glass-line);
-    border-radius: 6px;
-    color: var(--fable-text);
-    font-family: var(--fable-font-body);
-    font-size: 13px;
-}
-.fable-fab-seed-input::placeholder { color: var(--fable-text-faint); }
-.fable-fab-seed-input:focus {
-    outline: none;
-    border-color: var(--fable-brass);
-    box-shadow: 0 0 0 2px var(--fable-brass-dim);
-}
-
-/* --- Ghostwriter Director inline bar (the long-press expansion) --- */
-.fable-director-bar {
-    position: absolute;
-    right: 56px;
-    /* Anchors BELOW the ✎ FAB (the second FAB in the column). The cluster
-       is column-layout; this bar sits to the left of the bottom FAB. */
-    bottom: 0;
-    width: 320px;
-    display: flex;
-    gap: 6px;
-    align-items: center;
-    background: linear-gradient(180deg, rgba(38, 26, 16, 0.97), rgba(20, 14, 9, 0.97));
-    border: 1px solid var(--fable-brass-dim);
-    border-radius: 10px;
-    padding: 8px;
-    box-shadow: 0 12px 30px rgba(0,0,0,0.5), var(--fable-emboss);
-    z-index: 36;
-}
-.fable-director-bar[hidden] { display: none; }
-.fable-director-input {
-    flex: 1;
-    padding: 6px 9px;
-    background: var(--fable-inset);
-    border: 1px solid var(--fable-glass-line);
-    border-radius: 6px;
-    color: var(--fable-text);
-    font-family: var(--fable-font-body);
-    font-size: 13px;
-}
-.fable-director-input::placeholder { color: var(--fable-text-faint); }
-.fable-director-input:focus {
-    outline: none;
-    border-color: var(--fable-brass);
-}
-.fable-director-arm,
-.fable-director-cancel {
-    padding: 6px 12px;
-    background: var(--fable-brass);
-    color: #1a120a;
-    border: none;
-    border-radius: 6px;
-    cursor: pointer;
-    font-family: var(--fable-font-body);
-    font-size: 13px;
-    font-weight: 600;
-    transition: background 140ms ease, transform 140ms ease;
-}
-.fable-director-arm:hover { background: var(--fable-brass-bright); }
-.fable-director-cancel {
-    background: transparent;
-    color: var(--fable-text-dim);
-    padding: 6px 8px;
-}
-.fable-director-cancel:hover { color: var(--fable-text); }
-
-/* --- Crossroads result modal (full-stage overlay with 6 cards) --- */
-.fable-crossroads-overlay {
-    position: absolute;
-    inset: 0;
-    z-index: 50;  /* above panel-overlay (45) + drawer */
-    display: flex;
-    align-items: center;
-    justify-content: center;
-}
-.fable-crossroads-backdrop {
-    position: absolute;
-    inset: 0;
-    background: rgba(2, 4, 10, 0.78);
-    backdrop-filter: blur(7px);
-}
-.fable-crossroads-modal {
-    position: relative;
-    z-index: 2;
-    width: min(920px, 94vw);
-    max-height: 88vh;
-    overflow-y: auto;
-    padding: 24px 28px;
-    background: linear-gradient(180deg, rgba(38, 26, 16, 0.97), rgba(20, 14, 9, 0.97));
-    border: 1px solid var(--fable-brass-dim);
-    border-radius: 14px;
-    box-shadow: 0 24px 60px rgba(0,0,0,0.6), var(--fable-emboss);
-    scrollbar-width: thin;
-    scrollbar-color: var(--fable-brass-dim) transparent;
-    font-family: var(--fable-font-body);
-}
-.fable-crossroads-modal::-webkit-scrollbar { width: 8px; }
-.fable-crossroads-modal::-webkit-scrollbar-thumb { background: rgba(203,163,92,0.25); border-radius: 4px; }
-.fable-crossroads-head {
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    margin-bottom: 18px;
-    padding-bottom: 12px;
-    border-bottom: 1px solid var(--fable-glass-line);
-}
-.fable-crossroads-head-title {
-    display: flex;
-    align-items: center;
-    gap: 10px;
-    font-size: 22px;
-    font-weight: 700;
-    color: var(--fable-text);
-    letter-spacing: 0.03em;
-}
-.fable-crossroads-head-glyph {
-    font-size: 26px;
-    color: var(--fable-brass-bright);
-    line-height: 1;
-}
-.fable-crossroads-close {
-    width: 32px;
-    height: 32px;
-    border-radius: 50%;
-    background: transparent;
-    border: 1px solid var(--fable-glass-line);
-    color: var(--fable-text-dim);
-    cursor: pointer;
-    font-size: 16px;
-    line-height: 1;
-    transition: background 140ms ease, color 140ms ease, border-color 140ms ease;
-}
-.fable-crossroads-close:hover {
-    background: rgba(80, 60, 30, 0.3);
-    color: var(--fable-text);
-    border-color: var(--fable-brass);
-}
-.fable-crossroads-body {
-    display: grid;
-    grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
-    gap: 14px;
-}
-
-/* A single option card. */
-.fable-crossroads-card {
-    display: flex;
-    flex-direction: column;
-    gap: 8px;
-    padding: 14px;
-    background: var(--fable-inset);
-    border: 1px solid var(--fable-glass-line);
-    border-radius: 10px;
-    transition: border-color 160ms ease, transform 160ms ease, box-shadow 160ms ease;
-}
-.fable-crossroads-card:hover {
-    border-color: var(--fable-brass);
-    transform: translateY(-2px);
-    box-shadow: 0 6px 18px rgba(0,0,0,0.4), 0 0 12px var(--fable-brass-glow);
-}
-.fable-crossroads-card-head {
-    display: flex;
-    align-items: baseline;
-    gap: 8px;
-}
-.fable-crossroads-card-icon {
-    font-size: 20px;
-    line-height: 1;
-    flex-shrink: 0;
-}
-.fable-crossroads-card-title {
-    font-size: 15px;
-    font-weight: 700;
-    color: var(--fable-text);
-    line-height: 1.25;
-}
-.fable-crossroads-card-body {
-    font-size: 13.5px;
-    line-height: 1.5;
-    color: var(--fable-text-dim);
-    flex: 1;
-}
-.fable-crossroads-card-actions {
-    display: flex;
-    gap: 6px;
-    margin-top: 4px;
-}
-.fable-crossroads-card-btn {
-    flex: 1;
-    padding: 6px 8px;
-    background: var(--fable-inset);
-    color: var(--fable-text);
-    border: 1px solid var(--fable-glass-line);
-    border-radius: 6px;
-    cursor: pointer;
-    font-family: var(--fable-font-body);
-    font-size: 12.5px;
-    font-weight: 600;
-    transition: background 140ms ease, border-color 140ms ease, color 140ms ease;
-}
-.fable-crossroads-card-btn:hover {
-    background: rgba(48, 32, 16, 0.7);
-    border-color: var(--fable-brass);
-    color: var(--fable-brass-bright);
-}
-.fable-crossroads-card-btn.primary {
-    background: var(--fable-brass);
-    color: #1a120a;
-    border-color: var(--fable-brass);
-}
-.fable-crossroads-card-btn.primary:hover {
-    background: var(--fable-brass-bright);
-    color: #1a120a;
-}
-.fable-crossroads-card-btn.ghost {
-    background: transparent;
-    color: var(--fable-text-dim);
-}
-
-/* Loading skeleton (6 cards pulsing while generation streams). */
-.fable-crossroads-card.skeleton {
-    min-height: 130px;
-    background: linear-gradient(100deg, rgba(48, 36, 22, 0.4) 30%, rgba(80, 60, 30, 0.5) 50%, rgba(48, 36, 22, 0.4) 70%);
-    background-size: 200% 100%;
-    animation: fable-crossroads-shimmer 1.6s ease-in-out infinite;
-    border-color: var(--fable-glass-line);
-}
-@keyframes fable-crossroads-shimmer {
-    0%   { background-position: 200% 0; }
-    100% { background-position: -200% 0; }
-}
-
-/* Error state inside the modal body. */
-.fable-crossroads-error {
-    grid-column: 1 / -1;
-    text-align: center;
-    padding: 40px 20px;
-    color: var(--fable-text-dim);
-    font-style: italic;
-    line-height: 1.5;
-}
-
 /* ============================================================
    New Game split screen + Creator (2026-08-01)
    New Game flow 2026-08-02: the three New Game screens (split +
@@ -3199,12 +3532,23 @@ body.fable-active.fable-chrome-peek .top-bar { transform: translateY(0); }
    ambiance + the serif headings carry the restyle there.
    ============================================================ */
 
-/* --- Shared New Game flow ambiance (split / picker / creator) --- */
-/* The deep-void floor replaces --fable-void on these three screens so the
-   embers read as the sole light source. */
+/* --- Shared New Game / Quick Play flow ambiance (split / picker / creator) --- */
+/* The deep-void floor replaces --fable-void on these screens so the
+   embers read as the sole light source. Quick Play's void-form joins the
+   group (2026-08-05 — same near-black floor as New Game, minus the hearth:
+   Quick Play has no warm glow, only the void + dark particles). */
 .fable-newgame-split-screen,
+.fable-quickplay-form-screen,
 .fable-picker-screen,
+.fable-worlds-screen,
 .fable-creator-screen { background: var(--fable-void-deep); }
+
+/* Quick Play's void is DARKER than the rest — near-pure-black so the brighter
+   void-blue particles read clearly against it (Chloe 2026-08-05: "make the
+   background darker and the particles more obvious ... it's a little too
+   subtle"). The other void-deep screens keep #05040a (they have warm embers
+   that need a touch of warmth in the floor); Quick Play's void is cold + empty. */
+.fable-quickplay-form-screen { background: #010103; }
 
 /* Ember canvas host: sits at the back of the screen, behind all content.
    The canvas (screens/embers.js) mounts inside this. Overflow hidden so
@@ -3240,6 +3584,8 @@ body.fable-active.fable-chrome-peek .top-bar { transform: translateY(0); }
    tiles + home button set their own z-index in their own rules below.) */
 .fable-picker-screen > .fable-screen-header,
 .fable-picker-screen > .fable-card-grid,
+.fable-worlds-screen > .fable-screen-header,
+.fable-worlds-screen > .fable-player-grid,
 .fable-creator-screen > .fable-screen-header,
 .fable-creator-screen > .fable-creator-tabs,
 .fable-creator-screen > .fable-creator-body,
@@ -3248,12 +3594,13 @@ body.fable-active.fable-chrome-peek .top-bar { transform: translateY(0); }
     z-index: 2;
 }
 
-/* --- New Game split (two giant logo-only square tiles + home button) --- */
-/* Redesigned 2026-08-02: no header bar. The screen is two giant square tiles
-   centered side by side, each showing ONLY a glyph (no text on the button).
-   On hover the tile pops forward, glows amber, and a glowing amber caption
-   fades in UNDERNEATH it. A small amber ⌂ home button sits in the top-right
-   corner. The shared .fable-screen-header is gone from this screen entirely. */
+/* --- New Game split (two giant caption-only square tiles + home button) --- */
+/* No header bar. The screen is two giant square tiles centered side by side,
+   each labeled by an always-visible amber caption (the tile's only content).
+   Every icon was removed from the New Game flow (Chloe 2026-08-03) — the
+   only chrome that survives is the flow controller's ‹ / ⌂, which is NOT on
+   this screen. On hover the tile pops forward + glows amber. The shared
+   .fable-screen-header is gone from this screen entirely. */
 
 /* Top-right home button: a minimalist brass house SVG (same icon as the
    in-game drawer footer's home), glowing softly — NO box/border around it,
@@ -3296,8 +3643,9 @@ body.fable-active.fable-chrome-peek .top-bar { transform: translateY(0); }
 }
 
 /* The tile row: two giant squares centered in the void. flex (not grid) so the
-   squares stay equal + the captions align under each without grid auto-fit
-   collapsing them on narrow viewports. */
+   squares stay equal without grid auto-fit collapsing them on narrow viewports.
+   max-width bumped (2026-08-03) to 1200px so the bigger tiles (up to 460px
+   each) + their gap don't crowd against the cap. */
 .fable-newgame-tiles {
     position: relative;
     z-index: 2;
@@ -3308,20 +3656,22 @@ body.fable-active.fable-chrome-peek .top-bar { transform: translateY(0); }
     gap: clamp(24px, 5vw, 80px);
     padding: 48px 28px;
     width: 100%;
-    max-width: 1100px;
+    max-width: 1200px;
     margin: 0 auto;
 }
 
-/* Each tile is a giant square. The button carries the glyph; the caption is a
-   child span that sits BELOW the square (positioned via the wrapper the button
-   itself forms — overflow visible so the caption shows outside the square).
-   Logo-only: no text inside the square. */
+/* Each tile is a giant square. The button's only content is the always-visible
+   caption, centered in the panel.
+   BIGGER (Chloe 2026-08-03: "the buttons need to be much bigger") — was
+   clamp(240px, 36vw, 380px), now clamp(280px, 42vw, 460px). Two still fit
+   side by side (max two across at ~460px each + the 80px gap on a wide
+   stage); the @media(max-width:620px) below stacks them on narrow viewports. */
 .fable-newgame-tile {
     position: relative;
     /* Giant square: sized off the viewport but capped so two fit side by side
        with generous separation. aspect-ratio keeps it a perfect square at any
        width. */
-    width: clamp(240px, 36vw, 380px);
+    width: clamp(280px, 42vw, 460px);
     aspect-ratio: 1 / 1;
     display: flex;
     align-items: center;
@@ -3334,20 +3684,60 @@ body.fable-active.fable-chrome-peek .top-bar { transform: translateY(0); }
     border-radius: 14px;
     color: inherit;
     cursor: pointer;
-    overflow: visible;   /* caption renders below the square */
+    overflow: visible;
     transition: border-color 240ms ease, transform 240ms cubic-bezier(0.2, 0.7, 0.3, 1),
                 box-shadow 240ms ease, background 240ms ease;
 }
-/* Soft inner top sheen, idle-off → lit on hover (the "warming up" read). */
-.fable-newgame-tile::before {
+/* 4-POINT CHRISTMAS STAR — hollow outline + star-shaped light (Chloe
+   2026-08-03: "SPOTLIGHT HAS TO MATCH THE STAR" — the bright area around the
+   text MUST be star-shaped too, not a circle). Both layers use the SAME
+   4-point star shape via inline-SVG data URIs (bulletproof in Chromium — no
+   clip-path:url(#) dependency):
+     ::before — the hollow star OUTLINE. A path with outer + inner star
+                polygons, fill-rule="evenodd" → interior cut out, only the
+                ring remains. Translucent fill (0.3 alpha = "more
+                transparent"); layered drop-shadows = the glow.
+     ::after  — the star-shaped LIGHT behind the text. A SOLID star (one
+                polygon, no hole) filled with a radial gradient so the center
+                is bright-hot and fades toward the points — the light source
+                that keeps the text lit. SAME star shape as the outline.
+   Both fade in on hover. */
+.fable-newgame-tile::before,
+.fable-newgame-tile::after {
     content: "";
     position: absolute;
     inset: 0;
     border-radius: inherit;
-    background: radial-gradient(circle at 50% 28%, rgba(230, 180, 90, 0.18), transparent 68%);
+    pointer-events: none;
     opacity: 0;
     transition: opacity 240ms ease;
-    pointer-events: none;
+}
+/* Hollow star outline: outer star + inner hole (evenodd), translucent fill,
+   glowing edges. Alpha 0.1 = subtle (Chloe 2026-08-03: "supposed to be
+   subtle"). The glow drop-shadows carry the visibility — the fill itself is
+   near-transparent glass. */
+.fable-newgame-tile::before {
+    background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100' preserveAspectRatio='none'><path fill-rule='evenodd' fill='rgba(255,220,140,0.1)' d='M50,0 L60,40 L100,50 L60,60 L50,100 L40,60 L0,50 L40,40 Z M50,10 L58,42 L90,50 L58,58 L50,90 L42,58 L10,50 L42,42 Z'/></svg>");
+    background-repeat: no-repeat;
+    background-size: 100% 100%;
+    background-position: center;
+    filter:
+        drop-shadow(0 0 4px rgba(255, 230, 160, 0.85))
+        drop-shadow(0 0 10px rgba(255, 200, 110, 0.6))
+        drop-shadow(0 0 22px rgba(230, 160, 60, 0.4));
+    z-index: 0;
+}
+/* Star-shaped LIGHT behind the caption (Chloe: "SPOTLIGHT HAS TO MATCH THE
+   STAR"). A SOLID 4-point star (no hole) filled with a radial gradient:
+   hot white-amber center fading to transparent at the points — the bright
+   area around the text, now STAR-shaped, not circular. Same star polygon as
+   the outline so they line up perfectly. */
+.fable-newgame-tile::after {
+    background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100' preserveAspectRatio='none'><defs><radialGradient id='g' cx='50%' cy='50%' r='50%'><stop offset='0%' stop-color='rgba(255,246,220,0.85)'/><stop offset='18%' stop-color='rgba(255,224,150,0.55)'/><stop offset='42%' stop-color='rgba(240,180,80,0.22)'/><stop offset='72%' stop-color='rgba(240,180,80,0)'/></radialGradient></defs><path fill='url(%23g)' d='M50,0 L60,40 L100,50 L60,60 L50,100 L40,60 L0,50 L40,40 Z'/></svg>");
+    background-repeat: no-repeat;
+    background-size: 100% 100%;
+    background-position: center;
+    z-index: 0;
 }
 .fable-newgame-tile:hover {
     border-color: var(--fable-brass);
@@ -3360,72 +3750,457 @@ body.fable-active.fable-chrome-peek .top-bar { transform: translateY(0); }
         0 14px 30px rgba(230, 160, 60, 0.28),      /* amber underglow */
         0 0 30px var(--fable-brass-glow);            /* outer halo */
 }
-.fable-newgame-tile:hover::before { opacity: 1; }
-
-/* The centered glyph — large, amber, softly glowing. Grows slightly + brightens
-   on hover so the tile feels alive. */
-.fable-newgame-tile-glyph {
-    font-size: clamp(120px, 18vw, 220px);
-    line-height: 1;
-    color: var(--fable-brass);
-    text-shadow: 0 0 26px var(--fable-brass-glow), 0 0 12px rgba(230, 213, 138, 0.4);
-    transition: color 240ms ease, text-shadow 240ms ease, transform 240ms ease;
+.fable-newgame-tile:hover::before,
+.fable-newgame-tile:hover::after { opacity: 1; }
+/* Disabled tile (Chloe 2026-08-03: Quick Play's LOAD LAST GAME when no
+   quicksave exists — "completely darkened out and not clickable"). Matches
+   the title button's disabled discipline: full-opacity body, dimmed via
+   filter (brightness/saturate/greyscale cut), no hover lift/glow, cursor
+   not-allowed, pointer-events off. Keeps the tile's carved presence but
+   reads as unlit/locked. */
+.fable-newgame-tile:disabled {
+    cursor: not-allowed;
+    filter: brightness(0.42) saturate(0.4) grayscale(0.5);
+    pointer-events: none;
 }
-/* The CREATE SIM CARD (pencil) + LOAD SIM CARD (4-pointed star) SVGs are a
-   matched brass line-art pair. Sized in em so they track the slot's font-size
-   clamp. stroke=currentColor inherits the slot's brass (and the hover-bright
-   swap). */
-.fable-newgame-tile-glyph svg.fable-create-glyph,
-.fable-newgame-tile-glyph svg.fable-scroll-glyph {
-    width: 1em;
-    height: 1em;
-    display: block;
-    margin: 0 auto;
-    filter: drop-shadow(0 0 18px var(--fable-brass-glow));
-    transition: color 240ms ease, filter 240ms ease;
+.fable-newgame-tile:disabled:hover {
+    transform: none;
+    border-color: var(--fable-brass-dim);
+    background: linear-gradient(180deg, rgba(22, 16, 12, 0.82), rgba(10, 7, 5, 0.9));
+    box-shadow: none;
 }
-.fable-newgame-tile:hover .fable-newgame-tile-glyph svg.fable-create-glyph,
-.fable-newgame-tile:hover .fable-newgame-tile-glyph svg.fable-scroll-glyph {
-    filter: drop-shadow(0 0 28px var(--fable-brass-glow));
-}
-.fable-newgame-tile:hover .fable-newgame-tile-glyph {
-    color: var(--fable-brass-bright);
-    transform: scale(1.06);
-    text-shadow: 0 0 40px var(--fable-brass-glow), 0 0 18px rgba(230, 213, 138, 0.6);
+.fable-newgame-tile:disabled:hover::before,
+.fable-newgame-tile:disabled:hover::after { opacity: 0; }
+.fable-newgame-tile:disabled .fable-newgame-tile-caption {
+    color: var(--fable-brass-dim);
+    text-shadow: none;
 }
 
-/* The caption: glowing amber, Cinzel engraved caps, UNDER the square. Hidden
-   by default, fades + lifts in on hover. Positioned below the tile via
-   absolute positioning so it doesn't push layout. */
+/* The caption: glowing amber, Cinzel engraved caps, CENTERED in the panel.
+   Always visible (the tile's only content — no glyph to hover-reveal it).
+   Brightens slightly on hover so the tile feels alive.
+   TEXT +4px (Chloe 2026-08-03: "make the words inside the buttons 4px
+   bigger") — was clamp(15px, 1.7vw, 20px), now clamp(19px, 2.0vw, 24px).
+   WORD STACKING: each .fable-tile-line is display:block so multi-word
+   captions stack per the rule (2 words = vertical; 3 words = 1 over 2).
+   See engine/tile-caption.js. */
 .fable-newgame-tile-caption {
-    position: absolute;
-    top: calc(100% + 22px);     /* sit beneath the square */
-    left: 50%;
-    transform: translateX(-50%) translateY(6px);
-    white-space: nowrap;
-    font-family: var(--fable-font-serif);
-    font-size: clamp(13px, 1.4vw, 16px);
-    font-weight: 600;
-    letter-spacing: 0.22em;
+    position: relative;   /* flow into the tile's flex center, not absolute */
+    z-index: 1;           /* above the ::before/::after star light */
+    text-align: center;
+    padding: 0 12px;
+    /* Almendra (Chloe 2026-08-03: "Use font Almendra") — a gothic blackletter-
+       adjacent serif with strong engraving character, loaded via the Google
+       Fonts link in wupi.html. Falls back to Cinzel/the serif stack if the
+       webfont hasn't cached yet. */
+    font-family: 'Almendra', var(--fable-font-serif);
+    font-size: clamp(60px, 2.6vw, 60px);   /* +10px more (was 37–42) — Chloe 2026-08-03 */
+    font-weight: 900;                       /* Almendra's real max (no 900 ships) */
+    letter-spacing: 0.08em;                  /* Chloe 2026-08-03: was 0.26em */
     text-transform: uppercase;
+    line-height: 1.1;                       /* Chloe 2026-08-03: was 1.18 */
+    /* Slight upward nudge (Chloe 2026-08-03: "move the font up by 10px just a
+       slight nudge"). translateY doesn't affect the flex centering layout —
+       it only shifts the painted glyph up 10px. */
+    transform: translateY(-4px);
     color: var(--fable-brass-bright);
     text-shadow: 0 0 16px var(--fable-brass-glow), 0 0 8px rgba(230, 213, 138, 0.5);
-    opacity: 0;
     pointer-events: none;
-    transition: opacity 240ms ease, transform 240ms ease;
+    transition: color 240ms ease, text-shadow 240ms ease;
+}
+.fable-newgame-tile-caption .fable-tile-line {
+    display: block;       /* stack vertically — one line per span */
 }
 .fable-newgame-tile:hover .fable-newgame-tile-caption {
-    opacity: 1;
-    transform: translateX(-50%) translateY(0);
+    color: #fff5d6;
+    text-shadow: 0 0 28px var(--fable-brass-glow), 0 0 14px rgba(230, 213, 138, 0.7);
 }
 
-/* Narrow viewports: stack the two tiles vertically so neither shrinks below the
-   glyph's readable size. The home button stays top-right. */
+/* Narrow viewports: stack the two tiles vertically so neither shrinks below a
+   readable size. The home button stays top-right. */
 @media (max-width: 620px) {
     .fable-newgame-tiles {
         flex-direction: column;
-        gap: 56px;   /* extra room for the caption between tiles */
+        gap: 56px;
     }
+}
+
+/* --- Sim Creator chooser PYRAMID (NPC / WORLD / SCENE) ------------------
+   2026-08-05: the three creator-type tiles arrange as a pyramid — NPC on
+   top center, WORLD + SCENE on the bottom row. The pyramid is a single flex
+   item inside `.fable-newgame-tiles` (so the host's centering still applies),
+   but is itself a column so the three tiles stack vertically with a generous
+   gap ("not too close"). The bottom row reuses the host's horizontal gap
+   discipline so the pair reads like Pair 1/2. The tiles themselves are plain
+   `.fable-newgame-tile` elements (same giant-square sizing + star hover) —
+   only the CONTAINER changes. */
+.fable-sim-chooser-pyramid {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: clamp(40px, 6vh, 80px);            /* generous vertical separation */
+    width: 100%;
+}
+.fable-sim-chooser-row {
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    justify-content: center;
+    gap: clamp(24px, 5vw, 80px);            /* matches Pair 1/2 horizontal gap */
+}
+/* The pyramid's tiles are SMALLER than the Player pair's giant squares (Chloe
+   2026-08-05: "make the world, npc, and scene buttons a bit smaller too").
+   Scoped to `.fable-sim-chooser-pyramid .fable-newgame-tile` so the Player
+   pair (slide 1) keeps its big squares. The pyramid's column + row are both
+   centered (align-items + justify-content), so smaller tiles stay centered
+   as a unit. */
+.fable-sim-chooser-pyramid .fable-newgame-tile {
+    width: clamp(220px, 32vw, 340px);
+}
+/* The pyramid's tiles inherit the full .fable-newgame-tile square sizing. On
+   narrow viewports the bottom row stacks so neither tile shrinks below a
+   readable size (mirrors the Pair 1/2 narrow rule above). */
+@media (max-width: 620px) {
+    .fable-sim-chooser-row {
+        flex-direction: column;
+        gap: 56px;
+    }
+}
+
+/* ============================================================= */
+/* QUICK PLAY VOID FORM (2026-08-05) — the ominous Quick Play entry. */
+/* Three sleek dark charcoal-gray auto-growing text fields stacked    */
+/* vertically + a black-and-white CREATE button that emits dark       */
+/* particles + a dark glow. Pure void + dark particles in the bg.     */
+/* ============================================================= */
+
+/* The void-particle canvas host: sits at the back of the screen, behind the
+   form. The canvas (screens/void-particles.js) mounts inside this. Same
+   layering discipline as the ember host. */
+.fable-void-particle-host {
+    position: absolute;
+    inset: 0;
+    z-index: 0;
+    overflow: hidden;
+    pointer-events: none;
+}
+
+/* The form stack: a centered column of three field blocks + the CREATE
+   button, vertically centered with equal gaps. Ships at opacity 0 so the
+   screen's reveal transition (driven by showScreen) can fade it in; the
+   .is-fading class drives the CREATE → drift handoff (fade to 0, leaving
+   the void + particles). z:2 lifts it above the particle host. */
+.fable-qp-stack {
+    position: relative;
+    z-index: 2;
+    display: flex;
+    flex-direction: column;
+    align-items: stretch;
+    justify-content: flex-end;            /* CREATE near the bottom (not flush) */
+    gap: clamp(40px, 7vh, 80px);          /* spread the blocks out more */
+    width: min(640px, 86vw);
+    flex: 1;                              /* fill the screen (flex child of .fable-screen) */
+    min-height: 0;                        /* allow the flex child to shrink + scroll */
+    box-sizing: border-box;
+    margin: 0 auto;
+    padding: clamp(24px, 6vh, 60px) 0 clamp(48px, 9vh, 96px);  /* bottom breathing room — nudged up (was clamp(24px, 4vh, 48px)) so the whole column sits higher */
+    overflow-y: auto;                     /* scroll if the bigger fields/headers overflow */
+    scrollbar-width: none;                /* Firefox — sleek, no scrollbar */
+    -ms-overflow-style: none;
+    opacity: 0;                            /* reveal via .is-shown (JS-driven) */
+    transition: opacity 700ms ease;
+}
+.fable-qp-stack::-webkit-scrollbar { display: none; }   /* Chrome/Edge — no scrollbar */
+/* Reveal: .is-shown is toggled by the screen's _startAmbient hook (which
+   showScreen calls the instant the screen becomes visible). JS-driven rather
+   than :not([hidden]) because [hidden] = display:none, and a CSS opacity
+   transition cannot fire from display:none — the initial opacity:0 must
+   paint first (forced via a reflow in _startAmbient), then this class runs
+   the fade-in. */
+.fable-qp-stack.is-shown { opacity: 1; }
+/* The drift handoff: fade everything except the void + particles to 0. */
+.fable-qp-stack.is-fading {
+    opacity: 0;
+}
+
+/* A single field block: the bold header + the auto-growing textarea. The
+   gap between header + field is larger now that the header is ~3× taller. */
+.fable-qp-field-block {
+    display: flex;
+    flex-direction: column;
+    gap: 18px;
+    /* Nudge the three headers + boxes up WITHOUT moving the CREATE button.
+       The stack is justify-content:flex-end (CREATE pinned to the bottom), so
+       a layout change (gap/margin/padding) would reflow the packed group and
+       drag the button with it. A transform is purely visual — it shifts these
+       blocks up while the button's flow position stays exactly put. (Chloe
+       2026-08-05.) */
+    transform: translateY(-24px);
+}
+
+/* The label: the bold inscription header ABOVE each field. Bigger + centered
+   (Chloe 2026-08-05: "All 3 'describe' headers should be 3 times bigger ...
+   centered on top of the text boxes"). Almendra display weight at ~3× the
+   prior size, centered under the dim ominous palette. */
+.fable-qp-label {
+    font-family: 'Almendra', var(--fable-font-serif);
+    font-size: clamp(28px, 3.6vw, 38px);
+    font-weight: 700;
+    letter-spacing: 0.18em;
+    text-transform: uppercase;
+    color: rgba(176, 166, 160, 0.72);
+    text-align: center;
+    user-select: none;
+}
+
+/* SCOPED text-selection color for Quick Play ONLY. The browser default is a
+   bright system-blue highlight that clashes hard with the ominous void
+   palette. Here it's a dark charcoal-gray (matching the field surfaces) so a
+   selection reads as "subtly emphasized" rather than "alarming blue."
+   Scoped to .fable-quickplay-form-screen so the rest of the app keeps its
+   default selection color. (Chloe 2026-08-05.) */
+.fable-quickplay-form-screen ::selection {
+    background: rgba(60, 54, 52, 0.85);
+    color: #f4f1ef;
+}
+.fable-quickplay-form-screen ::-moz-selection {     /* Firefox */
+    background: rgba(60, 54, 52, 0.85);
+    color: #f4f1ef;
+}
+
+/* The field: sleek dark charcoal-gray, no resize handle, no visible scrollbar,
+   hairline border + subtle inset shadow. FIXED at exactly 2 full lines tall —
+   text beyond 2 lines scrolls internally (scroll wheel only; the scrollbar is
+   hidden across all browsers). This is what keeps the three boxes uniform +
+   the whole form fitting the viewport without resizing text or clipping the
+   top block. (Previously min-height:160px + auto-grow via JS, which made the
+   stack overflow on shorter viewports.)
+   HEIGHT MATH (load-bearing for the "2 full lines, no clipping while typing"
+   contract): font-size 1.25rem = 20px, line-height 1.5 → 30px/line × 2 = 60px
+   content + 14px×2 padding = 88px. The slack (vs a too-tight 102px/1.55) is
+   what lets the 2nd line's descenders clear the bottom edge AND lets the
+   browser's native auto-scroll-on-type keep the active line in view while the
+   user types past line 2 — without the slack, scrollTop pins at 0 and the
+   bottom line gets cut mid-character during active typing. */
+.fable-qp-field {
+    display: block;
+    width: 100%;
+    height: 88px;                           /* 2 full lines × 30px + 12px×2 padding + 4px slack */
+    padding: 12px 22px;
+    box-sizing: border-box;
+    background: rgba(20, 18, 16, 0.72);
+    border: 1px solid var(--fable-glass-line);
+    border-radius: 6px;
+    color: var(--fable-text);
+    font-family: var(--fable-font-serif);
+    font-size: 1.25rem;
+    line-height: 1.5;                       /* 30px/line — was 1.55 (31px) */
+    resize: none !important;               /* no resize handle — sleek */
+    overflow-y: auto;                       /* scroll internally past 2 lines */
+    scrollbar-width: none;                  /* Firefox — hidden scrollbar */
+    -ms-overflow-style: none;
+    box-shadow: inset 0 1px 6px rgba(0, 0, 0, 0.55), inset 0 0 0 1px rgba(0, 0, 0, 0.25);
+    transition: border-color 260ms ease, box-shadow 260ms ease, background 260ms ease;
+    user-select: text;
+}
+.fable-qp-field::-webkit-scrollbar { display: none; }   /* Chrome/Edge no scrollbar */
+.fable-qp-field:focus {
+    outline: none;
+    border-color: rgba(120, 112, 108, 0.7);
+    background: rgba(24, 22, 20, 0.82);
+    box-shadow: inset 0 1px 6px rgba(0, 0, 0, 0.6), 0 0 0 1px rgba(120, 112, 108, 0.18);
+}
+
+/* CREATE: a large black-and-white button at the very bottom. Disabled state
+   = dim gray border + muted text + not-allowed; .is-ready (all fields
+   filled) = white border + white text + a dark glow + subtle dark particles
+   rising off it. The glow pulses slowly (ominous). */
+.fable-qp-create {
+    position: relative;
+    display: block;
+    width: min(360px, 72%);                /* bigger — was min(280px, 60%) */
+    margin: clamp(-4px, 0.5vh, 8px) auto 0;  /* nudged up ~12px (was clamp(8px, 2vh, 20px)) */
+    padding: 34px 32px;                    /* taller — was 26px 24px */
+    background: rgba(8, 7, 9, 0.92);
+    border: 1.5px solid rgba(90, 86, 88, 0.5);
+    border-radius: 6px;
+    color: rgba(150, 146, 148, 0.55);
+    font-family: 'Almendra', var(--fable-font-serif);
+    font-size: clamp(22px, 2.6vw, 30px);   /* bigger — was clamp(18px, 2vw, 24px) */
+    font-weight: 700;
+    letter-spacing: 0.4em;
+    text-transform: uppercase;
+    cursor: not-allowed;
+    overflow: visible;                      /* let the dark-particle pseudo-elements rise out */
+    transition: color 320ms ease, border-color 320ms ease, background 320ms ease, box-shadow 320ms ease, transform 200ms ease;
+}
+/* Disabled CREATE: a faint static dark inner shadow so it reads as inert,
+   not absent. */
+.fable-qp-create:disabled {
+    box-shadow: inset 0 0 24px rgba(0, 0, 0, 0.6);
+}
+/* Ready + enabled: white border + white text + the dark glow + slow pulse.
+   The pulse is a layered near-black/charcoal box-shadow breathing in/out —
+   the ominous "dark glow" (NOT a bright glow). The outer white halo is kept
+   TIGHT (small blur + spread) per Chloe 2026-08-05: "make the white outer glow
+   smaller" — only a thin edge ring + a small diffuse fringe, not a wide bloom. */
+.fable-qp-create.is-ready {
+    border-color: rgba(235, 232, 230, 0.85);
+    color: #f4f1ef;
+    background: rgba(6, 5, 7, 0.96);
+    cursor: pointer;
+    box-shadow:
+        0 0 0 1px rgba(235, 232, 230, 0.12),
+        0 0 11px 2px rgba(0, 0, 0, 0.85),
+        0 0 24px 6px rgba(20, 18, 22, 0.7);
+    animation: fable-qp-create-pulse 3.6s ease-in-out infinite;
+}
+@keyframes fable-qp-create-pulse {
+    0%, 100% {
+        box-shadow:
+            0 0 0 1px rgba(235, 232, 230, 0.12),
+            0 0 11px 2px rgba(0, 0, 0, 0.85),
+            0 0 24px 6px rgba(20, 18, 22, 0.7);
+    }
+    50% {
+        box-shadow:
+            0 0 0 1px rgba(235, 232, 230, 0.2),
+            0 0 17px 4px rgba(0, 0, 0, 0.9),
+            0 0 36px 9px rgba(28, 24, 32, 0.78);
+    }
+}
+/* Dark particles rising off the ready CREATE button — two CSS pseudo-element
+   mote columns. Cheap (no second canvas): radial-gradient dots drifting up
+   via background-position animation. Omitting on the disabled state keeps
+   the inert read clean. */
+.fable-qp-create.is-ready::before,
+.fable-qp-create.is-ready::after {
+    content: '';
+    position: absolute;
+    left: 0;
+    right: 0;
+    bottom: 100%;
+    height: 60px;
+    pointer-events: none;
+    background-image:
+        radial-gradient(circle at 18% 100%, rgba(30, 27, 30, 0.85) 0 1.4px, transparent 1.6px),
+        radial-gradient(circle at 42% 100%, rgba(18, 16, 20, 0.8) 0 1.1px, transparent 1.3px),
+        radial-gradient(circle at 68% 100%, rgba(40, 36, 40, 0.75) 0 1.6px, transparent 1.8px),
+        radial-gradient(circle at 88% 100%, rgba(22, 20, 24, 0.8) 0 1.2px, transparent 1.4px);
+    background-repeat: no-repeat;
+    opacity: 0.7;
+    animation: fable-qp-emit 2.8s linear infinite;
+}
+.fable-qp-create.is-ready::after {
+    animation-duration: 3.6s;
+    animation-delay: -1.4s;
+    opacity: 0.5;
+}
+@keyframes fable-qp-emit {
+    0%   { background-position-y: 0; opacity: 0; }
+    18%  { opacity: 0.75; }
+    100% { background-position-y: -60px; opacity: 0; }
+}
+/* Hover (ONLY when .is-ready — i.e. all 3 fields filled, button enabled):
+   brighter glow + pop forward toward the viewer. Inactive/disabled hover does
+   nothing (the button isn't clickable; no false affordance). The pop is a
+   translateY up + a slight scale-up so it reads as lifting off the void. */
+.fable-qp-create.is-ready:hover {
+    transform: translateY(-3px) scale(1.03);
+    box-shadow:
+        0 0 0 1px rgba(235, 232, 230, 0.4),
+        0 6px 20px 4px rgba(0, 0, 0, 0.95),
+        0 0 60px 16px rgba(235, 232, 230, 0.35);
+    animation: none;             /* pause the idle pulse so hover owns the glow */
+}
+.fable-qp-create.is-ready:active {
+    transform: translateY(0);
+}
+.fable-qp-create-label {
+    position: relative;
+    z-index: 1;
+}
+
+/* --- Quick Play resume popup (shown over the void-form when a quicksave exists) --- */
+.fable-qp-popup {
+    position: absolute;
+    inset: 0;
+    z-index: 10;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: rgba(0, 0, 0, 0.55);
+    opacity: 0;
+    transition: opacity 260ms ease;
+}
+.fable-qp-popup.is-open { opacity: 1; }
+.fable-qp-popup-card {
+    width: min(440px, 84vw);
+    padding: 28px 30px 24px;
+    background: linear-gradient(180deg, rgba(26, 22, 24, 0.96), rgba(14, 12, 14, 0.97));
+    border: 1px solid var(--fable-glass-line);
+    border-radius: 8px;
+    box-shadow: 0 18px 60px rgba(0, 0, 0, 0.7), inset 0 1px 0 rgba(255, 255, 255, 0.04);
+    text-align: center;
+}
+.fable-qp-popup-title {
+    margin: 0 0 8px;
+    font-family: 'Almendra', var(--fable-font-serif);
+    font-size: 1.25rem;
+    letter-spacing: 0.04em;
+    color: var(--fable-text);
+}
+.fable-qp-popup-warn {
+    margin: 0 0 22px;
+    font-family: var(--fable-font-serif);
+    font-size: 0.95rem;
+    line-height: 1.5;
+    color: rgba(180, 172, 168, 0.8);
+}
+.fable-qp-popup-actions {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    align-items: stretch;
+}
+.fable-qp-popup-btn {
+    padding: 11px 16px;
+    background: rgba(10, 9, 11, 0.9);
+    border: 1px solid rgba(120, 112, 108, 0.5);
+    border-radius: 5px;
+    color: var(--fable-text);
+    font-family: 'Almendra', var(--fable-font-serif);
+    font-size: 0.95rem;
+    letter-spacing: 0.18em;
+    text-transform: uppercase;
+    cursor: pointer;
+    transition: border-color 200ms ease, color 200ms ease, background 200ms ease;
+}
+.fable-qp-popup-btn:hover {
+    border-color: rgba(200, 194, 190, 0.7);
+    color: #f4f1ef;
+    background: rgba(16, 14, 17, 0.95);
+}
+.fable-qp-popup-cancel {
+    margin-top: 4px;
+    background: transparent;
+    border-color: transparent;
+    font-size: 0.8rem;
+    letter-spacing: 0.12em;
+    color: rgba(150, 142, 138, 0.6);
+    text-transform: none;
+}
+.fable-qp-popup-cancel:hover {
+    color: rgba(200, 194, 190, 0.85);
+    background: transparent;
+}
+
+/* Narrow viewports: tighten the stack so all three fields + CREATE stay
+   reachable without scroll. */
+@media (max-width: 620px) {
+    .fable-qp-stack { gap: clamp(14px, 3vh, 26px); width: 90vw; }
+    .fable-qp-field { height: 72px; padding: 11px 15px; font-size: 1rem; line-height: 1.5; }
 }
 
 /* --- New Game split header: serif title flanked by thin ornamental rules --- */

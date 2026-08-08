@@ -1685,6 +1685,27 @@ input[type="password"]::-webkit-credentials-auto-fill-button {
 .home-app:hover .home-app-icon svg {
     filter: drop-shadow(0 0 12px color-mix(in srgb, var(--ui-accent) 55%, transparent));
 }
+/* FABLE tile icon: a white OUTLINED uppercase "F" in Uncial Antiqua, interior
+   transparent. Scoped to the Fable tile so the other home icons (SVG strokes)
+   are untouched. The stroke is painted via -webkit-text-stroke (Chrome/WebKit
+   — the Tauri webview is Chromium, so this is the supported path) with the
+   fill set transparent so only the outline shows. Sized to match the 72px SVG
+   glyphs; line-height:1 + flex centering (inherited from .home-app-icon)
+   keeps it optically centered. The hover glow mirrors the SVG tiles'
+   drop-shadow so FABLE lights up consistently on hover. */
+.home-app[data-open="fable"] .home-app-icon .fable-glyph {
+    font-family: 'Uncial Antiqua', 'Times New Roman', serif;
+    font-size: 74px;
+    line-height: 1;
+    color: transparent;
+    -webkit-text-stroke: 2px #ffffff;
+    paint-order: stroke fill;
+    transition: filter 0.18s;
+    user-select: none;
+}
+.home-app[data-open="fable"]:hover .home-app-icon .fable-glyph {
+    filter: drop-shadow(0 0 12px color-mix(in srgb, var(--ui-accent) 55%, transparent));
+}
 .home-app-label {
     font-size: 14px;
     font-weight: 600;
@@ -1756,29 +1777,6 @@ input[type="password"]::-webkit-credentials-auto-fill-button {
     color: color-mix(in srgb, var(--ui-accent) 80%, transparent);
 }
 @keyframes blink { 50% { opacity: 0; } }
-.msg-reasoning {
-    margin-top: 8px;
-    border-top: 1px solid rgba(255, 255, 255, 0.08);
-    padding-top: 8px;
-}
-.msg-reasoning summary {
-    cursor: pointer;
-    font-size: 12px;
-    color: rgba(255, 255, 255, 0.45);
-    font-weight: 600;
-    letter-spacing: 0.4px;
-    user-select: none;
-}
-.msg-reasoning summary:hover { color: rgba(255, 255, 255, 0.7); }
-.msg-reasoning-body {
-    margin-top: 8px;
-    font-size: 12.5px;
-    color: rgba(255, 255, 255, 0.55);
-    line-height: 1.5;
-    white-space: pre-wrap;
-    padding-left: 12px;
-    border-left: 2px solid color-mix(in srgb, var(--ui-accent) 25%, transparent);
-}
 /* Tool-calling agent loop chips (Phase 5). Small monospace status badges
    that appear above the Wupi bubble while tools execute, then settle to a
    success/failure tint. Subtle by design: tool surface is invisible to the
@@ -2041,13 +2039,15 @@ input[type="password"]::-webkit-credentials-auto-fill-button {
     /* Neon reflection pool below the title. box-reflect mirrors the LIVE
        rendered element, so the L→R .lit sweep + its layered glow reflect in
        real time. line-height:1 tightens the element box to the glyph cap-height
-       so the mirror starts right at the baseline (no line-box gap). The mask is
+       so the mirror starts right at the baseline (no line-box gap); the -8px
+       below offset pulls the reflection UP a tiny smidge toward the text
+       (2026-08-04: a touch closer than the prior 0px gap). The mask is
        deliberately gentle — it holds near-full opacity through the first third
        then eases out, so the FULL reflection shows (not cut in half). The long
        soft fade gives a watery/blurry quality that reads as neon rippling on
        water. Chromium (WebView2) supports -webkit-box-reflect; WUPI is a
        Tauri/Chromium-only target so no fallback is needed (one property). */
-    -webkit-box-reflect: below 0px linear-gradient(to bottom, rgba(255,255,255,0.55), rgba(255,255,255,0.40) 30%, rgba(255,255,255,0.20) 60%, transparent 100%);
+    -webkit-box-reflect: below -8px linear-gradient(to bottom, rgba(255,255,255,0.55), rgba(255,255,255,0.40) 30%, rgba(255,255,255,0.20) 60%, transparent 100%);
 }
 .boot-loading-text span {
     display: inline-block;
@@ -2070,6 +2070,23 @@ input[type="password"]::-webkit-credentials-auto-fill-button {
     text-shadow:
         0 0 14px color-mix(in srgb, var(--ui-accent-bright) 95%, transparent),
         0 0 32px color-mix(in srgb, var(--ui-accent-bright) 65%, transparent),
+        0 0 60px color-mix(in srgb, var(--ui-accent) 55%, transparent);
+}
+/* Vibrant-only LOADING OS tint: Chloe wants the boot title to read as
+   magenta, not pink. Vibrant's --ui-accent-bright (#ff66b2) is the shared
+   OS-chrome pink (Connect button, paw glow, swatches); repointing the
+   variable would re-color everything. Instead, override ONLY the lit boot
+   glyphs (color + glow) under [data-colorcode="Vibrant"], leaving every
+   other Vibrant surface on the original reference pink. The unlit .span
+   rule above already derives from --ui-accent-deep, so it stays themed
+   automatically; only the lit state needs this nudge to shift hue from
+   pink (#ff66b2, hue ~330°) toward magenta (#f036d6, hue ~310°) — more
+   violet, same perceived brightness so the layered glow still reads neon. */
+html[data-colorcode="Vibrant"] .boot-loading-text span.lit {
+    color: #f036d6;
+    text-shadow:
+        0 0 14px color-mix(in srgb, #f036d6 95%, transparent),
+        0 0 32px color-mix(in srgb, #f036d6 65%, transparent),
         0 0 60px color-mix(in srgb, var(--ui-accent) 55%, transparent);
 }
 @keyframes bootCharFloat {

@@ -187,8 +187,16 @@ pub struct SimCard {
     /// Seed text for the first narrator turn (the opening scene). The
     /// FableEngine uses this to prime the first generation if the conversation
     /// is empty. `None` for system cards.
-    #[serde(default)]
-    pub opening_scene: Option<String>,
+    ///
+    /// **REMOVED 2026-08-05:** the intro now lives in a SIBLING `.intro` file
+    /// (`cards/<id>/<id>.intro`), NOT inside the cached `<sim_card>`. The
+    /// intro is a one-shot first-turn seed — baking it into the system prompt
+    /// would inflate every turn's KV cache with text only relevant to turn 1
+    /// (a prime-directive violation). The `.intro` is read ONCE at game start
+    /// + surfaced on `FableLoadResult.intro` (not on `SimCard`). The field is
+    /// gone from the struct; the parser no longer reads `<opening_scene>` (a
+    /// clean break per Chloe 2026-08-05 — old user cards lose their intro
+    /// silently, which is the accepted cost; the shipped cards were migrated).
     /// Stable NPC ids present at scene start. Used by the Phase 2 NPC runtime
     /// to spawn the initial cast. Empty for system cards.
     #[serde(default)]
@@ -364,7 +372,6 @@ pub fn fallback() -> SimCard {
         setting: None,
         plot: None,
         tone: None,
-        opening_scene: None,
         start_npc_ids: Vec::new(),
         declared_activities: Vec::new(),
         player_name: None,
@@ -524,8 +531,9 @@ fn parse(xml: &str) -> anyhow::Result<SimCard> {
         .filter(|s| !s.is_empty());
     let tone = field_or(root, scenario, "tone")
         .filter(|s| !s.is_empty());
-    let opening_scene = field_or(root, scenario, "opening_scene")
-        .filter(|s| !s.is_empty());
+    // NOTE: `opening_scene` is no longer parsed here (2026-08-05). The intro
+    // lives in a sibling `.intro` file, read once at game start + surfaced on
+    // `FableLoadResult.intro`. See the struct doc above.
     let start_npc_ids = field_node_or(root, scenario, "start_npcs")
         .map(|n| parse_bullet_list(&text_content(n)))
         .unwrap_or_default();
@@ -621,7 +629,6 @@ fn parse(xml: &str) -> anyhow::Result<SimCard> {
         setting,
         plot,
         tone,
-        opening_scene,
         start_npc_ids,
         declared_activities,
         player_name,
@@ -840,7 +847,6 @@ mod tests {
             setting: None,
             plot: None,
             tone: None,
-            opening_scene: None,
             start_npc_ids: Vec::new(),
             declared_activities: Vec::new(),
             player_name: None,
@@ -890,9 +896,10 @@ mod tests {
 
     /// A roleplay scenario card (Games app Seam 1). Same strict-XML + CDATA
     /// format as `Wupi.sim`, but with a `<scenario>` block holding setting,
-    /// tone, opening_scene, start_npcs, and activities. The system card
-    /// (Wupi) omits this block entirely: those fields stay at their default
-    /// (None / empty). The dungeon card below is also the §2L-test seed
+    /// tone, start_npcs, and activities. (The opening beat is no longer in
+    /// the card — 2026-08-05 it moved to a sibling `.intro` file.) The
+    /// system card (Wupi) omits this block entirely: those fields stay at
+    /// their default (None / empty). The dungeon card below is also the §2L-test seed
     /// (the dungeon half of the cross-topic memory rejection test).
     #[test]
     fn parse_roleplay_scenario_block() {
@@ -913,11 +920,6 @@ A remote frontier tavern at the edge of the Goblinwood. Travellers
 shelter here before braving the ruined keep to the north.
     ]]></setting>
     <tone>grim, atmospheric, slow-burn</tone>
-    <opening_scene><![CDATA[
-Rain lashes the shutters of the Rusty Tankard. The barkeeper polishes
-a mug and watches the door. A goblin was seen in the back room an hour
-ago. A locked iron chest sits under a table by the hearth.
-    ]]></opening_scene>
     <start_npcs><![CDATA[
 - barkeeper
 - goblin
@@ -933,16 +935,19 @@ ago. A locked iron chest sits under a table by the hearth.
         assert_eq!(card.card_type, "roleplay");
         assert!(card.setting.as_deref().unwrap().contains("frontier tavern"));
         assert_eq!(card.tone.as_deref(), Some("grim, atmospheric, slow-burn"));
-        assert!(card.opening_scene.as_deref().unwrap().contains("Rain lashes"));
+        // opening_scene is no longer parsed (2026-08-05): the intro lives in
+        // a sibling .intro file. A leftover <opening_scene> element is now
+        // silently ignored by the parser.
         assert_eq!(card.start_npc_ids, vec!["barkeeper".to_string(), "goblin".to_string()]);
         assert_eq!(card.declared_activities, vec!["combat".to_string()]);
         assert_eq!(card.player_name.as_deref(), Some("Alex"));
     }
 
     /// The CANONICAL flat format (2026-08-01 card reorg): `setting`/`plot`/
-    /// `tone`/`opening_scene` as DIRECT children of `<sim_card>` (no
-    /// `<scenario>` wrapper), plus the `<persona>` tag (renamed from
-    /// `<core_persona>`). This is the shape `data/fable.sim` ships + what
+    /// `tone` as DIRECT children of `<sim_card>` (no `<scenario>` wrapper),
+    /// plus the `<persona>` tag (renamed from `<core_persona>`). (The opening
+    /// beat moved to a sibling `.intro` file 2026-08-05 — no longer a card
+    /// field.) This is the shape `data/fable.sim` ships + what
     /// the Creator emits. The `<plot>` field is new to the reorg — it pins
     /// that top-level `<plot>` parses into `SimCard.plot`.
     #[test]
@@ -956,7 +961,6 @@ ago. A locked iron chest sits under a table by the hearth.
   <setting><![CDATA[ A frontier tavern at the edge of the woods. ]]></setting>
   <plot><![CDATA[ Drive story through consequence. Let complications grow organically. ]]></plot>
   <tone><![CDATA[ Atmospheric, grounded, slow-burn. ]]></tone>
-  <opening_scene><![CDATA[ Rain lashes the shutters. ]]></opening_scene>
 </sim_card>"#;
         let card = parse(flat).expect("flat-format card parses");
         assert_eq!(card.name, "Narrator");
@@ -967,7 +971,6 @@ ago. A locked iron chest sits under a table by the hearth.
             "top-level <plot> must parse into SimCard.plot"
         );
         assert!(card.tone.as_deref().unwrap().contains("Atmospheric"));
-        assert!(card.opening_scene.as_deref().unwrap().contains("Rain lashes"));
     }
 
     /// Back-compat: the legacy `<scenario>` wrapper STILL loads (the flat-first
@@ -997,7 +1000,6 @@ ago. A locked iron chest sits under a table by the hearth.
         assert_eq!(card.card_type, "system");
         assert!(card.setting.is_none());
         assert!(card.tone.is_none());
-        assert!(card.opening_scene.is_none());
         assert!(card.start_npc_ids.is_empty());
         assert!(card.declared_activities.is_empty());
         assert!(card.player_name.is_none());
@@ -1024,7 +1026,6 @@ ago. A locked iron chest sits under a table by the hearth.
             setting: Some("A test place.".into()),
             plot: None,
             tone: Some("grim".into()),
-            opening_scene: Some("The scene opens.".into()),
             start_npc_ids: vec!["npc_one".into(), "npc_two".into()],
             declared_activities: vec!["combat".into()],
             player_name: Some("Kaelen".into()),
@@ -1038,7 +1039,6 @@ ago. A locked iron chest sits under a table by the hearth.
         assert_eq!(back.card_type, "roleplay");
         assert_eq!(back.setting, original.setting);
         assert_eq!(back.tone, original.tone);
-        assert_eq!(back.opening_scene, original.opening_scene);
         assert_eq!(back.start_npc_ids, original.start_npc_ids);
         assert_eq!(back.declared_activities, original.declared_activities);
         assert_eq!(back.player_name, original.player_name);
@@ -1058,7 +1058,6 @@ ago. A locked iron chest sits under a table by the hearth.
     <setting>A place.</setting>
     <tone>atmospheric</tone>
     <player_name>Kaelen</player_name>
-    <opening_scene>The scene opens.</opening_scene>
     <start_npcs>- npc_a</start_npcs>
     <activities>- exploration</activities>
   </scenario>
@@ -1115,7 +1114,6 @@ ago. A locked iron chest sits under a table by the hearth.
         let card: SimCard = serde_json::from_str(partial).expect("partial JSON loads");
         assert_eq!(card.id, "x");
         assert!(card.setting.is_none());
-        assert!(card.opening_scene.is_none());
         assert!(card.start_npc_ids.is_empty());
         assert!(card.player_name.is_none());
         assert!(card.introductions.is_empty());

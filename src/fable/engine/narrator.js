@@ -4,13 +4,12 @@
 // Owns the per-call Channel lifecycle for fable_send. Routes the 4
 // channel event types (chunk / scene_event / done / error) to:
 //   - beats.js       (dialogue feed rendering)
-//   - fx/effects.js  (FX rendering)
-//   - fx/atmosphere  (time/weather scan after the turn)
+//   - fx/effects.js  (FX rendering — explicit [FX] brackets only)
 //
 // Channel event shapes (the contract, verbatim from fable_send):
 //   { type: 'chunk',       text }
 //   { type: 'scene_event', command: { kind, ...} }
-//   { type: 'done',        final_text, cancelled? }
+//   { type: 'done',        final_text, reasoning?, cancelled? }
 //   { type: 'error',       message }
 //
 // command.kind values (snake_case via serde rename):
@@ -22,7 +21,6 @@
 import { invoke, Channel } from '@tauri-apps/api/core';
 import * as beats from './beats.js';
 import { playFX, clearFX } from '../fx/effects.js';
-import { scanAndApply } from '../fx/atmosphere.js';
 
 let activeBeat = null;     // the streaming narrator/character beat for the current turn
 let generating = false;
@@ -34,6 +32,11 @@ let onSchemaPop = null;    // hook: (count) => void — the schema-ring-buffer
                            // here so the mutation commands below can hand off
                            // the pop count without narrator.js knowing about
                            // the schema layer.
+let onApiLost = null;      // hook: (message) => void — fires on the `api_lost`
+                           // event (2026-08-07 override): the API narrator died
+                           // mid-session and there's no local fallback. stage.js
+                           // wires this to lock the composer with the red "API
+                           // LOST CONNECTION" state + surface a retry affordance.
 let rerolling = false;     // true when the current turn is a swipeable-variant
                            // reroll (the last beat is being streamed over in
                            // place). Set in sendFableTurn({reroll:true}), read
@@ -50,6 +53,7 @@ export function initNarrator(hooks = {}) {
   onTurnEnd = hooks.onTurnEnd || null;
   npcPretty = hooks.npcPretty || null;
   onSchemaPop = hooks.onSchemaPop || null;
+  onApiLost = hooks.onApiLost || null;
   if (typeof hooks.cardName === 'string') cardName = hooks.cardName;
   if (typeof hooks.playerName === 'string') playerName = hooks.playerName;
   // Mirror into beats so its builders (addUserBeat/startNarratorBeat) read the
@@ -124,8 +128,16 @@ function handleEvent(msg) {
       beats.addErrorBeat(msg.message || 'Generation failed.');
       finishTurn();
       break;
+    case 'api_lost':
+      // 2026-08-07 override: the API narrator died mid-session and there's no
+      // local fallback. The backend already autosaved + cleared the cancel
+      // slot; the turn aborts without a narrator beat. Lock the composer via
+      // the onApiLost hook so the player reconnects via Settings + retries.
+      onApiLost(msg.message || 'The API connection was lost.');
+      finishTurn();
+      break;
     case 'done':
-      onDone(msg.final_text, msg.cancelled);
+      onDone(msg.final_text, msg.reasoning, msg.cancelled);
       break;
   }
 }
@@ -158,7 +170,10 @@ function onSceneEvent(cmd) {
   }
 }
 
-function onDone(finalText, cancelled) {
+function onDone(finalText, reasoning, cancelled) {
+  // `reasoning` is unused post-2026-08-07 override (the API narrator never
+  // emits a thought channel + the player-facing reasoning UI was removed).
+  void reasoning;
   if (activeBeat) {
     beats.finalizeBeat(activeBeat, finalText);
     // After a reroll, this beat now has one more variant (the freshly-
@@ -177,9 +192,6 @@ function onDone(finalText, cancelled) {
     const b = beats.startNarratorBeat({ name: cardName });
     beats.finalizeBeat(b, finalText);
   }
-  // Scan the finalized prose for atmosphere cues (time/weather keywords).
-  // Cheap: one pass over the text, two applies.
-  scanAndApply(finalText || '', playFX, clearFX);
   finishTurn();
 }
 

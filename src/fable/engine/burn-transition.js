@@ -17,17 +17,26 @@
 //   • The selected button pops instantly (scale 0.95 → glow burst → 1).
 //   • Reverse-spawn is the burn played backward (mask 100→0).
 //
-// The mask-driver technique mirrors fog.js's per-frame linear-gradient
-// rebuild (fog.js:145) — one style write per frame, no layout thrash.
+// The mask-driver technique is a per-frame linear-gradient mask rebuild
+// (one style write per frame, no layout thrash). NOTE: fog.js's intro fog
+// used to share this gradient-mask approach but was rewritten 2026-08-03 to a
+// canvas-composited carve (see screens/fog.js); the burn here still uses the
+// mask technique because a burn front is a single element's edge, not a
+// parallax field — a straight-ish feathered line is exactly right for fire.
 // The displacement filter is a single inline <svg> defined ONCE and
 // referenced by url(#…) from each burn twin's CSS.
 //
-// AUDIO: playIgnitionWhoosh() synthesizes a low fiery whoosh via
-// window.__wupiAudioCtx (mirrors playUIClink in left-drawer.js:328).
+// AUDIO: playIgnitionWhoosh() plays the authored Incinerate.mp3 asset at
+// volume 0.6 (Chloe 2026-08-03: "Use Incinerate.mp3... volume 0.6 otherwise
+// it'll be too loud"). It fires on BOTH the burn (rejected cards incinerate)
+// AND the reverse-spawn (cards materialize) — "play the incinerator sound
+// when the cards spawn in as well."
 //
 // Reduced motion: collapse the burn to a 250ms opacity fade (mirrors
-// fog.js:190 + transition.js discipline).
+// transition.js's discipline + fog.js's reduced-motion short-circuit).
 // =============================================================
+
+import INCINERATE_SRC from '../assets/Incinerate.mp3';
 
 // --- Tunables ----------------------------------------------------
 // Burn duration. Long enough to read as deliberate fire, short enough
@@ -40,89 +49,46 @@ const SELECTED_FADE_MS = 650;
 // materializes top→bottom). Same mechanics as burn, inverted.
 const SPAWN_MS = 900;
 // Mask feather width as a fraction of the element height. Wider = a
-// broader, softer burn front (no hard horizontal cut line). Matches
-// fog.js's FEATHER rationale.
+// broader, softer burn front (no hard horizontal cut line).
 const FEATHER = 0.16;
 // Turbulence displacement scale (px). Higher = more violent ash-edge
 // wobble. Kept modest so the button stays readable until it burns.
 const DISPLACE = 14;
 
-// --- Audio: the fiery whoosh -------------------------------------
+// --- Audio: the incinerator sound (Incinerate.mp3 asset) ------------
+
+// The authored fire/incineration cue. Replaces the prior synthesized
+// layered-noise fire (which itself replaced the fart-like sub-bass whoosh)
+// — the authored asset is the real, final sound.
+// Vite-imported at the top of this module (hashed into dist/assets/, same
+// idiom as fableButtonSFX.mp3). Played as a one-shot <audio> node at the
+// burn/spawn moment: volume 0.6, self-removes on ended/error so nothing
+// leaks across plays. Swallows autoplay rejection silently (the click IS
+// the user gesture, so it plays). Same one-shot pattern as title.js
+// playButtonSfx.
+
+const INCINERATE_VOLUME = 0.6;   // Chloe: "otherwise it'll be too loud"
 
 function reducedMotion() {
   return !!(window.matchMedia &&
     window.matchMedia('(prefers-reduced-motion: reduce)').matches);
 }
 
-// Lazily fetch / resume the shared AudioContext singleton. Mirrors
-// playUIClink's lazy-create (left-drawer.js:332-338). Returns null if
-// Web Audio is unavailable.
-function ctxOrNull() {
-  const Ctx = window.AudioContext || window.webkitAudioContext;
-  if (!Ctx) return null;
-  let ctx = window.__wupiAudioCtx;
-  if (!ctx) {
-    try { ctx = new Ctx(); window.__wupiAudioCtx = ctx; }
-    catch (e) { return null; }
-  }
-  if (ctx.state === 'suspended') ctx.resume().catch(() => {});
-  return ctx;
-}
-
-// Pre-render a white-noise buffer (reusable across whooshes). Cached
-// on the context so we don't re-allocate per call.
-function noiseBuffer(ctx) {
-  const cache = ctx.__wupiBurnNoise;
-  if (cache && cache.sampleRate === ctx.sampleRate) return cache.buf;
-  const len = Math.floor(ctx.sampleRate * 1.2);
-  const buf = ctx.createBuffer(1, len, ctx.sampleRate);
-  const data = buf.getChannelData(0);
-  for (let i = 0; i < len; i++) data[i] = Math.random() * 2 - 1;
-  ctx.__wupiBurnNoise = { buf, sampleRate: ctx.sampleRate };
-  return buf;
-}
-
-// Synthesize a low, fiery whoosh / heavy ignition sound. Layers:
-//   • Filtered noise sweeping up (the "whoosh" body) through a bandpass.
-//   • A low sawtooth rumble (the "heavy ignition" weight).
-// Peak gain louder than a UI clink — this is a dramatic moment.
+// Play the Incinerate.mp3 cue once. The single source of truth for the
+// burn + the reverse-spawn (card materialization) — both fire the same
+// incineration sound (Chloe 2026-08-03: "play the incinerator sound when
+// the cards spawn in as well").
 export function playIgnitionWhoosh() {
-  const ctx = ctxOrNull();
-  if (!ctx) return;
-  const now = ctx.currentTime;
-  const DUR = 0.95;
-
-  // --- Noise whoosh: white noise → bandpass sweeping 200→1200Hz ---
-  const noise = ctx.createBufferSource();
-  noise.buffer = noiseBuffer(ctx);
-  const band = ctx.createBiquadFilter();
-  band.type = 'bandpass';
-  band.frequency.setValueAtTime(220, now);
-  band.frequency.exponentialRampToValueAtTime(1100, now + DUR);
-  band.Q.value = 0.7;
-  const noiseGain = ctx.createGain();
-  noiseGain.gain.setValueAtTime(0, now);
-  noiseGain.gain.linearRampToValueAtTime(0.22, now + 0.04);
-  noiseGain.gain.exponentialRampToValueAtTime(0.0001, now + DUR);
-  noise.connect(band).connect(noiseGain).connect(ctx.destination);
-  noise.start(now);
-  noise.stop(now + DUR + 0.05);
-
-  // --- Low rumble: sawtooth ~65Hz → lowpass (the heavy body) ---
-  const osc = ctx.createOscillator();
-  osc.type = 'sawtooth';
-  osc.frequency.setValueAtTime(68, now);
-  osc.frequency.linearRampToValueAtTime(52, now + DUR);
-  const low = ctx.createBiquadFilter();
-  low.type = 'lowpass';
-  low.frequency.value = 240;
-  const oscGain = ctx.createGain();
-  oscGain.gain.setValueAtTime(0, now);
-  oscGain.gain.linearRampToValueAtTime(0.18, now + 0.03);
-  oscGain.gain.exponentialRampToValueAtTime(0.0001, now + DUR);
-  osc.connect(low).connect(oscGain).connect(ctx.destination);
-  osc.start(now);
-  osc.stop(now + DUR + 0.05);
+  const audio = document.createElement('audio');
+  audio.src = INCINERATE_SRC;
+  audio.volume = INCINERATE_VOLUME;
+  audio.setAttribute('aria-hidden', 'true');
+  const cleanup = () => { if (audio.parentNode) audio.parentNode.removeChild(audio); };
+  audio.addEventListener('ended', cleanup, { once: true });
+  audio.addEventListener('error', cleanup, { once: true });
+  document.body.appendChild(audio);
+  const p = audio.play();
+  if (p && typeof p.catch === 'function') p.catch(cleanup);
 }
 
 // --- The SVG turbulence filter (defined once) --------------------
@@ -320,6 +286,11 @@ export function playReverseSpawn(btns = []) {
       setTimeout(resolve, 260);
       return;
     }
+
+    // Play the incinerator cue as the cards materialize too (Chloe
+    // 2026-08-03: "play the incinerator sound when the cards spawn in as
+    // well"). Same asset + volume as the burn.
+    try { playIgnitionWhoosh(); } catch (_) { /* audio is a bonus */ }
 
     let remaining = btns.length;
     btns.forEach((btn) => {

@@ -20,11 +20,13 @@
 // swap happens (the dim hides it). The Promise is for callers that need to
 // know the transition is fully done (e.g. to focus an input).
 //
-// AUDIO: the transition is visually-only. The button-press SFX
-// (fableButtonSFX.mp3, played by the title click handler on every menu
-// button press) accompanies the fade — it replaces the prior synthesized
-// "magical chime." The chime + its AudioContext singleton were removed when
-// the authored button SFX took over the sound-design role.
+// AUDIO: NO sound plays during the transition (Chloe 2026-08-03: "I don't
+// want any sound effects playing during the transition — it's awful"). The
+// midpoint used to fire a synthesized "magical chime" shimmer; it's gone.
+// The authored button-press SFX (fableButtonSFX.mp3) still fires on the
+// click itself (title.js playButtonSfx) — that's the press cue, separate
+// from this transition. The New Game music + fire bed fade in on the reveal
+// side (fable.js onNewGameClicked), not here.
 // =============================================================
 
 // --- The visual transition ---------------------------------------
@@ -32,13 +34,16 @@
 const DIM_OUT_MS = 2000;  // title → black
 const DIM_IN_MS = 2000;   // black → new scene
 
+// --- The transition driver --------------------------------------
+
 // Play the full magical transition. Returns a Promise that resolves when
 // the undim completes (the new scene is fully visible). `onMidpoint` is
 // called synchronously at peak darkness — this is where the caller swaps
 // the screen (the overlay hides it). `blackHoldMs` extends the hold at
 // complete black before the undim begins (default 150ms). Mounts a single
 // overlay element on document.body (z above the fable window), self-cleans
-// on completion.
+// on completion. NO audio plays here — the transition is silent (the press
+// SFX already fired on the click; the New Game music blooms on reveal).
 export function playMagicalTransition({ onMidpoint, blackHoldMs = 150 } = {}) {
   return new Promise((resolve) => {
     // Mount the overlay. One element, full-screen, opaque-black, starts
@@ -56,10 +61,9 @@ export function playMagicalTransition({ onMidpoint, blackHoldMs = 150 } = {}) {
     overlay.classList.add('dimming');
 
     // Phase 2: at peak darkness (overlay fully opaque), swap the scene.
-    // This is the invisible hand-off — the overlay hides it. The blackHoldMs
-    // gap between this and Phase 3 below is a deliberate hold at full black:
-    // it lets the swap settle + the chime's bloom peak land before the undim
-    // starts, so the new scene reveals cleanly rather than mid-swap.
+    // This is the invisible hand-off — the overlay hides it. NO audio fires
+    // here (silent transition — see header). The blackHoldMs gap lets the
+    // black settle before the undim reveals the new scene.
     setTimeout(() => {
       try { if (onMidpoint) onMidpoint(); } catch (e) {
         console.error('[fable] transition midpoint threw', e);
@@ -80,4 +84,3 @@ export function playMagicalTransition({ onMidpoint, blackHoldMs = 150 } = {}) {
     }, DIM_OUT_MS + blackHoldMs + DIM_IN_MS);
   });
 }
-

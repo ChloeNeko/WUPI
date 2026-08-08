@@ -12,9 +12,9 @@
 // zero background CPU/GPU waste):
 //   onOpen   → show #fable, activate chrome, pause OS aurora, ignite title,
 //              start theme music + title particles.
-//   onPause  → (alt-tab / focus-loss) freeze theme music + stage parallax +
-//              CSS FX particles. Title particle RAF already self-pauses on
-//              document.hidden (see particles.js).
+//   onPause  → (alt-tab / focus-loss) freeze theme music + CSS FX particles.
+//              Title particle RAF already self-pauses on document.hidden
+//              (see particles.js).
 //   onResume → (focus return) unfreeze all of the above smoothly.
 //   onClose  → (EXIT only) full teardown: stage torn down, particles
 //              destroyed, music removed, chrome restored, OS aurora resumed,
@@ -30,16 +30,24 @@
 // =============================================================
 
 import { invoke } from '@tauri-apps/api/core';
+import { listen } from '@tauri-apps/api/event';
 import { AppLifecycle } from '../app-lifecycle.js';
 import './fable.css';
 import './flow-cinematic.css';
 
 import { buildTitle } from './screens/title.js';
 import { buildStage, wireStage, teardownStage, toast } from './screens/stage.js';
-import { buildPicker, renderPicker } from './screens/picker.js';
+import { buildPicker } from './screens/picker.js';
 import { buildNewGameSplit } from './screens/newgame-split.js';
-import { buildCreator, renderCreator } from './screens/creator.js';
+import { buildQuickPlayForm } from './screens/quickplay-form.js';
+import {
+  startQuickPlayMusic, stopQuickPlayMusic,
+  pauseQuickPlayMusic, resumeQuickPlayMusic,
+} from './screens/quickplay-music.js';
 import { buildPlayerCreator, renderPlayerCreator } from './screens/player-creator.js';
+import { buildNpcCreator, renderNpcCreator } from './screens/npc-creator.js';
+import { buildWorldCreator, renderWorldCreator } from './screens/world-creator.js';
+import { buildScenarioCreator, renderScenarioCreator } from './screens/scenario-creator.js';
 import { buildPlayerPicker, renderPlayerPicker } from './screens/player-picker.js';
 import { buildWorlds, renderWorlds } from './screens/worlds.js';
 import { buildSaves, renderSaves } from './screens/saves.js';
@@ -54,11 +62,11 @@ import {
 import { playBootTransition } from './screens/boot.js';
 import { playFogIntro } from './screens/fog.js';
 import { pauseFX, resumeFX } from './fx/effects.js';
-import { detachParallax, attachParallax } from './fx/atmosphere.js';
 import { activateChrome, deactivateChrome } from './engine/chrome.js';
 import { playMagicalTransition } from './engine/transition.js';
 import { mountFlowChrome } from './engine/flow-chrome.js';
 import { playBurnTransition, playReverseSpawn } from './engine/burn-transition.js';
+import { tileCaptionHTML } from './engine/tile-caption.js';
 
 let fableRoot = null;       // the #fable app-window element
 let screens = {};           // name → screen element
@@ -66,13 +74,18 @@ let screens = {};           // name → screen element
 // fableRoot when the New Game flow begins; owns all nav for the flow
 // so the screens themselves carry no header bars.
 let flowChrome = null;
-// The New Game flow state machine. Tracks where we are so ‹ can route
-// back correctly + the selected sim/player ids carry forward.
-//   step: 'sim' (Pair 1) | 'player' (Pair 2) | 'sim-creator' | 'sim-picker' | 'player-creator' | 'player-picker'
-//   pair1Choice: 'create' | 'existing'  (which Pair 1 tile was clicked —
-//                routed to after the player step so the Sim Creator or
-//                Picker opens with the player already in hand)
-let flowState = { step: null, pair1Choice: null, selectedCardId: null, selectedPlayerId: null };
+// The New Game / Quick Play flow state machine. Tracks where we are so ‹
+// can route back correctly + the selected sim/player ids carry forward.
+//   mode: 'newgame' | 'quickplay'  (which flow is active — New Game routes
+//         through the Sim Creator chooser after the player step; Quick Play
+//         SKIPS the sim step entirely and starts the game with the chosen
+//         player attached to data/fable.sim. Added 2026-08-03.)
+//   step: 'player' (slide 1) | 'sim-chooser' | 'player-creator' | 'player-picker' | 'npc-creator' | 'world-creator' | 'scenario-creator'
+//   pair1Choice: vestigial (always null) — the Pair-1 sim choice was removed
+//                2026-08-05; kept on the object so every reset site stays
+//                shape-compatible. Loading an existing card now happens only
+//                via the title LOAD menu, not inside New Game.
+let flowState = { mode: null, step: null, pair1Choice: null, selectedCardId: null, selectedPlayerId: null };
 
 // DEV SHORTCUT (?dev=fable or #dev=fable): mirrors script.js's
 // DEV_FABLE_SHORTCUT. When active, openFable skips the fog gate + the 2s boot
@@ -88,6 +101,31 @@ const DEV_FABLE_SHORTCUT = (() => {
     return new URLSearchParams(h).get('dev') === 'fable';
   } catch (_) { return false; }
 })();
+// DEV SHORTCUT (?dev=quickplay or #dev=quickplay): a sibling of the fable
+// shortcut that goes ONE step further — skips Fable's title screen AND the
+// Quick Play void-form and drops you straight into the roleplay chat stage.
+// openFable's DEV branch routes to devQuickPlayEnter() instead of showing the
+// title. devQuickPlayEnter auto-resumes an existing Quick Play quicksave if
+// one exists; otherwise it seeds a fresh world from DEFAULT_QUICKPLAY_VALUES
+// (below) — so refresh lands in a real roleplay in well under a second. False
+// in production (same query/hash absence story as DEV_FABLE_SHORTCUT).
+const DEV_QUICKPLAY_SHORTCUT = (() => {
+  try {
+    if (new URLSearchParams(window.location.search).get('dev') === 'quickplay') return true;
+    const h = window.location.hash.replace(/^#/, '');
+    return new URLSearchParams(h).get('dev') === 'quickplay';
+  } catch (_) { return false; }
+})();
+
+// The baked-in default Quick Play descriptions used by the dev shortcut's
+// fresh-seed path (no quicksave exists yet). Reused verbatim each time the
+// dev run starts cold. Edit these to taste — they're only read by
+// devQuickPlayEnter, never by the real Quick Play void-form.
+const DEFAULT_QUICKPLAY_VALUES = Object.freeze({
+  player: 'A curious wanderer named Alex — quick-witted, kind-hearted, and cursed with a knack for stumbling into trouble.',
+  scenario: 'The fog-shrouded port city of Mirehaven, where smugglers whisper of a cursed relic hidden somewhere in the drowned quarter beneath the old piers.',
+  desire: 'Unravel the relic\'s mystery, forge uneasy alliances with the city\'s rival factions, and survive the gangs that hunt for the same prize.',
+});
 // Whether the stage screen is currently the active screen. Drives the
 // pause/resume split: title freezes music, stage freezes parallax + FX.
 let stageActive = false;
@@ -99,6 +137,50 @@ let currentBoot = null;
 // fog gate plays before the boot transition; closeFable cancels it FIRST so
 // an EXIT during the 3s hold tears down the overlay + wind audio.
 let currentFog = null;
+
+// ── Double-click / rapid-tap guard (2026-08-05) ───────────────────────
+// Chloe: "it's really easy to double click and glitch your game, prevent
+// double clicking all through FABLE." A single busy flag + a capture-phase
+// listener on fableRoot that swallows clicks/pointerdowns while a transition
+// / burn / load is in flight. Every transition path wraps itself in
+// withFlowBusy(...) below; a second click during the wrap is killed before it
+// reaches any handler. The flag is cleared on completion AND on a safety
+// timeout so a forgotten clear can never dead-lock the UI.
+let flowBusy = false;
+let flowBusyTimer = null;
+// Hard ceiling: no transition should ever run this long. If the flag is still
+// set after this, force-clear it (a forgotten clear is a recoverable bug, a
+// permanent dead-lock is not). 12s covers the longest burn+spawn+seed chains.
+const FLOW_BUSY_SAFETY_MS = 12000;
+function setFlowBusy(on) {
+  flowBusy = on;
+  if (flowBusyTimer) { clearTimeout(flowBusyTimer); flowBusyTimer = null; }
+  if (on) {
+    flowBusyTimer = setTimeout(() => {
+      flowBusy = false;
+      flowBusyTimer = null;
+    }, FLOW_BUSY_SAFETY_MS);
+  }
+}
+// Wrap an async/completion-based transition in the busy flag. `task` may
+// return a Promise (resolved → clear) or nothing (caller clears manually via
+// setFlowBusy(false)). Used by every burn/transition/load path so they share
+// one guard instead of per-button ad-hoc flags.
+function withFlowBusy(task) {
+  if (flowBusy) return;        // already mid-transition: drop the second click
+  setFlowBusy(true);
+  let ret;
+  try {
+    ret = task();
+  } catch (e) {
+    setFlowBusy(false);
+    throw e;
+  }
+  if (ret && typeof ret.then === 'function') {
+    ret.then(() => setFlowBusy(false), () => setFlowBusy(false));
+  }
+  return ret;
+}
 
 // External hooks set by script.js (the OS chrome integration).
 // closeWindow: ref to the OS closeWindow() so Fable's own close paths
@@ -148,8 +230,10 @@ let isQuickPlaySession = false;
 //
 // NEW GAME: a split screen (Use Existing vs Create New). "Use Existing" opens
 // the card picker (screens/picker.js) — pick a shipped .sim → fresh game.
-// "Create New" opens the Creator (screens/creator.js) — author a card via the
-// 3-tab form, save it, → fresh game from the new card. No interview, no draft.
+// "Create New" opens the Sim Creator chooser (NPC/WORLD/SCENARIO tiles) →
+// the matching wizard (screens/npc-creator.js / world-creator.js /
+// scenario-creator.js) — author a card via the slide wizard, save it, → fresh
+// game from the new card. No interview, no draft.
 //
 // QUICK PLAY: throw the player straight into the placeless Narrative
 // Simulator (data/fable.sim). If a quicksave exists (title._quickPlaySave),
@@ -167,7 +251,19 @@ let isQuickPlaySession = false;
 // so fable_start is the entry — NOT fable_load_save (that requires an
 // already-running game).
 async function resumeSave(cardId, saveId) {
-  if (screens.title && screens.title._stopAmbient) screens.title._stopAmbient();
+  // Guarded: a rapid double-click on a save row could fire two fable_start
+  // calls. The withFlowBusy wrapper drops the second; the first clears the
+  // flag via enterStageViaTransition's transition completion (which is the
+  // final async step below).
+  if (flowBusy) return;
+  setFlowBusy(true);
+  // The Load-menu music (shared with New Game) stops here — the stage owns its
+  // own ambience. Stopped before the IPC so the fade overlaps the load.
+  stopNewGameMusic(fableRoot);
+  // NOTE: the title ambient (grass/particles) is NOT stopped here — it's
+  // stopped inside enterStageViaTransition's onMidpoint (when the screen is
+  // black), so the grass keeps animating until the transition covers it
+  // instead of vanishing instantly at click.
   fadeOutThemeMusic(fableRoot);
   try { await invoke('fable_end'); } catch (_) {}
 
@@ -176,7 +272,7 @@ async function resumeSave(cardId, saveId) {
   try {
     const result = await invoke('fable_start', { cardId, saveId });
     engineStarted = true;
-    if (result && result.opening_scene) openingScene = result.opening_scene;
+    if (result && result.intro) openingScene = result.intro;
     if (result && Array.isArray(result.messages) && result.messages.length) {
       loadMessages = result.messages;
     }
@@ -198,41 +294,267 @@ function onContinueClicked() {
     console.warn('[fable] Continue clicked with no resume target — ignoring');
     return;
   }
+  // resumeSave sets the busy flag itself (it's also called from the saves
+  // screen); no separate wrap needed here.
   resumeSave(target.card_id, target.save_id);
 }
 
 // LOAD button handler: show the world picker + populate it. The worlds screen
 // lists only worlds that have saves (a world with no saves is a New Game
 // target). Selecting one routes to the saves list for that world.
+// LOAD button handler: show the world picker + populate it. The worlds screen
+// lists only worlds that have saves (a world with no saves is a New Game
+// target). Selecting one routes to the saves list for that world.
+//
+// Transition (Chloe 2026-08-03): wrap the title → worlds swap in the black
+// magical transition + stop the title ambient at click, matching Quick Play /
+// New Game. Previously this was an instant showScreen, so the grass stayed
+// animated through an abrupt swap — inconsistent with the other title buttons.
+// The title theme is NOT faded here — the worlds picker returns to the title
+// (via ‹), so the theme keeps playing through the picker rather than being
+// cut + restarted on back.
 function onLoadClicked() {
-  showScreen('worlds');
-  renderWorlds(screens.worlds, (card) => openWorldSaves(card));
+  withFlowBusy(() => {
+    // Stop the title ambient (grass + particles) at click so the dim falls over
+    // a static frame (matches Quick Play / New Game).
+    if (screens.title && screens.title._stopAmbient) screens.title._stopAmbient();
+    // Fade the title theme out — the Load menu gets the SAME newgame.mp3 +
+    // fire.mp3 ambience as New Game (Chloe 2026-08-05). The pair fades in at
+    // the transition midpoint, mirroring onNewGameClicked.
+    fadeOutThemeMusic(fableRoot);
+    return playMagicalTransition({
+      blackHoldMs: 1150,
+      onMidpoint: () => {
+        showScreen('worlds');
+        renderWorlds(screens.worlds, worldHandlers());
+        // Bloom the music + fire as the worlds screen reveals (same hand-off
+        // feel as New Game).
+        startNewGameMusic(fableRoot, { fadeIn: true });
+      },
+    }).catch((e) => {
+      console.error('[fable] Load transition failed, jumping to worlds', e);
+      showScreen('worlds');
+      renderWorlds(screens.worlds, worldHandlers());
+      startNewGameMusic(fableRoot, { fadeIn: true });
+    });
+  });
 }
 
-// World-picker select → switch to the saves screen for the chosen world +
-// render its save list. onSelect(save) resumes that slot.
+// The Load menu's card-modal handlers (2026-08-05). The modal surfaces four
+// actions per card; these are the wired behaviors:
+//   • onNewGame → fade out → Pair 2 (Create/Load Player) with reverse-spawn,
+//     the card pre-selected so the New Game flow continues into a fresh game
+//     with [card + chosen player]. The music keeps playing (it's the same
+//     New Game ambience the flow already uses).
+//   • onResume  → the saves list for this card (most-recent first; backend
+//     sorts by timestamp desc). ‹ Back from saves returns to the worlds grid.
+//   • onEdit    → a centered raw-XML editor over the worlds screen, loaded
+//     via fable_card_raw_get_by_id, saved via fable_card_raw_set_by_id (the
+//     _by_id variants take an explicit card_id — no active game required,
+//     which the Load menu needs since no game is active).
+function worldHandlers() {
+  return {
+    onNewGame: (card) => beginNewGameFromCard(card),
+    onResume: (card) => openWorldSaves(card),
+    onEdit: (card) => openCardRawEditor(card),
+  };
+}
+
+// NEW GAME from the Load menu: pre-select the card, then land on Pair 2
+// (Create/Load Player) with the fade + reverse-spawn animation. The New Game
+// flow's state is set up exactly as if the user had walked Pair 1 → Load Sim
+// → picked this card, so the existing advanceAfterPlayer → advanceToSimStep
+// machinery carries the run forward.
+function beginNewGameFromCard(card) {
+  withFlowBusy(() => {
+    // Set up the New Game flow state: card pre-selected, pair1 = existing
+    // (Load Sim), so flowBack() + the ‹ chrome route correctly from Pair 2.
+    flowState = {
+      mode: 'newgame',
+      step: 'player',
+      pair1Choice: 'existing',
+      selectedCardId: card.id,
+      selectedPlayerId: null,
+    };
+    if (!flowChrome) flowChrome = mountFlowChrome(fableRoot);
+    if (flowChrome) {
+      flowChrome.showBack();
+      flowChrome.delayHome(2500);
+      flowChrome.onHome(() => exitFlowToTitle());
+      flowChrome.onBack(() => flowBack());
+    }
+    return playMagicalTransition({
+      blackHoldMs: 600,
+      onMidpoint: () => {
+        // Land on Pair 2 with the two tiles reverse-spawning.
+        const tiles = rebuildSplitTiles([
+          { caption: 'CREATE PLAYER', act: 'create-player' },
+          { caption: 'LOAD PLAYER', act: 'load-player' },
+        ]);
+        tiles[0].addEventListener('click', (e) => flowCreatePlayer(e.currentTarget));
+        tiles[1].addEventListener('click', (e) => flowLoadPlayer(e.currentTarget));
+        showScreen('newgame-split');
+        tiles.forEach((t) => { t.style.opacity = '0'; });
+      },
+    }).then(() => {
+      const tiles = screens['newgame-split'].querySelectorAll('.fable-flow-spawn');
+      return playReverseSpawn(Array.from(tiles));
+    });
+  });
+}
+
+// RESUME from the Load menu → the saves list for this card.
 function openWorldSaves(card) {
   showScreen('saves');
   renderSaves(screens.saves, card.id, (save) => resumeSave(card.id, save.save_id), card.name);
 }
 
-// === THE CINEMATIC NEW GAME FLOW (4-step state machine) ================
+// EDIT from the Load menu → a centered raw-XML editor modal over the worlds
+// screen (2026-08-05). The card creators have no reverse-parse (their
+// <persona> block is a lossy merge), so the faithful edit surface is the XML
+// itself — zero data loss. Loads via fable_card_raw_get_by_id, saves via
+// fable_card_raw_set_by_id (the same validation gate the tab-rail raw editor
+// uses: parse_from_xml_str before any disk touch). Self-contained (doesn't
+// touch the stage's raw-editor.js singleton, which is active-card-keyed) so
+// it works from the title with no game active.
+function openCardRawEditor(card) {
+  const worlds = screens.worlds;
+  if (!worlds) return;
+  // If one's already open, close it first (defensive against a double-open).
+  const existing = worlds.querySelector('.fable-world-raw-overlay');
+  if (existing) existing.remove();
+
+  const overlay = document.createElement('div');
+  overlay.className = 'fable-raw-editor-overlay fable-world-raw-overlay';
+  overlay.innerHTML = `
+    <div class="fable-raw-editor-backdrop" aria-hidden="true"></div>
+    <div class="fable-raw-editor-modal" role="dialog" aria-modal="true">
+      <div class="fable-raw-editor-head">
+        <span class="fable-raw-editor-title">Edit ${escHtml(card.name)} — Sim Card (.sim)</span>
+        <div class="fable-raw-editor-controls">
+          <button type="button" class="fable-raw-btn save" data-raw-save title="Save (Ctrl+Enter)">✓</button>
+          <button type="button" class="fable-raw-btn revert" data-raw-revert title="Revert to last saved">↻</button>
+          <button type="button" class="fable-raw-btn close" data-raw-close title="Close (Esc)">✕</button>
+        </div>
+      </div>
+      <textarea class="fable-raw-editor-text" data-raw-text spellcheck="false"></textarea>
+      <div class="fable-raw-editor-status" data-raw-status></div>
+    </div>`;
+  worlds.appendChild(overlay);
+
+  const textarea = overlay.querySelector('[data-raw-text]');
+  const status = overlay.querySelector('[data-raw-status]');
+  const saveBtn = overlay.querySelector('[data-raw-save]');
+  const revertBtn = overlay.querySelector('[data-raw-revert]');
+  const closeBtn = overlay.querySelector('[data-raw-close]');
+  let lastGood = '';
+  let isValid = true;
+
+  // Load the current XML.
+  invoke('fable_card_raw_get_by_id', { cardId: card.id })
+    .then((xml) => { lastGood = xml || ''; textarea.value = lastGood; validate(); })
+    .catch((err) => { status.textContent = `Load failed: ${err}`; status.classList.add('bad'); });
+
+  // Client-side XML well-formedness sniff (mirrors raw-editor.js). Cheap
+  // pre-check; the authoritative gate is the server-side parse on save.
+  function sniffXmlWellFormed(s) {
+    const trimmed = String(s || '').trim();
+    if (!trimmed) return 'Empty card';
+    if (!/^<\?xml|<sim_card[\s>]/i.test(trimmed)) return 'Missing <sim_card> root';
+    // Basic tag-balance sniff: walk a stack of opening/closing tags.
+    const stack = [];
+    const re = /<\/?([a-zA-Z_][\w.-]*)([^>]*?)(\/?)>|<!--[\s\S]*?-->|<!\[CDATA\[[\s\S]*?\]\]>/g;
+    let m;
+    while ((m = re.exec(trimmed)) !== null) {
+      if (!m[1]) continue;                 // comment / CDATA
+      const isClose = m[0].charAt(1) === '/';
+      const isSelf = m[3] === '/';
+      if (isClose) {
+        if (!stack.length || stack[stack.length - 1] !== m[1]) return `Mismatched </${m[1]}>`;
+        stack.pop();
+      } else if (!isSelf) {
+        stack.push(m[1]);
+      }
+    }
+    if (stack.length) return `Unclosed <${stack[stack.length - 1]}>`;
+    return null;
+  }
+  function validate() {
+    const err = sniffXmlWellFormed(textarea.value);
+    isValid = !err;
+    saveBtn.disabled = !isValid;
+    textarea.classList.toggle('invalid', !isValid);
+    status.textContent = err ? `⚠ ${err}` : (textarea.value === lastGood ? '' : 'unsaved changes');
+    status.classList.toggle('bad', !!err);
+  }
+  textarea.addEventListener('input', validate);
+
+  function close() { overlay.remove(); }
+  async function save() {
+    if (!isValid) return;
+    status.textContent = 'Saving…';
+    status.classList.remove('bad');
+    try {
+      await invoke('fable_card_raw_set_by_id', { cardId: card.id, xml: textarea.value });
+      lastGood = textarea.value;
+      status.textContent = 'Saved.';
+      validate();
+    } catch (err) {
+      status.textContent = `Save failed: ${err}`;
+      status.classList.add('bad');
+      // Keep the modal open so the user sees the server's validation message.
+    }
+  }
+
+  saveBtn.addEventListener('click', save);
+  revertBtn.addEventListener('click', () => { textarea.value = lastGood; validate(); });
+  closeBtn.addEventListener('click', close);
+  // Esc closes (only when the text == last-good, mirroring the raw-editor's
+  // "✕ refuses on invalid" discipline — unsaved/invalid changes must be
+  // reverted or fixed first). Ctrl+Enter saves.
+  overlay.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape') {
+      if (textarea.value === lastGood || isValid) close();
+      else { status.textContent = 'Fix errors or ↻ revert before closing.'; status.classList.add('bad'); }
+    } else if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {
+      e.preventDefault(); save();
+    }
+  });
+  // Click on the backdrop (outside the modal) closes — same rule as Esc.
+  overlay.addEventListener('click', (e) => {
+    if (e.target === overlay && (textarea.value === lastGood || isValid)) close();
+  });
+
+  setTimeout(() => textarea.focus(), 50);
+}
+
+// Tiny HTML-escape for the editor title (card names are user-authored).
+function escHtml(s) {
+  return String(s == null ? '' : s)
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
+// === THE CINEMATIC NEW GAME FLOW (2-step, 2026-08-05 rework) ============
+//
+// The Pair-1 sim choice (Create Sim / Load Sim) was REMOVED 2026-08-05 — the
+// player pair is now slide 1. Loading an existing card happens only via the
+// title LOAD menu; New Game always authors a fresh card.
 //
 // Title "New Game" click
 //   → [black transition; embers + music + buttons fade IN after black clears]
-//   → Pair 1: [Create Sim] [Load Sim]   (‹ hidden, ⌂ present)
-//       Create Sim → burn → Sim Card Creator (3-button) → Save → advance to Pair 2
-//       Load Sim   → burn → Sim Card Picker → select → advance to Pair 2
-//   → Pair 2: [Create Player] [Load Player]   (‹ APPEARS, ⌂ present)
-//       Create Player → burn → Player Creator → Save → start game (sim + player)
-//       Load Player   → burn → Player Picker → select → start game
-//       ‹ from Pair 2 → reverse to Pair 1
+//   → Slide 1: [Create Player] [Load Player]   (‹ hidden, ⌂ present)
+//       Create Player → burn → Player Creator → Save → Slide 2
+//       Load Player   → burn → Player Picker → select → Slide 2
+//   → Slide 2: Sim Creator chooser [NPC / WORLD / SCENE pyramid]
+//       pick one → burn → that wizard → Save → start game (new sim + player)
 //
-// AUDIO (Chloe's spec, 2026-08-02): the music + buttons fade in ONLY after
-// the black fully clears — NOT at the midpoint. So onNewGameClicked runs
-// the black transition with an empty midpoint (just swaps the DOM at
-// opacity:0), then AFTER the undim resolves it starts the music fade-in
-// AND reverse-spawns the Pair 1 buttons together.
+// AUDIO (Chloe's spec, 2026-08-03): the music + fire fade-in KICKS OFF at
+// the transition midpoint (screen black) so its slow 3s ramp blooms THROUGH
+// the 2s undim — the pair is partly audible as the New Game scene reveals
+// (earlier + more gradual than starting it cold after the undim). The
+// reverse-spawn of the Pair 1 buttons still happens AFTER the undim resolves
+// (visible scene first, then UI). The fade-in duration lives in
+// newgame-music.js (FADE_IN_MS).
 //
 // The flow chrome (‹ / ⌂) is mounted once into fableRoot on entry; it
 // persists across every step (never burns, never moves). Only ‹'s
@@ -240,16 +562,28 @@ function openWorldSaves(card) {
 
 // Begin the New Game flow: black transition → embers + music + Pair 1.
 function onNewGameClicked() {
+  withFlowBusy(() => {
+  // NOTE: the title ambient (grass/particles) is NOT stopped here. It's stopped
+  // automatically by showScreen() when the title is hidden (fable.js:121) — and
+  // the title isn't hidden until the black-midpoint swap to 'newgame-split'
+  // below. Stopping it at click (the prior behavior) killed the grass instantly
+  // the moment New Game was pressed, vanishing under a still-visible screen.
+  // Leaving it alone keeps the grass animating through the 2s fade-out + stops
+  // it exactly when the screen is fully black (Chloe 2026-08-03).
   // Theme FADES OUT at click time (Chloe 2026-08-02: "let the entire mp3
   // play out, don't cut it"). The theme ramps to silence over ~1.5s + the
   // node removes itself when silent — no hard cut. The short button SFX
   // (fableButtonSFX.mp3) plays alongside it and finishes naturally.
   fadeOutThemeMusic(fableRoot);
-  // Reset the flow state + mount the chrome (‹ hidden initially).
-  flowState = { step: 'sim', pair1Choice: null, selectedCardId: null, selectedPlayerId: null };
+  // Reset the flow state + mount the chrome. Player choice is now slide 1
+  // (2026-08-05: "completely remove the 'create sim' and 'load sim' from new
+  // game so choosing player is the very first slide"). The Pair-1 sim choice
+  // is gone — loading an existing card happens only via the title LOAD menu.
+  flowState = { mode: 'newgame', step: 'player', pair1Choice: null, selectedCardId: null, selectedPlayerId: null };
   if (!flowChrome) flowChrome = mountFlowChrome(fableRoot);
   if (flowChrome) {
-    flowChrome.hideBack();  // Pair 1: ‹ hidden
+    flowChrome.setVariant('newgame');  // brass home glyph (default)
+    flowChrome.hideBack();  // first slide — no ‹ (matches the prior Pair 1 rule)
     // ⌂ home is hidden for 2.5s on every New Game entry so it doesn't appear
     // the instant the flow mounts (Chloe: "the house icon spawns immediately
     // when pressing new game, add a 2.5s delay"). Re-entrant: re-pressing New
@@ -259,36 +593,45 @@ function onNewGameClicked() {
     flowChrome.onBack(() => flowBack());
   }
   // The split tiles ship at opacity:0 (the reverse-spawn reveals them
-  // after the black clears). Show the screen at the midpoint (DOM ready,
-  // still invisible), then after the undim: start music + spawn buttons.
-  playMagicalTransition({
+  // after the black clears). AUDIO + DOM split (Chloe 2026-08-03: "have
+  // both the fire pit and music playing a tiny bit earlier and add more of a
+  // fade in"): the music+fire fade-in KICKS OFF at the midpoint (screen
+  // black) so its slow 3s ramp blooms THROUGH the 2s undim and the pair is
+  // partly audible as the New Game scene reveals — earlier + more gradual
+  // than starting it cold after the undim. The buttons still spawn AFTER
+  // the undim resolves (visible scene first, then UI).
+  return playMagicalTransition({
     blackHoldMs: 1150,
     onMidpoint: () => {
       // Swap the screen at peak darkness (invisible — content is at 0).
-      // Do NOT start music here; it blooms AFTER the black clears.
-      // Rebuild the Pair 1 tiles fresh (the split may hold Pair 2 labels
-      // from a prior run) + wire their click handlers.
+      // Start the music+fire fade-in HERE so it overlaps the undim reveal.
+      // Build the Player pair tiles (Create Player / Load Player) fresh +
+      // wire their click handlers. This is now slide 1 of the flow.
       const tiles = rebuildSplitTiles([
-        { glyphHtml: `<span class="fable-newgame-tile-glyph" aria-hidden="true">${CREATE_SIM_GLYPH_SVG}</span>`, caption: 'CREATE SIM CARD', act: 'create' },
-        { glyphHtml: `<span class="fable-newgame-tile-glyph" aria-hidden="true">${LOAD_SIM_GLYPH_SVG}</span>`, caption: 'LOAD SIM CARD', act: 'existing' },
+        { caption: 'CREATE PLAYER', act: 'create-player' },
+        { caption: 'LOAD PLAYER', act: 'load-player' },
       ]);
-      tiles[0].addEventListener('click', (e) => flowCreateSim(e.currentTarget));
-      tiles[1].addEventListener('click', (e) => flowLoadSim(e.currentTarget));
+      tiles[0].addEventListener('click', (e) => flowCreatePlayer(e.currentTarget));
+      tiles[1].addEventListener('click', (e) => flowLoadPlayer(e.currentTarget));
       showScreen('newgame-split');
       // Ensure the tiles are at opacity:0 for the reverse-spawn.
       tiles.forEach((t) => { t.style.opacity = '0'; });
+      // Bloom the music+fire as the screen begins to undim (earlier + the
+      // longer fade-in lives in newgame-music.js FADE_IN_MS).
+      startNewGameMusic(fableRoot, { fadeIn: true });
     },
   }).then(() => {
-    // AFTER the black fully clears: fade music in + reverse-spawn the
-    // Pair 1 buttons together. This is the load-bearing timing fix.
-    startNewGameMusic(fableRoot, { fadeIn: true });
+    // AFTER the black fully clears: reverse-spawn the Player pair buttons.
+    // (The music fade-in was already kicked off at the midpoint above.)
     const tiles = screens['newgame-split'].querySelectorAll('.fable-flow-spawn');
     return playReverseSpawn(Array.from(tiles));
   }).catch((e) => {
     console.error('[fable] New Game transition failed, jumping to split', e);
+    // Fallback: the midpoint may not have run, so ensure the music starts.
     startNewGameMusic(fableRoot, { fadeIn: true });
     showScreen('newgame-split');
   });
+  }); // withFlowBusy
 }
 
 // Exit the New Game flow back to the title (⌂ click). Fades the new-game
@@ -302,7 +645,19 @@ function exitFlowToTitle() {
     // exiting the flow (the chrome overlay persists; both buttons go dark).
     flowChrome.hideHome();
   }
-  flowState = { step: null, pair1Choice: null, selectedCardId: null, selectedPlayerId: null };
+  flowState = { mode: null, step: null, pair1Choice: null, selectedCardId: null, selectedPlayerId: null };
+  showScreen('title');
+}
+
+// Exit the LOAD flow (worlds/saves pickers) back to the title (‹ Back from the
+// worlds screen). Fades the new-game ambience out + restarts the title theme —
+// mirrors exitFlowToTitle. The Load menu shares the New Game music + ember
+// background, so it shares the teardown too. (2026-08-05) This is an instant
+// screen swap (no transition), so no withFlowBusy wrap — the title buttons
+// are immediately usable again.
+function exitLoadToTitle() {
+  stopNewGameMusic(fableRoot);
+  startThemeMusic(fableRoot);
   showScreen('title');
 }
 
@@ -314,123 +669,79 @@ function exitFlowToTitle() {
 // transition receives `selectedBtn` (the clicked one) + builds the
 // rejected list as "all siblings except the clicked one."
 //
-// THE ORDER (Chloe's spec): Player FIRST, then build the Sim Card.
-//   Pair 1 (Create Sim / Load Sim)
-//     → click either → burn →
-//   Pair 2 (Create Player / Load Player)
+// THE ORDER (2026-08-05 rework — Pair 1 sim choice REMOVED):
+//   Slide 1: Player pair (Create Player / Load Player)
 //     → click Create Player → burn → Player Creator → Save → Sim Creator
 //     → click Load Player   → burn → Player Picker → select → Sim Creator
-//   Sim Creator / Picker → start game with [sim + player]
-//
-// (The Sim Creator is reached AFTER the player is chosen, so the player
-// identity is in hand when the card is authored/selected. Both Create-Sim
-// and Load-Sim converge on the Player step before the Sim work begins.)
+//   Slide 2: Sim Creator chooser (NPC/WORLD/SCENE pyramid) → wizard → Save
+//            → start game with [new sim + player]
+//   (Loading an EXISTING card now happens only via the title LOAD menu, not
+//   inside New Game. New Game always authors a fresh card.)
 
 // Rebuild the split screen's two tiles with the given labels + return
 // the fresh tile elements (clone-detached so no handler stacks). Used by
 // every Pair render so the burn/spawn engine always sees clean buttons.
-// `labels[].glyphHtml` is the inner glyph markup — either a Pair-1 SVG
-// (quill-in-inkwell for CREATE / unrolled scroll for LOAD) or the player
-// person+badge SVG structure (Pair 2).
+// Each tile is a caption-only dark panel (Chloe 2026-08-03: every icon was
+// removed from the New Game flow — only ‹ / ⌂ in the flow chrome survive).
+// `labels[].caption` is the always-visible label text, split into stacked
+// lines per the word-count rule (engine/tile-caption.js).
 function rebuildSplitTiles(labels) {
   const split = screens['newgame-split'];
   const host = split.querySelector('.fable-newgame-tiles');
   host.innerHTML = labels.map((l) => `
     <button class="fable-newgame-tile fable-flow-spawn" type="button" data-act="${l.act}">
-      ${l.glyphHtml}
-      <span class="fable-newgame-tile-caption">${l.caption}</span>
+      <span class="fable-newgame-tile-caption">${tileCaptionHTML(l.caption)}</span>
     </button>
   `).join('');
   return Array.from(host.querySelectorAll('.fable-newgame-tile'));
 }
 
-// --- Pair 1 glyphs: CREATE = pencil, LOAD = 4-pointed star --------------------
-// Two inline SVGs in a matched brass line-art style. Sized in em via
-// .fable-create-glyph / .fable-scroll-glyph so they track the slot's font-size
-// clamp. The newgame-split.js copies use stroke=currentColor to inherit the
-// slot's brass hover-bright swap; these constant copies use the hardcoded
-// #D4AF37 brass for the non-tile uses.
-//
-// CREATE — a writer's pencil drawn diagonally: wood-cradle ferrule → sharpened
-// triangle nib → long shaft → eraser cap with a metal band.
-const CREATE_SIM_GLYPH_SVG = `<svg viewBox="0 0 24 24" width="64" height="64" stroke="#D4AF37" stroke-width="1.5" fill="none" stroke-linecap="round" stroke-linejoin="round" class="fable-icon-create"><!-- Pencil Shaft (diagonal: eraser top-right → nib bottom-left) --><line x1="16" y1="4" x2="5" y2="15" /><!-- Wood Cradle (the sharpened cone behind the nib) --><path d="M5 15 L7 9 L13 3 L19 9 L13 15 Z" /><!-- Graphite Nib Tip --><path d="M5 15 L3 19 L7 15" /><!-- Metal Ferrule Band on the Shaft --><line x1="11.5" y1="6.5" x2="15.5" y2="10.5" /><!-- Eraser Cap (top end) --><line x1="15" y1="3" x2="19" y2="7" /></svg>`;
-
-// LOAD — a 4-pointed star (concave diamond, the classic compass/tarot star):
-// "open / discover an existing card."
-const LOAD_SIM_GLYPH_SVG = `<svg viewBox="0 0 24 24" width="64" height="64" stroke="#D4AF37" stroke-width="1.5" fill="none" stroke-linecap="round" stroke-linejoin="round" class="fable-icon-load"><!-- 4-Pointed Star: outer points N/E/S/W, concave arcs into the center --><path d="M12 2 L14 10 L22 12 L14 14 L12 22 L10 14 L2 12 L10 10 Z" /><!-- Center Spark Dot --><circle cx="12" cy="12" r="1" fill="#D4AF37" /></svg>`;
-
-// --- Player tile glyphs (Pair 2): person silhouette + small badge ----
-// Both player tiles share the SAME person silhouette; a small bottom-
-// right badge distinguishes Create (+) from Load (folder). NOT the
-// reused create/load glyphs from Pair 1 (Chloe: "that's lazy").
-const PERSON_SVG = `<svg class="fable-person-icon" viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round">
-  <circle cx="12" cy="7" r="3.4"/>
-  <path d="M5 20c0-3.6 3.1-6.2 7-6.2s7 2.6 7 6.2"/>
-</svg>`;
-const PLUS_BADGE_SVG = `<svg viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg>`;
-const FOLDER_BADGE_SVG = `<svg viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 7a1 1 0 0 1 1-1h4l2 2h8a1 1 0 0 1 1 1v9a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V7z"/></svg>`;
-function playerTileGlyphHtml(badgeSvg) {
-  return `<span class="fable-player-tile-glyph">${PERSON_SVG}<span class="fable-player-tile-badge" aria-hidden="true">${badgeSvg}</span></span>`;
-}
-
-// Pair 1 → Create Sim: clicked pops+fades, the other burns, → Pair 2.
-function flowCreateSim(selectedBtn) {
-  flowState.pair1Choice = 'create';
-  const rejected = siblingTilesExcept(selectedBtn);
-  playBurnTransition({
-    selectedBtn,
-    rejectedBtns: rejected,
-    onComplete: () => advanceToPlayerPair(),
-  });
-}
-
-// Pair 1 → Load Sim: clicked pops+fades, the other burns, → Pair 2.
-function flowLoadSim(selectedBtn) {
-  flowState.pair1Choice = 'existing';
-  const rejected = siblingTilesExcept(selectedBtn);
-  playBurnTransition({
-    selectedBtn,
-    rejectedBtns: rejected,
-    onComplete: () => advanceToPlayerPair(),
-  });
-}
-
 // Helper: all sibling tiles except the clicked one (the burn targets).
+// Walks up to the `.fable-newgame-tiles` host first so the pyramid layout
+// (NPC in the column, WORLD/SCENE in a nested row) resolves ALL three tiles
+// as siblings regardless of which row the clicked tile sits in. For the flat
+// player-pair layout the host IS the parent, so this is a strict generalization.
 function siblingTilesExcept(selectedBtn) {
-  return Array.from(selectedBtn.parentElement.querySelectorAll('.fable-newgame-tile'))
+  const host = selectedBtn.closest('.fable-newgame-tiles') || selectedBtn.parentElement;
+  return Array.from(host.querySelectorAll('.fable-newgame-tile'))
     .filter((b) => b !== selectedBtn);
 }
 
-// Advance from Pair 1 to Pair 2 (Create/Load Player). Rebuilds the split
-// tiles with Pair 2 labels, shows the screen, and reverse-spawns the
-// new tiles. The ‹ chrome becomes visible here.
-function advanceToPlayerPair() {
-  const tiles = rebuildSplitTiles([
-    { glyphHtml: playerTileGlyphHtml(PLUS_BADGE_SVG), caption: 'CREATE PLAYER', act: 'create-player' },
-    { glyphHtml: playerTileGlyphHtml(FOLDER_BADGE_SVG), caption: 'LOAD PLAYER', act: 'load-player' },
-  ]);
-  // Wire Pair 2 handlers (pass the clicked button for the burn).
-  tiles[0].addEventListener('click', (e) => flowCreatePlayer(e.currentTarget));
-  tiles[1].addEventListener('click', (e) => flowLoadPlayer(e.currentTarget));
-  flowState.step = 'player';
-  if (flowChrome) flowChrome.showBack();
-  showScreen('newgame-split');
-  // Hide + then ignite the new tiles into place.
-  tiles.forEach((t) => { t.style.opacity = '0'; });
-  playReverseSpawn(tiles);
+// Route after a player is chosen (Create or Load) in the New Game flow.
+// Quick Play no longer routes through here — it dropped the player step
+// entirely (2026-08-05) and seeds the run from three free-text descriptions
+// instead. So this is now New-Game-only: the player is in hand, now pick/
+// author the sim card, then start a fresh game with both.
+//
+// EXCEPTION (2026-08-05): when the run entered via the Load menu's NEW GAME
+// action, the card is ALREADY selected (`flowState.selectedCardId` is set by
+// beginNewGameFromCard). In that case skip the sim step entirely and start
+// the game with [pre-selected card + chosen player].
+function advanceAfterPlayer(playerId) {
+  flowState.selectedPlayerId = playerId;
+  if (flowState.selectedCardId) {
+    const cardId = flowState.selectedCardId;
+    flowState.selectedCardId = null;   // one-shot: consume the pre-selection
+    startFreshGame(cardId, playerId);
+    return;
+  }
+  advanceToSimStep();
 }
 
 // Pair 2 → Create Player: clicked pops+fades, the other burns, → Player Creator.
 function flowCreatePlayer(selectedBtn) {
+  if (flowBusy) return;
+  setFlowBusy(true);
   const rejected = siblingTilesExcept(selectedBtn);
   playBurnTransition({
     selectedBtn,
     rejectedBtns: rejected,
     onComplete: () => {
+      setFlowBusy(false);
       showScreen('player-creator');
       flowState.step = 'player-creator';
       renderPlayerCreator(screens['player-creator'], {
-        onSave: (playerId) => { flowState.selectedPlayerId = playerId; advanceToSimStep(); },
+        onSave: (playerId) => advanceAfterPlayer(playerId),
       });
     },
   });
@@ -438,16 +749,30 @@ function flowCreatePlayer(selectedBtn) {
 
 // Pair 2 → Load Player: clicked pops+fades, the other burns, → Player Picker.
 function flowLoadPlayer(selectedBtn) {
+  if (flowBusy) return;
+  setFlowBusy(true);
   const rejected = siblingTilesExcept(selectedBtn);
   playBurnTransition({
     selectedBtn,
     rejectedBtns: rejected,
     onComplete: () => {
+      setFlowBusy(false);
       showScreen('player-picker');
       flowState.step = 'player-picker';
-      renderPlayerPicker(screens['player-picker'], (player) => {
-        flowState.selectedPlayerId = player.id;
-        advanceToSimStep();
+      // The picker now surfaces three actions per player (LOAD/EDIT/DELETE)
+      // via its expand-to-center modal (2026-08-04 overhaul). onSelect = LOAD
+      // (the existing handoff); onEdit pushes the loaded JSON into the Player
+      // Creator's slide wizard seeded with editFrom.
+      renderPlayerPicker(screens['player-picker'], {
+        onSelect: (player) => advanceAfterPlayer(player.id),
+        onEdit: (player) => {
+          showScreen('player-creator');
+          flowState.step = 'player-creator';
+          renderPlayerCreator(screens['player-creator'], {
+            onSave: (playerId) => advanceAfterPlayer(playerId),
+            editFrom: player,
+          });
+        },
       });
     },
   });
@@ -456,67 +781,158 @@ function flowLoadPlayer(selectedBtn) {
 // Advance from a completed Pair 2 (player chosen) to the Sim step.
 // The player chose Create-Sim or Load-Sim back at Pair 1 — route to the
 // matching Sim screen now, carrying the selected player id forward.
+//
+// CREATE path (2026-08-05): the old single 3-gate creator (creator.js) is
+// replaced by a Sim Creator CHOOSER — three tiles (NPC / WORLD / SCENARIO)
+// on the split screen. Each tile burns into its matching wizard
+// (npc-creator / world-creator / scenario-creator). All three author a sim
+// card (distinguished only by which fields the wizard collects); on save the
+// game starts with [new sim + player]. Reuses the burn/whoosh engine + the
+// rebuildSplitTiles pattern (no new transition code).
 function advanceToSimStep() {
-  if (flowState.pair1Choice === 'create') {
-    // → Sim Card Creator. On save, start the game with [new sim + player].
-    showScreen('creator');
-    flowState.step = 'sim-creator';
-    renderCreator(screens.creator, {
-      onSave: (cardId) => startFreshGame(cardId, flowState.selectedPlayerId),
-    });
-  } else {
-    // → Sim Card Picker. On select, start the game with [picked sim + player].
-    showScreen('picker');
-    flowState.step = 'sim-picker';
-    renderPicker(screens.picker, (card) => startFreshGame(card.id, flowState.selectedPlayerId));
-  }
+  // → Sim Creator chooser: a PYRAMID of three tiles (NPC on top, WORLD +
+  // SCENE on the bottom row). Each tile burns into its matching wizard.
+  // The pyramid lives inside the same `.fable-newgame-tiles` host but is a
+  // distinct `.fable-sim-chooser-pyramid` container so its CSS (column +
+  // generous gap) doesn't collide with the flat player-pair row layout. The
+  // tiles themselves reuse `.fable-newgame-tile` (same giant-square sizing
+  // as the player pair) so the burn/reverse-spawn engine + the star hover
+  // glow work unchanged.
+  //
+  // (2026-08-05 rework: the Pair-1 sim choice is gone — New Game always
+  // authors a fresh card. Loading an existing card happens only via the
+  // title LOAD menu. So this is no longer conditional on pair1Choice.)
+  const split = screens['newgame-split'];
+  const host = split.querySelector('.fable-newgame-tiles');
+  host.innerHTML = `
+    <div class="fable-sim-chooser-pyramid">
+      <button class="fable-newgame-tile fable-flow-spawn" type="button" data-act="create-npc">
+        <span class="fable-newgame-tile-caption">${tileCaptionHTML('NPC')}</span>
+      </button>
+      <div class="fable-sim-chooser-row">
+        <button class="fable-newgame-tile fable-flow-spawn" type="button" data-act="create-world">
+          <span class="fable-newgame-tile-caption">${tileCaptionHTML('WORLD')}</span>
+        </button>
+        <button class="fable-newgame-tile fable-flow-spawn" type="button" data-act="create-scenario">
+          <span class="fable-newgame-tile-caption">${tileCaptionHTML('SCENE')}</span>
+        </button>
+      </div>
+    </div>`;
+  const tiles = Array.from(host.querySelectorAll('.fable-newgame-tile'));
+  tiles.forEach((t) => {
+    const act = t.dataset.act;
+    t.addEventListener('click', (e) => flowSimCreatePick(e.currentTarget, act));
+  });
+  flowState.step = 'sim-chooser';
+  showScreen('newgame-split');
+  tiles.forEach((t) => { t.style.opacity = '0'; });
+  playReverseSpawn(tiles);
 }
 
-// ‹ (back) routing: depends on the current step.
+// A Sim Creator chooser tile was clicked. Burn the other two + route to the
+// matching wizard. `act` is 'create-npc' | 'create-world' | 'create-scenario'.
+function flowSimCreatePick(selectedBtn, act) {
+  if (flowBusy) return;
+  setFlowBusy(true);
+  const rejected = siblingTilesExcept(selectedBtn);
+  playBurnTransition({
+    selectedBtn,
+    rejectedBtns: rejected,
+    onComplete: () => {
+      setFlowBusy(false);
+      const onSave = (cardId) => startFreshGame(cardId, flowState.selectedPlayerId);
+      if (act === 'create-npc') {
+        showScreen('npc-creator');
+        flowState.step = 'npc-creator';
+        renderNpcCreator(screens['npc-creator'], { onSave });
+      } else if (act === 'create-world') {
+        showScreen('world-creator');
+        flowState.step = 'world-creator';
+        renderWorldCreator(screens['world-creator'], { onSave });
+      } else if (act === 'create-scenario') {
+        showScreen('scenario-creator');
+        flowState.step = 'scenario-creator';
+        renderScenarioCreator(screens['scenario-creator'], { onSave });
+      }
+    },
+  });
+}
+
+// ‹ (back) routing: depends on the current step + flow mode.
 function flowBack() {
+  // Quick Play's only screen is the void-form, which has ‹ hidden (it's the
+  // first slide). This branch is only reached via an edge case — bail to the
+  // title rather than stranding the user.
+  if (flowState.mode === 'quickplay') {
+    exitQuickPlayToTitle();
+    return;
+  }
   switch (flowState.step) {
-    case 'player':            // Pair 2 → Pair 1
-      returnToPair1();
+    case 'player':            // Player pair (slide 1). ‹ is only visible here
+                             // when entered via the Load menu's NEW GAME (a
+                             // pre-selected card is in hand) — go back to the
+                             // worlds grid. From the normal New Game entry ‹ is
+                             // hidden on slide 1, so this case is unreachable
+                             // there.
+      if (flowState.selectedCardId) {
+        returnToWorldsFromFlow();
+      } else {
+        exitFlowToTitle();
+      }
       break;
-    case 'player-creator':    // Player Creator → Pair 2
+    case 'player-creator':    // Player Creator → Player pair (slide 1)
     case 'player-picker':
-      returnToPair2();
+      returnToPlayerPair();
       break;
-    case 'sim-creator':       // Sim Creator → Pair 2 (player already chosen)
-    case 'sim-picker':
-      returnToPair2();
+    case 'sim-chooser':       // Sim Creator chooser → Player pair (slide 1)
+      returnToPlayerPair();
+      break;
+    case 'npc-creator':       // a Sim wizard → back to the Sim Creator chooser
+    case 'world-creator':
+    case 'scenario-creator':
+      returnToSimChooser();
       break;
     default:
       exitFlowToTitle();
   }
 }
 
-// Return to Pair 1 (Create/Load Sim) — rebuild tiles + re-spawn.
-function returnToPair1() {
-  const tiles = rebuildSplitTiles([
-    { glyphHtml: `<span class="fable-newgame-tile-glyph" aria-hidden="true">${CREATE_SIM_GLYPH_SVG}</span>`, caption: 'CREATE SIM CARD', act: 'create' },
-    { glyphHtml: `<span class="fable-newgame-tile-glyph" aria-hidden="true">${LOAD_SIM_GLYPH_SVG}</span>`, caption: 'LOAD SIM CARD', act: 'existing' },
-  ]);
-  tiles[0].addEventListener('click', (e) => flowCreateSim(e.currentTarget));
-  tiles[1].addEventListener('click', (e) => flowLoadSim(e.currentTarget));
-  showScreen('newgame-split');
-  flowState.step = 'sim';
-  if (flowChrome) flowChrome.hideBack();
-  tiles.forEach((t) => { t.style.opacity = '0'; });
-  playReverseSpawn(tiles);
+// Return to the Sim Creator chooser (NPC/WORLD/SCENARIO) from one of the
+// three wizards. Re-renders the three tiles + reverse-spawns them.
+function returnToSimChooser() {
+  advanceToSimStep();
 }
 
-// Return to Pair 2 (Create/Load Player) — rebuild tiles + re-spawn.
-function returnToPair2() {
+// Return from the New Game flow's Pair 2 back to the Load menu's worlds grid
+// (the Load-menu NEW GAME entry path, 2026-08-05). Clears the pre-selected
+// card + the flow chrome, shows the worlds screen, re-renders its grid. The
+// Load-menu music keeps playing (it's the same New Game ambience).
+function returnToWorldsFromFlow() {
+  flowState.selectedCardId = null;
+  flowState.step = null;
+  if (flowChrome) { flowChrome.hideBack(); flowChrome.hideHome(); }
+  showScreen('worlds');
+  renderWorlds(screens.worlds, worldHandlers());
+}
+
+// Return to the Player pair (slide 1: Create Player / Load Player) — rebuild
+// the tiles + reverse-spawn them. Replaces the old returnToPair1/2 split
+// (2026-08-05 rework: the sim Pair 1 is gone, so the player pair IS slide 1).
+// ‹ is HIDDEN here (slide 1 has no prior step in the New Game flow); ⌂ home
+// remains the only exit. If the run entered via the Load menu's NEW GAME
+// (selectedCardId set), ‹ from the player-pair goes back to the worlds grid
+// via returnToWorldsFromFlow — but that path keeps ‹ visible, so it doesn't
+// route through here.
+function returnToPlayerPair() {
   const tiles = rebuildSplitTiles([
-    { glyphHtml: playerTileGlyphHtml(PLUS_BADGE_SVG), caption: 'CREATE PLAYER', act: 'create-player' },
-    { glyphHtml: playerTileGlyphHtml(FOLDER_BADGE_SVG), caption: 'LOAD PLAYER', act: 'load-player' },
+    { caption: 'CREATE PLAYER', act: 'create-player' },
+    { caption: 'LOAD PLAYER', act: 'load-player' },
   ]);
   tiles[0].addEventListener('click', (e) => flowCreatePlayer(e.currentTarget));
   tiles[1].addEventListener('click', (e) => flowLoadPlayer(e.currentTarget));
   showScreen('newgame-split');
   flowState.step = 'player';
-  if (flowChrome) flowChrome.showBack();
+  if (flowChrome) flowChrome.hideBack();   // slide 1 — no ‹
   tiles.forEach((t) => { t.style.opacity = '0'; });
   playReverseSpawn(tiles);
 }
@@ -526,7 +942,13 @@ function returnToPair2() {
 // with fresh:true (+ player_id), then enter the stage. The player_id
 // attaches the saved player's identity onto the new game.
 async function startFreshGame(cardId, playerId = null) {
-  if (screens.title && screens.title._stopAmbient) screens.title._stopAmbient();
+  // Guarded: the final wizard slide's CREATE or the picker's select could
+  // double-fire. enterStageViaTransition's .finally clears the flag.
+  if (flowBusy) return;
+  setFlowBusy(true);
+  // NOTE: the title ambient is stopped inside enterStageViaTransition's
+  // onMidpoint (screen black), not here — so the grass doesn't vanish
+  // instantly at click.
   fadeOutThemeMusic(fableRoot);
   stopNewGameMusic(fableRoot);  // entering the stage — end the New Game ambience
   try { await invoke('fable_end'); } catch (_) {}
@@ -536,7 +958,7 @@ async function startFreshGame(cardId, playerId = null) {
   try {
     const result = await invoke('fable_start', { cardId, fresh: true, playerId });
     engineStarted = true;
-    if (result && result.opening_scene) openingScene = result.opening_scene;
+    if (result && result.intro) openingScene = result.intro;
     if (result && Array.isArray(result.messages) && result.messages.length) {
       loadMessages = result.messages;
     }
@@ -550,113 +972,345 @@ async function startFreshGame(cardId, playerId = null) {
 
 // === Quick Play =========================================================
 //
-// A single-button "throw me in" path. Runs the placeless Narrative Simulator
+// A "throw me in" path. Runs the placeless Narrative Simulator
 // (data/fable.sim) under a fixed __quickplay__ card id with ONE quicksave
 // slot, auto-written on fable_end (Home/Exit). Invisible to New Game / Load /
-// Continue. If a quicksave exists, the player chooses Start New (overwrites)
-// vs Resume Last; otherwise a fresh run starts immediately.
+// Continue. Player creation lives ONLY in New Game now — Quick Play drops the
+// player step entirely and seeds the run from three free-text descriptions
+// instead (Chloe 2026-08-05).
+//
+// VOID-FORM SCREEN (2026-08-05): Quick Play is now a FULL SCREEN ominous
+// void-form — a near-black void with slow dark void-particles drifting in
+// the background, three sleek dark charcoal-gray text fields stacked
+// vertically (DESCRIBE YOUR PLAYER / DESCRIBE THE SCENARIO / DESCRIBE WHAT
+// YOU DESIRE), and a large black-and-white CREATE button at the bottom that
+// emits subtle dark particles + a dark glow. QuickPlay.mp3 plays at 0.3.
+// CREATE stays disabled until ALL THREE fields have words; on enable it
+// turns white + becomes clickable.
+//
+// RESUME: if a quicksave exists when the user enters Quick Play, a centered
+// popup asks "start fresh (deletes the old save) or resume last?". Fresh →
+// the form (interactive); resume → resumeQuickPlay(). No quicksave → straight
+// to the interactive form.
+//
+// DRIFT: on CREATE the form fades out (everything except the void + particles
+// → opacity 0), leaving the user adrift in the pure void with the particles
+// still drifting while the backend seeds the world from the three
+// descriptions (fable_quick_play_seed). A cinematic minimum hold keeps the
+// drift on screen long enough to feel intentional even if the seed resolves
+// fast; once it resolves, the chat stage loads (no opening beat — cold open).
 
-// QUICK PLAY button handler. Reads the stashed quicksave state
-// (title._quickPlaySave, refreshed on every title show via
-// _refreshQuickPlay). No quicksave → straight into a fresh run. Quicksave
-// present → an inline Start-New / Resume-Last choice overlay.
+// QUICK PLAY button handler. Runs the black transition → swaps to the
+// Quick Play void-form → blooms the QuickPlay.mp3 bed on reveal. If a
+// quicksave exists, a centered popup offers Start-New (deletes the old
+// save) vs Resume-Last; otherwise the form is immediately interactive.
 function onQuickPlayClicked() {
-  const save = (screens.title && screens.title._quickPlaySave) || null;
-  if (save) {
-    showQuickPlayChoice(save);
-  } else {
-    startQuickPlayNew();
+  withFlowBusy(() => {
+  // NOTE: the title ambient (grass/particles) is NOT stopped here — it's
+  // stopped automatically by showScreen() when the title hides, and the
+  // title isn't hidden until the black-midpoint swap below. Leaving it
+  // alone keeps the grass animating through the 2s fade-out.
+  // Theme FADES OUT at click time — same hand-off as New Game.
+  fadeOutThemeMusic(fableRoot);
+  // Reset the flow state to Quick Play mode.
+  flowState = { mode: 'quickplay', step: 'quickplay-form', pair1Choice: null, selectedCardId: null, selectedPlayerId: null };
+  // Mount the flow chrome (‹ hidden on this first slide; ⌂ home delayed so
+  // it doesn't appear on entry — mirrors New Game). onHome → back to title.
+  if (!flowChrome) flowChrome = mountFlowChrome(fableRoot);
+  if (flowChrome) {
+    flowChrome.setVariant('quickplay');  // white home glyph over the void
+    flowChrome.hideBack();        // first slide — no ‹
+    flowChrome.delayHome(2500);   // ⌂ appears after 2.5s (matches New Game)
+    flowChrome.onHome(() => exitQuickPlayToTitle());
+    flowChrome.onBack(() => flowBack());  // ‹ routes via the shared flowBack
   }
+  return playMagicalTransition({
+    blackHoldMs: 1150,
+    onMidpoint: () => {
+      // Swap to the Quick Play void-form at peak darkness (invisible —
+      // content ships at opacity:0; the form's own fade-in handles the
+      // reveal after the black clears).
+      showScreen('quickplay-form');
+      // Start the QuickPlay.mp3 fade-in HERE so it overlaps the undim
+      // reveal (same timing fix as New Game).
+      startQuickPlayMusic(fableRoot, { fadeIn: true });
+    },
+  }).then(async () => {
+    // AFTER the black fully clears: authoritatively check whether a quicksave
+    // exists RIGHT NOW (the title's stashed _quickPlaySave can be stale if
+    // its refresh IPC hasn't resolved). If one exists, show the Start-New vs
+    // Resume-Last popup over the form; otherwise the form is already
+    // interactive. The form's own fade-in runs regardless (handled by CSS on
+    // the .fable-qp-stack once shown).
+    let has = false;
+    try {
+      const save = await invoke('fable_quick_play_status');
+      has = !!save;
+    } catch (e) {
+      console.error('[fable] quicksave status check failed, assuming none', e);
+      has = false;
+    }
+    // Mirror the fresh result into the title stash so a later ‹/⌂ return
+    // sees consistent state.
+    if (screens.title) screens.title._quickPlaySave = has ? true : null;
+    if (has) showQuickPlayResumePopup();
+  }).catch((e) => {
+    console.error('[fable] Quick Play transition failed, jumping to form', e);
+    showScreen('quickplay-form');
+    startQuickPlayMusic(fableRoot, { fadeIn: true });
+  });
+  }); // withFlowBusy
 }
 
-// The inline Start-New / Resume-Last overlay. A centered card (reuses the
-// save-modal visual language) offering two actions: Start New (overwrites the
-// old quicksave) or Resume Last (loads it). Built transiently on the title
-// screen + torn down on either choice or Esc/backdrop — no separate screen,
-// no new file. The summary/timestamp give the player enough to recognize the
-// saved run before overwriting it.
-function showQuickPlayChoice(save) {
-  // Tear down any prior choice overlay (idempotent re-entry).
-  hideQuickPlayChoice();
-  const overlay = document.createElement('div');
-  overlay.className = 'fable-save-overlay fable-quickplay-choice';
-  overlay.dataset.quickplayChoice = '';
-  overlay.innerHTML = `
-    <div class="fable-save-backdrop" data-qp-backdrop></div>
-    <div class="fable-save-modal">
-      <h2 class="fable-save-title">Quick Play</h2>
-      <p class="fable-quickplay-summary"></p>
-      <div class="fable-save-actions">
-        <button class="fable-save-btn ghost" data-qp-new>Start New</button>
-        <button class="fable-save-btn primary" data-qp-resume>Resume Last</button>
+// The Start-New vs Resume-Last popup (shown over the void-form when a
+// quicksave exists). Centered glass modal: a warning that starting fresh
+// deletes the old save, plus START NEW / RESUME LAST / cancel (cancel =
+// close popup, form stays interactive). START NEW just closes the popup —
+// the form is the fresh-run path. RESUME LAST → resumeQuickPlay().
+function showQuickPlayResumePopup() {
+  const form = screens['quickplay-form'];
+  if (!form || form.querySelector('.fable-qp-popup')) return;  // already shown
+  const popup = document.createElement('div');
+  popup.className = 'fable-qp-popup';
+  popup.setAttribute('role', 'dialog');
+  popup.setAttribute('aria-modal', 'true');
+  popup.innerHTML = `
+    <div class="fable-qp-popup-card">
+      <p class="fable-qp-popup-title">A previous drift lingers here.</p>
+      <p class="fable-qp-popup-warn">Starting fresh deletes the old save. Resume it, or let it go?</p>
+      <div class="fable-qp-popup-actions">
+        <button class="fable-qp-popup-btn" type="button" data-act="new">START NEW</button>
+        <button class="fable-qp-popup-btn" type="button" data-act="resume">RESUME LAST</button>
+        <button class="fable-qp-popup-btn fable-qp-popup-cancel" type="button" data-act="cancel">cancel</button>
       </div>
-      <button class="fable-save-close" data-qp-close aria-label="Close">✕</button>
     </div>
   `;
-  // Surface the saved run's summary so overwriting it is an informed choice.
-  const summaryEl = overlay.querySelector('.fable-quickplay-summary');
-  if (summaryEl) {
-    const text = save.summary && save.summary.trim()
-      ? save.summary
-      : 'A previous Quick Play run awaits.';
-    summaryEl.textContent = text;
-  }
-  const dismiss = () => hideQuickPlayChoice();
-  overlay.querySelector('[data-qp-new]').addEventListener('click', () => { dismiss(); startQuickPlayNew(); });
-  overlay.querySelector('[data-qp-resume]').addEventListener('click', () => { dismiss(); resumeQuickPlay(); });
-  overlay.querySelector('[data-qp-close]').addEventListener('click', dismiss);
-  overlay.querySelector('[data-qp-backdrop]').addEventListener('click', dismiss);
-  // Esc dismiss (one-shot listener — removed on hide).
-  const onEsc = (e) => { if (e.key === 'Escape') { dismiss(); } };
-  overlay.addEventListener('remove-choice', () => document.removeEventListener('keydown', onEsc, true), { once: true });
-  document.addEventListener('keydown', onEsc, true);
-  if (screens.title) screens.title.appendChild(overlay);
+  form.appendChild(popup);
+  // Force a reflow so the CSS opacity transition runs (popup mounts at 0).
+  void popup.offsetWidth;
+  popup.classList.add('is-open');
+  const close = () => {
+    popup.classList.remove('is-open');
+    setTimeout(() => { if (popup.parentNode) popup.remove(); }, 260);
+  };
+  popup.querySelector('[data-act="new"]').addEventListener('click', () => close());
+  popup.querySelector('[data-act="resume"]').addEventListener('click', () => {
+    close();
+    resumeQuickPlay();
+  });
+  popup.querySelector('[data-act="cancel"]').addEventListener('click', () => close());
 }
 
-function hideQuickPlayChoice() {
-  const existing = document.querySelector('[data-quickplay-choice]');
-  if (existing) {
-    existing.dispatchEvent(new CustomEvent('remove-choice'));
-    existing.remove();
+// Exit the Quick Play void-form back to the title (⌂ click). Fades the
+// QuickPlay track out + restarts the title theme (mirrors exitFlowToTitle).
+function exitQuickPlayToTitle() {
+  stopQuickPlayMusic(fableRoot);
+  startThemeMusic(fableRoot);
+  if (flowChrome) {
+    flowChrome.hideBack();
+    flowChrome.hideHome();
   }
+  // Reset the form so a re-entry doesn't show stale text / a leftover popup.
+  const form = screens['quickplay-form'];
+  if (form && form._reset) form._reset();
+  const popup = form && form.querySelector('.fable-qp-popup');
+  if (popup) popup.remove();
+  flowState = { mode: null, step: null, pair1Choice: null, selectedCardId: null, selectedPlayerId: null };
+  showScreen('title');
 }
 
-// Start a brand-new Quick Play run: stop ambient/music, end any prior
-// session, call fable_quick_play_start (loads data/fable.sim, wipes the old
-// quicksave, seats the card at __quickplay__, fresh state), then enter the
-// stage flagged as Quick Play (Save/Load footer suppressed).
-async function startQuickPlayNew() {
-  if (screens.title && screens.title._stopAmbient) screens.title._stopAmbient();
+// === DEV SHORTCUT (?dev=quickplay) — straight-to-stage entry =============
+//
+// devQuickPlayEnter is the openFable hand-off for the ?dev=quickplay
+// shortcut. It skips the title + the Quick Play void-form entirely and lands
+// in the roleplay chat stage. Auto-resume if a quicksave exists; otherwise
+// seed a fresh world from DEFAULT_QUICKPLAY_VALUES.
+//
+// The model race: the schema-engine seed path (fable_quick_play_seed) needs
+// shared_model() loaded, which returns Err if the load hasn't finished yet.
+// The dev boot path fires boot_load_model fire-and-forget, so on a cold
+// refresh the model may still be loading when we get here. We therefore wait
+// for the model-status:ready event before the fresh-seed branch (resume is
+// unaffected — it only loads saved JSON, no model pass). The wait has a
+// generous timeout that proceeds best-effort so a missing event can't strand
+// the UI; the seed itself is already best-effort on the Rust side.
+async function devQuickPlayEnter() {
+  // Resume-vs-fresh: the authoritative quicksave-status check. If a quicksave
+  // exists, resume it — the bundled card + session + schema load straight
+  // into the stage (no model pass needed at entry). This is the path that
+  // makes "refresh continues the roleplay" work.
+  let hasSave = false;
+  try {
+    const save = await invoke('fable_quick_play_status');
+    hasSave = !!save;
+  } catch (e) {
+    console.error('[fable] dev-quickplay: quicksave status check failed, assuming none', e);
+    hasSave = false;
+  }
+  isQuickPlaySession = true;
+
+  if (hasSave) {
+    // ── DEV: skip the magical transition. resumeQuickPlay() normally ends
+    //    with enterStageViaTransition (the ~4s dim/undim cinematic). For the
+    //    straight-to-stage dev shortcut we inline its resume IPC + jump
+    //    straight to the stage via enterStageDirect (no transition overlay,
+    //    no title-ambient stop dance — no title was shown).
+    setFlowBusy(true); // enterStageDirect's .finally clears it
+    fadeOutThemeMusic(fableRoot);
+    stopQuickPlayMusic(fableRoot);
+    try { await invoke('fable_end'); } catch (_) {}
+    let loadMessages = null;
+    try {
+      const result = await invoke('fable_quick_play_resume');
+      engineStarted = true;
+      if (result && Array.isArray(result.messages) && result.messages.length) {
+        loadMessages = result.messages;
+      }
+    } catch (err) {
+      console.error('[fable] dev-quickplay: fable_quick_play_resume failed — entering stage without engine', err);
+      engineStarted = false;
+      try { toast('Could not resume Quick Play — the quicksave may be corrupt.'); } catch (_) {}
+    }
+    enterStageDirect(null, loadMessages);
+    return;
+  }
+
+  // Fresh seed — NO void drift. The normal path (beginVoidDrift) fades the
+  // quickplay-form out + holds a 1.5s cinematic drift over the void while the
+  // seed runs, then plays the magical transition into the stage. For the dev
+  // straight-to-stage shortcut we skip ALL of that: wait for the model, run
+  // the seed IPC directly, then jump straight to the stage. The screen is
+  // already black (openFable hid every Fable screen for the wait), so the
+  // hand-off is a seamless black → stage.
+  setFlowBusy(true); // enterStageDirect's .finally clears it
+  try {
+    await waitForModelReady();
+  } catch (e) {
+    console.warn('[fable] dev-quickplay: model-ready wait failed, seeding best-effort', e);
+  }
   fadeOutThemeMusic(fableRoot);
+  stopQuickPlayMusic(fableRoot);
   try { await invoke('fable_end'); } catch (_) {}
 
-  let openingScene = null;
   let loadMessages = null;
   try {
-    const result = await invoke('fable_quick_play_start');
+    const result = await invoke('fable_quick_play_seed', {
+      playerDesc: DEFAULT_QUICKPLAY_VALUES.player,
+      scenarioDesc: DEFAULT_QUICKPLAY_VALUES.scenario,
+      desireDesc: DEFAULT_QUICKPLAY_VALUES.desire,
+    });
     engineStarted = true;
-    isQuickPlaySession = true;
-    if (result && result.opening_scene) openingScene = result.opening_scene;
     if (result && Array.isArray(result.messages) && result.messages.length) {
       loadMessages = result.messages;
     }
   } catch (err) {
-    console.error('[fable] fable_quick_play_start failed — entering stage without engine', err);
+    console.error('[fable] dev-quickplay: fable_quick_play_seed failed — entering stage without seeded world', err);
     engineStarted = false;
-    isQuickPlaySession = true;
     try { toast('Quick Play narrator card missing or malformed (data/fable.sim).'); } catch (_) {}
   }
-
-  enterStageViaTransition(openingScene, loadMessages);
+  enterStageDirect(null, loadMessages);
 }
 
-// Resume the last Quick Play quicksave: mirrors startQuickPlayNew but calls
-// fable_quick_play_resume (loads the bundled card + session/schema from the
-// single quicksave slot). The frontend only reaches here after
-// title._quickPlaySave confirmed a quicksave exists.
-async function resumeQuickPlay() {
-  if (screens.title && screens.title._stopAmbient) screens.title._stopAmbient();
+// Wait for the chat 12B to report ready via Rust's model-status event. The
+// fresh-seed path needs shared_model() loaded (the schema engine returns Err
+// otherwise). On a cold dev refresh boot_load_model is fired fire-and-forget
+// during the OS boot-skip, so the model is almost always still loading when
+// we reach here — the ready event reliably fires after we subscribe. The 60s
+// timeout covers the unlikely warm-cache race (load completes before we
+// subscribe → no event arrives) by proceeding best-effort; the Rust seed path
+// is best-effort anyway.
+function waitForModelReady() {
+  return new Promise((resolve) => {
+    let done = false;
+    const finish = () => { if (!done) { done = true; resolve(); } };
+    // Safety timeout: don't strand the UI if the ready event never arrives.
+    const timer = setTimeout(() => {
+      finish();
+    }, 60000);
+    listen('model-status', (e) => {
+      if (e?.payload?.status === 'ready') {
+        clearTimeout(timer);
+        finish();
+      }
+    }).catch(() => finish());
+  });
+}
+
+// Quick Play → CREATE clicked (form valid). Fades the form out (everything
+// except the void + particles → opacity 0), then runs the seed: the backend
+// seeds the fresh empty world from the three descriptions
+// (fable_quick_play_seed) while the user drifts in the pure void with the
+// particles still drifting. A cinematic minimum hold keeps the drift on
+// screen long enough to feel intentional even if the seed resolves fast.
+// No opening beat — the chat opens cold.
+async function beginVoidDrift(values) {
+  // Guarded: a double-click on CREATE could fire two seeds. enterStageViaTransition's
+  // .finally clears the flag at the end of the drift.
+  if (flowBusy) return;
+  setFlowBusy(true);
+  const form = screens['quickplay-form'];
+  // Fade the form (labels + fields + CREATE) to 0 — the void + particles
+  // stay (the particle host is a sibling of the fading stack).
+  const fadePromise = (form && form._fadeFormOut) ? form._fadeFormOut() : Promise.resolve();
+  // Cinematic minimum: the drift should never feel like it blinked, even if
+  // the seed IPC resolves in 200ms. Race the fade against a 1.5s floor.
+  const minHold = new Promise((r) => setTimeout(r, 1500));
+
+  // The seed + stage-entry prep. Runs in parallel with the fade + min-hold.
+  // Stop the QuickPlay bed as the drift resolves (mirrors New Game stopping
+  // newgame-music on stage entry). End any prior session first.
   fadeOutThemeMusic(fableRoot);
+  stopQuickPlayMusic(fableRoot);
+  try { await invoke('fable_end'); } catch (_) {}
+
+  let loadMessages = null;
+  const seedPromise = (async () => {
+    try {
+      const result = await invoke('fable_quick_play_seed', {
+        playerDesc: values.player,
+        scenarioDesc: values.scenario,
+        desireDesc: values.desire,
+      });
+      engineStarted = true;
+      isQuickPlaySession = true;
+      // No opening beat — the chat opens cold. loadMessages is empty for a
+      // fresh seed.
+      if (result && Array.isArray(result.messages) && result.messages.length) {
+        loadMessages = result.messages;
+      }
+    } catch (err) {
+      console.error('[fable] fable_quick_play_seed failed — entering stage without seeded world', err);
+      engineStarted = false;
+      isQuickPlaySession = true;
+      try { toast('Quick Play narrator card missing or malformed (data/fable.sim).'); } catch (_) {}
+    }
+  })();
+
+  // Hold the drift until BOTH the form has faded AND the cinematic minimum
+  // has elapsed. The seed itself doesn't gate the drift — it's awaited next
+  // (the drift covers perceived latency, but a fast seed shouldn't rush the
+  // cinematic; a slow seed shouldn't extend the drift past what feels right
+  // — both are bounded independently).
+  await Promise.all([fadePromise, minHold]);
+  // Now wait for the seed to finish before loading the stage (the stage
+  // reads the seeded schema on its first narrator turn).
+  await seedPromise;
+
+  enterStageViaTransition(null, loadMessages);
+}
+
+// Resume the last Quick Play quicksave: calls fable_quick_play_resume (loads
+// the bundled card + session/schema from the single quicksave slot). Reached
+// from the void-form's resume popup (shown only when a quicksave exists).
+async function resumeQuickPlay() {
+  // Guarded: double-click on RESUME LAST. enterStageViaTransition's .finally clears.
+  if (flowBusy) return;
+  setFlowBusy(true);
+  // NOTE: the title ambient is stopped inside enterStageViaTransition's
+  // onMidpoint (screen black), not here — so the grass doesn't vanish
+  // instantly at click.
+  fadeOutThemeMusic(fableRoot);
+  stopQuickPlayMusic(fableRoot);
   try { await invoke('fable_end'); } catch (_) {}
 
   let openingScene = null;
@@ -687,6 +1341,14 @@ function enterStageViaTransition(openingScene, loadMessages) {
   if (flowChrome) { flowChrome.hideBack(); flowChrome.hideHome(); }
   playMagicalTransition({
     onMidpoint: () => {
+      // The screen is now fully black — safe to tear down the title ambient
+      // (grass/particles) HERE, hidden, rather than at click time. Stopping
+      // it at the midpoint (not before) means the grass keeps animating up
+      // until the moment the black covers it, so it never vanishes abruptly
+      // while the title is still visible. (Chloe 2026-08-03 fix — the prior
+      // start/resume paths stopped it at the top, before the IPC await, so the
+      // grass died instantly on click then a beat passed before the fade.)
+      if (screens.title && screens.title._stopAmbient) screens.title._stopAmbient();
       showScreen('stage');
       try {
         if (screens.stage) {
@@ -719,7 +1381,52 @@ function enterStageViaTransition(openingScene, loadMessages) {
         });
       }
     } catch (e) { console.error('[fable] wireStage threw on fallback', e); }
+  }).finally(() => {
+    // Stage-entry transitions are the terminal step of every start/resume
+    // path — clear the double-click guard here so the flag set by resumeSave
+    // / startFreshGame / the Quick Play paths is always released.
+    setFlowBusy(false);
   });
+}
+
+// === DEV SHORTCUT (?dev=quickplay) — cinema-free stage entry ================
+//
+// enterStageDirect is the straight-to-stage hand-off for the dev shortcut. It
+// mirrors enterStageViaTransition's onMidpoint body EXACTLY (stop title
+// ambient → showScreen('stage') → wireStage → engine-unavailable toast) but
+// WITHOUT the ~4s magical dim/undim transition overlay, and WITHOUT the
+// .finally flowBusy clear being conditional on the transition resolving. Used
+// only by devQuickPlayEnter's resume + fresh-seed branches so the dev refresh
+// lands in the roleplay stage instantly — no title, no void-form, no drift,
+// no cinematic. The wait for the model/seed still happens (it must — the
+// stage's first narrator turn needs the seeded schema), but it happens over a
+// seamless black, not a staged screen.
+function enterStageDirect(openingScene, loadMessages) {
+  if (flowChrome) { flowChrome.hideBack(); flowChrome.hideHome(); }
+  try {
+    // No title was shown for the dev shortcut, but stop its ambient anyway in
+    // case a re-entry left it running (idempotent + safe if it never started).
+    if (screens.title && screens.title._stopAmbient) screens.title._stopAmbient();
+  } catch (_) {}
+  showScreen('stage');
+  try {
+    if (screens.stage) {
+      wireStage(screens.stage, {
+        cardContext: null,
+        onExit: returnToTitle,
+        openingScene,
+        loadMessages,
+        isQuickPlay: isQuickPlaySession,
+      });
+    }
+  } catch (e) {
+    console.error('[fable] dev-quickplay: wireStage threw (stage shown, some features may degrade)', e);
+  }
+  if (!engineStarted) {
+    try { toast('Simulation engine unavailable — chat will not respond.'); } catch (_) {}
+  }
+  // Terminal step of the dev shortcut's entry paths — release the guard.
+  setFlowBusy(false);
 }
 
 // Return from the stage to the Fable title screen. Wired as the stage's
@@ -764,35 +1471,79 @@ async function returnToTitle() {
 // button reveal. See screens/boot.js for the timeline.
 function openFable() {
   if (!fableRoot) return;
-  // Hide the title buttons BEFORE the screen shows so they never flash
-  // visible for one frame before the boot transition hides them. They stay
-  // hidden through boot's REVEAL_DELAY pause.
+
+  // ── DEV SHORTCUT (?dev=fable / ?dev=quickplay): skip the fog gate + boot. ──
+  // Both shortcuts show #fable + chrome + pause the OS aurora directly (the
+  // cinematic path defers this to the fog hold — here we skip straight there),
+  // then return BEFORE the fog/boot setup. No fog node, no ripple aura, no
+  // boot timers → nothing for closeFable to cancel; currentFog + currentBoot
+  // stay null.
+  //
+  // They diverge on WHICH screen to land on:
+  //   ?dev=fable     → show the title immediately (buttons visible + theme
+  //                    music started). Ready to click in <1s. Mirrors boot.js's
+  //                    prefers-reduced-motion fast path.
+  //   ?dev=quickplay → skip the title too; hand off to devQuickPlayEnter,
+  //                    which auto-resumes a quicksave or seeds a fresh world
+  //                    from DEFAULT_QUICKPLAY_VALUES and drops straight into
+  //                    the roleplay stage. No theme music (we're skipping the
+  //                    title entirely).
+  if (DEV_FABLE_SHORTCUT || DEV_QUICKPLAY_SHORTCUT) {
+    fableRoot.classList.add('show');
+    fableRoot.setAttribute('aria-hidden', 'false');
+    activateChrome();
+    if (hooks.pauseAurora) hooks.pauseAurora();
+    if (DEV_QUICKPLAY_SHORTCUT) {
+      // ── Straight-to-stage (Chloe 2026-08-05): skip title AND the void. ──
+      // initFable() ends with showScreen('title'); devQuickPlayEnter() below is
+      // async (IPC + model-ready wait) and only swaps to the stage AFTER it
+      // resolves. During that gap the active screen is visible — and we don't
+      // want the title OR the quickplay void to show. So hide every Fable screen
+      // now: #fable's own --fable-void background (on .app-window.fable-app) is
+      // a clean near-black, and the stage screen is pure black (#000), so the
+      // wait reads as a seamless black with no title flash + no void-form.
+      // devQuickPlayEnter swaps straight to the stage (no magical transition)
+      // the instant the seed/resume is ready.
+      for (const s of Object.values(screens)) s.hidden = true;
+      stageActive = false; // no screen owns the stage yet
+      // devQuickPlayEnter owns its own flowBusy guard + the (cinema-free)
+      // stage-entry sequence; fire-and-forget here (errors are logged inside).
+      try { devQuickPlayEnter(); } catch (e) {
+        console.error('[fable] dev-quickplay enter failed', e);
+      }
+    } else {
+      showScreen('title');
+      try { startThemeMusic(fableRoot); } catch (_) {}
+    }
+    return;
+  }
+
+  // ── CINEMATIC: the fog gate (rewritten 2026-08-03). ──
+  //
+  // One full-screen overlay. Simple sequence:
+  //   t=0s    Click. Overlay mounts over the OS desktop; .fog-in fades it to
+  //           fully opaque over 2s (the fog-up). Wind audio loops. Fable's
+  //           title buttons are hidden now (pre-flashed) so they never show
+  //           through the fog.
+  //   t=2–4s  HOLD: overlay at 100% opacity.
+  //   t=3s    onSwap fires (mid-hold, fully foggy) — swap the OS desktop for
+  //           Fable's title here, invisibly under the solid fog.
+  //   t=4–6s  UNFOG: .fog-out fades the overlay back to 0 over 2s, revealing
+  //           Fable's title.
+  //   t=6s    Overlay removed. The boot transition (music + ripple + buttons)
+  //           fires now so its beat isn't hidden under the fog.
+  //
+  // The whole thing is one CSS opacity transition on one element — no rAF, no
+  // canvas, no per-frame JS. `cancel()` tears it down for closeFable's
+  // EXIT-mid-fog path.
+
+  // Hide the title buttons BEFORE the swap so they never flash visible for
+  // one frame when #fable shows under the fog. They stay hidden through the
+  // fog + boot's REVEAL_DELAY pause.
   if (screens.title) {
     screens.title.querySelectorAll('.fable-title-btn').forEach((b) => {
       b.classList.add('fable-title-btn--hidden');
     });
-  }
-  fableRoot.classList.add('show');
-  fableRoot.setAttribute('aria-hidden', 'false');
-  activateChrome();
-  if (hooks.pauseAurora) hooks.pauseAurora();
-  showScreen('title');
-
-  // ── DEV SHORTCUT (?dev=fable): skip the fog gate + 2s boot transition. ──
-  // The buttons were left hidden above for the cinematic path; here we
-  // force-reveal them immediately + start the theme music, then return BEFORE
-  // the fog/boot setup. Title screen is ready to click in <1s. This mirrors
-  // boot.js's own prefers-reduced-motion fast path (music on, buttons shown).
-  // No fog node, no ripple aura, no boot timers → nothing for closeFable to
-  // cancel; currentFable + currentBoot stay null.
-  if (DEV_FABLE_SHORTCUT) {
-    if (screens.title) {
-      screens.title.querySelectorAll('.fable-title-btn--hidden').forEach((b) => {
-        b.classList.remove('fable-title-btn--hidden');
-      });
-    }
-    try { startThemeMusic(fableRoot); } catch (_) {}
-    return;
   }
 
   // The ripple aura anchors on the QUICK PLAY button (the middle of the
@@ -814,15 +1565,25 @@ function openFable() {
   ].map((group) => group.filter(Boolean))
    .filter((group) => group.length > 0);
 
-  // FOG GATE (re-added 2026-08-01): the title screen is already shown behind
-  // the fog; the fog overlay (z:7000, on document.body) covers it for a 2s
-  // hold with wind looping + the fog drifting, then a soft left→right
-  // feathered wipe reveals the menu. The boot transition (music + ripple +
-  // button cascade from Quick Play) fires AFTER the fog clears so its beat
-  // isn't hidden under the fog. The fog's `done` promise resolves on clear;
-  // cancel() is available for teardown if the app closes mid-intro.
-  const fog = playFogIntro();
+  // The fog overlay covers the OS desktop + fades up over 2s. At mid-hold
+  // (fully foggy) the swap fires — OS desktop → Fable title, hidden under the
+  // solid fog. The boot transition fires AFTER the fog so its beat isn't hidden.
+  const fog = playFogIntro({
+    onSwap: () => {
+      // The invisible hand-off. Everything here is hidden by the solid fog.
+      fableRoot.classList.add('show');
+      fableRoot.setAttribute('aria-hidden', 'false');
+      activateChrome();
+      if (hooks.pauseAurora) hooks.pauseAurora();
+      showScreen('title');
+      // Dismiss the OS home grid so it isn't stranded open behind the closed
+      // app (the home tile click left 'apps' open). Routed through the OS
+      // closeWindow hook the same way the EXIT path keeps openWindows in sync.
+      if (hooks.closeWindow) { try { hooks.closeWindow('apps'); } catch (_) {} }
+    },
+  });
   currentFog = fog;
+
   fog.done.then(() => {
     if (currentFog !== fog) return;  // a newer open / cancel superseded us
     currentFog = null;
@@ -847,14 +1608,64 @@ function openFable() {
 // The fog overlay covers the title for 3s with wind looping, then blows off
 // the right edge to reveal the menu; the boot transition fires after it
 // clears. launchFable itself stays immediate.
-export function launchFable() {
+export async function launchFable() {
+  // Architectural override (2026-08-07): Fable narration is API-only — the
+  // local 12B never narrates. Block opening Fable without an active API
+  // connection and show a glass popup instead of triggering the fog gate /
+  // title. The backend `fable_*` IPCs enforce the same rule (require_api_
+  // for_fable), so this is the primary UX gate + the backend is the backstop.
+  let extra;
+  try {
+    extra = await invoke('model_source_get');
+  } catch (e) {
+    console.warn('[Fable] model_source_get failed; blocking launch', e);
+  }
+  const apiReady = !!(extra && extra.source === 'api' && extra.apiReady);
+  if (!apiReady) {
+    showFableApiRequiredPopup();
+    return;
+  }
   AppLifecycle.launchApp('fable');
 }
 
+// API-required launch gate popup (2026-08-07). Centered glass modal mirroring
+// the Quick Play resume popup (`.fable-qp-popup`), but mounts on document.body
+// because Fable isn't open yet — the home grid is still the active surface.
+// Idempotent singleton (guards on an existing popup). Dismiss = OK button only.
+function showFableApiRequiredPopup() {
+  if (document.querySelector('.fable-api-required-popup')) return;  // already shown
+  const popup = document.createElement('div');
+  popup.className = 'fable-api-required-popup';
+  popup.setAttribute('role', 'dialog');
+  popup.setAttribute('aria-modal', 'true');
+  popup.innerHTML = `
+    <div class="fable-qp-popup-card">
+      <p class="fable-qp-popup-title">No API Connection</p>
+      <p class="fable-qp-popup-warn">Fable narration requires an active API connection. The local model handles tracking only — it cannot narrate. Connect an API provider in Settings (the paw-menu AI panel), then try again.</p>
+      <div class="fable-qp-popup-actions">
+        <button class="fable-qp-popup-btn" type="button" data-act="ok">OK</button>
+      </div>
+    </div>
+  `;
+  document.body.appendChild(popup);
+  // Force a reflow so the opacity transition runs (mounts at 0).
+  void popup.offsetWidth;
+  popup.classList.add('is-open');
+  const close = () => {
+    popup.classList.remove('is-open');
+    setTimeout(() => { if (popup.parentNode) popup.remove(); }, 260);
+  };
+  popup.querySelector('[data-act="ok"]').addEventListener('click', close);
+  // Esc also dismisses.
+  popup.addEventListener('keydown', (e) => { if (e.key === 'Escape') close(); });
+  // Focus the OK button for keyboard users.
+  setTimeout(() => popup.querySelector('[data-act="ok"]').focus(), 50);
+}
+
 // onPause: the resource-freeze layer (alt-tab / focus-loss). Freezes the
-// title theme music + (if the stage is active) the stage parallax + CSS FX
-// particles. The title canvas particle RAF self-pauses on document.hidden
-// (see particles.js's onVisibility), so nothing to do there. The narrator
+// title theme music + (if the stage is active) the CSS FX particles. The
+// title canvas particle RAF self-pauses on document.hidden (see
+// particles.js's onVisibility), so nothing to do there. The narrator
 // streaming path is event-driven (no JS RAF), so no loop to stop.
 // Idempotent — safe to fire repeatedly.
 function pauseFable() {
@@ -865,21 +1676,22 @@ function pauseFable() {
   // New Game tracks: same pause-in-place treatment so alt-tab doesn't leave
   // them playing while Fable is hidden.
   pauseNewGameMusic(fableRoot);
+  // Quick Play track: same pause-in-place treatment.
+  pauseQuickPlayMusic(fableRoot);
   if (stageActive) {
-    detachParallax();   // stop the parallax RAF throttle
     pauseFX();          // freeze CSS particle animations
   }
 }
 
-// onResume: the focus-return mirror of onPause. Unfreezes music + stage
-// parallax + FX. Best-effort (play() can reject under autoplay policy;
-// pauseFX/resumeFX + attach/detachParallax are idempotent).
+// onResume: the focus-return mirror of onPause. Unfreezes music + FX.
+// Best-effort (play() can reject under autoplay policy; pauseFX/resumeFX
+// are idempotent).
 function resumeFable() {
   resumeThemeMusic(fableRoot);
   resumeNewGameMusic(fableRoot);
+  resumeQuickPlayMusic(fableRoot);
   if (stageActive) {
     resumeFX();
-    attachParallax();
   }
 }
 
@@ -926,6 +1738,8 @@ function closeFable() {
     // New Game tracks: immediate teardown (no fade — the app is closing, no
     // point in a 1.5s fade-out after the window is gone).
     stopNewGameMusic(fableRoot, { immediate: true });
+    // Quick Play track: same immediate teardown on close.
+    stopQuickPlayMusic(fableRoot, { immediate: true });
   } catch (err) {
     console.error('[fable] teardown threw, continuing with OS restore', err);
   } finally {
@@ -998,15 +1812,47 @@ export function initFable(extHooks = {}) {
     useExisting: () => {},
     createNew: () => {},
   });
+  // The Quick Play void-form (2026-08-05): three free-text fields (player /
+  // scenario / desire) + a CREATE button. CREATE is disabled until all three
+  // fields have words; on enable it turns white + becomes clickable. The
+  // form's onCreate → beginVoidDrift (fade out + seed the world + load the
+  // stage). Resume-Last is handled by a popup shown over the form when a
+  // quicksave exists (not a tile on this screen).
+  screens['quickplay-form'] = buildQuickPlayForm({
+    onCreate: (values) => { beginVoidDrift(values); },
+  });
   screens.picker = buildPicker({});
-  screens.creator = buildCreator();
   // Player Creator + Picker (Pair 2). Built once; rendered on entry.
   screens['player-creator'] = buildPlayerCreator();
   screens['player-picker'] = buildPlayerPicker();
-  screens.worlds = buildWorlds({ back: () => showScreen('title') });
+  // The three Sim Card Creators (2026-08-05): NPC / World / Scenario, each a
+  // thin config over the generic wizard-engine. All three author a sim card
+  // (distinguished only by which fields the wizard collects). Built once;
+  // rendered on entry from the Sim Creator chooser.
+  screens['npc-creator'] = buildNpcCreator();
+  screens['world-creator'] = buildWorldCreator();
+  screens['scenario-creator'] = buildScenarioCreator();
+  screens.worlds = buildWorlds({ back: () => exitLoadToTitle() });
   screens.saves = buildSaves({ back: () => showScreen('worlds') });
   for (const s of Object.values(screens)) fableRoot.appendChild(s);
   showScreen('title');
+
+  // ── The global double-click guard (capture phase) ────────────────
+  // One listener at the root, capture phase, swallows click + pointerdown
+  // while a transition is in flight (flowBusy). Capture phase is load-bearing:
+  // it intercepts the event BEFORE any per-button listener can run, so no
+  // handler needs to know about the guard. pointerdown is covered too so a
+  // fast double-tap doesn't even start a press animation on the second click.
+  // The title's disabled-button guard (title.js) already short-circuits
+  // disabled buttons; this is the belt-and-suspenders for the rapid-click
+  // case on ENABLED buttons mid-transition.
+  ['click', 'pointerdown'].forEach((evt) => {
+    fableRoot.addEventListener(evt, (e) => {
+      if (!flowBusy) return;
+      e.stopImmediatePropagation();
+      e.preventDefault();
+    }, { capture: true });
+  });
 
   // Register Fable as a full-screen OS app under the lifecycle framework.
   // The manager owns onOpen/onPause/onResume/onClose; the OS window set is

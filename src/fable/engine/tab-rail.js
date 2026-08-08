@@ -6,12 +6,13 @@
 // icon toggles a prose dropdown (JSON/XML-free, friendly labels). One tab
 // active at a time (glowing); re-click or pick another closes/swaps.
 //
-// THE HOVER-REOPEN-KEEPS-ACTIVE BEHAVIOR (the spec's core mechanic):
-//   The dropdown state (`activeTab`) is SEPARATE from the drawer-open state.
-//   When the drawer auto-closes on mouseleave, `activeTab` PERSISTS. On the
-//   next hover-open, `renderActive()` re-runs so the dropdown reappears with
-//   the active tab still glowing — as if it never left. This is why the rail
-//   owns its own state instead of coupling to the drawer's open/close.
+// TAB STATE + DRAWER CLOSE (2026-08-06):
+//   The dropdown state (`activeTab`) is SEPARATE from the drawer-open state so
+//   the rail owns its own state. When the Wupi drawer closes (mouseleave / close
+//   button), `closeDrawer()` calls `resetTabRail()` → `setActiveTab(null)`,
+//   collapsing the dropdown + deactivating the icon so nothing persists behind
+//   a closed drawer. (The prior persist-on-close behavior was retired to match
+//   the left drawer.) `renderActive()` remains for the reopen-after-edit path.
 //
 // Each dropdown has a ✎ icon (top-right) that opens the raw-file editor
 // (engine/raw-editor.js) loaded with that tab's file. The prose fields save
@@ -207,7 +208,6 @@ async function renderCard(body) {
       ${field('Setting', 'setting', card.setting || '', 3)}
       ${field('Tone', 'tone', card.tone || '')}
       ${field('Core persona', 'persona', card.core_persona || '', 4)}
-      ${field('Opening scene', 'opening', card.opening_scene || '', 5)}
       <div class="fable-drop-actions">
         <button class="fable-drop-btn primary" data-card-save>Save (live)</button>
         <span class="fable-drop-status"></span>
@@ -223,7 +223,6 @@ async function renderCard(body) {
       setting: form.querySelector('[data-f="setting"]').value,
       tone: form.querySelector('[data-f="tone"]').value,
       core_persona: form.querySelector('[data-f="persona"]').value,
-      opening_scene: form.querySelector('[data-f="opening"]').value,
     };
     status.textContent = 'Saving…';
     try {
@@ -452,8 +451,13 @@ async function renderNpc(body) {
   });
 }
 
-// Hard reset (called from teardownStage on stage exit). Clears the active tab
-// so the next session starts clean (no stale dropdown leaking across entries).
+// Reset the rail to its beginning state: collapse the open dropdown + strip the
+// glowing is-active state from every icon. Called from TWO places now: (1)
+// teardownStage on stage exit (the original hard-reset), + (2) wupi-drawer's
+// closeDrawer so an open tab never persists behind a closed drawer (Chloe
+// 2026-08-06: match the left drawer's reset-on-close; the prior persist-on-
+// close behavior is retired). Touches ONLY the tab rail — the Wupi chat
+// history lives in a separate element + is never cleared here.
 export function resetTabRail() {
   setActiveTab(null);
 }

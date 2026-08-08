@@ -96,6 +96,13 @@ function bindController(chrome) {
     // Re-route click handlers (clone-detach prevents stacking).
     onBack(fn) { backRef = setHandler(backRef, fn); },
     onHome(fn) { homeRef = setHandler(homeRef, fn); },
+    // Set the visual variant: 'newgame' (brass) or 'quickplay' (white). The
+    // Quick Play home button reads as a bright white glyph over the void
+    // (Chloe 2026-08-05) instead of the New Game flow's aged brass.
+    setVariant(variant) {
+      chrome.classList.remove('fable-flow-chrome--quickplay', 'fable-flow-chrome--newgame');
+      if (variant) chrome.classList.add(`fable-flow-chrome--${variant}`);
+    },
     // Full teardown (on Fable close).
     destroy() {
       if (homeTimer) { clearTimeout(homeTimer); homeTimer = null; }

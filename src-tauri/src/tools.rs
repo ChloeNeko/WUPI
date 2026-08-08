@@ -37,7 +37,6 @@
 use crate::chat_format::ToolSpec;
 use serde::{Deserialize, Serialize};
 use std::path::{Component, Path, PathBuf};
-use std::sync::Arc;
 
 /// The maximum number of tool-call ↔ decode round-trips per `chat_send` turn.
 /// Past this the model is stuck in a loop; we surface the last assistant reply
@@ -375,30 +374,11 @@ impl ToolError {
 #[derive(Debug, Clone)]
 pub struct ToolCtx {
     pub install_root: PathBuf,
-    /// Per-turn Director directive slot (the `set_directive` tool's write
-    /// target). Minted fresh by `chat_send` per call, drained to
-    /// `AppState::pending_directive` after the agent loop returns.
-    /// `Tool::execute` is sync and the slot is never held across an await, so
-    /// `std::sync::Mutex` is correct here (NOT `tokio::sync`). Default `None`
-    /// → test/standalone unaffected; the `set_directive` tool errors
-    /// gracefully if invoked without a slot.
-    pub directive_slot: Option<Arc<std::sync::Mutex<Option<String>>>>,
 }
 
 impl ToolCtx {
     pub fn new(install_root: PathBuf) -> Self {
-        Self {
-            install_root,
-            directive_slot: None,
-        }
-    }
-    /// Attach the per-turn directive slot (called once per chat_send from
-    /// lib.rs when a Fable session is active, before the agent loop iterates).
-    /// The `set_directive` tool writes here; the chat-path post-loop block
-    /// drains the slot into `state.pending_directive`.
-    pub fn with_directive_slot(mut self, slot: Arc<std::sync::Mutex<Option<String>>>) -> Self {
-        self.directive_slot = Some(slot);
-        self
+        Self { install_root }
     }
     /// Resolve a sandboxed relative path against the install root.
     pub fn resolve(&self, rel: &str) -> Result<PathBuf, ToolError> {
@@ -442,13 +422,14 @@ pub fn registry() -> Vec<Box<dyn Tool>> {
     ]
 }
 
-/// The Fable-only tools (the "Director" suite): `generate_options` opens the
-/// Crossroads option picker; `set_directive` arms a one-shot narrator steer.
-/// These are attached to the chat agent loop ONLY when a Fable session is
-/// active (`chat_send` gates this in lib.rs) — they're invisible to the model
-/// outside a game, which prevents false-firing in plain Wupi-assistant chat.
+/// The Fable-only tools. Currently EMPTY — the "Director" suite
+/// (`generate_options` + `set_directive`) was removed in full (the
+/// Crossroads option-picker frontend + the `pending_directive` narrator-steer
+/// channel were both dead). Kept as a non-empty-call site so `chat_send`'s
+/// Fable-session tool gating still compiles; add Fable-only tools here when
+/// they're introduced.
 pub fn fable_registry() -> Vec<Box<dyn Tool>> {
-    vec![Box::new(GenerateOptions), Box::new(SetDirective)]
+    Vec::new()
 }
 
 /// The full tool spec list, ready to hand to `Gemma4Format::render_prompt`.
@@ -818,144 +799,6 @@ impl Tool for EditUserProfile {
     }
 }
 
-// --- generate_options (Fable-only) ---------------------------------------
-
-/// Open the Crossroads option picker. This is a **signal tool**: the model
-/// emits the args, Rust validates, and the agent loop's `tool_call` event
-/// carries them to the frontend drawer, which invokes `crossroads_generate`
-/// to do the actual generation + render the modal. The tool itself produces
-/// no work; it exists so the model has a structured NL→action path that
-/// `validate_args` can gate (the false-tool-call guardrail).
-///
-/// `Tool::execute` returning a short success string means the agent loop's
-/// standard `tool_result` event fires normally — the model sees "options
-/// picker queued" in its `<|tool_response>` and can continue its prose turn
-/// ("Alright, popping open the picker now…"). Meanwhile the frontend has
-/// already received the `tool_call` event and opened the modal.
-struct GenerateOptions;
-impl Tool for GenerateOptions {
-    fn spec(&self) -> ToolSpec {
-        ToolSpec {
-            name: "generate_options".into(),
-            description: "Open the Crossroads option picker — generates concrete, \
-                          grounded story options the player picks from. ONLY available \
-                          during an active Fable session. Natural triggers: 'what should \
-                          I do next', 'give me options', 'ideas?', 'introduce an NPC', \
-                          'branch the story'. \
-                          \
-                          Arguments: {\"lens\": \"action|plot|character|explicit|world\", \
-                          \"count\": 6, \"seed\": \"optional free-text nudge\"}. \
-                          All arguments optional. `lens` defaults to action. `count` \
-                          defaults to 6, range 1-12 (HARD MAX). `seed` biases the \
-                          generated options toward a theme. \
-                          \
-                          COUNT RULE (load-bearing): if the user asks for MORE than 12, \
-                          DO NOT call this tool with count>12 — it will error. Instead \
-                          apologize in prose ('12 is the max — is that cool?') and wait \
-                          for the user's confirmation before calling with count=12. \
-                          Never silently clamp.".into(),
-        }
-    }
-    fn validate_args(&self, args: &serde_json::Value) -> Result<(), ToolError> {
-        // lens: if present, must be one of the 5 valid ids. Inlined from the
-        // removed `crossroads_prompt` module so validation still steers the model.
-        if let Some(lens) = args.get("lens").and_then(|v| v.as_str()) {
-            const VALID_LENS: &[&str] = &["action", "plot", "character", "explicit", "world"];
-            if !VALID_LENS.contains(&lens) {
-                return Err(ToolError::new(format!(
-                    "unknown lens {lens:?}; expected one of action|plot|character|explicit|world"
-                )));
-            }
-        }
-        // count: if present, must be 1..=12. count>12 is a HARD error that steers
-        // the model — the description tells it to apologize-then-ask in that case,
-        // and this error message reinforces it so the repair loop's `<|tool_response>`
-        // blocks a silent re-fire with the same out-of-range count.
-        if let Some(n) = args.get("count").and_then(|v| v.as_u64()) {
-            if n > 12 {
-                return Err(ToolError::new(format!(
-                    "count {n} exceeds the max of 12. Apologize to the user in prose \
-                     ('12's the cap — want me to go with 12?') and wait for confirmation \
-                     before calling again. Do NOT auto-clamp."
-                )));
-            }
-            if n == 0 {
-                return Err(ToolError::new(
-                    "count must be at least 1. Default is 6; omit the field if unsure.",
-                ));
-            }
-        }
-        // seed: if present, ≤ 500 chars (keeps the user message cheap; the lens
-        // + live scene are the main context anyway).
-        if let Some(seed) = args.get("seed").and_then(|v| v.as_str()) {
-            if seed.chars().count() > 500 {
-                return Err(ToolError::new("seed exceeds 500 chars; trim it."));
-            }
-        }
-        Ok(())
-    }
-    fn execute(&self, _args: &serde_json::Value, _ctx: &ToolCtx) -> Result<String, ToolError> {
-        // Pure signal — the drawer reads the prior `tool_call` event (which
-        // carries the validated args) and invokes crossroads_generate.
-        Ok("options picker queued — the modal is opening.".into())
-    }
-}
-
-// --- set_directive (Fable-only) ------------------------------------------
-
-/// Arm a one-shot world directive for the NEXT narrator turn. Unlike
-/// `generate_options`, this tool does real work: it writes the validated
-/// directive text into `ToolCtx::directive_slot`, which `chat_send` drains to
-/// `AppState::pending_directive` after the agent loop returns. `fable_send`
-/// then consumes the directive at the top of its schema-lock block and
-/// threads it into the narrator prompt as a `<director_directive>` block.
-struct SetDirective;
-impl Tool for SetDirective {
-    fn spec(&self) -> ToolSpec {
-        ToolSpec {
-            name: "set_directive".into(),
-            description: "Steer the next narrator turn — a one-shot world directive \
-                          consumed by the NEXT fable_send, then cleared. ONLY available \
-                          during an active Fable session. Use when the user asks to \
-                          nudge the world off-screen: 'make the barkeeper suspicious of \
-                          me', 'have a storm roll in', 'advance time to morning', 'shift \
-                          the tone darker'. \
-                          \
-                          Argument: {\"text\": \"the directive in one or two sentences\"}. \
-                          After arming, confirm to the user in prose what you armed.".into(),
-        }
-    }
-    fn validate_args(&self, args: &serde_json::Value) -> Result<(), ToolError> {
-        let text = req_str_nonempty(args, "text")?;
-        if text.chars().count() > 1000 {
-            return Err(ToolError::new("directive text exceeds 1000 chars; tighten it."));
-        }
-        Ok(())
-    }
-    fn execute(&self, args: &serde_json::Value, ctx: &ToolCtx) -> Result<String, ToolError> {
-        let text = req_str(args, "text")?;
-        let trimmed = text.trim();
-        if trimmed.is_empty() {
-            return Err(ToolError::new("directive text must not be empty"));
-        }
-        let Some(slot) = &ctx.directive_slot else {
-            // No slot = no Fable session. Defensive: the tool spec says
-            // Fable-only, but a model could still emit it outside a game.
-            return Err(ToolError::new(
-                "no directive slot available (not in a Fable session?)",
-            ));
-        };
-        let mut g = slot
-            .lock()
-            .map_err(|_| ToolError::new("directive slot poisoned"))?;
-        // Overwrite any prior directive this turn — last write wins. The slot
-        // is per-turn (drained after the agent loop), so this is not a global
-        // state leak.
-        *g = Some(trimmed.to_string());
-        Ok("directive armed — fires on the next narrator turn.".into())
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -1287,14 +1130,12 @@ mod tests {
         }
     }
 
-    // === Fable-only Director tools (generate_options / set_directive) ========
-
-    #[test]
-    fn fable_registry_includes_director_tools() {
-        let names: Vec<String> = fable_specs().iter().map(|s| s.name.clone()).collect();
-        assert!(names.contains(&"generate_options".to_string()), "have: {names:?}");
-        assert!(names.contains(&"set_directive".to_string()), "have: {names:?}");
-    }
+    // === Fable-only tools ===================================================
+    // The "Director" suite (generate_options + set_directive) was removed in
+    // full; fable_registry() is currently empty. These two property tests pin
+    // the contract that the (currently-empty) fable registry never collides
+    // with or shadows the main registry — useful scaffolding for when the
+    // next Fable-only tool is added.
 
     #[test]
     fn fable_registry_specs_disjoint_from_main_registry() {
@@ -1321,146 +1162,6 @@ mod tests {
         let mut sorted_dedup = deduped.clone();
         sorted_dedup.sort();
         assert_eq!(names, sorted_dedup, "fable tool name collision");
-    }
-
-    // --- generate_options validation ---------------------------------------
-
-    #[test]
-    fn generate_options_validate_accepts_default_no_args() {
-        assert!(GenerateOptions.validate_args(&serde_json::Value::Null).is_ok());
-        assert!(GenerateOptions.validate_args(&serde_json::json!({})).is_ok());
-    }
-
-    #[test]
-    fn generate_options_validate_accepts_each_lens() {
-        for lens in ["action", "plot", "character", "explicit", "world"] {
-            let payload = serde_json::json!({ "lens": lens });
-            assert!(
-                GenerateOptions.validate_args(&payload).is_ok(),
-                "lens {lens} should be valid"
-            );
-        }
-    }
-
-    #[test]
-    fn generate_options_validate_rejects_unknown_lens() {
-        let payload = serde_json::json!({ "lens": "bogus" });
-        let err = GenerateOptions.validate_args(&payload).unwrap_err();
-        assert!(err.message.contains("unknown lens"));
-    }
-
-    #[test]
-    fn generate_options_validate_accepts_count_in_range() {
-        for n in [1u64, 6, 12] {
-            let payload = serde_json::json!({ "count": n });
-            assert!(
-                GenerateOptions.validate_args(&payload).is_ok(),
-                "count {n} should be valid"
-            );
-        }
-    }
-
-    #[test]
-    fn generate_options_validate_rejects_count_over_12_with_ask_first_message() {
-        // The error message is load-bearing: it steers the model to apologize
-        // in prose + wait for user confirmation rather than silently clamping.
-        let payload = serde_json::json!({ "count": 50 });
-        let err = GenerateOptions.validate_args(&payload).unwrap_err();
-        assert!(err.message.contains("50"), "error should name the offending count");
-        assert!(err.message.contains("12"), "error should name the cap");
-        assert!(
-            err.message.to_lowercase().contains("apolog") || err.message.to_lowercase().contains("wait"),
-            "error must steer the model to apologize+wait, not clamp. Got: {}",
-            err.message
-        );
-    }
-
-    #[test]
-    fn generate_options_validate_rejects_zero_count() {
-        let payload = serde_json::json!({ "count": 0 });
-        assert!(GenerateOptions.validate_args(&payload).is_err());
-    }
-
-    #[test]
-    fn generate_options_validate_rejects_oversized_seed() {
-        let big = "x".repeat(501);
-        let payload = serde_json::json!({ "seed": big });
-        let err = GenerateOptions.validate_args(&payload).unwrap_err();
-        assert!(err.message.contains("500"));
-    }
-
-    #[test]
-    fn generate_options_execute_returns_signal_string() {
-        let (_guard, ctx) = temp_ctx();
-        let out = GenerateOptions
-            .execute(&serde_json::json!({ "lens": "action", "count": 6 }), &ctx)
-            .unwrap();
-        assert!(out.contains("picker queued"));
-    }
-
-    // --- set_directive validation + execution ------------------------------
-
-    #[test]
-    fn set_directive_validate_rejects_empty_text() {
-        let payload = serde_json::json!({ "text": "   " });
-        assert!(SetDirective.validate_args(&payload).is_err());
-    }
-
-    #[test]
-    fn set_directive_validate_rejects_missing_text() {
-        assert!(SetDirective.validate_args(&serde_json::json!({})).is_err());
-    }
-
-    #[test]
-    fn set_directive_validate_rejects_oversized_text() {
-        let big = "x".repeat(1001);
-        let payload = serde_json::json!({ "text": big });
-        let err = SetDirective.validate_args(&payload).unwrap_err();
-        assert!(err.message.contains("1000"));
-    }
-
-    #[test]
-    fn set_directive_execute_writes_to_slot() {
-        let (_guard, mut ctx) = temp_ctx();
-        let slot: Arc<std::sync::Mutex<Option<String>>> =
-            Arc::new(std::sync::Mutex::new(None));
-        ctx = ctx.with_directive_slot(slot.clone());
-        let payload = serde_json::json!({ "text": "  the barkeeper grows suspicious  " });
-        let out = SetDirective.execute(&payload, &ctx).unwrap();
-        assert!(out.contains("armed"));
-        let guard = slot.lock().unwrap();
-        assert_eq!(*guard, Some("the barkeeper grows suspicious".to_string()));
-    }
-
-    #[test]
-    fn set_directive_execute_overwrites_prior_directive_same_turn() {
-        // Last-write-wins within a single agent-loop turn (the slot is drained
-        // post-loop, so multiple set_directive calls in one turn are sequential
-        // overwrites — only the final one survives).
-        let (_guard, mut ctx) = temp_ctx();
-        let slot: Arc<std::sync::Mutex<Option<String>>> =
-            Arc::new(std::sync::Mutex::new(None));
-        ctx = ctx.with_directive_slot(slot.clone());
-        SetDirective
-            .execute(&serde_json::json!({ "text": "first" }), &ctx)
-            .unwrap();
-        SetDirective
-            .execute(&serde_json::json!({ "text": "second" }), &ctx)
-            .unwrap();
-        let guard = slot.lock().unwrap();
-        assert_eq!(*guard, Some("second".to_string()));
-    }
-
-    #[test]
-    fn set_directive_execute_errors_without_slot() {
-        // Defensive: model could emit the tool outside a Fable session
-        // (the spec says Fable-only but enforcement is by chat_send gating,
-        // not the tool itself). The tool must error cleanly, not panic.
-        let (_guard, ctx) = temp_ctx(); // no with_directive_slot
-        let err = SetDirective
-            .execute(&serde_json::json!({ "text": "x" }), &ctx)
-            .unwrap_err();
-        assert!(err.message.contains("directive slot") || err.message.contains("Fable"));
     }
 
 }

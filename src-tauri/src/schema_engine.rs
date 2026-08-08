@@ -785,12 +785,32 @@ impl SchemaRuntime {
                 render_accumulated_repair_prompt(&raw_outputs, &errors)
             };
             let raw = self.generate_text(&prompt)?;
-            last_raw = raw.clone();
-            raw_outputs.push(raw.clone());
+            // Reasoning debug: strip the thought channel BEFORE storing the
+            // raw output into raw_outputs / last_raw. extract_reply_channel
+            // (the same gate from_model_output uses) drops the
+            // `<|channel>thought ... <channel|>` body, so (a) the repair
+            // prompt's re-quoted prior outputs never show the model its own
+            // thought as if it were payload, and (b) the forensic raw_output
+            // we return is the clean JSON. The thought itself is captured
+            // separately for debug logging. No-op when the model didn't emit
+            // a thought channel.
+            let reply = crate::schema::extract_reply_channel(&raw);
+            let reasoning = crate::chat_format::extract_reasoning_channel(&raw);
+            if !reasoning.is_empty() {
+                tracing::debug!(
+                    label,
+                    pass,
+                    reasoning_len = reasoning.len(),
+                    "{label} pass {pass} reasoning: {}",
+                    reasoning.chars().take(600).collect::<String>()
+                );
+            }
+            last_raw = reply.clone();
+            raw_outputs.push(reply.clone());
 
             // Parse the JSON (channel-protocol + fence strip happens inside
-            // from_model_output).
-            let parsed = SchemaDelta::from_model_output(&raw);
+            // from_model_output; on a reply already stripped this is a no-op).
+            let parsed = SchemaDelta::from_model_output(&reply);
             let delta = match parsed {
                 Ok(d) => d,
                 Err(e) => {
@@ -799,7 +819,7 @@ impl SchemaRuntime {
                         label,
                         pass,
                         error = %e,
-                        raw_preview = %raw.chars().take(200).collect::<String>(),
+                        raw_preview = %reply.chars().take(200).collect::<String>(),
                         "{label} parse failed"
                     );
                     errors.push(msg);
@@ -821,11 +841,11 @@ impl SchemaRuntime {
             tracing::debug!(
                 label,
                 pass,
-                tokens = raw.len(),
+                tokens = reply.len(),
                 deferred = prior_deferred.len(),
                 "{label} committed on pass {pass}"
             );
-            return Ok(AttemptOutcome::Committed { raw_output: raw, delta });
+            return Ok(AttemptOutcome::Committed { raw_output: reply, delta });
         }
 
         // All passes exhausted. Build the failure-queue carrier so the caller
@@ -1013,6 +1033,11 @@ fn render_delta_prompt(
     let mut out = String::with_capacity(2048);
     out.push_str("<|turn>system\n");
     out.push_str(DELTA_SYSTEM_INSTRUCTION);
+    // Always-on thinking: inject the Gemma4 `<|think|>` control token so the
+    // delta pass always reasons before the JSON. The thought body is stripped
+    // before parsing by SchemaDelta::from_model_output → extract_reply_channel
+    // (the single load-bearing gate; see schema.rs).
+    out.push_str("<|think|>");
     out.push_str("<turn|>\n");
     out.push_str("<|turn>user\n");
     out.push_str("Current schema:\n");
@@ -1072,6 +1097,8 @@ fn render_world_progression_prompt(
     let mut out = String::with_capacity(2048);
     out.push_str("<|turn>system\n");
     out.push_str(WORLD_PROGRESSION_SYSTEM_INSTRUCTION);
+    // Always-on thinking (delta prompt above documents the strip pipeline).
+    out.push_str("<|think|>");
     out.push_str("<turn|>\n");
     out.push_str("<|turn>user\n");
     out.push_str("Current world state:\n");
@@ -1119,6 +1146,8 @@ fn render_accumulated_repair_prompt(prior_raw: &[String], prior_errors: &[String
     out.push_str(
         "Your previous output(s) were invalid. Emit ONLY the JSON delta object: no prose, no markdown fences, no commentary. Address EACH error below. If nothing actually changed, emit {}.",
     );
+    // Always-on thinking (delta prompt above documents the strip pipeline).
+    out.push_str("<|think|>");
     out.push_str("<turn|>\n");
     out.push_str("<|turn>user\n");
     out.push_str(&format!("{} prior attempt(s) failed:\n", prior_raw.len()));

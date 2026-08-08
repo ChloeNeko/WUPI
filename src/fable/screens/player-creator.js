@@ -1,224 +1,358 @@
 // =============================================================
-// SCREEN: PLAYER CREATOR — author a standalone, reusable player.
+// SCREEN: PLAYER CREATOR — a 15-slide wizard authoring a reusable player.
 //
-// A single form (NOT a burn-button flow): name, description, appearance,
-// personality, accessories, + a portrait upload slot. All fields visible
-// together — no section-hiding burn here (the burn is for the menu pairs).
+// REFACTORED 2026-08-05: the slide engine, renderers, arrows, validation
+// lock, + review control flow now live in the generic wizard-engine.js
+// (shared with the NPC/World/Scenario creators). This file is the PLAYER-
+// specific config: the 15-slide list, the SavedPlayer serializer, the
+// portrait-crop ctx, + the bespoke review (player's review predates the
+// generic one + has the clothing-as-its-own-entity layout — kept as-is so
+// the player review's exact look is unchanged).
 //
-// The chrome (‹ / ⌂) is owned by the flow controller — no header bar.
+// THE 15 SLIDES (order is load-bearing — matches the Rust trait set):
+//   1  Portrait        (optional — upload via @tauri-apps/plugin-dialog)
+//   2  Name            (text, required, the identity anchor + slug source)
+//   3  Gender          (♂/♀ toggle — persists to localStorage + JSON)
+//   4-11 traits        (Race/Age/Height/Weight/Hair×3/Body/Skin/Eyes)
+//   12-14 conditional  (Breast/Ears/Tail — Yes/No, No omits from JSON)
+//   15 Clothing        (dynamic chip list)
+//   16 [REVIEW]        (SIM card + CREATE button)
 //
-// PORTRAIT UPLOAD: a circular avatar slot opens the native file dialog
-// (@tauri-apps/plugin-dialog → PNG/JPG). The picked path is passed to
-// the fable_player_portrait_upload IPC, which reads + writes the bytes
-// server-side. The returned absolute path is shown via convertFileSrc.
+// The Player Creator is NOT a sim card — it authors a SavedPlayer (player.rs)
+// via fable_player_write + fable_player_portrait_upload_bytes. The three new
+// creators (NPC/World/Scenario) author sim cards via fable_write_card. This
+// file keeps the SavedPlayer serializer + the player-portrait upload path.
 //
-// VALIDATION LOCK: a client-side mirror of Rust's validate_player
-// (player.rs). Runs on every input; Save stays disabled + a status line
-// shows the reason until valid (mirrors raw-editor.js:setValid). The
-// authoritative gate re-runs server-side on fable_player_write.
+// SillyTavern import (2026-08-05): the import button on slide 1 auto-fills
+// the wizard's fields from a parsed ST character (the player schema maps
+// only name → Name; the rest is ignored — players don't have ST-style prose).
 // =============================================================
 
 import { invoke, convertFileSrc } from '@tauri-apps/api/core';
 import { open as openDialog } from '@tauri-apps/plugin-dialog';
-import { createEmbers } from './embers.js';
+import {
+  buildWizard, renderWizard, runCreate, buildGenericReview,
+  requiredTextValidate, conditionalValidate, traitInvalid,
+  normalizeGender, slugify, bytesToBase64, esc,
+  NAME_MAX, TRAIT_MAX, SILHOUETTE_SVG, ARROW_SVG_LEFT,
+} from './wizard-engine.js';
+import { openPortraitCropper } from './portrait-cropper.js';
+import { setPaperdollGender } from '../engine/left-drawer.js';
+import { openImportDialog } from './st-import.js';
 
-// --- Client-side validation mirror (player.rs::validate_player) ----
-const NAME_MAX = 64;
-const PROSE_MAX = 4000;
-const CONTROL_RE = /[\u0000-\u0008\u000B\u000C\u000E-\u001F]/;
+const SCHEMA_KEY = 'player';
 
-function validatePlayer(fields) {
-  const name = (fields.name || '').trim();
-  if (!name) return 'Name is required.';
-  if (name.length > NAME_MAX) return `Name must be ${NAME_MAX} characters or fewer.`;
-  if (CONTROL_RE.test(fields.name || '')) return 'Name contains invalid control characters.';
-  for (const [label, val] of [
-    ['Description', fields.description],
-    ['Appearance', fields.appearance],
-    ['Personality', fields.personality],
-    ['Accessories', fields.accessories],
-  ]) {
-    const s = (val || '').trim();
-    if (s.length > PROSE_MAX) return `${label} must be ${PROSE_MAX} characters or fewer.`;
-    if (val && CONTROL_RE.test(val)) return `${label} contains invalid control characters.`;
+// --- The 15-slide list (mirrors the pre-refactor player-creator.js exactly).
+function buildSlides() {
+  return [
+    { id: 'portrait', title: 'Portrait', kind: 'portrait' },
+    {
+      id: 'name', title: 'Name', kind: 'text', field: 'name', required: true,
+      validate: (s) => {
+        const v = (s.name || '').trim();
+        if (!v) return 'Name is required.';
+        if (v.length > NAME_MAX) return `Name must be ${NAME_MAX} characters or fewer.`;
+        return null;
+      },
+    },
+    {
+      id: 'gender', title: 'Gender', kind: 'gender',
+      validate: (s) => {
+        const g = (s.gender || '').trim().toLowerCase();
+        if (g !== 'male' && g !== 'female') return 'Choose a silhouette.';
+        return null;
+      },
+    },
+    traitSlide('race', 'Race'),
+    traitSlide('age', 'Age'),
+    traitSlide('height', 'Height'),
+    traitSlide('weight', 'Weight'),
+    {
+      id: 'hair', title: 'Hair', kind: 'hair',
+      validate: (s) => {
+        for (const key of ['hair_color', 'hair_length', 'hair_style']) {
+          const v = (s[key] || '').trim();
+          if (!v) return 'All three hair fields are required.';
+          const err = traitInvalid('Hair', s[key]);
+          if (err) return err;
+        }
+        return null;
+      },
+    },
+    traitSlide('body_type', 'Body'),
+    traitSlide('skin_complexion', 'Skin'),
+    traitSlide('eye_color', 'Eyes'),
+    { id: 'breast_size', title: 'Breast', kind: 'conditional', field: 'breast_size',
+      validate: (s) => conditionalValidate('Breast', s.breast_size, s.breast_size_enabled) },
+    { id: 'ears', title: 'Ears', kind: 'conditional', field: 'ears',
+      validate: (s) => conditionalValidate('Ears', s.ears, s.ears_enabled) },
+    { id: 'tail', title: 'Tail', kind: 'conditional', field: 'tail',
+      validate: (s) => conditionalValidate('Tail', s.tail, s.tail_enabled) },
+    { id: 'clothing', title: 'Clothing', kind: 'clothing',
+      validate: (s) => {
+        const list = Array.isArray(s.clothing) ? s.clothing : [];
+        if (list.length === 0) return 'Add at least one garment.';
+        return null;
+      },
+    },
+  ];
+}
+
+function traitSlide(id, title) {
+  return {
+    id, title, kind: 'text', field: id,
+    validate: requiredTextValidate(title, id),
+  };
+}
+
+// --- The player-specific portrait pick ctx: routes through the cropper +
+// persists the gender to the paperdoll (mirrors the pre-refactor flow).
+async function pickPlayerPortrait(screenEl, stashed, onChange) {
+  try {
+    const picked = await openDialog({
+      multiple: false,
+      filters: [{ name: 'Images', extensions: ['png', 'jpg', 'jpeg'] }],
+    });
+    if (!picked) return;
+    const srcPath = typeof picked === 'string' ? picked : (picked.path || picked);
+    if (!srcPath) return;
+    const pickedSrc = await invoke('fable_player_portrait_read_bytes', { srcPath });
+    if (!pickedSrc) return;
+    const cropped = await openPortraitCropper(screenEl, pickedSrc);
+    if (!cropped) return;
+    stashed.portraitSrcPath = srcPath;
+    stashed.portraitCroppedBytes = cropped.bytes;
+    stashed.portraitCroppedExt = cropped.ext;
+    stashed.portraitPreviewSrc = cropped.dataUrl;
+    if (onChange) onChange();
+  } catch (err) {
+    const toast = screenEl && screenEl._toast;
+    if (toast) toast(String(err));
   }
-  return null;
 }
 
-let playerToastTimer = null;
-function playerToast(root, msg) {
-  const host = root.querySelector('[data-player-toast]');
-  if (!host) return;
-  host.textContent = msg;
-  host.hidden = false;
-  if (playerToastTimer) clearTimeout(playerToastTimer);
-  playerToastTimer = setTimeout(() => { host.hidden = true; }, 4000);
+function buildCtx() {
+  return {
+    onPickPortrait: pickPlayerPortrait,
+    onGenderPicked: (key) => {
+      // Persist to the paperdoll localStorage + the live drawer (mirrors the
+      // pre-refactor player-creator gender slide).
+      try { setPaperdollGender(key); } catch (_) { /* drawer not yet loaded */ }
+    },
+    onImport: (screenEl) => importIntoPlayerCreator(screenEl),
+    schemaKey: SCHEMA_KEY,
+  };
 }
 
-const FIELDS = [
-  { key: 'name', label: 'Name', required: true, tag: 'input', placeholder: 'e.g. Kaelen Voss', rows: 0 },
-  { key: 'description', label: 'Description', tag: 'textarea', placeholder: 'Backstory, identity, who they are at their core.', rows: 4 },
-  { key: 'appearance', label: 'Appearance', tag: 'textarea', placeholder: 'Physical description: age, race, build, hair, eyes, clothing.', rows: 5 },
-  { key: 'personality', label: 'Personality', tag: 'textarea', placeholder: 'Demeanor, voice, mannerisms, temperament.', rows: 5 },
-  { key: 'accessories', label: 'Accessories', tag: 'textarea', placeholder: 'Signature carried items, trinkets, gear.', rows: 3 },
-];
-
-function fieldMarkup(f) {
-  const req = f.required ? ' <em>(required)</em>' : '';
-  const control = f.tag === 'textarea'
-    ? `<textarea data-field="${f.key}" rows="${f.rows}" placeholder="${f.placeholder || ''}"></textarea>`
-    : `<input type="text" data-field="${f.key}" placeholder="${f.placeholder || ''}" autocomplete="off">`;
-  return `<label class="fable-creator-field">
-    <span class="fable-creator-label">${f.label}${req}</span>
-    ${control}
-  </label>`;
+// --- freshStashed: the initial wizard state (mirrors the pre-refactor fn).
+function freshStashed() {
+  return {
+    fields: {
+      gender: normalizeGender(localStorage.getItem('wupi.paperdoll.gender') || 'male'),
+      clothing: [],
+    },
+    portraitSrcPath: null,
+    portraitCroppedBytes: null,
+    portraitCroppedExt: null,
+    portraitPreviewSrc: null,
+  };
 }
 
-function readFields(root) {
-  const f = {};
-  root.querySelectorAll('[data-field]').forEach((el) => { f[el.dataset.field] = el.value; });
-  return f;
+// --- Seed the wizard from a loaded SavedPlayer (the EDIT path).
+function seedFromPlayer(stashed, sp) {
+  const f = stashed.fields;
+  f.name = sp.name || '';
+  f.gender = normalizeGender(sp.gender || f.gender);
+  f.race = sp.race || '';
+  f.age = sp.age || '';
+  f.height = sp.height || '';
+  f.weight = sp.weight || '';
+  f.hair_color = sp.hair_color || '';
+  f.hair_length = sp.hair_length || '';
+  f.hair_style = sp.hair_style || '';
+  f.body_type = sp.body_type || '';
+  f.skin_complexion = sp.skin_complexion || '';
+  f.eye_color = sp.eye_color || '';
+  f.breast_size = sp.breast_size || '';
+  f.breast_size_enabled = sp.breast_size != null;
+  f.ears = sp.ears || '';
+  f.ears_enabled = sp.ears != null;
+  f.tail = sp.tail || '';
+  f.tail_enabled = sp.tail != null;
+  f.clothing = Array.isArray(sp.clothing) ? sp.clothing.slice() : [];
+  if (sp.portrait) {
+    stashed.portraitPreviewSrc = convertFileSrc(sp.portrait);
+  }
 }
 
-function opt(v) { const s = (v || '').trim(); return s ? s : null; }
-function slugify(name) {
-  const s = (name || '').trim().toLowerCase()
-    .replace(/[^a-z0-9_-]+/g, '-').replace(/^-+|-+$/g, '');
-  return s || 'player';
+// --- The bespoke player review. Predates the generic review + has the
+// clothing-as-its-own-entity layout (the 2026-08-05 overhaul Chloe signed
+// off on). Kept verbatim so the player review's exact look is unchanged.
+function renderReview(stashed) {
+  const f = stashed.fields;
+  const identityRows = [
+    ['Name', f.name],
+    ['Gender', f.gender],
+    ['Race', f.race],
+    ['Age', f.age],
+    ['Height', f.height],
+    ['Weight', f.weight],
+  ].filter(([, v]) => (v || '').toString().trim());
+  const appearanceRows = [
+    ['Hair Color', f.hair_color],
+    ['Hair Length', f.hair_length],
+    ['Hair Style', f.hair_style],
+    ['Body', f.body_type],
+    ['Skin', f.skin_complexion],
+    ['Eyes', f.eye_color],
+  ].filter(([, v]) => (v || '').toString().trim());
+  if (f.breast_size_enabled) appearanceRows.push(['Breast', f.breast_size]);
+  if (f.ears_enabled) appearanceRows.push(['Ears', f.ears]);
+  if (f.tail_enabled) appearanceRows.push(['Tail', f.tail]);
+  const clothing = Array.isArray(f.clothing) && f.clothing.length ? f.clothing : null;
+
+  const portraitHTML = stashed.portraitPreviewSrc
+    ? `<img src="${esc(stashed.portraitPreviewSrc)}" alt="" onerror="this.style.display='none'">`
+    : `<span class="fable-player-review-portrait-fallback" aria-hidden="true">${SILHOUETTE_SVG}</span>`;
+
+  const pair = ([k, v]) => `<div><dt>${esc(k)}</dt><dd>${esc(v)}</dd></div>`;
+  const identityHTML = identityRows.length
+    ? `<section class="fable-player-review-section"><h3>Identity</h3><dl>${identityRows.map(pair).join('')}</dl></section>`
+    : '';
+  const appearanceHTML = appearanceRows.length
+    ? `<section class="fable-player-review-section"><h3>Appearance</h3><dl>${appearanceRows.map(pair).join('')}</dl></section>`
+    : '';
+  const clothingHTML = `<section class="fable-player-review-section fable-player-review-clothing">
+    <h3>Clothing</h3>
+    <div class="fable-player-review-chips">${clothing ? clothing.map((c) => `<span class="fable-wizard-chip">${esc(c)}</span>`).join('') : '<span class="fable-player-review-chips-empty">No garments</span>'}</div>
+  </section>`;
+
+  return `<div class="fable-player-review-card">
+    <div class="fable-player-review-top">
+      <div class="fable-player-review-portrait">${portraitHTML}</div>
+      <div class="fable-player-review-body">
+        ${identityHTML}${appearanceHTML}
+      </div>
+    </div>
+    ${clothingHTML}
+  </div>
+  <div class="fable-player-review-create-wrap">
+    <button type="button" class="fable-player-review-create" data-review-create>CREATE</button>
+    <button type="button" class="fable-player-review-back" data-review-back aria-label="Back">${ARROW_SVG_LEFT}</button>
+  </div>`;
+}
+
+function buildPlayerReview() {
+  return {
+    title: 'Review',
+    render: renderReview,
+    wire(stage, root, onCreateFn, back) {
+      const createBtn = stage.querySelector('[data-review-create]');
+      const reviewBack = stage.querySelector('[data-review-back]');
+      if (createBtn) {
+        createBtn.addEventListener('click', () => {
+          if (createBtn.disabled) return;
+          onCreateFn(root);
+        });
+      }
+      if (reviewBack) reviewBack.addEventListener('click', back);
+    },
+  };
+}
+
+// --- Serialize stashed → SavedPlayer JSON (mirrors the pre-refactor fn).
+function buildPlayer(stashed) {
+  const f = stashed.fields;
+  const opt = (v) => { const s = (v || '').trim(); return s ? s : null; };
+  const conditional = (field) => {
+    if (f[`${field}_enabled`] !== true) return null;
+    return opt(f[field]);
+  };
+  const clothing = Array.isArray(f.clothing) && f.clothing.length
+    ? f.clothing.map((c) => String(c).trim()).filter(Boolean)
+    : null;
+  return {
+    id: slugify(f.name || ''),
+    name: (f.name || '').trim(),
+    gender: normalizeGender(f.gender),
+    race: opt(f.race),
+    age: opt(f.age),
+    height: opt(f.height),
+    weight: opt(f.weight),
+    hair_color: opt(f.hair_color),
+    hair_length: opt(f.hair_length),
+    hair_style: opt(f.hair_style),
+    body_type: opt(f.body_type),
+    skin_complexion: opt(f.skin_complexion),
+    eye_color: opt(f.eye_color),
+    breast_size: conditional('breast_size'),
+    ears: conditional('ears'),
+    tail: conditional('tail'),
+    clothing,
+    portrait: null,
+    created_at_ms: 0,
+  };
+}
+
+// --- onCreated: the SavedPlayer write path (keeps the pre-refactor flow).
+async function onCreated(root, stashed) {
+  const player = buildPlayer(stashed);
+  const handlers = root._handlers || {};
+  try {
+    const meta = await invoke('fable_player_write', { id: player.id, player });
+    if (stashed.portraitCroppedBytes && stashed.portraitCroppedExt) {
+      try {
+        await invoke('fable_player_portrait_upload_bytes', {
+          id: meta.id,
+          bytesB64: bytesToBase64(stashed.portraitCroppedBytes),
+        });
+      } catch (err) {
+        if (root._toast) root._toast(`Player saved, but portrait upload failed: ${err}`);
+      }
+    } else if (stashed.portraitSrcPath) {
+      try {
+        await invoke('fable_player_portrait_upload', { id: meta.id, srcPath: stashed.portraitSrcPath });
+      } catch (err) {
+        if (root._toast) root._toast(`Player saved, but portrait upload failed: ${err}`);
+      }
+    }
+    if (handlers.onSave) handlers.onSave(meta.id);
+  } catch (err) {
+    throw err; // runCreate surfaces the toast
+  }
 }
 
 export function buildPlayerCreator() {
-  const root = document.createElement('section');
-  root.className = 'fable-screen fable-player-creator-screen';
-  root.dataset.fableScreen = 'player-creator';
-  root.hidden = true;
-  root.innerHTML = `
-    <div class="fable-void-glow" aria-hidden="true"></div>
-    <div class="fable-ember-host" aria-hidden="true"></div>
-    <div class="fable-player-creator-body">
-      <div class="fable-portrait-slot" data-portrait-slot>
-        <span class="fable-portrait-slot__placeholder" aria-hidden="true"></span>
-        <span class="fable-portrait-slot__hint">Portrait</span>
-      </div>
-      <div class="fable-creator-form" data-form>
-        ${FIELDS.map(fieldMarkup).join('')}
-      </div>
-      <div class="fable-player-status" data-status></div>
-    </div>
-    <button class="fable-creator-save" type="button" data-act="save" disabled>Save Player</button>
-    <div class="fable-creator-toast" data-player-toast hidden></div>
-  `;
-
-  const saveBtn = root.querySelector('[data-act="save"]');
-  const statusEl = root.querySelector('[data-status]');
-  const portraitSlot = root.querySelector('[data-portrait-slot]');
-  let currentPortraitPath = null;
-
-  // Re-validate on every input.
-  root.querySelectorAll('[data-field]').forEach((el) => {
-    el.addEventListener('input', () => revalidate());
+  const root = buildWizard({
+    screenId: 'player-creator',
+    screenClass: 'fable-player-creator-screen',
+    slides: buildSlides(),
+    freshStashed,
+    seedFrom: seedFromPlayer,
+    review: buildPlayerReview(),
+    onCreated,
+    ctx: buildCtx(),
   });
-
-  function revalidate() {
-    const fields = readFields(root);
-    const err = validatePlayer(fields);
-    if (err) {
-      saveBtn.disabled = true;
-      statusEl.textContent = err;
-      statusEl.classList.remove('is-valid');
-    } else {
-      saveBtn.disabled = false;
-      statusEl.textContent = 'Ready to save.';
-      statusEl.classList.add('is-valid');
-    }
-  }
-  root._revalidate = revalidate;
-
-  // Portrait upload flow.
-  portraitSlot.addEventListener('click', async () => {
-    try {
-      const picked = await openDialog({
-        multiple: false,
-        filters: [{ name: 'Images', extensions: ['png', 'jpg', 'jpeg'] }],
-      });
-      if (!picked) return;
-      const srcPath = typeof picked === 'string' ? picked : (picked.path || picked);
-      if (!srcPath) return;
-      const fields = readFields(root);
-      if (!(fields.name || '').trim()) {
-        playerToast(root, 'Enter a name before uploading a portrait.');
-        return;
-      }
-      playerToast(root, 'Uploading portrait…');
-      const id = slugify(fields.name);
-      const err = validatePlayer(fields);
-      if (err) { playerToast(root, err); return; }
-      await invoke('fable_player_write', { id, player: buildPlayer(id, fields, currentPortraitPath) });
-      const absPath = await invoke('fable_player_portrait_upload', { id, srcPath });
-      currentPortraitPath = absPath;
-      portraitSlot.innerHTML = `<img src="${convertFileSrc(absPath)}" alt="Portrait"><span class="fable-portrait-slot__hint">Change</span>`;
-      playerToast(root, 'Portrait set.');
-    } catch (err) {
-      playerToast(root, String(err));
-    }
-  });
-  root._getCurrentPortrait = () => currentPortraitPath;
-
-  function buildPlayer(id, fields, portraitPath) {
-    return {
-      id,
-      name: (fields.name || '').trim(),
-      description: opt(fields.description),
-      appearance: opt(fields.appearance),
-      personality: opt(fields.personality),
-      accessories: opt(fields.accessories),
-      portrait: portraitPath ? 'portrait' : null,
-      created_at_ms: 0,
-    };
-  }
-  root._buildPlayer = buildPlayer;
-
-  // Ambient embers.
-  const emberHost = root.querySelector('.fable-ember-host');
-  let embers = null;
-  root._startAmbient = () => { if (!embers) embers = createEmbers(emberHost); };
-  root._stopAmbient = () => { if (embers) { embers.destroy(); embers = null; } };
-
+  root._runCreate = () => runCreate(root);
   return root;
 }
 
-export function renderPlayerCreator(root, handlers) {
-  // Reset all fields.
-  root.querySelectorAll('[data-field]').forEach((el) => { el.value = ''; });
-  const saveBtn = root.querySelector('[data-act="save"]');
-  const statusEl = root.querySelector('[data-status]');
-  const portraitSlot = root.querySelector('[data-portrait-slot]');
-  if (saveBtn) { saveBtn.disabled = true; }
-  if (statusEl) { statusEl.textContent = ''; statusEl.classList.remove('is-valid'); }
-  if (portraitSlot) {
-    portraitSlot.innerHTML = `<span class="fable-portrait-slot__placeholder" aria-hidden="true"></span><span class="fable-portrait-slot__hint">Portrait</span>`;
-  }
-  // Re-wire Save (clone-detach to avoid stacking).
-  const oldSave = root.querySelector('[data-act="save"]');
-  if (oldSave) {
-    const newSave = oldSave.cloneNode(true);
-    oldSave.replaceWith(newSave);
-    newSave.addEventListener('click', () => onSave(root, handlers));
-  }
+export function renderPlayerCreator(root, handlers = {}) {
+  renderWizard(root, handlers);
 }
 
-async function onSave(root, handlers) {
-  const fields = readFields(root);
-  const id = slugify(fields.name);
-  const player = root._buildPlayer(id, fields, root._getCurrentPortrait());
-  const saveBtn = root.querySelector('[data-act="save"]');
-  if (saveBtn) { saveBtn.disabled = true; saveBtn.textContent = 'Saving…'; }
-  try {
-    await invoke('fable_player_write', { id, player });
-    if (handlers.onSave) handlers.onSave(id);
-  } catch (err) {
-    playerToast(root, String(err));
-  } finally {
-    if (saveBtn) { saveBtn.disabled = false; saveBtn.textContent = 'Save Player'; }
+// Apply a parsed ST import to the player wizard (the player schema maps only
+// name → Name; the rest of a ST character is ignored — players are pure
+// identity, not prose). Called by the slide-1 import button.
+export async function importIntoPlayerCreator(root) {
+  const result = await openImportDialog(root, SCHEMA_KEY);
+  if (!result) return;
+  const stashed = root._stashed;
+  Object.assign(stashed.fields, result.fields);
+  if (result.portraitBytes && result.portraitExt) {
+    stashed.portraitCroppedBytes = result.portraitBytes;
+    stashed.portraitCroppedExt = result.portraitExt;
+    stashed.portraitPreviewSrc = result.portraitDataUrl;
   }
+  if (root._paint) root._paint();
 }

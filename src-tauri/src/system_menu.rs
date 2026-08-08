@@ -119,6 +119,16 @@ pub fn power_shutdown<R: Runtime>(app: &AppHandle<R>) {
 ///
 /// `current_exe()` is the canonical way to re-launch; detached spawn so the
 /// new process survives this one's exit.
+///
+/// SINGLE-INSTANCE OPT-OUT: the spawn sets `WUPI_RESTART_SPAWN=1` on the
+/// child so the new instance skips the single-instance lock acquisition
+/// (see the gate in lib.rs run()). Without this, the child would detect
+/// the still-alive parent (we spawn BEFORE power_shutdown exits us), signal
+/// it via power_wake, and exit itself — leaving nothing running after the
+/// parent shuts down. The parent is gone within milliseconds of the spawn,
+/// so the child boots cleanly and itself acquires the mutex for any
+/// subsequent double-launch. `app.restart()` (the updater's path) is
+/// Tauri-core and handles this internally — no opt-out needed there.
 pub fn power_restart<R: Runtime>(app: &AppHandle<R>) {
     let exe = match std::env::current_exe() {
         Ok(p) => p,
@@ -127,7 +137,10 @@ pub fn power_restart<R: Runtime>(app: &AppHandle<R>) {
             return;
         }
     };
-    match std::process::Command::new(&exe).spawn() {
+    match std::process::Command::new(&exe)
+        .env(RESTART_SPAWN_SENTINEL, "1")
+        .spawn()
+    {
         Ok(_) => tracing::info!("restart: spawned new instance, shutting down"),
         Err(e) => {
             tracing::error!(error = %e, exe = %exe.display(), "restart: spawn failed");
@@ -138,6 +151,13 @@ pub fn power_restart<R: Runtime>(app: &AppHandle<R>) {
     }
     power_shutdown(app);
 }
+
+/// The env-var sentinel `power_restart` sets on its spawned child so the new
+/// instance opts out of the single-instance lock (the parent is still alive
+/// during the spawn). Read by the gate in `lib.rs run()`. Kept `pub` so the
+/// lib.rs gate references the SAME string (no drift between the writer +
+/// the reader).
+pub const RESTART_SPAWN_SENTINEL: &str = "WUPI_RESTART_SPAWN";
 
 /// Sleep: hide the main window to the tray and pause the canvas. Engines
 /// stay warm. The window leaves the taskbar entirely (hidden, not minimized).

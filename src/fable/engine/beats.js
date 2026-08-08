@@ -307,7 +307,10 @@ function renderStreamingBody(beat) {
 // Finalize: drop the .streaming class + render the final text cleanly (no
 // .echo-word spans — the finished beat is plain prose with dialogue coloring).
 // Cancels any pending rAF so a late frame can't overwrite the finalized HTML.
-export function finalizeBeat(beat, finalText) {
+// `reasoning` (unused post-2026-08-07 override): the player-facing reasoning UI
+// was removed; the API narrator never emits a thought channel anyway.
+export function finalizeBeat(beat, finalText, reasoning) {
+  void reasoning;
   if (!beat) return;
   if (beat._rafPending) {
     beat._rafPending = false;
@@ -417,8 +420,8 @@ export function clearFeed() {
 // (the Rust FableLoadMessage gains it alongside this UI; until then it's
 // absent → the header just omits the time line). Assistant messages are
 // finalized narrator beats (no streaming caret, no chunk-by-chunk); the
-// bracket-parser / atmosphere scan do NOT re-fire on a rebuild (those only
-// fire during live streaming).
+// bracket-parser does NOT re-fire on a rebuild (it only fires during live
+// streaming).
 // =============================================================
 export function rebuildFromMessages(messages) {
   if (!feed) return;
