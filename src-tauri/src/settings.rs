@@ -20,6 +20,30 @@
 //! AGENTS.md §1C + §10 point here as the authoritative location.
 
 // ---------------------------------------------------------------------------
+// Thinking (the Gemma4 <|think|> control token)
+// ---------------------------------------------------------------------------
+
+/// Whether the LOCAL 12B emits its Gemma4 thought channel (`<|think|>`) on
+/// every local pass (Wupi chat, the Fable tracker, + the schema passes).
+///
+/// `false` (default, 2026-08-09): `<|think|>` is NOT injected. The thought
+/// channel was a precautionary coherence measure, but live measurement on the
+/// Gemma 4 12B showed it either (a) roughly 5×'d per-turn wall-clock (the model
+/// reasons before every reply) or, worse, (b) could wedge into a thought
+/// channel that never closed → generation ran to `max_tokens` → a 4-minute+
+/// apparent hang with zero streamed events. Gemma 12B tracked brackets + schema
+/// state cleanly WITHOUT thinking in prior sessions, so the cost/benefit was
+/// upside-down. Flipping this to `false` keeps all the thought-handling
+/// machinery (ThoughtGate, the StreamFilter `<|think|>` strip, the
+/// `extract_reasoning_channel` capture) intact but DORMANT — they're no-ops
+/// when the model emits no thought channel. Re-enable by setting `true`.
+///
+/// Gating the 4 injection sites (chat_format system turn, build_narrator_prompt
+/// tracker, fable_command translation + seed prompts) here means flipping one
+/// constant re-enables thinking everywhere consistently.
+pub const THINKING_ENABLED: bool = false;
+
+// ---------------------------------------------------------------------------
 // API failure handling
 // ---------------------------------------------------------------------------
 
@@ -48,9 +72,18 @@ pub const CTX_LOCAL_SOLO: u32 = 4096;
 /// carries narration. 2048 fits the short, mechanical agent turns.
 pub const CTX_LOCAL_WITH_API: u32 = 2048;
 
-/// Fable engine context. LOCKED — do not change without sign-off. Held at 4096
-/// since the 2026-07-29 prompt-distillation scrub (see fable_engine.rs header).
-pub const CTX_FABLE: u32 = 4096;
+/// Fable engine context (the tracker pass). **2026-08-08 override: 3072.** The
+/// local 12B's Fable role is TRACKING ONLY (bracket commands + schema state) —
+/// the API narrates. The tracker window is 2 messages (1 turn) — it
+/// relies on the schema delta + Rust state, not re-read history.
+/// 3072 fits the AGENT section (~386 tok) + bracket protocol (~477 tok) +
+/// world_state + the 1-turn window + the 256-token tracker generation
+/// reserve (TRACKER_MAX_TOKENS; raised 150→256 post-T52; the sniper is the
+/// primary stop). The prior
+/// 4096 was sized for the deleted local-narrator path; 2048 was too tight
+/// (the fixed overhead alone is ~860 tok, nearly half the budget before any
+/// card/world_state enters).
+pub const CTX_FABLE: u32 = 3072;
 
 /// Schema-delta engine context. The micro-delta pass only needs system
 /// instruction + current schema JSON + one exchange (see schema_engine.rs).
@@ -77,6 +110,33 @@ pub const WINDOW_LOCAL_FABLE: usize = 8;
 
 /// API-connected Fable visible window (8 turns).
 pub const WINDOW_API_FABLE: usize = 16;
+
+/// The Fable TRACKER window (2026-08-10). The tracker scans ONE turn: the
+/// player's just-typed action + the immediately preceding narrator response
+/// (2 messages = 1 turn). Its job per the AGENT directive is "read what
+/// happened THIS turn" — singular — and emit a state delta. It does NOT re-
+/// read narrative history; the schema delta + Rust state are the authority,
+/// and the API narrator (16 messages) carries full history. The prior value
+/// of 4 (2 full turns of prose) was the bulk of the prompt bloat: 4 messages
+/// at ~400 tokens each = ~1600 tokens just for the window, pushing the prompt
+/// past the truncation guard and chopping the bracket protocol. With 1 turn
+/// the prompt stays lean (~1200-1500 tokens), well under the 2922 budget, and
+/// the bracket protocol survives intact.
+pub const WINDOW_TRACKER: usize = 2;
+
+/// Char cap on each ASSISTANT message fed into the tracker window (2026-08-10,
+/// T52 overflow fix). The tracker sees the last 1 turn (the player's action +
+/// the preceding narrator beat). The narrator beat can run 1500-4700 chars
+/// (~400-1200 tokens) — feeding it raw pushed the tracker prompt to 3331 tokens
+/// (over the 2922 budget) 7 times in T52, front-truncating the bracket protocol
+/// on the worst turns. The tracker doesn't need the full prose — it needs the
+/// gist (what happened) to decide whether brackets fire. Capping at 600 chars
+/// (~150 tokens) per assistant message mathematically bounds the window to
+/// ~300 tokens, keeping the total prompt under 2922 even with a maxed-out
+/// world_state block. User messages are NOT capped (they're the player's action
+/// — typically short, and truncating them would lose the trigger the tracker
+/// keys off). The narrator window is unaffected (it has the 16k API budget).
+pub const TRACKER_ASSISTANT_CHAR_CAP: usize = 600;
 
 /// Cache-coherent fallback window. When an API call fails and the turn falls
 /// back to local, the message window re-assembles at 6 — sized to stay inside

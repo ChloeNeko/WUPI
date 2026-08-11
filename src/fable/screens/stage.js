@@ -5,7 +5,7 @@
 // panel overlay + toast. Wires engine/* modules together.
 //
 // This module is the COMPOSITION ROOT for an active game session:
-//   - beats.js        → dialogue feed
+//   - beats.js        → the card-style dialogue feed
 //   - narrator.js     → fable_send streaming
 //   - wupi-drawer.js  → chat_send (game master) + panel summoning
 //   - fx/effects.js   → FX rendering (hooked by narrator)
@@ -31,11 +31,25 @@
 
 import * as beats from '../engine/beats.js';
 import * as narrator from '../engine/narrator.js';
+import { swipeNextAction } from '../engine/drawer-logic.js';
 import * as wupiDrawer from '../engine/wupi-drawer.js';
 import * as leftDrawer from '../engine/left-drawer.js';
+// VN INTERACTIONS (2026-08-11): the behavior layer over the .fable-mes feed
+// — hysteresis history mask, portrait corner snaps, flank dblclick portrait-
+// hide, dblclick-to-edit. Decoupled from narrator.js (knows the DOM, not the
+// IPC) — it calls back into stage.js's onEditBeat hook, which mirrors the
+// routing the ✎ control-button handler below uses. Returns { teardown };
+// stage.js stores the handle + tears it down in teardownStage so the reused
+// stage DOM doesn't accumulate listeners/observer across entries.
+import * as vn from '../engine/vn-interactions.js';
+// isActionPopupOpen feeds the left drawer's mouseleave guard: the action popup
+// is appended to document.body, so reaching for CONSUME/EQUIP/etc. would
+// otherwise fire the drawer's mouseleave + yank it in mid-click. See
+// left-drawer.js setActionPopupProbe.
+import { isActionPopupOpen } from '../engine/inventory-panel.js';
 import { buildTabRail, renderActive, resetTabRail } from '../engine/tab-rail.js';
 import { buildRawEditor, onEsc as rawEditorEsc, resetRawEditor, isOpen as rawEditorOpen } from '../engine/raw-editor.js';
-import { invoke } from '@tauri-apps/api/core';
+import { invoke, convertFileSrc } from '@tauri-apps/api/core';
 // playFX + clearFX were the weather-render hooks pre-stripping; weather is
 // gone now (file header), so only initFX + clearAllFX remain used. The two
 // named exports stay imported here so re-adding weather later is a one-line
@@ -45,8 +59,31 @@ import { initFX, playFX, clearFX, clearAllFX } from '../fx/effects.js';
 // (they're reserved for the weather re-add). No-op at runtime.
 void playFX; void clearFX;
 import { saveNow } from '../engine/saves-io.js';
+// Background Library (2026-08-11): the 4th WUPI-drawer foot button. Owns the
+// gallery modal + the dormant .fable-stage-bg paint layer. Global to Fable
+// (one marker file, not per-card). Self-contained: builds + caches its own
+// overlay appended to the stage (mirrors the save-overlay pattern).
+import * as backgrounds from '../engine/backgrounds.js';
 import { initPanelManager, summon as summonPanel, dismissPanel, isActive as panelActive } from '../panels/manager.js';
 import { setMapTheme } from '../panels/map.js';
+// DEV PREVIEW placeholders (?dev=preview): static bundled portraits so the
+// VN layout renders with real images without a backend session. Vite hashes
+// these into dist/assets/ like every other static image in the project.
+// (Dev-only sample art: mage.jpg for the narrator, player.jpg for the user.
+// Production uses portraits resolved via fable_active_card_get / the saved
+// player — these imports only flow into the DEV_PREVIEW branch below.)
+import PLACEHOLDER_AI_PORTRAIT from '../assets/mage.jpg';
+import PLACEHOLDER_PLAYER_PORTRAIT from '../assets/player.jpg';
+
+// DEV PREVIEW flag: pure-frontend layout preview (no backend). Same query/hash
+// parsing as script.js's DEV_PREVIEW_SHORTCUT. False in production.
+const DEV_PREVIEW = (() => {
+  try {
+    if (new URLSearchParams(window.location.search).get('dev') === 'preview') return true;
+    const h = window.location.hash.replace(/^#/, '');
+    return new URLSearchParams(h).get('dev') === 'preview';
+  } catch (_) { return false; }
+})();
 
 function esc(s) {
   return String(s || '')
@@ -69,6 +106,12 @@ let pendingTurnText = '';
 let cardContext = null;  // { card, saveId } for the active session
 let activeCardName = '';  // display name of the seated card (the typing indicator)
 let activePlayerName = '';  // protagonist name (card.player_name) → user-beat headers
+// Portrait identity for the VN chat (Phase 2 portrait bridge). Resolved in
+// refreshActiveCardName from fable_active_card_get's extended return shape.
+// Each is already a convertFileSrc-ready asset:// URL (or '' when absent).
+let activeCardPortrait = '';  // the card/narrator portrait (NPC fallback too)
+let activePlayerPortrait = '';  // the active saved player's portrait
+let npcNameMap = new Map();  // npc_id → display name (from the card's <cast>)
 let cornerTrigger = null;   // the right-edge hover zone (Wupi drawer)
 let cornerDwellTimer = null; // 300ms arm-before-open timer (right edge)
 let leftCornerTrigger = null;   // the left-edge hover zone (Card / Tracker drawer)
@@ -84,6 +127,13 @@ const CORNER_DWELL_MS = 300;
 // them in teardownStage so the next wireStage binds exactly once. Each
 // entry is [element, type, handler, useCapture?].
 let stageListeners = [];
+// VN-interactions handle ({ teardown } from vn.init). Stored here so
+// teardownStage can release it; null when no live session. The vn module
+// owns its own listeners + MutationObserver internally (NOT routed through
+// stageListeners, because the observer + the feed-scoped click/dblclick are
+// module-internal details stage.js shouldn't enumerate) — its teardown() is
+// the single release point.
+let vnApi = null;
 
 export function buildStage() {
   const root = document.createElement('section');
@@ -93,13 +143,12 @@ export function buildStage() {
   root.innerHTML = `
     <div class="fable-stage-bg"></div>
     <div class="fable-fx-layer" data-fx></div>
-    <div class="fable-dialogue-feed" data-feed></div>
-    <!-- Typing indicator: "(name) is currently typing.." pinned just above the
-         input row while a narrator/character beat streams. Toggled via the
-         .is-visible class from onTurnStart/onTurnEnd hooks. -->
-    <div class="fable-typing-indicator" data-typing-indicator aria-hidden="true">
-      <span class="fable-typing-indicator__text" data-typing-text></span>
-    </div>
+    <!-- The card-style dialogue feed. Each narrator/user turn renders as a
+         rounded glass card with a flush-left 2:3 portrait (dissolved inner
+         edge) + a name header + the prose body. engine/beats.js owns the
+         DOM; this is its mount point. Sits above the bg/FX, below the input
+         row + drawers. -->
+    <div class="fable-feed" data-feed></div>
     <form class="fable-input-row" data-input-form>
       <!-- The input is a single centered, max-width text box. The send button
            is GONE (2026-07-27): generation is fired by pressing Enter on a
@@ -153,8 +202,8 @@ export function buildStage() {
       <!-- The tracked-stat tab rail (Player / Sim Card / Codex / World / NPC).
            Built by engine/tab-rail.js + injected here in buildStage. Sits
            between the brand + the chat messages. A toggled tab drops down its
-           prose panel; the dropdown persists across drawer close/reopen (the
-           hover-reopen-keeps-active mechanic). -->
+           read-only prose panel; the dropdown collapses on drawer close +
+           re-renders on reopen (the hover-reopen-keeps-active mechanic). -->
       <div class="fable-tab-rail-mount" data-tab-rail-mount></div>
       <div class="fable-wupi-messages" data-wupi-messages></div>
       <form class="fable-wupi-input-row" data-wupi-form>
@@ -169,6 +218,14 @@ export function buildStage() {
            title via the onExit hook. aria-label + title preserved for a11y. -->
       <footer class="fable-wupi-footer" data-wupi-footer>
         <div class="fable-wupi-foot-actions">
+          <!-- Background Library (2026-08-11): the 4th foot tool, FIRST child
+               so it lands far-left (the flex row is DOM-ordered LTR, centered).
+               Opens the gallery modal over the stage. Visible in ALL modes
+               (including Quick Play — backgrounds are global, unlike
+               Save/Load which Quick Play hides). -->
+          <button class="fable-foot-icon" data-foot-bg aria-label="Background" title="Background">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="5" width="18" height="14" rx="2" fill="none" stroke="currentColor" stroke-width="1.6"/><circle cx="8.5" cy="10" r="1.6" fill="currentColor"/><path d="M3 16l4.5-4 3.5 3 4-5 6 6" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round" stroke-linecap="round"/></svg>
+          </button>
           <button class="fable-foot-icon" data-foot-save aria-label="Save" title="Save">
             <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 3h11l3 3v15a0 0 0 0 1 0 0H5a0 0 0 0 1 0 0V3z" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/><rect x="8" y="3" width="7" height="5" rx="0.8" fill="none" stroke="currentColor" stroke-width="1.6"/><rect x="8" y="12" width="8" height="6" rx="0.6" fill="none" stroke="currentColor" stroke-width="1.4"/></svg>
           </button>
@@ -230,7 +287,6 @@ export async function wireStage(root, hooks) {
   stageRoot = root;
   cardContext = hooks.cardContext || null;
 
-  const feed = root.querySelector('[data-feed]');
   const fxLayer = root.querySelector('[data-fx]');
 
   // Background stripped (file header). The bg layer (.fable-stage-bg) is
@@ -239,26 +295,47 @@ export async function wireStage(root, hooks) {
   // without a card tone.
   setMapTheme('fantasy');
 
-  // Engine init (composition root).
-  beats.initBeats(feed);
+  // Engine init (composition root). beats owns the [data-feed] dialogue
+  // surface; hand it the element so its builders can append cards.
+  beats.initBeats(root.querySelector('[data-feed]'));
+  // VN INTERACTIONS: attach the behavior layer (history mask, snaps, flank
+  // dblclick, dblclick-to-edit) to the same feed + stage. Initialized AFTER
+  // beats.initBeats so the feedEl ref is live + any seed beats (opening scene
+  // / loaded history) are present for the first refreshHistory pass. The
+  // onEditBeat hook mirrors the ✎ control-button routing at the feed click
+  // handler below (user beat → editMessage, assistant → rewind-and-edit) so
+  // dblclick-on-prose opens the SAME editor the ✎ button does.
+  vnApi = vn.init({
+    stageRoot: root,
+    feedEl: root.querySelector('[data-feed]'),
+    onEditBeat: (beat) => {
+      if (narrator.isGenerating()) return;
+      const index = Number.parseInt(beat.dataset.index || '-1', 10);
+      const isUser = beat.dataset.role === 'user';
+      beats.enterEditMode(beat, {
+        onSave: (text) => {
+          // Player → rewind + branch + regen ("I changed what I did"); AI
+          // beat → in-place prose tweak (no inference). Inverted from the
+          // prior wiring (which called rewind_and_edit_user on assistant
+          // beats — that errors: the command requires a user target).
+          if (isUser) narrator.rewindAndEditUser(index, text);
+          else narrator.editMessage(index, text);
+        },
+      });
+    },
+  });
   initFX(fxLayer, root, { onTransient: () => {} });
-  // The typing indicator + the message-header identity: fetch the active
-  // card's name + player_name ONCE (best-effort) so the narrator/beats
-  // builders can stamp the headers. Awaited so the names are in hand before
-  // initNarrator forwards them (a fetch failure falls back to generic labels).
+  // The message-header identity: fetch the active card's name + player_name
+  // ONCE (best-effort) so the narrator builders can stamp the headers.
+  // Awaited so the names are in hand before initNarrator forwards them (a
+  // fetch failure falls back to generic labels).
   await refreshActiveCardName(root);
   narrator.initNarrator({
     onTurnStart: () => {
       setGenerating(true);
-      showTypingIndicator(root);
     },
     onTurnEnd: () => {
       setGenerating(false);
-      hideTypingIndicator(root);
-      // A narrator turn just finalized → a new assistant beat is now the
-      // last in the feed. Re-stamp controls so the swipe/regenerate affordance
-      // moves onto it (and the prior last assistant beat loses its bar).
-      refreshControls();
       // §11.30 Left-Drawer HUD: a turn may have mutated player body (Combat
       // Referee), entities (item-grant brackets), clock/weather (TIME/
       // WEATHER commands). Refresh the paperdoll + ambient + inventory so
@@ -266,9 +343,21 @@ export async function wireStage(root, hooks) {
       // UI re-enable above must not block on IPC latency).
       leftDrawer.refreshAll();
     },
-    npcPretty: hooks.npcPretty || null,
+    npcPretty: hooks.npcPretty || ((id) => npcNameMap.get(id) || null),
     cardName: activeCardName,
     playerName: activePlayerName,
+    // Phase 2 portrait bridge: pass the resolved asset:// URLs + the npc name
+    // map into the narrator, which forwards them to beats.setIdentity for the
+    // VN renderer. npcPortraits is deferred (empty) — NPCs fall back to the
+    // card portrait until per-NPC portrait storage exists.
+    cardPortrait: activeCardPortrait,
+    playerPortrait: activePlayerPortrait,
+    npcNames: npcNameMap,
+    // Chat-side schema patch hook (2026-08-11): when the operator asks WUPI
+    // via chat to fable_schema_patch the active session, the backend emits
+    // `fable-session-changed` kind=schema; narrator forwards the merged_keys
+    // here. Same refresh as onTurnEnd — the paperdoll/inventory may have moved.
+    onSchemaPatch: (_mergedKeys) => { leftDrawer.refreshAll(); },
     // Schema-ring-buffer handoff: when a mutation command (reroll / rewind)
     // returns `schema_pop_count`, invoke `fable_rollback` that many times to
     // restore the matching world-state snapshots. `fable_rollback` is the
@@ -360,92 +449,85 @@ export async function wireStage(root, hooks) {
   on(input, 'input', () => autoGrow(input));
   setGenerating(false);
 
-  // Delegated click handler for the per-beat UX controls (edit / reroll).
-  // Delegation (one listener on the feed container) beats per-beat binding
-  // because `beats.rebuildFromMessages` wipes + recreates the whole feed on
-  // every mutation — per-beat listeners would need re-binding each time.
-  // The handler reads `data-action` off the clicked button (set in
-  // `beats.renderControls`) and the `data-index` off the enclosing beat.
-  //
-  // Edit has two flows:
-  //   - edit on the LAST beat (regardless of role) → `rewindAndEditUser`
-  //     if it's a user beat (branch the timeline + regen) OR `editMessage`
-  //     if it's the last assistant beat (in-place typo fix, no regen). The
-  //     distinction: editing a user message changes what the AI replies TO,
-  //     so we must regenerate; editing an assistant message is cosmetic.
-  //   - edit on a NON-last user beat → `rewindAndEditUser` (this is the
-  //     "edit 3 turns ago" case the spec describes — branch the timeline).
-  // Reroll is only ever on the last assistant beat (refreshControls pins
-  // it there) → `rerollLastTurn`.
-  // Shared edit entry-point used by BOTH the legacy pencil (removed) and the
-  // new double-click-to-edit (2026-07-29). Routes by role: user beats branch
-  // the timeline (rewind + regen); assistant beats get an in-place typo fix.
-  function beginEdit(beat) {
-    const role = beat.dataset.role;
-    const idx = Number.parseInt(beat.dataset.index || '', 10);
-    if (!Number.isInteger(idx)) return;
-    beats.enterEditMode(beat, {
-      onSave: (newText) => {
-        if (!newText) return;
-        if (role === 'user') {
-          // Editing a user message always branches the timeline (the AI
-          // would reply differently to the new text) → rewind + regen.
-          narrator.rewindAndEditUser(idx, newText);
-        } else {
-          // Assistant message edit → in-place typo fix, no regen.
-          narrator.editMessage(idx, newText);
-        }
-      },
-      onCancel: () => { /* no-op — editor already torn down */ },
-    });
-  }
-
-  // Delegated click handler for the feed controls (the swipe arrows + the edit
-  // ✎ button in the hover header). The › arrow on the last variant of the last
-  // beat carries `data-action="regenerate"` (a new variant is generated +
-  // appended — unlimited); ‹ / non-last › carry swipe-left/right (navigate
-  // existing variants); `data-action="edit"` enters inline edit mode (same
-  // routing as the dblclick shortcut below). One delegated listener because
-  // `beats.renderControls` rebuilds the actions slot on every mutation.
+  // Per-beat UX controls: a single delegated click handler on the feed
+  // routes the drawer's data-action buttons to the narrator API. The
+  // backend (edit_message / rewind_and_edit_user / reroll_last_turn /
+  // swipe_variant / delete_message) is the source of truth — the DOM is
+  // regenerated from the returned messages[] where applicable. The drawer
+  // (built by beats.renderMessageDrawer) lives in beats.js; this handler
+  // only routes clicks. Regenerate is FOLDED INTO › (there is no separate
+  // ↻ button): › at the last variant of the trailing assistant beat rerolls.
+  // All actions except the two-step delete-confirm arm are blocked while a
+  // turn is in flight (the ›-during-generation interrupt is wired later).
+  // Tracked via on() so teardown removes it.
+  const feed = root.querySelector('[data-feed]');
   on(feed, 'click', (e) => {
     const btn = e.target.closest('[data-action]');
     if (!btn) return;
-    const beat = e.target.closest('.fable-beat');
+    const beat = btn.closest('.fable-mes');
     if (!beat) return;
     const action = btn.dataset.action;
-    const idx = Number.parseInt(beat.dataset.index || '', 10);
-    if (!Number.isInteger(idx)) return;
-    if (narrator.isGenerating()) return;
-    if (action === 'edit') {
-      // Header ✎ button → inline edit (same routing as dblclick).
-      if (beat.classList.contains('streaming') || beat.classList.contains('editing')) return;
-      beginEdit(beat);
-      return;
-    }
-    if (action === 'regenerate') {
-      // › on the last variant → generate a fresh sibling variant (uncapped).
-      narrator.rerollLastTurn();
-      return;
-    }
-    if (action === 'swipe-left' || action === 'swipe-right') {
-      const target = Number.parseInt(btn.dataset.targetVariant || '0', 10);
-      if (Number.isInteger(target)) narrator.swipeVariant(idx, target);
-      return;
-    }
-  });
+    const index = Number.parseInt(beat.dataset.index || '-1', 10);
 
-  // Double-click anywhere on a beat → edit mode (2026-07-29, replaces the
-  // pencil button). Same routing as the old pencil click: user beats branch,
-  // assistant beats get an in-place fix. Ignored while generating so a
-  // mid-stream dblclick can't collide with the active beat.
-  on(feed, 'dblclick', (e) => {
-    const beat = e.target.closest('.fable-beat');
-    if (!beat) return;
-    if (beat.classList.contains('streaming') || beat.classList.contains('editing')) return;
+    // Two-step inline delete confirm: first click arms a 3.5s window + morphs
+    // the button to a check; a second click within it confirms. A timeout
+    // (or any re-render) restores the default delete button. No native dialog.
+    if (action === 'delete') {
+      if (narrator.isGenerating()) return;
+      btn.dataset.action = 'delete-confirm';
+      btn.classList.add('is-confirming');
+      btn.setAttribute('title', 'Click again to confirm delete');
+      btn.innerHTML = '<svg viewBox="0 0 24 24" aria-hidden="true" focusable="false" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>';
+      if (btn._deleteTimer) clearTimeout(btn._deleteTimer);
+      btn._deleteTimer = setTimeout(() => { beats.renderMessageDrawer(beat); }, 3500);
+      return;
+    }
+    if (action === 'delete-confirm') {
+      if (btn._deleteTimer) { clearTimeout(btn._deleteTimer); btn._deleteTimer = null; }
+      if (narrator.isGenerating()) return;
+      narrator.deleteMessage(index);
+      return;
+    }
+
+    // › during an in-flight REROLL: interrupt it + auto-reroll (Stage 3,
+    // 2026-08-11). The drawer only enables › at the trailing assistant beat's
+    // last variant; mid-reroll that's the beat being re-streamed, so re-pressing
+    // › abandons this roll + starts a fresh one (cancel → revert schema to base
+    // → reroll). A normal turn in flight is left alone (its streaming beat has
+    // no drawer; › on an older beat mid-turn would reroll the wrong turn).
+    if (action === 'swipe-next' && narrator.isGenerating()) {
+      if (narrator.isRerolling()) narrator.interruptAndReroll();
+      return;
+    }
+
+    // Everything below is blocked mid-generation.
     if (narrator.isGenerating()) return;
-    const role = beat.dataset.role;
-    if (role !== 'user' && role !== 'assistant') return; // no editing system beats
-    beginEdit(beat);
+
+    if (action === 'swipe-prev') {
+      const active = Number.parseInt(beat.dataset.variantActive || '0', 10);
+      if (active <= 0) return;
+      narrator.swipeVariant(index, active - 1);
+    } else if (action === 'swipe-next') {
+      const count = Number.parseInt(beat.dataset.variantCount || '1', 10);
+      const active = Number.parseInt(beat.dataset.variantActive || '0', 10);
+      const next = swipeNextAction({ count, active });
+      if (next.kind === 'swipe') {
+        narrator.swipeVariant(index, next.variantIdx);
+      } else {
+        // At the last variant → fold into Regenerate. The drawer only enables ›
+        // here on the trailing assistant beat, so this is the reroll trigger.
+        narrator.rerollLastTurn();
+      }
+    } else if (action === 'edit') {
+      // Player message → rewind + branch + regen; AI beat → in-place edit.
+      const isUser = beat.dataset.role === 'user';
+      beats.enterEditMode(beat, {
+        onSave: (text) => {
+          if (isUser) narrator.rewindAndEditUser(index, text);
+          else narrator.editMessage(index, text);
+        },
+      });
+    }
   });
 
   // Wupi trigger: invisible right-edge strip with a 300ms dwell.
@@ -474,7 +556,10 @@ export async function wireStage(root, hooks) {
   // locked), no glyph. The pop-out zone (wider, ~2 inches) is separate;
   // the UI always pops out FIRST, the edge lock only appears at the very
   // edge afterward.
-  const EDGE_HIT_PX = 6;  // how close to the absolute edge counts as "touching"
+  // How close to the absolute edge counts as "touching" the lock bar. Widened
+  // 2026-08-10 (6 → 14) alongside the bar itself (2px → 10px) so the wider bar
+  // is easy to summon + click without pixel-precise aiming. Both edges share it.
+  const EDGE_HIT_PX = 14;
   const wupiEdgeLock = root.querySelector('[data-wupi-edge-lock]');
 
   // Wire the edge-lock visibility probe into the wupi drawer module. Its
@@ -526,6 +611,10 @@ export async function wireStage(root, hooks) {
 
   const leftEdgeLock = root.querySelector('[data-left-edge-lock]');
   leftDrawer.setEdgeLockProbe(() => leftEdgeLock && leftEdgeLock.classList.contains('visible'));
+  // While the inventory action popup is open, the unlocked drawer must NOT
+  // auto-close on mouseleave (the popup lives on document.body, so the mouse
+  // crosses the drawer boundary reaching for it). Mirrors the edge-lock probe.
+  leftDrawer.setActionPopupProbe(() => isActionPopupOpen());
 
   function syncLeftEdgeLockColor() {
     if (leftEdgeLock) leftEdgeLock.classList.toggle('locked', leftDrawer.isLocked());
@@ -618,6 +707,7 @@ export async function wireStage(root, hooks) {
 
   const saveOverlay = root.querySelector('[data-save-overlay]');
   const saveNameInput = root.querySelector('[data-save-name-input]');
+  const footBg = root.querySelector('[data-foot-bg]');
   const footSave = root.querySelector('[data-foot-save]');
   const footLoad = root.querySelector('[data-foot-load]');
   const footHome = root.querySelector('[data-foot-home]');
@@ -682,29 +772,50 @@ export async function wireStage(root, hooks) {
     wupiDrawer.closeDrawer();
     if (onExitHook) onExitHook();
   });
+  // Background Library (2026-08-11): open the gallery modal. Close the drawer
+  // first so the modal isn't half-covered by the drawer's slide-out. The modal
+  // is stage-appended (z:46, above the drawer's z:40) + Esc/backdrop-dismiss.
+  on(footBg, 'click', () => {
+    if (footBg.disabled) return;
+    wupiDrawer.closeDrawer();
+    backgrounds.openBackgroundsPanel(root);
+  });
 
   // Esc: dismiss panel → close wupi.
   document.addEventListener('keydown', onKeyDown, true);
 
-  // If we have an opening scene (New Game on a fresh card), render it
-  // as the first narrator beat.
-  if (hooks.openingScene) {
-    const b = beats.startNarratorBeat();
-    beats.appendChunk(b, hooks.openingScene);
-    beats.finalizeBeat(b, hooks.openingScene);
-  }
-  // Resumed session (Continue / Load): re-populate the feed from the loaded
-  // messages in one pass so the user sees their prior conversation. Comes
-  // AFTER the opening-scene render so a fresh game shows the scene first;
-  // for a resumed game openingScene is null (the card's opening beat is
-  // already in the message history).
+  // Paint the dialogue feed on entry. Two paths feed it:
+  //   - hooks.loadMessages: a resumed/loaded session's full history
+  //     (the backend already holds it; we mirror it into the DOM). This
+  //     is authoritative — when present it IS the feed, including any
+  //     opening beat as its first entry.
+  //   - hooks.openingScene: a fresh game's one-shot narrator beat (the
+  //     card's .intro), rendered as the sole assistant card. Used only
+  //     when there's no history to rebuild from.
+  // A cold Quick Play start has neither — the first fable_send turn
+  // streams the opening beat live.
+  beats.clearFeed();
   if (Array.isArray(hooks.loadMessages) && hooks.loadMessages.length) {
     beats.rebuildFromMessages(hooks.loadMessages);
+  } else if (typeof hooks.openingScene === 'string' && hooks.openingScene.trim()) {
+    const opening = beats.startNarratorBeat({ name: activeCardName });
+    beats.finalizeBeat(opening, hooks.openingScene);
   }
-  // Stamp the UX chat controls (edit on user beats + last assistant beat,
-  // reroll on the last assistant beat). Called after every populate path
-  // and after every narrator turn finalizes (see onTurnEnd wiring below).
-  refreshControls();
+  beats.scrollDown();
+
+  // §11.30 Left-Drawer HUD: hydrate immediately on stage entry. Without this
+  // the HUD (clock / weather / location / paperdoll heatsink) stays stale
+  // until the first narrator turn finalizes (onTurnEnd at line ~267) or the
+  // user opens the left drawer (armLeftCornerDwell at line ~864). On a
+  // Continue/Load resume this meant a freshly-loaded save showed default
+  // values for a beat even though the persisted schema carried real state.
+  // Best-effort + non-blocking: refreshAll swallows IPC failures internally.
+  leftDrawer.refreshAll();
+
+  // Background Library (2026-08-11): paint the saved active background (if any)
+  // onto .fable-stage-bg on entry. Best-effort + non-blocking — a fetch failure
+  // leaves the stage at its default black void. Mirrors refreshAll's tolerance.
+  void backgrounds.applyBackground(root);
 
   // Ambient music removed in Fable asset wipe (Phase 0a). Music module deleted;
   // §2A "ambient title music" will be re-sourced when audio assets are re-added.
@@ -827,6 +938,9 @@ function onKeyDown(e) {
     const overlay = stageRoot && stageRoot.querySelector('[data-save-overlay]');
     if (overlay && !overlay.hidden) { saveModalClose(); e.preventDefault(); return; }
   }
+  // Backgrounds gallery modal — same z-tier as the save modal, so it dismisses
+  // right after it (before the drawer/panel surfaces below).
+  if (backgrounds.isOpen()) { backgrounds.closeBackgroundsPanel(); e.preventDefault(); return; }
   if (panelActive()) { dismissPanel(); e.preventDefault(); return; }
   if (wupiDrawer.isOpen()) { wupiDrawer.closeDrawer(); e.preventDefault(); return; }
   if (leftDrawer.isOpenState()) { leftDrawer.closeDrawer(); e.preventDefault(); return; }
@@ -886,13 +1000,12 @@ export function toast(msg) {
   toastTimer = setTimeout(() => { t.hidden = true; }, 2200);
 }
 
-// Populate the feed from a load result (messages: [{role, content}]).
-// Delegates to `beats.rebuildFromMessages` (single source of truth — the
-// mutation wrappers in narrator.js use the same path) then stamps the UX
-// chat controls via `refreshControls`.
+// Populate the feed from a load result (messages: [{role, content, variants?,
+// active_idx?, timestamp?}]). Forwards straight to beats.rebuildFromMessages,
+// which is the single source of truth for the feed DOM.
 export function loadHistory(messages) {
   beats.rebuildFromMessages(messages);
-  refreshControls();
+  beats.scrollDown();
 }
 
 // ── Typing indicator + card identity ────────────────────────────────────
@@ -908,91 +1021,61 @@ export function loadHistory(messages) {
 // We accept BOTH shapes so this UI works whether or not that Rust edit has
 // landed yet (a string → name only, player_name stays ''; an object → both).
 async function refreshActiveCardName(root) {
+  // DEV PREVIEW: skip the IPC entirely — inject the placeholder identities +
+  // portraits directly. The preview has no backend, so fable_active_card_get
+  // would fail/return empty. The AI/narrator identity is "Game Master" (the
+  // default narrator), the player is "Wanderer". NPCs fall back to the AI
+  // portrait (per the deferred-NPC-portrait rule).
+  if (DEV_PREVIEW) {
+    activeCardName = 'Game Master';
+    activePlayerName = 'Wanderer';
+    activeCardPortrait = PLACEHOLDER_AI_PORTRAIT;
+    activePlayerPortrait = PLACEHOLDER_PLAYER_PORTRAIT;
+    npcNameMap = new Map();
+    return;
+  }
   try {
     const res = await invoke('fable_active_card_get');
     if (typeof res === 'string') {
+      // Legacy plain-string shape (older backend): just the card name.
       activeCardName = res;
       activePlayerName = '';
+      activeCardPortrait = '';
+      activePlayerPortrait = '';
+      npcNameMap = new Map();
     } else if (res && typeof res === 'object') {
       activeCardName = typeof res.name === 'string' ? res.name : '';
       activePlayerName = typeof res.player_name === 'string' ? res.player_name : '';
+      // Portrait paths arrive as absolute filesystem paths; convertFileSrc
+      // mints the asset:// URL the webview can <img src>. Empty when absent.
+      activeCardPortrait = typeof res.card_portrait_url === 'string' && res.card_portrait_url
+        ? convertFileSrc(res.card_portrait_url) : '';
+      activePlayerPortrait = typeof res.player_portrait_url === 'string' && res.player_portrait_url
+        ? convertFileSrc(res.player_portrait_url) : '';
+      // Build the npc_id → display-name map from the cast summary. Real NPC
+      // speaker labels on character beats (replaces the slug-title fallback).
+      npcNameMap = new Map();
+      if (Array.isArray(res.npc_names)) {
+        for (const n of res.npc_names) {
+          if (n && typeof n.id === 'string' && typeof n.name === 'string') {
+            npcNameMap.set(n.id, n.name);
+          }
+        }
+      }
     } else {
       activeCardName = '';
       activePlayerName = '';
+      activeCardPortrait = '';
+      activePlayerPortrait = '';
+      npcNameMap = new Map();
     }
   } catch (_) {
     activeCardName = '';
     activePlayerName = '';
+    activeCardPortrait = '';
+    activePlayerPortrait = '';
+    npcNameMap = new Map();
   }
-  updateTypingText(root);
-}
-function typingLabel() {
-  // "Game Master" is the neutral fallback (the seated card IS the GM persona
-  // — data/fable.sim). A named card (e.g. "Rusty Tavern") reads as that card.
-  const who = activeCardName || 'Game Master';
-  return `${who} is currently typing..`;
-}
-function updateTypingText(root) {
-  const el = root.querySelector('[data-typing-text]');
-  if (el) el.textContent = typingLabel();
-}
-function showTypingIndicator(root) {
-  updateTypingText(root);
-  const ind = root.querySelector('[data-typing-indicator]');
-  if (ind) ind.classList.add('is-visible');
-}
-function hideTypingIndicator(root) {
-  const ind = root.querySelector('[data-typing-indicator]');
-  if (ind) ind.classList.remove('is-visible');
-}
-
-// Walk the feed and stamp UX chat controls (edit / reroll) on each beat
-// based on its role + position:
-//   - every USER beat: edit (in-place typo fix via `edit_message`).
-//   - the LAST ASSISTANT beat: edit (in-place) + reroll (regen via
-//     `reroll_last_turn`).
-// Assistant beats that aren't last get nothing — you can't reroll a
-// non-final turn, and editing a mid-history assistant message without
-// branching the timeline would desync the conversation. Mid-history edits
-// of assistant prose are intentionally not supported at v1.
-//
-// Idempotent: `beats.renderControls` removes any prior controls block
-// before injecting, so calling this after every turn finalize is cheap.
-function refreshControls() {
-  const feedEl = stageRoot && stageRoot.querySelector('[data-feed]');
-  if (!feedEl) return;
-  const allBeats = feedEl.querySelectorAll('.fable-beat');
-  if (!allBeats.length) return;
-  const lastIdx = allBeats.length - 1;
-  allBeats.forEach((beat, i) => {
-    const role = beat.dataset.role;
-    // Variant state is stamped on the beat dataset (beats.stampVariants) so
-    // we can render the ‹ n/N › swipe bar without a message cache. Default
-    // count 1.
-    const variantCount = Number.parseInt(beat.dataset.variantCount || '1', 10);
-    const activeVariant = Number.parseInt(beat.dataset.activeVariant || '0', 10);
-    if (role === 'assistant' && i === lastIdx) {
-      // Last assistant beat: the swipe bar (hover-gated via the header) + the
-      // edit ✎ button. › on the last variant is the regenerate trigger
-      // (variants are uncapped).
-      beats.renderControls(beat, {
-        variantCount,
-        activeVariant,
-        isLastBeat: true,
-        canRegenerate: true,
-        canEdit: true,
-      });
-    } else if (role === 'assistant') {
-      // Earlier assistant beats: hover-gated swipe bar (navigation only, no
-      // regenerate, no edit — mid-history assistant edits would desync).
-      beats.renderControls(beat, { variantCount, activeVariant, isLastBeat: false });
-    } else if (role === 'user') {
-      // User beats: the edit ✎ button only (rewind-and-edit branches the
-      // timeline). No swipe bar (variants are an assistant-only affordance).
-      beats.renderControls(beat, { variantCount: 1, activeVariant: 0, isLastBeat: false, canEdit: true });
-    }
-    // System beats: no controls.
-  });
 }
 
 // Tear down on exit to title / window close. HARDENED (Chloe 2026-07-23:
@@ -1029,9 +1112,15 @@ export function teardownStage() {
   // content don't persist into the next session.
   if (panelActive()) dismissPanel();
   clearAllFX();
+  // Release the VN-interactions layer (listeners + observer + any vn-* state
+  // classes on the feed + any snapped portraits) BEFORE the feed is wiped.
+  // Disconnecting the observer first means the imminent clearFeed's
+  // childList mutation doesn't fire a now-orphaned refreshHistory pass, +
+  // the snapped-portrait cleanup runs while the <img> nodes still exist.
+  if (vnApi) { vnApi.teardown(); vnApi = null; }
+  // Wipe the dialogue feed so a prior session's cards don't leak into the
+  // next entry (the stage DOM is reused across games).
   beats.clearFeed();
-  // Hide the typing indicator (a close mid-stream could leave it visible).
-  if (stageRoot) hideTypingIndicator(stageRoot);
   activeCardName = '';
   // Reset the engine module state so a close mid-turn can't leave a stuck
   // `generating` (would no-op the next session's first send) or a dangling

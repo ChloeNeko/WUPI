@@ -3,8 +3,20 @@
 //
 // Sits in the RIGHT Wupi drawer between the brand header and the chat
 // messages. Five tabs: Player · Sim Card · Codex · World · NPC. Clicking an
-// icon toggles a prose dropdown (JSON/XML-free, friendly labels). One tab
-// active at a time (glowing); re-click or pick another closes/swaps.
+// icon toggles a read-only PROSE dropdown (JSON/XML-free, friendly labels)
+// that shows ONLY what the simulation is actively tracking — empty/untracked
+// fields are hidden, never shown as blank inputs. One tab active at a time
+// (glowing); re-click or pick another closes/swaps.
+//
+// READ-ONLY BY DESIGN (2026-08-11): the dropdowns are VISUAL AID references.
+// You cannot edit anything inline. To change tracked state, either talk to
+// WUPI (she mutates it through the simulation) or press the ✎ icon (top-right
+// of each dropdown) to open the raw-file editor (engine/raw-editor.js). The
+// four prose tabs (Card/Codex/World/NPC) used to render live-editable forms +
+// Save buttons; those were retired because (a) the dropdowns are meant to be
+// read-only references, and (b) the NPC inline-save wrote a partial npc slice
+// that risked wiping npc_registry/relationships/presences. Editing now flows
+// exclusively through the ✎ raw-editor path or WUPI chat.
 //
 // TAB STATE + DRAWER CLOSE (2026-08-06):
 //   The dropdown state (`activeTab`) is SEPARATE from the drawer-open state so
@@ -12,12 +24,9 @@
 //   button), `closeDrawer()` calls `resetTabRail()` → `setActiveTab(null)`,
 //   collapsing the dropdown + deactivating the icon so nothing persists behind
 //   a closed drawer. (The prior persist-on-close behavior was retired to match
-//   the left drawer.) `renderActive()` remains for the reopen-after-edit path.
-//
-// Each dropdown has a ✎ icon (top-right) that opens the raw-file editor
-// (engine/raw-editor.js) loaded with that tab's file. The prose fields save
-// through the existing live-edit IPCs (fable_card_save, fable_schema_set) or
-// the new raw-slice IPCs (fable_json_raw_set).
+//   the left drawer.) `renderActive()` remains for the reopen-after-edit path:
+//   it's also the onSaved callback handed to the raw editor so the dropdown
+//   re-reads immediately after a ✎ save.
 // =============================================================
 
 import { invoke } from '@tauri-apps/api/core';
@@ -113,12 +122,12 @@ export function renderActive() {
   renderTab(activeTab, dropdownEl);
 }
 
-export function activeTabKey() { return activeTab; }
-
 // ── Per-tab renderers ───────────────────────────────────────────────────
-// Each builds the prose dropdown (friendly, no JSON/XML): a header row with
-// the tab label + a ✎ raw-edit icon, then the tab's content. The ✎ opens the
-// raw editor (engine/raw-editor.js) for that tab's file.
+// Each builds the read-only prose dropdown (friendly, no JSON/XML): a header
+// row with the tab label + a ✎ raw-edit icon, then the tab's content. The ✎
+// opens the raw editor (engine/raw-editor.js) for that tab's file; on a
+// successful save the editor calls back into renderActive so this dropdown
+// re-reads immediately.
 
 async function renderTab(key, el) {
   el.hidden = false;
@@ -133,7 +142,9 @@ async function renderTab(key, el) {
     <div class="fable-tab-drop__body" data-drop-body></div>
   `;
   el.querySelector('[data-raw-edit]').addEventListener('click', () => {
-    openRawEditor(meta.file.kind);
+    // onSaved: re-render this dropdown so the read-only view reflects the
+    // just-saved raw edit immediately (no stale display).
+    openRawEditor(meta.file.kind, renderActive);
   });
   const body = el.querySelector('[data-drop-body]');
   try {
@@ -147,48 +158,144 @@ async function renderTab(key, el) {
   }
 }
 
-// ── Player tab ──────────────────────────────────────────────────────────
-// player_state_get → { body: { head: "Transparent", ... }, stamina, wealth,
-// reputation }. Body keys are the 16 stable ids; values are PascalCase states.
-async function renderPlayer(body) {
+// ── Player tab (character sheet, READ-ONLY) ─────────────────────────────
+// Pulls from THREE sources + renders each section only when it has content:
+//   • fable_active_player_get → identity (name/race/gender/age/height/weight)
+//     + backstory. None for a playerless game (Quick Play) → section hidden.
+//   • player_state_get        → appearance deltas, vitals, injuries, inventory.
+//   • fable_schema_get        → relationships (keyed by npc id). Best-effort.
+// Editing happens via the ✎ raw editor or by talking to WUPI; nothing here
+// is editable inline.
+async function renderPlayer(bodyEl) {
   let ps;
   try {
     ps = await invoke('player_state_get');
   } catch (err) {
-    body.innerHTML = emptyBox('No active game.');
+    bodyEl.innerHTML = emptyBox('No active game.');
     return;
   }
-  const bodyParts = ps.body || {};
-  // Friendly labels for the body-part ids (the 16 stable ids from player_state.rs).
-  const PART_LABELS = {
-    head: 'Head', torso: 'Torso',
-    left_bicep: 'Left Arm', left_forearm: 'Left Forearm', left_hand: 'Left Hand',
-    right_bicep: 'Right Arm', right_forearm: 'Right Forearm', right_hand: 'Right Hand',
-    left_thigh: 'Left Thigh', left_calf: 'Left Calf', left_ankle: 'Left Ankle', left_foot: 'Left Foot',
-    right_thigh: 'Right Thigh', right_calf: 'Right Calf', right_ankle: 'Right Ankle', right_foot: 'Right Foot',
-  };
-  // Split body into status rows (only non-default/"Transparent" parts are
-  // interesting; the healthy default is shown as a summary, not 16 rows).
-  const injured = Object.entries(bodyParts)
-    .filter(([_, v]) => v && v !== 'Transparent')
-    .map(([k, v]) => `<div class="fable-drop-row"><span>${esc(PART_LABELS[k] || prettify(k))}</span><span class="fable-drop-val ${stateClass(v)}">${esc(prettifyState(v))}</span></div>`);
-  const stamina = ps.stamina || 'Fresh';
-  const wealth = ps.wealth ?? 0;
-  const rep = ps.reputation ?? 0;
-  body.innerHTML = `
-    <div class="fable-drop-row"><span>Stamina</span><span class="fable-drop-val">${esc(prettifyState(stamina))}</span></div>
-    <div class="fable-drop-row"><span>Gold</span><span class="fable-drop-val">${esc(String(wealth))}</span></div>
-    <div class="fable-drop-row"><span>Reputation</span><span class="fable-drop-val ${rep < 0 ? 'bad' : rep > 0 ? 'good' : ''}">${esc(repLabel(rep))}</span></div>
-    <div class="fable-drop-section">Body</div>
-    ${injured.length
-      ? injured.join('')
-      : '<div class="fable-drop-row"><span class="fable-drop-muted">Uninjured.</span></div>'}
-  `;
+  // Identity + relationships schema are best-effort: a Quick Play game has no
+  // attached player (identity stays hidden) + a schema read failure just hides
+  // relationships. Vitals/injuries/inventory always come from player_state.
+  const [player, schema] = await Promise.all([
+    invoke('fable_active_player_get').then((p) => p || null).catch(() => null),
+    invoke('fable_schema_get').catch(() => null),
+  ]);
+
+  const parts = [];
+  const identity = renderIdentity(player);
+  if (identity) parts.push(identity);
+  const appearance = renderAppearance(ps);
+  if (appearance) parts.push(appearance);
+  parts.push(renderVitals(ps));
+  const injuries = renderInjuries(ps);
+  if (injuries) parts.push(injuries);
+  const inventory = renderInventory(ps);
+  if (inventory) parts.push(inventory);
+  const relationships = renderRelationships(schema);
+  if (relationships) parts.push(relationships);
+  bodyEl.innerHTML = parts.join('');
 }
 
-// ── Sim Card tab ────────────────────────────────────────────────────────
-// fable_card_get → the editable scalar fields. Edits go through the existing
-// session-only fable_card_save (live narrator pick-up next turn).
+// Identity: name (bold header) + stable trait rows + optional backstory.
+// Omitted entirely when there's no attached player.
+function renderIdentity(player) {
+  if (!player) return '';
+  const out = [];
+  if (nonEmpty(player.name)) out.push(`<div class="fable-drop-name">${esc(player.name)}</div>`);
+  const traitRows = [
+    ['Race', player.race], ['Gender', player.gender], ['Age', player.age],
+    ['Height', player.height], ['Weight', player.weight],
+  ].filter(([, v]) => nonEmpty(v));
+  if (traitRows.length) out.push(traitRows.map(([k, v]) => row(k, v)).join(''));
+  if (nonEmpty(player.backstory)) out.push(proseBlock('Backstory', player.backstory));
+  return out.length ? out.join('') : '';
+}
+
+// Appearance: the live `current_appearance_deltas` (hair/body/skin/eyes/
+// outfit/scars/wounds/etc.) — what the character currently looks like in
+// this game. Hidden entirely when no deltas are tracked.
+function renderAppearance(ps) {
+  const deltas = ps.current_appearance_deltas || {};
+  const rows = Object.entries(deltas)
+    .filter(([, v]) => nonEmpty(v))
+    .map(([k, v]) => row(prettify(k), v));
+  return rows.length ? section('Appearance', rows.join('')) : '';
+}
+
+// Vitals: always present (stamina/gold/reputation have defaults).
+function renderVitals(ps) {
+  const stam = staminaInfo(ps.stamina);
+  const wealth = ps.wealth ?? 0;
+  const rep = ps.reputation ?? 0;
+  return section('Vitals',
+    row('Stamina', stam.label, stam.cls)
+    + row('Gold', String(wealth))
+    + row('Reputation', repLabel(rep), rep < 0 ? 'bad' : rep > 0 ? 'good' : ''));
+}
+
+// Injuries: only the 22 parts that are NOT Healthy, each with its severity
+// label + any wound descriptors from `injury_details`. Returns '' when
+// uninjured (no section rendered).
+function renderInjuries(ps) {
+  const bodyMap = ps.body || {};
+  const details = ps.injury_details || {};
+  const rows = [];
+  for (const [part, state] of Object.entries(bodyMap)) {
+    const info = injuryState(state);
+    if (info.label === 'Healthy') continue;
+    rows.push(row(pascalToWords(part), info.label, info.cls));
+    const descs = (details[part] || []).filter((d) => nonEmpty(d));
+    if (descs.length) rows.push(`<div class="fable-drop-injury-detail">${esc(descs.join('; '))}</div>`);
+  }
+  return rows.length ? section('Injuries', rows.join('')) : '';
+}
+
+// Inventory: equipped (6 slots, outer + inner layers) + belt (≤4) + pack
+// (unbounded). Each subsection hidden when empty. Item tags render as chips.
+function renderInventory(ps) {
+  const out = [];
+  // Equipped — slot keys are the snake_case EquipSlot wire ids.
+  const eq = ps.equipment || {};
+  const slotRows = Object.keys(eq)
+    .map((slot) => {
+      const layers = eq[slot] || {};
+      const items = [];
+      if (layers.outer && nonEmpty(layers.outer.name)) {
+        items.push(`<span class="fable-inv-item">${esc(layers.outer.name)}${tagChips(layers.outer.tags)}</span>`);
+      }
+      if (layers.inner && nonEmpty(layers.inner.name)) {
+        items.push(`<span class="fable-inv-item"><span class="fable-inv-layer">under:</span> ${esc(layers.inner.name)}${tagChips(layers.inner.tags)}</span>`);
+      }
+      if (!items.length) return '';
+      return `<div class="fable-inv-slot"><span class="fable-inv-slot-label">${esc(EQUIP_SLOT_LABELS[slot] || prettify(slot))}</span><span class="fable-inv-slot-items">${items.join('')}</span></div>`;
+    })
+    .filter(Boolean);
+  if (slotRows.length) out.push(section('Equipped', slotRows.join('')));
+
+  const belt = Array.isArray(ps.belt) ? ps.belt : [];
+  if (belt.length) out.push(section('Belt', stackList(belt)));
+  const pack = Array.isArray(ps.pack) ? ps.pack : [];
+  if (pack.length) out.push(section('Pack', stackList(pack)));
+  return out.join('');
+}
+
+// Relationships: per-NPC tier (nemesis → bonded). Keyed by npc id on the
+// WorldSchema. Hidden entirely when none are tracked.
+function renderRelationships(schema) {
+  const rels = (schema && schema.relationships) || {};
+  const rows = Object.entries(rels).map(([k, v]) => {
+    const tier = tierInfo((v && v.tier) || 'stranger');
+    return `<div class="fable-drop-row"><span>${esc(prettifyNpcKey(k))}</span><span class="fable-drop-tier ${tier.cls}">${esc(tier.label)}</span></div>`;
+  });
+  return rows.length ? section('Relationships', rows.join('')) : '';
+}
+
+// ── Sim Card tab (READ-ONLY) ────────────────────────────────────────────
+// fable_card_get → the card's identity fields. Rendered as read-only prose —
+// each field hidden when empty so the dropdown shows only what's authored.
+// Editing happens via the ✎ raw editor (writes the .sim) or by talking to
+// WUPI; there is no inline form.
 async function renderCard(body) {
   let card;
   try {
@@ -201,44 +308,20 @@ async function renderCard(body) {
     body.innerHTML = emptyBox('No active card.');
     return;
   }
-  body.innerHTML = `
-    <div class="fable-drop-form" data-card-form>
-      ${field('Name', 'name', card.name || '')}
-      ${field('Player name', 'player_name', card.player_name || '')}
-      ${field('Setting', 'setting', card.setting || '', 3)}
-      ${field('Tone', 'tone', card.tone || '')}
-      ${field('Core persona', 'persona', card.core_persona || '', 4)}
-      <div class="fable-drop-actions">
-        <button class="fable-drop-btn primary" data-card-save>Save (live)</button>
-        <span class="fable-drop-status"></span>
-      </div>
-    </div>
-  `;
-  const form = body.querySelector('[data-card-form]');
-  const status = form.querySelector('.fable-drop-status');
-  form.querySelector('[data-card-save]').addEventListener('click', async () => {
-    const fields = {
-      name: form.querySelector('[data-f="name"]').value,
-      player_name: form.querySelector('[data-f="player_name"]').value,
-      setting: form.querySelector('[data-f="setting"]').value,
-      tone: form.querySelector('[data-f="tone"]').value,
-      core_persona: form.querySelector('[data-f="persona"]').value,
-    };
-    status.textContent = 'Saving…';
-    try {
-      await invoke('fable_card_save', { fields });
-      status.textContent = 'Saved — applies next turn.';
-    } catch (err) {
-      status.textContent = `Failed: ${err}`;
-    }
-  });
+  const parts = [];
+  if (nonEmpty(card.name)) parts.push(row('Name', card.name));
+  if (nonEmpty(card.player_name)) parts.push(row('Playing as', card.player_name));
+  if (nonEmpty(card.setting)) parts.push(proseBlock('Setting', card.setting));
+  if (nonEmpty(card.plot)) parts.push(proseBlock('Plot', card.plot));
+  if (nonEmpty(card.tone)) parts.push(row('Tone', card.tone));
+  if (nonEmpty(card.core_persona)) parts.push(proseBlock('Persona', card.core_persona));
+  body.innerHTML = parts.length ? parts.join('') : emptyBox('No active card.');
 }
 
-// ── Codex tab ───────────────────────────────────────────────────────────
+// ── Codex tab (READ-ONLY) ───────────────────────────────────────────────
 // fable_codex_get → { raw, entries: [{title, tags, body}] }. The authored hard
-// rules of the world. Add/edit/delete entries; save serializes back via
-// fable_codex_raw_set. Editing the entries list rebuilds the raw compound text.
-let codexEntries = [];  // working copy (edited in-place by the UI)
+// rules of the world, shown read-only. Add/edit/delete happens via the ✎ raw
+// editor (writes the .codex) or by talking to WUPI; there is no inline form.
 async function renderCodex(body) {
   let read;
   try {
@@ -247,75 +330,33 @@ async function renderCodex(body) {
     body.innerHTML = emptyBox('No active game.');
     return;
   }
-  codexEntries = (read.entries || []).map((e) => ({ title: e.title || '', tags: [...(e.tags || [])], body: e.body || '' }));
-  paintCodex(body);
-}
-function paintCodex(body) {
-  body.innerHTML = `
-    <div class="fable-codex-add">
-      <button class="fable-drop-btn" data-codex-add>+ Add entry</button>
-    </div>
-    <div class="fable-codex-list"></div>
-    <div class="fable-drop-actions">
-      <button class="fable-drop-btn primary" data-codex-save>Save</button>
-      <span class="fable-drop-status"></span>
-    </div>
-  `;
-  const list = body.querySelector('.fable-codex-list');
-  if (!codexEntries.length) {
-    list.innerHTML = '<div class="fable-drop-muted">No codex entries yet — the hard rules of this world.</div>';
+  const entries = (read && read.entries) || [];
+  if (!entries.length) {
+    body.innerHTML = '<div class="fable-drop-empty">No codex entries for this world.</div>';
+    return;
   }
-  codexEntries.forEach((entry, i) => list.appendChild(codexEntryCard(entry, i, body)));
-  body.querySelector('[data-codex-add]').addEventListener('click', () => {
-    codexEntries.push({ title: 'New Entry', tags: [], body: '' });
-    paintCodex(body);
-  });
-  body.querySelector('[data-codex-save]').addEventListener('click', () => saveCodex(body));
+  body.innerHTML = `<div class="fable-codex-list">${entries.map(codexReadCard).join('')}</div>`;
 }
-function codexEntryCard(entry, i, body) {
-  const card = document.createElement('div');
-  card.className = 'fable-codex-item';
-  card.innerHTML = `
-    <input class="fable-codex-title" data-f="title" value="${esc(entry.title)}" placeholder="Title">
-    <input class="fable-codex-tags" data-f="tags" value="${esc(entry.tags.join(', '))}" placeholder="tags, comma, separated">
-    <textarea class="fable-codex-body" data-f="body" rows="4" placeholder="The rule / lore body…">${esc(entry.body)}</textarea>
-    <button class="fable-codex-del" data-del>Remove</button>
-  `;
-  card.querySelector('[data-f="title"]').addEventListener('input', (e) => { codexEntries[i].title = e.target.value; });
-  card.querySelector('[data-f="tags"]').addEventListener('input', (e) => {
-    codexEntries[i].tags = e.target.value.split(',').map((t) => t.trim()).filter(Boolean);
-  });
-  card.querySelector('[data-f="body"]').addEventListener('input', (e) => { codexEntries[i].body = e.target.value; });
-  card.querySelector('[data-del]').addEventListener('click', () => {
-    codexEntries.splice(i, 1);
-    paintCodex(body);
-  });
-  return card;
-}
-async function saveCodex(body) {
-  const status = body.querySelector('.fable-drop-status');
-  status.textContent = 'Saving…';
-  // Serialize entries back to the compound .codex format (mirrors Rust's
-  // codex::format_compound_text). Built client-side so the save is one IPC.
-  let text = '';
-  for (const e of codexEntries) {
-    if (!e.body.trim() && !e.title.trim()) continue;
-    if (text) text += '\n\n';
-    text += '---\ntitle: ' + e.title + '\n';
-    if (e.tags.length) text += 'tags: ' + e.tags.join(', ') + '\n';
-    text += '---\n\n' + e.body.trim() + '\n';
-  }
-  try {
-    await invoke('fable_codex_raw_set', { text });
-    status.textContent = 'Saved.';
-  } catch (err) {
-    status.textContent = `Failed: ${err}`;
-  }
+function codexReadCard(e) {
+  const title = (e.title || '').trim();
+  const tags = (e.tags || []).map((t) => String(t).trim()).filter(Boolean);
+  const tagLine = tags.length ? `<div class="fable-drop-tags">${esc(tags.join(', '))}</div>` : '';
+  const bodyText = (e.body || '').trim();
+  // Skip a fully-blank entry rather than render an empty card.
+  if (!title && !tags.length && !bodyText) return '';
+  return `<div class="fable-codex-item">
+    ${title ? `<div class="fable-drop-title">${esc(title)}</div>` : ''}
+    ${tagLine}
+    ${bodyText ? `<div class="fable-drop-prose">${esc(bodyText)}</div>` : ''}
+  </div>`;
 }
 
-// ── World tab ───────────────────────────────────────────────────────────
-// fable_schema_get → the full WorldSchema. Edits the friendly fields, saves
-// via the existing fable_schema_set (writes the live world state).
+// ── World tab (READ-ONLY) ───────────────────────────────────────────────
+// fable_schema_get → the full WorldSchema. Rendered as read-only prose, each
+// block shown ONLY when populated: dormant clock/weather/location are hidden
+// (zero tracked state → zero rows), so a fresh game shows nothing misleading.
+// Editing happens via the ✎ raw editor (writes world.json) or by talking to
+// WUPI; there is no inline form.
 async function renderWorld(body) {
   let schema;
   try {
@@ -329,76 +370,34 @@ async function renderWorld(body) {
     return;
   }
   const clock = schema.world_clock || {};
+  const mins = Number(clock.current_minutes || 0);
   const weather = (schema.weather && schema.weather.condition) || '';
-  const currentNode = (schema.travel_graph && schema.travel_graph.current_node) || '';
-  const rumors = Array.isArray(schema.rumors) ? schema.rumors : [];
-  const rumorText = rumors.map((r) => (r && r.label) ? r.label : '').filter(Boolean).join('\n');
-  const events = Array.isArray(schema.recent_events) ? schema.recent_events.join('\n') : '';
-  const entities = schema.entities || {};
-  const worldEntText = Object.entries(entities)
+  const node = (schema.travel_graph && schema.travel_graph.current_node) || '';
+  const rumors = (Array.isArray(schema.rumors) ? schema.rumors : [])
+    .map((r) => (r && r.label ? r.label : null))
+    .filter(Boolean);
+  const events = (Array.isArray(schema.recent_events) ? schema.recent_events : [])
+    .filter((e) => nonEmpty(e));
+  const worldEnts = Object.entries(schema.entities || {})
     .filter(([k]) => !k.startsWith('npc.'))
-    .map(([k, v]) => `${k}: ${v}`).join('\n');
-  body.innerHTML = `
-    <div class="fable-drop-form" data-world-form>
-      ${field('Summary', 'summary', schema.summary || '', 3)}
-      ${field('Time — day', 'day', String(clock.day ?? 1))}
-      ${field('Time — minutes (0–1439)', 'minutes', String(clock.current_minutes ?? 0))}
-      ${field('Weather', 'weather', weather)}
-      ${field('Current location', 'location', currentNode)}
-      ${field('Rumors (one per line)', 'rumors', rumorText, 4)}
-      ${field('Recent events (one per line)', 'events', events, 4)}
-      ${field('Tracked details (key: value, one per line)', 'entities', worldEntText, 5)}
-      <div class="fable-drop-actions">
-        <button class="fable-drop-btn primary" data-world-save>Save</button>
-        <span class="fable-drop-status"></span>
-      </div>
-    </div>
-  `;
-  const form = body.querySelector('[data-world-form]');
-  const status = form.querySelector('.fable-drop-status');
-  form.querySelector('[data-world-save]').addEventListener('click', async () => {
-    status.textContent = 'Saving…';
-    try {
-      const next = JSON.parse(JSON.stringify(schema));
-      next.summary = form.querySelector('[data-f="summary"]').value;
-      next.recent_events = splitLines(form.querySelector('[data-f="events"]').value);
-      // Rebuild non-npc entities from the textarea; preserve npc.* entries.
-      const entText = form.querySelector('[data-f="entities"]').value;
-      const ent = {};
-      for (const [k, v] of Object.entries(next.entities || {})) {
-        if (k.startsWith('npc.')) ent[k] = v;  // preserve
-      }
-      for (const line of splitLines(entText)) {
-        const idx = line.indexOf(':');
-        if (idx > 0) ent[line.slice(0, idx).trim()] = line.slice(idx + 1).trim();
-      }
-      next.entities = ent;
-      if (!next.world_clock) next.world_clock = {};
-      next.world_clock.day = numOr(form.querySelector('[data-f="day"]').value, 1);
-      next.world_clock.current_minutes = numOr(form.querySelector('[data-f="minutes"]').value, 0);
-      const w = form.querySelector('[data-f="weather"]').value.trim();
-      if (!next.weather) next.weather = {};
-      next.weather.condition = w;
-      if (next.travel_graph) next.travel_graph.current_node = form.querySelector('[data-f="location"]').value.trim() || null;
-      const newLabels = splitLines(form.querySelector('[data-f="rumors"]').value);
-      const existingByLabel = new Map((rumors || []).filter((r) => r && r.label).map((r) => [r.label, r]));
-      const root = next.travel_graph && next.travel_graph.current_node;
-      next.rumors = newLabels.map((label) => existingByLabel.get(label) || {
-        label, origin_node: root, known_nodes: root ? [root] : [],
-        born_minutes: next.world_clock.current_minutes || 0,
-      });
-      await invoke('fable_schema_set', { schemaJson: next });
-      status.textContent = 'Saved.';
-    } catch (err) {
-      status.textContent = `Failed: ${err}`;
-    }
-  });
+    .filter(([, v]) => nonEmpty(v));
+
+  const parts = [];
+  if (mins > 0) parts.push(row('Time', clockLabel(mins)));
+  if (weather.trim()) parts.push(row('Weather', weather.trim()));
+  if (node.trim()) parts.push(row('Location', prettify(node)));
+  if (nonEmpty(schema.summary)) parts.push(proseBlock('Summary', schema.summary));
+  if (rumors.length) parts.push(listBlock('Rumors', rumors));
+  if (events.length) parts.push(listBlock('Recent events', events.slice(-5)));
+  if (worldEnts.length) parts.push(listBlock('Tracked details', worldEnts.map(([k, v]) => `${prettify(k)}: ${v}`)));
+  body.innerHTML = parts.length ? parts.join('') : '<div class="fable-drop-empty">World state not yet established.</div>';
 }
 
-// ── NPC tab ─────────────────────────────────────────────────────────────
-// fable_schema_get → the npc.* entities + npc_registry. Each NPC shown as a
-// name + disposition card. Edits the npc.* entity values; saves via
-// fable_json_raw_set('npc', ...) which recomposes the npc slice live.
+// ── NPC tab (READ-ONLY) ─────────────────────────────────────────────────
+// fable_schema_get → the npc.* entities. Each NPC shown as a read-only name +
+// state card. The old inline-save path wrote a partial npc slice that risked
+// wiping npc_registry/relationships/presences — it's gone. Editing happens via
+// the ✎ raw editor (writes npc.json) or by talking to WUPI.
 async function renderNpc(body) {
   let schema;
   try {
@@ -416,39 +415,15 @@ async function renderNpc(body) {
     body.innerHTML = emptyBox('No NPCs tracked yet.');
     return;
   }
-  body.innerHTML = `
-    <div class="fable-npc-list" data-npc-list>
-      ${npcs.map(([k, v]) => `
-        <div class="fable-npc-card" data-key="${esc(k)}">
-          <input class="fable-npc-name" value="${esc(prettifyNpcKey(k))}" readonly>
-          <textarea class="fable-npc-state" rows="2">${esc(v || '')}</textarea>
-        </div>
-      `).join('')}
-    </div>
-    <div class="fable-drop-actions">
-      <button class="fable-drop-btn primary" data-npc-save>Save</button>
-      <span class="fable-drop-status"></span>
-    </div>
-  `;
-  const list = body.querySelector('[data-npc-list]');
-  const status = body.querySelector('.fable-drop-status');
-  body.querySelector('[data-npc-save]').addEventListener('click', async () => {
-    status.textContent = 'Saving…';
-    try {
-      // Build the npc slice JSON: { entities: { npc.*: editedValue } }.
-      const entities = {};
-      for (const cardEl of list.querySelectorAll('.fable-npc-card')) {
-        const key = cardEl.dataset.key;
-        const val = cardEl.querySelector('.fable-npc-state').value;
-        entities[key] = val;
-      }
-      const npcJson = JSON.stringify({ entities }, null, 2);
-      await invoke('fable_json_raw_set', { kind: 'npc', json: npcJson });
-      status.textContent = 'Saved.';
-    } catch (err) {
-      status.textContent = `Failed: ${err}`;
-    }
-  });
+  body.innerHTML = `<div class="fable-npc-list">${npcs.map(([k, v]) => npcReadCard(k, v)).join('')}</div>`;
+}
+function npcReadCard(key, val) {
+  const name = prettifyNpcKey(key);
+  const state = nonEmpty(val) ? String(val).trim() : '';
+  return `<div class="fable-npc-card">
+    <div class="fable-drop-title">${esc(name)}</div>
+    ${state ? `<div class="fable-drop-prose">${esc(state)}</div>` : ''}
+  </div>`;
 }
 
 // Reset the rail to its beginning state: collapse the open dropdown + strip the
@@ -468,23 +443,77 @@ function esc(s) {
     .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
     .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
 }
+// True when a value holds non-blank content (string or otherwise).
+function nonEmpty(v) {
+  return v !== null && v !== undefined && String(v).trim() !== '';
+}
 function prettify(k) {
   return String(k).replace(/_/g, ' ').replace(/\b\w/g, (c) => c.toUpperCase());
-}
-function prettifyState(s) {
-  // The PascalCase enum names → "Fresh", "Winded", etc. Already friendly;
-  // just space-out camel boundaries defensively.
-  return String(s || '').replace(/([a-z])([A-Z])/g, '$1 $2');
 }
 function prettifyNpcKey(k) {
   return String(k).replace(/^npc\./, '').replace(/_/g, ' ')
     .replace(/\b\w/g, (c) => c.toUpperCase());
 }
-function stateClass(v) {
-  const s = String(v || '').toLowerCase();
-  if (/wound|injur|bleed|broken|crippled|sever|dead|dying|critical/.test(s)) return 'bad';
-  if (/bruis|cut|scrap|sore|winded|tired|fatigue/.test(s)) return 'warn';
-  return '';
+// BodyPart wire keys are PascalCase ("LeftUpperArm") → "Left Upper Arm".
+function pascalToWords(k) {
+  return String(k || '').replace(/([a-z0-9])([A-Z])/g, '$1 $2');
+}
+// BodyPartState wire (PascalCase or lowercase) → { label, cls }. The Healthy
+// (Transparent) state is the sentinel renderInjuries skips.
+const INJURY_STATES = {
+  transparent: { label: 'Healthy', cls: '' },
+  yellow:      { label: 'Minor Injury', cls: 'warn' },
+  orange:      { label: 'Medium Injury', cls: 'warn' },
+  red:         { label: 'Heavy Injury', cls: 'bad' },
+  purple:      { label: 'Critical', cls: 'bad' },
+  black:       { label: 'Amputated', cls: 'bad' },
+};
+function injuryState(v) {
+  const info = INJURY_STATES[String(v || '').toLowerCase()];
+  return info || { label: pascalToWords(v) || '—', cls: '' };
+}
+// Stamina enum wire → { label, cls }.
+const STAMINA_LABELS = {
+  depleted:  { label: 'Depleted', cls: 'bad' },
+  exhausted: { label: 'Exhausted', cls: 'warn' },
+  winded:    { label: 'Winded', cls: 'warn' },
+  active:    { label: 'Active', cls: 'good' },
+  fresh:     { label: 'Fresh', cls: 'good' },
+};
+function staminaInfo(s) {
+  const key = String(s || '').toLowerCase();
+  return STAMINA_LABELS[key] || { label: pascalToWords(s) || 'Fresh', cls: '' };
+}
+// RelationshipTier wire (snake_case) → { label, cls }. The label is left
+// lowercase; the .fable-drop-tier CSS capitalizes it for display.
+const TIER_INFO = {
+  nemesis: { cls: 'bad' }, hostile: { cls: 'bad' }, rival: { cls: 'bad' },
+  stranger: { cls: '' }, acquaintance: { cls: '' },
+  friendly: { cls: 'good' }, trusted: { cls: 'good' }, bonded: { cls: 'good' },
+};
+function tierInfo(t) {
+  const key = String(t || 'stranger').toLowerCase();
+  return { label: key, cls: (TIER_INFO[key] || {}).cls || '' };
+}
+// EquipSlot wire ids → friendly slot labels.
+const EQUIP_SLOT_LABELS = {
+  head: 'Head', chest: 'Chest', main_hand: 'Main Hand',
+  off_hand: 'Off Hand', legs: 'Legs', feet: 'Feet',
+};
+// Behavior-tag chips (consumable/equippable/pocketable) for inventory items.
+function tagChips(tags) {
+  if (!Array.isArray(tags) || !tags.length) return '';
+  return `<span class="fable-drop-chips">${tags
+    .map((t) => `<span class="fable-drop-chip">${esc(String(t))}</span>`).join('')}</span>`;
+}
+// A belt/pack entry: name + optional ×qty + tag chips.
+function stackItemRow(it) {
+  const name = nonEmpty(it.name) ? String(it.name) : 'Unknown';
+  const qty = (typeof it.qty === 'number' && it.qty > 1) ? `<span class="fable-drop-qty">×${it.qty}</span>` : '';
+  return `<div class="fable-drop-list-item">${esc(name)}${qty}${tagChips(it.tags)}</div>`;
+}
+function stackList(items) {
+  return `<div class="fable-drop-list">${items.map(stackItemRow).join('')}</div>`;
 }
 function repLabel(rep) {
   if (rep > 5) return `Renowned (${rep})`;
@@ -493,20 +522,33 @@ function repLabel(rep) {
   if (rep < 0) return `Distrusted (${rep})`;
   return 'Neutral (0)';
 }
-function splitLines(s) {
-  return String(s || '').split('\n').map((l) => l.trim()).filter(Boolean);
+// Format epoch-minutes as the narrator's "Day N, HH:MM" clock line. Mirrors
+// Rust's WorldClock::render_clock_line exactly (schema.rs): 1 day = 1440 min,
+// day index = minutes/1440 + 1, time-of-day = minutes % 1440.
+function clockLabel(minutes) {
+  const m = Number(minutes) || 0;
+  const day = Math.floor(m / 1440) + 1;
+  const rem = m % 1440;
+  const h = Math.floor(rem / 60);
+  const min = rem % 60;
+  return `Day ${day}, ${String(h).padStart(2, '0')}:${String(min).padStart(2, '0')}`;
 }
-function numOr(s, fallback) {
-  const n = Number.parseInt(String(s || ''), 10);
-  return Number.isFinite(n) ? n : fallback;
+// ─ read-only block builders (reused by Card / World / Codex / NPC / Player) ─
+// `cls` (optional) adds a severity class to the value (bad/warn/good).
+function row(label, val, cls) {
+  return `<div class="fable-drop-row"><span>${esc(label)}</span><span class="fable-drop-val ${cls || ''}">${esc(val)}</span></div>`;
 }
-// A labeled form field (reused by Card + World tabs). `rows` makes a textarea.
-function field(label, name, value, rows) {
-  const v = esc(value);
-  if (rows) {
-    return `<label class="fable-drop-field"><span class="fable-drop-label">${esc(label)}</span><textarea data-f="${name}" rows="${rows}">${v}</textarea></label>`;
-  }
-  return `<label class="fable-drop-field"><span class="fable-drop-label">${esc(label)}</span><input data-f="${name}" value="${v}"></label>`;
+// A section header + arbitrary inner HTML.
+function section(label, inner) {
+  return `<div class="fable-drop-section">${esc(label)}</div>${inner}`;
+}
+function proseBlock(label, text) {
+  return `<div class="fable-drop-section">${esc(label)}</div><div class="fable-drop-prose">${esc(text)}</div>`;
+}
+function listBlock(label, items) {
+  return `<div class="fable-drop-section">${esc(label)}</div><div class="fable-drop-list">${
+    items.map((i) => `<div class="fable-drop-list-item">${esc(i)}</div>`).join('')
+  }</div>`;
 }
 function emptyBox(msg) {
   return `<div class="fable-drop-empty">${esc(msg)}</div>`;

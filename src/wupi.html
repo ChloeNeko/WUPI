@@ -345,49 +345,17 @@
         </div>
     </div>
 
-    <!-- AI: connection profile manager. Two large mode boxes (LOCAL vs
-         ONLINE) swap the section below. LOCAL shows the single local model
-         (WUPI.gguf 12B). ONLINE shows saved endpoint profiles + an editor.
-         Selecting ONLINE unloads the 12B and runs Agent.gguf as the
-         schema/memory engine. Temperature is fixed at 1.0 (no UI field). -->
+    <!-- API: connection manager. WUPI's narration (Fable) runs over an
+         external API provider; this panel is the ONLY way to connect one.
+         The local model is an internal engine detail, never surfaced here. -->
     <div class="app-window modal api" id="api" aria-hidden="true">
         <div class="app-window-header">
-            <span class="app-window-title">Connection Profile</span>
+            <span class="app-window-title">API Connection</span>
             <button class="app-window-close" data-close="api" aria-label="Close">✕</button>
         </div>
-        <div class="app-window-body api-body" id="aiPanel" data-mode="local">
-            <!-- ── Mode selector: LOCAL | ONLINE ── -->
-            <div class="ai-mode-row">
-                <button class="ai-mode-box" data-mode="local" id="aiModeLocal">
-                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round">
-                        <rect x="5" y="5" width="14" height="14" rx="2"></rect>
-                        <rect x="9" y="9" width="6" height="6" rx="0.5"></rect>
-                        <path d="M9 2v3M15 2v3M9 19v3M15 19v3M2 9h3M2 15h3M19 9h3M19 15h3"></path>
-                    </svg>
-                    <span class="ai-mode-label">LOCAL</span>
-                </button>
-                <button class="ai-mode-box" data-mode="online" id="aiModeOnline">
-                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round">
-                        <path d="M17.5 19a4.5 4.5 0 0 0 0-9 6 6 0 0 0-11.6 1.5A4 4 0 0 0 6 19z"></path>
-                        <path d="M8 14v3M12 12v5M16 10v7"></path>
-                    </svg>
-                    <span class="ai-mode-label">ONLINE</span>
-                </button>
-            </div>
-
-            <!-- ── LOCAL section ── -->
-            <div class="ai-local-section" id="aiLocalSection">
-                <div class="ai-local-list">
-                    <div class="ai-local-bubble active" id="aiLocalModel">
-                        <span class="ai-local-name">WUPI Gemma 4</span>
-                        <span class="ai-local-size">12B</span>
-                    </div>
-                </div>
-                    <button id="aiLocalConnectBtn" class="ai-connect-btn">Connect</button>
-                </div>
-
-            <!-- ── ONLINE section ── -->
-            <div class="ai-online-section" id="aiOnlineSection">
+        <div class="app-window-body api-body" id="aiPanel">
+            <!-- ── API section (the whole panel) ── -->
+            <div class="ai-online-section visible" id="aiOnlineSection">
                 <div class="ai-online-stack">
                     <!-- PROFILE heading + edit/trash on the far right -->
                     <div class="ai-profile-header">
@@ -410,11 +378,10 @@
                         <option value="">Pick a profile to load models…</option>
                     </select>
 
-                    <!-- Active-state bubble (mirrors the LOCAL 12B bubble). Shows
-                         "Custom Name: model-id" when a profile is connected,
-                         otherwise a muted hint. -->
+                    <!-- Active-state bubble. Shows "Custom Name: model-id" when
+                         a profile is connected, otherwise a muted hint. -->
                     <div class="ai-online-bubble" id="aiOnlineBubble">
-                        <span class="ai-online-bubble-text">No profile connected</span>
+                        <span class="ai-online-bubble-text">No API connected</span>
                     </div>
 
                     <!-- Connect: the single runtime action. Pink by

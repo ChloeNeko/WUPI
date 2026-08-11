@@ -31,7 +31,8 @@
         "scope": [
           "$RESOURCE/../apps/prism/gallery/**",
           "$RESOURCE/../apps/fable/players/**",
-          "$RESOURCE/../apps/fable/cards/**"
+          "$RESOURCE/../apps/fable/cards/**",
+          "$RESOURCE/../apps/fable/images/backgrounds/**"
         ]
       }
     },

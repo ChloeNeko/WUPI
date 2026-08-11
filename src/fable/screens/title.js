@@ -139,19 +139,22 @@ export function buildTitle(handlers) {
       if (!handler) return;
       // Every menu press plays the button SFX (the authored press cue).
       try { playButtonSfx(); } catch (e) { /* autoplay blocked: silent */ }
-      // NEW GAME owns its OWN transition + audio hand-off inside its handler
-      // (onNewGameClicked — the theme cuts at click, a longer black hold, and
-      // the new tracks start at the reveal). Wrapping it in the title-level
-      // fade here would double-fade + delay the theme cut. So 'new' runs its
-      // handler directly.
-      // LOAD / EXIT jump screens instantly — wrap them in the 2s fade-to-black
-      // → swap → 2s reveal cinematic so they share the same fade hand-off. The
-      // handler runs at peak darkness (the overlay hides the swap). CONTINUE +
-      // QUICK PLAY are left to their own handlers — those internally route
-      // through enterStageViaTransition (which already fades) or show an inline
-      // overlay (Quick Play's Start-New/Resume-Last choice), so a title-level
-      // fade here would either double-fade or wrongly hide the choice card.
-      if (act === 'load' || act === 'exit') {
+      // NEW GAME + LOAD own their OWN transitions + audio hand-offs inside
+      // their handlers (onNewGameClicked / onLoadClicked — the theme cuts at
+      // click, a longer black hold, and the new tracks start at the reveal).
+      // Wrapping either in the title-level fade here would DOUBLE-FADE: two
+      // stacked overlays crossfade, and the title briefly shows through in the
+      // gap between their midpoints (the black → menu → black flicker). So
+      // 'new' + 'load' run their handlers directly.
+      // CONTINUE + QUICK PLAY are left to their own handlers too — those
+      // internally route through enterStageViaTransition (which already fades)
+      // or show an inline overlay (Quick Play's Start-New/Resume-Last choice),
+      // so a title-level fade would either double-fade or wrongly hide the
+      // choice card.
+      // EXIT is the only one wrapped: it jumps (closes the app) with no
+      // transition of its own, so the 2s fade-to-black → close gives it the
+      // same hand-off as the other buttons.
+      if (act === 'exit') {
         playMagicalTransition({ onMidpoint: () => { try { handler(); } catch (e) { console.error('[fable] title handler "' + act + '" threw', e); } } })
           .catch((e) => { console.error('[fable] title fade failed, running handler directly', e); try { handler(); } catch (_) {} });
       } else {

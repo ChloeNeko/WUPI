@@ -5,17 +5,18 @@
 //                     base) + positioned clear of the gender toggle (top-left).
 //                     This module just swaps the src per gender.
 //
-// The INVENTORY section (equip slots, drag-and-drop grid, context menu, the
-// consume/equip/unequip/drop pipelines, the equipment-node paperdoll overlay,
-// + the belt/pack hover widgets) was REMOVED (the original panel on
-// 2026-08-02; the paperdoll-node overlay + belt/pack widgets on 2026-08-07).
-// The standalone CLICKABLE backpack button (.hud-backpack) STAYS — it's the
-// inventory affordance anchor, currently a no-op awaiting a new surface. The
-// typed Rust inventory model (equipment.rs: 6 slots × 2 layers + belt +
-// weight-bounded pack) + the [EQUIP]/[BELT]/[PACK] bracket commands +
-// route_to_fable_query's inventory-summary narration path are INTENTIONALLY
-// left intact — the data model is correct; only the HUD visualization layers
-// over the paperdoll are gone (to be rebuilt later).
+// The INVENTORY HUD is the **Soul Gems** bloom system (engine/soul-gem.js) +
+// the **inspection panel** (engine/inventory-panel.js): clicking the backpack
+// blooms 6 gems onto the paperdoll's body regions; selecting a gem reveals
+// the inspection panel above the backpack, which renders that zone's items as
+// a paginated button list + a contextual action popup (CONSUME/EQUIP/POCKET/
+// STORE/DISCARD) with an EQUIP destination sub-menu. The typed Rust inventory
+// model (equipment.rs: 6 slots × 2 layers + belt + pack, each item carrying a
+// behavior-tag set) is mutated by the [EQUIP]/[BELT]/[PACK] brackets (tagged
+// via the tracker) OR by the inspection panel's UI actions (which fire
+// fable_schema_set with an event_note trace the next narrator turn sees).
+// (History: the original 2026-08-02 drag-and-drop panel + the 2026-08-07
+// hover overlay/widgets were deleted; the Soul Gems system replaced them.)
 // The ambient time-of-day tint + Chronos & Climate panel was REMOVED on
 // 2026-08-03 to be redone later.
 //
@@ -34,10 +35,34 @@ import { MARS_SVG, VENUS_SVG } from '../screens/wizard-engine.js';
 //   fable_active_card_get → { name, player_name }  (player_name = '' when unset)
 //   fable_schema_get      → full WorldSchema (world_clock / weather / travel_graph)
 import { invoke } from '@tauri-apps/api/core';
+// DEV PREVIEW mock: serves a frozen test schema (injuries + inventory) so the
+// paperdoll heatsink + left-drawer header render in the no-backend preview.
+import { isDevPreview, getDevSchema, getDevActiveCard } from './dev-preview-schema.js';
 // The localized injury heatmap: paints a soft radial "bruise" per injured
 // body part over the paperdoll. Reads the same schema's player_state.body
 // the rest of the HUD trusts — no new IPC. Healthy parts render nothing.
 import { paintInjuryHeatmap, clearInjuryHeatmap } from './injury-heatmap.js';
+// The SOUL GEMS — six glowing diamond inventory triggers that bloom out
+// from the backpack to anatomical body-region coordinates when the player
+// clicks the backpack, then retract on a second click. UNANCHORED from
+// the paperdoll (fixed bloom targets baked in soul-gem.js); the master
+// toggle + selection state live there too. This module owns the DOM
+// scaffold (the backpack button + the overlay host); soul-gem.js owns the
+// bloom/retract state machine + the per-gem selection.
+import {
+  buildSoulGems, toggleSoulGems, closeSoulGems, clearSoulGems, repositionToBody,
+  repositionOnResize, repositionSlotOnly, selectGem, soulGemsOpen,
+  setGender as setSoulGemGender, soulGemSet, SOUL_GEM_DATA_ATTR,
+} from './soul-gem.js';
+// The INVENTORY PANEL — the item inspection surface rendered into the
+// #inventory-panel-slot when a Soul Gem is selected. Owns the 6-zone data
+// aggregation (equipment/belt/pack → the gem's category), the paginated
+// fixed-button list (exactly 6 visible, scroll jumps by 1 button), + the
+// contextual action popup (CONSUME/EQUIP/POCKET/STORE/DISCARD). Encumbrance
+// + storage limits are intentionally NOT rendered (ripped out per spec).
+import {
+  renderInventoryPanel, clearInventoryPanel,
+} from './inventory-panel.js';
 // paintDebugOverlay is the DEV-ONLY hitbox verification layer from
 // body-parts.js (window.__wupiDebug.showHitboxes). body-parts.js is already
 // pulled into the main chunk via injury-heatmap.js above, so we static-import
@@ -92,10 +117,10 @@ const ICON_STROKE = 'stroke-width="1.5" stroke-linecap="butt" stroke-linejoin="m
 const CALENDAR_SVG = `
 <svg class="hud-status-svg" viewBox="0 0 24 24" fill="none" stroke="currentColor"
      ${ICON_STROKE} xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
-  <rect x="1.5" y="5" width="17" height="15" rx="1.5"/>
-  <line x1="1.5" y1="9.5" x2="18.5" y2="9.5"/>
-  <line x1="6" y1="3" x2="6" y2="6.5"/>
-  <line x1="14" y1="3" x2="14" y2="6.5"/>
+  <rect x="3.5" y="5" width="17" height="15" rx="1.5"/>
+  <line x1="3.5" y1="9.5" x2="20.5" y2="9.5"/>
+  <line x1="8" y1="3" x2="8" y2="6.5"/>
+  <line x1="16" y1="3" x2="16" y2="6.5"/>
 </svg>`;
 
 // Weather glyph set — one SVG per mapped condition. The matcher below picks
@@ -139,6 +164,15 @@ let drawerEl = null;
 let isOpen = false;
 let locked = false;
 let edgeLockVisible = () => false;
+// Inventory action-popup visibility probe: set by stage.js via
+// setActionPopupProbe. The action popup is appended to document.body (so it
+// can overlay the drawer edge), so moving the mouse from a drawer item button
+// onto the popup fires the drawer's mouseleave → the unlocked drawer would
+// yank in mid-click. While this probe returns true, auto-close on mouseleave
+// is SUPPRESSED so the user can reach + click CONSUME/EQUIP/etc. Mirrors the
+// edgeLockVisible probe pattern (same "reaching for something outside the
+// drawer" problem).
+let actionPopupOpen = () => false;
 
 // ─── DEV-ONLY hitbox overlay state ──────────────────────────────────────────
 // True while the body-parts debug overlay (window.__wupiDebug.showHitboxes) is
@@ -175,6 +209,11 @@ let lastSnap = null;                  // { playerName, cardName, clock, weather,
 // refreshAll; reset to null in resetLeftDrawer so a stale map can't bleed
 // into a new session.
 let lastBodyMap = null;
+// The matching per-zone injury descriptor map (PascalCase wire key → string[]
+// of wound descriptors the Referee appended). Same cache discipline as
+// lastBodyMap: reused by the gender-toggle repaint path, reset on stage exit.
+// null when no game / dormant schema → the tooltip renders the header only.
+let lastDetailsMap = null;
 
 // ===========================================================================
 // §1  PAPERDOLL — static silhouette
@@ -279,6 +318,24 @@ export function buildLeftDrawer() {
     </div>
   `;
   wireInteractions(drawerEl);
+  // Build the soul-gem overlay (the 6 inventory triggers that bloom from the
+  // backpack onto the body regions) once the DOM is wired. The backpack is
+  // the bloom origin + master toggle; the paperdoll <img>'s box drives the
+  // body targets (Head → Foot, per-gender). Done AFTER wireInteractions so
+  // the toggle's click listener is bound first.
+  const backpackEl = drawerEl.querySelector('[data-backpack-btn]');
+  const paperdollImgEl = drawerEl.querySelector('[data-paperdoll-img]');
+  if (backpackEl) {
+    buildSoulGems(drawerEl, backpackEl, paperdollImgEl, normGender(gender));
+    // The paperdoll <img> + the backpack both use fluid sizing, so their
+    // boxes resolve after first paint + shift on resize. Re-measure the body
+    // targets once on window load + on resize so the gems stay glued. The
+    // resize path is rAF-coalesced (a fullscreen-toggle burst fires dozens
+    // of events — one measurement per frame, not dozens) + the reposition
+    // itself suppresses the bloom transition so the gems SNAP, not spring.
+    window.addEventListener('load', repositionToBody, { once: true });
+    window.addEventListener('resize', repositionOnResize);
+  }
   renderGenderGlyph(); // paint the initial glyph + color
   // Paint the fixed Sun/Moon glyphs (these never change), then load the live
   // world state once. The header (player name), the diamond position, + the
@@ -350,9 +407,18 @@ function wireInteractions(root) {
         const section = drawerEl.querySelector('.hud-paperdoll-section');
         if (section) {
           try {
-            paintInjuryHeatmap(section, normGender(gender), lastBodyMap);
+            paintInjuryHeatmap(section, normGender(gender), lastBodyMap, lastDetailsMap);
           } catch (e) {
             console.warn('[left-drawer] heatmap repaint on gender swap failed:', e);
+          }
+          // Soul gems: re-target for the new silhouette. The bloom targets
+          // are derived from the lower_torso hitbox centroid + per-gender
+          // nudges, so a ♂↔♀ swap moves them. The re-measure MUST wait for
+          // the new <img> to load (the img box drives the centroid→px map).
+          try {
+            setSoulGemGender(normGender(gender));
+          } catch (e) {
+            console.warn('[left-drawer] soul gem re-target on gender swap failed:', e);
           }
           // DEV-ONLY: if the hitbox debug overlay is on screen, re-paint it
           // against the new silhouette too (same load-wait reason — the
@@ -414,6 +480,92 @@ function wireInteractions(root) {
     hit.addEventListener('mouseenter', activate);
     keepalive.addEventListener('mouseleave', deactivate);
   }
+
+  // ── Soul gems: backpack master toggle + gem selection ──────────────
+  // The backpack is the master toggle: clicking it blooms the 6 soul gems
+  // out to their anatomical targets (Head→Foot), retracts them on a second
+  // click. A 350ms cooldown inside toggleSoulGems() guards against rapid
+  // multi-clicks thrashing the spring transition.
+  const backpack = root.querySelector('[data-backpack-btn]');
+  if (backpack) {
+    backpack.addEventListener('click', () => {
+      playUIClink();
+      toggleSoulGems();
+      // Closing the gem overlay also hides the inspection slot — the panel
+      // only makes sense while a gem is selectable. soulGemsOpen() is read
+      // AFTER the toggle so it reflects the new state.
+      if (!soulGemsOpen()) hideInventorySlot();
+    });
+  }
+
+  // Gem selection: a single delegated listener on the drawer filters clicks
+  // to [data-soul-gem] nodes. Clicking a gem selects it (.is-active gold
+  // pulse) + deselects the others; re-clicking the active gem deselects it.
+  // The #inventory-panel-slot reveals/hides to match — selecting a gem shows
+  // the panel (inventory-panel.js renders that zone's item-button list +
+  // action popup into it); deselecting or closing the overlay hides it.
+  root.addEventListener('click', (e) => {
+    const gemNode = e.target.closest('[' + SOUL_GEM_DATA_ATTR + ']');
+    if (!gemNode) return;
+    e.stopPropagation();             // don't bubble to the click-outside-close handler
+    const id = gemNode.getAttribute(SOUL_GEM_DATA_ATTR);
+    const nowActive = selectGem(id); // null if toggled off
+    if (nowActive) {
+      showInventorySlot(nowActive);  // reveal the panel for this gem's slot
+    } else {
+      hideInventorySlot();           // deselected → hide
+    }
+  });
+}
+
+// Reveal the #inventory-panel-slot for the given gem id. The slot is a
+// dedicated container above the backpack; it shows a header naming the selected
+// category + a body where inventory-panel.js renders the paginated item-button
+// list. Flips the .is-visible class so the CSS opacity/transform transition
+// animates it in, then hands the body off to the inventory panel renderer.
+function showInventorySlot(gemId) {
+  if (!drawerEl) return;
+  const slot = drawerEl.querySelector('#inventory-panel-slot');
+  if (!slot) return;
+  // Re-measure the panel position from the live backpack box BEFORE revealing.
+  // Same stale-cache fix as the gems: the initial build measurement can race
+  // with layout settling, so every reveal measures fresh. This is the panel's
+  // own hook (the gem-open path's repositionToBody doesn't fire on gem-select).
+  repositionSlotOnly();
+  // Label the panel with the slot name. soulGemSet() maps id → label.
+  const gem = soulGemSet().find((g) => g.id === gemId);
+  const label = gem ? gem.label : gemId;
+  // Header (the category name) + an empty body the inventory-panel fills.
+  slot.innerHTML = `<div class="inventory-slot-header">${label}</div>` +
+    `<div class="inventory-slot-body" data-slot="${gemId}"></div>`;
+  slot.setAttribute('aria-hidden', 'false');
+  slot.classList.add('is-visible');
+  // Hand the body to the inventory panel renderer. It fetches the live schema,
+  // aggregates the gem's category items, + paints the paginated button list.
+  // Best-effort: a failure leaves the empty body (the panel reveal isn't blocked).
+  const bodyEl = slot.querySelector('.inventory-slot-body');
+  if (bodyEl) {
+    renderInventoryPanel(bodyEl, gemId).catch((e) => {
+      console.warn('[left-drawer] inventory panel render failed:', e);
+    });
+  }
+}
+
+// Hide the #inventory-panel-slot (a gem was deselected, or the overlay
+// closed). Clears the inventory panel state + flips .is-visible off so the CSS
+// transition animates it out.
+function hideInventorySlot() {
+  if (!drawerEl) return;
+  clearInventoryPanel();          // drop the panel module's state + close any popup
+  const slot = drawerEl.querySelector('#inventory-panel-slot');
+  if (!slot) return;
+  slot.classList.remove('is-visible');
+  slot.setAttribute('aria-hidden', 'true');
+  // Defer the content clear until after the fade-out transition so the panel
+  // doesn't visually blank while it's still mid-fade.
+  setTimeout(() => {
+    if (!slot.classList.contains('is-visible')) slot.innerHTML = '';
+  }, 240);
 }
 
 // Paint the gender glyph into the single toggle button + tag it with the
@@ -838,6 +990,13 @@ function closeInfoCard() {
 export async function refreshAll() {
   if (!drawerEl) return;
   // The paperdoll is local-only (gender + PNG) — re-render it always.
+  // NOTE: renderPaperdoll assigns a fresh img.src. The paperdoll <img> uses
+  // height:clamp() + width:auto, so its rendered width is 0 until the PNG
+  // decodes. paintInjuryHeatmap measures img.getBoundingClientRect() to size
+  // its overlay SVG — measuring pre-decode produces a 0-width SVG → every
+  // injury polygon squashes to nothing → transparent heatsink. So the heatmap
+  // paint below MUST wait for the img to finish loading, exactly like the
+  // gender-toggle path (lines ~419-423) already does.
   renderPaperdoll();
 
   // Pull the live card (player name) + the full world schema in parallel.
@@ -850,12 +1009,17 @@ export async function refreshAll() {
   let weather = '';
   let node = null;
   let bodyMap = null;                 // player_state.body (PascalCase→PascalCase) or null
+  let detailsMap = null;              // player_state.injury_details (wire key → string[]) or null
 
   try {
-    const [cardRes, schema] = await Promise.all([
-      invoke('fable_active_card_get').catch(() => null),
-      invoke('fable_schema_get').catch(() => null),
-    ]);
+    // DEV PREVIEW: skip the IPCs (no backend) — serve the mock card + schema
+    // so the heatsink + header render real test data.
+    const [cardRes, schema] = isDevPreview()
+      ? [getDevActiveCard(), getDevSchema()]
+      : await Promise.all([
+          invoke('fable_active_card_get').catch(() => null),
+          invoke('fable_schema_get').catch(() => null),
+        ]);
     // fable_active_card_get → { name, player_name } (object) when a game is
     // active, or null when none is. The player_name is the empty string in
     // Quick Play (no SavedPlayer attached) — fall back to the card name, then
@@ -879,6 +1043,11 @@ export async function refreshAll() {
       // → PascalCase BodyPartState). May be absent on a fresh/dormant schema;
       // null routes the heatmap to the no-op render path (renders nothing).
       bodyMap = (schema.player_state && schema.player_state.body) || null;
+      // The parallel injury_details map (same PascalCase wire keys → string[]
+      // of per-zone wound descriptors the Referee appended). Drives the
+      // tooltip's detail list under the header. Absent on old saves / dormant
+      // schemas → null → tooltip renders the header only (no detail list).
+      detailsMap = (schema.player_state && schema.player_state.injury_details) || null;
     }
   } catch (_) {
     // swallow — dormant fallbacks below stand.
@@ -901,17 +1070,39 @@ export async function refreshAll() {
   // The injury heatmap: paint over the paperdoll from the live body map.
   // Best-effort — a paint failure is logged + dropped (never blocks the UI
   // re-enable), matching the file's IPC-failure posture. Healthy body /
-  // dormant schema → paintInjuryHeatmap's no-op path (renders nothing). The
-  // paperdoll <img> must be loaded for the renderer to measure its box, so
-  // renderPaperdoll() above (which sets the src) runs first. Cache the body
-  // map so the gender toggle can re-paint without a fresh IPC.
+  // dormant schema → paintInjuryHeatmap's no-op path (renders nothing). Cache
+  // the body map so the gender toggle can re-paint without a fresh IPC.
+  //
+  // IMAGE-LOAD GUARD: the paperdoll <img> (height:clamp + width:auto) has
+  // width 0 until the PNG decodes. paintInjuryHeatmap measures the box to size
+  // its overlay, so we MUST wait for img.complete OR the load event before
+  // painting — same guard the gender-toggle path uses. Without this the SVG
+  // overlay is created at width:0px and every injury polygon is invisible.
   lastBodyMap = bodyMap;
-  try {
-    const section = drawerEl.querySelector('.hud-paperdoll-section');
-    if (section) paintInjuryHeatmap(section, normGender(gender), bodyMap);
-  } catch (e) {
-    console.warn('[left-drawer] injury heatmap paint failed:', e);
+  lastDetailsMap = detailsMap;
+  const paintHeatmap = () => {
+    try {
+      const section = drawerEl.querySelector('.hud-paperdoll-section');
+      if (section) paintInjuryHeatmap(section, normGender(gender), bodyMap, detailsMap);
+    } catch (e) {
+      console.warn('[left-drawer] injury heatmap paint failed:', e);
+    }
+  };
+  const paperdollImg = drawerEl.querySelector('[data-paperdoll-img]');
+  if (paperdollImg && !paperdollImg.complete) {
+    // The img is still decoding the fresh src renderPaperdoll just assigned.
+    // Defer the paint to the load event (fires once when decode completes).
+    // If the decode fails (error/onerror), the heatmap stays unpainted for
+    // this turn — acceptable: the next refreshAll re-attempts.
+    paperdollImg.addEventListener('load', paintHeatmap, { once: true });
+  } else {
+    paintHeatmap();
   }
+
+  // Soul gems: NO repaint on refresh. They are unanchored from the paperdoll
+  // (fixed bloom targets) + stateful (open/closed/active), not re-painted per
+  // narrator turn like the injury heatmap. Their build happens once in
+  // buildLeftDrawer; their state is owned by soul-gem.js.
 }
 
 // ===========================================================================
@@ -932,6 +1123,13 @@ export function closeDrawer() {
   // leave a card "active" behind a closed drawer — mouseleave/edge-lock/reset
   // all route through here, so this is the single chokepoint).
   closeInfoCard();
+  // Retract the soul gems too — an open inventory shouldn't dangle behind a
+  // closed drawer. closeSoulGems() is a no-op if already closed (so a drawer
+  // close with the gems retracted costs nothing).
+  closeSoulGems();
+  // And hide the inspection slot — closing the drawer clears any open gem
+  // selection, so the panel should go with it.
+  hideInventorySlot();
 }
 export function isOpenState() { return isOpen; }
 export function isLocked() { return locked; }
@@ -943,9 +1141,16 @@ export function toggleLock() {
 export function setEdgeLockProbe(probe) {
   edgeLockVisible = typeof probe === 'function' ? probe : () => false;
 }
+// Wire the inventory action-popup visibility probe (the popup lives on
+// document.body, so reaching for it fires the drawer's mouseleave). See the
+// actionPopupOpen decl above for the full rationale.
+export function setActionPopupProbe(probe) {
+  actionPopupOpen = typeof probe === 'function' ? probe : () => false;
+}
 export function onDrawerMouseLeave() {
   if (locked) return;
   if (edgeLockVisible()) return;
+  if (actionPopupOpen()) return;   // user is reaching for the popup — hold
   closeDrawer();
 }
 // Hard reset (called from teardownStage on stage exit). Wipes HUD state too
@@ -956,6 +1161,7 @@ export function resetLeftDrawer() {
   activeCardDock = null;
   lastSnap = null;
   lastBodyMap = null;       // drop the cached injury map so it can't bleed into a new session
+  lastDetailsMap = null;    // drop the cached descriptor map too (same bleed risk)
   hitboxDebugVisible = false; // drop the dev-overlay flag (the DOM clear below
                               // removes any painted overlay; this keeps the flag
                               // in sync so a later toggle won't re-paint stale)
@@ -967,6 +1173,10 @@ export function resetLeftDrawer() {
     if (section) {
       try { clearInjuryHeatmap(section); }
       catch (e) { console.warn('[left-drawer] heatmap clear on reset failed:', e); }
+      // Drop the soul gems too so they can't linger into a new session
+      // (removes the overlay + the #inventory-panel-slot + resets state).
+      try { clearSoulGems(drawerEl); }
+      catch (e) { console.warn('[left-drawer] soul gem clear on reset failed:', e); }
       // DEV-ONLY: also clear the hitbox debug overlay if a developer left it
       // on screen before exiting the stage. No-op in normal use.
       const debugOverlay = section.querySelector('[data-body-parts-debug]');

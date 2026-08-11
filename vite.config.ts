@@ -1,4 +1,7 @@
 import { defineConfig } from "vite";
+import * as fs from "node:fs";
+import * as path from "node:path";
+import { fileURLToPath } from "node:url";
 
 // ── Dev HMR policy: CSS hot-swaps, JS does NOT auto-reload. ──────────────
 // By default Vite injects an HMR client that, on any file change, tries to
@@ -40,6 +43,70 @@ function suppressJsHmrReload() {
   };
 }
 
+// ── Hitbox editor + save-to-file middleware (dev server only) ────────────
+// The standalone hitbox authoring tool (src/hitbox-editor.html) is a dev-only
+// page, NOT shipped. This plugin serves it at /hitbox-editor.html and exposes
+// a POST /__hitbox-write endpoint that writes the editor's export directly to
+// src/fable/data/paperdoll-hitboxes.json — so Chloe can iterate without the
+// copy/paste/download dance. Dev server only (apply: 'serve'); `vite build`
+// never invokes these hooks + the page isn't in the production input.
+function hitboxEditorDevServer() {
+  return {
+    name: 'wupi-hitbox-editor-dev',
+    apply: 'serve' as const,
+    configureServer(server) {
+      const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)));
+      const editorPath = path.resolve(repoRoot, 'src/hitbox-editor.html');
+      const dataPath = path.resolve(repoRoot, 'src/fable/data/paperdoll-hitboxes.json');
+      // Serve the editor page.
+      server.middlewares.use('/hitbox-editor.html', (_req, res) => {
+        try {
+          const html = fs.readFileSync(editorPath, 'utf-8');
+          res.setHeader('Content-Type', 'text/html; charset=utf-8');
+          res.end(html);
+        } catch (e) {
+          res.statusCode = 500;
+          res.end('hitbox-editor.html not found: ' + (e as Error).message);
+        }
+      });
+      // Save-to-file endpoint.
+      server.middlewares.use('/__hitbox-write', (req, res) => {
+        if (req.method !== 'POST') {
+          res.statusCode = 405;
+          res.setHeader('Allow', 'POST');
+          res.end(JSON.stringify({ error: 'POST required' }));
+          return;
+        }
+        const chunks: Buffer[] = [];
+        req.on('data', (c) => chunks.push(c));
+        req.on('end', () => {
+          try {
+            const body = Buffer.concat(chunks).toString('utf-8');
+            // Validate it's well-formed JSON + structurally a {male,female}
+            // map before touching the file (defensive — the editor is the only
+            // caller, but a bad payload must never corrupt the canonical file).
+            const parsed = JSON.parse(body);
+            if (!parsed || typeof parsed !== 'object' || !parsed.male || !parsed.female) {
+              throw new Error('payload is not a {male,female} hitbox map');
+            }
+            // Atomic write: temp file + rename (mirrors the Rust write_atomic
+            // discipline so a crash mid-write can't leave a truncated file).
+            const tmp = dataPath + '.tmp';
+            fs.writeFileSync(tmp, body, 'utf-8');
+            fs.renameSync(tmp, dataPath);
+            res.setHeader('Content-Type', 'application/json');
+            res.end(JSON.stringify({ ok: true, path: 'src/fable/data/paperdoll-hitboxes.json' }));
+          } catch (e) {
+            res.statusCode = 400;
+            res.setHeader('Content-Type', 'application/json');
+            res.end(JSON.stringify({ error: (e as Error).message }));
+          }
+        });
+      });
+    },
+  };
+}
+
 export default defineConfig({
   root: "src",
   publicDir: "../public",
@@ -51,7 +118,7 @@ export default defineConfig({
     port: 1420,
     strictPort: true,
   },
-  plugins: [suppressJsHmrReload()],
+  plugins: [suppressJsHmrReload(), hitboxEditorDevServer()],
   build: {
     outDir: "../dist",
     emptyOutDir: true,

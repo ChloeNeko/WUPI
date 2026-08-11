@@ -193,7 +193,15 @@ impl ChatFormat for Gemma4Format {
             // The StreamFilter strips `<|think|>` if the model echoes it.
             // (Local-only — the API chat path is OpenAI format, no control
             // tokens; the Fable narrator is also API-only and never thinks.)
-            out.push_str("<|think|>");
+            //
+            // DISABLED 2026-08-09 (`THINKING_ENABLED`): thinking 5×'d per-turn
+            // wall-clock + could wedge into a non-terminating thought channel
+            // (→ max_tokens hang). Gemma 12B tracks cleanly without it. The
+            // ThoughtGate / StreamFilter / extract_reasoning machinery stays
+            // resident but dormant (no-ops when no thought is emitted).
+            if crate::settings::THINKING_ENABLED {
+                out.push_str("<|think|>");
+            }
             out.push_str("<turn|>\n");
         }
 

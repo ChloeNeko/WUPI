@@ -390,7 +390,12 @@ impl ToolCtx {
 
 /// The tool trait. Each implementation owns one tool's spec, validation, and
 /// execution. Tools are pure (no AppState access) — the agent loop in lib.rs
-/// owns stateful coordination.
+/// owns stateful coordination. The Fable-state tools (`fable_message_*` /
+/// `fable_schema_patch`) bypass this trait's `execute` entirely: their specs
+/// + `validate_args` are exposed via `fable_state_tool_specs()` /
+/// `validate_fable_state_tool()` and dispatched inline from `run_agent_loop`
+/// (which has AppState access for the live mutexes). See
+/// `dispatch_fable_state_tool` in lib.rs.
 pub trait Tool: Send + Sync {
     /// The name + description rendered into the system turn via
     /// `Gemma4Format::render_prompt` (`chat_format.rs:177-183`). The
@@ -441,6 +446,133 @@ pub fn specs() -> Vec<ToolSpec> {
 /// when a Fable session is active (lib.rs).
 pub fn fable_specs() -> Vec<ToolSpec> {
     fable_registry().iter().map(|t| t.spec()).collect()
+}
+
+// ---------------------------------------------------------------------------
+// Fable-stateful tools (dispatched async from `run_agent_loop`)
+// ---------------------------------------------------------------------------
+//
+// The three tools below mutate LIVE Fable state (the in-memory `fable_session`
+// `Conversation` + the `fable_schema` `WorldSchema`). They can't go through
+// the sync `Tool::execute` trait path because they need to await tokio mutex
+// locks. Instead `chat_send` includes their specs in the prompt via
+// `fable_state_specs()` (only when a Fable game is active), and the agent
+// loop dispatches them inline via `dispatch_fable_state_tool` in lib.rs (which
+// has `&tauri::State<'_, AppState>` access). Validation lives here so it can
+// be unit-tested without AppState.
+
+/// The three stateful tool names. Used by `dispatch_fable_state_tool` to
+/// decide whether a call name should bypass the sync registry. Kept in sync
+/// with `fable_state_specs()` / `validate_fable_state_tool`.
+pub const FABLE_STATE_TOOL_NAMES: &[&str] =
+    &["fable_message_edit", "fable_message_delete", "fable_schema_patch"];
+
+/// True iff `name` is one of the async-dispatched Fable-state tools.
+pub fn is_fable_state_tool(name: &str) -> bool {
+    FABLE_STATE_TOOL_NAMES.contains(&name)
+}
+
+/// The spec list for the three stateful tools. Attached to the chat system
+/// prompt only when a Fable game is active (`chat_send` gating in lib.rs).
+/// Each description is the model's only guidance — keep it tight.
+pub fn fable_state_specs() -> Vec<ToolSpec> {
+    vec![
+        ToolSpec {
+            name: "fable_message_edit".into(),
+            description: "Edit the content of one message in the active Fable \
+                          session by its 0-based array index. Args: \
+                          {\"index\": 3, \"content\": \"new text\"}. \
+                          Find the index first via file_read on \
+                          apps/fable/cards/<card_id>/session.json (the messages \
+                          array). Clears the message's raw_model_output (it \
+                          will not be KV-cache-coherent for that turn). \"
+                          No-op on system messages."
+                .into(),
+        },
+        ToolSpec {
+            name: "fable_message_delete".into(),
+            description: "Permanently remove one message from the active Fable \
+                          session by its 0-based array index. Args: \
+                          {\"index\": 3}. Subsequent messages shift down. Use \
+                          sparingly — fable_message_edit is usually better \
+                          (preserves narrative continuity)."
+                .into(),
+        },
+        ToolSpec {
+            name: "fable_schema_patch".into(),
+            description: "Merge a partial WorldSchema JSON into the active \
+                          Fable session's tracked state. Args: \
+                          {\"patch\": {<partial WorldSchema>}}. Per top-level \
+                          key in the patch: entities shallow-merges (null \
+                          value deletes a key); every other field full-\
+                          replaces via typed deserialize. Excludes \
+                          immutable_keys (the meta-lock). Pushes prior state \
+                          to the undo buffer + persists. Read current state \
+                          first via file_read on apps/fable/cards/<card_id>/\
+                          {world,player,npc}.json."
+                .into(),
+        },
+    ]
+}
+
+/// Cheap structural validation for the three stateful tools. Mirrors the
+/// `Tool::validate_args` contract: returns a model-facing error string on
+/// failure. Stateful precondition checks (e.g. "is fable_session seated?")
+/// happen in `dispatch_fable_state_tool` — this is purely the args shape.
+pub fn validate_fable_state_tool(
+    name: &str,
+    args: &serde_json::Value,
+) -> Result<(), ToolError> {
+    match name {
+        "fable_message_edit" => {
+            let idx = args
+                .get("index")
+                .and_then(|v| v.as_u64())
+                .ok_or_else(|| ToolError::new("missing or non-integer argument `index`"))?;
+            if idx > i32::MAX as u64 {
+                return Err(ToolError::new("`index` is implausibly large"));
+            }
+            let content = args
+                .get("content")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| ToolError::new("missing or non-string argument `content`"))?;
+            if content.len() > 50_000 {
+                return Err(ToolError::new("`content` exceeds 50 KB cap"));
+            }
+            Ok(())
+        }
+        "fable_message_delete" => {
+            let idx = args
+                .get("index")
+                .and_then(|v| v.as_u64())
+                .ok_or_else(|| ToolError::new("missing or non-integer argument `index`"))?;
+            if idx > i32::MAX as u64 {
+                return Err(ToolError::new("`index` is implausibly large"));
+            }
+            Ok(())
+        }
+        "fable_schema_patch" => {
+            let patch = args
+                .get("patch")
+                .ok_or_else(|| ToolError::new("missing argument `patch`"))?;
+            if !patch.is_object() {
+                return Err(ToolError::new("`patch` must be a JSON object"));
+            }
+            // Hard-cap the serialized patch so the model can't balloon the
+            // system prompt with a 50 KB schema write. 100 KB is generous
+            // (a full WorldSchema typically serializes to <10 KB).
+            let serialized = serde_json::to_string(patch).unwrap_or_default();
+            if serialized.len() > 100_000 {
+                return Err(ToolError::new(
+                    "`patch` serializes to >100 KB; split into smaller patches",
+                ));
+            }
+            Ok(())
+        }
+        _ => Err(ToolError::new(format!(
+            "not a fable-state tool: {name}"
+        ))),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -986,6 +1118,87 @@ mod tests {
     #[test]
     fn not_writable_empty_path() {
         assert!(!is_writable(Path::new("")));
+    }
+
+    // === Fable-state tool specs + validation (2026-08-11) ===================
+
+    #[test]
+    fn fable_state_specs_lists_three_tools() {
+        let s = fable_state_specs();
+        let names: Vec<&str> = s.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(names, vec!["fable_message_edit", "fable_message_delete", "fable_schema_patch"]);
+        // Each spec must carry a non-empty description (it's the model's only
+        // guidance).
+        for spec in &s {
+            assert!(!spec.description.trim().is_empty(), "empty description for {}", spec.name);
+        }
+    }
+
+    #[test]
+    fn is_fable_state_tool_matches_three_names() {
+        assert!(is_fable_state_tool("fable_message_edit"));
+        assert!(is_fable_state_tool("fable_message_delete"));
+        assert!(is_fable_state_tool("fable_schema_patch"));
+        // Negative cases: file tools + unknowns don't match.
+        assert!(!is_fable_state_tool("file_read"));
+        assert!(!is_fable_state_tool(""));
+        assert!(!is_fable_state_tool("fable_schema_patch_typo"));
+    }
+
+    #[test]
+    fn validate_fable_message_edit_requires_index_and_content() {
+        // Happy path.
+        let ok = args(r#"{"index": 3, "content": "fixed"}"#);
+        validate_fable_state_tool("fable_message_edit", &ok).expect("valid args");
+        // Missing index.
+        let miss = args(r#"{"content": "x"}"#);
+        let err = validate_fable_state_tool("fable_message_edit", &miss).expect_err("missing index");
+        assert!(err.to_string().contains("index"));
+        // Missing content.
+        let miss = args(r#"{"index": 0}"#);
+        let err = validate_fable_state_tool("fable_message_edit", &miss).expect_err("missing content");
+        assert!(err.to_string().contains("content"));
+        // Non-integer index.
+        let bad = args(r#"{"index": "three", "content": "x"}"#);
+        validate_fable_state_tool("fable_message_edit", &bad).expect_err("non-int index");
+        // Content over cap.
+        let huge = serde_json::json!({ "index": 0, "content": "x".repeat(50_001) });
+        let err = validate_fable_state_tool("fable_message_edit", &huge).expect_err("content too big");
+        assert!(err.to_string().contains("50 KB"));
+    }
+
+    #[test]
+    fn validate_fable_message_delete_requires_index() {
+        validate_fable_state_tool("fable_message_delete", &args(r#"{"index": 7}"#))
+            .expect("valid");
+        validate_fable_state_tool("fable_message_delete", &args(r#"{}"#))
+            .expect_err("missing index");
+    }
+
+    #[test]
+    fn validate_fable_schema_patch_requires_object_patch() {
+        // Happy path: any JSON object.
+        validate_fable_state_tool(
+            "fable_schema_patch",
+            &args(r#"{"patch": {"summary": "new arc"}}"#),
+        )
+        .expect("valid");
+        // Missing patch.
+        validate_fable_state_tool("fable_schema_patch", &args(r#"{}"#))
+            .expect_err("missing patch");
+        // Non-object patch.
+        validate_fable_state_tool(
+            "fable_schema_patch",
+            &args(r#"{"patch": ["not", "an", "object"]}"#),
+        )
+        .expect_err("non-object patch");
+    }
+
+    #[test]
+    fn validate_fable_state_tool_unknown_name_errors() {
+        let err = validate_fable_state_tool("file_read", &args("{}"))
+            .expect_err("not a stateful tool");
+        assert!(err.to_string().contains("not a fable-state tool"));
     }
 
     // === Tool round-trips (use tempdir) =====================================

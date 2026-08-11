@@ -3,7 +3,6 @@ import { listen } from '@tauri-apps/api/event';
 import { getVersion } from '@tauri-apps/api/app';
 import { initFable, launchFable } from './fable/fable.js';
 import { initPrism } from './prism/prism.js';
-import { showApiTimeout, dismissApiTimeout } from './api-timeout-bubble.js';
 // Shell-wide rapid-click / double-launch guard (src/shell-guard.js). Importing
 // it self-registers the capture-phase click/pointerdown swallower on `document`
 // + exposes withShellBusy to wrap the shell-chrome transition entry points
@@ -504,6 +503,19 @@ const DEV_QUICKPLAY_SHORTCUT = (() => {
     return new URLSearchParams(h).get('dev') === 'quickplay';
   } catch (_) { return false; }
 })();
+// DEV SHORTCUT (?dev=preview or #dev=preview): a PURE-FRONTEND layout preview
+// that skips the OS boot, skips Fable's title, skips ALL backend/IPC (no model
+// load, no API, no fable_send), and drops straight into the chat stage with 4
+// hardcoded placeholder messages + 2 placeholder portraits. Purpose: iterate
+// on the VN chat UI visually without launching a real game. Refresh lands in
+// the stage instantly. False in production (query/hash absent under Tauri).
+const DEV_PREVIEW_SHORTCUT = (() => {
+  try {
+    if (new URLSearchParams(window.location.search).get('dev') === 'preview') return true;
+    const h = window.location.hash.replace(/^#/, '');
+    return new URLSearchParams(h).get('dev') === 'preview';
+  } catch (_) { return false; }
+})();
 
 // The running app version, resolved by runBootGate() via getVersion() before
 // the cosmetic terminal stream starts. Referenced by the first TERMINAL_LINES
@@ -554,22 +566,19 @@ window.addEventListener('focus', () => {
 // with the circle" bug) AND fight the boot gate.
 
 // "WUPI" title: live AI-status indicator
-// The title reflects the live state of the MAIN chat model (local 12B OR the
-// connected API model: NOT Agent.gguf, which runs on its own thread and
-// never drives chat_send). Three states:
+// The title reflects the live state of the chat model. Wupi chat is LOCAL-ONLY
+// (2026-08-08 override): the local 12B is ALWAYS the chat model — the API is
+// reserved exclusively for Fable narration (a separate path). Three states:
 //   - 'idle'    : connected, not generating → steady medium white glow
-//   - 'offline' : no AI connected (boot pre-load, ONLINE w/ no profile,
-//                 connect error, or a mode swap in progress) → fast red flash
-//   - 'typing'  : main model actively generating tokens → subtle random
+//   - 'offline' : boot pre-load or model error → fast red flash
+//   - 'typing'  : local model actively generating tokens → subtle random
 //                 white pulse spurts driven by a jittered setTimeout loop
 //                 (CSS can't do random timing).
 //
 // State inputs:
-//   1. The `model-status` Tauri event: Rust already emits ready/error/
-//      no_model at boot + on api_disconnect reload; this is the offline/idle
-//      authority. We just never listened before.
+//   1. The `model-status` Tauri event: Rust emits ready/error/no_model at
+//      boot; this is the offline/idle authority.
 //   2. The chat IIFE's setGenerating() flag: bridges to 'typing'/'idle'.
-//   3. The AI panel's mode swaps: calls 'offline' while a swap is pending.
 const osTitleEl = document.querySelector('.os-title');
 let titleState = 'idle';      // 'idle' | 'offline' | 'typing'
 let titleFlickerTimer = null;  // the setTimeout handle for the typing pulse
@@ -1030,6 +1039,18 @@ function spawnLaunchSparkles(parent, count = 18) {
   // initFable() runs (see the DEV_*_SHORTCUT block in the app wiring). We
   // still honor check_models: on first-run (models missing) we let the
   // download overlay do its job and bail just like the normal path.
+  // DEV PREVIEW: pure-frontend layout preview — no models, no API, no IPC.
+  // Clear the boot DOM + classes + bail; the app-wiring block below launches
+  // Fable (which routes preview to devPreviewEnter, never invoking anything).
+  if (DEV_PREVIEW_SHORTCUT) {
+    console.log('[Wupi] dev-preview: pure-frontend layout preview (no backend)');
+    document.getElementById('boot-paw')?.remove();
+    document.getElementById('boot-loading')?.remove();
+    document.body.classList.remove('booting', 'loading');
+    bootDone = true;
+    return;
+  }
+
   if (DEV_FABLE_SHORTCUT || DEV_QUICKPLAY_SHORTCUT) {
     const tag = DEV_QUICKPLAY_SHORTCUT ? 'dev-quickplay' : 'dev-fable';
     try {
@@ -2888,12 +2909,7 @@ const dropdownMenu = document.getElementById('dropdownMenu');
     const addBtn = document.getElementById('aiAddBtn');
     const editProfileBtn = document.getElementById('aiEditProfileBtn');
     const deleteProfileBtn = document.getElementById('aiDeleteProfileBtn');
-    const localConnectBtn = document.getElementById('aiLocalConnectBtn');
     const statusEl = document.getElementById('apiStatus');
-    const modeLocalBtn = document.getElementById('aiModeLocal');
-    const modeOnlineBtn = document.getElementById('aiModeOnline');
-    const localSection = document.getElementById('aiLocalSection');
-    const onlineSection = document.getElementById('aiOnlineSection');
     const profileSelect = document.getElementById('aiProfileSelect');
     const modelSelect = document.getElementById('apiModel');
     const onlineBubble = document.getElementById('aiOnlineBubble');
@@ -2901,13 +2917,11 @@ const dropdownMenu = document.getElementById('dropdownMenu');
 
     let editingId = null; // null = creating; string = editing existing
     let lastConfig = null; // cached for rendering
-    let currentMode = 'local'; // UI view: 'local' | 'online'
-    let runtimeSource = 'local'; // actual backend source
+    let runtimeSource = 'local'; // actual backend source (api = Fable-narrator connected)
     let activeProfileId = null; // currently-connected profile (mirror of backend)
     // Model cache: profileId → { ids: [..], selected: str }. Avoids refetching
     // /models when toggling between already-loaded profiles.
     const modelCache = new Map();
-    let modeInitialized = false;
 
     function setStatus(msg, kind) {
       statusEl.textContent = msg || '';
@@ -2974,7 +2988,7 @@ const dropdownMenu = document.getElementById('dropdownMenu');
     //     preview of what Connect will activate, no glow
     //   - nothing picked: muted "No profile connected"
     function renderOnlineBubble() {
-      // Connected: runtime actually on API with an active profile.
+      // Connected: API profile active (reserved for Fable narration).
       if (runtimeSource === 'api' && activeProfileId) {
         const p = findProfile(activeProfileId);
         if (p) {
@@ -3006,7 +3020,7 @@ const dropdownMenu = document.getElementById('dropdownMenu');
       }
       // Nothing useful to show.
       onlineBubble.classList.remove('active', 'pending');
-      onlineBubble.innerHTML = '<span class="ai-online-bubble-text">No profile connected</span>';
+      onlineBubble.innerHTML = '<span class="ai-online-bubble-text">No API connected</span>';
     }
 
     // Fetch /models for a profile + populate the model dropdown. Cached per
@@ -3076,15 +3090,6 @@ const dropdownMenu = document.getElementById('dropdownMenu');
       connectBtn.disabled = !ready;
     }
 
-    // Apply the current UI mode to the DOM. Pure view; no backend call.
-    function applyMode() {
-      panel.dataset.mode = currentMode;
-      modeLocalBtn.classList.toggle('active', currentMode === 'local');
-      modeOnlineBtn.classList.toggle('active', currentMode === 'online');
-      localSection.classList.toggle('hidden', currentMode !== 'local');
-      onlineSection.classList.toggle('visible', currentMode === 'online');
-    }
-
     async function refresh() {
       try {
         const config = await invoke('api_profiles_list');
@@ -3094,18 +3099,11 @@ const dropdownMenu = document.getElementById('dropdownMenu');
         activeProfileId = config.active_profile_id || null;
         renderProfileSelect(config);
         renderOnlineBubble();
-        // Seed the mode from the backend ONCE on first refresh. After that
-        // the mode is the user's click: refresh() must never clobber it.
-        if (!modeInitialized) {
-          currentMode = runtimeSource === 'api' ? 'online' : 'local';
-          modeInitialized = true;
-          applyMode();
-        }
         // ALWAYS populate the model dropdown for the currently-selected
         // profile (if any). Programmatic .value = ... doesn't fire the
         // change event, so this is the only reliable way to keep the model
         // list in sync after a refresh.
-        if (currentMode === 'online' && profileSelect.value) {
+        if (profileSelect.value) {
           await populateModelDropdown(findProfile(profileSelect.value));
         }
         updateConnectEnabled();
@@ -3114,49 +3112,6 @@ const dropdownMenu = document.getElementById('dropdownMenu');
         setStatus('Load failed: ' + err, 'err');
       }
     }
-
-    // Clicking LOCAL: disconnect API (if on API), reload the 12B. Clicking
-    // ONLINE: reconnect the last-used API profile + model. No separate
-    // disconnect affordance: you pick one or the other.
-    modeLocalBtn?.addEventListener('click', async () => {
-      if (currentMode === 'local' && runtimeSource === 'local') return;
-      currentMode = 'local';
-      applyMode();
-      if (runtimeSource === 'api') {
-        setTitleState('offline'); // red while the 12B reloads
-        setStatus('Disconnecting API: reloading WUPI 12B…', '');
-        try {
-          await invoke('api_disconnect');
-          setStatus('Back on local WUPI 12B.', 'ok');
-        } catch (err) {
-          setStatus('Disconnect failed: ' + err + '.', 'err');
-        }
-        await refresh();
-      }
-    });
-
-    modeOnlineBtn?.addEventListener('click', async () => {
-      currentMode = 'online';
-      applyMode();
-      // If a profile is already connected, nothing to do: just show it.
-      if (runtimeSource === 'api' && activeProfileId) return;
-      // Reconnect the last-used profile if one exists.
-      if (activeProfileId) {
-        setTitleState('offline');
-        setStatus('Connecting last-used profile…', '');
-        try {
-          await invoke('api_connect', { profileId: activeProfileId });
-          setStatus('Connected.', 'ok');
-        } catch (err) {
-          setStatus('Connect failed: ' + err + ': still on local.', 'err');
-          setTitleState('idle');
-        }
-        await refresh();
-      } else {
-        // No active profile: ONLINE view is up, user picks one + hits Connect.
-        setStatus('');
-      }
-    });
 
     // When the dropdown has no real selection (zero-profile state: the
     // "Create a New Profile" placeholder is selected), focus the editor so
@@ -3220,9 +3175,9 @@ const dropdownMenu = document.getElementById('dropdownMenu');
       connectBtn.disabled = true;
       try {
         await invoke('api_connect', { profileId });
-        setStatus('Connected: chat via API now.', 'ok');
+        setStatus('Connected: API ready for Fable narration.', 'ok');
       } catch (err) {
-        setStatus('Connect failed: ' + err + ': still on local.', 'err');
+        setStatus('Connect failed: ' + err + '.', 'err');
         setTitleState('idle');
       }
       await refresh();
@@ -3307,27 +3262,6 @@ const dropdownMenu = document.getElementById('dropdownMenu');
         await refresh();
       } catch (err) {
         setStatus('Delete failed: ' + err, 'err');
-      }
-    });
-
-    // LOCAL is always "connected" to the 12B by design: clicking Connect
-    // here is visual parity with ONLINE. If the runtime is somehow on API
-    // (user connected then peeked at LOCAL), this triggers the disconnect +
-    // 12B reload. Otherwise it's a no-op confirmation.
-    localConnectBtn?.addEventListener('click', async () => {
-      if (runtimeSource === 'api') {
-        setTitleState('offline');
-        localConnectBtn.disabled = true;
-        setStatus('Disconnecting API: reloading WUPI 12B…', '');
-        try {
-          await invoke('api_disconnect');
-          setStatus('Back on local WUPI 12B.', 'ok');
-        } catch (err) {
-          setStatus('Disconnect failed: ' + err, 'err');
-        }
-        await refresh();
-      } else {
-        setStatus('Already on local WUPI 12B.', 'ok');
       }
     });
 
@@ -3469,15 +3403,7 @@ const dropdownMenu = document.getElementById('dropdownMenu');
               : `✗ ${e.name || 'tool'}: ${e.output || 'failed'}`;
             scrollBottom();
           }
-        } else if (e.type === 'api_timeout') {
-          // API TTFT deadline elapsed (no first token in 10s) — the turn is
-          // being handled by Local fallback. Show the persistent top-center
-          // error bubble; it dismisses on click or on the next successful
-          // turn (see the 'done' branch below).
-          showApiTimeout();
         } else if (e.type === 'done') {
-          // Successful turn — clear any lingering timeout bubble.
-          dismissApiTimeout();
           setGenerating(false);
           const finalText = e.final_text != null ? e.final_text : streamed;
           finalizeWupiBubble(bubble, finalText);
@@ -3573,9 +3499,11 @@ initFable({
 // the roleplay stage (auto-resume if a quicksave exists, else a fresh seed
 // from DEFAULT_QUICKPLAY_VALUES). Production builds never hit this (the param
 // is absent under Tauri's custom protocol).
-if (DEV_FABLE_SHORTCUT || DEV_QUICKPLAY_SHORTCUT) {
+if (DEV_FABLE_SHORTCUT || DEV_QUICKPLAY_SHORTCUT || DEV_PREVIEW_SHORTCUT) {
   // launchFable is now async + API-gated (2026-08-07); the gate popup will
-  // fire if no API is connected, even on the dev shortcut.
+  // fire if no API is connected, even on the dev shortcut. The dev-preview
+  // path is pure-frontend (no backend) — the import.meta.env.DEV bypass in
+  // launchFable already skips the API gate for it.
   launchFable().catch((e) => console.error('[Wupi] dev auto-launch failed', e));
 }
 

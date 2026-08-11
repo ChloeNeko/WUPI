@@ -1,16 +1,20 @@
 // =============================================================
 // SCREEN: SAVES — the save-slot list (Load Game flow, step 2).
 //
-// Reached after picking a world (screens/worlds.js). Reads SaveMeta for that
-// world from fable_list_saves:
+// Reached after picking a world (screens/worlds.js) + clicking LOAD on its
+// modal. Reads SaveMeta for that world from fable_list_saves:
 //   { save_id, name, summary, timestamp, turn_count, is_autosave }
-// Every slot — manual AND autosave — is listed AND deletable here. Autosaves
-// still carry an "auto" tag for visual distinction (they're the per-turn
-// checkpoint) but are not protected from deletion (the user may want to clear
-// the recovery checkpoint, and deleting an autosave is harmless — the next
-// turn simply writes a fresh one).
 //
-// Load    → onSelect(save). Delete → fable_delete_save, then re-render.
+// The per-turn AUTOSAVE is promoted to a one-click "Resume Latest" button at
+// the top of the list — it IS the world's latest state. (There is no separate
+// per-card quicksave: "quicksave" is a Quick-Play-only concept. Resume Latest
+// reuses the autosave, which is exactly what CONTINUE on the title screen
+// resumes too.) The list below shows the MANUAL saves only (most-recent
+// first; the backend sorts by timestamp desc). Each manual row is Load +
+// Delete; the autosave button is resume-only (deleting it is pointless — the
+// next turn writes a fresh one).
+//
+// Load → onSelect(save) → resumeSave. Delete → fable_delete_save → re-render.
 // =============================================================
 
 import { listSaves, deleteSave } from '../engine/saves-io.js';
@@ -59,18 +63,46 @@ export async function renderSaves(root, cardId, onSelect, cardName) {
     host.innerHTML = `<div class="fable-saves-empty">Couldn't load saves: ${esc(err)}</div>`;
     return;
   }
-  if (!saves.length) {
-    host.innerHTML = `<div class="fable-saves-empty">
-      <p>No saved fable yet for this world.</p>
-    </div>`;
+  // The autosave is the per-turn checkpoint = the world's latest state. Promote
+  // it to a one-click Resume Latest button at the top; the list below shows the
+  // manual saves only. (No per-card quicksave exists — Resume Latest reuses the
+  // autosave, the same slot CONTINUE on the title screen resumes.)
+  const autosave = saves.find((s) => s.is_autosave) || null;
+  const manuals = saves.filter((s) => !s.is_autosave);
+
+  if (autosave) {
+    const resume = document.createElement('button');
+    resume.type = 'button';
+    resume.className = 'fable-save-resume-latest';
+    resume.innerHTML = `
+      <span class="fable-save-resume-latest-main">
+        <span class="fable-save-resume-latest-label">Resume Latest</span>
+        ${autosave.summary ? `<span class="fable-save-resume-latest-summary">${esc(autosave.summary)}</span>` : ''}
+      </span>
+      <span class="fable-save-resume-latest-meta">${autosave.turn_count ? autosave.turn_count + ' turns · ' : ''}${fmtTime(autosave.timestamp)}</span>
+    `;
+    resume.addEventListener('click', () => onSelect(autosave));
+    host.appendChild(resume);
+  }
+
+  if (!manuals.length) {
+    // No manual saves. If the Resume Latest button is shown, a soft hint
+    // suffices; otherwise this world has no saves at all.
+    const empty = document.createElement('div');
+    empty.className = 'fable-saves-empty';
+    empty.innerHTML = autosave
+      ? `<p>No manual saves yet for this world.</p>`
+      : `<p>No saved fable yet for this world.</p>`;
+    host.appendChild(empty);
     return;
   }
-  for (const save of saves) {
+
+  for (const save of manuals) {
     const row = document.createElement('div');
-    row.className = 'fable-save-row' + (save.is_autosave ? ' autosave' : '');
+    row.className = 'fable-save-row';
     row.innerHTML = `
       <div class="fable-save-info">
-        <div class="fable-save-name">${esc(save.name)}${save.is_autosave ? '<span class="fable-save-tag">auto</span>' : ''}</div>
+        <div class="fable-save-name">${esc(save.name)}</div>
         ${save.summary ? `<div class="fable-save-summary">${esc(save.summary)}</div>` : ''}
         <div class="fable-save-meta">${save.turn_count ? save.turn_count + ' turns · ' : ''}${fmtTime(save.timestamp)}</div>
       </div>

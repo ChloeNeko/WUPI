@@ -196,6 +196,14 @@ struct ChatRequestMessage {
 /// `content` is `Option` because the first chunk typically carries only `role`,
 /// and the final chunk carries `finish_reason` instead. Everything else is
 /// ignored: we only want the delta text.
+///
+/// `reasoning_content` (2026-08-09): GLM-5.2 (and other reasoning models) stream
+/// their chain-of-thought in a SEPARATE `reasoning_content` delta field BEFORE
+/// the first `content` token. We do NOT render reasoning (the API narrator must
+/// never think, §3A) — but we DO need to know a token arrived so the TTFT
+/// deadline retires (else a long reasoning phase trips the 10s timeout →
+/// `api_lost`). The field is parsed + checked for "is the stream alive?" but
+/// its body is discarded.
 #[derive(serde::Deserialize)]
 struct ChatStreamChunk {
     choices: Vec<ChatStreamChoice>,
@@ -208,6 +216,10 @@ struct ChatStreamChoice {
 struct ChatStreamDelta {
     #[serde(default)]
     content: Option<String>,
+    /// GLM-5.2 reasoning-model chain-of-thought. Parsed so the TTFT deadline
+    /// can retire on it; the body is discarded (never rendered, never stored).
+    #[serde(default)]
+    reasoning_content: Option<String>,
 }
 
 /// v0.7: enforce a soft char-budget on the API message payload by dropping the
@@ -332,12 +344,23 @@ impl GenerationClient for HttpBackend {
             // defeats the whole point of the API path. Cloud providers
             // handle their own sampler internals behind temperature/top_p,
             // so the llama.cpp-specific knobs add no value here anyway.
+            //
+            // PRECISION (2026-08-09): GLM-5.2 rejects top_p/temperature with
+            // more than 2 decimal places (HTTP 400 code 1210 "限制小数点[2]位").
+            // API_TEMP/API_TOP_P are `f32`, + the `json!` macro promotes f32 →
+            // f64 for serialization, so `0.95_f32` becomes `0.949999988079071`
+            // (16 places) → instant 400. Round to 2 decimals (as f64) BEFORE
+            // serialization so the JSON emits clean `0.95`/`0.85`. The profile's
+            // own temperature (also f32) gets the same treatment.
+            let temp_val = temperature.unwrap_or(crate::settings::API_TEMP) as f64;
+            let temp_r = (temp_val * 100.0).round() / 100.0;
+            let topp_r = ((crate::settings::API_TOP_P as f64) * 100.0).round() / 100.0;
             let body = serde_json::json!({
                 "model": model,
                 "messages": wire_messages,
                 "stream": true,
-                "temperature": temperature.unwrap_or(crate::settings::API_TEMP),
-                "top_p": crate::settings::API_TOP_P,
+                "temperature": temp_r,
+                "top_p": topp_r,
             });
 
             let response = client
@@ -435,6 +458,19 @@ impl GenerationClient for HttpBackend {
                     // about). A malformed chunk must never kill the stream.
                     if let Ok(parsed) = serde_json::from_str::<ChatStreamChunk>(data) {
                         if let Some(choice) = parsed.choices.into_iter().next() {
+                            // GLM-5.2 (a reasoning model) streams its chain-of-
+                            // thought in `reasoning_content` BEFORE the first
+                            // `content` token. The reasoning body is DISCARDED
+                            // (the API narrator never thinks, §3A) — but the
+                            // arrival of a reasoning token proves the stream is
+                            // alive, so retire the TTFT deadline on it. Without
+                            // this, a long reasoning phase trips the 10s
+                            // first-token timeout → `api_lost` mid-narration.
+                            if let Some(rc) = choice.delta.reasoning_content {
+                                if !rc.is_empty() {
+                                    got_first_token = true;
+                                }
+                            }
                             if let Some(piece) = choice.delta.content {
                                 if !piece.is_empty() {
                                     // First content token landed — retire the

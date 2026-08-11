@@ -142,7 +142,10 @@ pub fn render_translation_prompt(
     // reasons before emitting JSON. Output flows through schema_engine's
     // generate_with_repair, which strips the thought before parsing (see
     // schema_engine.rs generate_with_repair + extract_reply_channel).
-    out.push_str("<|think|>");
+    // DISABLED 2026-08-09 (`THINKING_ENABLED`) — see settings.rs.
+    if crate::settings::THINKING_ENABLED {
+        out.push_str("<|think|>");
+    }
     out.push_str("<turn|>\n");
     out.push_str("<|turn>user\n");
     out.push_str("Current world state:\n");
@@ -201,7 +204,10 @@ pub fn render_quick_play_seed_prompt(
     out.push_str("<|turn>system\n");
     out.push_str(SEED_INSTRUCTION);
     // Always-on thinking (translation prompt above documents the pipeline).
-    out.push_str("<|think|>");
+    // DISABLED 2026-08-09 (`THINKING_ENABLED`) — see settings.rs.
+    if crate::settings::THINKING_ENABLED {
+        out.push_str("<|think|>");
+    }
     out.push_str("<turn|>\n");
     out.push_str("<|turn>user\n");
     out.push_str("Current world state (empty — you are seeding it):\n");
@@ -217,6 +223,93 @@ pub fn render_quick_play_seed_prompt(
     out.push_str("<|turn>model\n");
     out
 }
+
+/// Render the BOOTSTRAP prompt (2026-08-10): derive the starting clock + weather
+/// + opening location from a card's `.intro` text (the one-shot first narrator
+/// beat) when no `<start>` block seeded them. This is the cold-start anchor gap
+/// fix for Creator-authored cards that ship no `<locations>`/`<start>`: the
+/// tracker renders no `clock:`/`weather:` line while those are dormant → it has
+/// nothing to maintain → `[TIME]`/`[WEATHER]` never fire. Seeding the anchors
+/// from the intro gives the tracker its baseline from turn 1.
+///
+/// Sibling of `render_quick_play_seed_prompt` (same `<|turn>` framing, same
+/// `THINKING_ENABLED` gate). Runs on the schema engine's isolated context at
+/// `enter_fable_session` time (NOT inside `fable_send` — the schema engine's
+/// VRAM lease conflicts with the Fable lease held mid-turn). The reply is
+/// parsed by `schema::BootstrapAnchors::from_model_output` (NOT `SchemaDelta` —
+/// `apply_delta` is test-pinned to never touch clock/weather). Generic
+/// angle-bracket templates only (anti-pattern #4: no concrete copyable
+/// examples).
+///
+/// `intro_text` is the full `.intro` (may be empty when a card has no intro —
+/// the caller then relies on sensible defaults instead). `setting`/`tone`/
+/// `player_name` carry the card's authored identity for extra context.
+pub fn render_bootstrap_prompt(
+    intro_text: &str,
+    setting: Option<&str>,
+    tone: Option<&str>,
+    player_name: Option<&str>,
+) -> String {
+    let mut out = String::with_capacity(1024);
+    out.push_str("<|turn>system\n");
+    out.push_str(BOOTSTRAP_INSTRUCTION);
+    // Same thinking gate as the other schema passes (§3A — currently OFF).
+    if crate::settings::THINKING_ENABLED {
+        out.push_str("<|think|>");
+    }
+    out.push_str("<turn|>\n");
+    out.push_str("<|turn>user\n");
+    out.push_str("Opening scene (the first narrator beat):\n");
+    out.push_str(intro_text.trim());
+    if let Some(s) = setting.filter(|s| !s.trim().is_empty()) {
+        out.push_str("\n\nWorld setting:\n");
+        out.push_str(s.trim());
+    }
+    if let Some(t) = tone.filter(|t| !t.trim().is_empty()) {
+        out.push_str("\n\nTone:\n");
+        out.push_str(t.trim());
+    }
+    if let Some(p) = player_name.filter(|p| !p.trim().is_empty()) {
+        out.push_str("\n\nPlayer character: ");
+        out.push_str(p.trim());
+    }
+    out.push_str(
+        "\n\nEmit ONLY the JSON object with the anchors the opening scene establishes. \
+         Omit any field the scene does not clearly establish — do not invent.\n",
+    );
+    out.push_str("<turn|>\n");
+    out.push_str("<|turn>model\n");
+    out
+}
+
+const BOOTSTRAP_INSTRUCTION: &str = "\
+You are deriving the starting world-state anchors for a roleplay scene from its\n\
+opening narration. Read the opening scene + extract three anchors the scene\n\
+establishes, emitting each as a JSON field (omit any the scene does not set):
+
+{\n\
+  \"time\": \"<Day N, HH:MM in 24h>\" — the in-world time the scene opens at.\n\
+     Infer from cues like time of day, lighting, or explicit time words. Use the\n\
+     form \"Day N, HH:MM\" (Day is 1-indexed; 24h clock). If the scene spans an\n\
+     undefined moment with no time signal, omit.\n\
+  \"weather\": \"<one short phrase>\" — the sky / atmospheric condition.\n\
+     e.g. fog, heavy rain, clear night, snowfall. If the scene is indoors with\n\
+     no outside cue, omit.\n\
+  \"location_id\": \"<bare slug>\" — a snake_case id for the opening location.\n\
+     Derive from the place name (e.g. \"crooked_lantern\"). Pair with\n\
+     location_name. If the scene has no specific place, omit BOTH location\n\
+     fields.\n\
+  \"location_name\": \"<diegetic name>\" — the place's full prose name\n\
+     (e.g. \"The Crooked Lantern\").\n\
+}\n\
+\n\
+Rules:\n\
+ - Emit raw JSON only. No markdown fences, no <|channel> protocol markers.\n\
+ - Omit a field rather than guessing. A partial extraction is correct; the\n\
+   caller fills gaps with sensible defaults.\n\
+ - \"time\" MUST be the \"Day N, HH:MM\" form so it parses. Never a bare word\n\
+   like \"night\" or \"morning\" — convert to the nearest HH:MM.\n\
+ - Slugs are lowercase snake_case (letters/digits/underscores only).";
 
 const SEED_INSTRUCTION: &str = "\
 You are seeding an EMPTY roleplay world from three free-text descriptions.

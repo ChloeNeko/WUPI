@@ -109,6 +109,47 @@ pub struct CardNpc {
     pub aliases: Vec<String>,
 }
 
+/// The starting world-state anchors authored in a `.sim` card's `<start>`
+/// block (2026-08-10, Issue #2 — the cold-start anchor gap). A fresh game's
+/// `WorldClock` + `Weather` are dormant (zero/unset) until the first
+/// `[TIME]`/`[WEATHER]` bracket lands — but the tracker renders no `clock:`/
+/// `weather:` line while dormant, so it has nothing to maintain, and the
+/// brackets never fire. The `<start>` block lets a card author seed the
+/// initial time + weather so both lines render from turn 1, giving the
+/// tracker the anchors it needs to advance/change them as the scene moves.
+///
+/// Parsed from (both children optional; flat-first, `<scenario>` back-compat):
+/// ```xml
+/// <start>
+///   <time>Day 1, 08:00</time>
+///   <weather>thick fog off the marsh</weather>
+/// </start>
+/// ```
+/// `time` is a free-form in-world time string parsed by
+/// `bracket_parser::parse_in_world_time` (the same parser `[TIME]` uses —
+/// accepts "Day N, HH:MM", 12h with AM/PM, calendar dates). `None` when
+/// absent or unparseable → the clock stays dormant (pre-start-block behavior).
+/// `weather` is a free-form diegetic condition phrase seeded verbatim into
+/// `Weather.condition`. `None` when absent → weather stays dormant.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default)]
+pub struct CardStart {
+    /// In-world minutes since 0001-01-01, the resolved form of the authored
+    /// `<time>` string. `None` when no `<time>` was authored or it didn't
+    /// parse → the clock is NOT seeded (stays dormant, pre-start behavior).
+    /// `fable_start` writes this directly into `WorldClock.current_minutes`
+    /// AND `last_tick_minutes` (so the seed counts as the baseline — no
+    /// immediate World Progression tick fires on turn 1).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub time_minutes: Option<i64>,
+    /// Diegetic condition phrase ("thick fog off the marsh"). `None` when no
+    /// `<weather>` was authored → weather is NOT seeded. `fable_start` writes
+    /// this into `Weather.condition` + stamps `started_at_minutes` to the
+    /// seeded clock (or 0 when the clock is also unseeded — the dormant
+    /// baseline, harmless).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub weather: Option<String>,
+}
+
 /// One Simulation Card, parsed from a `.sim` file. Owned and immutable for the
 /// process lifetime after `setup()` loads it.
 ///
@@ -257,6 +298,15 @@ pub struct SimCard {
     /// whitelist the narrator obeys.
     #[serde(default)]
     pub cast: Vec<CardNpc>,
+    /// Fable cold-start anchors (2026-08-10, Issue #2): the optional `<start>`
+    /// block's seeded initial time + weather. Empty `Default` (no seed) for
+    /// system cards + roleplay cards that omit the block — the clock + weather
+    /// stay dormant until the first `[TIME]`/`[WEATHER]` bracket (the
+    /// pre-start-block behavior). When populated, `fable_start` seeds
+    /// `WorldClock` + `Weather` so both render from turn 1, giving the tracker
+    /// the anchors it needs to maintain them. See [`CardStart`].
+    #[serde(default)]
+    pub start: CardStart,
 }
 
 impl SimCard {
@@ -377,6 +427,7 @@ pub fn fallback() -> SimCard {
         player_name: None,
         locations: Vec::new(),
         cast: Vec::new(),
+        start: CardStart::default(),
     }
 }
 
@@ -568,12 +619,38 @@ fn parse(xml: &str) -> anyhow::Result<SimCard> {
                         .trim()
                         .to_owned();
                     let name = child_text(node_el, "name").unwrap_or_default();
-                    let neighbors: Vec<String> = node_el
+                    // Postel's law for adjacency edges (2026-08-10, Issue #1):
+                    // accept BOTH authoring shapes so a card author can't break
+                    // their travel graph over a typo'd 's':
+                    //   (a) FLAT — one <neighbor> child element per edge:
+                    //         <neighbor>cellar</neighbor>
+                    //         <neighbor>market_square</neighbor>
+                    //     (the canonical form documented in rusty_tavern.sim)
+                    //   (b) WRAPPED — a single <neighbors> element holding a
+                    //     comma- and/or whitespace-separated id list:
+                    //         <neighbors>market_square, warehouse_docks</neighbors>
+                    //     (the form the hand-authored cinderfen card used — every
+                    //     node parsed with neighbors: [] because only <neighbor>
+                    //     singular was recognized, freezing travel graph-wide).
+                    // Both forms may combine; flat children are collected first,
+                    // then the wrapped element's ids are split + appended. Dupes
+                    // are NOT deduped here (the schema's upsert_node is the
+                    // idempotent back-link authority; a harmless double-edge is
+                    // cheaper than a dedupe pass on the hot parse path).
+                    let mut neighbors: Vec<String> = node_el
                         .children()
                         .filter(|c| c.is_element() && c.has_tag_name("neighbor"))
                         .map(|n| text_content(n).trim().to_owned())
                         .filter(|s| !s.is_empty())
                         .collect();
+                    if let Some(wrapped) = child_text(node_el, "neighbors") {
+                        for id in wrapped.split(|c: char| c == ',' || c.is_whitespace()) {
+                            let id = id.trim();
+                            if !id.is_empty() {
+                                neighbors.push(id.to_owned());
+                            }
+                        }
+                    }
                     CardNode { id, name, neighbors, setting }
                 })
                 .filter(|n| !n.id.is_empty()) // defensive: drop id-less nodes
@@ -614,6 +691,39 @@ fn parse(xml: &str) -> anyhow::Result<SimCard> {
         })
         .unwrap_or_default();
 
+    // Fable cold-start anchors (2026-08-10, Issue #2): optional <start> block
+    // seeding the initial world clock + weather so they render from turn 1
+    // (giving the tracker the anchors it needs to maintain them). Flat-first
+    // (top-level <start>), falling back to <scenario><start>. Both children
+    // are optional + independently parsed: a card may seed time-only,
+    // weather-only, both, or neither (the dormant pre-start behavior).
+    // <time> is parsed by bracket_parser::parse_in_world_time (the SAME parser
+    // [TIME] uses — "Day N, HH:MM", 12h AM/PM, calendar dates); an unparseable
+    // <time> is a warn-and-skip (None), never a card-load failure. <weather>
+    // is free-form diegetic prose taken verbatim.
+    let start = if let Some(start_el) = field_node_or(root, scenario, "start") {
+        let time_minutes = child_text(start_el, "time")
+            .filter(|s| !s.is_empty())
+            .and_then(|s| {
+                match crate::bracket_parser::parse_in_world_time(&s) {
+                    Some(mins) => Some(mins),
+                    None => {
+                        tracing::warn!(
+                            card_id = %id,
+                            time_text = %s,
+                            "card <start><time> did not parse; clock will stay dormant"
+                        );
+                        None
+                    }
+                }
+            });
+        let weather = child_text(start_el, "weather")
+            .filter(|s| !s.is_empty());
+        CardStart { time_minutes, weather }
+    } else {
+        CardStart::default()
+    };
+
     Ok(SimCard {
         id,
         name,
@@ -634,6 +744,7 @@ fn parse(xml: &str) -> anyhow::Result<SimCard> {
         player_name,
         locations,
         cast,
+        start,
     })
 }
 
@@ -852,6 +963,7 @@ mod tests {
             player_name: None,
             locations: Vec::new(),
             cast: Vec::new(),
+            start: CardStart::default(),
         };
         assert!(card.random_intro().is_none());
     }
@@ -1031,6 +1143,7 @@ shelter here before braving the ruined keep to the north.
             player_name: Some("Kaelen".into()),
             locations: Vec::new(),
             cast: Vec::new(),
+            start: CardStart::default(),
         };
         let json = serde_json::to_string(&original).expect("serialize");
         let back: SimCard = serde_json::from_str(&json).expect("deserialize");
@@ -1185,6 +1298,108 @@ shelter here before braving the ruined keep to the north.
         assert_eq!(card.locations[2].id, "market_square");
         assert_eq!(card.locations[2].setting, "outdoor");
         assert_eq!(card.locations[2].neighbors, vec!["tavern"]);
+    }
+
+    /// Postel's law for adjacency edges (2026-08-10, Issue #1): the WRAPPED
+    /// `<neighbors>` element (a single child holding a comma- and/or whitespace-
+    /// separated id list) must parse to the same `neighbors` Vec as the flat
+    /// `<neighbor>`-per-edge form. The hand-authored cinderfen card used this
+    /// wrapped shape; before the fix every node parsed with `neighbors: []`,
+    /// freezing the entire travel graph (every [TRAVEL] rejected as
+    /// non-adjacent). Both comma + whitespace separators are tolerated.
+    #[test]
+    fn card_location_wrapped_neighbors_element_parses() {
+        let xml = r#"<sim_card>
+  <metadata><id>wrapped</id><type>roleplay</type></metadata>
+  <identity><name>Wrapped</name></identity>
+  <locations>
+    <node id="tavern">
+      <name>The Crooked Lantern</name>
+      <neighbors>market_square, warehouse_docks</neighbors>
+    </node>
+    <node id="market_square">
+      <name>Market Square</name>
+      <neighbors>warehouse_docks tavern</neighbors>
+    </node>
+  </locations>
+</sim_card>"#;
+        let card = parse(xml).expect("card with wrapped <neighbors> parses");
+        assert_eq!(card.locations.len(), 2);
+        // Comma-separated ids in the wrapped element.
+        assert_eq!(card.locations[0].neighbors, vec!["market_square", "warehouse_docks"]);
+        // Whitespace-separated ids in the wrapped element (also tolerated).
+        assert_eq!(card.locations[1].neighbors, vec!["warehouse_docks", "tavern"]);
+    }
+
+    /// The flat `<neighbor>` + wrapped `<neighbors>` forms may combine on the
+    /// same node (flat children collected first, then the wrapped ids
+    /// appended). Idempotent back-link in `upsert_node` handles any dupes.
+    #[test]
+    fn card_location_flat_and_wrapped_neighbors_combine() {
+        let xml = r#"<sim_card>
+  <metadata><id>combo</id><type>roleplay</type></metadata>
+  <identity><name>Combo</name></identity>
+  <locations>
+    <node id="tavern">
+      <name>Tavern</name>
+      <neighbor>cellar</neighbor>
+      <neighbors>market_square, docks</neighbors>
+    </node>
+  </locations>
+</sim_card>"#;
+        let card = parse(xml).expect("card with combined neighbor forms parses");
+        // Flat child first, then the wrapped element's ids appended in order.
+        assert_eq!(card.locations[0].neighbors, vec!["cellar", "market_square", "docks"]);
+    }
+
+    /// Cold-start anchors (2026-08-10, Issue #2): a card with a `<start>`
+    /// block seeds both `time_minutes` (parsed from the free-form time string
+    /// via the same parser `[TIME]` uses) + the verbatim `weather` phrase.
+    /// This is the load-bearing fix for the cold-start anchor gap — without
+    /// seeded anchors the tracker renders no clock:/weather: line + never
+    /// maintains them.
+    #[test]
+    fn card_start_block_seeds_time_and_weather() {
+        let xml = r#"<sim_card>
+  <metadata><id>anchored</id><type>roleplay</type></metadata>
+  <identity><name>Anchored</name></identity>
+  <start>
+    <time>Day 1, 08:00</time>
+    <weather>thick fog off the marsh</weather>
+  </start>
+</sim_card>"#;
+        let card = parse(xml).expect("card with <start> parses");
+        // Day 1 08:00 = (1-1)*1440 + 8*60 = 480 minutes.
+        assert_eq!(card.start.time_minutes, Some(480));
+        assert_eq!(card.start.weather.as_deref(), Some("thick fog off the marsh"));
+    }
+
+    /// A `<start>` block is fully optional — a card without one parses with an
+    /// empty (dormant) `CardStart`. Both anchors stay `None` → the clock +
+    /// weather stay dormant at fable_start (the pre-start-block behavior).
+    #[test]
+    fn card_without_start_block_has_dormant_anchors() {
+        let xml = r#"<sim_card>
+  <metadata><id>plain</id><type>roleplay</type></metadata>
+  <identity><name>Plain</name></identity>
+</sim_card>"#;
+        let card = parse(xml).expect("card parses");
+        assert!(card.start.time_minutes.is_none());
+        assert!(card.start.weather.is_none());
+    }
+
+    /// A `<start>` block may seed time-only or weather-only (independent
+    /// children). A card seeding weather-only leaves time dormant.
+    #[test]
+    fn card_start_block_weather_only() {
+        let xml = r#"<sim_card>
+  <metadata><id>weatheronly</id><type>roleplay</type></metadata>
+  <identity><name>WeatherOnly</name></identity>
+  <start><weather>clear night</weather></start>
+</sim_card>"#;
+        let card = parse(xml).expect("card parses");
+        assert!(card.start.time_minutes.is_none(), "time absent → dormant clock");
+        assert_eq!(card.start.weather.as_deref(), Some("clear night"));
     }
 
     /// Phase 4 Component 3 (2026-07-28): a node with no `setting` attribute

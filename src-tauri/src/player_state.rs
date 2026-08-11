@@ -351,6 +351,17 @@ pub struct PlayerState {
     #[serde(default)]
     pub body: HashMap<BodyPart, BodyPartState>,
 
+    /// Per-zone injury descriptors, parallel to `body` (same `BodyPart` keys).
+    /// Each entry is a list of terse noun-phrases ("Deep gash", "Minor scrape")
+    /// appended by the Combat Referee each time that zone is wounded — so a zone
+    /// hit across multiple turns accumulates a real history of what happened to
+    /// it, surfaced in the paperdoll injury tooltip + rendered inline in the
+    /// narrator's `injuries:` line. A zone heals/clears when it goes amputated
+    /// (`Black`) — the limb is gone, its wound list is no longer meaningful.
+    /// `#[serde(default)]` keeps pre-field saves loadable (empty map → no list).
+    #[serde(default)]
+    pub injury_details: HashMap<BodyPart, Vec<String>>,
+
     #[serde(default)]
     pub stamina: Stamina,
 
@@ -391,22 +402,14 @@ pub struct PlayerState {
     #[serde(default)]
     pub belt: Vec<equipment::StackItem>,
 
-    /// Deep-storage pack — weight-bounded (`pack_capacity_lbs`) for everything
-    /// else. Mutated by the `[PACK]` bracket. The encumbrance UI divides
-    /// `stack_weight(&pack)` by `pack_capacity_lbs`. Never appearance-visible.
+    /// Deep-storage pack — UNBOUNDED bagged inventory (the encumbrance/weight
+    /// system was PERMANENTLY REMOVED 2026-08-09: no capacity enforcement, no
+    /// fill bar, ever). Mutated by the `[PACK]` bracket OR by the Soul Gem
+    /// inspection panel's STORE action. Never appearance-visible (carried, not
+    /// worn). (`StackItem.weight` survives only for the narrator-summary text
+    /// readout — it enforces nothing.)
     #[serde(default)]
     pub pack: Vec<equipment::StackItem>,
-
-    /// Pack carry capacity in pounds. Per-card overridable; defaults to
-    /// `PACK_DEFAULT_CAPACITY_LBS` (20.0). Drives the encumbrance fill bar.
-    #[serde(default = "equipment_default_pack_capacity")]
-    pub pack_capacity_lbs: f32,
-}
-
-/// Default pack capacity for serde `#[serde(default = ...)]`. Wraps the const
-/// so the attribute can name a fn (serde requires a fn path, not a const).
-fn equipment_default_pack_capacity() -> f32 {
-    equipment::PACK_DEFAULT_CAPACITY_LBS
 }
 
 impl Default for PlayerState {
@@ -421,6 +424,7 @@ impl Default for PlayerState {
         }
         PlayerState {
             body,
+            injury_details: HashMap::new(),
             stamina: Stamina::Fresh,
             wealth: 0,
             reputation: 0,
@@ -428,7 +432,6 @@ impl Default for PlayerState {
             equipment: HashMap::new(),
             belt: Vec::new(),
             pack: Vec::new(),
-            pack_capacity_lbs: equipment::PACK_DEFAULT_CAPACITY_LBS,
         }
     }
 }
@@ -445,11 +448,11 @@ impl PlayerState {
             && self.wealth == 0
             && self.reputation == 0
             && self.body.values().all(|s| *s == BodyPartState::Transparent)
+            && self.injury_details.values().all(|v| v.is_empty())
             && self.current_appearance_deltas.is_empty()
             && self.equipment.is_empty()
             && self.belt.is_empty()
             && self.pack.is_empty()
-            && self.pack_capacity_lbs == equipment::PACK_DEFAULT_CAPACITY_LBS
     }
 
     /// Render the semantic block injected into the narrator prompt. Returns
@@ -489,6 +492,9 @@ impl PlayerState {
         lines.push(format!("stamina: {}", self.stamina.semantic()));
 
         // Injuries: any part not Healthy AND not Amputated, in anatomical order.
+        // Each entry carries its per-zone wound history (from injury_details)
+        // so the narrator reads the descriptors as hard fact, not just the
+        // severity tier — "Left Upper Arm (Medium Injury): Deep cut; Puncture".
         let injuries: Vec<String> = BodyPart::all()
             .iter()
             .filter_map(|p| {
@@ -496,7 +502,27 @@ impl PlayerState {
                 match state {
                     BodyPartState::Transparent
                     | BodyPartState::Black => None,
-                    _ => Some(format!("{} ({})", p.display(), state.semantic())),
+                    _ => {
+                        let base = format!("{} ({})", p.display(), state.semantic());
+                        // Append the wound list if the zone has any. Joined by
+                        // "; " so a multi-wound zone reads as a clean sublist.
+                        match self.injury_details.get(p) {
+                            Some(details) if !details.is_empty() => {
+                                let joined = details
+                                    .iter()
+                                    .filter(|d| !d.is_empty())
+                                    .cloned()
+                                    .collect::<Vec<_>>()
+                                    .join("; ");
+                                if joined.is_empty() {
+                                    Some(base)
+                                } else {
+                                    Some(format!("{base}: {joined}"))
+                                }
+                            }
+                            _ => Some(base),
+                        }
+                    }
                 }
             })
             .collect();
@@ -605,6 +631,14 @@ pub struct RefereeOutcome {
     pub stamina_after: Stamina,
     /// Short, second-person prose seed. Empty when the change was stamina-only.
     pub narrative_hint: String,
+    /// Terse noun-phrase descriptor for THIS wound, picked from a static table
+    /// keyed by `(attacker_tier, new_state)` + rolled by the outcome's own
+    /// Roller so back-to-back identical blows differ (e.g. "Deep gash",
+    /// "Minor scrape", "Shattered"). Applied by `apply_outcome` as a new entry
+    /// in `PlayerState::injury_details[part]` — the paperdoll injury tooltip +
+    /// the narrator's `injuries:` line both surface it. Empty only when the
+    /// outcome was stamina-only (no wound descriptor to record).
+    pub injury_desc: String,
     /// True when the Referee judged this blow lethal — the body is Downed
     /// (unconscious, dying). The narrator must obey: the player character
     /// cannot continue to fight, run, or act this turn. False for ordinary
@@ -788,6 +822,57 @@ fn hash_text(s: &str) -> u64 {
     h
 }
 
+/// Roll a terse wound descriptor for a fresh injury. Indexed by the resolved
+/// `BodyPartState` tier (the wound's severity) with vocabulary that escalates
+/// in weight alongside the attacker's tier — a Minion's Minor hit is a
+/// "Scratch" or "Bruise", a Legendary's Heavy hit is a "Ruptured wound" or
+/// "Caved-in fracture". `roller` picks one variant so back-to-back identical
+/// blows differ. Returns Title Case so it reads cleanly in the tooltip + the
+/// narrator's `injuries:` line. Pure (no I/O).
+///
+/// The vocabulary deliberately stays noun-phrase (no verb, no full sentence) so
+/// the descriptor composes as a list item under the tooltip header and slots
+/// into the existing `injuries: <part> (<severity>): <desc>; <desc>` render
+/// without grammar surgery.
+fn roll_injury_descriptor(roller: &mut Roller, tier: AttackerTier, state: BodyPartState) -> String {
+    // The base vocabulary per severity tier. Each row escalates: Minor is
+    // surface damage, Medium cuts tissue, Heavy breaks structure, Critical
+    // ruins it. Amputated/Healthy never reach here (Black is off the
+    // injureable pool; Transparent never produces an outcome).
+    let table: &[&str] = match state {
+        BodyPartState::Yellow => &["Scratch", "Bruise", "Minor scrape", "Abrasion", "Splinter"],
+        BodyPartState::Orange => &["Deep cut", "Gash", "Bad bruise", "Laceration", "Puncture"],
+        BodyPartState::Red => &["Deep gash", "Fracture", "Torn muscle", "Shattered bone", "Severe wound"],
+        BodyPartState::Purple => &["Mangled wound", "Shattered", "Ruptured tissue", "Crushed bone", "Gruesome gash"],
+        // Healthy/Amputated never produce a descriptor (no outcome for Healthy;
+        // Black is reached only via escalation, which still carries the
+        // escalator's severity word). Fall back to the semantic label so the
+        // field is never empty if an unexpected path reaches here.
+        BodyPartState::Transparent | BodyPartState::Black => &[],
+    };
+    if table.is_empty() {
+        return match state {
+            BodyPartState::Black => "Severed".to_string(),
+            BodyPartState::Transparent => String::new(),
+            _ => state.semantic().to_string(),
+        };
+    }
+    let base = table[roller.range(table.len())];
+
+    // Attacker-tier prefix: only the heaviest tiers prepend a qualifier — a
+    // Minion's hit is just the base word ("Bruise"), while a Legendary's
+    // becomes "Brutal Bruise" so the tooltip conveys the weight class at a
+    // glance. Keeps the common case (Soldier, the default) unqualified.
+    let prefix: &str = match tier {
+        AttackerTier::Minion | AttackerTier::Soldier => "",
+        AttackerTier::Elite => "Nasty ",
+        AttackerTier::Boss => "Brutal ",
+        AttackerTier::Legendary => "Devastating ",
+    };
+    format!("{prefix}{base}")
+}
+
+
 /// The Referee entry point. Pure fn — no I/O, no locks, no side effects.
 /// Scans `text` for combat/exertion keywords; if matched, rolls the dice
 /// against the current player state and returns the outcome.
@@ -829,16 +914,19 @@ pub fn referee_evaluate(text: &str, state: &PlayerState) -> Option<RefereeOutcom
 /// Pure fn — no I/O. The entity map is `&HashMap<String, String>` (the
 /// WorldSchema's `entities` field shape).
 pub fn select_attacker_tier_from_entities(
-    entities: &std::collections::HashMap<String, String>,
+    entities: &std::collections::HashMap<String, serde_json::Value>,
 ) -> AttackerTier {
     // Single-pass scan: collect every npc.*.tier value, parse each, keep the
-    // max. Cheap (entity maps are small — typically <50 keys).
+    // max. Cheap (entity maps are small — typically <50 keys). Tier keys are
+    // conventionally bare strings ("Elite", "Boss"); a structured value at a
+    // .tier key is unrecognized noise — skip it.
     let mut best: Option<AttackerTier> = None;
     for (key, value) in entities.iter() {
         if !key.starts_with("npc.") || !key.ends_with(".tier") {
             continue;
         }
-        if let Some(tier) = parse_attacker_tier(value) {
+        let Some(s) = value.as_str() else { continue };
+        if let Some(tier) = parse_attacker_tier(s) {
             best = Some(match best {
                 Some(prev) if prev as u8 >= tier as u8 => prev,
                 _ => tier,
@@ -979,7 +1067,7 @@ pub fn referee_evaluate_with_tier(
     let lethality_roll = roll_d20(&mut roller);
     let lethal = (lethality_roll as i32) < lethality_dc;
 
-    // Narrative hint: a short second-person seed. The narrator reads the
+    // Narrative hint: a short second-person prose seed. The narrator reads the
     // canonical body-state change as hard fact; this hint just nudges prose.
     // Lethal outcomes get a stronger hint that flags the drop.
     let narrative_hint = if lethal {
@@ -995,6 +1083,12 @@ pub fn referee_evaluate_with_tier(
             new_state.semantic().to_lowercase(),
         )
     };
+
+    // Wound descriptor: a terse noun-phrase rolled from the (tier, severity)
+    // table via the outcome's own Roller (so identical blows still differ).
+    // This is what `apply_outcome` appends to injury_details[part] — the
+    // paperdoll tooltip lists it + the narrator's injuries: line carries it.
+    let injury_desc = roll_injury_descriptor(&mut roller, attacker_tier, new_state);
 
     // Directive: only populated when lethal. The caller wraps as
     // `[DIRECTIVE: {directive}]` in `<world_state>`.
@@ -1016,6 +1110,7 @@ pub fn referee_evaluate_with_tier(
         new_state,
         stamina_after,
         narrative_hint,
+        injury_desc,
         lethal,
         directive,
     })
@@ -1028,6 +1123,21 @@ pub fn referee_evaluate_with_tier(
 pub fn apply_outcome(state: &mut PlayerState, outcome: &RefereeOutcome) {
     state.body.insert(outcome.part, outcome.new_state);
     state.stamina = outcome.stamina_after;
+
+    // Record the wound descriptor. A non-empty `injury_desc` appends to the
+    // zone's detail history (so a zone hit across turns accumulates a list).
+    // Amputation (Black) is the clear sentinel: the limb is gone, its prior
+    // wound list is no longer meaningful, so drop it + leave just the
+    // "Severed" marker the descriptor table produces for Black.
+    if outcome.new_state == BodyPartState::Black {
+        state.injury_details.insert(outcome.part, vec![outcome.injury_desc.clone()]);
+    } else if !outcome.injury_desc.is_empty() {
+        state
+            .injury_details
+            .entry(outcome.part)
+            .or_default()
+            .push(outcome.injury_desc.clone());
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1364,7 +1474,7 @@ const SCRUTINIZED_FAIL_SEED: &str = "the act cracks under scrutiny; the disguise
 pub fn evaluate_disguise_gate(
     text: &str,
     tags: &[crate::consequence::StatusTag],
-    entities: &HashMap<String, String>,
+    entities: &HashMap<String, serde_json::Value>,
     pacing_dc_mod: i32,
 ) -> Option<DisguiseDirective> {
     let disguise = find_disguise_tag(tags)?;
@@ -1411,6 +1521,48 @@ mod tests {
 
     fn fresh_state() -> PlayerState {
         PlayerState::default()
+    }
+
+    // --- pack_capacity_lbs removal (2026-08-11) ---
+    //
+    // The field was deleted from `PlayerState` after being permanently retired
+    // (2026-08-09). Old saves with a stray `pack_capacity_lbs` key must still
+    // load — serde's default unknown-field tolerance ignores it (the struct
+    // doesn't carry `#[serde(deny_unknown_fields)]`). This is the regression
+    // guard.
+
+    #[test]
+    fn player_state_loads_with_legacy_pack_capacity_lbs_field() {
+        // A pre-removal save would have included "pack_capacity_lbs": 20.0.
+        let legacy_json = r#"{
+            "body": {},
+            "injury_details": {},
+            "stamina": "Fresh",
+            "wealth": 0,
+            "reputation": 0,
+            "current_appearance_deltas": {},
+            "equipment": {},
+            "belt": [],
+            "pack": [],
+            "pack_capacity_lbs": 20.0
+        }"#;
+        let parsed: PlayerState = serde_json::from_str(legacy_json)
+            .expect("legacy save with pack_capacity_lbs must still load");
+        // The struct no longer has the field — the assertion is purely "didn't
+        // error during deserialize". Sanity-check a sibling field landed.
+        assert_eq!(parsed.stamina, Stamina::Fresh);
+    }
+
+    #[test]
+    fn player_state_serializes_without_pack_capacity_lbs_key() {
+        // Post-removal saves must NOT carry the field — confirm it's gone from
+        // the wire shape (a future reload won't see it).
+        let s = PlayerState::default();
+        let json = serde_json::to_string(&s).expect("serialize");
+        assert!(
+            !json.contains("pack_capacity_lbs"),
+            "post-removal save must not include pack_capacity_lbs: {json}"
+        );
     }
 
     // --- enum basics ---
@@ -1723,13 +1875,115 @@ mod tests {
             new_state: BodyPartState::Orange,
             stamina_after: Stamina::Winded,
             narrative_hint: "test".into(),
+            injury_desc: "Deep cut".into(),
             lethal: false,
             directive: String::new(),
         };
         apply_outcome(&mut s, &outcome);
         assert_eq!(s.body.get(&BodyPart::RightUpperLeg).copied().unwrap(), BodyPartState::Orange);
         assert_eq!(s.stamina, Stamina::Winded);
+        // The wound descriptor is appended to the zone's detail history.
+        let details = s.injury_details.get(&BodyPart::RightUpperLeg).unwrap();
+        assert_eq!(details, &vec!["Deep cut".to_string()]);
         assert!(!s.is_default());
+    }
+
+    #[test]
+    fn apply_outcome_appends_to_existing_detail_history() {
+        // A zone hit across multiple turns accumulates a real list, not a
+        // single overwrite. This is what makes the tooltip's detail list
+        // meaningful.
+        let mut s = fresh_state();
+        s.body.insert(BodyPart::LeftUpperArm, BodyPartState::Yellow);
+        s.injury_details.insert(
+            BodyPart::LeftUpperArm,
+            vec!["Scratch".to_string()],
+        );
+        let outcome = RefereeOutcome {
+            part: BodyPart::LeftUpperArm,
+            new_state: BodyPartState::Orange,
+            stamina_after: Stamina::Active,
+            narrative_hint: "test".into(),
+            injury_desc: "Gash".into(),
+            lethal: false,
+            directive: String::new(),
+        };
+        apply_outcome(&mut s, &outcome);
+        let details = s.injury_details.get(&BodyPart::LeftUpperArm).unwrap();
+        assert_eq!(
+            details,
+            &vec!["Scratch".to_string(), "Gash".to_string()]
+        );
+    }
+
+    #[test]
+    fn apply_outcome_amputate_clears_detail_history() {
+        // Amputation replaces the wound list with the single "Severed" marker —
+        // the prior wound history is no longer meaningful on a missing limb.
+        let mut s = fresh_state();
+        s.body.insert(BodyPart::LeftHand, BodyPartState::Red);
+        s.injury_details.insert(
+            BodyPart::LeftHand,
+            vec!["Deep gash".to_string(), "Fracture".to_string()],
+        );
+        let outcome = RefereeOutcome {
+            part: BodyPart::LeftHand,
+            new_state: BodyPartState::Black,
+            stamina_after: Stamina::Exhausted,
+            narrative_hint: "test".into(),
+            injury_desc: "Severed".into(),
+            lethal: true,
+            directive: "down".into(),
+        };
+        apply_outcome(&mut s, &outcome);
+        // The body reflects amputation; the detail history is replaced.
+        assert_eq!(s.body.get(&BodyPart::LeftHand).copied().unwrap(), BodyPartState::Black);
+        let details = s.injury_details.get(&BodyPart::LeftHand).unwrap();
+        assert_eq!(details, &vec!["Severed".to_string()]);
+    }
+
+    #[test]
+    fn render_for_prompt_emits_injury_detail() {
+        // The narrator's injuries: line carries the per-zone descriptors so the
+        // API narrator reads them as hard fact (closes the schema→narrator loop).
+        let mut s = fresh_state();
+        s.body.insert(BodyPart::Neck, BodyPartState::Yellow);
+        s.injury_details.insert(BodyPart::Neck, vec!["Bruise".to_string()]);
+        let rendered = s.render_for_prompt().unwrap();
+        assert!(
+            rendered.contains("Neck (Minor Injury): Bruise"),
+            "expected the descriptor in the injuries line, got: {rendered}"
+        );
+    }
+
+    #[test]
+    fn injury_descriptor_table_covers_injureable_tiers() {
+        // Every severity the Referee can produce (Yellow..Purple) yields a
+        // non-empty descriptor. Sanity-check the table + the roller path.
+        let mut r = Roller::new(42);
+        for state in [
+            BodyPartState::Yellow,
+            BodyPartState::Orange,
+            BodyPartState::Red,
+            BodyPartState::Purple,
+        ] {
+            let d = roll_injury_descriptor(&mut r, AttackerTier::Soldier, state);
+            assert!(!d.is_empty(), "descriptor for {:?} was empty", state);
+        }
+        // Black yields the "Severed" marker; Healthy yields empty (no wound).
+        assert_eq!(roll_injury_descriptor(&mut r, AttackerTier::Soldier, BodyPartState::Black), "Severed");
+        assert_eq!(roll_injury_descriptor(&mut r, AttackerTier::Soldier, BodyPartState::Transparent), "");
+    }
+
+    #[test]
+    fn injury_descriptor_tier_prefix_escalates() {
+        // Heavier attacker tiers prepend a qualifier so the weight class reads
+        // at a glance; Minion/Soldier stay unqualified (the common case).
+        let mut r = Roller::new(7);
+        let minion = roll_injury_descriptor(&mut r, AttackerTier::Minion, BodyPartState::Orange);
+        let legendary = roll_injury_descriptor(&mut r, AttackerTier::Legendary, BodyPartState::Orange);
+        assert!(!minion.starts_with("Devastating"), "Minion should be unqualified: {minion}");
+        assert!(legendary.starts_with("Devastating"), "Legendary should be qualified: {legendary}");
     }
 
     // --- Roller (the mocked RNG) ---
@@ -2176,9 +2430,12 @@ mod tests {
         }
     }
 
-    fn entities_with_tier(tier: &str) -> HashMap<String, String> {
+    fn entities_with_tier(tier: &str) -> HashMap<String, serde_json::Value> {
         let mut m = HashMap::new();
-        m.insert("npc.guard1.tier".into(), tier.into());
+        m.insert(
+            "npc.guard1.tier".into(),
+            serde_json::Value::String(tier.into()),
+        );
         m
     }
 

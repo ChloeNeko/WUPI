@@ -190,9 +190,11 @@ pub async fn perform_update(
 }
 
 /// Delete EVERY remnant from a prior self-update. Called from `setup()` on
-/// every boot — by the time the new process runs, the old one's locks are
-/// gone. This is the "leave nothing behind" sweep. It clears THREE classes
-/// of leftover:
+/// every boot, BEFORE model load — by the time this runs, the old process is
+/// usually gone, but it may still be tearing down (joining model threads,
+/// flushing SQLite), and can hold its OS lock on the renamed binary for up to
+/// a few seconds. This is the "leave nothing behind" sweep. It clears THREE
+/// classes of leftover:
 ///
 /// 1. `wupi.exe.old` — the running-exe swap dance (`swap_running_exe`).
 /// 2. Any `<name>.old` DLL remnant — `copy_file_robust` renames a locked/
@@ -206,11 +208,21 @@ pub async fn perform_update(
 ///
 /// **The contract: after this runs, there are no `.old` files, no update
 /// folders, no backups, no staging cache — only the live install.** Per spec:
-/// "completely delete everything old that the update is meant to replace."
+/// "completely delete everything old that the update is meant to replace, no
+/// .old files left behind."
 ///
-/// Best-effort: a delete failure (file transiently in use, perms) is logged
-/// and retried next boot. Scans `exe_dir` non-recursively + `bin/` (flat) —
-/// the only two places the rename dance ever writes `.old` files.
+/// **Retry-with-backoff (why `.old` no longer lingers across a boot):** the
+/// old delete was a single shot — if the old process still held its lock
+/// (the restart race), the delete failed and the `.old` survived a whole
+/// extra session. Now [`remove_with_retry`] / [`remove_dir_all_with_retry`]
+/// retry through the ~1-2s the old process needs to fully exit, with
+/// escalating sleeps. Only a genuinely-stuck lock (old process hung, not
+/// just slow) defers to the next boot. The retry cost is paid ONLY when a
+/// `.old` exists (i.e. only on the boot right after an update) and runs
+/// before model load, so the user never feels it.
+///
+/// Scans `exe_dir` non-recursively + `bin/` (flat) — the only two places the
+/// rename dance ever writes `.old` files.
 pub fn cleanup_old_files(app_handle: &tauri::AppHandle) {
     let Some(exe_dir) = exe_dir(app_handle) else {
         return;
@@ -238,123 +250,34 @@ pub fn cleanup_old_files(app_handle: &tauri::AppHandle) {
             if !is_old {
                 continue;
             }
-            match std::fs::remove_file(&path) {
-                Ok(()) => {
-                    swept += 1;
-                    tracing::info!(?path, "cleaned up .old remnant from prior update");
-                }
-                Err(e) => tracing::warn!(?path, ?e, "could not remove .old remnant; will retry next boot"),
+            if remove_with_retry(&path) {
+                swept += 1;
+                tracing::info!(?path, "cleaned up .old remnant from prior update");
+            } else {
+                // Only reached if the lock is genuinely stuck (old process
+                // hung) — a transient restart-race lock was retried away above.
+                tracing::warn!(?path, "could not remove .old remnant after retries; lock appears stuck — will retry next boot");
             }
         }
     }
     // ── Staging dir sweep: data/_update/ (interrupted-update remnants).
     //    Removed wholesale — the zip, the extracted tree, and the dir itself.
-    //    Recreated on the next update's Phase 1 if needed.
+    //    Recreated on the next update's Phase 1 if needed. Same retry-with-
+    //    backoff: a briefly-locked file inside (antivirus scan, the old
+    //    process's final handle close) is waited out, not deferred.
     let staging = exe_dir.join("data").join("_update");
     if staging.is_dir() {
-        match std::fs::remove_dir_all(&staging) {
-            Ok(()) => {
-                swept += 1;
-                tracing::info!(?staging, "removed leftover update staging dir");
-            }
-            Err(e) => tracing::warn!(?staging, ?e, "could not remove staging dir; will retry next boot"),
+        if remove_dir_all_with_retry(&staging) {
+            swept += 1;
+            tracing::info!(?staging, "removed leftover update staging dir");
+        } else {
+            tracing::warn!(?staging, "could not remove staging dir after retries; will retry next boot");
         }
     }
     if swept > 0 {
         tracing::info!(swept, "cleaned up remnants from prior update");
     }
 }
-
-/// Delete deprecated assets left at the install root by older versions.
-///
-/// Historically every file in `public/` was copied flat to the install root
-/// by Vite + `release.cjs`. Several of those assets turned out to be dead
-/// (never referenced by the running app) or were relocated/renamed:
-///
-/// - The 4-track soundtrack library (soundtrack.js is not wired in):
-///   `Across_the_Verdant_Ridge.mp3`, `Iron_and_Silk.mp3`,
-///   `Promises_in_the_Pavilion.mp3`, `Thunder_and_Salt.mp3`.
-/// - The map atlases (panels/map.js is not wired in): `map-fantasy-atlas.png`,
-///   `map-futuristic-atlas.png`, `map-modern-atlas.png`.
-/// - The starting-scene PNGs (zero references anywhere): the 6
-///   `starting-*.png` files.
-/// - `fable_title.png` — relocated into `src/fable/assets/` (Vite now hashes
-///   it into `assets/`); the old flat-root copy is stale.
-/// - `fable_whoosh.mp3` — renamed to `wind.mp3` (2026-07-27); the old name
-///   is stale.
-/// - `wind.mp3` — the renamed successor of `fable_whoosh.mp3`, intended for a
-///   future intro cue. Removed (2026-07-27): nothing in the app references it
-///   and it was leaking flat to the install root on every build. It lives in
-///   the build workstation archive for later reintroduction.
-///
-/// New builds no longer ship any of these to the root. This sweep clears
-/// them from installs that received them via a prior update, so the root
-/// converges on the §8C layout (just `wupi.exe`, `wupi.html`, `assets/`,
-/// `bin/`, `data/`, `msvcp140.dll`). Called from `setup()` on every boot,
-/// alongside [`cleanup_old_files`].
-///
-/// Non-recursive (scans `exe_dir` only): every deprecated asset lived flat
-/// at the root. Best-effort: a delete failure is logged + retried next boot.
-/// The list is exact lowercase basenames; Windows FS is case-insensitive so
-/// the case-matching is forgiving in practice, but the names below are the
-/// ones Vite emitted.
-pub fn cleanup_deprecated_assets(app_handle: &tauri::AppHandle) {
-    let Some(exe_dir) = exe_dir(app_handle) else { return; };
-    let _ = cleanup_deprecated_in_dir(&exe_dir);
-}
-
-/// The testable core: walks `DEPRECATED_ASSETS` against `dir` and removes
-/// any that exist. Returns the count removed. Best-effort — a delete failure
-/// is logged and the loop continues (the file gets a retry next boot).
-fn cleanup_deprecated_in_dir(dir: &Path) -> usize {
-    let mut swept = 0;
-    for name in DEPRECATED_ASSETS {
-        let path = dir.join(name);
-        if !path.exists() {
-            continue;
-        }
-        match std::fs::remove_file(&path) {
-            Ok(()) => {
-                swept += 1;
-                tracing::info!(?path, "removed deprecated asset from prior version");
-            }
-            Err(e) => tracing::warn!(?path, ?e, "could not remove deprecated asset; will retry next boot"),
-        }
-    }
-    if swept > 0 {
-        tracing::info!(swept, "cleaned up deprecated assets from prior version");
-    }
-    swept
-}
-
-/// The exact basenames of assets older versions shipped flat to the install
-/// root that this version no longer ships. See [`cleanup_deprecated_assets`]
-/// for the per-entry rationale. Module-scope `const` so the unit test can
-/// assert against it without going through `AppHandle`.
-const DEPRECATED_ASSETS: &[&str] = &[
-    // Dead soundtrack library (soundtrack.js not wired in).
-    "Across_the_Verdant_Ridge.mp3",
-    "Iron_and_Silk.mp3",
-    "Promises_in_the_Pavilion.mp3",
-    "Thunder_and_Salt.mp3",
-    // Dead map atlases (panels/map.js not wired in).
-    "map-fantasy-atlas.png",
-    "map-futuristic-atlas.png",
-    "map-modern-atlas.png",
-    // Dead starting-scene PNGs (zero references).
-    "starting-apartment-studio.png",
-    "starting-classroom-modern.png",
-    "starting-frontier-airship-dock.png",
-    "starting-moonlit-guild-hall.png",
-    "starting-neon-transit-platform.png",
-    "starting-rainy-cafe.png",
-    // Relocated/renamed: old flat-root copies are stale.
-    "fable_title.png",  // → src/fable/assets/ (Vite-hashed into assets/)
-    "fable_whoosh.mp3", // → renamed wind.mp3 (2026-07-27)
-    // Dead: never wired in; lives in the build-workstation archive for later
-    // reintroduction. New builds no longer ship it to the root.
-    "wind.mp3",         // removed from public/ 2026-07-27 (dead mp3)
-];
 
 // ── Internals ──────────────────────────────────────────────────────────────
 
@@ -709,6 +632,71 @@ fn with_old_extension(path: &Path) -> PathBuf {
     path.with_file_name(name)
 }
 
+/// Delete `path`, retrying through a transient lock (the restart race where
+/// the old process is still tearing down and holds the OS lock on its renamed
+/// binary). Returns true on success, false if the file never went away.
+///
+/// - If `path` doesn't exist: returns false immediately (nothing to do —
+///   caller logs nothing spurious; this is the common case on a boot that
+///   didn't follow an update).
+/// - On a sharing/permission error: sleeps + retries with escalating backoff
+///   (`OLD_RETRY_DELAYS_MS`), up to ~2.5s total. A process that's just slow
+///   (joining model threads, flushing SQLite) clears within this window; only
+///   a genuinely-hung process defers.
+/// - On any OTHER error (e.g. the file vanished between the existence check
+///   and the delete): returns true (the desired end state — file is gone).
+///
+/// Runs in `setup()` before model load, so the retry cost (paid only when a
+/// `.old` actually exists) is invisible to the user.
+fn remove_with_retry(path: &Path) -> bool {
+    remove_with_retry_inner(path, |p| std::fs::remove_file(p))
+}
+
+/// Like [`remove_with_retry`] but for a directory tree
+/// (`std::fs::remove_dir_all`). Used on the staging dir sweep.
+fn remove_dir_all_with_retry(path: &Path) -> bool {
+    remove_with_retry_inner(path, |p| std::fs::remove_dir_all(p))
+}
+
+/// Shared retry core for file + dir removal. `remove` is `std::fs::remove_file`
+/// or `std::fs::remove_dir_all`. See [`remove_with_retry`] for the contract.
+fn remove_with_retry_inner<F>(path: &Path, remove: F) -> bool
+where
+    F: Fn(&Path) -> std::io::Result<()>,
+{
+    if !path.exists() {
+        return false;
+    }
+    for &delay_ms in OLD_RETRY_DELAYS_MS {
+        match remove(path) {
+            Ok(()) => return true,
+            Err(e) if is_sharing_violation(&e) => {
+                // Still locked (restart race). Sleep + retry; the old process
+                // is typically releasing its last handles.
+                std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // Vanished between the existence check and the delete — the
+                // desired end state.
+                return true;
+            }
+            Err(e) => {
+                // Non-lock, non-NotFound error (perms, disk fault). Don't
+                // spin — caller logs + retries on the next boot.
+                tracing::warn!(?path, ?e, "remove failed (non-lock); deferring to next boot");
+                return false;
+            }
+        }
+    }
+    // Exhausted retries — the lock appears genuinely stuck.
+    false
+}
+
+/// Escalating backoff schedule (ms) for the `.old` lock retry. ~2.5s total —
+/// comfortably longer than the ~1-2s the old process needs to fully exit
+/// (thread joins + SQLite flush), short enough to be imperceptible at boot.
+const OLD_RETRY_DELAYS_MS: &[u64] = &[50, 100, 150, 250, 400, 500, 500, 500];
+
 /// Recursively collect all files under `root` (depth-first). Used by
 /// [`apply_extracted`] to walk the extracted tree.
 fn walk_files(root: &Path) -> Result<Vec<PathBuf>, String> {
@@ -737,87 +725,28 @@ mod tests {
     use super::*;
 
     #[test]
-    fn deprecated_list_is_nonempty_and_unique() {
-        // Sanity: the list is the contract — every entry must be a real
-        // filename we stopped shipping. Empty or duplicate entries would
-        // indicate a copy-paste error in the cleanup definition.
-        assert!(!DEPRECATED_ASSETS.is_empty(), "deprecated list must not be empty");
-        let mut sorted = DEPRECATED_ASSETS.to_vec();
-        sorted.sort_unstable();
-        let before = sorted.len();
-        sorted.dedup();
-        assert_eq!(before, sorted.len(), "deprecated list must have no duplicates");
-        // Every entry has an extension (sanity: these are all asset files).
-        for name in DEPRECATED_ASSETS {
-            assert!(Path::new(name).extension().is_some(), "{name} has no extension");
-        }
+    fn remove_with_retry_deletes_an_existing_file() {
+        // The happy path: a normal (unlocked) file is deleted on the first
+        // attempt and `remove_with_retry` returns true.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let file = tmp.path().join("wupi.exe.old");
+        std::fs::write(&file, b"stale binary").unwrap();
+        assert!(file.exists());
+
+        assert!(remove_with_retry(&file), "an existing unlocked file should be removed");
+        assert!(!file.exists(), "file should be gone after remove_with_retry");
     }
 
     #[test]
-    fn cleanup_removes_only_deprecated_assets() {
-        // Stage a fake install root with: one deprecated asset, one legit
-        // engine file (must survive), one user-data file (must survive),
-        // and one nested file under a subdir (must survive — sweep is
-        // non-recursive at the install root).
+    fn remove_with_retry_is_a_noop_on_a_missing_path() {
+        // The common case on a boot that did NOT follow an update: no `.old`
+        // exists, so there is nothing to remove. Returns false without panic
+        // and without spurious logging.
         let tmp = tempfile::tempdir().expect("tempdir");
-        let root = tmp.path();
+        let ghost = tmp.path().join("does-not-exist.old");
+        assert!(!ghost.exists());
 
-        std::fs::write(root.join("fable_whoosh.mp3"), b"old wind").unwrap(); // deprecated
-        std::fs::write(root.join("wupi.exe"), b"engine").unwrap();           // legit engine
-        std::fs::write(root.join("paw.png"), b"mascot").unwrap();            // legit engine asset
-        std::fs::write(root.join("data").join("user.xml"), b"user").unwrap_or_else(|_| {
-            std::fs::create_dir_all(root.join("data")).unwrap();
-            std::fs::write(root.join("data").join("user.xml"), b"user").unwrap()
-        });
-        // A deprecated filename placed UNDER a subdir must NOT be swept — the
-        // real sweep is non-recursive at the exe_dir root.
-        std::fs::create_dir_all(root.join("assets")).unwrap();
-        std::fs::write(root.join("assets").join("fable_title.png"), b"hashed").unwrap();
-
-        let swept = cleanup_deprecated_in_dir(root);
-        assert_eq!(swept, 1, "exactly one deprecated file at root should be swept");
-
-        // The deprecated flat-root files are gone.
-        assert!(!root.join("fable_whoosh.mp3").exists(), "deprecated file should be removed");
-        // Legit engine + mascot asset + user data survive.
-        assert!(root.join("wupi.exe").exists(), "engine file must survive");
-        assert!(root.join("paw.png").exists(), "legit engine asset must survive");
-        assert!(root.join("data").join("user.xml").exists(), "user data must survive");
-        // The nested same-named file under assets/ survives (non-recursive).
-        assert!(
-            root.join("assets").join("fable_title.png").exists(),
-            "nested file under a subdir must survive (sweep is root-only)"
-        );
-    }
-
-    #[test]
-    fn cleanup_is_noop_on_clean_install() {
-        // A fresh install that never received the deprecated files: the
-        // sweep removes nothing and errors on nothing.
-        let tmp = tempfile::tempdir().expect("tempdir");
-        std::fs::write(tmp.path().join("wupi.exe"), b"engine").unwrap();
-        let swept = cleanup_deprecated_in_dir(tmp.path());
-        assert_eq!(swept, 0, "clean install should sweep nothing");
-        assert!(tmp.path().join("wupi.exe").exists());
-    }
-
-    #[test]
-    fn cleanup_sweeps_every_deprecated_entry_when_present() {
-        // The strongest contract test: if EVERY deprecated file is present at
-        // the root, ALL of them get removed in one pass.
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let root = tmp.path();
-        for name in DEPRECATED_ASSETS {
-            std::fs::write(root.join(name), b"x").unwrap();
-        }
-        let swept = cleanup_deprecated_in_dir(root);
-        assert_eq!(
-            swept,
-            DEPRECATED_ASSETS.len(),
-            "every deprecated file present should be swept"
-        );
-        for name in DEPRECATED_ASSETS {
-            assert!(!root.join(name).exists(), "{name} should be gone");
-        }
+        assert!(!remove_with_retry(&ghost), "a missing path should report not-removed");
+        assert!(!ghost.exists());
     }
 }

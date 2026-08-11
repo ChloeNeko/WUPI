@@ -22,9 +22,10 @@
 //   imports from here; nothing else hardcodes part names.
 //
 // DATA INVARIANT: every entry in PARTS MUST exist in the JSON under
-// BOTH "male" and "female" with exactly 8 [x,y] vertices. The
-// paperdoll-hitbox-editor enforces this on export; the loader below
-// asserts it on import.
+// BOTH "male" and "female" as an array of [x,y] vertices. The canonical
+// count is 16 (8 originals + 8 edge-midpoints); the loader accepts any
+// count ≥ MIN_VERTICES (3) so the hitbox-editor can add/remove vertices
+// per part without the runtime rejecting the export.
 // =============================================================
 
 import HITBOXES_JSON from '../data/paperdoll-hitboxes.json';
@@ -88,13 +89,24 @@ export function partByLabel(label){ return BY_LABEL[label]; }
 
 // ─── §2  HITBOXES ──────────────────────────────────────────────────────────
 // Load + validate the JSON once at module load. The file stores each part as
-// an array of 8 [x,y] pairs in PERCENT of the paperdoll PNG's intrinsic
+// an array of [x,y] pairs in PERCENT of the paperdoll PNG's intrinsic
 // dimensions (0–100). We convert to plain [x,y] arrays here (the lookup +
 // renderer use the same shape, so no conversion needed — kept as arrays).
+//
+// Vertex count: the canonical format is 16 vertices per part (8 originals +
+// 8 edge-midpoints, a lossless midpoint-subdivision of the prior 8-vertex
+// format that traces the identical outline — done 2026-08-10 so the hitbox-
+// editor can offer finer bend points). The renderer + the point-in-polygon
+// lookup are vertex-count-agnostic (PNPOLY works for any simple polygon ≥3),
+// so the count is NOT hard-pinned here — a part with 8 (legacy), 16
+// (canonical), or any other count ≥3 is accepted. A count <3 is a degenerate
+// polygon (no area) + is rejected. This keeps the editor free to add/remove
+// vertices per part without the runtime rejecting the export.
 //
 // Validate hard at import: a missing/malformed part is a DATA BUG (the editor
 // or the file drifted), not a runtime condition to silently paper over. Fail
 // loudly in the console so it's caught immediately during dev.
+const MIN_VERTICES = 3;
 const HITBOXES = validateHitboxes(HITBOXES_JSON);
 
 function validateHitboxes(json) {
@@ -111,8 +123,8 @@ function validateHitboxes(json) {
         console.error(`[body-parts] ${gender}.${label}: missing or not an array`);
         continue;
       }
-      if (raw.length !== 8) {
-        console.error(`[body-parts] ${gender}.${label}: expected 8 vertices, got ${raw.length}`);
+      if (raw.length < MIN_VERTICES) {
+        console.error(`[body-parts] ${gender}.${label}: expected ≥${MIN_VERTICES} vertices, got ${raw.length}`);
         continue;
       }
       // normalize each vertex to [x,y] numbers + range-check
@@ -132,7 +144,7 @@ function validateHitboxes(json) {
   return out;
 }
 
-// Get the 8-vertex polygon ([x,y][] in % of the PNG) for a part by id +
+// Get the polygon ([x,y][] in % of the PNG) for a part by id +
 // gender. Returns undefined if the part or gender is unknown. Pure.
 export function getHitbox(id, gender) {
   const g = HITBOXES[gender];
@@ -288,7 +300,7 @@ export function paintDebugOverlay(stageEl, gender, opts = {}) {
   for (const { id, label } of PARTS) {
     for (const gender of ['male', 'female']) {
       const poly = HITBOXES[gender] && HITBOXES[gender][id];
-      if (!poly || poly.length !== 8) {
+      if (!poly || poly.length < MIN_VERTICES) {
         console.warn(`[body-parts] self-check: ${gender}.${label} (${id}) has no valid polygon`);
       }
     }

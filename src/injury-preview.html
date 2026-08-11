@@ -1,0 +1,217 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Injury Heatmap · All 22 parts</title>
+<!--
+  DEV-ONLY preview of the injury heatmap across ALL 22 body parts at once.
+  Served by the Vite dev server (root=src) at /injury-preview.html. Imports the
+  REAL paintInjuryHeatmap + PARTS + the production paperdoll PNGs so what you
+  see is byte-identical to the in-app overlay. Not shipped (not in the build
+  input; delete freely).
+
+  Use the tier buttons to swap Yellow/Orange/Red/Purple + the gender toggle for
+  ♂/♀. Every part is set to the chosen tier simultaneously so you can audit the
+  full-body bloom, overlap behavior, + outline-sharpness across all regions.
+-->
+<style>
+  :root { --gold: #d4af37; --bg: #050810; --panel: #121316; --line: #2a2d33; --text: #e6e6e6; --dim: #8a8d93; }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body {
+    background:
+      radial-gradient(circle at 50% 20%, #0d1018 0%, var(--bg) 70%);
+    color: var(--text);
+    font: 14px/1.4 -apple-system, "Segoe UI", Roboto, sans-serif;
+    display: flex;
+    overflow: hidden;
+  }
+  .controls {
+    flex: 0 0 240px;
+    background: var(--panel);
+    border-right: 1px solid var(--line);
+    padding: 20px 16px;
+    display: flex;
+    flex-direction: column;
+    gap: 18px;
+    overflow-y: auto;
+  }
+  .controls h1 {
+    font-size: 13px;
+    margin: 0;
+    color: var(--gold);
+    letter-spacing: 1.5px;
+    text-transform: uppercase;
+  }
+  .group { display: flex; flex-direction: column; gap: 6px; }
+  .group-label { font-size: 11px; color: var(--dim); text-transform: uppercase; letter-spacing: 1px; margin: 0; }
+  .btn-row { display: flex; gap: 6px; flex-wrap: wrap; }
+  .btn-row button {
+    flex: 1 1 auto;
+    padding: 8px 10px;
+    background: #1a1c20;
+    color: var(--text);
+    border: 1px solid var(--line);
+    border-radius: 5px;
+    cursor: pointer;
+    font: inherit;
+    font-weight: 600;
+    transition: background 0.12s, border-color 0.12s, color 0.12s;
+  }
+  .btn-row button:hover { background: #23262b; border-color: #3a3e45; }
+  .btn-row button.is-active { background: var(--gold); color: #000; border-color: var(--gold); }
+  .swatch { display: inline-block; width: 10px; height: 10px; border-radius: 50%; margin-right: 6px; vertical-align: middle; }
+  .stage-wrap {
+    flex: 1 1 auto;
+    display: flex;
+    align-items: flex-start;
+    justify-content: center;
+    padding: 24px;
+    overflow: auto;
+  }
+  .figure { position: relative; }
+  .figure .hud-paperdoll-section { position: relative; }
+  .figure img {
+    display: block;
+    height: 80vh;
+    width: auto;
+    max-height: calc(100vh - 48px);
+    filter: drop-shadow(0 0 10px rgba(0,0,0,0.6));
+  }
+  .info { font-size: 12px; color: var(--dim); line-height: 1.5; }
+  .info b { color: var(--gold); }
+
+  /* The REAL production overlay CSS (mirrored from fable.css so the preview is
+     accurate). If fable.css changes, update this block to match. */
+  .injury-heatmap-overlay {
+      position: absolute;
+      pointer-events: none;
+      overflow: visible;
+      filter: blur(8px);
+      mix-blend-mode: screen;
+      isolation: isolate;
+  }
+  .injury-heatmap-overlay polygon { opacity: 0; pointer-events: none; transition: opacity 220ms ease-out; }
+  .injury-heatmap-overlay polygon.is-injured { opacity: 0.4; pointer-events: auto; cursor: help; }
+  .injury-heatmap-tooltip { position: absolute; transform: translate(-50%,-50%); background: #0d0d0d; border: 1px solid rgba(212,175,55,0.4); padding: 4px 10px; border-radius: 4px; font-size: 0.8rem; color: #E6D58A; white-space: nowrap; opacity: 0; pointer-events: none; z-index: 9; }
+  .injury-heatmap-tooltip.is-visible { opacity: 1; }
+</style>
+</head>
+<body>
+  <aside class="controls">
+    <h1>Injury Heatmap Preview</h1>
+
+    <div class="group">
+      <p class="group-label">Severity (all 22 parts)</p>
+      <div class="btn-row" id="tierRow">
+        <button data-tier="Yellow"><span class="swatch" style="background:#ffd700"></span>Yellow</button>
+        <button data-tier="Orange"><span class="swatch" style="background:#ff8c00"></span>Orange</button>
+        <button data-tier="Red"><span class="swatch" style="background:#dc143c"></span>Red</button>
+        <button data-tier="Purple"><span class="swatch" style="background:#800080"></span>Purple</button>
+      </div>
+    </div>
+
+    <div class="group">
+      <p class="group-label">Gender</p>
+      <div class="btn-row" id="genderRow">
+        <button data-gender="male" class="is-active">♂ Male</button>
+        <button data-gender="female">♀ Female</button>
+      </div>
+    </div>
+
+    <div class="group">
+      <p class="group-label">Mode</p>
+      <div class="btn-row" id="modeRow">
+        <button data-mode="all" class="is-active">All 22 parts</button>
+        <button data-mode="clear">Clear (healthy)</button>
+      </div>
+    </div>
+
+    <p class="info">
+      Every body part is set to the selected tier at once. Toggle <b>Clear</b>
+      to see the bare figure, then back to a tier to compare the bloom against
+      the crisp white outline. Hover any lit region for the part name + tier.
+    </p>
+    <p class="info">
+      Live composite: <b>blur(8px) + screen blend + 0.4 opacity</b>. This page
+      imports the real <code>paintInjuryHeatmap</code> — what you see is the
+      shipped overlay.
+    </p>
+  </aside>
+
+  <main class="stage-wrap">
+    <div class="figure">
+      <div class="hud-paperdoll-section" id="section">
+        <img class="hud-paperdoll-base" id="img" alt="" />
+      </div>
+    </div>
+  </main>
+
+<script type="module">
+  import { paintInjuryHeatmap } from '/fable/engine/injury-heatmap.js';
+  import { PARTS } from '/fable/engine/body-parts.js';
+  import MALE_URL from '/fable/assets/paperdoll_male.png';
+  import FEMALE_URL from '/fable/assets/paperdoll_female.png';
+
+  const img = document.getElementById('img');
+  const section = document.getElementById('section');
+
+  // Wire-key map: every snake_case PARTS id → its PascalCase wire key (the form
+  // the Rust body map + WIRE_TO_ID seam use). Built once from PARTS.
+  const ALL_PARTS_WIRE = {};
+  for (const { id } of PARTS) {
+    const wire = id.split('_').map(s => s.charAt(0).toUpperCase() + s.slice(1)).join('');
+    ALL_PARTS_WIRE[wire] = id;
+  }
+
+  let tier = 'Yellow';
+  let gender = 'male';
+  let mode = 'all';   // 'all' | 'clear'
+
+  function buildBodyMap() {
+    if (mode === 'clear') return {};
+    // Set EVERY part to the chosen tier.
+    const map = {};
+    for (const wire of Object.keys(ALL_PARTS_WIRE)) map[wire] = tier;
+    return map;
+  }
+
+  function render() {
+    img.src = gender === 'female' ? FEMALE_URL : MALE_URL;
+    const bodyMap = buildBodyMap();
+    const paint = () => paintInjuryHeatmap(section, gender, bodyMap);
+    if (img.complete && img.naturalWidth) paint();
+    else img.addEventListener('load', paint, { once: true });
+  }
+
+  // Wire controls.
+  document.getElementById('tierRow').addEventListener('click', (e) => {
+    const b = e.target.closest('button[data-tier]'); if (!b) return;
+    tier = b.dataset.tier;
+    document.querySelectorAll('#tierRow button').forEach(x => x.classList.toggle('is-active', x.dataset.tier === tier));
+    if (mode === 'clear') { mode = 'all'; syncMode(); }
+    render();
+  });
+  document.getElementById('genderRow').addEventListener('click', (e) => {
+    const b = e.target.closest('button[data-gender]'); if (!b) return;
+    gender = b.dataset.gender;
+    document.querySelectorAll('#genderRow button').forEach(x => x.classList.toggle('is-active', x === b));
+    render();
+  });
+  document.getElementById('modeRow').addEventListener('click', (e) => {
+    const b = e.target.closest('button[data-mode]'); if (!b) return;
+    mode = b.dataset.mode;
+    syncMode();
+    render();
+  });
+  function syncMode() {
+    document.querySelectorAll('#modeRow button').forEach(x => x.classList.toggle('is-active', x.dataset.mode === mode));
+  }
+
+  // Default: Yellow + all parts.
+  document.querySelector('#tierRow button[data-tier="Yellow"]').classList.add('is-active');
+  render();
+</script>
+</body>
+</html>

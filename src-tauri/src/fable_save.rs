@@ -367,6 +367,7 @@ mod tests {
             player_name: Some("Tester".into()),
             locations: Vec::new(),
             cast: Vec::new(),
+            start: crate::sim_card::CardStart::default(),
         }
     }
 

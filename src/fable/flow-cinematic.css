@@ -181,25 +181,22 @@
 }
 
 /* =============================================================
- * TEXT-SELECTION LOCKDOWN (Chloe 2026-08-02)
- * Default EVERYTHING in Fable to user-select: none — icons, buttons,
- * labels, chrome, captions are all non-selectable. The ONLY things a
- * user can highlight are message prose (.fable-beat-body, both user +
- * AI beats) and form inputs (where selection is editing, not copying).
- * Applied at the .app-window.fable-app root so it scopes to Fable only
- * (never the OS shell). Inputs/textareas/contenteditable re-enabled.
+ * TEXT-SELECTION LOCKDOWN (Chloe 2026-08-02). Default EVERYTHING in
+ * Fable to user-select: none — icons, buttons, labels, chrome, captions
+ * are all non-selectable. Form inputs + the dialogue-feed prose remain
+ * selectable (selection IS editing there, + the narrator prose is the
+ * one body of text a user legitimately wants to copy/quote). Applied
+ * at the .app-window.fable-app root so it scopes to Fable only (never
+ * the OS shell).
  * ============================================================= */
 .app-window.fable-app {
     -webkit-user-select: none;
     user-select: none;
 }
-.app-window.fable-app .fable-beat-body {
-    -webkit-user-select: text;
-    user-select: text;
-}
 .app-window.fable-app input,
 .app-window.fable-app textarea,
-.app-window.fable-app [contenteditable="true"] {
+.app-window.fable-app [contenteditable="true"],
+.app-window.fable-app .fable-mes-text {
     -webkit-user-select: text;
     user-select: text;
 }
@@ -683,7 +680,7 @@
 /* ============================================================
  * PLAYER CREATION SUITE OVERHAUL (2026-08-04)
  * Slide-by-slide wizard + SIM-card review + grid-to-modal picker.
- * All tokens (--fable-brass, --fable-glass, --echo-blur, etc.) are
+ * All tokens (--fable-brass, --fable-glass, etc.) are
  * inherited from fable.css :root; this block only adds the structural
  * + themed rules for the new surfaces.
  * ============================================================ */
@@ -1236,8 +1233,8 @@
     gap: 12px;                    /* tight (was 22): frees room so 2 clothing rows show */
     padding: 24px;
     background: rgba(255, 255, 255, 0.035);
-    backdrop-filter: blur(var(--echo-blur));
-    -webkit-backdrop-filter: blur(var(--echo-blur));
+    backdrop-filter: blur(8px);
+    -webkit-backdrop-filter: blur(8px);
     border: 1px solid rgba(230, 213, 138, 0.28);
     border-radius: 16px;
     box-shadow: 0 8px 28px rgba(0, 0, 0, 0.55), 0 0 24px rgba(230, 213, 138, 0.12);

@@ -19,6 +19,7 @@
 // =============================================================
 
 import { invoke, Channel } from '@tauri-apps/api/core';
+import { listen } from '@tauri-apps/api/event';
 import * as beats from './beats.js';
 import { playFX, clearFX } from '../fx/effects.js';
 
@@ -42,11 +43,31 @@ let rerolling = false;     // true when the current turn is a swipeable-variant
                            // place). Set in sendFableTurn({reroll:true}), read
                            // in onDone to update the beat's variant stamp +
                            // refresh the swipe controls.
+// Stage 3 (2026-08-11): armed by interruptAndReroll when the user re-presses ›
+// mid-reroll. The backend's abort path emits a `cancelled` event once the
+// in-flight roll is discarded + the schema reverted to base; onCancelled
+// consumes this flag to fire the fresh reroll. Cleared on any turn end.
+let deferredReroll = false;
+
+// The unlisten handle for the `fable-session-changed` Tauri event (set up in
+// initNarrator, torn down in resetNarrator). Captured at module scope so re-
+// entry into the Fable stage cleans up the prior listener before registering
+// a new one (otherwise multiple listeners accumulate across stage entries).
+let sessionChangedUnlisten = null;
+// Optional hook fired when a chat-side `fable_schema_patch` tool mutates the
+// live schema (the HUD may refresh its Soul Gem panel immediately). Receives
+// the list of merged top-level field names.
+let onSchemaPatch = null;
 
 // Identity for the message headers. cardName → narrator beats; playerName →
 // user beats. Forwarded to beats.setIdentity so the builders pick them up.
 let cardName = '';
 let playerName = '';
+// Portrait identity for the VN chat (Phase 2 bridge). Each is an asset:// URL
+// (or '' when absent). cardPortrait is the narrator portrait AND the NPC
+// fallback (per-NPC portraits are deferred). playerPortrait is the user side.
+let cardPortrait = '';
+let playerPortrait = '';
 
 export function initNarrator(hooks = {}) {
   onTurnStart = hooks.onTurnStart || null;
@@ -54,11 +75,46 @@ export function initNarrator(hooks = {}) {
   npcPretty = hooks.npcPretty || null;
   onSchemaPop = hooks.onSchemaPop || null;
   onApiLost = hooks.onApiLost || null;
+  onSchemaPatch = hooks.onSchemaPatch || null;
   if (typeof hooks.cardName === 'string') cardName = hooks.cardName;
   if (typeof hooks.playerName === 'string') playerName = hooks.playerName;
+  if (typeof hooks.cardPortrait === 'string') cardPortrait = hooks.cardPortrait;
+  if (typeof hooks.playerPortrait === 'string') playerPortrait = hooks.playerPortrait;
   // Mirror into beats so its builders (addUserBeat/startNarratorBeat) read the
-  // same names. beats.setIdentity only overwrites fields it's handed.
-  beats.setIdentity({ cardName, playerName });
+  // same identity. beats.setIdentity only overwrites fields it's handed.
+  beats.setIdentity({
+    cardName, playerName,
+    cardPortrait, playerPortrait,
+    npcNames: hooks.npcNames instanceof Map ? hooks.npcNames : new Map(),
+  });
+  // Wire the fable-session-changed listener. The backend emits this when a
+  // chat-side stateful tool (fable_message_edit/delete/fable_schema_patch,
+  // dispatched from run_agent_loop) mutates the active Fable session's live
+  // state. Two payload kinds:
+  //   - { kind: 'messages', messages: [...] } → rebuild the dialogue feed
+  //     (the operator asked WUPI to edit/delete a roleplay message via chat).
+  //   - { kind: 'schema', merged_keys: [...] } → refresh the Soul Gem panel /
+  //     HUD (the operator asked WUPI to patch world/player/npc state).
+  // Re-entry safe: any prior listener is torn down before the new one is set
+  // up (initNarrator runs on every Fable stage entry).
+  if (sessionChangedUnlisten) {
+    try { sessionChangedUnlisten(); } catch (_) { /* already torn down */ }
+    sessionChangedUnlisten = null;
+  }
+  listen('fable-session-changed', (e) => {
+    const payload = e?.payload || {};
+    if (payload.kind === 'messages' && Array.isArray(payload.messages)) {
+      beats.rebuildFromMessages(payload.messages);
+    } else if (payload.kind === 'schema') {
+      // The HUD (left-drawer) reads schema on its own refresh cadence; the
+      // turn-end hook already calls refreshAll. We hook here so a future
+      // immediate-refresh path can wire in without touching narrator again.
+      if (typeof onSchemaPatch === 'function') {
+        try { onSchemaPatch(payload.merged_keys || []); } catch (_) {}
+      }
+    }
+  }).then((un) => { sessionChangedUnlisten = un; })
+    .catch((err) => { /* listener setup failed; non-fatal */ });
 }
 
 // Hard reset of all module state (Chloe 2026-07-23: the resource-isolation
@@ -71,6 +127,12 @@ export function resetNarrator() {
   activeBeat = null;
   generating = false;
   rerolling = false;
+  // Tear down the session-changed listener — the stage is exiting, no more
+  // chat-side mutations should rebuild the (now-hidden) feed.
+  if (sessionChangedUnlisten) {
+    try { sessionChangedUnlisten(); } catch (_) {}
+    sessionChangedUnlisten = null;
+  }
 }
 
 // Send a narrator turn. Options:
@@ -136,6 +198,9 @@ function handleEvent(msg) {
       onApiLost(msg.message || 'The API connection was lost.');
       finishTurn();
       break;
+    case 'cancelled':
+      onCancelled();
+      break;
     case 'done':
       onDone(msg.final_text, msg.reasoning, msg.cancelled);
       break;
@@ -158,7 +223,10 @@ function onSceneEvent(cmd) {
     // Re-class the live narrator beat as a character beat.
     if (!activeBeat) activeBeat = beats.startNarratorBeat();
     const label = prettySpeaker(cmd.npc_id);
-    beats.reclassToCharacter(activeBeat, label);
+    // NPC portrait resolution: per-NPC portraits are deferred, so every NPC
+    // falls back to the card portrait (the narrator sprite). reclassToCharacter
+    // accepts an optional portrait URL (3rd arg) for this.
+    beats.reclassToCharacter(activeBeat, label, cardPortrait);
     if (cmd.line) beats.appendChunk(activeBeat, cmd.line);
     return;
   }
@@ -184,7 +252,10 @@ function onDone(finalText, reasoning, cancelled) {
     if (rerolling) {
       const prior = Number.parseInt(activeBeat.dataset.variantCount || '1', 10);
       const newCount = prior + 1;
-      beats.stampVariants(activeBeat, new Array(newCount - 1).fill(''), newCount - 1);
+      // Stamp the new count + active index (the fresh variant is the new tail).
+      // variantCount(variants) == variants.length post-fix, so the synthetic
+      // array's length must equal newCount (was newCount-1 under the old +1).
+      beats.stampVariants(activeBeat, new Array(newCount).fill(''), newCount - 1);
     }
     activeBeat = null;
   } else if (finalText) {
@@ -203,9 +274,46 @@ function finishTurn() {
 }
 
 export function isGenerating() { return generating; }
+export function isRerolling() { return rerolling; }
 
 export async function stopFableTurn() {
   try { await invoke('fable_stop'); } catch (_) {}
+}
+
+// Stage 3 (2026-08-11): the drawer's › interrupt — the user re-pressed ›
+// mid-reroll to abandon the in-flight roll + start a fresh one. Arms the
+// deferred reroll, then signals the backend to abort (cancel decode + set the
+// discard-and-revert flag). The backend's fable_send abort path discards the
+// partial, reverts the schema to the pre-turn base, emits `cancelled`; this
+// module's onCancelled consumes the flag + fires the fresh reroll. No-op if
+// no reroll is in flight (a normal turn keeps its existing stop gesture).
+export async function interruptAndReroll() {
+  if (!generating || !rerolling) return;
+  deferredReroll = true;
+  try {
+    await invoke('fable_interrupt_reroll');
+  } catch (_) {
+    deferredReroll = false;
+  }
+}
+
+// The `cancelled` event handler (Stage 3): the in-flight roll was discarded
+// by the backend's abort path. Clear the partial from the streaming beat +
+// start the deferred reroll (re-streams over the trailing beat, replacing the
+// aborted partial). If no reroll was armed (defensive — shouldn't happen since
+// `cancelled` is only emitted by the abort path), just finalize the turn.
+function onCancelled() {
+  if (activeBeat) {
+    // beginReroll clears the aborted partial + preps the beat for the fresh
+    // stream (so nothing lingers during the reroll's IPC round-trip).
+    beats.beginReroll(activeBeat);
+  }
+  finishTurn();
+  if (deferredReroll) {
+    deferredReroll = false;
+    // generating was just cleared by finishTurn, so rerollLastTurn's guard passes.
+    rerollLastTurn();
+  }
 }
 
 // =============================================================
@@ -237,6 +345,33 @@ export async function editMessage(index, newText) {
   if (onTurnStart) onTurnStart();
   try {
     const res = await invoke('edit_message', { index, newText });
+    if (res && Array.isArray(res.messages)) {
+      beats.rebuildFromMessages(res.messages);
+    }
+    if (onSchemaPop && typeof res.schema_pop_count === 'number') {
+      onSchemaPop(res.schema_pop_count);
+    }
+    return true;
+  } catch (err) {
+    beats.addErrorBeat(String(err));
+    return false;
+  } finally {
+    finishTurn();
+  }
+}
+
+// Delete a single message by index. Permanently removes the message + shifts
+// the tail down — the same primitive the model-facing fable_message_delete
+// tool uses (Conversation::remove_at). No inference, no schema change
+// (schema_pop_count is 0). Rebuilds the feed from the returned messages[].
+// Destructive (no conversation-undo), so the drawer gates it behind a
+// two-step inline confirm.
+export async function deleteMessage(index) {
+  if (generating) return false;
+  generating = true;
+  if (onTurnStart) onTurnStart();
+  try {
+    const res = await invoke('delete_message', { index });
     if (res && Array.isArray(res.messages)) {
       beats.rebuildFromMessages(res.messages);
     }
@@ -307,7 +442,7 @@ export async function swipeVariant(index, variantIdx) {
         // Re-stamp: the backend's select_variant updated active_idx; mirror it
         // onto the DOM. variants length unchanged.
         const feed = document.querySelector('[data-feed]');
-        const beat = feed && feed.querySelector(`.fable-beat[data-index="${index}"]`);
+        const beat = feed && feed.querySelector(`.fable-mes[data-index="${index}"]`);
         if (beat) beats.stampVariants(beat, msg.variants || [], msg.active_idx || 0);
       }
       if (onSchemaPop && typeof res.schema_pop_count === 'number') {

@@ -100,6 +100,70 @@ impl EquipSlot {
 // The layering model — Outer is narrator-visible, Inner is hidden.
 // ---------------------------------------------------------------------------
 
+/// A behavior tag on an inventory item. Drives which actions the Soul Gem
+/// inspection popup offers (CONSUME / EQUIP / POCKET). The closed three-value
+/// domain keeps the tracker prompt + the frontend UI in lockstep via the
+/// snake_case serde form (`"consumable"` / `"equippable"` / `"pocketable"`):
+/// the local model emits these in `[EQUIP/BELT/PACK ... tags=...]`, Rust parses
+/// them into the enum, and the frontend reads `item.tags` as an array of these
+/// strings to conditionally render actions (no client-side name heuristics).
+///
+/// `Equippable` is the natural tag for items the player can wear/wield;
+/// `Consumable` for food/drink/potions/scrolls; `Pocketable` for small items
+/// that fit a belt pouch (rings, keys, vials, coins). An item may carry several
+/// (a "Healing Potion" is both Consumable + Pocketable).
+#[derive(Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize, Debug)]
+#[serde(rename_all = "snake_case")]
+pub enum ItemTag {
+    Consumable,
+    Equippable,
+    Pocketable,
+}
+
+impl ItemTag {
+    /// Case-insensitive parse from a serde string (`"consumable"`). Returns
+    /// `None` for unknown tags — the parser drops these silently (same
+    /// leniency as every other bracket field).
+    pub fn from_id(s: &str) -> Option<ItemTag> {
+        match s.trim().to_lowercase().as_str() {
+            "consumable" => Some(ItemTag::Consumable),
+            "equippable" | "equipable" => Some(ItemTag::Equippable),
+            "pocketable" | "pocket" => Some(ItemTag::Pocketable),
+            _ => None,
+        }
+    }
+
+    /// The canonical snake_case id (`"consumable"`). Mirrors the serde wire
+    /// form so the parser, the applier, and the frontend share one vocabulary.
+    pub fn id(self) -> &'static str {
+        match self {
+            ItemTag::Consumable => "consumable",
+            ItemTag::Equippable => "equippable",
+            ItemTag::Pocketable => "pocketable",
+        }
+    }
+}
+
+/// Parse a comma-separated tag string (`"consumable, pocketable"`) into a
+/// deduped `Vec<ItemTag>` in canonical order. Unknown tags are dropped (no
+/// error). Empty/whitespace input → empty vec. Used by the bracket text parser
+/// (`tags=consumable,equippable`).
+pub fn parse_tag_list(s: &str) -> Vec<ItemTag> {
+    let mut out: Vec<ItemTag> = Vec::new();
+    for raw in s.split(',') {
+        // Strip JSON array + quote punctuation the model sometimes wraps tags
+        // in (`tags=["pocketable"]` → the text path sees `["pocketable"]`).
+        // Trimming `[]{}"' ` recovers the bare tag id for `from_id`.
+        let cleaned = raw.trim_matches(|c| matches!(c, '[' | ']' | '"' | '\'' | ' '));
+        if let Some(t) = ItemTag::from_id(cleaned) {
+            if !out.contains(&t) {
+                out.push(t);
+            }
+        }
+    }
+    out
+}
+
 /// Which layer an equipped item sits in. The Outer layer is what an observer
 /// sees; the Inner layer is concealed beneath it. The narrator's
 /// `render_for_prompt` exposes ONLY Outer — so a `Heavy Cloak` (Outer) over a
@@ -118,14 +182,20 @@ impl Default for ItemLayer {
 }
 
 /// A single equipped item: a name + optional flavor stats for the tooltip
-/// (e.g. `"+2 ATK"`, `"lined with wolf fur"`). Pure identity — no weight
-/// (worn items don't count against carry capacity), no quantity (a slot holds
-/// one item per layer).
+/// (e.g. `"+2 ATK"`, `"lined with wolf fur"`) + a behavior-tag set driving the
+/// Soul Gem inspection popup actions. Pure identity — no weight (worn items
+/// don't count against carry capacity), no quantity (a slot holds one item per
+/// layer).
 #[derive(Clone, PartialEq, serde::Serialize, serde::Deserialize, Debug, Default)]
 pub struct EquippedItem {
     pub name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stats: Option<String>,
+    /// Behavior tags (`consumable`/`equippable`/`pocketable`). `#[serde
+    /// (default)]` so existing saves without tags load as empty; empty vecs
+    /// are skipped on serialize to keep the JSON tight.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<ItemTag>,
 }
 
 /// The two-layer stack a single slot holds. A slot may carry an Outer item, an
@@ -165,8 +235,13 @@ pub type Equipment = HashMap<EquipSlot, SlotLayers>;
 // ---------------------------------------------------------------------------
 
 /// A stackable item entry: name + quantity + per-unit weight (lbs) + optional
-/// stats. Used by both belt and pack — they differ only in capacity semantics
-/// (belt is a fixed 4-slot count; pack is weight-bounded for encumbrance).
+/// stats + a behavior-tag set. Used by both belt and pack — they differ only in
+/// capacity semantics (belt is a fixed 4-slot count; pack is UNBOUNDED deep
+/// storage — the encumbrance/weight system was PERMANENTLY REMOVED 2026-08-09:
+/// no weight limits, no fill bar, no capacity enforcement, ever). `weight`
+/// survives on the struct purely for the narrator-summary text readout (it
+/// carries no live semantics + no code path enforces it). The belt is the
+/// only true capacity cap (`BELT_MAX = 4`).
 #[derive(Clone, PartialEq, serde::Serialize, serde::Deserialize, Debug)]
 pub struct StackItem {
     pub name: String,
@@ -176,6 +251,13 @@ pub struct StackItem {
     pub weight: f32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stats: Option<String>,
+    /// Behavior tags (`consumable`/`equippable`/`pocketable`). `#[serde
+    /// (default)]` so existing saves without tags load as empty; empty vecs
+    /// are skipped on serialize to keep the JSON tight. When `stack_upsert`
+    /// merges into an existing same-name entry, the union of both tag sets is
+    /// kept (tags are monotonic — once known, never forgotten).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<ItemTag>,
 }
 
 fn default_qty() -> u32 {
@@ -192,13 +274,15 @@ impl Default for StackItem {
             qty: default_qty(),
             weight: default_weight(),
             stats: None,
+            tags: Vec::new(),
         }
     }
 }
 
 impl StackItem {
-    /// Total weight of this stack (qty × per-unit). Drives the pack
-    /// encumbrance bar.
+    /// Total weight of this stack (qty × per-unit). RETAINED for the narrator's
+    /// inventory-summary text readout only — the encumbrance system was
+    /// permanently removed 2026-08-09, so this drives no UI + enforces nothing.
     pub fn total_weight(&self) -> f32 {
         self.qty as f32 * self.weight
     }
@@ -210,12 +294,12 @@ impl StackItem {
 /// slots + tests can pin the eviction order.
 pub const BELT_MAX: usize = 4;
 
-/// Default pack carry capacity in pounds. Per-card overridable via
-/// `PlayerState.pack_capacity_lbs`; this is the seed for a fresh game.
-pub const PACK_DEFAULT_CAPACITY_LBS: f32 = 20.0;
-
-/// Total weight of a stack list (belt or pack). Pure fold; the pack
-/// encumbrance UI divides this by `pack_capacity_lbs` for the fill bar.
+/// Total weight of a stack list (belt or pack). Pure fold; surfaced only in the
+/// narrator's inventory-summary text. The encumbrance UI that divided this by
+/// a pack-capacity field was permanently removed 2026-08-09 (the field itself
+/// was deleted from `PlayerState` on 2026-08-11 — old saves with a stray
+/// `pack_capacity_lbs` key are ignored by serde's default unknown-field
+/// tolerance).
 pub fn stack_weight(items: &[StackItem]) -> f32 {
     items.iter().map(|i| i.total_weight()).sum()
 }
@@ -233,6 +317,14 @@ pub fn stack_upsert(items: &mut Vec<StackItem>, item: StackItem) -> bool {
         }
         if existing.stats.is_none() {
             existing.stats = item.stats;
+        }
+        // Union the tag sets (monotonic: once a tag is known it's never
+        // forgotten on a restack — a "Healing Potion" re-added with only the
+        // consumable tag keeps the pocketable tag it had before).
+        for t in &item.tags {
+            if !existing.tags.contains(t) {
+                existing.tags.push(*t);
+            }
         }
         false
     } else {
@@ -317,18 +409,25 @@ fn contains_any(hay: &str, needles: &[&str]) -> bool {
 /// (the deleted `panels/inventory.js` read-view) — once migrated, the typed
 /// model is the sole source of truth.
 pub fn migrate_legacy_items(
-    entities: &mut HashMap<String, String>,
+    entities: &mut HashMap<String, serde_json::Value>,
     equipment: &mut Equipment,
     pack: &mut Vec<StackItem>,
 ) {
-    // Collect first to avoid mutating while iterating (borrowck).
+    // Collect first to avoid mutating while iterating (borrowck). Only
+    // bare-string values are legacy-convention states ("equipped", "3 in
+    // pack"); a widened structured value at an `item_*`/`inv_*` key is
+    // unrecognized noise — skip it (leave it in the entity map untouched).
     let legacy: Vec<(String, String)> = entities
         .keys()
         .filter(|k| k.starts_with("item_") || k.starts_with("inv_"))
         .cloned()
         // pull the matching values via a second pass (can't borrow mut + immut together)
         .into_iter()
-        .filter_map(|k| entities.get(&k).map(|v| (k, v.clone())))
+        .filter_map(|k| {
+            entities
+                .get(&k)
+                .and_then(|v| v.as_str().map(|s| (k, s.to_string())))
+        })
         .collect();
 
     for (raw_key, state_raw) in legacy {
@@ -347,17 +446,19 @@ pub fn migrate_legacy_items(
         if let Some(slot) = route_legacy_to_slot(&name.to_lowercase()) {
             if is_equipped {
                 // Route to the slot's Outer layer (preserving any existing item
-                // by pushing it to Inner — rare for a fresh migration).
+                // by pushing it to Inner — rare for a fresh migration). Legacy
+                // items carry no tags (the old entity convention had none) →
+                // default to empty; a future tracker turn may tag them.
                 let layers = equipment.entry(slot).or_default();
                 if layers.outer.is_none() {
-                    layers.outer = Some(EquippedItem { name: name.clone(), stats: None });
+                    layers.outer = Some(EquippedItem { name: name.clone(), stats: None, ..Default::default() });
                 } else if layers.inner.is_none() {
-                    layers.inner = Some(EquippedItem { name: name.clone(), stats: None });
+                    layers.inner = Some(EquippedItem { name: name.clone(), stats: None, ..Default::default() });
                 } else {
                     // Both layers full → fall back to pack.
                     stack_upsert(
                         pack,
-                        StackItem { name: name.clone(), qty: 1, weight: 1.0, stats: None },
+                        StackItem { name: name.clone(), qty: 1, weight: 1.0, stats: None, ..Default::default() },
                     );
                 }
             } else {
@@ -365,7 +466,7 @@ pub fn migrate_legacy_items(
                 let qty = parse_qty_hint(&state);
                 stack_upsert(
                     pack,
-                    StackItem { name: name.clone(), qty, weight: 1.0, stats: None },
+                    StackItem { name: name.clone(), qty, weight: 1.0, stats: None, ..Default::default() },
                 );
             }
         } else {
@@ -373,7 +474,7 @@ pub fn migrate_legacy_items(
             let qty = parse_qty_hint(&state);
             stack_upsert(
                 pack,
-                StackItem { name: name.clone(), qty, weight: 1.0, stats: None },
+                StackItem { name: name.clone(), qty, weight: 1.0, stats: None, ..Default::default() },
             );
         }
 
@@ -448,9 +549,9 @@ mod tests {
     #[test]
     fn stack_upsert_adds_then_stacks_by_name() {
         let mut items = Vec::new();
-        let added = stack_upsert(&mut items, StackItem { name: "Lockpick".into(), qty: 2, weight: 0.5, stats: None });
+        let added = stack_upsert(&mut items, StackItem { name: "Lockpick".into(), qty: 2, weight: 0.5, stats: None, ..Default::default() });
         assert!(added, "first entry is a new add");
-        let added2 = stack_upsert(&mut items, StackItem { name: "lockpick".into(), qty: 3, weight: 0.5, stats: None });
+        let added2 = stack_upsert(&mut items, StackItem { name: "lockpick".into(), qty: 3, weight: 0.5, stats: None, ..Default::default() });
         assert!(!added2, "second is a stack onto existing (case-insensitive)");
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].qty, 5);
@@ -460,23 +561,64 @@ mod tests {
     #[test]
     fn stack_upsert_takes_heavier_weight() {
         let mut items = Vec::new();
-        stack_upsert(&mut items, StackItem { name: "Iron Sword".into(), qty: 1, weight: 4.0, stats: None });
-        stack_upsert(&mut items, StackItem { name: "iron sword".into(), qty: 1, weight: 6.0, stats: None });
+        stack_upsert(&mut items, StackItem { name: "Iron Sword".into(), qty: 1, weight: 4.0, stats: None, ..Default::default() });
+        stack_upsert(&mut items, StackItem { name: "iron sword".into(), qty: 1, weight: 6.0, stats: None, ..Default::default() });
         assert_eq!(items[0].weight, 6.0, "the heavier per-unit weight wins on restack");
     }
 
     #[test]
+    fn stack_upsert_unions_tags_on_restack() {
+        let mut items = Vec::new();
+        stack_upsert(&mut items, StackItem { name: "Healing Potion".into(), qty: 1, weight: 0.5, stats: None, tags: vec![ItemTag::Consumable], ..Default::default() });
+        stack_upsert(&mut items, StackItem { name: "healing potion".into(), qty: 1, weight: 0.5, stats: None, tags: vec![ItemTag::Pocketable], ..Default::default() });
+        assert_eq!(items.len(), 1);
+        assert!(items[0].tags.contains(&ItemTag::Consumable), "consumable tag kept on restack");
+        assert!(items[0].tags.contains(&ItemTag::Pocketable), "pocketable tag unioned in");
+    }
+
+    #[test]
     fn stack_remove_drops_whole_entry_at_qty_zero() {
-        let mut items = vec![StackItem { name: "Arrow".into(), qty: 10, weight: 0.1, stats: None }];
+        let mut items = vec![StackItem { name: "Arrow".into(), qty: 10, weight: 0.1, stats: None, ..Default::default() }];
         assert!(stack_remove(&mut items, "arrow", 0));
         assert!(items.is_empty(), "qty=0 removes the whole entry");
     }
 
     #[test]
     fn stack_remove_partial_decrements() {
-        let mut items = vec![StackItem { name: "Arrow".into(), qty: 10, weight: 0.1, stats: None }];
+        let mut items = vec![StackItem { name: "Arrow".into(), qty: 10, weight: 0.1, stats: None, ..Default::default() }];
         assert!(stack_remove(&mut items, "Arrow", 3));
         assert_eq!(items[0].qty, 7);
+    }
+
+    // ── ItemTag parsing ──────────────────────────────────────────────────
+
+    #[test]
+    fn item_tag_from_id_canonical_and_aliases() {
+        assert_eq!(ItemTag::from_id("consumable"), Some(ItemTag::Consumable));
+        assert_eq!(ItemTag::from_id("Equippable"), Some(ItemTag::Equippable));
+        assert_eq!(ItemTag::from_id("equipable"), Some(ItemTag::Equippable), "common misspelling tolerated");
+        assert_eq!(ItemTag::from_id("POCKETABLE"), Some(ItemTag::Pocketable));
+        assert_eq!(ItemTag::from_id("pocket"), Some(ItemTag::Pocketable));
+        assert_eq!(ItemTag::from_id("cursed"), None, "unknown tag rejected");
+        assert_eq!(ItemTag::from_id(""), None);
+    }
+
+    #[test]
+    fn parse_tag_list_dedupes_and_drops_unknown() {
+        let tags = parse_tag_list("consumable, pocketable, consumable, junk, equippable");
+        assert_eq!(tags.len(), 3);
+        assert_eq!(tags[0], ItemTag::Consumable);
+        assert_eq!(tags[1], ItemTag::Pocketable);
+        assert_eq!(tags[2], ItemTag::Equippable);
+        assert!(parse_tag_list("   ").is_empty());
+    }
+
+    #[test]
+    fn item_tag_serde_is_snake_case() {
+        let json = serde_json::to_string(&vec![ItemTag::Consumable, ItemTag::Pocketable]).unwrap();
+        assert_eq!(json, r#"["consumable","pocketable"]"#);
+        let parsed: Vec<ItemTag> = serde_json::from_str(r#"["equippable"]"#).unwrap();
+        assert_eq!(parsed, vec![ItemTag::Equippable]);
     }
 
     // ── render_for_prompt Outer-layer filter ──────────────────────────────
@@ -487,14 +629,14 @@ mod tests {
         ps.equipment.insert(
             EquipSlot::Chest,
             SlotLayers {
-                outer: Some(EquippedItem { name: "Heavy Cloak".into(), stats: None }),
-                inner: Some(EquippedItem { name: "Linen Shirt".into(), stats: None }),
+                outer: Some(EquippedItem { name: "Heavy Cloak".into(), stats: None, ..Default::default() }),
+                inner: Some(EquippedItem { name: "Linen Shirt".into(), stats: None, ..Default::default() }),
             },
         );
         ps.equipment.insert(
             EquipSlot::MainHand,
             SlotLayers {
-                outer: Some(EquippedItem { name: "Iron Sword".into(), stats: Some("+2 ATK".into()) }),
+                outer: Some(EquippedItem { name: "Iron Sword".into(), stats: Some("+2 ATK".into()), ..Default::default() }),
                 inner: None,
             },
         );
@@ -518,8 +660,8 @@ mod tests {
 
     #[test]
     fn migrate_legacy_items_routes_weapon_to_main_hand() {
-        let mut entities: HashMap<String, String> = HashMap::new();
-        entities.insert("item_iron_sword".into(), "equipped".into());
+        let mut entities: HashMap<String, serde_json::Value> = HashMap::new();
+        entities.insert("item_iron_sword".into(), serde_json::Value::String("equipped".into()));
         let mut equipment = Equipment::new();
         let mut pack = Vec::new();
         migrate_legacy_items(&mut entities, &mut equipment, &mut pack);
@@ -531,8 +673,11 @@ mod tests {
 
     #[test]
     fn migrate_legacy_items_routes_unknown_to_pack() {
-        let mut entities: HashMap<String, String> = HashMap::new();
-        entities.insert("inv_health_potion".into(), "3 in pack".into());
+        let mut entities: HashMap<String, serde_json::Value> = HashMap::new();
+        entities.insert(
+            "inv_health_potion".into(),
+            serde_json::Value::String("3 in pack".into()),
+        );
         let mut equipment = Equipment::new();
         let mut pack = Vec::new();
         migrate_legacy_items(&mut entities, &mut equipment, &mut pack);
@@ -544,8 +689,8 @@ mod tests {
 
     #[test]
     fn migrate_legacy_items_is_idempotent() {
-        let mut entities: HashMap<String, String> = HashMap::new();
-        entities.insert("item_iron_sword".into(), "equipped".into());
+        let mut entities: HashMap<String, serde_json::Value> = HashMap::new();
+        entities.insert("item_iron_sword".into(), serde_json::Value::String("equipped".into()));
         let mut equipment = Equipment::new();
         let mut pack = Vec::new();
         migrate_legacy_items(&mut entities, &mut equipment, &mut pack);
@@ -555,5 +700,25 @@ mod tests {
         migrate_legacy_items(&mut entities, &mut equipment, &mut pack);
         assert_eq!(equipment, equipment_before, "idempotent — no change on second run");
         assert_eq!(pack, pack_before);
+    }
+
+    #[test]
+    fn migrate_legacy_items_skips_structured_values() {
+        // Widening guard (2026-08-11): a structured JSON value at an item_* key
+        // is unrecognized noise — leave it in the entity map untouched.
+        let mut entities: HashMap<String, serde_json::Value> = HashMap::new();
+        entities.insert(
+            "item_strange".into(),
+            serde_json::json!({ "enchantment": "unknown" }),
+        );
+        let mut equipment = Equipment::new();
+        let mut pack = Vec::new();
+        migrate_legacy_items(&mut entities, &mut equipment, &mut pack);
+        assert!(equipment.is_empty(), "structured value not routed");
+        assert!(pack.is_empty(), "structured value not packed");
+        assert!(
+            entities.contains_key("item_strange"),
+            "structured value left in entity map"
+        );
     }
 }

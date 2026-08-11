@@ -116,6 +116,18 @@ const DEV_QUICKPLAY_SHORTCUT = (() => {
     return new URLSearchParams(h).get('dev') === 'quickplay';
   } catch (_) { return false; }
 })();
+// DEV SHORTCUT (?dev=preview or #dev=preview): pure-frontend layout preview.
+// Skips title + void + ALL backend (no model, no API, no fable_send) and drops
+// straight into the chat stage with 4 placeholder messages. Purpose: iterate
+// on the VN chat UI without launching a real game. stage.js injects the
+// placeholder portraits via its own DEV_PREVIEW flag. False in production.
+const DEV_PREVIEW_SHORTCUT = (() => {
+  try {
+    if (new URLSearchParams(window.location.search).get('dev') === 'preview') return true;
+    const h = window.location.hash.replace(/^#/, '');
+    return new URLSearchParams(h).get('dev') === 'preview';
+  } catch (_) { return false; }
+})();
 
 // The baked-in default Quick Play descriptions used by the dev shortcut's
 // fresh-seed path (no quicksave exists yet). Reused verbatim each time the
@@ -299,20 +311,19 @@ function onContinueClicked() {
   resumeSave(target.card_id, target.save_id);
 }
 
-// LOAD button handler: show the world picker + populate it. The worlds screen
-// lists only worlds that have saves (a world with no saves is a New Game
-// target). Selecting one routes to the saves list for that world.
-// LOAD button handler: show the world picker + populate it. The worlds screen
-// lists only worlds that have saves (a world with no saves is a New Game
-// target). Selecting one routes to the saves list for that world.
+// LOAD button handler: show the world picker (the "Load Game" grid) +
+// populate it. The worlds screen mirrors the Player Picker exactly — same
+// embers + grid + mini-cards, no ‹ Back header — and uses the flow-chrome ⌂
+// home button (top-right) to return to the title. Selecting a world card
+// opens a modal (NEW / LOAD / EDIT / DELETE) via worldHandlers().
 //
-// Transition (Chloe 2026-08-03): wrap the title → worlds swap in the black
-// magical transition + stop the title ambient at click, matching Quick Play /
-// New Game. Previously this was an instant showScreen, so the grass stayed
-// animated through an abrupt swap — inconsistent with the other title buttons.
-// The title theme is NOT faded here — the worlds picker returns to the title
-// (via ‹), so the theme keeps playing through the picker rather than being
-// cut + restarted on back.
+// Transition: wrap the title → worlds swap in the black magical transition +
+// stop the title ambient at click (matches New Game / Quick Play). The title
+// theme fades out at click; the SAME newgame.mp3 + fire.mp3 ambience as New
+// Game blooms in at the transition midpoint. On exit (⌂ → exitLoadToTitle)
+// the ambience stops + the title theme restarts. NB: this owns its OWN
+// transition, so title.js must call it directly (NOT wrapped in a second
+// playMagicalTransition — that double-fades; see title.js).
 function onLoadClicked() {
   withFlowBusy(() => {
     // Stop the title ambient (grass + particles) at click so the dim falls over
@@ -322,20 +333,32 @@ function onLoadClicked() {
     // fire.mp3 ambience as New Game (Chloe 2026-08-05). The pair fades in at
     // the transition midpoint, mirroring onNewGameClicked.
     fadeOutThemeMusic(fableRoot);
-    return playMagicalTransition({
-      blackHoldMs: 1150,
-      onMidpoint: () => {
-        showScreen('worlds');
-        renderWorlds(screens.worlds, worldHandlers());
-        // Bloom the music + fire as the worlds screen reveals (same hand-off
-        // feel as New Game).
-        startNewGameMusic(fableRoot, { fadeIn: true });
-      },
-    }).catch((e) => {
-      console.error('[fable] Load transition failed, jumping to worlds', e);
+    // The reveal is factored out so the transition's catch fallback (below)
+    // mounts the home button + music too, not just the happy path.
+    const revealWorlds = () => {
       showScreen('worlds');
       renderWorlds(screens.worlds, worldHandlers());
+      // Mount the flow chrome (⌂ home, top-right) — mirrors the Player Picker.
+      // No ‹ Back here (the worlds grid is the top of the Load flow); ⌂ returns
+      // to the title. Hidden for 2.5s so it doesn't spawn the instant the
+      // screen reveals (matches the New Game flow's delayHome feel).
+      if (!flowChrome) flowChrome = mountFlowChrome(fableRoot);
+      if (flowChrome) {
+        flowChrome.setVariant('newgame');
+        flowChrome.hideBack();
+        flowChrome.delayHome(2500);
+        flowChrome.onHome(() => exitLoadToTitle());
+      }
+      // Bloom the music + fire as the worlds screen reveals (same hand-off
+      // feel as New Game).
       startNewGameMusic(fableRoot, { fadeIn: true });
+    };
+    return playMagicalTransition({
+      blackHoldMs: 1150,
+      onMidpoint: revealWorlds,
+    }).catch((e) => {
+      console.error('[fable] Load transition failed, jumping to worlds', e);
+      revealWorlds();
     });
   });
 }
@@ -649,15 +672,20 @@ function exitFlowToTitle() {
   showScreen('title');
 }
 
-// Exit the LOAD flow (worlds/saves pickers) back to the title (‹ Back from the
+// Exit the LOAD flow (worlds/saves pickers) back to the title (⌂ home from the
 // worlds screen). Fades the new-game ambience out + restarts the title theme —
-// mirrors exitFlowToTitle. The Load menu shares the New Game music + ember
-// background, so it shares the teardown too. (2026-08-05) This is an instant
-// screen swap (no transition), so no withFlowBusy wrap — the title buttons
-// are immediately usable again.
+// mirrors exitFlowToTitle. Also hides the flow-chrome buttons so ‹ + ⌂ don't
+// linger over the title (the chrome overlay persists; both go dark). The Load
+// menu shares the New Game music + ember background, so it shares the teardown
+// too. This is an instant screen swap (no transition), so no withFlowBusy wrap
+// — the title buttons are immediately usable again.
 function exitLoadToTitle() {
   stopNewGameMusic(fableRoot);
   startThemeMusic(fableRoot);
+  if (flowChrome) {
+    flowChrome.hideBack();
+    flowChrome.hideHome();
+  }
   showScreen('title');
 }
 
@@ -1134,6 +1162,43 @@ function exitQuickPlayToTitle() {
 // unaffected — it only loads saved JSON, no model pass). The wait has a
 // generous timeout that proceeds best-effort so a missing event can't strand
 // the UI; the seed itself is already best-effort on the Rust side.
+// DEV PREVIEW entry (?dev=preview): pure-frontend layout preview. NO backend
+// calls — no model, no API, no fable_send. Builds 4 placeholder messages (2
+// AI / 2 Player, alternating) + hands them to enterStageDirect, which wires
+// the stage + renders them. stage.js's DEV_PREVIEW flag injects the placeholder
+// portraits (Game Master + Wanderer) via refreshActiveCardName's early-return.
+// The engine is NOT started (engineStarted stays false) — a toast notes the
+// chat won't respond, which is expected (this is a static layout preview).
+function devPreviewEnter() {
+  const now = Date.now();
+  // 4 placeholder messages: AI → Player → AI → Player (2 turns).
+  // The content exercises the VN prose renderer: dialogue quotes (ivory),
+  // *italics* (lavender), + multi-line beats so the long-beat cap is visible.
+  const loadMessages = [
+    {
+      role: 'assistant',
+      content: 'The tavern door creaks open, spilling rain across the warped floorboards. A hooded figure slips inside, shaking the wet from a travel-worn cloak. \"The roads are flooded,\" the stranger mutters, *glancing at the empty tables*. \"I need a room. Just for tonight.\"',
+      timestamp: now - 1000 * 60 * 4,
+    },
+    {
+      role: 'user',
+      content: 'You step behind the bar and pull a copper key from the hook. \"Third door on the left. Three silvers.\" Your eyes drift to the muddy blade at the stranger\'s hip — *a knight\'s arming sword, recently drawn*.',
+      timestamp: now - 1000 * 60 * 3,
+    },
+    {
+      role: 'assistant',
+      content: 'The stranger drops three coins onto the bar without counting them. \"You\'re kind. Most innkeepers turn me out on sight.\" *A tired smile flickers across a weathered face.* \"The name\'s Aldric. If anyone comes asking — I was never here.\"',
+      timestamp: now - 1000 * 60 * 2,
+    },
+    {
+      role: 'user',
+      content: '\"Your secret\'s safe. I don\'t ask questions.\" You sweep the coins into your palm and turn back to the hearth, but the image of that blade lingers. *A knight\'s sword, in the hands of a fugitive.*',
+      timestamp: now - 1000 * 60,
+    },
+  ];
+  enterStageDirect(null, loadMessages);
+}
+
 async function devQuickPlayEnter() {
   // Resume-vs-fresh: the authoritative quicksave-status check. If a quicksave
   // exists, resume it — the bundled card + session + schema load straight
@@ -1488,6 +1553,24 @@ function openFable() {
   //                    from DEFAULT_QUICKPLAY_VALUES and drops straight into
   //                    the roleplay stage. No theme music (we're skipping the
   //                    title entirely).
+  // DEV PREVIEW: pure-frontend layout preview. Show #fable + chrome, hide
+  // every screen (clean black wait), then drop straight into the stage with
+  // 4 placeholder messages. No backend, no model, no IPC — devPreviewEnter is
+  // synchronous (enterStageDirect is the only call). Checked BEFORE the
+  // fable/quickplay branch because the three shortcuts are mutually exclusive.
+  if (DEV_PREVIEW_SHORTCUT) {
+    fableRoot.classList.add('show');
+    fableRoot.setAttribute('aria-hidden', 'false');
+    activateChrome();
+    if (hooks.pauseAurora) hooks.pauseAurora();
+    for (const s of Object.values(screens)) s.hidden = true;
+    stageActive = false;
+    try { devPreviewEnter(); } catch (e) {
+      console.error('[fable] dev-preview enter failed', e);
+    }
+    return;
+  }
+
   if (DEV_FABLE_SHORTCUT || DEV_QUICKPLAY_SHORTCUT) {
     fableRoot.classList.add('show');
     fableRoot.setAttribute('aria-hidden', 'false');
@@ -1614,6 +1697,17 @@ export async function launchFable() {
   // connection and show a glass popup instead of triggering the fog gate /
   // title. The backend `fable_*` IPCs enforce the same rule (require_api_
   // for_fable), so this is the primary UX gate + the backend is the backstop.
+  //
+  // Dev-only bypass (2026-08-08): `npm run dev` runs with no reachable API
+  // (the browser dev context can't push an API connection). Vite replaces
+  // `import.meta.env.DEV` with the literal `true` in dev + `false` in the
+  // built bundle, so this branch vanishes in production — the gate is
+  // untouched in shipped wupi.exe. The backend (require_api_for_fable) has a
+  // matching `cfg!(debug_assertions)` bypass.
+  if (import.meta.env.DEV) {
+    AppLifecycle.launchApp('fable');
+    return;
+  }
   let extra;
   try {
     extra = await invoke('model_source_get');
@@ -1641,7 +1735,7 @@ function showFableApiRequiredPopup() {
   popup.innerHTML = `
     <div class="fable-qp-popup-card">
       <p class="fable-qp-popup-title">No API Connection</p>
-      <p class="fable-qp-popup-warn">Fable narration requires an active API connection. The local model handles tracking only — it cannot narrate. Connect an API provider in Settings (the paw-menu AI panel), then try again.</p>
+      <p class="fable-qp-popup-warn">Fable narration requires an active API connection. Connect an API provider in Settings (the paw-menu AI panel), then try again.</p>
       <div class="fable-qp-popup-actions">
         <button class="fable-qp-popup-btn" type="button" data-act="ok">OK</button>
       </div>

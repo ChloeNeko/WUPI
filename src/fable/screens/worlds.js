@@ -9,16 +9,19 @@
 // player-picker.js: a grid of mini-cards (portrait + thin themed divider +
 // NAME ONLY), each expanding into a centered modal on click.
 //
-// THE MODAL carries four actions (per Chloe's follow-ups):
-//   • NEW GAME → fade transition into Pair 2 (Create/Load Player), reverse-
+// THE MODAL carries four actions: NEW / LOAD / EDIT / DELETE.
+//   • NEW     → fade transition into Pair 2 (Create/Load Player), reverse-
 //     spawn the buttons, then the New Game flow continues with this card
 //     pre-selected (the player chooses/creates a player → fresh game).
-//   • RESUME  → the saves list for this card (most-recent first; the backend
-//     already sorts by timestamp desc). Autosaves + quicksaves surface their
-//     "auto" tag at the top.
+//   • LOAD    → the saves list for this card (screens/saves.js). The per-turn
+//     autosave is promoted to a one-click "Resume Latest" button at the top;
+//     the list below shows the manual saves (most-recent first; the backend
+//     already sorts by timestamp desc). There is NO per-card quicksave — the
+//     autosave IS the latest world state.
 //   • EDIT    → the raw XML editor (engine/raw-editor.js) loaded with the
-//     card's <sim_card> via fable_card_raw_get, saved via fable_card_raw_set.
-//     The <persona> block is a lossy merge of several wizard fields, so the
+//     card's <sim_card> via fable_card_raw_get_by_id, saved via
+//     fable_card_raw_set_by_id. The <persona> block is a lossy merge of
+//     several wizard fields (the sim creators have no reverse-parser), so the
 //     faithful edit surface is the XML itself (zero data loss).
 //   • DELETE  → confirm → fable_card_delete → re-render the grid.
 //
@@ -47,16 +50,11 @@ function esc(s) {
 
 export function buildWorlds(handlers) {
   const root = document.createElement('section');
-  root.className = 'fable-screen fable-player-picker-screen fable-worlds-screen';
+  root.className = 'fable-screen fable-player-picker-screen';
   root.dataset.fableScreen = 'worlds';
   root.hidden = true;
   root.innerHTML = `
-    <div class="fable-void-glow" aria-hidden="true"></div>
     <div class="fable-ember-host" aria-hidden="true"></div>
-    <header class="fable-screen-header">
-      <button class="fable-back-btn" data-act="back">‹ Back</button>
-      <h2 class="fable-screen-title">Load</h2>
-    </header>
     <div class="fable-player-grid" data-host></div>
     <div class="fable-player-modal-overlay" data-modal hidden>
       <div class="fable-player-modal-backdrop" data-modal-backdrop></div>
@@ -72,15 +70,12 @@ export function buildWorlds(handlers) {
       </div>
     </div>
   `;
-  // NOTE: the worlds screen keeps its own ‹ Back header (returns to title via
-  // handlers.back, which fable.js wires to exitLoadToTitle). The header + the
-  // ‹ button are rendered once at build; renderWorlds only repopulates the
-  // grid below them so a stale handler never lingers.
-  root.querySelector('[data-act="back"]').addEventListener('click', () => {
-    if (handlers.back) handlers.back();
-  });
-  root._backHandler = () => handlers.back && handlers.back();
-
+  // No ‹ Back header here — the worlds screen mirrors the Player Picker
+  // exactly (embers + grid + modal, no header bar). The flow-chrome ⌂ home
+  // button (top-right) is mounted by fable.js::onLoadClicked and returns to
+  // the title via exitLoadToTitle. (`handlers` is unused at build time — the
+  // per-card modal handlers are passed to renderWorlds — but kept for
+  // signature symmetry with the other picker builders.)
   // Ambient ember lifecycle (mirrors newgame-split.js). Fresh on show,
   // destroyed on hide — no RAF leak. The newgame.mp3 + fire.mp3 pair is
   // started/stopped by fable.js at the title↔worlds transition midpoints.
@@ -251,8 +246,8 @@ const SILHOUETTE_SVG = `<svg class="fable-portrait-silhouette" viewBox="0 0 120 
 
 // The modal card: portrait on the LEFT (clickable), card identity on the
 // right (name + tone + setting/intro blurb + player_name + saves state), +
-// four action buttons in a centered row BELOW (NEW GAME / RESUME / EDIT /
-// DELETE). Reuses the player modal's classes so the look matches.
+// four action buttons in a centered row BELOW (NEW / LOAD / EDIT / DELETE).
+// Reuses the player modal's classes so the look matches.
 function renderModalCard(card) {
   const portraitSrc = (card.has_portrait && card.portrait_url) ? convertFileSrc(card.portrait_url) : '';
   const portraitHTML = portraitSrc
@@ -283,8 +278,8 @@ function renderModalCard(card) {
       </div>
     </div>
     <div class="fable-player-modal-actions">
-      <button type="button" class="fable-player-modal-btn fable-player-modal-btn--load" data-modal-new>NEW GAME</button>
-      <button type="button" class="fable-player-modal-btn fable-player-modal-btn--load" data-modal-resume>RESUME</button>
+      <button type="button" class="fable-player-modal-btn fable-player-modal-btn--load" data-modal-new>NEW</button>
+      <button type="button" class="fable-player-modal-btn fable-player-modal-btn--load" data-modal-resume>LOAD</button>
       <button type="button" class="fable-player-modal-btn fable-player-modal-btn--edit" data-modal-edit>EDIT</button>
       <button type="button" class="fable-player-modal-btn fable-player-modal-btn--delete" data-modal-delete>DELETE</button>
     </div>`;

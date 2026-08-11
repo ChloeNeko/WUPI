@@ -1023,128 +1023,21 @@ input[type="password"]::-webkit-credentials-auto-fill-button {
 }
 .api-body > * { width: auto; box-sizing: border-box; }
 
-/* Mode boxes: two large click targets side-by-side. Clicking highlights
-   the box (magenta border + faint bg) and swaps the section below. */
-.ai-mode-row {
-    display: flex;
-    gap: 14px;
-    margin-top: 4px;
-}
-.ai-mode-box {
-    flex: 1;
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    justify-content: center;
-    gap: 10px;
-    padding: 22px 12px;
-    background: rgba(255, 255, 255, 0.03);
-    border: 1.5px solid rgba(255, 255, 255, 0.12);
-    border-radius: 14px;
-    color: rgba(255, 255, 255, 0.65);
-    cursor: pointer;
-    transition: border-color 0.15s, background 0.15s, color 0.15s, box-shadow 0.2s;
-    font-family: inherit;
-}
-.ai-mode-box svg {
-    width: 34px;
-    height: 34px;
-    opacity: 0.7;
-    transition: opacity 0.15s;
-}
-.ai-mode-label {
-    font-size: 13px;
-    font-weight: 700;
-    letter-spacing: 2px;
-}
-.ai-mode-box:hover {
-    border-color: rgba(255, 255, 255, 0.3);
-    color: rgba(255, 255, 255, 0.9);
-}
-.ai-mode-box:hover svg { opacity: 0.95; }
-.ai-mode-box.active {
-    border-color: color-mix(in srgb, var(--ui-accent) 65%, transparent);
-    background: color-mix(in srgb, var(--ui-accent) 10%, transparent);
-    color: #ffffff;
-    box-shadow: 0 0 18px color-mix(in srgb, var(--ui-accent) 25%, transparent),
-                inset 0 0 12px color-mix(in srgb, var(--ui-accent) 8%, transparent);
-}
-.ai-mode-box.active svg { opacity: 1; }
-
-/* LOCAL section: a single centered glowing bubble. Only one local model
-   exists today, so it's a list-of-one; the active look is permanent. */
-.ai-local-section {
+/* LOCAL section: a single centered glowing bubble (always-on status). */
+/* API section: the whole panel. Always visible — the local model is an
+   internal engine detail, never surfaced in this UI. */
+.ai-online-section {
     margin-top: 22px;
-    display: flex;
-    flex-direction: column;
-    align-items: center;
+    display: block;
 }
-.ai-local-list {
-    display: flex;
-    flex-direction: column;
-    gap: 12px;
-    width: 100%;
-    align-items: center;
-}
-.ai-local-bubble {
-    display: flex;
-    align-items: baseline;
-    gap: 10px;
-    padding: 18px 36px;
-    border: 1.5px solid color-mix(in srgb, var(--ui-accent) 50%, transparent);
-    border-radius: 999px;
-    background: color-mix(in srgb, var(--ui-accent) 10%, transparent);
-    box-shadow: 0 0 22px color-mix(in srgb, var(--ui-accent) 40%, transparent),
-                inset 0 0 14px color-mix(in srgb, var(--ui-accent) 12%, transparent);
-    color: #ffffff;
-    user-select: none;
-    transition: transform 0.12s, box-shadow 0.12s;
-}
-/* The bubble is a runtime disconnect affordance when the backend is on API.
-   The JS adds .can-disconnect (and the cursor) only in that state; in normal
-   LOCAL runtime the bubble is informational and not clickable. */
-.ai-local-bubble.can-disconnect {
-    cursor: pointer;
-}
-.ai-local-bubble.can-disconnect:hover {
-    transform: scale(1.03);
-    box-shadow: 0 0 30px color-mix(in srgb, var(--ui-accent) 65%, transparent),
-                inset 0 0 18px color-mix(in srgb, var(--ui-accent) 20%, transparent);
-}
-.ai-local-bubble.active {
-    animation: localGlow 3.5s ease-in-out infinite;
-}
-.ai-local-name {
-    font-size: 16px;
-    font-weight: 700;
-    letter-spacing: 0.5px;
-}
-.ai-local-size {
-    font-size: 13px;
-    font-weight: 500;
-    color: #555;
-    letter-spacing: 1px;
-}
-@keyframes localGlow {
+
+/* The pulsing glow shared by the connected status bubble. */
+@keyframes bubbleGlow {
     0%, 100% { box-shadow: 0 0 16px color-mix(in srgb, var(--ui-accent) 35%, transparent),
                          inset 0 0 10px color-mix(in srgb, var(--ui-accent) 10%, transparent); }
     50%      { box-shadow: 0 0 28px color-mix(in srgb, var(--ui-accent) 60%, transparent),
                          inset 0 0 16px color-mix(in srgb, var(--ui-accent) 18%, transparent); }
 }
-.ai-local-hint {
-    margin: 14px 0 0;
-    font-size: 12px;
-    color: rgba(255, 255, 255, 0.4);
-    text-align: center;
-}
-
-/* ONLINE section: hidden unless ONLINE mode is active. */
-.ai-online-section {
-    margin-top: 22px;
-    display: none;
-}
-.ai-online-section.visible { display: block; }
-.ai-local-section.hidden { display: none; }
 
 /* Vertical stack: profile dropdown → model dropdown → bubble → Connect. */
 .ai-online-stack {
@@ -1206,7 +1099,7 @@ input[type="password"]::-webkit-credentials-auto-fill-button {
     color: #ffffff;
     box-shadow: 0 0 22px color-mix(in srgb, var(--ui-accent) 40%, transparent),
                 inset 0 0 14px color-mix(in srgb, var(--ui-accent) 12%, transparent);
-    animation: localGlow 3.5s ease-in-out infinite;
+    animation: bubbleGlow 3.5s ease-in-out infinite;
 }
 /* Pending = profile + model picked in the dropdowns but not yet connected.
    Preview state: subdued white, no glow, no animation. */
@@ -2311,7 +2204,7 @@ html[data-colorcode="Vibrant"] .boot-loading-text span.lit {
 
 /* Slow magenta→pink glow pulse. The box-shadow alpha breathes between 0.4
    and 0.8 so the button reads as alive + inviting without strobing. Mirrors
-   localGlow's mood (the AI panel's idle indicator). */
+   bubbleGlow's mood (the AI panel's connected indicator). */
 @keyframes launchGlow {
     0%, 100% {
         box-shadow:
@@ -2334,79 +2227,4 @@ html[data-colorcode="Vibrant"] .boot-loading-text span.lit {
     color: #ff6b8a;
     min-height: 18px;
     line-height: 1.5;
-}
-
-/* =============================================================
-   API TIMEOUT BUBBLE — top-center, persistent-until-dismissed error
-   overlay (see api-timeout-bubble.js). Distinct from the transient
-   bottom toast: a TTFT timeout is a real failure worth interrupting
-   for, and the Local fallback handling the turn needs a visible
-   signal. Dark-glass aesthetic to match the ECHO shell.
-   ============================================================= */
-.api-timeout-bubble {
-    position: fixed;
-    top: 24px;
-    left: 50%;
-    transform: translateX(-50%);
-    z-index: 100000; /* above everything (app shells, drawers, modals) */
-    display: flex;
-    align-items: center;
-    gap: 10px;
-    max-width: min(560px, 92vw);
-    padding: 12px 14px 12px 16px;
-    border-radius: 10px;
-    /* Dark-glass surface, ECHO-style. Amber accent (warning, not red-error
-       panic) — the turn still succeeds via Local fallback. */
-    background: rgba(28, 22, 16, 0.92);
-    border: 1px solid rgba(255, 178, 90, 0.45);
-    box-shadow:
-        0 8px 30px rgba(0, 0, 0, 0.55),
-        inset 0 1px 0 rgba(255, 255, 255, 0.06);
-    color: #ffd9a8;
-    font-size: 14px;
-    line-height: 1.4;
-    cursor: pointer; /* click anywhere dismisses */
-    animation: api-timeout-bubble-in 0.18s ease-out;
-    -webkit-backdrop-filter: blur(8px);
-    backdrop-filter: blur(8px);
-}
-
-.api-timeout-bubble__icon {
-    font-size: 18px;
-    color: #ffb25a;
-    flex-shrink: 0;
-}
-
-.api-timeout-bubble__text {
-    flex: 1 1 auto;
-}
-
-.api-timeout-bubble__close {
-    flex-shrink: 0;
-    width: 22px;
-    height: 22px;
-    border: none;
-    background: transparent;
-    color: #ffd9a8;
-    font-size: 20px;
-    line-height: 1;
-    cursor: pointer;
-    border-radius: 4px;
-    opacity: 0.7;
-    transition: opacity 0.12s, background 0.12s;
-}
-.api-timeout-bubble__close:hover {
-    opacity: 1;
-    background: rgba(255, 178, 90, 0.15);
-}
-
-@keyframes api-timeout-bubble-in {
-    from {
-        opacity: 0;
-        transform: translateX(-50%) translateY(-8px);
-    }
-    to {
-        opacity: 1;
-        transform: translateX(-50%) translateY(0);
-    }
 }

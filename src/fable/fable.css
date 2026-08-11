@@ -58,19 +58,6 @@
        panel edges, icon buttons. */
     --fable-emboss:       0 0 8px rgba(197, 179, 88, 0.18);
 
-    /* --- ECHO overlay (2026-07-31) — the Moonlit-Echoes-inspired chat layer.
-       These ride ON TOP of the warm brass palette: the message bubbles + the
-       feed read from these glass + accent values so the dialogue column feels
-       like the dark, glassy SillyTavern theme, while the rest of Fable (title,
-       drawers, panels) keeps its brass identity. */
-    --echo-accent:        #51A0DE;          /* primary blue (focus / links / active) */
-    --echo-accent-2:      #FAC679;          /* secondary amber */
-    --echo-blur:          8px;              /* backdrop-blur strength */
-    --echo-glass:         rgba(33, 33, 33, 0.65);  /* base glass tint */
-    --echo-glass-user:    rgba(45, 45, 45, 0.50);  /* user bubble fill */
-    --echo-glass-ai:      rgba(39, 39, 39, 0.65);  /* AI/narrator bubble fill */
-    --echo-shadow:        rgba(0, 0, 0, 0.50);
-    --echo-shadow-soft:   3px 3px 8px rgba(0, 0, 0, 0.08);
     --fable-emboss-strong: 0 0 14px rgba(230, 213, 138, 0.35);
 
     /* (The mannequin injury-state color vars were removed 2026-07-25 with
@@ -825,6 +812,47 @@ body.fable-active.fable-chrome-peek .top-bar { transform: translateY(0); }
 /* --- Save picker --- */
 .fable-saves-screen { background: var(--fable-void); }
 .fable-saves-list { flex: 1; overflow-y: auto; padding: 20px 28px; display: flex; flex-direction: column; gap: 12px; }
+/* The one-click "Resume Latest" button (the per-turn autosave promoted to the
+   top of the list — the world's latest state). Reads as the primary action:
+   richer brass fill + brass border + emboss, brighter than a normal save row. */
+.fable-save-resume-latest {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 16px;
+    width: 100%;
+    box-sizing: border-box;
+    padding: 18px 20px;
+    text-align: left;
+    cursor: pointer;
+    background: linear-gradient(180deg, rgba(203, 163, 92, 0.22), rgba(120, 90, 40, 0.18));
+    border: 1px solid var(--fable-brass);
+    border-left: 3px solid var(--fable-brass);
+    border-radius: 12px;
+    box-shadow: var(--fable-emboss);
+    transition: transform 160ms ease, box-shadow 160ms ease, background 160ms ease;
+}
+.fable-save-resume-latest:hover {
+    transform: translateY(-1px);
+    background: linear-gradient(180deg, rgba(203, 163, 92, 0.3), rgba(120, 90, 40, 0.24));
+    box-shadow: 0 0 18px rgba(230, 213, 138, 0.25), var(--fable-emboss);
+}
+.fable-save-resume-latest-main { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+.fable-save-resume-latest-label {
+    color: var(--fable-brass-bright, var(--fable-brass));
+    font-weight: 700;
+    font-size: 19px;
+    letter-spacing: 0.02em;
+}
+.fable-save-resume-latest-summary {
+    color: var(--fable-text-dim);
+    font-size: 14px;
+    line-height: 1.4;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+.fable-save-resume-latest-meta { color: var(--fable-text-faint); font-size: 13px; white-space: nowrap; flex: 0 0 auto; }
 .fable-save-row {
     display: flex;
     justify-content: space-between;
@@ -910,530 +938,40 @@ body.fable-active.fable-chrome-peek .top-bar { transform: translateY(0); }
     inset: 0;
     overflow: hidden;
     /* The background layer. SD scene-image was unhooked from Fable (2026-07-31);
-       the inner <img> is gone. Stream C re-tints this as the dark ECHO base.
-       Hidden until art returns so a stray layer never flashes. */
+       the inner <img> is gone. 2026-08-11 Background Library: REACTIVATED — the
+       4th WUPI-drawer foot button ("Background") paints an imported image here
+       via convertFileSrc (engine/backgrounds.js). display:none stays the
+       OFF-state (the default black void); JS flips it to block + sets
+       background-image when a background is selected.
+       CONTAIN (not cover): the WHOLE image always shows — non-16:9 sources and
+       ultrawide screens get transparent bars that fall through to the black
+       .fable-stage behind (the default "background"). Nothing stretches; the
+       user's own crop (from the cropper) already frames what matters. */
     display: none;
+    background-size: contain;
+    background-position: center center;
+    background-repeat: no-repeat;
+}
+/* NO full-layer readability veil here: with `contain`, a veil over the whole
+   layer would wash the transparent bars (violating "completely transparent
+   edges"). Readability over a photo instead comes from scoped glass panels on
+   the narrative cards — see `.fable-stage.has-bg .fable-mes-block` near the
+   feed styles — which render ONLY when a background is painted (so the default
+   void keeps the current transparent-card aesthetic). */
+/* Scoped readability: when a background is active (the .has-bg class is toggled
+   on .fable-stage by engine/backgrounds.js#applyBackground), each narrative
+   card's prose block becomes a translucent glass panel so the light text stays
+   legible over any photo. Without this the cards are transparent
+   (.fable-mes-block is background:none — fine over the default black void,
+   unreadable over a busy photo). Scoped to .has-bg so the void keeps the
+   floating transparent-card look; the panels appear only with a background. */
+.fable-stage.has-bg .fable-mes-block {
+    background: rgba(2, 4, 10, 0.55);
+    backdrop-filter: blur(4px);
+    -webkit-backdrop-filter: blur(4px);
+    border-radius: 12px;
 }
 /* The fx-layer z-index + classes live in fx/fx.css. */
-
-/* --- Dialogue feed (ECHO rewrite, 2026-07-31) --- */
-/* The chat column. New beats append at the bottom (just above the input row,
-   where the user's eye lands) + auto-scroll keeps the newest in view, so
-   older beats get "pushed upward" as the conversation grows — the standard
-   chat rhythm. Each new beat's `echoRise` entrance animation (translateY from
-   below) gives the "appears from the bottom" feel.
-
-   The fade-to-edges mask gives the "dissolve at the top/bottom" cinematic
-   edge (Moonlit Echoes' mask-image gradient). Generous padding-x keeps the
-   bubbles in a centered readable column. pointer-events:none on the
-   container + auto on each beat keeps clicks on bubbles only (the input
-   row owns the rest). */
-.fable-dialogue-feed {
-    position: absolute;
-    left: 0;
-    right: 0;
-    bottom: 96px;   /* clears the input row (+ typing indicator) */
-    top: 0;
-    overflow-y: auto;
-    padding: 60px max(40px, 10vw) 20px;
-    z-index: 20;
-    pointer-events: none;
-    scrollbar-width: none;
-    /* fade-to-edges mask: messages dissolve as they near the top + the input */
-    -webkit-mask-image: linear-gradient(to bottom, transparent 0%, black 3%, black 90%, transparent 100%);
-    mask-image: linear-gradient(to bottom, transparent 0%, black 3%, black 90%, transparent 100%);
-}
-.fable-dialogue-feed::-webkit-scrollbar { width: 0; height: 0; }
-.fable-dialogue-feed::-webkit-scrollbar-thumb { background: transparent; }
-
-/* === CARD-BASED MESSAGE LAYOUT (2026-08-01 overhaul) ======================
-   Each beat is a flex ROW: [avatar] [card], aligned left (AI/narrator/
-   character/error) or right (user, mirrored via row-reverse so the avatar
-   sits on the outer edge). Capped at 85% of the feed width. Tight 10–12px
-   vertical gaps kill the old large empty margins. The card carries a hover-
-   only header (.message-header) with name + time + action controls, so the
-   feed stays completely clean until the user hovers a card.
-
-   The structural contract (consumed by beats.js/narrator.js/stage.js):
-     .fable-beat            = the flex row (alignment + entrance anim here)
-       .message-avatar      = 80×120 portrait box (svg silhouette; img layer)
-       .message-card        = glass card (was .fable-beat-card)
-         .message-header    = hover-only: .msg-name + .msg-time + actions
-         .fable-beat-body   = UNCHANGED — streaming/variant/edit read this
-   .fable-beat-card is retained as a synonym alias of .message-card below so
-   the old selector paths in beats.js keep resolving during the transition;
-   new code targets .message-card directly.
-   ========================================================================= */
-.fable-beat {
-    display: flex;
-    align-items: flex-start;
-    gap: 10px;
-    max-width: 85%;
-    margin: 10px 0;            /* tight rhythm — was 4px (killed the big gaps) */
-    margin-left: 0;            /* AI/narrator/character/error: hug the LEFT */
-    margin-right: auto;
-    animation: echoRise 300ms cubic-bezier(0.2, 0.8, 0.2, 1) both;
-    pointer-events: auto;
-}
-@keyframes echoRise {
-    from { opacity: 0; transform: translateY(18px); }   /* rise from the bottom */
-    to   { opacity: 1; transform: translateY(0); }
-}
-
-/* USER — mirrored to the RIGHT. row-reverse puts the avatar on the outer
-   (right) edge, and the right/left margins swap so the card hugs the right. */
-.fable-beat.user {
-    flex-direction: row-reverse;
-    margin-left: auto;
-    margin-right: 0;
-}
-
-/* --- Avatar (the portrait box) --- */
-/* Fixed 80×120 portrait. The inline-SVG silhouette is the always-present
-   fallback layer; an <img> (if resolveAvatar returns a URL) layers on top.
-   object-fit:cover so portraits never stretch; the svg fills via currentColor
-   so it tints with the message-type accent. A subtle inner ring reads as an
-   integrated frame, not a floating tile. */
-.message-avatar {
-    position: relative;
-    flex: 0 0 80px;
-    width: 80px;
-    height: 120px;
-    border-radius: 10px;
-    overflow: hidden;
-    background: rgba(255, 255, 255, 0.035);
-    border: 1px solid rgba(255, 255, 255, 0.08);
-    box-shadow: inset 0 0 0 1px rgba(0, 0, 0, 0.25), 0 4px 10px rgba(0, 0, 0, 0.35);
-}
-.message-avatar svg {
-    position: absolute;
-    inset: 0;
-    width: 100%;
-    height: 100%;
-    color: var(--fable-text-faint);
-    opacity: 0.55;
-}
-.message-avatar img {
-    position: absolute;
-    inset: 0;
-    width: 100%;
-    height: 100%;
-    object-fit: cover;
-}
-/* Tint the silhouette per message type so avatars carry a hint of identity
-   even without art. AI/narrator → echo blue; user → warm brass. */
-.fable-beat.narrator .message-avatar svg,
-.fable-beat.character .message-avatar svg { color: var(--echo-accent); opacity: 0.6; }
-.fable-beat.user .message-avatar svg { color: var(--fable-brass); opacity: 0.6; }
-
-/* --- Card face (the dark-charcoal glass panel) --- */
-/* Your exact spec: rgba(255,255,255,0.035) + blur(8px) + 1px hairline. The
-   asymmetric tail corner radius (bottom-left for AI / bottom-right for user)
-   is retained from the ECHO layer so the speech-bubble character survives. */
-.message-card {
-    position: relative;
-    flex: 1 1 auto;
-    min-width: 0;             /* allow the prose to shrink so the avatar holds 80px */
-    padding: 12px 16px;
-    border-radius: 15px 15px 15px 4px;   /* tail corner bottom-left (AI) */
-    background: rgba(255, 255, 255, 0.035);
-    backdrop-filter: blur(var(--echo-blur));
-    -webkit-backdrop-filter: blur(var(--echo-blur));
-    border: 1px solid rgba(255, 255, 255, 0.08);
-    box-shadow: var(--echo-shadow-soft), 0 6px 18px var(--echo-shadow);
-    font-size: 16px;
-    line-height: 1.6;
-    color: var(--fable-text);
-}
-.fable-beat.user .message-card {
-    border-radius: 15px 15px 4px 15px;   /* tail corner bottom-right (mirrored) */
-}
-/* Legacy selector alias: keep .fable-beat-card pointing at the same face so
-   the querySelector('.fable-beat-card') sites in beats.js resolve during the
-   class-name transition. New code should target .message-card. */
-.fable-beat .fable-beat-card { /* alias */ }
-
-/* Per-type glass tints (subtle, over the shared charcoal base). */
-.fable-beat.narrator .message-card,
-.fable-beat.character .message-card { background: var(--echo-glass-ai); }
-.fable-beat.user .message-card { background: var(--echo-glass-user); }
-.fable-beat.error .message-card {
-    background: rgba(120, 30, 30, 0.55);
-    border: 1px solid rgba(244, 114, 114, 0.4);
-    border-radius: 10px;
-    color: #f4c4c4;
-    font-size: 15px;
-}
-
-/* --- Hover-only header (name + time + actions) --- */
-/* opacity 0 → 1 on .message-card:hover. Hidden entirely while streaming or
-   editing so a live/in-flight card shows no chrome. Anchored at the top edge
-   of the card (the row above the prose), pushing the body down on reveal. */
-.message-header {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    margin-bottom: 6px;
-    opacity: 0;
-    transition: opacity 0.2s ease;
-    pointer-events: none;     /* the whole header is inert until revealed */
-}
-.message-card:hover .message-header,
-.message-card:focus-within .message-header {
-    opacity: 1;
-    pointer-events: auto;
-}
-.fable-beat.streaming .message-header,
-.fable-beat.editing .message-header {
-    opacity: 0 !important;
-    pointer-events: none !important;
-}
-.msg-name {
-    font-size: 12.5px;
-    font-weight: 700;
-    letter-spacing: 0.06em;
-    text-transform: uppercase;
-    color: var(--echo-accent);
-    white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
-}
-.fable-beat.user .msg-name { color: var(--fable-brass-bright); }
-.msg-time {
-    font-size: 11px;
-    color: var(--fable-text-faint);
-    font-variant-numeric: tabular-nums;
-    white-space: nowrap;
-}
-.message-actions {
-    display: inline-flex;
-    align-items: center;
-    gap: 4px;
-    margin-left: auto;        /* push controls to the header's right edge */
-}
-/* Edit trigger (the ✎ icon button in the header). Shares the swipe-btn chrome
-   so the controls read as one family. */
-.msg-action-btn {
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    width: 22px;
-    height: 22px;
-    padding: 0;
-    background: transparent;
-    border: 1px solid transparent;
-    border-radius: 5px;
-    color: var(--fable-text-faint);
-    cursor: pointer;
-    transition: color 160ms ease, border-color 160ms ease, background 160ms ease;
-}
-.msg-action-btn:hover {
-    color: var(--echo-accent);
-    border-color: rgba(81, 160, 222, 0.4);
-    background: rgba(81, 160, 222, 0.08);
-}
-.msg-action-btn:focus-visible {
-    outline: 1.5px solid var(--echo-accent);
-    outline-offset: 1px;
-}
-.msg-action-btn svg { display: block; width: 14px; height: 14px; }
-
-/* --- Dialogue coloring (visual-novel immersion) --- */
-/* Quoted speech (straight or smart quotes) is wrapped in .dialogue by the
-   renderProse pass (beats.js) → rendered accent + italic so spoken lines pop
-   against narration prose. Narration text stays default. */
-.fable-beat-body .dialogue {
-    color: var(--echo-accent-2);
-    font-style: italic;
-}
-
-/* SYSTEM — centered, de-emphasized italic line (object state changes, saves).
-   No card, no avatar (plain text node). Overrides the flex row above. */
-.fable-beat.system {
-    display: block;
-    max-width: 560px;
-    margin: 6px auto;
-    text-align: center;
-    color: var(--fable-text-faint);
-    font-size: 13.5px;
-    font-style: italic;
-    letter-spacing: 0.03em;
-    opacity: 0.85;
-    animation: none;   /* system lines don't rise */
-}
-.fable-beat-body br { content: ""; display: block; }
-
-/* --- Word fade-in streaming (ECHO rewrite, 2026-07-31) --- */
-/* Replaces the old blinking ▌ caret. As text streams, appendChunk wraps each
-   newly-arrived word in a .echo-word span that fades + lifts in once. The
-   result reads like text "popping in" from a live narrative, not a terminal
-   cursor. The animation is short (140ms) + runs once (both), so finished
-   words settle to full opacity and stay still. */
-.echo-word {
-    display: inline;
-    animation: echoWordIn 140ms ease-out both;
-}
-@keyframes echoWordIn {
-    from { opacity: 0; transform: translateY(4px); }
-    to   { opacity: 1; transform: translateY(0); }
-}
-
-/* =============================================================
-   UX CHAT CONTROLS — the SillyTavern-style ‹ n/N › swipe bar.
-   Thin Unicode chevrons flank a counter on assistant beats:
-     ‹ (left)  → step back to the previous variant (undo, unlimited).
-     › (right) → step forward; if on the LAST variant, REGENERATE (a new
-                variant is generated + appended; variants are uncapped).
-   2026-08-01: the bar now lives INSIDE .message-actions (the hover-only
-   header), so its visibility is driven by the header's opacity transition
-   above — the feed stays fully clean until a card is hovered. The
-   .is-hidden class (on earlier beats' read-only counter) is retained but
-   no longer toggles opacity itself (the header gate already hides it).
-   ============================================================= */
-.fable-beat-controls {
-    display: inline-flex;
-    align-items: center;
-    gap: 2px;
-}
-
-/* --- Swipeable variants (the ‹ n/N › bar) --- */
-/* The arrows flank the index counter; › at the last variant is the
-   regenerate trigger (styled with the accent so it reads as an action). */
-.fable-swipe-bar {
-    display: inline-flex;
-    align-items: center;
-    gap: 2px;
-}
-.fable-swipe-btn {
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    width: 22px;
-    height: 22px;
-    padding: 0;
-    background: transparent;
-    border: 1px solid transparent;
-    border-radius: 5px;
-    color: var(--fable-text-faint);
-    font-size: 17px;
-    line-height: 1;
-    cursor: pointer;
-    transition: color 160ms ease, border-color 160ms ease, background 160ms ease;
-}
-.fable-swipe-btn:hover:not(:disabled) {
-    color: var(--echo-accent);
-    border-color: rgba(81, 160, 222, 0.4);
-    background: rgba(81, 160, 222, 0.08);
-}
-.fable-swipe-btn:focus-visible {
-    outline: 1.5px solid var(--echo-accent);
-    outline-offset: 1px;
-}
-.fable-swipe-btn:disabled {
-    opacity: 0.25;
-    cursor: default;
-}
-/* The regenerate arrow (› on the last variant) glows accent-blue so it reads
-   as the "make a new one" action rather than plain navigation. */
-.fable-swipe-btn.is-regenerate {
-    color: var(--echo-accent);
-}
-.fable-swipe-btn.is-regenerate:hover:not(:disabled) {
-    color: var(--fable-text);
-    background: rgba(81, 160, 222, 0.18);
-    border-color: var(--echo-accent);
-}
-.fable-swipe-count {
-    min-width: 30px;
-    text-align: center;
-    font-size: 11px;
-    color: var(--fable-text-faint);
-    font-variant-numeric: tabular-nums;
-    user-select: none;
-}
-
-/* --- Inline edit mode (beats.enterEditMode) --- */
-/* The editor textarea + Save/Cancel footer swap in for the read-only body.
-   `beats.enterEditMode` hides the original `.fable-beat-body` via inline
-   `display:none` and adds `.editing` to the beat; we hide the controls
-   block too so the editor is the sole focus. */
-.fable-beat.editing .fable-beat-controls { display: none; }
-.fable-beat-editor {
-    width: 100%;
-    box-sizing: border-box;
-    resize: vertical;
-    min-height: 3em;
-    margin-top: 4px;
-    padding: 10px 12px;
-    background: var(--fable-inset);
-    color: var(--fable-text);
-    border: 1px solid var(--fable-brass-dim);
-    border-radius: 8px;
-    font-size: 15px;
-    font-family: inherit;
-    line-height: 1.45;
-    box-shadow:
-        inset 0 1px 0 rgba(232, 201, 138, 0.14),
-        inset 0 0 0 1px rgba(0, 0, 0, 0.25);
-}
-.fable-beat-editor:focus {
-    outline: none;
-    border-color: var(--fable-brass);
-}
-.fable-beat-editor-footer {
-    display: flex;
-    justify-content: flex-end;
-    gap: 8px;
-    margin-top: 6px;
-}
-.fable-beat-editor-btn {
-    padding: 5px 14px;
-    background: transparent;
-    color: var(--fable-text);
-    border: 1px solid var(--fable-brass-dim);
-    border-radius: 6px;
-    font-size: 13px;
-    font-family: inherit;
-    cursor: pointer;
-    transition: border-color 120ms ease, color 120ms ease, background 120ms ease;
-}
-.fable-beat-editor-btn:hover {
-    border-color: var(--fable-brass);
-    color: var(--fable-brass);
-}
-.fable-beat-editor-btn.primary {
-    background: var(--fable-brass);
-    color: #1a1714;
-    border-color: var(--fable-brass);
-    font-weight: 600;
-}
-.fable-beat-editor-btn.primary:hover {
-    color: #1a1714;
-    filter: brightness(1.08);
-}
-
-/* --- Selective regenerate popup (engine/selection.js) --- */
-/* A floating "Regenerate" chip that appears next to a text selection inside
-   the LAST assistant beat. Clicking it asks the model to rewrite ONLY the
-   highlighted passage in-place. Lives at stage root (NOT a beat descendant)
-   because .fable-dialogue-feed has pointer-events:none — only .fable-beat
-   children re-enable it, and a floating popup needs to survive the
-   selection collapsing on hover. Styled to match the .fable-beat-btn brass-
-   accent glass so it reads as a sibling of the edit/reroll controls. */
-.fable-selection-popup {
-    position: absolute;
-    z-index: 50;
-    display: inline-flex;
-    align-items: center;
-    gap: 5px;
-    padding: 5px 10px 5px 8px;
-    background: rgba(38, 26, 16, 0.96);
-    color: var(--fable-brass);
-    border: 1px solid var(--fable-brass-dim);
-    border-radius: 999px;
-    font-size: 12.5px;
-    font-weight: 600;
-    font-family: inherit;
-    letter-spacing: 0.02em;
-    cursor: pointer;
-    user-select: none;
-    box-shadow:
-        0 4px 14px rgba(0, 0, 0, 0.55),
-        inset 0 1px 0 rgba(232, 201, 138, 0.12);
-    backdrop-filter: blur(6px);
-    -webkit-backdrop-filter: blur(6px);
-    transition: color 120ms ease, border-color 120ms ease, background 120ms ease, transform 120ms ease;
-    animation: fableSelectionPopIn 140ms ease both;
-}
-.fable-selection-popup:hover {
-    color: var(--fable-brass-bright, #f4d896);
-    border-color: var(--fable-brass);
-    background: rgba(58, 40, 24, 0.98);
-    transform: translateY(-1px);
-}
-.fable-selection-popup:focus-visible {
-    outline: 1.5px solid var(--fable-brass);
-    outline-offset: 2px;
-}
-.fable-selection-popup[hidden] { display: none; }
-.fable-selection-popup-icon {
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    color: var(--fable-brass);
-}
-.fable-selection-popup-icon svg { display: block; }
-.fable-selection-popup-label { line-height: 1; }
-@keyframes fableSelectionPopIn {
-    from { opacity: 0; transform: translateY(4px) scale(0.96); }
-    to   { opacity: 1; transform: translateY(0) scale(1); }
-}
-
-/* The "regenerating" preview state: the beat body shows before + a live-
-   filling slot + after, all read-only. Dim the anchors slightly so the eye
-   tracks the filling gap. The caret inside the empty slot mirrors the
-   streaming narrator beat's .streaming caret. */
-.fable-beat.regenerating .fable-beat-body {
-    opacity: 0.96;
-}
-.fable-beat.regenerating .fable-slice-slot {
-    color: var(--fable-brass-bright, #f4d896);
-    background: rgba(232, 201, 138, 0.07);
-    border-radius: 3px;
-    padding: 0 2px;
-}
-.fable-slice-caret {
-    display: inline-block;
-    width: 2px;
-    height: 1.05em;
-    margin-left: 1px;
-    vertical-align: text-bottom;
-    background: var(--fable-brass);
-    animation: fableSliceBlink 1s steps(2, start) infinite;
-}
-@keyframes fableSliceBlink { to { background: transparent; } }
-
-/* --- Input row --- */
-/* PHASE 2: the input is now a parchment-edged console — a recessed dark
-   well with a brass frame + a faint top sheen, reading as an engraved
-   brass tray holding a sheet of vellum. Replaces the raw glassmorphism
-   textarea. The gradient fade-up behind it is warmed to match the stage. */
-/* --- Typing indicator (ECHO rewrite, 2026-07-31) --- */
-/* A small sticky label pinned just above the input row: "(name) is currently
-   typing.." shows while a narrator/character beat is streaming. Hidden by
-   default; the stage toggles `.is-visible` on first chunk / off on `done`.
-   Styled per Moonlit Echoes: small, soft glow, low-contrast until active. */
-.fable-typing-indicator {
-    position: absolute;
-    left: 0;
-    right: 0;
-    bottom: 96px;          /* sits just above the input row */
-    z-index: 24;
-    display: flex;
-    justify-content: center;
-    padding: 0 max(32px, 12vw);
-    pointer-events: none;
-    opacity: 0;
-    transform: translateY(6px);
-    transition: opacity 220ms ease, transform 220ms ease;
-}
-.fable-typing-indicator.is-visible {
-    opacity: 0.85;
-    transform: translateY(0);
-}
-.fable-typing-indicator__text {
-    font-size: 12.5px;
-    font-style: italic;
-    letter-spacing: 0.04em;
-    color: var(--fable-text-dim);
-    text-shadow: 0 0 6px var(--echo-shadow);
-    /* The three-dot ellipsis animates a gentle "still typing" pulse. */
-    animation: echoTypingPulse 1.4s ease-in-out infinite;
-}
-@keyframes echoTypingPulse {
-    0%, 100% { opacity: 0.55; }
-    50%      { opacity: 1; }
-}
 
 .fable-input-row {
     position: absolute;
@@ -1445,19 +983,22 @@ body.fable-active.fable-chrome-peek .top-bar { transform: translateY(0); }
     justify-content: center;
     /* Bottom padding: textarea outer-bottom lands ~10px above screen bottom
        (Chloe 2026-07-26). The textarea's 1px border + box layering add ~4px,
-       so 6px padding → 10px visual gap. */
-    padding: 10px max(32px, 12vw) 6px;
+       so 6px padding → 10px visual gap. Side padding floor raised 32→40 on
+       2026-08-11 to track the feed's margin (crisp axis alignment). */
+    padding: 10px max(40px, 12vw) 6px;
     background: linear-gradient(180deg, transparent, rgba(10, 6, 4, 0.88) 38%);
     z-index: 25;
 }
 /* The input GROUP: a centered, max-width container holding the single text
    box. The send button is GONE (2026-07-27) — generation is Enter-driven.
    Kept as a relative-positioned wrapper so future absolutely-positioned
-   affordances resolve against it. */
+   affordances resolve against it. Width bumped to 920 on 2026-08-11 to
+   track the widened bubble column (keeps the composer flush with the
+   dialogue cards). */
 .fable-input-group {
     position: relative;
     width: 100%;
-    max-width: 720px;
+    max-width: 1040px;            /* synced to .fable-mes max-width so the composer stays flush with the dialogue cards (920→1040 2026-08-11). If the bubble cap changes, change this too. */
 }
 /* The text box: holds the textarea, centered inside the group. Chloe
    2026-07-27: position: relative so the Impersonate ✎ button can anchor
@@ -1537,11 +1078,12 @@ body.fable-active.fable-chrome-peek .top-bar { transform: translateY(0); }
 }
 
 /* API-required launch popup (2026-08-07). Body-mounted (Fable isn't open
-   yet), so fixed-position. Mirrors the Quick Play resume popup's glass card. */
+   yet), so fixed-position. z-index 100100 sits above the dock (9998) + the
+   home grid (#apps, 1000) so the popup isn't painted behind either. */
 .fable-api-required-popup {
     position: fixed;
     inset: 0;
-    z-index: 1000;
+    z-index: 100100;
     display: flex;
     align-items: center;
     justify-content: center;
@@ -1563,7 +1105,13 @@ body.fable-active.fable-chrome-peek .top-bar { transform: translateY(0); }
     top: 0;
     right: 0;
     bottom: 0;
-    width: 192px;  /* ~2 inches at 96dpi */
+    width: 72px;  /* retuned 2026-08-11: was 192px (too large, fought the VN
+                      flank/history layers), then 44px (too short — hard to
+                      hit deliberately). 72px = ~0.75in: deliberate dwell-open
+                      is easy, accidental swipes don't trigger it. The 300ms
+                      mouseenter dwell + mouseleave-cancel + the drawer's own
+                      mouseleave auto-close are UNCHANGED — only the band
+                      width changed. See vn-interactions.js. */
     z-index: 30;
     background: transparent;
 }
@@ -1605,8 +1153,8 @@ body.fable-active.fable-chrome-peek .top-bar { transform: translateY(0); }
 .fable-wupi-drawer.open { transform: translateX(0); }
 
 /* =============================================================
-   LEFT DRAWER — Card / Tracker authoring panel (ECHO, 2026-07-31; mirrored
-   to the right drawer 2026-08-01). EXACT MIRROR of the right Wupi drawer:
+   LEFT DRAWER — Card / Tracker authoring panel (mirrored to the right
+   drawer 2026-08-01). EXACT MIRROR of the right Wupi drawer:
    opened by an invisible left-edge hover strip (.fable-corner-trigger--left,
    below) + pinned by a left edge-lock bar (.fable-edge-lock--left). The old
    always-visible `›` handle was removed — the two drawers behave identically,
@@ -1621,7 +1169,10 @@ body.fable-active.fable-chrome-peek .top-bar { transform: translateY(0); }
     top: 0;
     left: 0;
     bottom: 0;
-    width: 192px;  /* ~2 inches at 96dpi — same as the right strip */
+    width: 72px;  /* retuned 2026-08-11 (was 44px, before that 192px) — mirror
+                     of the right strip. Same change, same rationale, same
+                     untouched dwell/leave semantics. See .fable-corner-trigger
+                     above. */
     z-index: 30;
     background: transparent;
 }
@@ -2100,6 +1651,8 @@ body.fable-active.fable-chrome-peek .top-bar { transform: translateY(0); }
        floor preserves the silhouette on small windows. */
     filter: drop-shadow(0 0 10px rgba(0,0,0,0.6));
     pointer-events: none;
+    -webkit-user-drag: none;          /* the figure is not a draggable image — kills the click drag-ghost */
+    user-select: none;
 }
 
 /* ── BODY-PARTS DEBUG OVERLAY (engine/body-parts.js §4) ─────────────────────
@@ -2131,6 +1684,21 @@ body.fable-active.fable-chrome-peek .top-bar { transform: translateY(0); }
    + fades to 0 alpha before the line-art boundary) — or a flat dark fill
    for amputated parts. The polygons are CLICK-THROUGH unless injured, so
    the paperdoll's other interactions never break.
+
+   THE BLOOM DISCIPLINE (2026-08-10 — the "bruise under the skin" rewrite):
+   the overlay is NOT a flat color block laid over the figure. Three effects
+   stack to make the color read as a subdermal bruise while the crisp white
+   paperdoll outline stays completely sharp ON TOP:
+     1. SVG filter:blur(8px) — feathers every polygon edge into a soft glow
+        with no hard silhouette. Applied here (not per-polygon) so one filter
+        node is shared across all injured parts (cheap).
+     2. mix-blend-mode: screen — the overlay ADDS its color to the paperdoll
+        beneath instead of painting over it. Dark line-art stays dark (screen
+        against dark ≈ no-op); the bruise tints the midtone body fill only.
+        This is the single load-bearing property for "outline stays sharp."
+     3. opacity ~0.4 on .is-injured — the master throttle. Combined with the
+        gradient's own inner-alpha falloff, this keeps even a Critical (Red)
+        injury from overpowering the figure.
    POSITIONING: the SVG's width/height/left/top are set INLINE at paint time
    by measuring the paperdoll <img>'s rendered box (mirrors body-parts.js's
    debug overlay alignment). This rule sets ONLY position + z-index + the
@@ -2143,6 +1711,21 @@ body.fable-active.fable-chrome-peek .top-bar { transform: translateY(0); }
                                         injured polygons re-enable them below */
     z-index: 8;                      /* above the paperdoll (7), below modals */
     overflow: visible;
+    /* The feathered-edge + subdermal-blend combo. filter:blur softens the
+       radial-gradient polygons into a diffuse bloom; mix-blend-mode:screen
+       makes the color add to (not cover) the paperdoll beneath so the white
+       outline reads through crisp. isolation:isolate keeps the blend scoped
+       to this overlay's stacking context so it can't bleed into sibling
+       layers (the soul gems, the tooltip). */
+    filter: blur(8px);
+    mix-blend-mode: screen;
+    isolation: isolate;
+    /* Clicking an injury area should ONLY show the hover tooltip — never paint a
+       focus ring or tap highlight over the figure. The defaults are suppressed
+       here + on the polygons, and a mousedown preventDefault in injury-heatmap.js
+       cancels focus/selection at the source. */
+    outline: none;
+    -webkit-tap-highlight-color: transparent;
 }
 /* Default polygon state: invisible + click-through. The renderer only emits
    polygons for INJURED parts, but this rule is the belt-and-braces default
@@ -2151,38 +1734,41 @@ body.fable-active.fable-chrome-peek .top-bar { transform: translateY(0); }
 .injury-heatmap-overlay polygon {
     opacity: 0;
     pointer-events: none;
+    outline: none;                    /* no focus ring on click (see overlay block) */
+    -webkit-tap-highlight-color: transparent;
     transition: opacity 220ms ease-out;
 }
 /* An injured part: visible + hoverable. cursor:help signals "there's
-   something to read here" (the tooltip names the exact injury). */
+   something to read here" (the tooltip names the exact injury).
+   opacity:0.4 is the master intensity throttle — combined with the overlay-
+   wide blur + screen blend, even a Critical (Red) tier reads as a soft bruise,
+   not a color block. */
 .injury-heatmap-overlay polygon.is-injured {
-    opacity: 1;
+    opacity: 0.4;
     pointer-events: auto;
     cursor: help;
 }
-/* The injury tooltip — reuses the UNIFIED dark-gold badge aesthetic from
-   .hud-tooltip (fable.css ~line 2289): same #0d0d0d bg, brass-hairline
-   border, Cinzel serif, brass text, soft shadow. The only differences from
-   .hud-tooltip are anchoring (this one is JS-anchored to the injured zone's
-   center via left/top, not CSS-translated above a dock icon) + the reveal
-   trigger (JS .is-visible from a delegated mouseenter, not :hover on a
-   parent). Kept as its own rule rather than reusing .hud-tooltip so the two
-   reveal mechanisms can't couple (a future .hud-tooltip tweak must not
-   change how an injury tooltip anchors). */
+/* The injury tooltip — a dark, sleek two-part card: an uppercase header
+   (PART [SEVERITY]) over a gold-tinted divider + a compact list of the zone's
+   wound descriptors. Reuses the dark-gold badge aesthetic (#0d0d0d bg,
+   brass-hairline border, Cinzel serif, brass text, soft shadow) but drops
+   `white-space: nowrap` so the header + list stack vertically. Anchoring +
+   reveal (JS .is-visible from a delegated mouseenter) are unchanged from the
+   prior single-line badge; only the inner content structure grew. */
 .injury-heatmap-tooltip {
     position: absolute;
     transform: translate(-50%, -50%); /* center the badge ON the anchor point
                                          set by JS (left/top = zone center) */
     background: #0d0d0d;
-    border: 1px solid rgba(212, 175, 55, 0.4);
-    padding: 4px 10px;
-    border-radius: 4px;
-    font-size: 0.8rem;
+    border: 1px solid rgba(212, 175, 55, 0.55);
+    padding: 7px 12px;
+    border-radius: 5px;
     font-family: var(--fable-font-serif, 'Cinzel', serif);
     color: var(--fable-brass-bright, #E6D58A);
-    white-space: nowrap;
     text-align: center;
     line-height: 1.35;
+    min-width: 120px;
+    max-width: 220px;
     opacity: 0;
     pointer-events: none;
     transition: opacity 180ms ease;
@@ -2192,17 +1778,522 @@ body.fable-active.fable-chrome-peek .top-bar { transform: translateY(0); }
 .injury-heatmap-tooltip.is-visible {
     opacity: 1;
 }
+/* The header block: a 2-line stack — the part name on top (bold brass), the
+   bracketed severity beneath it (smaller, muted gray) so a long severity no
+   longer overflows the tooltip on one line. JS builds the two child spans. */
+.injury-tooltip-header {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 1px;
+}
+.injury-tooltip-part {
+    font-size: 0.82rem;
+    font-weight: 700;
+    letter-spacing: 0.04em;
+    color: var(--fable-brass-bright, #E6D58A);
+}
+.injury-tooltip-severity {
+    font-size: 0.66rem;
+    font-weight: 500;
+    letter-spacing: 0.06em;
+    color: #9a9a9a;                    /* subordinate gray — reads as secondary */
+}
+/* The divider between header + detail list. A subtle gold-tinted hairline —
+   present ONLY when the zone has descriptors (JS emits the divider + the list
+   together), so a header-only tooltip has no dangling rule. */
+.injury-tooltip-divider {
+    height: 1px;
+    margin: 5px 0 4px;
+    background: linear-gradient(
+        to right,
+        rgba(212, 175, 55, 0) 0%,
+        rgba(212, 175, 55, 0.45) 50%,
+        rgba(212, 175, 55, 0) 100%
+    );
+}
+/* The wound descriptor list. Smaller, muted off-white, tight, left-aligned so
+   the bullet column reads as a clean list over the centered header. */
+.injury-tooltip-list {
+    margin: 0;
+    padding: 0;
+    list-style: none;
+    text-align: left;
+}
+.injury-tooltip-list li {
+    font-size: 0.72rem;
+    font-family: var(--fable-font-sans, 'Segoe UI', system-ui, sans-serif);
+    color: #d8d8d8;
+    line-height: 1.3;
+    padding: 1px 0;
+    white-space: normal;
+    word-break: break-word;
+}
+.injury-tooltip-list li::before {
+    content: '•';
+    color: var(--fable-brass, #B8932A);
+    margin-right: 6px;
+}
+
+/* ─── SOUL GEM OVERLAY (engine/soul-gem.js) ─────────────────────────────────
+   Six glowing diamond inventory triggers that BLOOM out from the backpack's
+   origin to fixed anatomical body-region coordinates (Head→Foot) when the
+   player clicks the backpack, then RETRACT back into the backpack on a
+   second click. UNANCHORED from the paperdoll — the bloom targets are
+   fixed --target-x/--target-y CSS custom properties set inline per gem by
+   soul-gem.js, NOT derived from the paperdoll <img>'s box. The long spring
+   travel (the Head gem climbs ~720px from the backpack) is the feature: the
+   staggered spring snap is the whole visual appeal.
+
+   STATE (driven by soul-gem.js, toggled on the overlay):
+     .is-closed  — gems collapsed to the backpack origin (opacity 0, scale
+                   0.3, pointer-events none). DEFAULT.
+     .is-open    — gems at their --target-x/--target-y (opacity 1, scale 1,
+                   pointer-events auto).
+   Each gem carries its OWN --target-x/--target-y + a per-gem
+   transition-delay (30ms stagger, set inline by JS) so the burst radiates
+   outward in bloom order. The snappy overshoot spring curve
+   cubic-bezier(0.34, 1.56, 0.64, 1) gives the magnetic snap feel.
+
+   A single .is-active class on a gem (gold pulse glow) marks the selected
+   slot; the others stay at rest. Closing the overlay clears all .is-active.
+────────────────────────────────────────────────────────────────────────── */
+.soul-gem-overlay {
+    position: absolute;
+    top: 0;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    z-index: 9;                       /* above the paperdoll (7) + dock (6) + backpack (6) */
+    overflow: visible;
+    pointer-events: none;             /* the overlay never eats clicks; gems re-enable below */
+}
+/* The soul gem node — a fixed-size square SVG positioned at the backpack
+   origin (left/top set inline by soul-gem.js to the backpack center). The
+   negative margins compensate for the fixed px width/height so the gem's
+   CENTER sits on the origin point (mirrors the prior chest-gem discipline).
+   transform-origin is the backpack-origin corner of the gem box so the
+   scale grows FROM the backpack, not the gem's own center — this keeps the
+   bloom direction coherent (gems appear to emerge FROM the backpack). */
+.soul-gem {
+    position: absolute;
+    margin-left: -15px;               /* −(GEM_SIZE_PX / 2) — keep in sync w/ JS */
+    margin-top: -15px;
+    pointer-events: none;             /* overridden to auto when .is-open (below) */
+    cursor: pointer;
+    outline: none;
+    transform-origin: 15px 15px;      /* the gem's center, in local px (matches the margin) */
+    /* The spring curve — snappy overshoot for the magnetic snap. Applies to
+       bloom + retract symmetrically. transition-delay is set PER-GEM inline
+       by JS (30ms stagger) so the burst radiates outward. */
+    transition:
+        transform 320ms cubic-bezier(0.34, 1.56, 0.64, 1),
+        opacity 260ms ease-out;
+    /* Default (collapsed) transform: scaled down at the backpack origin.
+       The .is-open state overrides this with the translate to the target. */
+    opacity: 0;
+    transform: translate(0, 0) scale(0.3);
+    will-change: transform, opacity;  /* the bloom is the hero animation — promote it */
+}
+/* COLLAPSED (.is-closed): gems retracted to the backpack origin. This is the
+   default transform above; the rule exists to make the state explicit + to
+   guarantee pointer-events:none (no stray clicks on invisible gems). */
+.soul-gem-overlay.is-closed .soul-gem {
+    opacity: 0;
+    transform: translate(0, 0) scale(0.3);
+    pointer-events: none;
+}
+/* REPOSITIONING (.is-repositioning): a transient class added by soul-gem.js
+   while it rewrites gem positions on a resize / load / gender-swap. The
+   fluid clamp() sizes on the paperdoll + backpack shift on viewport change,
+   so --target-x/--target-y change too — WITHOUT this suppression the gems
+   would visibly SPRING to their new targets (the 320ms bloom transition
+   firing on the transform), drifting a few px mid-resize. This zeros the
+   transition for the duration of the layout write so the gems SNAP to their
+   new positions, keeping them glued to the body across resolution changes.
+   The JS forces a reflow + removes the class immediately after writing. */
+.soul-gem-overlay.is-repositioning .soul-gem {
+    transition: none !important;
+}
+/* BLOOMED (.is-open): gems at their --target-x/--target-y. The translate reads
+   the per-gem custom properties set inline by soul-gem.js; scale(1) + full
+   opacity make them solid + clickable. */
+.soul-gem-overlay.is-open .soul-gem {
+    opacity: 1;
+    transform: translate(var(--target-x, 0), var(--target-y, 0)) scale(1);
+    pointer-events: auto;
+}
+
+/* The glow layer — a diamond polygon behind the stone, blurred. opacity:0 at
+   rest (truly invisible — no resting outline); ignites neon red on hover. Kept
+   at the stone's size (not the frame's) so the blur stays inside the SVG's
+   viewBox + doesn't get sliced by the clip. */
+.soul-gem .gem-glow {
+    fill: #FF1630;                    /* neon red */
+    opacity: 0;
+    filter: blur(2px);
+    transition: opacity 160ms ease-out, filter 160ms ease-out;
+}
+/* The diamond frame — a slim brass-hairline outline (matches the HUD's
+   gold/brass accent family). On hover/active the outline glows by brightening
+   + thickening the stroke itself (NOT a drop-shadow — that blurs a thin
+   unfilled stroke into a fuzzy ghost line). */
+.soul-gem .gem-frame {
+    stroke: #d4af37;                    /* fully opaque so the outline reads over the heatsink */
+    stroke-width: 1.4;
+    transition: stroke 160ms ease-out, stroke-width 160ms ease-out;
+}
+/* The red faceted gem held inside the frame. Deep ruby at rest; neon red on
+   hover/active. */
+.soul-gem .gem-stone {
+    fill: #C01828;                    /* deep ruby */
+    fill-opacity: 1;                  /* fully opaque — no heatsink bleed-through */
+    transition: fill 160ms ease-out;
+}
+.soul-gem .gem-facet {
+    /* the upper-right facet catches the light — a brighter red wedge */
+    fill: #E64050;
+    fill-opacity: 1;                  /* fully opaque — solid over the heatsink */
+}
+/* Hover (only meaningful when bloomed): grow a touch, ignite the diamond glow
+   (neon red), + flip the stone to neon red. Keyboard focus mirrors hover. */
+.soul-gem-overlay.is-open .soul-gem:hover,
+.soul-gem-overlay.is-open .soul-gem:focus-visible {
+    transform: translate(var(--target-x, 0), var(--target-y, 0)) scale(1.18);
+}
+.soul-gem:hover .gem-glow,
+.soul-gem:focus-visible .gem-glow {
+    opacity: 0.9;
+    filter: blur(3px);
+}
+.soul-gem:hover .gem-stone,
+.soul-gem:focus-visible .gem-stone {
+    fill: #FF2A3C;                    /* neon red */
+}
+.soul-gem:hover .gem-frame,
+.soul-gem:focus-visible .gem-frame {
+    stroke: #F0CE6A;                  /* bright brass */
+    stroke-width: 2.2;                /* thicker = the line itself glowing */
+}
+
+/* ── ACTIVE SELECTION (the gold pulse) ──────────────────────────────────
+   The selected gem (single-select, set by soul-gem.js on click). A gold
+   pulse glow replaces the resting red — the brass frame + stone flip to
+   bright gold + a slow ambient pulse animation marks it as "the active
+   slot." The hover rule above is overridden for the active gem so the gold
+   state holds steady (a hover shouldn't flip an active gem back to red). */
+.soul-gem.is-active .gem-glow {
+    fill: #F0CE6A;                    /* gold glow */
+    opacity: 0.85;
+    filter: blur(4px);
+    animation: soul-gem-pulse 2s ease-in-out infinite;
+}
+.soul-gem.is-active .gem-frame {
+    stroke: #F0CE6A;                  /* bright brass */
+    stroke-width: 2.4;
+}
+.soul-gem.is-active .gem-stone {
+    fill: #E6B84D;                    /* warm gold */
+}
+.soul-gem.is-active .gem-facet {
+    fill: #F5D77A;                    /* pale gold highlight */
+    fill-opacity: 0.75;
+}
+/* Keep the active gem's gold even on hover (don't revert to red). Only the
+   scale grows — the gold identity holds. */
+.soul-gem-overlay.is-open .soul-gem.is-active:hover,
+.soul-gem-overlay.is-open .soul-gem.is-active:focus-visible {
+    transform: translate(var(--target-x, 0), var(--target-y, 0)) scale(1.18);
+}
+@keyframes soul-gem-pulse {
+    0%, 100% { opacity: 0.65; filter: blur(3px); }
+    50%      { opacity: 1;    filter: blur(5px); }
+}
+
+/* ── INVENTORY INSPECTION PANEL SLOT (#inventory-panel-slot) ────────────
+   The dedicated container for the active zone's item-button list + action
+   popup, hosted directly above the backpack. Hidden until a gem is selected;
+   inventory-panel.js renders the per-zone content into it on selection.
+   POSITIONING: left/top are set INLINE by soul-gem.js's repositionToBody()
+   (measured live from the backpack's box), so the slot is centered on the
+   backpack's X axis + sits with a fixed px gap above the backpack's top
+   edge — the same measurement source the gems use, so the slot can NEVER
+   drift from the gems on a resolution change. Do NOT set right/bottom here
+   (the JS clears them to auto); they'd fight the measured left/top. The
+   soul-gem overlay (z-index 9) sits ABOVE this so bloomed gems never get
+   occluded by the panel. */
+.inventory-panel-slot {
+    position: absolute;
+    /* VERTICAL rectangle: narrow + tall. Tucks into the right-side gutter
+       above the backpack (the empty space to the right of the head/chest
+       gems), not sprawling left over the paperdoll. Width stays narrow so
+       it never crosses the figure's centerline; height fills the vertical
+       space above the backpack up toward the time scrubber. */
+    width: clamp(155px, 13vw, 213px);
+    min-height: 300px;
+    max-height: 65vh;
+    z-index: 10;                       /* above the paperdoll (7), below the gems (9) */
+    background: rgba(13, 13, 13, 0.92);
+    border: 1px solid rgba(212, 175, 55, 0.35);
+    border-radius: 10px;
+    box-shadow: 0 6px 20px rgba(0, 0, 0, 0.6), 0 0 8px rgba(212, 175, 55, 0.06);
+    opacity: 0;
+    pointer-events: none;
+    transform: translateY(8px);
+    transition: opacity 220ms ease-out, transform 220ms ease-out;
+}
+/* The slot is wired to show once a gem is active — inventory-panel.js's
+   renderInventoryPanel() fills the body + this class flips on reveal. */
+.inventory-panel-slot.is-visible {
+    opacity: 1;
+    pointer-events: auto;
+    transform: translateY(0);
+}
+/* The gold header naming the selected zone (Head/Top/Hand/Inventory/Bottom/
+   Feet) — painted by left-drawer.js::showInventorySlot before the body is
+   handed to inventory-panel.js. */
+.inventory-slot-header {
+    padding: 8px 14px 6px;
+    border-bottom: 1px solid rgba(212, 175, 55, 0.22);
+    font-family: var(--fable-font-serif, 'Cinzel', serif);
+    font-size: 0.92rem;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--fable-brass-bright, #E6D58A);
+    text-align: center;
+}
+.inventory-slot-body {
+    padding: 10px;
+    min-height: 60px;
+}
+
+/* ── ITEM BUTTON LIST (engine/inventory-panel.js) ───────────────────────
+   The dark right-hand inventory panel's contents: a paginated list of fixed
+   horizontal item buttons. Exactly 6 buttons are visible at once inside a
+   scroll-snap viewport; the JS intercepts the wheel + advances the scroll by
+   EXACTLY one (button + gap) per step so the view always lands flush on a
+   button boundary — never a partial, never a multi-button jump.
+
+   The buttons are STRICT FIXED DIMENSIONS: they never grow regardless of
+   content. Text is CENTERED, UPPERCASE, BOLD; long names are auto-split onto
+   stacked lines + font-shrunk by JS (fitLabel) so they fit inside the fixed
+   box without clipping or altering the bounds.
+
+   ENCUMBRANCE / LIMITS: intentionally NOT rendered here. The old weight-limit
+   UI (0.0 / 20.0 lbs) was ripped out; storage arrays are treated as infinite.
+   ─────────────────────────────────────────────────────────────────────── */
+/* The scroll viewport. Its height is set INLINE by inventory-panel.js to
+   exactly 6 × (button height + gap). overflow:hidden so a partial 7th button
+   never peeks — the JS step-scroll owns all vertical motion. */
+.inv-viewport {
+    overflow: hidden;
+    position: relative;
+    border-radius: 6px;
+    background: rgba(0, 0, 0, 0.35);
+    outline: none;
+}
+.inv-viewport:focus-visible {
+    box-shadow: inset 0 0 0 1px rgba(212, 175, 55, 0.4);
+}
+/* The scrollable track holding all item buttons. scroll-snap-y is the visual
+   backstop for the JS step-scroll — each button is a snap point, so the smooth
+   scroll always settles flush on a button top edge. */
+.inv-track {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;                         /* BUTTON_GAP_PX — keep in sync w/ JS */
+    padding: 8px;
+    scroll-snap-type: y mandatory;
+    scroll-behavior: smooth;
+}
+/* The fixed item button. STRICT height + width — never grows. The label sits
+   centered; the qty badge sits at the right. Height MUST match
+   BUTTON_HEIGHT_PX in inventory-panel.js (46px). */
+.inv-item-btn {
+    flex: 0 0 auto;
+    height: 46px;                     /* BUTTON_HEIGHT_PX — keep in sync w/ JS */
+    width: 100%;
+    box-sizing: border-box;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 6px;
+    padding: 4px 12px;
+    scroll-snap-align: start;         /* each button snaps its top to the viewport top */
+    cursor: pointer;
+    border: 1px solid rgba(212, 175, 55, 0.28);
+    border-radius: 6px;
+    background: linear-gradient(180deg, rgba(28, 24, 18, 0.95) 0%, rgba(15, 13, 10, 0.95) 100%);
+    color: var(--fable-brass-bright, #E6D58A);
+    font-family: var(--fable-font-serif, 'Cinzel', serif);
+    font-size: 0.82rem;               /* base; fitLabel shrinks for long names */
+    font-weight: 700;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;        /* CENTERED, UPPERCASE, BOLD */
+    text-align: center;
+    line-height: 1.12;
+    overflow: hidden;                 /* the fixed box never clips visibly — fitLabel prevents it */
+    transition: border-color 140ms ease, background 140ms ease, transform 120ms ease;
+    user-select: none;
+}
+.inv-item-btn:hover {
+    border-color: rgba(240, 206, 106, 0.7);
+    background: linear-gradient(180deg, rgba(40, 34, 24, 0.95) 0%, rgba(22, 19, 14, 0.95) 100%);
+}
+.inv-item-btn:active {
+    transform: scale(0.98);
+}
+.inv-item-btn:focus-visible {
+    outline: 2px solid rgba(240, 206, 106, 0.7);
+    outline-offset: 1px;
+}
+/* Selected (its action popup is open) — a gold border that matches the Soul
+   Gem's .is-active frame, so the player sees exactly which item the popup is
+   acting on. Toggled by openActionPopup / _forceCloseActionPopup. */
+.inv-item-btn.is-selected {
+    border-color: #F0CE6A;
+    background: linear-gradient(180deg, rgba(40, 34, 24, 0.95) 0%, rgba(22, 19, 14, 0.95) 100%);
+    box-shadow: 0 0 8px rgba(240, 206, 106, 0.35);
+}
+/* The label span. Inline-block so its own scrollWidth/Height can be measured
+   for the fitLabel auto-shrink. min-width:0 lets it shrink within the flex row.
+   word-break lets the JS-driven stacked split work without forcing it. */
+.inv-item-label {
+    display: inline-block;
+    min-width: 0;
+    max-width: 100%;
+    word-break: break-word;
+}
+/* The qty badge (only when qty > 1). Sits to the right of the label, dimmer. */
+.inv-item-qty {
+    flex: 0 0 auto;
+    align-self: center;
+    font-size: 0.72rem;
+    font-weight: 700;
+    color: rgba(230, 213, 138, 0.6);
+    letter-spacing: 0.02em;
+}
+/* Loading + empty placeholders. Centered, dimmed. */
+.inv-loading,
+.inv-empty {
+    padding: 24px 8px;
+    text-align: center;
+    font-family: var(--fable-font-serif, 'Cinzel', serif);
+    font-size: 0.78rem;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    color: rgba(230, 213, 138, 0.4);
+}
+
+/* ── THE ACTION POPUP (engine/inventory-panel.js) ───────────────────────
+   A sleek floating overlay that appears next to the clicked item button,
+   listing the contextual actions. Actions render conditionally on the item's
+   backend-assigned tags (CONSUME/EQUIP/POCKET/STORE); DISCARD is always present.
+   Only one popup is open at a time (singleton); clicking outside or Esc closes
+   it. The danger action (DISCARD) is tinted red.
+
+   FABLE AESTHETIC: near-black panel (#111), a thin brass-gold hairline border,
+   a layered drop shadow (deep black ground + a faint brass outer glow), + the
+   open animation snaps from scale(0.95) → scale(1) over 150ms ease-out so the
+   popup feels like it unfolds from the clicked button. */
+.inv-action-popup {
+    position: fixed;
+    /* ABOVE the fullscreen Fable app (.app-window.fable-app is z:4000) — the
+       popup is body-mounted (a sibling of the Fable app, not a descendant), so
+       it shares the body-level stacking context + must clear z:4000 to be
+       visible. Same fix already applied to .fable-api-required-popup (z:100100). */
+    z-index: 100100;
+    display: flex;
+    flex-direction: column;
+    min-width: 140px;
+    padding: 6px;
+    background: #111;                                          /* near-black Fable panel */
+    border: 1px solid rgba(212, 175, 55, 0.5);                 /* thin brass hairline */
+    border-radius: 8px;
+    box-shadow:
+        0 8px 24px rgba(0, 0, 0, 0.75),                        /* deep ground shadow */
+        0 0 12px rgba(212, 175, 55, 0.12);                     /* faint brass outer glow */
+    backdrop-filter: blur(6px);
+    transform-origin: top left;                                /* unfolds from the anchor corner */
+    animation: inv-popup-in 150ms ease-out;                    /* scale(0.95) → scale(1) snap-open */
+}
+@keyframes inv-popup-in {
+    from { opacity: 0; transform: scale(0.95); }
+    to   { opacity: 1; transform: scale(1); }
+}
+.inv-action-btn {
+    display: block;
+    width: 100%;
+    padding: 7px 12px;
+    margin: 0;
+    border: none;
+    border-radius: 5px;
+    background: transparent;
+    color: var(--fable-brass-bright, #E6D58A);
+    font-family: var(--fable-font-serif, 'Cinzel', serif);
+    font-size: 0.8rem;
+    font-weight: 700;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    text-align: center;
+    cursor: pointer;
+    transition: background 120ms ease, color 120ms ease;
+}
+.inv-action-btn:hover {
+    background: rgba(212, 175, 55, 0.18);
+    color: #F5D77A;
+}
+.inv-action-btn:focus-visible {
+    outline: 2px solid rgba(240, 206, 106, 0.7);
+    outline-offset: 1px;
+}
+.inv-action-btn.is-danger {
+    color: #E0505A;
+}
+.inv-action-btn.is-danger:hover {
+    background: rgba(224, 80, 90, 0.18);
+    color: #FF6670;
+}
+
+/* ── EQUIP sub-menu (destination buttons + BACK) ────────────────────────
+   When the player clicks EQUIP, the popup swaps to the destination view in
+   place (the same .inv-action-popup element, re-rendered). The destination
+   buttons reuse .inv-action-btn; the ‹ BACK button is dimmed + sits below the
+   destinations with a thin brass divider. A quick fade re-triggers the open
+   animation on each view swap so the transition reads as a snap, not a flash. */
+.inv-action-popup.is-swapping {
+    animation: inv-popup-in 120ms ease-out;   /* re-trigger the snap on view swap */
+}
+.inv-action-btn.inv-equip-dest {
+    /* Same base as a normal action button; could carry a slot accent later. */
+}
+/* A thin brass divider above the BACK button separates destinations from nav. */
+.inv-action-btn.inv-back-btn {
+    margin-top: 4px;
+    border-top: 1px solid rgba(212, 175, 55, 0.18);
+    border-radius: 0 0 5px 5px;
+    padding-top: 9px;
+    color: rgba(230, 213, 138, 0.62);          /* dimmed — it's nav, not an action */
+    font-size: 0.72rem;
+    letter-spacing: 0.08em;
+}
+.inv-action-btn.inv-back-btn:hover {
+    background: rgba(212, 175, 55, 0.1);
+    color: var(--fable-brass-bright, #E6D58A);
+}
 
 /* =============================================================
-   INVENTORY HUD OVERLAY (REMOVED 2026-08-07)
+   INVENTORY HUD OVERLAY (REMOVED 2026-08-07; REPLACED 2026-08-08/09)
    The equipment-node paperdoll overlay (equipment-overlay.js), the belt
    diamond + pack panel widgets (inventory-widgets.js), + all their CSS
    below were REMOVED — the canvas was cluttered with empty debug circles
    + the pack/belt interaction model was wrong. The typed Rust inventory
-   model (equipment.rs) + the [EQUIP]/[BELT]/[PACK] bracket commands stay
-   intact; only the visualization layers are gone (to be rebuilt later).
-   The standalone CLICKABLE backpack button (.hud-backpack, below) STAYS
-   as the inventory affordance anchor.
+   model (equipment.rs) + the [EQUIP]/[BELT]/[PACK] bracket commands stayed
+   intact. The visualization was REPLACED by the Soul Gems bloom system
+   (soul-gem.js — the 6 diamond triggers) + the inspection panel
+   (inventory-panel.js — the item-button list + action popup). The
+   standalone CLICKABLE backpack button (.hud-backpack, below) is the
+   bloom master toggle.
    ============================================================= */
 
 /* ── §2  THE 5-ICON DOCK (Gender · Calendar · Weather · Location · Inventory)
@@ -2348,7 +2439,7 @@ body.fable-active.fable-chrome-peek .top-bar { transform: translateY(0); }
 [data-weather-icon] .hud-status-svg {
     width: 58px;                     /* bigger (was 52) with the button bump */
     height: 58px;
-    transform: translateY(-5px);
+    transform: translateY(-2px);     /* nudged up slightly (less than the old -5px) */
 }
 .hud-dock-btn:hover .hud-dock-icon {
     /* Amber glow on hover — same filter stack as the backpack img. */
@@ -2805,68 +2896,34 @@ body.fable-active.fable-chrome-peek .top-bar { transform: translateY(0); }
 .fable-drop-empty { padding: 16px 4px; color: var(--fable-text-faint); font-style: italic; text-align: center; }
 .fable-drop-error { color: #f4a0a0; padding: 8px 0; }
 
-/* Form fields (Card + World tabs reuse these). */
-.fable-drop-form { display: flex; flex-direction: column; gap: 9px; }
-.fable-drop-field { display: flex; flex-direction: column; gap: 3px; }
-.fable-drop-label {
-    font-size: 10.5px; text-transform: uppercase; letter-spacing: 0.07em;
-    color: var(--fable-text-faint);
+/* Read-only prose/list/title blocks (Card / World / Codex / NPC tabs).
+   The dropdowns are visual-aid references — these render tracked state as
+   plain text (no inputs). Empty fields are omitted upstream in tab-rail.js. */
+.fable-drop-prose {
+    padding: 1px 0 5px;
+    color: var(--fable-text); font-size: 13px; line-height: 1.5;
+    white-space: pre-wrap; overflow-wrap: break-word;
 }
-.fable-drop-field input,
-.fable-drop-field textarea {
-    width: 100%; box-sizing: border-box;
-    padding: 7px 9px;
-    background: var(--fable-inset); color: var(--fable-text);
-    border: 1px solid var(--fable-brass-dim); border-radius: 6px;
-    font-family: inherit; font-size: 13px; line-height: 1.4; resize: vertical;
+.fable-drop-list { display: flex; flex-direction: column; gap: 3px; padding: 1px 0 5px; }
+.fable-drop-list-item {
+    position: relative; padding-left: 14px;
+    color: var(--fable-text); font-size: 13px; line-height: 1.45;
 }
-.fable-drop-field input:focus,
-.fable-drop-field textarea:focus { outline: none; border-color: var(--fable-brass); }
-.fable-drop-actions { display: flex; align-items: center; gap: 10px; margin-top: 6px; }
-.fable-drop-btn {
-    padding: 6px 14px; background: transparent; color: var(--fable-text);
-    border: 1px solid var(--fable-brass-dim); border-radius: 6px;
-    font-family: inherit; font-size: 12.5px; cursor: pointer;
-    transition: color 160ms ease, border-color 160ms ease;
+.fable-drop-list-item::before {
+    content: '•'; position: absolute; left: 2px; color: var(--fable-brass);
 }
-.fable-drop-btn:hover { border-color: var(--fable-brass); color: var(--fable-brass-bright); }
-.fable-drop-btn.primary {
-    background: rgba(81, 160, 222, 0.16); border-color: var(--echo-accent); color: var(--echo-accent);
-}
-.fable-drop-btn.primary:hover { background: rgba(81, 160, 222, 0.28); color: var(--fable-text); }
-.fable-drop-status { font-size: 11.5px; color: var(--fable-text-dim); }
+.fable-drop-title { font-size: 13px; font-weight: 600; color: var(--fable-text); }
+.fable-drop-tags { font-size: 11px; color: var(--fable-text-faint); font-style: italic; }
 
-/* Codex entries. */
-.fable-codex-add { margin-bottom: 10px; }
+/* Read-only card containers (Codex entries + NPC cards). The input-flavored
+   rules that used to live here were retired with the read-only conversion
+   (2026-08-11). */
 .fable-codex-list { display: flex; flex-direction: column; gap: 8px; margin-bottom: 8px; }
 .fable-codex-item {
     display: flex; flex-direction: column; gap: 5px;
     padding: 9px; background: rgba(255,255,255,0.03);
     border: 1px solid var(--fable-glass-line); border-radius: 7px;
 }
-.fable-codex-title, .fable-codex-tags {
-    width: 100%; box-sizing: border-box; padding: 6px 8px;
-    background: var(--fable-inset); color: var(--fable-text);
-    border: 1px solid var(--fable-brass-dim); border-radius: 5px;
-    font-family: inherit; font-size: 12.5px;
-}
-.fable-codex-body {
-    width: 100%; box-sizing: border-box; padding: 6px 8px;
-    background: var(--fable-inset); color: var(--fable-text);
-    border: 1px solid var(--fable-brass-dim); border-radius: 5px;
-    font-family: inherit; font-size: 12.5px; line-height: 1.4; resize: vertical;
-}
-.fable-codex-title:focus, .fable-codex-tags:focus, .fable-codex-body:focus {
-    outline: none; border-color: var(--fable-brass);
-}
-.fable-codex-del {
-    align-self: flex-start; padding: 3px 9px; background: transparent;
-    color: var(--fable-text-faint); border: 1px solid var(--fable-glass-line);
-    border-radius: 4px; font-family: inherit; font-size: 11px; cursor: pointer;
-}
-.fable-codex-del:hover { color: #f4a0a0; border-color: rgba(244,160,160,0.4); }
-
-/* NPC cards. */
 .fable-npc-list { display: flex; flex-direction: column; gap: 8px; margin-bottom: 8px; }
 .fable-npc-card {
     display: flex; flex-direction: column; gap: 4px;
@@ -2874,19 +2931,35 @@ body.fable-active.fable-chrome-peek .top-bar { transform: translateY(0); }
     border: 1px solid var(--fable-glass-line); border-left: 3px solid var(--fable-brass);
     border-radius: 6px;
 }
-.fable-npc-name {
-    width: 100%; box-sizing: border-box; padding: 5px 8px;
-    background: transparent; color: var(--fable-text);
-    border: none; font-family: inherit; font-size: 13px; font-weight: 600;
-}
-.fable-npc-state {
-    width: 100%; box-sizing: border-box; padding: 6px 8px;
-    background: var(--fable-inset); color: var(--fable-text-dim);
-    border: 1px solid var(--fable-brass-dim); border-radius: 5px;
-    font-family: inherit; font-size: 12.5px; line-height: 1.4; resize: vertical;
-}
-.fable-npc-state:focus { outline: none; border-color: var(--fable-brass); }
 
+/* Player tab — character-sheet blocks (identity, appearance, inventory,
+   injuries, relationships). Read-only like the rest of the dropdown; each
+   section is omitted upstream in tab-rail.js when empty. */
+.fable-drop-name { font-size: 15px; font-weight: 700; color: var(--fable-text); padding: 1px 0 3px; }
+.fable-drop-injury-detail {
+    color: var(--fable-text-faint); font-size: 11.5px; font-style: italic;
+    padding: 0 0 4px 14px; line-height: 1.4;
+}
+.fable-drop-qty { color: var(--fable-text-faint); font-size: 11.5px; margin-left: 5px; }
+.fable-drop-tier { font-weight: 600; font-size: 12px; text-transform: capitalize; color: var(--fable-brass-bright); }
+.fable-drop-tier.bad { color: #f4a0a0; }
+.fable-drop-tier.warn { color: #fbbf24; }
+.fable-drop-tier.good { color: #86efac; }
+/* Equipment slot row: slot label left, item(s) right. */
+.fable-inv-slot {
+    display: flex; justify-content: space-between; align-items: baseline; gap: 10px;
+    padding: 4px 0; border-bottom: 1px solid rgba(255,255,255,0.03);
+}
+.fable-inv-slot-label { color: var(--fable-text-faint); font-size: 12px; flex: 0 0 auto; }
+.fable-inv-slot-items { display: flex; flex-direction: column; gap: 1px; text-align: right; }
+.fable-inv-layer { color: var(--fable-text-faint); font-size: 10.5px; font-style: italic; }
+/* Behavior-tag chips (consumable/equippable/pocketable). */
+.fable-drop-chips { display: inline-flex; flex-wrap: wrap; gap: 4px; margin-left: 6px; vertical-align: middle; }
+.fable-drop-chip {
+    font-size: 9.5px; letter-spacing: 0.04em; text-transform: uppercase;
+    color: var(--fable-brass); border: 1px solid var(--fable-brass-dim);
+    border-radius: 10px; padding: 1px 7px; background: rgba(197,179,88,0.06);
+}
 /* =============================================================
    RAW EDITOR — the centered, immovable raw-file modal.
    Darkens the full stage; ✓ / ↻ / ✕ controls; validation lock on invalid.
@@ -3016,13 +3089,17 @@ body.fable-active.fable-chrome-peek .top-bar { transform: translateY(0); }
    each click).
    z:50 sits ABOVE the drawers (z:40) so the bar is CLICKABLE even when the
    drawer covers that edge — without this the drawer ate the clicks (the
-   "doesn't work when clicking it" bug). The bar is only 2px wide so it
-   reads as a thin accent line over the drawer's edge, not a obstruction. */
+   "doesn't work when clicking it" bug). The bar is 10px wide (Chloe 2026-08-10:
+   widened from 2px) so it reads as a real, easy-to-click control rather than a
+   hairline — the prior 2px strip was hard to land on + its two brass states
+   (bright vs dark) read as the same line. No glow / box-shadow — kept off per
+   the 2026-07-26 dark-rectangle-artifact call; the hue + luminance delta alone
+   is the state signal now. */
 .fable-edge-lock {
     position: absolute;
     top: 0;
     bottom: 0;
-    width: 2px;
+    width: 10px;
     z-index: 50;
     background: transparent;
     cursor: pointer;
@@ -3032,26 +3109,25 @@ body.fable-active.fable-chrome-peek .top-bar { transform: translateY(0); }
 }
 .fable-edge-lock--right { right: 0; }
 .fable-edge-lock--left { left: 0; }   /* mirror of the right edge-lock bar */
-/* Visible state: the bar appears as a clean bright brass line. NO outer
-   glow / box-shadow — Chloe 2026-07-26: those caused a dark-rectangle
-   artifact on the screen edge (the shadow bled past the 2px bar at rest).
-   The bar reads as a thin solid accent line, nothing more. */
+/* Visible UNLOCKED state: a muted cool steel-blue. Reads as a neutral "idle"
+   line — deliberately NOT brass (the prior bright-brass unlocked vs darker-
+   brass locked were too similar to tell apart at a glance). */
 .fable-edge-lock.visible {
     opacity: 1;
     pointer-events: auto;
-    background: var(--fable-brass-bright);
+    background: #5a6b7a;
 }
 .fable-edge-lock.visible:hover {
-    background: #f5dca8;
+    background: #7a8b9a;
 }
-/* Locked state: GOLD (Chloe 2026-07-26 — was magenta). Distinguished from
-   the unlocked bright brass by going DEEPER: a darker, more saturated brass
-   (#8a6d2a) reads as "engaged/heavy" vs the unlocked "bright/idle." No glow. */
+/* Locked state: saturated EMERALD GREEN (Chloe 2026-08-10 — was darker brass).
+   Green-vs-steel is an unambiguous "engaged/secured" read, far from the
+   unlocked steel in BOTH hue and luminance. No glow. */
 .fable-edge-lock.visible.locked {
-    background: #8a6d2a;
+    background: #3fa66a;
 }
 .fable-edge-lock.visible.locked:hover {
-    background: #a88438;
+    background: #54c98a;
 }
 
 /* (The mannequin/stats/stamina/vitals/injuries/legend CSS blocks were
@@ -3364,6 +3440,185 @@ body.fable-active.fable-chrome-peek .top-bar { transform: translateY(0); }
 }
 .fable-save-close:hover { color: var(--fable-text); }
 
+/* --- Background Library modal (2026-08-11) --- */
+/* Same tier + structure as .fable-save-overlay (full-stage overlay, dim blur
+   backdrop, centered card, [hidden] toggle). Wider than the save modal so the
+   gallery grid has room; the grid scrolls internally. z:46 = above the drawers
+   (z:40), below the toast. Driven by engine/backgrounds.js. */
+.fable-bg-overlay {
+    position: absolute;
+    inset: 0;
+    z-index: 46;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}
+.fable-bg-overlay[hidden] { display: none; }
+.fable-bg-backdrop {
+    position: absolute;
+    inset: 0;
+    background: rgba(2, 4, 10, 0.75);
+    backdrop-filter: blur(6px);
+}
+.fable-bg-modal {
+    position: relative;
+    z-index: 2;
+    width: min(720px, 92vw);
+    max-height: 86vh;
+    padding: 22px 24px 20px;
+    background: linear-gradient(180deg, rgba(38, 26, 16, 0.97), rgba(20, 14, 9, 0.97));
+    border: 1px solid var(--fable-brass-dim);
+    border-radius: 14px;
+    box-shadow: 0 24px 60px rgba(0, 0, 0, 0.6);
+    display: flex;
+    flex-direction: column;
+}
+.fable-bg-head {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    flex: 0 0 auto;
+}
+.fable-bg-title {
+    margin: 0;
+    flex: 1 1 auto;
+    color: var(--fable-text);
+    font-family: var(--fable-font-body);
+    font-size: 21px;
+    font-weight: 700;
+    letter-spacing: 0.04em;
+}
+.fable-bg-import {
+    display: inline-flex;
+    align-items: center;
+    gap: 7px;
+    padding: 8px 14px;
+    border-radius: 8px;
+    cursor: pointer;
+    font-size: 14px;
+    font-weight: 600;
+    background: linear-gradient(135deg, var(--fable-brass-bright), var(--fable-brass));
+    color: #1a0f06;
+    border: none;
+    transition: filter 150ms ease;
+}
+.fable-bg-import:hover { filter: brightness(1.08); }
+.fable-bg-import svg { width: 16px; height: 16px; }
+.fable-bg-close {
+    width: 28px;
+    height: 28px;
+    flex: 0 0 auto;
+    border-radius: 6px;
+    background: transparent;
+    color: var(--fable-text-dim);
+    border: 1px solid var(--fable-glass-line);
+    cursor: pointer;
+    font-size: 15px;
+}
+.fable-bg-close:hover { color: var(--fable-text); }
+.fable-bg-hint {
+    flex: 0 0 auto;
+    margin: 12px 0 14px;
+    color: var(--fable-text-faint);
+    font-size: 13px;
+    letter-spacing: 0.02em;
+}
+/* The gallery grid. auto-fill minmax so it wraps 4–5 per row on desktop,
+   fewer on the narrow drawer. Scrolls internally if the library grows. */
+.fable-bg-grid {
+    flex: 1 1 auto;
+    overflow-y: auto;
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(148px, 1fr));
+    gap: 12px;
+    padding: 2px 2px 4px;
+}
+.fable-bg-cell {
+    position: relative; /* anchor for the absolute delete ✕ */
+}
+.fable-bg-tile {
+    width: 100%;
+    display: flex;
+    flex-direction: column;
+    padding: 0;
+    background: var(--fable-inset);
+    color: var(--fable-text);
+    border: 1px solid var(--fable-brass-dim);
+    border-radius: 10px;
+    cursor: pointer;
+    overflow: hidden;
+    transition: border-color 150ms ease, box-shadow 150ms ease, transform 150ms ease;
+}
+.fable-bg-tile:hover {
+    border-color: var(--fable-brass);
+    transform: translateY(-1px);
+}
+.fable-bg-cell.is-active .fable-bg-tile {
+    border-color: var(--fable-brass-bright);
+    box-shadow: 0 0 0 1px var(--fable-brass-dim), 0 0 14px var(--fable-brass-glow);
+}
+/* Thumbnail: 16:9, cover-cropped preview. Matches the recommended import ratio
+   so a 1440p source fills it edge-to-edge with no visible crop. */
+.fable-bg-thumb {
+    width: 100%;
+    aspect-ratio: 16 / 9;
+    background-size: cover;
+    background-position: center;
+    background-color: #000;
+}
+.fable-bg-thumb--none {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    color: var(--fable-brass-dim);
+}
+.fable-bg-thumb--none svg { width: 30px; height: 30px; }
+.fable-bg-name {
+    display: block;
+    padding: 8px 10px;
+    font-size: 13px;
+    font-weight: 500;
+    color: var(--fable-text);
+    text-align: center;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+/* Per-tile delete ✕ — absolute over the cell's top-right, only on hover so it
+   doesn't clutter the gallery at rest. Sibling (not nested) of the tile button
+   so both are valid HTML + the click delegate can tell them apart. */
+.fable-bg-delete {
+    position: absolute;
+    top: 5px;
+    right: 5px;
+    width: 24px;
+    height: 24px;
+    border-radius: 6px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: rgba(2, 4, 10, 0.78);
+    color: var(--fable-text-dim);
+    border: 1px solid var(--fable-glass-line);
+    cursor: pointer;
+    opacity: 0;
+    transition: opacity 150ms ease, color 150ms ease, border-color 150ms ease;
+}
+.fable-bg-delete svg { width: 13px; height: 13px; }
+.fable-bg-cell:hover .fable-bg-delete { opacity: 1; }
+.fable-bg-delete:hover {
+    color: #f4b8b8;
+    border-color: #b04040;
+}
+.fable-bg-empty {
+    grid-column: 1 / -1;
+    padding: 30px 12px;
+    text-align: center;
+    color: var(--fable-text-dim);
+    font-size: 14px;
+}
+.fable-bg-empty b { color: var(--fable-brass-bright); font-weight: 600; }
+
 /* --- Toast --- */
 .fable-toast {
     position: absolute; bottom: 100px; left: 50%; transform: translateX(-50%);
@@ -3397,7 +3652,7 @@ body.fable-active.fable-chrome-peek .top-bar { transform: translateY(0); }
 /* --- Reduced motion --- */
 @media (prefers-reduced-motion: reduce) {
     .fable-title-content,
-    .fable-beat, .fable-loading-spinner, .fable-toast,
+    .fable-loading-spinner, .fable-toast,
     .fable-cloud-layer, .fable-wind-leaf {
         animation: none !important;
     }
@@ -4334,3 +4589,984 @@ body.fable-active.fable-chrome-peek .top-bar { transform: translateY(0); }
     line-height: 1.4;
 }
 .fable-creator-toast[hidden] { display: none; }
+
+/* ============================================================= */
+/* CARD-STYLE DIALOGUE FEED                                       */
+/* The narrator/user message stream. Each turn is a rounded glass */
+/* card with a flush-left 2:3 portrait (its inner edge dissolved  */
+/* via a CSS mask) + a speaker name with a hairline underline +   */
+/* the prose body. AI vs user differ only by card tint. System +  */
+/* error beats are narrow, portrait-less centered cards.          */
+/* ============================================================= */
+
+:root {
+    /* Card tints — translucent so the stage's near-black floor reads */
+    /* through them (the cards float over the void, not over a solid). */
+    --fable-mes-bot:  rgba(28, 24, 20, 0.55);   /* narrator/assistant card */
+    --fable-mes-user: rgba(40, 26, 18, 0.62);   /* user card (warmer)    */
+    /* Portrait — 2:3 aspect, sticky to the card's top. 180px desktop, */
+    /* 100px mobile (the @media rule below swaps the var).             */
+    --fable-mes-avatar-w: 180px;
+    --fable-mes-avatar-h: calc(var(--fable-mes-avatar-w) * 1.5);
+    --fable-mes-avatar-mobile-w: 100px;
+    /* The dissolve: how far the portrait's right + bottom edges fade  */
+    /* into the body. Larger = softer/longer fade.                      */
+    --fable-mes-fade-x: 30%;
+    --fable-mes-fade-y: 40%;
+}
+
+/* The feed: a scroll column filling the stage, padded so the last  */
+/* card clears the input row's gradient at the bottom + the top bar */
+/* peek at the top. z:5 puts it above the bg (z:auto) + FX layer,   */
+/* below the input row (z:25), drawers (z:30+), + edge lock (z:50). */
+/* The cards inside are capped to a readable max-width + centered,  */
+/* so on a wide window the conversation reads as a centered column, */
+/* not edge-to-edge slabs. The bottom padding (96px) keeps the last */
+/* card clear of the input row while letting it sit visibly closer  */
+/* to the composer than the old 130px gap (2026-08-11 refinement).  */
+/*                                                                    */
+/* FLEX COLUMN (2026-08-11, revised same day). The feed is a flex column
+   that CENTERs its beats (align-items:center) + bottom-aligns SHORT
+   content via the first child's margin-top:auto (see rule below).
+
+   WHY NOT justify-content:flex-end: that bottom-aligns short content
+   BUT makes the TOP of an overflowing (revealed) transcript unreachable
+   by scroll — the well-known flex-end overflow quirk. The user hit it
+   ("can't scroll up"). The margin-top:auto trick gets the same bottom-
+   alignment for short content while keeping the default flex-start
+   packing, so the FULL transcript scrolls normally from top to bottom.
+   When content is shorter than the viewport, the first beat's auto top
+   margin soaks up the free space → the recent 2 park right above the
+   input box. When it overflows, that margin collapses to 0 + the feed
+   scrolls. Best of both.                                                  */
+.fable-feed {
+    position: absolute;
+    inset: 0;
+    bottom: 0;
+    overflow-y: auto;
+    display: flex;
+    flex-direction: column;
+    align-items: center;          /* center the capped-width bubble column */
+    /* justify-content left at the default (flex-start) — see comment above */
+    overflow-x: hidden;
+    padding: 14px max(40px, 12vw) 100px;  /* 100px bottom → moves the latest beat UP ~4px (per Chloe). The .vn-recent −4px margin — kept for the recent-pair overlap — drags the LAST beat down toward the composer; this cancels that drag. .fable-input-row overlays the feed's bottom ~70px (10 top pad + 54 textarea + 6 bottom pad), so visible gap = padding-bottom + last-beat margin-bottom − 70 = 100 + (−4) − 70 = 26px. To move the beat UP further, INCREASE padding-bottom (1px up per 1px); to lower it, decrease. */
+    scrollbar-width: none;                /* hidden scrollbar — still scrollable */
+    z-index: 5;
+    pointer-events: auto;
+    overflow-anchor: none;        /* don't auto-adjust scrollTop during the reveal tween — we anchor it ourselves */
+}
+/* Bottom-align short content WITHOUT the flex-end scroll quirk. A generated
+   ::before spacer sits as the FIRST flex item with flex-grow:1 — it soaks
+   up all the free space above the beats when the transcript is shorter
+   than the viewport (parking the recent 2 near the input box), and
+   collapses to 0 height when content overflows (so the feed scrolls
+   normally from the top). Using a pseudo-element (not a real child + not
+   margin-top:auto on the first beat) is load-bearing: (1) it survives
+   beats.js's innerHTML='' rebuilds, and (2) the reveal tween in
+   vn-interactions.js animates inline margins on .vn-history beats — a real
+   first-child that was sometimes a collapsed history beat would have its
+   auto margin clobbered by both .vn-history{margin:0} and the tween. The
+   ::before is neither a .fable-mes nor a margin target, so it's immune. */
+.fable-feed::before {
+    content: '';
+    flex: 1 0 auto;                /* grow to fill free space; 0 on overflow */
+    min-height: 0;
+    pointer-events: none;
+    order: 2;                      /* MIDDLE slot — sits BETWEEN history + recent so history can drop down from the top */
+}
+.fable-feed::-webkit-scrollbar { width: 0; height: 0; }
+.fable-feed::-webkit-scrollbar-thumb { background: transparent; }
+
+/* ── The message card ───────────────────────────────────────────── */
+/* 2026-08-11 layout pass: the card is now a vertical stack — a      */
+/* detached centered nameplate header (.fable-mes-header) above an    */
+/* avatar+body row (.fable-mes-row) — instead of a flat avatar|body   */
+/* flex. The subtle ±15px stagger gives the VN silhouette without     */
+/* fighting the centering. Width bumped 720→860 for breathing room.   */
+/* --fable-mes-shift carries the stagger so the entry keyframes can   */
+/* compose it with the translateY (a single transform per element —   */
+/* otherwise the keyframe's translateY would clobber translateX).     */
+/*                                                                    */
+/* The bubble treatment (tint + border + radius + shadow + clip)      */
+/* lives on .fable-mes-ROW now, NOT on .fable-mes. The outer .fable-  */
+/* mes is a transparent column so the detached header floats in open  */
+/* space ABOVE the tinted bubble (the nameplate is not "inside" the   */
+/* card visually). This is the fix for the header reading as in-card: */
+/* when the tint spanned the full column the name sat on the tint.    */
+.fable-mes {
+    --fable-mes-shift: 48px;    /* widened 2026-08-11: AI −48 / user +48 = 96px split — bubbles lean further toward their side */
+    display: flex;
+    flex-direction: column;        /* header above the avatar+body row */
+    align-items: stretch;
+    gap: 0;
+    /* SIZING AS A FLEX ITEM of .fable-feed (a flex column, 2026-08-11).
+       flex:none = no grow + NO SHRINK — beats keep their natural height +
+       the feed overflows + scrolls instead of squishing every beat to fit
+       the viewport (the "collapsed windows, unscrollable" failure). The
+       feed's justify-content:flex-end still bottom-aligns short content. */
+    flex: none;
+    /* Override the flex default min-height:auto so a .vn-history beat's
+       height:0 actually collapses it. Without this, flex clamps the item
+       to its content's intrinsic min-height → history beats render full-
+       size (the bug) instead of disappearing until revealed. */
+    min-height: 0;
+    background: none;              /* tint moved to .fable-mes-row */
+    border-radius: 0;              /* radius moved to .fable-mes-row */
+    padding: 0;
+    margin: 10px auto;             /* auto centers within the feed's column */
+    max-width: 1040px;             /* readable column cap (mirrors input row). 860→920 2026-08-11; 920→1040 2026-08-11 per Chloe — lessen the side gap so more text fits per line. Keep .fable-input-group max-width in sync so the composer stays flush. */
+    width: 100%;
+    overflow: visible;             /* clip moved to .fable-mes-row */
+    position: relative;
+    border: 0;
+    box-shadow: none;
+    order: 1;                      /* TOP slot — history beats live above the spacer (order:2). .vn-recent overrides to 3 (bottom). */
+    transform: translateX(calc(-1 * var(--fable-mes-shift)));
+    animation: fable-mes-in-left 280ms ease-out;
+}
+/* The recent 2 beats sit in the BOTTOM slot (below the order:2 spacer), so
+   the feed reads top→bottom as: [hidden history][spacer][recent 2]. The
+   spacer pushes the recent 2 to the bottom (near the input box); history
+   reveals DROP DOWN from the top toward them. */
+.fable-mes.vn-recent {
+    order: 3;
+}
+@keyframes fable-mes-in-left {
+    from { opacity: 0; transform: translate(calc(-1 * var(--fable-mes-shift)), 8px); }
+    to   { opacity: 1; transform: translate(calc(-1 * var(--fable-mes-shift)), 0); }
+}
+.fable-mes.user {
+    transform: translateX(var(--fable-mes-shift));
+    animation-name: fable-mes-in-right;
+}
+@keyframes fable-mes-in-right {
+    from { opacity: 0; transform: translate(var(--fable-mes-shift), 8px); }
+    to   { opacity: 1; transform: translate(var(--fable-mes-shift), 0); }
+}
+
+/* ── Portrait column ────────────────────────────────────────────── */
+
+/* ── Portrait column ────────────────────────────────────────────── */
+/* Sticky to the card's top so a long beat keeps the face visible as */
+/* the user scrolls within the card. The <img> carries the dissolve  */
+/* mask; the wrapper just clips + positions.                         */
+.fable-mes-avatar {
+    position: sticky;
+    top: 0;
+    flex: 0 0 var(--fable-mes-avatar-w);
+    width: var(--fable-mes-avatar-w);
+    align-self: flex-start;
+    display: flex;
+    align-items: flex-start;
+    justify-content: flex-start;
+    pointer-events: none;
+}
+/* User cards mirror: the avatar sits on the RIGHT edge of the card, so
+   justify it to the right + the dissolve-mask fades the LEFT edge (the
+   one facing the body) instead of the right. */
+.fable-mes.user .fable-mes-avatar {
+    justify-content: flex-end;
+}
+.fable-mes-avatar-img {
+    display: block;
+    width: var(--fable-mes-avatar-w);
+    height: var(--fable-mes-avatar-h);
+    min-width: var(--fable-mes-avatar-w);
+    min-height: var(--fable-mes-avatar-h);
+    aspect-ratio: 2 / 3;
+    object-fit: cover;
+    object-position: center top;
+    border: 0;
+    border-radius: 15px 0 0 0;     /* flush with the card's top-left corner */
+    /* The signature dissolve: a 4-layer mask stack. Each layer is fully */
+    /* opaque everywhere EXCEPT a soft fade on one edge. The two layers  */
+    /* with both stops at 0% are no-ops (hard opaque); the two real ones */
+    /* fade the RIGHT edge (30%) + BOTTOM edge (40%) so the portrait     */
+    /* dissolves softly into the body area on those two sides while the  */
+    /* face + top stay crisp. mask-composite: intersect combines them so */
+    /* the visible region is "opaque everywhere minus the two fades".    */
+    -webkit-mask-image:
+        linear-gradient(to right,  rgba(0,0,0,0), rgba(0,0,0,1) 0%),
+        linear-gradient(to left,   rgba(0,0,0,0), rgba(0,0,0,1) var(--fable-mes-fade-x)),
+        linear-gradient(to bottom, rgba(0,0,0,0), rgba(0,0,0,1) 0%),
+        linear-gradient(to top,    rgba(0,0,0,0), rgba(0,0,0,1) var(--fable-mes-fade-y));
+    -webkit-mask-composite: source-in;
+            mask-image:
+        linear-gradient(to right,  rgba(0,0,0,0), rgba(0,0,0,1) 0%),
+        linear-gradient(to left,   rgba(0,0,0,0), rgba(0,0,0,1) var(--fable-mes-fade-x)),
+        linear-gradient(to bottom, rgba(0,0,0,0), rgba(0,0,0,1) 0%),
+        linear-gradient(to top,    rgba(0,0,0,0), rgba(0,0,0,1) var(--fable-mes-fade-y));
+            mask-composite: intersect;
+}
+/* User avatar: mirror the dissolve. The portrait is flush with the
+   card's TOP-RIGHT corner (radius flipped) + the mask fades the LEFT
+   edge (the one facing the body) + the bottom — the mirror image of
+   the assistant dissolve. */
+.fable-mes.user .fable-mes-avatar-img {
+    border-radius: 0 15px 0 0;          /* top-RIGHT corner flush */
+    -webkit-mask-image:
+        linear-gradient(to left,   rgba(0,0,0,0), rgba(0,0,0,1) 0%),
+        linear-gradient(to right,  rgba(0,0,0,0), rgba(0,0,0,1) var(--fable-mes-fade-x)),
+        linear-gradient(to bottom, rgba(0,0,0,0), rgba(0,0,0,1) 0%),
+        linear-gradient(to top,    rgba(0,0,0,0), rgba(0,0,0,1) var(--fable-mes-fade-y));
+    -webkit-mask-composite: source-in;
+            mask-image:
+        linear-gradient(to left,   rgba(0,0,0,0), rgba(0,0,0,1) 0%),
+        linear-gradient(to right,  rgba(0,0,0,0), rgba(0,0,0,1) var(--fable-mes-fade-x)),
+        linear-gradient(to bottom, rgba(0,0,0,0), rgba(0,0,0,1) 0%),
+        linear-gradient(to top,    rgba(0,0,0,0), rgba(0,0,0,1) var(--fable-mes-fade-y));
+            mask-composite: intersect;
+}
+/* When no portrait is available (e.g. a user beat with no saved player
+   portrait), collapse the avatar column entirely — the body takes the
+   full card width. */
+.fable-mes.no-avatar .fable-mes-avatar { display: none; }
+
+/* ── Detached nameplate header (2026-08-11) ─────────────────────── */
+/* Holds ONLY the brass speaker name (centered). The timestamp is its   */
+/* own element now (2026-08-11, per Chloe) — a sibling flex child of    */
+/* .fable-mes that sits between this header and the bubble row,         */
+/* centered over the avatar column (see .fable-mes-time--over). Keeping */
+/* the time OUT of the header is load-bearing: the header is screen-    */
+/* centered via the counter-shift below, but the over-avatar timestamp  */
+/* must stay pinned to the portrait's side (move with the card), so it  */
+/* can't share the header's transform. The history archive's corner     */
+/* timestamp lives inside .fable-mes-block instead.                    */
+/*                                                                      */
+/* The header COUNTER-SHIFTS the card's stagger (translateX of the      */
+/* opposite sign) so the nameplate stays perfectly centered with the   */
+/* SCREEN regardless of the ±48px bubble stagger — the bubbles          */
+/* alternate left/right, but every nameplate reads on the same dead-   */
+/* center axis. (2026-08-11)                                            */
+.fable-mes-header {
+    position: relative;            /* anchor for the absolutely-positioned time */
+    display: flex;
+    justify-content: center;       /* name centered alone over the card */
+    align-items: baseline;
+    padding: 14px 22px 6px;
+    flex: 0 0 auto;
+    /* counter the card's stagger so the header (name + time) is screen-centered */
+    transform: translateX(var(--fable-mes-shift));
+}
+.fable-mes.user .fable-mes-header {
+    transform: translateX(calc(-1 * var(--fable-mes-shift)));
+}
+/* The nameplate: a metallic gold sheen. The fill is a DIAGONAL gold
+   gradient clipped to the glyph shapes via background-clip:text —
+   diagonal (not vertical) because the glyph strokes are tall+narrow,
+   so a vertical gradient compresses to a flat read. Diagonal across
+   the lettering gives each stroke a top-left highlight + bottom-right
+   shadow that reads as polished metal catching an angled light. A
+   filter:drop-shadow carries the warm halo + dark under-bevel that
+   text-shadow can't do reliably once the fill is transparent (clip:
+   text makes text-shadow render behind the transparent fill, not
+   behind the glyph stroke — drop-shadow operates on the final glyph
+   mask so it lands correctly). --fable-brass-bright stays as the
+   fallback color for any context that drops the clip. */
+.fable-mes-name {
+    color: var(--fable-brass-bright);
+    background: linear-gradient(
+        135deg,
+        #fff7d4 0%,        /* top-left highlight — candlelit sheen */
+        #f6e08a 22%,       /* bright polished gold */
+        var(--fable-brass-bright) 45%,   /* gold core */
+        #d4ad52 68%,       /* warm transition */
+        #9c7a30 88%,       /* deep shadow band */
+        #6e5320 100%       /* bottom-right dark metal */
+    );
+    -webkit-background-clip: text;
+    background-clip: text;
+    -webkit-text-fill-color: transparent;
+    font-family: var(--fable-font-body);
+    font-size: 24px;               /* 16 → 20 → 24px (2026-08-11) */
+    font-weight: 700;
+    letter-spacing: 0.04em;
+    /* drop-shadow stacks (softened 2026-08-11): a subtle warm halo +
+       a tight dark under-bevel that reads as the engraved metal's
+       lower edge. filter instead of text-shadow because the
+       transparent fill breaks text-shadow. */
+    filter:
+        drop-shadow(0 0 3px rgba(230, 213, 138, 0.25))
+        drop-shadow(0 1px 0.5px rgba(60, 44, 14, 0.85));
+    flex: 0 0 auto;
+}
+/* Notes: on engines that drop -webkit-text-fill-color, the fallback
+   solid color (color: --fable-brass-bright) still reads as brass. The
+   clip+gradient+drop-shadow path is the dominant one on Chromium/WebView2. */
+/* The muted timestamp (2026-08-11 dual-placement, per Chloe). TWO
+   placements are rendered per beat (see beats.js::buildMes) and toggled
+   purely by the vn-recent / vn-history classes — only one is ever
+   visible at a time. This base rule carries ONLY the shared typography;
+   the two modifiers below carry their own positioning.
+     • --over   : latest 2 beats — centered OVER the avatar column,
+                  absolutely positioned inside the header's bottom band
+                  so it adds zero card height ("right above the pictures,
+                  outside the box"), fully separate from the centered
+                  nameplate.
+     • --corner : revealed archive — tucked into the far bottom corner of
+                  the bubble (bottom-LEFT for AI/NPC, bottom-RIGHT for
+                  user, mirrored), pushed toward the edge.
+   Deliberately dim so it reads as metadata, not a second voice competing
+   with the nameplate. */
+.fable-mes-time {
+    color: rgba(255, 255, 255, 0.34);
+    font-family: var(--fable-font-body);
+    font-size: 0.8rem;               /* slightly bigger (was 0.7rem), per Chloe */
+    font-variant-numeric: tabular-nums;
+    letter-spacing: 0.04em;
+    line-height: 1;
+    pointer-events: none;
+}
+
+/* (1) Over-avatar — the 2 latest beats. Lives INSIDE .fable-mes-header as
+   an absolutely-positioned child so it adds ZERO card height: it floats in
+   the header's bottom band directly above the bubble row, without pushing
+   the nameplate upward. (An in-flow line would grow the card, and recent
+   cards are bottom-anchored in the feed, so any added height lifts the
+   nameplate.) A fixed avatar-width box + text-align:center centers it over
+   the portrait column. The header's screen-centering counter-shift would
+   otherwise drag this stamp to the centered nameplate's axis, so each side
+   undoes it with the opposite translateX — the stamp stays pinned to the
+   avatar in CARD coordinates and moves with the card's stagger. The 4px
+   `bottom` is the "tiny bit of space underneath the time." User cards
+   mirror to the right edge. */
+.fable-mes-time--over {
+    position: absolute;
+    bottom: 4px;                     /* tiny gap below the time, just above the bubble */
+    left: 0;                         /* AI/NPC: card's left edge = the left portrait column */
+    width: var(--fable-mes-avatar-w);
+    text-align: center;
+    transform: translateX(calc(-1 * var(--fable-mes-shift)));  /* undo the AI header's +48 counter-shift */
+}
+.fable-mes.user .fable-mes-time--over {
+    left: auto;
+    right: 0;                        /* user: the right portrait column */
+    transform: translateX(var(--fable-mes-shift));  /* undo the user header's −48 counter-shift */
+}
+
+/* (2) Bottom-corner — the revealed archive. Absolutely positioned against
+   .fable-mes-block (which is position:relative). AI/NPC → far bottom-LEFT,
+   user → far bottom-RIGHT (mirrored), pushed toward the edge (10px) per
+   Chloe — "more towards the edges, there's a bit more room." Hidden by
+   default; the .vn-history toggle below shows it. */
+.fable-mes-time--corner {
+    position: absolute;
+    bottom: 4px;
+    right: 10px;                     /* bottom-right — AI/NPC HISTORY beats mirror the user history placement (per Chloe 2026-08-11; was left:10px). The .user override below is now redundant but kept harmless. */
+    display: none;                   /* default hidden — recent beats use --over */
+}
+.fable-mes.user .fable-mes-time--corner {
+    left: auto;
+    right: 10px;                     /* user: far bottom-right */
+}
+
+/* Visibility toggle — exactly one placement shows per beat. The corner
+   variant is hidden by default (fresh/recent beats show the over-avatar
+   variant); .vn-history flips them. A brand-new beat has neither class
+   yet, so it reads as recent (--over visible) until the MutationObserver
+   in vn-interactions.js retags it — which is correct, since a fresh beat
+   IS one of the 2 latest. */
+.fable-mes.vn-history .fable-mes-time--over { display: none; }
+.fable-mes.vn-history .fable-mes-time--corner { display: block; }
+
+/* ── Avatar + body row ──────────────────────────────────────────── */
+/* The flex container holding the portrait + body, sitting BELOW the
+   detached header. This is the old .fable-mes flex (avatar|body) moved
+   one level down so the header can span full width above it. It ALSO
+   carries the bubble treatment (tint + border + radius + shadow + clip)
+   that used to live on .fable-mes — moved here 2026-08-11 so the tint
+   fills only the bubble, not the header above it (the nameplate now
+   floats on the transparent feed floor, visibly detached from card). */
+.fable-mes-row {
+    display: flex;
+    align-items: stretch;
+    gap: 0;
+    flex: 1 1 auto;
+    min-height: 0;
+    background: var(--fable-mes-bot);
+    border-radius: 15px;
+    border: 1px solid rgba(255, 255, 255, 0.04);
+    box-shadow: 0 6px 20px rgba(0, 0, 0, 0.35);
+    overflow: hidden;              /* avatar mask + radius clip to the bubble */
+}
+.fable-mes.user .fable-mes-row {
+    background: var(--fable-mes-user);
+}
+
+/* ── Body column ────────────────────────────────────────────────── */
+.fable-mes-block {
+    flex: 1 1 auto;
+    min-width: 0;                  /* allow flex shrink so long words wrap */
+    padding: 6px 22px 14px 22px;   /* header carries the top padding now; side padding 28→22 2026-08-11 per Chloe — less side gap so more text fits (reverses the earlier 22→28 "breathing room" widen). The 14px bottom padding is also the "line of room" the timestamp sits in (bottom-right, no size increase). */
+    background: none;
+    border: none;
+    box-shadow: none;
+    display: flex;
+    flex-direction: column;
+    position: relative;            /* anchor the absolutely-positioned timestamp */
+}
+/* User cards: the avatar sits on the RIGHT edge, but the prose now
+   reads LEFT-aligned like the narrator's (2026-08-11 — was right-
+   aligned). The header stays centered; only the avatar side mirrors. */
+.fable-mes.user .fable-mes-block {
+    align-items: flex-start;
+}
+.fable-mes.user .fable-mes-text {
+    text-align: left;
+    /* Stretch to the block's full width so the inline editor (✎ / dblclick)
+       resolves its width:100% correctly. The user block carries
+       align-items:flex-start (above) for the left-aligned look; without
+       this override that setting shrinks .fable-mes-text to CONTENT width.
+       In normal mode that's invisible (long text fills the width via
+       fit-content anyway), but during edit .fable-mes-text's ONLY child is
+       the textarea → its max-content is the textarea's tiny intrinsic width
+       → .fable-mes-text collapses → the editor's width:100% resolves to a
+       tiny square. align-self:stretch makes the text container definite-
+       width (== assistant beats' default stretch), so the editor fills it.
+       Scoped to .fable-mes-text only — controls + timestamp siblings keep
+       the block's flex-start alignment, so their layout is unchanged. */
+    align-self: stretch;
+}
+
+/* ── Body text + inline markdown ────────────────────────────────── */
+.fable-mes-text {
+    color: var(--fable-text);
+    font-family: var(--fable-font-body);
+    font-size: 18px;                /* 16.5 → 18px per Chloe (2026-08-11) */
+    line-height: 1.4;               /* 1.6 → 1.5 → 1.4 per Chloe (2026-08-11) */
+    letter-spacing: 0.04em;         /* per Chloe (2026-08-11) — subtle body-prose breathing gap (0.03em at 18px ≈ 0.54px/letter). */
+    word-wrap: break-word;
+    overflow-wrap: anywhere;
+}
+.fable-mes-text em {
+    font-style: italic;
+    color: #c9b6e4;                /* lavender — *action* beats */
+}
+.fable-mes-text strong {
+    font-weight: 700;
+    color: var(--fable-brass-bright);
+}
+.fable-mes-text .quote {
+    color: #f6efd9;                /* warm ivory — dialogue */
+}
+/* Streaming caret: a brass block cursor appended while a beat is live. */
+.fable-mes.streaming .fable-mes-text::after {
+    content: "▌";
+    color: var(--fable-brass);
+    animation: fableBlink 1s steps(2) infinite;
+    margin-left: 1px;
+}
+@keyframes fableBlink {
+    0%, 49%   { opacity: 1; }
+    50%, 100% { opacity: 0; }
+}
+
+/* ── Inline editor (✎ edit mode) ────────────────────────────────── */
+.fable-mes-editor {
+    width: 100%;
+    /* Stretch across the flex-column .fable-mes-block cross-axis. width:100%
+       alone collapsed when the VN-interactions layer made .fable-mes-controls
+       align-self:flex-end (since reverted); keep align-self:stretch as a hard
+       guard so the editor can never shrink to a tiny square again. */
+    align-self: stretch;
+    box-sizing: border-box;
+    resize: vertical;
+    min-height: 80px;
+    padding: 10px 12px;
+    background: var(--fable-inset);
+    color: var(--fable-text);
+    border: 1px solid var(--fable-brass-dim);
+    border-radius: 8px;
+    font-family: var(--fable-font-body);
+    font-size: 16.5px;
+    line-height: 1.55;
+    outline: none;
+    scrollbar-width: none;
+}
+.fable-mes-editor:focus {
+    border-color: var(--fable-brass);
+    box-shadow: 0 0 0 1px var(--fable-brass-dim);
+}
+.fable-mes-editor::-webkit-scrollbar { width: 0; height: 0; }
+
+/* ── Per-beat hover side-drawer (tools + ‹ N/1 › nav) ───────────── */
+/* Replaces the old in-flow .fable-mes-controls bar (2026-08-11). A tall  */
+/* narrow glass column that slides out from the bubble's OPEN edge on     */
+/* hover: AI/narrator beats → RIGHT edge (into the center gutter), player  */
+/* beats → LEFT edge. Absolute-anchored to .fable-mes (which is position: */
+/* relative + overflow:visible) so it escapes .fable-mes-row's            */
+/* overflow:hidden. Vertically centered on the card. Revealed by the SAME */
+/* .fable-mes:hover trigger as the nameplate + over-portrait timestamp    */
+/* (the vn-interactions reveal layer). Fully hidden until hover — no      */
+/* always-visible affordance, per the clean-aesthetic call. The drawer is */
+/* a DOM child of .fable-mes, so moving the cursor INTO it keeps :hover   */
+/* alive → the buttons are clickable without a pin/lock.                  */
+.fable-mes-drawer {
+    position: absolute;
+    top: 50%;
+    z-index: 6;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    padding: 8px 6px;
+    background: var(--fable-glass);
+    backdrop-filter: blur(16px);
+    -webkit-backdrop-filter: blur(16px);
+    border: 1px solid var(--fable-brass-dim);
+    border-radius: 10px;
+    box-shadow: 0 6px 20px rgba(0, 0, 0, 0.45);
+    opacity: 0;
+    pointer-events: none;
+    transition:
+        opacity 200ms ease,
+        transform 320ms cubic-bezier(0.2, 0.8, 0.2, 1);
+}
+/* AI/narrator: drawer hugs the bubble's RIGHT edge, slides right into the gutter. */
+.fable-mes:not(.user) .fable-mes-drawer {
+    left: 100%;
+    transform: translateY(-50%) translateX(-10px);   /* resting: tucked against the edge */
+}
+/* Player: drawer hugs the bubble's LEFT edge, slides left into the gutter. */
+.fable-mes.user .fable-mes-drawer {
+    right: 100%;
+    transform: translateY(-50%) translateX(10px);
+}
+/* Reveal on hover/focus-within — same trigger as nameplate + timestamp. */
+.fable-mes:hover .fable-mes-drawer,
+.fable-mes:focus-within .fable-mes-drawer {
+    opacity: 1;
+    pointer-events: auto;
+}
+.fable-mes:not(.user):hover .fable-mes-drawer,
+.fable-mes:not(.user):focus-within .fable-mes-drawer {
+    transform: translateY(-50%) translateX(8px);     /* pushed out into the gutter */
+}
+.fable-mes.user:hover .fable-mes-drawer,
+.fable-mes.user:focus-within .fable-mes-drawer {
+    transform: translateY(-50%) translateX(-8px);
+}
+
+/* Tool stack (Edit / Delete) — vertical column of square buttons mirroring
+   the .hud-dock-btn recipe scaled down. The SVGs are currentColor-driven. */
+.fable-mes-drawer-tools {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+}
+.fable-mes-drawer-tool {
+    width: 38px;
+    height: 38px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    background: transparent;
+    border: 1px solid transparent;
+    border-radius: 8px;
+    color: var(--fable-text-dim);
+    cursor: pointer;
+    padding: 0;
+    transition:
+        transform 220ms cubic-bezier(0.2, 0.8, 0.2, 1),
+        color 220ms ease,
+        border-color 220ms ease,
+        background 220ms ease;
+}
+.fable-mes-drawer-tool svg {
+    width: 20px;
+    height: 20px;
+    display: block;
+}
+.fable-mes-drawer-tool:hover:not(:disabled) {
+    color: var(--fable-brass-bright);
+    border-color: var(--fable-brass);
+    background: rgba(197, 179, 88, 0.10);
+    transform: scale(1.06);
+}
+.fable-mes-drawer-tool:active:not(:disabled) {
+    transform: scale(1.02);
+}
+.fable-mes-drawer-tool:focus-visible {
+    outline: 2px solid var(--fable-brass-bright);
+    outline-offset: 2px;
+}
+.fable-mes-drawer-tool:disabled {
+    opacity: 0.3;
+    cursor: not-allowed;
+}
+/* Delete-confirm state (two-step inline confirm): the tool button morphs to
+   a check + glows red while the second-click window is open. */
+.fable-mes-drawer-tool.is-confirming {
+    color: #f4c4c4;
+    border-color: rgba(244, 114, 114, 0.5);
+    background: rgba(244, 114, 114, 0.12);
+}
+.fable-mes-drawer-tool.is-confirming:hover:not(:disabled) {
+    color: #ff8a8a;
+    border-color: rgba(244, 114, 114, 0.85);
+    background: rgba(244, 114, 114, 0.20);
+    transform: scale(1.06);
+}
+
+/* Nav footer: ‹ N/1 › — the medieval chevron arrows (ARROW_SVG_LEFT/RIGHT
+   imported into beats.js from wizard-engine.js) scaled small + brass. › at
+   the last variant of the trailing assistant beat folds in Regenerate. */
+.fable-mes-drawer-nav {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 2px;
+    padding-top: 4px;
+    margin-top: 2px;
+    border-top: 1px solid var(--fable-glass-line);
+}
+.fable-mes-drawer-arrow {
+    width: 38px;
+    height: 22px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    background: transparent;
+    border: none;
+    color: var(--fable-brass);
+    cursor: pointer;
+    padding: 0;
+    filter: drop-shadow(0 0 6px rgba(230, 213, 138, 0.22));
+    transition: color 160ms ease, transform 160ms ease, filter 160ms ease;
+}
+.fable-mes-drawer-arrow svg {
+    width: 30px;
+    height: 18px;
+    display: block;
+}
+.fable-mes-drawer-arrow:hover:not(:disabled) {
+    color: var(--fable-brass-bright);
+    transform: translateY(-1px);
+    filter: drop-shadow(0 0 10px rgba(230, 213, 138, 0.55));
+}
+.fable-mes-drawer-arrow:disabled {
+    opacity: 0.22;
+    cursor: not-allowed;
+}
+.fable-mes-drawer-count {
+    color: var(--fable-text-dim);
+    font-size: 11.5px;
+    font-variant-numeric: tabular-nums;
+    letter-spacing: 0.06em;
+    line-height: 1;
+}
+
+/* Reduced motion: drop the slide travel; hide-by-default + instant opacity
+   reveal still works. Base + hover transforms collapse to vertical centering
+   (later source order wins the specificity tie). */
+@media (prefers-reduced-motion: reduce) {
+    .fable-mes-drawer,
+    .fable-mes-drawer-tool,
+    .fable-mes-drawer-arrow {
+        transition: opacity 160ms ease;
+    }
+    .fable-mes:not(.user) .fable-mes-drawer,
+    .fable-mes.user .fable-mes-drawer,
+    .fable-mes:not(.user):hover .fable-mes-drawer,
+    .fable-mes.user:hover .fable-mes-drawer,
+    .fable-mes:not(.user):focus-within .fable-mes-drawer,
+    .fable-mes.user:focus-within .fable-mes-drawer {
+        transform: translateY(-50%);
+    }
+}
+
+/* ── System + error beats: narrow centered cards ────────────────── */
+.fable-mes.system,
+.fable-mes.error {
+    display: block;
+    max-width: 70%;
+    margin: 10px auto;
+    padding: 10px 16px;
+    background: rgba(28, 24, 20, 0.55);
+    border-radius: 10px;
+}
+.fable-mes.system .fable-mes-block { padding: 0; }
+.fable-mes.system .fable-mes-text {
+    color: var(--fable-text-dim);
+    font-size: 14px;
+    font-style: italic;
+    text-align: center;
+}
+.fable-mes.error {
+    background: rgba(120, 30, 30, 0.5);
+    border: 1px solid rgba(244, 114, 114, 0.4);
+}
+.fable-mes.error .fable-mes-block { padding: 0; }
+.fable-mes.error .fable-mes-text {
+    color: #f4c4c4;
+    font-size: 14px;
+    text-align: center;
+}
+
+/* ── Mobile: shrink the portrait to ~100px on narrow screens ────── */
+@media screen and (max-width: 1000px) {
+    .fable-feed {
+        padding: 10px 12px 96px;      /* tracks the desktop bottom padding */
+    }
+    .fable-mes-avatar,
+    .fable-mes-avatar-img {
+        width: var(--fable-mes-avatar-mobile-w);
+        height: calc(var(--fable-mes-avatar-mobile-w) * 1.5);
+        min-width: var(--fable-mes-avatar-mobile-w);
+        min-height: calc(var(--fable-mes-avatar-mobile-w) * 1.5);
+    }
+    .fable-mes-block {
+        padding: 4px 14px 12px 14px;  /* header carries the top padding now */
+    }
+    .fable-mes-header {
+        padding: 10px 14px 2px;
+    }
+    .fable-mes-text { font-size: 15.5px; }
+    /* Drop the stagger on narrow screens — the ±15px nudge would shove
+       cards into the tight 12px side margin. Reset to a centered column. */
+    .fable-mes,
+    .fable-mes.user {
+        --fable-mes-shift: 0px;
+    }
+}
+
+/* ============================================================= */
+/* VN INTERACTIONS — behavior-layer additions over the .fable-mes  */
+/* feed. Driven by engine/vn-interactions.js (history tagging,     */
+/* portrait snaps, flank dblclick, dblclick edit) + native scroll   */
+/* for the history reveal (2026-08-11: the hover hysteresis is gone).*/
+/* Additive only — no rule above is rewritten + no text-            */
+/* node carries a warm tint. The vn-* prefix marks these as the    */
+/* interaction layer, distinct from the fable-mes-* structural     */
+/* contract.                                                       */
+/* ============================================================= */
+
+/* ── 1. History — fully OFF-SCREEN at rest, wheel up to open ─────── */
+/* The archive is COLLAPSED to height 0 + visibility hidden at rest —    */
+/* nothing of it is visible at all initially (no peek sliver, no fade    */
+/* mask). Wheeling up at the top opens it in ONE smooth drop (recent 2   */
+/* stay pinned at the bottom); once open it's explored with NATIVE       */
+/* scroll (scroll up past the recent beats to read older history);       */
+/* wheeling back down to the very bottom edge snaps it shut again. All   */
+/* of that lives in vn-interactions.js (onFeedWheel + openHistory /      */
+/* closeHistory); this rule is just the resting (fully hidden) state the */
+/* JS hands closed beats back to.                                        */
+/*                                                                       */
+/* History beats are also re-centered to the screen here: their stagger  */
+/* transform is nulled so, unlike the latest 2 (which keep the ±48px     */
+/* VN lean), the archive reads as a centered column of faceless prose.  */
+/*                                                                       */
+/* .vn-recent beats (last 2) are never touched — full name + portrait +  */
+/* stagger + the over-avatar timestamp, exactly as built. Their inter-   */
+/* beat margin is tightened below (recent reads as a tight pair).        */
+.fable-mes.vn-history {
+    height: 0;                   /* fully off-screen at rest */
+    margin: 0;
+    overflow: hidden;
+    visibility: hidden;
+    animation: none;             /* don't slide in on feed rebuild */
+    transform: none;             /* centered to the screen — no ±48px stagger (latest 2 keep theirs) */
+}
+/* The latest 2 beats sit CLOSE (10px → 3px margin) so the active       */
+/* exchange reads as one tight beat-pair. The feed is a flex column      */
+/* (margins don't collapse) → the resting gap between the two is the     */
+/* sum of both margins = 6px. This is the SINGLE governing rule for the  */
+/* recent-pair margin — keep it here only. The .vn-recent { order:3 }   */
+/* block above intentionally carries NO margin: a second .vn-recent      */
+/* margin rule elsewhere would silently lose to this one (same           */
+/* specificity, this is later in source) and edits to it do nothing.     */
+/* The opposite of the archive beats, whose revealed margin the JS       */
+/* bumps to 8px (HISTORY_MARGIN_PX) so the transcript breathes.          */
+.fable-mes.vn-recent {
+    margin: -4px auto;
+}
+
+/* ── 2. Portrait corner snaps ───────────────────────────────────── */
+/* .vn-snapped on the <img> detaches it from its flex slot + turns it
+   into a fixed-position VN character sprite locked to a screen      */
+/* corner (AI = bottom-left, user = bottom-right). The signature 4-  */
+/* layer dissolve mask is CLEARED so the snapped sprite reads as a   */
+/* crisp cut-in, not a soft-edged card portrait. A second click      */
+/* (handled in vn-interactions.js) removes the class → the <img>     */
+/* reflows back into its flex slot + the dissolve mask restores.      */
+/*                                                                   */
+/* z-index:45 — above the feed (5), the hover bands (6), the drawer  */
+/* hover-trigger (30), + the input-row gradient (25). Below the      */
+/* open Wupi drawer (40)?? — no: 45 > 40, so a snapped sprite floats  */
+/* OVER an open drawer. That's the VN-correct read: the character    */
+/* stays visible as the foreground even when the management drawer   */
+/* is summoned. Below the edge-lock (50) so the lock bar never gets  */
+/* covered. (If the drawer-over-sprite read ever feels wrong, drop   */
+/* this to 35 — but the VN sprite-as-foreground convention is the    */
+/* intent.)                                                          */
+.fable-mes-avatar-img.vn-snapped {
+    position: fixed;
+    bottom: 14px;
+    width: clamp(180px, 18vw, 300px);
+    /* height:auto + aspect-ratio:2/3 keep the portrait's native shape */
+    /* ratio without forcing the in-card min-height (which would        */
+    /* stretch the fixed sprite). The 2/3 matches the in-feed card      */
+    /* portrait's aspect-ratio so a snap/un-snap is shape-stable.       */
+    height: auto;
+    aspect-ratio: 2 / 3;
+    object-fit: cover;
+    object-position: center top;
+    z-index: 45;
+    border-radius: 12px;
+    border: 0;
+    box-shadow: 0 10px 40px rgba(0, 0, 0, 0.6);
+    animation: vn-snap-in 220ms cubic-bezier(0.2, 0.8, 0.2, 1);
+    pointer-events: auto;          /* the second click re-docks it */
+    /* Clear the dissolve mask stack so the sprite is a clean rect. */
+    -webkit-mask-image: none;
+            mask-image: none;
+}
+/* AI snaps bottom-left, user snaps bottom-right. The beat's .assistant/
+   .user class is on the .fable-mes ancestor, so we scope the corner
+   via the parent. */
+.fable-mes.assistant .fable-mes-avatar-img.vn-snapped { left: 14px;  right: auto; }
+.fable-mes.user      .fable-mes-avatar-img.vn-snapped { right: 14px; left: auto;  }
+@keyframes vn-snap-in {
+    from { opacity: 0; transform: translateY(12px) scale(0.96); }
+    to   { opacity: 1; transform: none; }
+}
+
+/* ── 3. Portrait visibility: recent-only + flank toggle ─────────── */
+/* TWO independent paths hide docked portraits:                      */
+/*                                                                   */
+/* (a) HISTORY — only the recent 2 beats show portraits; the archive  */
+/*     never does. A history beat's .fable-mes-avatar is hidden for    */
+/*     good (2026-08-11, per Chloe: "remove the images from the chat   */
+/*     history above the 2 messages") — even when the transcript is    */
+/*     revealed, history beats render as text-only. The recent 2 are   */
+/*     the only beats that carry faces. Snapped sprites stay exempt    */
+/*     via :has(.vn-snapped) so a foreground character the player      */
+/*     pinned to a corner survives.                                    */
+/*                                                                   */
+/* (b) FLANK TOGGLE — dblclick within the left/right edge band       */
+/*     (vn-interactions.js) adds a feed-level .vn-hide-*-portraits    */
+/*     class that hides ALL docked portraits for that side (AI/user). */
+/*     Same :has(.vn-snapped) carve-out so snapped sprites survive.  */
+/*                                                                   */
+/* :has() is safe in WebView2 (Chromium ≥115; stable since M105).    */
+/*                                                                   */
+/* The carve-out is the load-bearing detail: without it, hiding      */
+/* portraits would also yank any sprite the player snapped into the  */
+/* foreground — defeating the whole point of snapping.               */
+
+/* (a) History beats never show their docked portrait (text-only archive).
+   The old `.vn-revealed` restore was removed 2026-08-11 — revealed history
+   now reads as faceless prose too. A snapped sprite still survives via the
+   :has(.vn-snapped) carve-out below. */
+.fable-mes.vn-history .fable-mes-avatar:not(:has(.fable-mes-avatar-img.vn-snapped)) {
+    display: none;
+}
+
+/* History beats are NAMELESS + faceless + tightly stacked (2026-08-11
+   per Chloe: "remove the nametags outside the initial 2 messages but
+   leave the timestamps... margins much closer together"). The archive
+   reads as a dense transcript: prose + the bottom-corner timestamp
+   (.fable-mes-time--corner — far bottom-left for AI / bottom-right for
+   user, pushed to the edge), no brass nameplate, no portrait, minimal
+   vertical air between beats. The whole header band is hidden here: the
+   name is gone AND the timestamp moved into the bubble, so there is
+   nothing left to render above the row. Only the recent 2 keep the full
+   name + over-avatar timestamp + portrait + 10px spacing treatment. The
+   tight 4px archive margin lives in §1 above. */
+.fable-mes.vn-history .fable-mes-header {
+    display: none;                /* nameless, timestamp-less archive header */
+}
+
+/* (b) Flank dblclick toggles. */
+.fable-feed.vn-hide-ai-portraits
+    .fable-mes.assistant .fable-mes-avatar:not(:has(.fable-mes-avatar-img.vn-snapped)) {
+    display: none;
+}
+.fable-feed.vn-hide-user-portraits
+    .fable-mes.user .fable-mes-avatar:not(:has(.fable-mes-avatar-img.vn-snapped)) {
+    display: none;
+}
+
+/* ── 4. Hover side-drawer (moved to its own block, 2026-08-11) ──── */
+/* The old in-flow .fable-mes-controls bar + this opacity-fade override
+   are RETIRED. The per-beat controls now live in a .fable-mes-drawer that
+   slides out from the bubble's side edge on hover (see the dedicated
+   ".fable-mes-drawer" block above, near the editor rules). The drawer
+   owns its OWN reveal (opacity + transform) on the same .fable-mes:hover
+   trigger used here for the nameplate/timestamp — no fade override needed. */
+
+/* ── 5. Nameplate + over-avatar timestamp hover-reveal (2026-08-11) ─ */
+/* Per Chloe: the brass nameplate + the over-portrait timestamp read   */
+/* as permanent chrome competing with prose. Hide BOTH until the beat  */
+/* is hovered, then let them rise cleanly into place.                  */
+/*                                                                     */
+/* NO LAYOUT SHIFT: the header reserves its space via fixed padding    */
+/* (.fable-mes-header padding is constant) + the nameplate is an       */
+/* in-flow flex child whose box stays put at opacity:0, while the      */
+/* --over stamp is already position:absolute. So opacity+transform     */
+/* animate VISIBILITY ONLY — the bubble row never moves and neighbor   */
+/* beats are never pushed. (transform never affects layout, and the    */
+/* header height is padding+name-line-box regardless of opacity.)      */
+/*                                                                     */
+/* TIMING: ~480ms (slowed + smoothed 2026-08-11 per Chloe — was 320ms  */
+/* with an aggressive ease-out that read as too fast/snappy). Now uses  */
+/* the Material-standard ease-in-out cubic-bezier(0.4, 0, 0.2, 1): a    */
+/* gentle start, smooth middle, soft settle — fluid instead of a pop.   */
+/* No bounce. The nameplate has no prior transform so it takes a plain  */
+/* translateY; the --over stamp already carries a translateX that pins  */
+/* it to the portrait column (fable.css:4727/4732), so its rise COMPOSES*/
+/* that X pin with a Y nudge on top of it — each side keeps its column  */
+/* pin. Mirrors the controls layer's hide-by-default + .fable-mes:hover */
+/* reveal pattern.                                                      */
+.fable-mes .fable-mes-name,
+.fable-mes .fable-mes-time--over {
+    opacity: 0;
+    transition:
+        opacity 480ms cubic-bezier(0.4, 0, 0.2, 1),
+        transform 480ms cubic-bezier(0.4, 0, 0.2, 1);
+}
+.fable-mes .fable-mes-name {
+    transform: translateY(6px);          /* resting hidden state: nudged down, rises on hover */
+}
+.fable-mes .fable-mes-time--over {
+    transform: translateX(calc(-1 * var(--fable-mes-shift))) translateY(6px);
+}
+.fable-mes.user .fable-mes-time--over {
+    transform: translateX(var(--fable-mes-shift)) translateY(6px);
+}
+/* Hover: rise to rest + fade in. The two --over selectors carry the   */
+/* same translateX pin as idle so the stamp stays over the portrait    */
+/* column throughout the rise (only the Y travel changes).             */
+.fable-mes:hover .fable-mes-name {
+    opacity: 1;
+    transform: translateY(0);
+}
+.fable-mes:hover .fable-mes-time--over {
+    opacity: 1;
+    transform: translateX(calc(-1 * var(--fable-mes-shift))) translateY(0);
+}
+.fable-mes.user:hover .fable-mes-time--over {
+    transform: translateX(var(--fable-mes-shift)) translateY(0);
+}
+/* Reduced motion: drop the rise travel entirely; the hide-by-default  */
+/* + instant reveal still works, just with no motion. The --over stamp */
+/* keeps its column-pinning translateX (no Y).                         */
+@media (prefers-reduced-motion: reduce) {
+    .fable-mes .fable-mes-name,
+    .fable-mes .fable-mes-time--over {
+        transition: none;
+    }
+    .fable-mes .fable-mes-name {
+        transform: none;
+    }
+    .fable-mes .fable-mes-time--over {
+        transform: translateX(calc(-1 * var(--fable-mes-shift)));
+    }
+    .fable-mes.user .fable-mes-time--over {
+        transform: translateX(var(--fable-mes-shift));
+    }
+    .fable-mes:hover .fable-mes-name,
+    .fable-mes:hover .fable-mes-time--over {
+        opacity: 1;
+    }
+}
+

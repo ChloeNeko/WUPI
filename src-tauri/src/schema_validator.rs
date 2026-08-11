@@ -243,21 +243,40 @@ pub fn validate(delta: &SchemaDelta, ctx: &ValidationContext<'_>) -> Result<(), 
             }
 
             // Value shape (only when Some — None is the delete signal, always
-            // valid). Allow newlines in values (multi-line prose is fine);
-            // reject other control chars + cap length.
+            // valid). Values are `serde_json::Value` (widened 2026-08-11 from
+            // `String`): a bare string still passes the prose control-char
+            // check directly; structured values (objects/arrays/numbers) are
+            // measured by their serialized-JSON char length + skip the prose
+            // control-char check (serde_json escapes control chars per spec,
+            // so a structured value's serialized form has none raw).
             if let Some(value) = value_opt {
-                let val_len = value.chars().count();
-                if val_len > MAX_VALUE_LEN {
-                    return Err(ValidationFailure::InvalidValue {
-                        key: key.clone(),
-                        reason: format!("is {val_len} chars; max {MAX_VALUE_LEN}"),
-                    });
-                }
-                if has_disallowed_control_chars(value) {
-                    return Err(ValidationFailure::InvalidValue {
-                        key: key.clone(),
-                        reason: "contains control characters (newlines are allowed; strip other control chars)".to_string(),
-                    });
+                match value {
+                    serde_json::Value::String(s) => {
+                        let val_len = s.chars().count();
+                        if val_len > MAX_VALUE_LEN {
+                            return Err(ValidationFailure::InvalidValue {
+                                key: key.clone(),
+                                reason: format!("is {val_len} chars; max {MAX_VALUE_LEN}"),
+                            });
+                        }
+                        if has_disallowed_control_chars(s) {
+                            return Err(ValidationFailure::InvalidValue {
+                                key: key.clone(),
+                                reason: "contains control characters (newlines are allowed; strip other control chars)".to_string(),
+                            });
+                        }
+                    }
+                    other => {
+                        // Structured JSON value: length-cap the serialized form.
+                        let serialized = serde_json::to_string(other).unwrap_or_default();
+                        let val_len = serialized.chars().count();
+                        if val_len > MAX_VALUE_LEN {
+                            return Err(ValidationFailure::InvalidValue {
+                                key: key.clone(),
+                                reason: format!("serializes to {val_len} chars; max {MAX_VALUE_LEN}"),
+                            });
+                        }
+                    }
                 }
             }
 
@@ -336,9 +355,9 @@ mod tests {
     #[test]
     fn accepts_normal_entities() {
         let mut ents = HashMap::new();
-        ents.insert("item.iron_sword".to_string(), Some("acquired".to_string()));
-        ents.insert("char.mira.trust".to_string(), Some("0.85".to_string()));
-        ents.insert("loc.current".to_string(), Some("tavern".to_string()));
+        ents.insert("item.iron_sword".to_string(), Some(serde_json::Value::String("acquired".into())));
+        ents.insert("char.mira.trust".to_string(), Some(serde_json::Value::String("0.85".into())));
+        ents.insert("loc.current".to_string(), Some(serde_json::Value::String("tavern".into())));
         let delta = SchemaDelta {
             summary: None,
             recent_events: None,
@@ -369,7 +388,7 @@ mod tests {
         let mut ents = HashMap::new();
         ents.insert(
             "char.mira.notes".to_string(),
-            Some("Line one.\nLine two.\nLine three.".to_string()),
+            Some(serde_json::Value::String("Line one.\nLine two.\nLine three.".into())),
         );
         let delta = SchemaDelta {
             summary: None,
@@ -386,7 +405,7 @@ mod tests {
         let mut ents = HashMap::new();
         ents.insert(
             "item.katana".to_string(),
-            Some("刀".to_string()),
+            Some(serde_json::Value::String("刀".into())),
         );
         let delta = SchemaDelta {
             summary: None,
@@ -414,7 +433,7 @@ mod tests {
     #[test]
     fn rejects_empty_key() {
         let mut ents = HashMap::new();
-        ents.insert("   ".to_string(), Some("v".to_string()));
+        ents.insert("   ".to_string(), Some(serde_json::Value::String("v".into())));
         let delta = SchemaDelta {
             summary: None,
             recent_events: None,
@@ -434,7 +453,7 @@ mod tests {
     fn rejects_key_with_control_chars() {
         // A newline in a key is always model noise.
         let mut ents = HashMap::new();
-        ents.insert("bad\nkey".to_string(), Some("v".to_string()));
+        ents.insert("bad\nkey".to_string(), Some(serde_json::Value::String("v".into())));
         let delta = SchemaDelta {
             summary: None,
             recent_events: None,
@@ -453,7 +472,7 @@ mod tests {
         let mut ents = HashMap::new();
         ents.insert(
             "char.mira.notes".to_string(),
-            Some("corrupt\x00value".to_string()),
+            Some(serde_json::Value::String("corrupt\x00value".into())),
         );
         let delta = SchemaDelta {
             summary: None,
@@ -501,7 +520,7 @@ mod tests {
     fn rejects_too_many_entity_keys() {
         let mut ents = HashMap::new();
         for i in 0..(MAX_ENTITY_KEYS_PER_DELTA + 1) {
-            ents.insert(format!("k{i}"), Some("v".to_string()));
+            ents.insert(format!("k{i}"), Some(serde_json::Value::String("v".into())));
         }
         let delta = SchemaDelta {
             summary: None,
@@ -574,7 +593,7 @@ mod tests {
         let mut ents = HashMap::new();
         ents.insert(
             "npc.marcus.core".to_string(),
-            Some("a totally different identity".to_string()),
+            Some(serde_json::Value::String("a totally different identity".into())),
         );
         let delta = SchemaDelta {
             summary: None,
@@ -615,7 +634,7 @@ mod tests {
         let mut ents = HashMap::new();
         ents.insert(
             "npc.marcus.core".to_string(),
-            Some("gruff ex-soldier, scarred, Cult informant".to_string()),
+            Some(serde_json::Value::String("gruff ex-soldier, scarred, Cult informant".into())),
         );
         let delta = SchemaDelta {
             summary: None,
@@ -637,7 +656,7 @@ mod tests {
         // A new key, not in the immutable set — append to chronicle.
         ents.insert(
             "npc.marcus.chronicle".to_string(),
-            Some("saved the player in the alley".to_string()),
+            Some(serde_json::Value::String("saved the player in the alley".into())),
         );
         let delta = SchemaDelta {
             summary: None,
@@ -655,7 +674,7 @@ mod tests {
         let mut ents = HashMap::new();
         ents.insert(
             "npc.marcus.core".to_string(),
-            Some("overwrite attempt".to_string()),
+            Some(serde_json::Value::String("overwrite attempt".into())),
         );
         let delta = SchemaDelta {
             summary: None,
@@ -676,7 +695,7 @@ mod tests {
         let mut ents = HashMap::new();
         ents.insert(
             "npc.marcus.core".to_string(),
-            Some("overwrite attempt".to_string()),
+            Some(serde_json::Value::String("overwrite attempt".into())),
         );
         let delta = SchemaDelta {
             summary: None,

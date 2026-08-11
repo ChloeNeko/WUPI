@@ -178,9 +178,9 @@ const SCHEMA_MAPS = {
   },
   player: {
     name: 'name',
-    description: null,        // players don't have backstory prose in the wizard
+    description: 'backstory',   // a ST character's description → Backstory slide
     personality: null,
-    scenario: null,
+    scenario: 'backstory',      // scenario context also feeds Backstory
     first_mes: null,
     mes_example: null,
     creator_notes: null,

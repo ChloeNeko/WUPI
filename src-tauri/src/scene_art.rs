@@ -143,7 +143,14 @@ fn compose_no_graph_fallback(s: &WorldSchema) -> String {
     let mut parts: Vec<String> = Vec::new();
 
     // 1. The "where" anchor: loc.current entity, else the narrative summary.
-    let loc = s.entities.get("loc.current").map(|v| v.trim()).filter(|v| !v.is_empty());
+    //    `loc.current` is conventionally a bare string ("tavern"); a structured
+    //    value at this key is unrecognized noise → fall through to the summary.
+    let loc = s
+        .entities
+        .get("loc.current")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|v| !v.is_empty());
     if let Some(loc) = loc {
         parts.push(loc.to_string());
     } else if !s.summary.trim().is_empty() {

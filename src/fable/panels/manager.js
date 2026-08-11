@@ -12,18 +12,20 @@
 // Each panel is a single-purpose render function over WorldSchema.
 // entities is a plain { id: state } map (the WorldSchema.entities).
 //
-// NOTE (2026-08-07): the inventory panel was RETIRED. Items live in the
-// typed player_state.{equipment,belt,pack} model (equipment.rs). An
-// "inventory"/"items"/"equipment"/"carrying"/"pack"/"belt" focus no longer
-// opens a modal — route_to_fable_query (lib.rs) renders a summary from the
-// typed model for Wupi to narrate. The paperdoll-node overlay
-// (equipment-overlay.js) + the belt/pack hover widgets
-// (inventory-widgets.js) were REMOVED the same day — the canvas was
-// cluttered + the interaction model was wrong; they're to be rebuilt later.
-// The inventory-specific routing + the item_/inv_ entity-prefix fallback
-// were removed; the keyword now falls through to the codex/world-recap
-// default (harmless — the narration path already handled the inventory
-// summary).
+// NOTE (2026-08-07; rebuilt 2026-08-08/09): the inventory panel was RETIRED.
+// Items live in the typed player_state.{equipment,belt,pack} model
+// (equipment.rs). An "inventory"/"items"/"equipment"/"carrying"/"pack"/"belt"
+// focus no longer opens a modal — route_to_fable_query (lib.rs) renders a
+// summary from the typed model for Wupi to narrate. The paperdoll-node overlay
+// (equipment-overlay.js) + the belt/pack hover widgets (inventory-widgets.js)
+// were REMOVED the same day — the canvas was cluttered + the interaction model
+// was wrong. The inventory HUD was REPLACED by the Soul Gems bloom system
+// (engine/soul-gem.js — the 6 diamond triggers) + the inspection panel
+// (engine/inventory-panel.js — the item-button list + action popup + EQUIP
+// sub-menu); see AGENTS.md §9C. The inventory-specific routing + the item_/inv_
+// entity-prefix fallback were removed; the keyword now falls through to the
+// codex/world-recap default (harmless — the narration path already handled the
+// inventory summary).
 // =============================================================
 
 import { renderMap } from './map.js';

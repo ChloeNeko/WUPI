@@ -8,20 +8,32 @@
   DEV-ONLY paperdoll hitbox authoring tool. NOT shipped, NOT wired into the
   app. Produces a JSON map of body-part polygons that the left drawer reads.
 
-  Each body part is an 8-VERTEX POLYGON (4 corners + 4 edge midpoints),
-  NOT a rectangle with edge-handles. Every vertex is an independent point —
-  drag any vertex and the polygon bends at that exact spot, exactly like the
-  corner/anchor points of a vector object in Figma/Illustrator. This lets a
-  hitbox conform to an irregular body part (a shoulder that flares, a neck
-  that tapers) instead of being locked to a box.
+  Each body part is a POLYGON of draggable vertices (16 by default: 8
+  originals + 8 edge-midpoints, a lossless refinement of the original
+  8-vertex shape). Every vertex is an independent point — drag any vertex and
+  the polygon bends at that exact spot, exactly like the corner/anchor points
+  of a vector object in Figma/Illustrator. This lets a hitbox conform to an
+  irregular body part (a shoulder that flares, a neck that tapers) instead of
+  being locked to a box.
+
+  VERTEX EDITING (the 2026-08-10 upgrade): the count is no longer fixed at 8
+  or 16. You can refine any part:
+    • Double-click an EDGE (the line between two vertices) → inserts a new
+      vertex at the exact midpoint of that edge (no shape change).
+    • Shift-click a VERTEX → removes it (minimum 3 kept so the polygon is
+      never degenerate).
+  So you can add bend points exactly where a part needs more detail and drop
+  them where it doesn't. The runtime loader accepts any count ≥3.
 
   Workflow:
     1. Pick a gender (male first).
-    2. Click a part in the sidebar (or its polygon) → its 8 vertices appear.
+    2. Click a part in the sidebar (or its polygon) → its vertices appear.
     3. Drag a VERTEX point → bends the polygon there. Drag inside the polygon
-       → moves the whole part.
+       → moves the whole part. Double-click an edge to add a vertex; shift-
+       click a vertex to remove it.
     4. Repeat for all parts. Work autosaves to localStorage.
-    5. "Copy JSON" / "Download JSON" → src/fable/data/paperdoll-hitboxes.json.
+    5. "Save to file" writes src/fable/data/paperdoll-hitboxes.json directly
+       (dev server only); "Copy JSON" / "Download JSON" are manual fallbacks.
 
   Coordinate system: every vertex is {x, y} in PERCENT of the PNG's intrinsic
   dimensions (0–100). Resolution-independent.
@@ -101,6 +113,23 @@
     stroke: var(--accent);
   }
   .hb-poly.is-selected:hover { fill: rgba(74,158,255,0.20); }
+  /* Edge-insert affordance: a faint "+" hint at the nearest edge midpoint to
+     the cursor, shown only over the SELECTED polygon while not dragging. */
+  .hb-edge-hint {
+    position: absolute;
+    width: 14px; height: 14px;
+    margin: -7px;
+    background: var(--accent);
+    color: #fff;
+    border-radius: 50%;
+    font-size: 11px; font-weight: 700; line-height: 14px; text-align: center;
+    pointer-events: none;
+    opacity: 0;
+    transition: opacity 0.1s;
+    z-index: 5;
+    box-shadow: 0 0 0 2px rgba(0,0,0,0.4);
+  }
+  .hb-edge-hint.is-visible { opacity: 0.9; }
 
   /* Vertex handles — HTML divs (NOT svg circles) so they stay a constant pixel
      size regardless of zoom. Positioned with left/top in %, centered via
@@ -298,6 +327,7 @@
       <img id="figure" alt="" />
       <svg class="hb-svg" id="hbSvg" viewBox="0 0 100 100" preserveAspectRatio="none"></svg>
       <div class="hb-vertices" id="hbVertices"></div>
+      <div class="hb-edge-hint" id="hbEdgeHint">+</div>
     </div>
   </div>
 
@@ -314,17 +344,21 @@
 
     <div class="sb-footer">
       <p class="hint">
-        Click a part → drag a <b>vertex</b> (round corners + square edge
-        points) to bend the shape there. Drag inside the polygon to move the
-        whole part. Arrow keys nudge. Work autosaves.
+        Click a part → drag a <b>vertex</b> (round = original, square =
+        midpoint) to bend the shape there. Drag inside the polygon to move the
+        whole part. <b>Double-click an edge</b> to insert a vertex;
+        <b>shift-click a vertex</b> to remove it (min 3). Arrow keys nudge.
+        Work autosaves.
       </p>
       <div class="btn-row">
         <button class="btn" id="copyBtn">Copy JSON</button>
         <button class="btn danger" id="resetBtn">Reset gender</button>
       </div>
+      <button class="btn" id="reduceBtn" title="Reduce the SELECTED part to its 8 corner vertices (drops the midpoints). Use to restart a part from a clean 8-corner shape.">Reduce selected to 8 corners</button>
+      <button class="btn primary" id="saveFileBtn" title="Write directly to src/fable/data/paperdoll-hitboxes.json (dev server only)">Save to file</button>
       <button class="btn" id="syncBtn" title="Overwrite the OTHER gender's boxes with this gender's current positions">⇄ Copy <span id="syncFrom">male</span> → <span id="syncTo">female</span></button>
       <textarea class="export-area" id="exportArea" readonly></textarea>
-      <button class="btn primary" id="downloadBtn">Download JSON</button>
+      <button class="btn" id="downloadBtn">Download JSON</button>
     </div>
   </aside>
 
@@ -348,12 +382,12 @@ const PARTS = [
   "Left Foot", "Right Foot",
 ];
 
-// 8 vertices per part: 4 corners + 4 edge midpoints (one per edge), going
-// CLOCKWISE from the top-left corner:
-//   0=TL corner, 1=top-mid, 2=TR corner, 3=right-mid,
-//   4=BR corner, 5=bottom-mid, 6=BL corner, 7=left-mid
-// Each is a freely draggable 2D point; the polygon bends wherever you pull one.
-const CORNER_INDICES = new Set([0, 2, 4, 6]);  // round handles; rest are square
+// Vertex corners vs edge-points. The canonical 16-vertex polygon stores the 8
+// ORIGINAL vertices at EVEN indices (0,2,4,...14) + the 8 edge-midpoints at
+// ODD indices. To keep the originals visually distinct after subdivision (and
+// for any count), "corner" = even index (round handle); "edge-point" = odd
+// index (square). With add/remove the distinction is cosmetic, not structural.
+function isCorner(i) { return i % 2 === 0; }
 
 // Intrinsic PNG dimensions per gender (px). The editor renders the image at a
 // scaled height but the vertex coords are stored as % of these intrinsic dims,
@@ -437,7 +471,7 @@ function roughDefaults() {
 //
 // FORMAT: the file stores each part as an array of [x,y] pairs (compact); the
 // editor works in {x,y} objects internally. normalizeBoxes() bridges both.
-const LS_KEY = "wupi.hitbox-editor.v3";   // v3: 8-vertex polygon (v2 was 16-vertex)
+const LS_KEY = "wupi.hitbox-editor.v4";   // v4: variable-count polygons (was v3: 8-vertex-only)
 const HITBOX_FILE_URL = "/fable/data/paperdoll-hitboxes.json";
 let boxes = structuredClone(DEFAULTS);    // provisional; reloaded async at boot
 let gender = "male";
@@ -445,14 +479,17 @@ let selectedPart = PARTS[0];
 
 // Accept EITHER format ([x,y] arrays from the file OR {x,y} from localStorage)
 // and normalize to {x,y} objects the renderer expects. Returns a clean
-// {male,female} map or null if the shape is wrong.
+// {male,female} map or null if the shape is wrong. The vertex count is NOT
+// pinned to 8 or 16 — any count ≥ MIN_VERTICES (3) per part is accepted so
+// the add/remove-vertex editing is preserved across save/load.
+const MIN_VERTICES = 3;
 function normalizeBoxes(obj) {
   if (!obj || !obj.male || !obj.female) return null;
   const out = { male: {}, female: {} };
   for (const g of ["male", "female"]) {
     for (const part of PARTS) {
       const arr = obj[g][part];
-      if (!Array.isArray(arr) || arr.length !== 8) return null;
+      if (!Array.isArray(arr) || arr.length < MIN_VERTICES) return null;
       const pts = arr.map((p) => {
         if (Array.isArray(p)) return { x: Number(p[0]), y: Number(p[1]) };
         return { x: Number(p.x), y: Number(p.y) };
@@ -542,7 +579,7 @@ function renderVertices() {
 
   pts.forEach((p, i) => {
     const v = document.createElement("div");
-    v.className = "hb-vertex" + (CORNER_INDICES.has(i) ? " is-corner" : "");
+    v.className = "hb-vertex" + (isCorner(i) ? " is-corner" : "");
     v.style.left = p.x + "%";
     v.style.top = p.y + "%";
     v.dataset.idx = String(i);
@@ -565,7 +602,7 @@ function renderSidebar() {
       '<span class="part-name"></span>' +
       '<span class="part-status"></span>';
     row.querySelector(".part-name").textContent = part;
-    row.querySelector(".part-status").textContent = r ? "8 pts" : "—";
+    row.querySelector(".part-status").textContent = r ? (r.length + " pts") : "—";
     row.addEventListener("click", () => {
       selectedPart = part;
       render();
@@ -579,11 +616,26 @@ function renderSidebar() {
 // ── Dragging: vertex (single point) + polygon move (all 8) ───────────────
 let drag = null;   // active drag descriptor
 
-// pointerdown on a VERTEX → drag just that vertex.
+// pointerdown on a VERTEX → drag just that vertex. SHIFT+click removes it
+// instead (keeps ≥ MIN_VERTICES so the polygon is never degenerate).
 function onVertexPointerDown(e) {
   if (e.button !== 0) return;
   e.preventDefault();
   e.stopPropagation();           // don't also start a polygon-move
+  // SHIFT-click = remove this vertex.
+  if (e.shiftKey) {
+    const idx = Number(e.currentTarget.dataset.idx);
+    const pts = boxes[gender][selectedPart];
+    if (pts.length <= MIN_VERTICES) {
+      toast(`Min ${MIN_VERTICES} vertices — can't remove`);
+      return;
+    }
+    pts.splice(idx, 1);
+    saveBoxes();
+    render();
+    renderSidebar();
+    return;
+  }
   const idx = Number(e.currentTarget.dataset.idx);
   drag = {
     mode: "vertex",
@@ -597,6 +649,7 @@ function onVertexPointerDown(e) {
 }
 
 // pointerdown on a POLYGON fill → if not selected, select it; else move all.
+// DOUBLE-click inserts a new vertex at the nearest edge to the click point.
 function onPolyPointerDown(e) {
   if (e.button !== 0) return;
   const part = e.currentTarget.dataset.part;
@@ -604,6 +657,18 @@ function onPolyPointerDown(e) {
     selectedPart = part;
     render();
     renderSidebar();
+    return;
+  }
+  // DOUBLE-click on the selected polygon → insert a vertex at the nearest
+  // edge midpoint to the click. The new vertex lands ON the existing outline
+  // (the nearest point on the closest edge), so the shape doesn't shift — it
+  // just gains a bend point exactly where you clicked.
+  if (e.detail === 2) {
+    e.preventDefault();
+    const stageRect = stage.getBoundingClientRect();
+    const px = ((e.clientX - stageRect.left) / stageRect.width) * 100;
+    const py = ((e.clientY - stageRect.top) / stageRect.height) * 100;
+    insertNearestEdgeVertex(part, px, py);
     return;
   }
   e.preventDefault();
@@ -617,6 +682,34 @@ function onPolyPointerDown(e) {
   };
   window.addEventListener("pointermove", onPointerMove);
   window.addEventListener("pointerup", onPointerUp, { once: true });
+}
+
+// Insert a vertex at the nearest point on the closest polygon edge to (px,py).
+// Mutates boxes[gender][part], saves, + re-renders. Pure geometry: for each
+// edge (i → i+1), project (px,py) onto the segment, clamp to [0,1]; the edge
+// with the smallest projected distance wins; the new vertex is that projected
+// point, spliced into the array after edge i.
+function insertNearestEdgeVertex(part, px, py) {
+  const pts = boxes[gender][part];
+  if (!pts || pts.length < MIN_VERTICES) return;
+  let bestEdge = -1, bestDist = Infinity, bestPt = null;
+  for (let i = 0; i < pts.length; i++) {
+    const a = pts[i], b = pts[(i + 1) % pts.length];
+    const dx = b.x - a.x, dy = b.y - a.y;
+    const lenSq = dx * dx + dy * dy;
+    let t = lenSq > 0 ? ((px - a.x) * dx + (py - a.y) * dy) / lenSq : 0;
+    t = Math.max(0, Math.min(1, t));
+    const cx = a.x + t * dx, cy = a.y + t * dy;
+    const d = (px - cx) ** 2 + (py - cy) ** 2;
+    if (d < bestDist) { bestDist = d; bestEdge = i; bestPt = { x: cx, y: cy }; }
+  }
+  if (bestEdge < 0 || !bestPt) return;
+  const newPt = { x: +bestPt.x.toFixed(2), y: +bestPt.y.toFixed(2) };
+  pts.splice(bestEdge + 1, 0, newPt);
+  saveBoxes();
+  render();
+  renderSidebar();
+  toast(`Vertex added (${pts.length} pts)`);
 }
 
 function onPointerMove(e) {
@@ -663,7 +756,8 @@ function paintPolygon(part) {
 
 // ── Export ────────────────────────────────────────────────────────────────
 function buildExportJSON() {
-  // Each part → array of 8 [x, y] pairs (2-decimal). Keys in PARTS order.
+  // Each part → array of [x, y] pairs (2-decimal), preserving the live vertex
+  // count. Keys in PARTS order.
   const out = { male: {}, female: {} };
   for (const g of ["male", "female"]) {
     for (const part of PARTS) {
@@ -713,6 +807,26 @@ genderToggle.querySelectorAll("button").forEach((b) => {
   b.addEventListener("click", () => setGender(b.dataset.gender));
 });
 
+// Reduce the SELECTED part to 8 corner vertices by keeping the even-index
+// points (the originals from the 8→16 subdivision) + dropping the midpoints.
+// If the part already has ≤8 vertices, this is a no-op. Useful when you want
+// to restart a part from a clean 8-corner shape + re-expand it with double-
+// clicks exactly where you want bend points.
+document.getElementById("reduceBtn").addEventListener("click", () => {
+  const pts = boxes[gender][selectedPart];
+  if (!pts) return;
+  if (pts.length <= 8) {
+    toast(`${selectedPart} already has ${pts.length} verts (≤8)`);
+    return;
+  }
+  if (!confirm(`Reduce ${selectedPart} (${gender}) from ${pts.length} to 8 corner vertices?\n\nThis drops the midpoint handles, keeping only the 8 corner points. The shape will approximate the current outline (corners preserved, curves flattened). You can re-add bend points with double-click.`)) return;
+  boxes[gender][selectedPart] = pts.filter((_, i) => i % 2 === 0);
+  saveBoxes();
+  render();
+  renderSidebar();
+  toast(`${selectedPart} reduced to 8 corners`);
+});
+
 document.getElementById("copyBtn").addEventListener("click", async () => {
   updateExport();
   try {
@@ -736,6 +850,33 @@ document.getElementById("downloadBtn").addEventListener("click", () => {
   a.remove();
   URL.revokeObjectURL(url);
   toast("Downloaded paperdoll-hitboxes.json");
+});
+
+// Save directly to src/fable/data/paperdoll-hitboxes.json via the dev-server's
+// /__hitbox-write endpoint (added in the Vite middleware). Dev-server only —
+// the endpoint does not exist in a production build, so this is a no-op there.
+document.getElementById("saveFileBtn").addEventListener("click", async () => {
+  updateExport();
+  const btn = document.getElementById("saveFileBtn");
+  const orig = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = "Saving…";
+  try {
+    const res = await fetch("/__hitbox-write", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: exportArea.value,
+    });
+    if (!res.ok) throw new Error("HTTP " + res.status);
+    const info = await res.json().catch(() => ({}));
+    toast("Saved → " + (info.path || "paperdoll-hitboxes.json"));
+  } catch (e) {
+    console.error("[hitbox-editor] save-to-file failed:", e);
+    toast("Save failed — is `npm run dev` running? (use Download instead)");
+  } finally {
+    btn.disabled = false;
+    btn.textContent = orig;
+  }
 });
 
 document.getElementById("resetBtn").addEventListener("click", () => {

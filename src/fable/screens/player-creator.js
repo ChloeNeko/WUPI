@@ -9,14 +9,15 @@
 // generic one + has the clothing-as-its-own-entity layout — kept as-is so
 // the player review's exact look is unchanged).
 //
-// THE 15 SLIDES (order is load-bearing — matches the Rust trait set):
+// THE 16 SLIDES (order is load-bearing — matches the Rust trait set):
 //   1  Portrait        (optional — upload via @tauri-apps/plugin-dialog)
 //   2  Name            (text, required, the identity anchor + slug source)
 //   3  Gender          (♂/♀ toggle — persists to localStorage + JSON)
 //   4-11 traits        (Race/Age/Height/Weight/Hair×3/Body/Skin/Eyes)
 //   12-14 conditional  (Breast/Ears/Tail — Yes/No, No omits from JSON)
 //   15 Clothing        (dynamic chip list)
-//   16 [REVIEW]        (SIM card + CREATE button)
+//   16 Backstory       (textarea, OPTIONAL — skipped → omitted from JSON)
+//   17 [REVIEW]        (SIM card + CREATE button)
 //
 // The Player Creator is NOT a sim card — it authors a SavedPlayer (player.rs)
 // via fable_player_write + fable_player_portrait_upload_bytes. The three new
@@ -32,9 +33,9 @@ import { invoke, convertFileSrc } from '@tauri-apps/api/core';
 import { open as openDialog } from '@tauri-apps/plugin-dialog';
 import {
   buildWizard, renderWizard, runCreate, buildGenericReview,
-  requiredTextValidate, conditionalValidate, traitInvalid,
+  requiredTextValidate, conditionalValidate, traitInvalid, proseInvalid,
   normalizeGender, slugify, bytesToBase64, esc,
-  NAME_MAX, TRAIT_MAX, SILHOUETTE_SVG, ARROW_SVG_LEFT,
+  NAME_MAX, TRAIT_MAX, PROSE_MAX, SILHOUETTE_SVG, ARROW_SVG_LEFT,
 } from './wizard-engine.js';
 import { openPortraitCropper } from './portrait-cropper.js';
 import { setPaperdollGender } from '../engine/left-drawer.js';
@@ -95,6 +96,15 @@ function buildSlides() {
         return null;
       },
     },
+    // Backstory is OPTIONAL: a skipped (empty) backstory serializes to None +
+    // is omitted from the JSON entirely (mirrors the conditional traits).
+    // proseInvalid returns null on empty (valid) + only errors when the text
+    // exceeds PROSE_MAX, so Next is never blocked by leaving it blank.
+    { id: 'backstory', title: 'Backstory', kind: 'textarea', field: 'backstory',
+      rows: 8,
+      placeholder: "The character's history — where they came from, what shaped them. Optional; skip to leave blank.",
+      validate: (s) => proseInvalid('Backstory', s.backstory),
+    },
   ];
 }
 
@@ -150,6 +160,7 @@ function freshStashed() {
     fields: {
       gender: normalizeGender(localStorage.getItem('wupi.paperdoll.gender') || 'male'),
       clothing: [],
+      backstory: '',
     },
     portraitSrcPath: null,
     portraitCroppedBytes: null,
@@ -180,6 +191,7 @@ function seedFromPlayer(stashed, sp) {
   f.tail = sp.tail || '';
   f.tail_enabled = sp.tail != null;
   f.clothing = Array.isArray(sp.clothing) ? sp.clothing.slice() : [];
+  f.backstory = sp.backstory || '';
   if (sp.portrait) {
     stashed.portraitPreviewSrc = convertFileSrc(sp.portrait);
   }
@@ -227,6 +239,11 @@ function renderReview(stashed) {
     <div class="fable-player-review-chips">${clothing ? clothing.map((c) => `<span class="fable-wizard-chip">${esc(c)}</span>`).join('') : '<span class="fable-player-review-chips-empty">No garments</span>'}</div>
   </section>`;
 
+  const backstory = (f.backstory || '').trim();
+  const backstoryHTML = backstory
+    ? `<section class="fable-player-review-section fable-player-review-backstory"><h3>Backstory</h3><p>${esc(backstory)}</p></section>`
+    : '';
+
   return `<div class="fable-player-review-card">
     <div class="fable-player-review-top">
       <div class="fable-player-review-portrait">${portraitHTML}</div>
@@ -235,6 +252,7 @@ function renderReview(stashed) {
       </div>
     </div>
     ${clothingHTML}
+    ${backstoryHTML}
   </div>
   <div class="fable-player-review-create-wrap">
     <button type="button" class="fable-player-review-create" data-review-create>CREATE</button>
@@ -289,6 +307,9 @@ function buildPlayer(stashed) {
     ears: conditional('ears'),
     tail: conditional('tail'),
     clothing,
+    // Optional: a blank backstory → null → omitted from JSON by Rust's
+    // skip_serializing_if (mirrors the conditional traits).
+    backstory: opt(f.backstory),
     portrait: null,
     created_at_ms: 0,
   };

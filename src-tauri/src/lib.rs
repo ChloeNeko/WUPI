@@ -269,6 +269,15 @@ pub struct AppState {
     /// Per-game cancel token, parallel to `active_cancel`. Distinct slot so
     /// chat-stop and game-stop never cross-wire (Bug #7 pattern, §2C).
     pub active_fable_cancel: Arc<std::sync::Mutex<Option<llm::CancelToken>>>,
+    /// Stage 3 (2026-08-11): the "discard + revert" flag for the drawer's ›
+    /// interrupt. Set by `fable_interrupt_reroll` (alongside signaling the
+    /// cancel token) when the user re-presses › mid-reroll to abandon the
+    /// in-flight roll + start a fresh one. Distinct from the cancel token
+    /// (which only halts decoding between tokens) so `fable_stop`'s
+    /// "halt + keep partial" stays different from ›'s
+    /// "halt + discard + revert to base + retry". Read + reset (swap) exactly
+    /// once in fable_send's abort check after the reply lands.
+    pub fable_abort_requested: Arc<std::sync::atomic::AtomicBool>,
     /// Per-selective-regenerate cancel token, parallel to `active_cancel` +
     /// `active_fable_cancel`. Distinct slot so a future direct-`chat_stop`
     /// caller (or a fable_stop) can't cancel a slice regen mid-stream — same
@@ -308,6 +317,13 @@ pub struct AppState {
     /// `fable_start`, cleared on `fable_end`. The narrator prompt builder
     /// reads this each `fable_send` turn.
     pub active_fable_card: Arc<std::sync::Mutex<Option<sim_card::SimCard>>>,
+    /// The active saved-player id (`apps/fable/players/<id>/`). `None` for
+    /// playerless games (Quick Play) or no game running. Set on
+    /// `enter_fable_session`, cleared on `fable_end`. Read by
+    /// `fable_active_card_get` to resolve the player portrait path for the
+    /// chat UI. Mirrors `active_fable_card` (short critical section, std
+    /// mutex — never held across `.await`).
+    pub active_player_id: Arc<std::sync::Mutex<Option<String>>>,
     /// The card id BEFORE a game started, so `fable_end` can restore it. The
     /// system card (`__wupi__`) is the default; games swap to the
     /// roleplay card's id and restore on exit.
@@ -339,6 +355,31 @@ pub struct AppState {
     /// cause — see `context_swap.rs` module doc + AGENTS.md §7B correction).
     /// Cheap to clone (just an `Arc`); shared by all three engines.
     pub context_swap: context_swap::ContextSwap,
+
+    /// **The local-model turn lock (2026-08-08).** Serializes the THREE
+    /// local-model consumers — chat (`chat_send`), the Fable tracker
+    /// (`fable_send` Stage 1), and the schema engine (`request_delta`/
+    /// `request_translation`) — so at most ONE decodes on the local 12B at
+    /// any instant. Whichever acquires first runs to completion; the others
+    /// await at their `.lock().await`.
+    ///
+    /// **Why this exists alongside `context_swap`:** the swap-lock only
+    /// serializes VRAM *eviction ordering* — its `LeaseGuard::drop` is a
+    /// documented no-op (`context_swap.rs:268-278`) and the mutex is NOT
+    /// held across a turn. The swap-lock's own module doc admits "the
+    /// SERIALIZATION that matters happens at the engine level," but chat
+    /// and fable are *different engines on different slots*, so those
+    /// per-engine mutexes don't block each other. Without this lock, a
+    /// mid-Fable Wupi-drawer chat and the Fable tracker could both reach
+    /// the local 12B near-simultaneously → the swap-lock would evict one
+    /// mid-turn → corruption. This lock is the actual "one local decode at
+    /// a time" authority; the swap-lock is now a pure VRAM layer beneath it
+    /// (with zero concurrent acquirers, eliminating the "concurrent
+    /// cross-role contention" caveat at `context_swap.rs:230-231`).
+    ///
+    /// **The API narrator does NOT take this lock** — it touches zero
+    /// local VRAM (pure HTTP), so it streams freely while a local turn runs.
+    pub local_model_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl AppState {
@@ -378,6 +419,7 @@ impl AppState {
             pending_player_action: Arc::new(tokio::sync::Mutex::new(None)),
             pending_tick_directives: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             active_fable_cancel: Arc::new(std::sync::Mutex::new(None)),
+            fable_abort_requested: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             active_slice_cancel: Arc::new(std::sync::Mutex::new(None)),
             active_sd_cancel: Arc::new(std::sync::Mutex::new(None)),
             fable_schema: Arc::new(tokio::sync::Mutex::new(schema::WorldSchema::default())),
@@ -386,6 +428,7 @@ impl AppState {
             )),
             fable_session: Arc::new(tokio::sync::Mutex::new(session::Conversation::new())),
             active_fable_card: Arc::new(std::sync::Mutex::new(None)),
+            active_player_id: Arc::new(std::sync::Mutex::new(None)),
             pre_fable_card_id: Arc::new(std::sync::Mutex::new(memory::WUPI_CARD_ID.to_owned())),
             download_progress: Arc::new(std::sync::Mutex::new(
                 model_downloader::DownloadProgress::default(),
@@ -393,6 +436,7 @@ impl AppState {
             download_cancel: Arc::new(std::sync::Mutex::new(None)),
             pending_model_path: Arc::new(std::sync::Mutex::new(None)),
             context_swap: context_swap::ContextSwap::new(),
+            local_model_lock: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
 }
@@ -465,11 +509,6 @@ pub fn run() {
             // file out of the way. By the time this exe runs, the old
             // process's locks are gone.
             updater::cleanup_old_files(app.handle());
-            // Sweep deprecated assets that older versions shipped flat to the
-            // install root (dead soundtrack/map/starting files + the old
-            // fable_title.png and fable_whoosh.mp3 names after their
-            // relocate/rename). No-op on installs that never had them.
-            updater::cleanup_deprecated_assets(app.handle());
             // §8C portable layout: four top-level sibling dirs next to
             // wupi.exe hold all user state. Nothing leaves the install
             // folder. Created lazily here at boot so the rest of setup +
@@ -925,6 +964,7 @@ pub fn run() {
             fable_start,
             fable_send,
             fable_stop,
+            fable_interrupt_reroll,
             fable_end,
             fable_list_saves,
             fable_save_now,
@@ -934,6 +974,7 @@ pub fn run() {
             // mutators; the schema ring buffer is owned by fable_rollback
             // above, driven by each command's `schema_pop_count` return.
             edit_message,
+            delete_message,
             reroll_last_turn,
             rewind_and_edit_user,
             swipe_variant,
@@ -967,7 +1008,6 @@ pub fn run() {
             fable_schema_get,
             fable_schema_set,
             fable_card_get,
-            fable_card_save,
             fable_card_raw_get,
             fable_card_raw_set,
             fable_json_raw_get,
@@ -989,11 +1029,22 @@ pub fn run() {
             // _upload copies a dialog-picked image into the player folder.
             fable_players_list,
             fable_player_get,
+            fable_active_player_get,
             fable_player_write,
             fable_player_delete,
             fable_player_portrait_upload,
             fable_player_portrait_upload_bytes,
             fable_player_portrait_read_bytes,
+            // Fable Background Library (2026-08-11): a user-importable image
+            // library at apps/fable/images/backgrounds/ (global) + a per-card,
+            // save-persistent selection on WorldSchema.background. The 4th WUPI-
+            // drawer foot button ("Background") drives these — list the library,
+            // import cropped bytes, delete, + get/set the per-card selection.
+            fable_backgrounds_list,
+            fable_background_import_bytes,
+            fable_background_delete,
+            fable_background_active_get,
+            fable_background_active_set,
             fable_rollback,
             fable_history_depth,
             system_menu::power_shutdown_cmd,
@@ -1880,18 +1931,11 @@ async fn boot_load_model(app: tauri::AppHandle, state: tauri::State<'_, AppState
     tracing::info!(path = %path.display(), "boot_load_model: spawning chat model");
 
     let app_handle = app.clone();
-    // context_size fixes the persistent context's n_ctx for the session.
-    // v0.7: the size is source-dependent. Read model_source FIRST so the chat
-    // backend is born at the correct size — under API it's 2048 (silent-agent
-    // mode); under Local-only it's the user's tuned settings.context_size
-    // (default 4096). This avoids a wasteful re-spawn right after boot when
-    // an API profile was active at last shutdown (the restore branch below
-    // only flips the flag now — no re-spawn needed).
-    let context_size = {
-        let source = *state.model_source.lock().expect("model_source mutex");
-        let s = state.settings.lock().expect("settings mutex");
-        effective_local_ctx(source, &s)
-    };
+    // Wupi chat is LOCAL-ONLY (2026-08-08 override): the chat backend ALWAYS
+    // spawns at 2048 (CTX_LOCAL_WITH_API). The 4096 context is retired for
+    // chat — it was for narrative, which the local model no longer does.
+    // model_source no longer drives the boot context size; always 2048.
+    let context_size = settings::CTX_LOCAL_WITH_API;
     let backend = llm::LlamaCppBackend::spawn_load(path.clone(), 99, context_size, Box::new(move |result| {
         match &result {
             Ok(name) => {
@@ -1925,6 +1969,48 @@ async fn boot_load_model(app: tauri::AppHandle, state: tauri::State<'_, AppState
                 // routes to the API), so it stays here on the model-ready
                 // path — un-nested from the deleted schema spawn.
                 let app_state = app_handle.state::<AppState>();
+
+                // Register the boot-spawned chat context with the VRAM
+                // swap-lock so a Fable/schema `acquire` that fires BEFORE
+                // any `chat_send` can EVICT it (2026-08-10 freeze fix). The
+                // chat backend spawns eagerly at boot for fast first-message
+                // latency but does NOT take the lease (chat_send takes it
+                // lazily). Without this registration, the lease's default
+                // "idle" state (teardown = None) makes the first fable/schema
+                // acquire skip eviction → chat + fable co-resident → VRAM
+                // exhaust → CPU fallback → multi-minute PC freeze. The
+                // teardown closure mirrors chat_send's (take backend from
+                // slot + shutdown, freeing KV; weights stay leaked). The
+                // registration is idempotent (a chat_send that ran first
+                // already registered it → no-op). This is the chat-side
+                // analog of the eager-schema-spawn bypass fix at lib.rs:1917.
+                {
+                    let context_swap = app_state.context_swap.clone();
+                    let backend_slot = Arc::clone(&app_state.backend);
+                    tauri::async_runtime::spawn(async move {
+                        context_swap
+                            .register_resident(
+                                context_swap::ContextRole::Chat,
+                                Box::new(move || {
+                                    let backend = {
+                                        let mut g = backend_slot
+                                            .lock()
+                                            .map_err(|e| e.to_string())?;
+                                        g.take()
+                                    };
+                                    if let Some(backend) = backend {
+                                        backend.shutdown();
+                                        tracing::info!(
+                                            "context-swap: boot chat backend torn down \
+                                             (KV freed, weights retained)"
+                                        );
+                                    }
+                                    Ok(())
+                                }),
+                            )
+                            .await;
+                    });
+                }
 
                 // If the user was on an API profile at last shutdown, boot
                 // brought the 12B up as a safe default. Now that the chat
@@ -2251,21 +2337,36 @@ fn resolve_user_path(app: &tauri::AppHandle) -> Option<std::path::PathBuf> {
 /// independently of this task.
 async fn acquire_schema_engine(
     state: &tauri::State<'_, AppState>,
-) -> Result<(Arc<schema_engine::SchemaEngine>, context_swap::LeaseGuard), String> {
+) -> Result<(Arc<schema_engine::SchemaEngine>, context_swap::LeaseGuard, tokio::sync::OwnedMutexGuard<()>), String> {
     acquire_schema_engine_from_arcs(
         state.context_swap.clone(),
         Arc::clone(&state.schema_engine),
+        Arc::clone(&state.local_model_lock),
     )
     .await
 }
 
 /// The Arcs-only inner of `acquire_schema_engine`. Exists so a detached
-/// `tokio::spawn` task (the chat_send delta-fire path) can acquire the
-/// schema engine without a `tauri::State<'_>` borrow — it owns its Arcs.
+/// `tokio::spawn` task (the chat_send delta-fire path) can acquire the schema
+/// engine without a `tauri::State<'_, AppState>` borrow — it owns its Arcs.
+///
+/// **Local-model turn lock (2026-08-08):** acquires the process-wide
+/// `local_model_lock` and returns the guard as the third tuple element. The
+/// caller holds it across the `request_delta`/`request_translation` decode so
+/// the schema pass serializes against chat + the Fable tracker — at most ONE
+/// local decode at any instant. Dropping the returned guard (end of caller
+/// scope) releases the lock.
 async fn acquire_schema_engine_from_arcs(
     context_swap: context_swap::ContextSwap,
     schema_engine_slot: Arc<std::sync::Mutex<Option<Arc<schema_engine::SchemaEngine>>>>,
-) -> Result<(Arc<schema_engine::SchemaEngine>, context_swap::LeaseGuard), String> {
+    local_model_lock: Arc<tokio::sync::Mutex<()>>,
+) -> Result<(Arc<schema_engine::SchemaEngine>, context_swap::LeaseGuard, tokio::sync::OwnedMutexGuard<()>), String> {
+    // Acquire the local-model turn lock FIRST (before the VRAM lease): the
+    // lock serializes the decode; the lease handles eviction beneath it.
+    // lock_owned() returns an OwnedMutexGuard (no lifetime tie to this fn).
+    let model_guard = local_model_lock.lock_owned().await;
+
+
     // Clone the slot Arc for the teardown closure (the closure moves it; we
     // still need the original for the spawn-or-reuse below).
     let teardown_slot = Arc::clone(&schema_engine_slot);
@@ -2325,7 +2426,7 @@ async fn acquire_schema_engine_from_arcs(
             }
         }
     };
-    Ok((engine, lease))
+    Ok((engine, lease, model_guard))
 }
 
 /// The SHARED core of the SD swap cycle (used by PRISM; the FABLE scene-art
@@ -2553,7 +2654,7 @@ async fn route_to_fable_manager(
     //    freeze. The lease guard is held for the duration of the translation;
     //    dropping it at end of scope marks the slot free (the resident schema
     //    engine persists until a chat/fable turn evicts it).
-    let (schema_engine, _schema_lease) = acquire_schema_engine(state).await?;
+    let (schema_engine, _schema_lease, _model_guard) = acquire_schema_engine(state).await?;
 
     // 2. Snapshot the current game schema (the delta diffs against this).
     //    Clone out + drop the guard before the awaited translation call.
@@ -2715,8 +2816,11 @@ async fn route_to_fable_manager(
 /// Render a tight natural-language summary of the typed inventory for the
 /// `QueryWorldState("inventory")` path (2026-08-07). Lists worn equipment
 /// (both layers — Wupi sees everything, unlike the narrator's Outer-only
-/// filter), the belt rack, + the pack with an encumbrance readout. Empty
-/// sections are omitted. Pure; reads from a schema snapshot.
+/// filter), the belt rack, + the pack with a `carried / capacity lb` text
+/// readout. NOTE: the encumbrance system was PERMANENTLY REMOVED 2026-08-09 —
+/// the `X / capacity lb` text here is the ONLY place the retired capacity
+/// field still surfaces (no fill bar, no enforcement anywhere). Empty sections
+/// are omitted. Pure; reads from a schema snapshot.
 fn render_inventory_summary(schema: &schema::WorldSchema) -> String {
     use crate::equipment;
     let ps = &schema.player_state;
@@ -2765,7 +2869,7 @@ fn render_inventory_summary(schema: &schema::WorldSchema) -> String {
         lines.push(format!("Belt:\n{}", belt.join("\n")));
     }
 
-    // Pack — deep storage + encumbrance readout.
+    // Pack — deep storage + carried-weight readout.
     if !ps.pack.is_empty() {
         let pack: Vec<String> = ps
             .pack
@@ -2781,8 +2885,8 @@ fn render_inventory_summary(schema: &schema::WorldSchema) -> String {
             .collect();
         let carried = equipment::stack_weight(&ps.pack);
         lines.push(format!(
-            "Pack ({} / {} lb):\n{}",
-            carried, ps.pack_capacity_lbs, pack.join("\n")
+            "Pack ({} lb):\n{}",
+            carried, pack.join("\n")
         ));
     }
 
@@ -2956,6 +3060,11 @@ fn strip_invalid_relationship_writes(
             continue;
         };
 
+        // Relationship-tier keys are conventionally bare strings ("Friend",
+        // "Ally"). A structured value at a rel.* key is unrecognized noise —
+        // treat as Unparseable (the validator's silent-drop path).
+        let attempted_str = attempted_value.as_str().unwrap_or("");
+
         // Look up the canonical state (default Stranger if untracked).
         let current = schema
             .relationships
@@ -2963,14 +3072,14 @@ fn strip_invalid_relationship_writes(
             .cloned()
             .unwrap_or_default();
 
-        let validation = relationship::validate_llm_tier_write(&attempted_value, &current);
+        let validation = relationship::validate_llm_tier_write(attempted_str, &current);
         match validation {
             relationship::RelationshipValidation::Accept => {
                 // The one allowed LLM transition: Stranger → Acquaintance.
                 // Record the upsert; apply after the loop (can't borrow schema
                 // mutably while iterating). The attempted tier IS the new tier
                 // (validate_llm_tier_write already checked it's Acquaintance).
-                let new_tier = relationship::parse_tier(&attempted_value)
+                let new_tier = relationship::parse_tier(attempted_str)
                     .unwrap_or(relationship::RelationshipTier::Acquaintance);
                 accepted_upserts.push((npc_id.to_string(), new_tier));
                 // Remove from the delta — the canonical state is the source
@@ -3060,16 +3169,28 @@ async fn chat_send(
     }
 
     // If a background schema delta pass is still in flight from the PREVIOUS
-    // turn, await it before doing anything else. To the user this looks like
-    // normal thinking time: the frontend gets no signal until the first chunk
-    // arrives, so a pre-stream delay is indistinguishable from model latency.
-    // The await resolves when the delta task completes (success or failure);
-    // the schema is already updated in AppState by the task before it exits.
-    // Errors are ignored: schema is best-effort, a failed delta must not
-    // block chat (the schema stays at its last-good state).
+    // turn, await it BEFORE acquiring the local-model lock. This is load-
+    // bearing for ordering: the pending delta task needs the local_model_lock
+    // to run its decode, so we must NOT hold the lock while awaiting it (else
+    // deadlock — the task can never acquire the lock we're holding). To the
+    // user this looks like normal thinking time: the frontend gets no signal
+    // until the first chunk arrives, so a pre-stream delay is indistinguishable
+    // from model latency. Errors are ignored: schema is best-effort.
     if let Some(handle) = state.pending_delta.lock().await.take() {
         let _ = handle.await;
     }
+
+    // ── Local-model turn lock (2026-08-08) ──────────────────────────────
+    // Acquire the process-wide local-model lock for the chat turn. This
+    // serializes chat against the Fable tracker + the schema engine (the
+    // other two local-model consumers) so at most ONE local decode runs at
+    // any instant. The swap-lock alone does NOT serialize turns (its guard
+    // drop is a no-op) — see AppState::local_model_lock doc. Held across the
+    // lease, the decode, and the schema-delta spawn; dropped on every exit
+    // path (success, cancel, error) by RAII scope drop. The delta task itself
+    // re-acquires the lock when it runs — fire-and-forget, never awaited
+    // under this guard.
+    let _local_model_guard = state.local_model_lock.lock().await;
 
     let settings = state.settings.lock().expect("settings mutex").clone();
 
@@ -3178,16 +3299,14 @@ async fn chat_send(
     // backfills evicted turns via retrieval. Truncation in the engine becomes
     // a safety net that effectively never fires (4 short turns ≪ ~3000 budget).
     //
-    // Window is source-dependent (the v0.6.3 local-always redesign): the
-    // API path keeps a wider 12-message window (the cloud model has the
-    // context budget + the local model is kept hot as a silent agent doing
-    // schema/memory tracking, so the API can carry more narrative); the Local
-    // path is 4 (2 beats: the local chat backend is the silent agent at
-    // effective_local_ctx(Api)=2048 — short assistant replies only, no
-    // narration, no long payloads. 4 messages = 2 user↔assistant exchanges,
-    // plenty for a tracking assistant + small talk, fits the 2048 budget).
-    let source = *state.model_source.lock().expect("model_source mutex");
-    let visible_window = if source == api::ModelSource::Api { settings::WINDOW_API_CHAT } else { settings::WINDOW_LOCAL_CHAT };
+    // Wupi chat is LOCAL-ONLY (2026-08-08 override): the window is always the
+    // local 8-message window + the 2048 context. The API path is deleted
+    // (the API is exclusively the Fable narrator now); model_source no longer
+    // drives chat routing. The local chat backend carries short assistant
+    // replies only — no narration, no long payloads. 8 messages = 4
+    // user↔assistant exchanges, plenty for a tracking assistant + small talk,
+    // fits the 2048 budget.
+    let visible_window = settings::WINDOW_LOCAL_CHAT;
 
     // System prompt: assembled inline from the authored copilot directive
     // (`data/wupi.prompt`) + persona + user_profile. The `.prompt` file holds
@@ -3197,7 +3316,7 @@ async fn chat_send(
     // drawer (`wupi-drawer.js`) — the Fable game-manager gate (`classify`
     // above) returns early for management intents, so this assembly only runs
     // for the NotACommand fall-through (normal Wupi chat) in either context.
-    let effective_ctx = effective_local_ctx(source, &settings);
+    let effective_ctx = settings::CTX_LOCAL_WITH_API;
     let mut sections: Vec<String> = Vec::new();
     if let Some(w) = state
         .wupi_prompts
@@ -3219,11 +3338,14 @@ async fn chat_send(
     ));
     let system_prompt = sections.join("\n\n");
 
-    let messages = {
+    // Append the user message to the session. The message window is re-read
+    // later by `run_local_or_echo` (inside `run_agent_loop`) directly from
+    // the session, so we don't need to build + carry a `messages` Vec here
+    // (that was only for the now-deleted API `http.stream()` call).
+    {
         let mut s = state.session.lock().await;
         s.add_message(session::Role::User, text.clone());
-        s.assemble_api_messages_windowed(&system_prompt, visible_window)
-    };
+    }
 
     let on_chunk: llm::ChunkFn = Arc::new({
         let on_event = on_event.clone();
@@ -3254,14 +3376,11 @@ async fn chat_send(
     // spawn_from_shared).
     let context_swap_clone = state.context_swap.clone();
     let backend_slot = Arc::clone(&state.backend);
-    // v0.7: chat_context_size is now source-aware. Under API the local chat
-    // backend runs at 2048 (silent-agent mode); under Local-only at the user's
-    // tuned settings.context_size. This is the load-bearing fix for the
-    // eviction-revert landmine: if a fable/schema turn evicted the chat
-    // backend mid-API-session, the slow-path re-spawn below MUST re-spawn at
-    // 2048 (not settings.context_size = 4096) — otherwise the reduced context
-    // silently reverts the first time the chat backend gets evicted.
-    let chat_context_size = effective_local_ctx(source, &settings);
+    // Wupi chat is LOCAL-ONLY (2026-08-08 override): the chat backend ALWAYS
+    // runs at 2048 (CTX_LOCAL_WITH_API). The 4096 context is retired for chat
+    // — it was for narrative, which the local model no longer does. The API
+    // path is deleted; there is no source-dependent teardown or re-spawn here.
+    let chat_context_size = settings::CTX_LOCAL_WITH_API;
     let _chat_lease = context_swap_clone
         .acquire(
             context_swap::ContextRole::Chat,
@@ -3290,50 +3409,9 @@ async fn chat_send(
         .await;
 
     // Spawn-or-reuse the chat backend. Fast path: a prior chat turn (or
-    // boot) left it resident. Slow path: re-spawn from shared model.
-    //
-    // **2026-07-27 Bug #2 fix (force_full_ctx under API):** under API mode
-    // the resident backend is at the 2048 silent-agent ctx maintained by
-    // api_connect/boot_load_model — far too small for the Wupi system prompt
-    // (~1542 tokens) + tools declarations + history. Tool-calling requests
-    // errored instantly with "context too long even after truncation: 2501
-    // tokens, max 1536". The §11.18 fix applied this pattern to the one-shot
-    // generator; we apply it to `chat_send` here. The teardown takes the
-    // resident backend
-    // out of the slot + shuts it down (joins the engine thread, frees the
-    // 2048 KV context — the weights stay leaked + shared). Then the spawn-
-    // await logic below re-spawns fresh from `shared_model()` at
-    // `spawn_ctx` (which is `settings.context_size` = 4096 under API after
-    // teardown — NOT the 2048 `chat_context_size`, which is the silent-agent
-    // ctx we just tore down). Under Local mode no teardown happens (the
-    // resident is already at `settings.context_size`), so `spawn_ctx` falls
-    // back to `chat_context_size` and the reuse path takes over.
-    if source == api::ModelSource::Api {
-        let old = {
-            let mut g = state.backend.lock().expect("backend mutex");
-            g.take()
-        };
-        if let Some(old) = old {
-            old.shutdown();
-            tracing::info!(
-                "chat_send: API mode — torn down 2048 silent-agent backend; \
-                 re-spawning at full local ctx (settings.context_size={})",
-                settings.context_size
-            );
-        }
-    }
-    // The ctx to spawn at: under API (post-teardown) we want the full
-    // `settings.context_size` (4096) so tools + system prompt fit. Under
-    // Local the resident is already at `settings.context_size`, so when the
-    // reuse path fires (no spawn needed) the value is unused; when the slow
-    // path spawns (rare under Local) `chat_context_size` already equals
-    // `settings.context_size`. So: API → settings.context_size, Local →
-    // chat_context_size (same thing).
-    let spawn_ctx = if source == api::ModelSource::Api {
-        settings.context_size
-    } else {
-        chat_context_size
-    };
+    // boot) left it resident at 2048. Slow path: re-spawn from shared model
+    // at the same 2048. No source-dependent teardown — chat is always local.
+    let spawn_ctx = chat_context_size;
     let backend_opt = {
         let existing = state.backend.lock().expect("backend mutex").clone();
         match existing {
@@ -3419,12 +3497,20 @@ async fn chat_send(
     let chat_tools: Vec<chat_format::ToolSpec> = if backend_opt.is_some() {
         // Always-on tools (file ops, codex, sim cards, user profile).
         let mut s = tools::specs();
-        // Fable-only tools. `fable_specs()` is currently empty (the Director
-        // suite was removed); attached ONLY when a Fable session is active so
-        // future Fable tools stay invisible to the model in plain Wupi-assistant
-        // chat (the false-tool-call guardrail at the prompt level).
+        // Fable-only tools. Attached ONLY when a Fable session is active so
+        // they stay invisible to the model in plain Wupi-assistant chat (the
+        // false-tool-call guardrail at the prompt level — saves ~250 tokens
+        // of tool declarations when no game is running). Two buckets:
+        //   - `fable_specs()`     — sync Trait tools (currently empty; the
+        //                            Director suite was removed).
+        //   - `fable_state_specs()` — the 3 async-dispatched stateful tools
+        //                            (fable_message_edit/delete,
+        //                            fable_schema_patch). Their specs render
+        //                            into the prompt; their execute path goes
+        //                            through `dispatch_fable_state_tool`.
         if fable_is_active(&state) {
             s.extend(tools::fable_specs());
+            s.extend(tools::fable_state_specs());
         }
         s
     } else {
@@ -3457,163 +3543,30 @@ async fn chat_send(
         system_prompt.clone()
     };
 
-    let (result, tools_fired) = if source == api::ModelSource::Api {
-        // API mode: tool-routing pre-pass on local. If tools fire, we keep
-        // the local result; otherwise we hand off to the API for narration.
-        //
-        // **ctx (2026-07-27 Bug #2 fix):** the teardown + re-spawn to the
-        // full local ctx (`settings.context_size`, default 4096) happens in
-        // the `backend_opt` block above — the agent loop receives an
-        // already-fresh backend via `backend_opt`. The ctx arg here is just
-        // for `run_local_or_echo`'s info; the actual context the engine
-        // runs at is whatever the backend was spawned at (4096 after the
-        // teardown). Without the upstream fix, every tool-calling request
-        // under API mode errored instantly with "context too long even
-        // after truncation: 2501 tokens, max 1536".
-        match run_agent_loop(
-            &state, &app, &on_event, &agent_system_prompt, settings::WINDOW_API_FALLBACK,
-            memory_block.clone(), world_state.clone(), chat_tools.clone(),
-            settings::CTX_FALLBACK_TURN,
-            on_chunk.clone(), cancel.clone(), backend_opt.clone(),
-        )
-        .await
-        {
-            Ok((local_result, true)) => {
-                // Tools fired → local agent handled it. Skip the API.
-                tracing::info!("chat_send: API mode but tools fired locally; using local reply");
-                (local_result, true)
-            }
-            Ok((_, false)) => {
-                // No tools fired → discard local prose, hand to the API for
-                // the narrative reply (the API is the better narrator).
-                let profile_opt = {
-                    let cfg = state.api_config.lock().expect("api_config mutex");
-                    cfg.active_profile().cloned()
-                };
-                let api_result = match profile_opt {
-                    Some(profile) => {
-                        let http = llm::HttpBackend::new(profile);
-                        match http
-                            .stream(messages, memory_block.clone(), world_state.clone(), Vec::new(), settings.context_size, on_chunk.clone(), cancel.clone())
-                            .await
-                        {
-                            Ok(text) => text,
-                            Err(e) => {
-                                // Seamless fallback (the load-bearing path). Do NOT
-                                // surface the error or roll back the user message:
-                                // re-run the turn on the local model at the 6-window
-                                // so the user gets a reply and immersion is preserved.
-                                tracing::warn!(error = %e, "chat_send: API stream failed; falling back to local");
-                                // Timeout vs other failure: a TTFT timeout (no
-                                // first token within the deadline) is the case
-                                // you flagged — the provider hung with no
-                                // thinking/nothing. Fire the dedicated
-                                // `api_timeout` event so the frontend shows the
-                                // top-center persistent error bubble (distinct
-                                // from the transient toast for a plain network
-                                // error). The fallback itself is identical.
-                                let is_timeout = e.to_string().contains("API_TIMEOUT");
-                                if is_timeout {
-                                    let _ = on_event.send(serde_json::json!({
-                                        "type": "api_timeout",
-                                        "source": "local",
-                                    }));
-                                }
-                                let _ = on_event.send(serde_json::json!({
-                                    "type": "fallback",
-                                    "reason": if is_timeout { "api_timeout" } else { "api_unreachable" },
-                                    "source": "local",
-                                }));
-                                match run_local_or_echo(
-                                    &state,
-                                    &on_event,
-                                    &system_prompt,
-                                    settings::WINDOW_API_FALLBACK,
-                                    memory_block,
-                                    world_state,
-                                    Vec::new(),
-                                    // Fallback rebound: this one turn runs the
-                                    // local model at the full 4096 context (not
-                                    // the API-mode 2048) so the user-visible
-                                    // fallback reply carries full history. The
-                                    // next turn's normal path drops back to 2048.
-                                    settings::CTX_FALLBACK_TURN,
-                                    on_chunk.clone(),
-                                    cancel.clone(),
-                                    backend_opt.as_ref(),
-                                )
-                                .await
-                                {
-                                    Ok(text) => text,
-                                    Err(()) => {
-                                        rollback_last_user_message(&state, &app).await;
-                                        return Ok(());
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    None => {
-                        // No active profile but source=Api. Same seamless fallback.
-                        tracing::warn!("chat_send: source=Api but no active profile; falling back to local");
-                        let _ = on_event.send(serde_json::json!({
-                            "type": "fallback",
-                            "reason": "no_active_profile",
-                            "source": "local",
-                        }));
-                        match run_local_or_echo(
-                            &state,
-                            &on_event,
-                            &system_prompt,
-                            settings::WINDOW_API_FALLBACK,
-                            memory_block,
-                            world_state,
-                            Vec::new(),
-                            // Same fallback-rebound contract as the stream-error
-                            // path above: this turn runs at full 4096, next turn
-                            // resumes at the API-mode 2048.
-                            settings::CTX_FALLBACK_TURN,
-                            on_chunk.clone(),
-                            cancel.clone(),
-                            backend_opt.as_ref(),
-                        )
-                        .await
-                        {
-                            Ok(text) => text,
-                            Err(()) => {
-                                rollback_last_user_message(&state, &app).await;
-                                return Ok(());
-                            }
-                        }
-                    }
-                };
-                (api_result, false)
-            }
-            Err(()) => {
-                // Agent loop itself failed (local backend unavailable /
-                // errored mid-iteration). Roll back + bail.
-                rollback_last_user_message(&state, &app).await;
-                return Ok(());
-            }
-        }
-    } else {
-        // Local mode: the agent loop IS the user-visible reply path.
-        // The resident backend is already at `settings.context_size`
-        // (Local mode never torn down to 2048), so the fast reuse path
-        // in `backend_opt` above applies — no teardown needed.
-        match run_agent_loop(
-            &state, &app, &on_event, &agent_system_prompt, visible_window,
-            memory_block, world_state, chat_tools,
-            settings::CTX_LOCAL_SOLO,
-            on_chunk.clone(), cancel.clone(), backend_opt.clone(),
-        )
-        .await
-        {
-            Ok((result, tools_fired)) => (result, tools_fired),
-            Err(()) => {
-                rollback_last_user_message(&state, &app).await;
-                return Ok(());
-            }
+    // ── Wupi chat is LOCAL-ONLY (2026-08-08 override) ───────────────────
+    // The API branch is DELETED. Wupi chat (OS home + the Fable Wupi drawer)
+    // always runs on the local 12B at 2048, temp 0.85, with `<think>` always
+    // on + tools. The API is reserved exclusively for Fable narration
+    // (`fable_send`, a separate path). `model_source` no longer drives chat
+    // routing — it's now purely a Fable-eligibility flag.
+    //
+    // `run_agent_loop` IS the user-visible reply path: it handles tool
+    // calling end-to-end (fast path when no tools, multi-iteration loop
+    // otherwise) and returns `(ParsedOutput, bool)` — the exact shape the
+    // post-routing code (session append, memory archive, schema delta, done
+    // event) consumes. It is model_source-agnostic.
+    let (result, tools_fired) = match run_agent_loop(
+        &state, &app, &on_event, &agent_system_prompt, visible_window,
+        memory_block, world_state, chat_tools,
+        settings::CTX_LOCAL_WITH_API,
+        on_chunk.clone(), cancel.clone(), backend_opt.clone(),
+    )
+    .await
+    {
+        Ok((result, tools_fired)) => (result, tools_fired),
+        Err(()) => {
+            rollback_last_user_message(&state, &app).await;
+            return Ok(());
         }
     };
     // tools_fired is read by the done event below to flag a tool-call turn.
@@ -3751,15 +3704,17 @@ async fn chat_send(
         // + `state.context_swap`; clone both.
         let context_swap = state.context_swap.clone();
         let schema_engine_slot = Arc::clone(&state.schema_engine);
+        let local_model_lock = Arc::clone(&state.local_model_lock);
         let handle = tokio::spawn(async move {
             // Acquire the Schema lease inside the task. This blocks until
             // any resident chat/fable context is torn down (the chat turn's
             // lease drops when chat_send returns, which has already
             // happened by the time this task is scheduled — but the lease
             // makes the VRAM ordering explicit).
-            let (schema_engine, _lease) = match acquire_schema_engine_from_arcs(
+            let (schema_engine, _lease, _model_guard) = match acquire_schema_engine_from_arcs(
                 context_swap,
                 schema_engine_slot,
+                local_model_lock,
             )
             .await
             {
@@ -3956,6 +3911,100 @@ async fn run_local_or_echo(
 /// archiver/delta logic uses `checked_sub(2)` indexing against the final
 /// message list, which still resolves correctly because the inserts land
 /// AFTER the user's original message and BEFORE the next prefill.
+
+// ---------------------------------------------------------------------------
+// Fable-state tool dispatch (2026-08-11)
+// ---------------------------------------------------------------------------
+
+/// Dispatch a Fable-state tool call (one of `fable_message_edit` /
+/// `fable_message_delete` / `fable_schema_patch`) against the LIVE AppState
+/// mutexes. Returns `Ok(Some(msg))` on success, `Err(err)` on validation /
+/// execution failure (the agent loop folds the error into the tool_result
+/// payload), or `Ok(None)` if `call.name` isn't a Fable-state tool (so the
+/// caller falls through to the sync `registry`).
+///
+/// Why this bypasses the sync `Tool::execute` trait: the three stateful tools
+/// need to await `tokio::sync::Mutex` locks on `state.fable_session` /
+/// `state.fable_schema`. The trait's `execute` is sync (the 7 file tools are
+/// pure `std::fs` calls). Rather than make the whole trait async (cascading
+/// to every tool + adding async-trait), the agent loop — which is itself
+/// async + already holds the local-model turn lock — dispatches these three
+/// names inline. Validation lives in `tools::validate_fable_state_tool` so
+/// it stays unit-testable without AppState.
+async fn dispatch_fable_state_tool(
+    state: &tauri::State<'_, AppState>,
+    app: &tauri::AppHandle,
+    call: &tools::ToolCall,
+) -> Result<Option<String>, String> {
+    if !tools::is_fable_state_tool(&call.name) {
+        return Ok(None);
+    }
+    // Validate args shape first (cheap, no locks).
+    tools::validate_fable_state_tool(&call.name, &call.args)
+        .map_err(|e| format!("invalid args: {e}"))?;
+    // Seat check — every stateful tool needs an active Fable game.
+    let card_id = active_fable_card_id(state)?;
+    let outcome: String = match call.name.as_str() {
+        "fable_message_edit" => {
+            let index = call.args["index"].as_u64().unwrap_or(0) as usize;
+            let content = call.args["content"].as_str().unwrap_or("").to_string();
+            let messages = {
+                let mut gs = state.fable_session.lock().await;
+                apply_edit(&mut gs, index, content)?;
+                project_messages(&gs)
+            };
+            persist_fable_session(app, state, &card_id).await?;
+            let _ = app.emit(
+                "fable-session-changed",
+                serde_json::json!({ "kind": "messages", "messages": messages }),
+            );
+            format!("edited message at index {index}")
+        }
+        "fable_message_delete" => {
+            let index = call.args["index"].as_u64().unwrap_or(0) as usize;
+            let messages = {
+                let mut gs = state.fable_session.lock().await;
+                gs.remove_at(index)?;
+                project_messages(&gs)
+            };
+            persist_fable_session(app, state, &card_id).await?;
+            let _ = app.emit(
+                "fable-session-changed",
+                serde_json::json!({ "kind": "messages", "messages": messages }),
+            );
+            format!("deleted message at index {index}")
+        }
+        "fable_schema_patch" => {
+            let patch = call.args.get("patch").cloned().unwrap_or(serde_json::Value::Null);
+            // Snapshot prior schema → undo buffer (same trust-class as
+            // fable_schema_set: the model path is undoable via fable_rollback).
+            {
+                let snap = state.fable_schema.lock().await.clone();
+                push_fable_history_snapshot(state, snap).await;
+            }
+            let merged_keys = {
+                let mut s = state.fable_schema.lock().await;
+                s.merge_patch(patch)?
+            };
+            // Persist via the same path fable_schema_set uses.
+            let roleplay_card_id = state
+                .active_card_id
+                .lock()
+                .expect("active_card_id mutex")
+                .clone();
+            let schema_snapshot = state.fable_schema.lock().await.clone();
+            save_schema(app, &roleplay_card_id, &schema_snapshot).await;
+            let _ = app.emit(
+                "fable-session-changed",
+                serde_json::json!({ "kind": "schema", "merged_keys": merged_keys }),
+            );
+            format!("patched schema fields: {}", merged_keys.join(", "))
+        }
+        _ => return Ok(None), // unreachable: is_fable_state_tool gated above
+    };
+    Ok(Some(outcome))
+}
+
 async fn run_agent_loop(
     state: &tauri::State<'_, AppState>,
     app: &tauri::AppHandle,
@@ -4052,16 +4101,26 @@ async fn run_agent_loop(
                 "args": call.args,
             }));
 
-            let outcome = match registry.iter().find(|t| t.spec().name == call.name) {
-                Some(tool) => match tool.validate_args(&call.args) {
-                    Ok(()) => match tool.execute(&call.args, &ctx) {
-                        Ok(output) => (true, output),
-                        Err(e) => (false, format!("error: {e}")),
+            // Dispatch path: Fable-state tools (async, need AppState mutex
+            // access) go through `dispatch_fable_state_tool`; everything else
+            // hits the sync `Tool::execute` registry. The stateful dispatcher
+            // returns Ok(None) for unknown-to-it names so the fallthrough is
+            // clean (Ok(Some(msg)) = success, Err(e) = folded into tool_result).
+            let outcome: (bool, String) =
+                match dispatch_fable_state_tool(state, app, call).await {
+                    Ok(Some(msg)) => (true, msg),
+                    Err(e) => (false, e),
+                    Ok(None) => match registry.iter().find(|t| t.spec().name == call.name) {
+                        Some(tool) => match tool.validate_args(&call.args) {
+                            Ok(()) => match tool.execute(&call.args, &ctx) {
+                                Ok(output) => (true, output),
+                                Err(e) => (false, format!("error: {e}")),
+                            },
+                            Err(e) => (false, format!("invalid args: {e}")),
+                        },
+                        None => (false, format!("unknown tool: {}", call.name)),
                     },
-                    Err(e) => (false, format!("invalid args: {e}")),
-                },
-                None => (false, format!("unknown tool: {}", call.name)),
-            };
+                };
 
             let _ = on_event.send(serde_json::json!({
                 "type": "tool_result",
@@ -4177,6 +4236,14 @@ const WORLD_PROGRESSION_INTERVAL_HOURS: u32 = 24;
 /// Bounded to cap memory growth (each clone holds the full `entities`
 /// HashMap + `recent_events` Vec — moderate cost, dominated by entity count).
 const FABLE_HISTORY_CAP: usize = 5;
+
+/// Max char length of a UI-action `event_note` passed to `fable_schema_set`
+/// (2026-08-08). The note is appended to `recent_events` so the next narrator
+/// turn sees the player's Soul Gem inventory action (EQUIP/CONSUME/...). 160
+/// chars is generous for "equipped Iron Sword" / "consumed Health Potion" while
+/// keeping the prompt-bloat cost trivial (the recent_events render caps at the
+/// last 5, so the total injected budget is ≤ 800 chars).
+const EVENT_NOTE_MAX: usize = 160;
 
 /// Snapshot the current `fable_schema` into the history ring buffer before a
 /// mutation. Pushes a clone of the LIVE (pre-mutation) state so a later
@@ -4640,16 +4707,20 @@ async fn apply_phase3_bracket_commands(
         // [TRAVEL] — advance `current_node` (Fable Phase 4 Component 3,
         // 2026-07-28). Single-region schema-tracking command, last-wins on
         // multiples (mirrors [WEATHER] / [TIME]). Rust is the SOLE authority
-        // on legality — the anti-sycophancy gate:
-        //   (a) destination must exist in the graph (else REJECT + directive);
-        //   (b) if `current_node` is already set, the destination must be a
-        //       declared neighbor (else REJECT + directive — the Tracker must
-        //       either chain stops or emit [TIME] between);
+        // on legality:
+        //   (a) destination must EXIST in the graph (else REJECT + directive —
+        //       the anti-teleport gate that still matters);
+        //   (b) if `current_node` is set + the destination is a KNOWN node but
+        //       NOT a declared neighbor, AUTO-LINK the bidirectional edge +
+        //       ALLOW the move (2026-08-10). The player walking there IS the
+        //       evidence the two locations are connected — this is the organic
+        //       edge-formation path for cards that ship no <locations> block,
+        //       so dynamically-discovered nodes don't strand the player.
         //   (c) the FIRST `[TRAVEL]` from `current_node: None` is allowed
         //       (seeds initial location without scenario-card wiring).
-        // Reject directives surface to the narrator via the return tuple;
-        // the caller merges them into the `<directives>` block so the narrator
-        // obeys ("the move to <X> is not possible from here; <exits>").
+        // Reject directives (only the unknown-node case now) surface to the
+        // narrator via the return tuple; the caller merges them into the
+        // `<directives>` block.
         let last_travel = travel_cmds.iter().rev().find_map(|cmd| {
             if let bracket_parser::BracketCommand::Travel { destination } = cmd {
                 Some(destination.clone())
@@ -4657,74 +4728,72 @@ async fn apply_phase3_bracket_commands(
                 None
             }
         });
-        if let Some(dest) = last_travel {
-            if s.travel_graph.find_node(&dest).is_none() {
-                // Unknown destination — the Tracker invented a node id. List
-                // the known node ids so the next emission can be valid.
-                let known: Vec<&str> =
-                    s.travel_graph.nodes.iter().map(|n| n.id.as_str()).collect();
-                tracing::warn!(dest = %dest, known = ?known, "[TRAVEL] rejected — unknown node");
-                reject_directives.push(format!(
-                    "Travel to \"{dest}\" is not possible — that location is not in the world. \
-                     Known locations: {}. Stay where you are or travel to a known location.",
-                    if known.is_empty() {
-                        "(none defined)".to_string()
-                    } else {
-                        known.join(", ")
-                    }
-                ));
-            } else if s.travel_graph.current_node.is_some()
-                && !s.travel_graph.is_adjacent_to_current(&dest)
-            {
-                // Non-neighbor move — the Tracker tried to skip stops. List
-                // the actual exits from the current node.
-                let exits: Vec<String> = s
-                    .travel_graph
-                    .current()
-                    .map(|cur| {
-                        cur.neighbors
-                            .iter()
-                            .map(|id| {
-                                s.travel_graph
-                                    .find_node(id)
-                                    .map(|n| n.name.clone())
-                                    .filter(|n| !n.is_empty())
-                                    .unwrap_or_else(|| id.clone())
-                            })
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                let from_id = s.travel_graph.current_node.clone().unwrap_or_default();
-                tracing::warn!(
-                    from = %from_id,
-                    to = %dest,
-                    exits = ?exits,
-                    "[TRAVEL] rejected — non-adjacent"
-                );
-                reject_directives.push(format!(
-                    "Travel to \"{dest}\" is not possible from the current location \
-                     (it is not adjacent). Reachable exits: {}. To reach a distant \
-                     location, travel to an adjacent stop first, or advance time with \
-                     [TIME] to cover the longer journey.",
-                    if exits.is_empty() {
-                        "(none — this location has no declared exits)".to_string()
-                    } else {
-                        exits.join(", ")
-                    }
-                ));
-            } else {
-                // Legal move (or the bootstrap first-move-from-None case).
-                if undo_snapshot.is_none() {
-                    undo_snapshot = Some(s.clone());
+        if let Some(dest_raw) = last_travel {
+            // Resolve the destination to a canonical node id. The tracker often
+            // emits diegetic names ("Market Square") instead of bare slugs
+            // ("market_square"); `resolve_node_id` normalizes + fuzzy-matches
+            // so a legal move isn't rejected on a casing/spelling technicality
+            // (2026-08-10, T52 Open Issue #1 — location was stuck all 52 turns
+            // because every `[TRAVEL Market Square]` hit the unknown-node reject).
+            match s.travel_graph.resolve_node_id(&dest_raw) {
+                None => {
+                    // Unknown destination — the Tracker invented a node id that
+                    // doesn't fuzzy-match anything. List the known node ids.
+                    let known: Vec<&str> =
+                        s.travel_graph.nodes.iter().map(|n| n.id.as_str()).collect();
+                    tracing::warn!(dest = %dest_raw, known = ?known, "[TRAVEL] rejected — unknown node");
+                    reject_directives.push(format!(
+                        "Travel to \"{dest_raw}\" is not possible — that location is not in the world. \
+                         Known locations: {}. Stay where you are or travel to a known location.",
+                        if known.is_empty() {
+                            "(none defined)".to_string()
+                        } else {
+                            known.join(", ")
+                        }
+                    ));
                 }
-                let prev = s.travel_graph.current_node.clone();
-                s.travel_graph.current_node = Some(dest.clone());
-                mutated = true;
-                tracing::info!(
-                    from = ?prev,
-                    to = %dest,
-                    "[TRAVEL] current_node advanced"
-                );
+                Some(dest) if s.travel_graph.current_node.is_some()
+                    && !s.travel_graph.is_adjacent_to_current(&dest) =>
+                {
+                    // Known but non-adjacent (2026-08-10 auto-link). The player
+                    // traveling here IS evidence the two locations are connected
+                    // — form the bidirectional edge + allow the move. This is the
+                    // organic edge-formation path for cards with no <locations>
+                    // block: a [DISCOVER] establishes node B, then a [TRAVEL B]
+                    // from node A links A↔B without the tracker having to name
+                    // the neighbor explicitly. (Previously this case rejected;
+                    // that stranded players who reached a discovered node the
+                    // graph hadn't pre-wired.)
+                    if undo_snapshot.is_none() {
+                        undo_snapshot = Some(s.clone());
+                    }
+                    let from_id = s.travel_graph.current_node.clone().unwrap_or_default();
+                    s.travel_graph.link_nodes(&from_id, &dest);
+                    let prev = s.travel_graph.current_node.clone();
+                    s.travel_graph.current_node = Some(dest.clone());
+                    mutated = true;
+                    tracing::info!(
+                        from = ?prev,
+                        to = %dest,
+                        "[TRAVEL] auto-linked edge + advanced (known non-adjacent)"
+                    );
+                }
+                Some(dest) => {
+                    // Legal adjacent move (or the bootstrap first-move-from-None
+                    // case, which falls through here because the non-adjacent
+                    // guard above requires current_node.is_some()).
+                    if undo_snapshot.is_none() {
+                        undo_snapshot = Some(s.clone());
+                    }
+                    let prev = s.travel_graph.current_node.clone();
+                    s.travel_graph.current_node = Some(dest.clone());
+                    mutated = true;
+                    tracing::info!(
+                        from = ?prev,
+                        to = %dest,
+                        "[TRAVEL] current_node advanced"
+                    );
+                }
             }
         }
 
@@ -4914,7 +4983,8 @@ async fn apply_phase3_bracket_commands(
                         ttl: schema::PRESENCE_GRACE_RESET,
                     });
                 } else if p.ttl > 1 {
-                    // Grace: decrement, keep (one miss tolerated).
+                    // Grace: decrement, keep. With PRESENCE_GRACE_RESET = 4 an
+                    // NPC survives three missed re-assertions before dropping.
                     rebuilt.push(schema::Presence {
                         npc_id: p.npc_id.clone(),
                         name: p.name.clone(),
@@ -4930,7 +5000,8 @@ async fn apply_phase3_bracket_commands(
                     // ttl was 1 → drops to 0 → removed from the whitelist.
                     tracing::info!(
                         npc_id = %p.npc_id,
-                        "[PRESENCE] dropped — grace expired (not re-asserted for 2 turns)"
+                        "[PRESENCE] dropped — grace expired (not re-asserted for {} turns",
+                        schema::PRESENCE_GRACE_RESET
                     );
                 }
                 asserted.remove(&p.npc_id);
@@ -4997,6 +5068,7 @@ async fn apply_phase3_bracket_commands(
                 layer,
                 item_name,
                 item_stats,
+                item_tags,
             } = cmd
             {
                 if undo_snapshot.is_none() {
@@ -5024,6 +5096,7 @@ async fn apply_phase3_bracket_commands(
                         let item = equipment::EquippedItem {
                             name: name.clone(),
                             stats: item_stats.clone(),
+                            tags: item_tags.clone(),
                         };
                         let layers = s
                             .player_state
@@ -5050,6 +5123,7 @@ async fn apply_phase3_bracket_commands(
                 qty,
                 item_stats,
                 remove,
+                item_tags,
             } = cmd
             {
                 if undo_snapshot.is_none() {
@@ -5069,6 +5143,7 @@ async fn apply_phase3_bracket_commands(
                             qty: *qty,
                             weight: 0.0, // belt items are weightless (quick-access)
                             stats: item_stats.clone(),
+                            tags: item_tags.clone(),
                         },
                     );
                     // FIFO eviction: if this added a new entry past the cap,
@@ -5085,11 +5160,12 @@ async fn apply_phase3_bracket_commands(
             }
         }
 
-        // [PACK] — deep-storage pack (weight-bounded for encumbrance). Add:
-        // upsert by name (stack qty, take the heavier per-unit weight). Remove:
-        // drop the whole stack. Encumbrance is computed read-side by the
-        // frontend (stack_weight(&pack) / pack_capacity_lbs) — no hard reject
-        // here; over-encumbrance surfaces as an amber/red fill bar instead.
+        // [PACK] — deep-storage pack (UNBOUNDED bagged inventory; the
+        // encumbrance/weight system was PERMANENTLY REMOVED 2026-08-09). Add:
+        // upsert by name (stack qty, take the heavier per-unit weight, union
+        // tags). Remove: drop the whole stack. No capacity rejection — the pack
+        // is infinite; `weight` survives only for the narrator-summary text
+        // readout, enforcing nothing.
         for cmd in &pack_cmds {
             if let bracket_parser::BracketCommand::Pack {
                 item_name,
@@ -5097,6 +5173,7 @@ async fn apply_phase3_bracket_commands(
                 weight,
                 item_stats,
                 remove,
+                item_tags,
             } = cmd
             {
                 if undo_snapshot.is_none() {
@@ -5116,6 +5193,7 @@ async fn apply_phase3_bracket_commands(
                             qty: *qty,
                             weight: *weight,
                             stats: item_stats.clone(),
+                            tags: item_tags.clone(),
                         },
                     );
                     mutated = true;
@@ -5406,9 +5484,11 @@ async fn apply_time_command_and_maybe_tick(
 
     let context_swap = state.context_swap.clone();
     let schema_engine_slot = Arc::clone(&state.schema_engine);
-    let (schema_engine, _schema_lease) = match acquire_schema_engine_from_arcs(
+    let local_model_lock = Arc::clone(&state.local_model_lock);
+    let (schema_engine, _schema_lease, _model_guard) = match acquire_schema_engine_from_arcs(
         context_swap,
         schema_engine_slot,
+        local_model_lock,
     )
     .await
     {
@@ -5842,37 +5922,20 @@ async fn api_connect(
     }
 }
 
-/// The effective n_ctx for the LOCAL CHAT context given the active source.
-/// This is the v0.7 source-of-truth for "how big should the local chat
-/// context be?"
+/// The effective n_ctx for the LOCAL CHAT context.
 ///
-/// - **Local-only:** the user's tuned `settings.context_size` (default 4096).
-///   The local 12B is the primary chat + narrator model and needs the room.
-/// - **API connected:** 2048. The local 12B demotes to a silent tracking
-///   agent (memory tracking + small assistant replies) — no narration, no
-///   long payloads. 2048 is plenty for that and frees ~half the chat KV
-///   vs the 4096-tok Local-only mode.
+/// **Wupi chat is LOCAL-ONLY (2026-08-08 override):** the chat backend ALWAYS
+/// runs at `CTX_LOCAL_WITH_API` (2048). The 4096 context is retired for chat
+/// — it was for narrative, which the local model no longer does. Both params
+/// are now read-ignored; the function always returns 2048.
 ///
-/// **Schema is NOT affected** — it's a fixed `SCHEMA_CTX = 2048` in both
-/// modes (already the right size for delta work; no source-dependent sizing
-/// needed). **Fable is EXEMPT** — it stays at `FABLE_CTX = 4096` regardless
-/// (under API it only materializes as the fallback narrator, and a smaller
-/// context would leave zero room for the narrator prompt).
-///
-/// **Why a single helper:** every chat spawn site (boot, chat_send slow
-/// path, api_connect/disconnect re-spawn) MUST read this — otherwise the
-/// swap-lock eviction slow path would silently re-spawn at
-/// `settings.context_size` mid-API-session (the eviction-revert landmine).
-fn effective_local_ctx(source: api::ModelSource, _settings: &WupiSettings) -> u32 {
-    // 2026-07-31: context sizes now come from `settings.rs` constants, not the
-    // user-tuned `settings.context_size`. The param is retained (callers pass
-    // it; the test exercises the signature) but reads nothing — hence the
-    // `_` prefix. Keeping it avoids rippling every call site + preserves the
-    // historical shape (a future per-user override could read it again).
-    match source {
-        api::ModelSource::Api => settings::CTX_LOCAL_WITH_API,
-        api::ModelSource::Local => settings::CTX_LOCAL_SOLO,
-    }
+/// `#[cfg(test)]` — all live call sites were replaced with the constant
+/// directly (boot, chat_send, api_connect/disconnect). This fn survives only
+/// to pin the contract in the test suite (`effective_local_ctx_always_
+/// returns_with_api_constant`).
+#[cfg(test)]
+fn effective_local_ctx(_source: api::ModelSource, _settings: &WupiSettings) -> u32 {
+    settings::CTX_LOCAL_WITH_API
 }
 
 async fn api_connect_inner(
@@ -5931,46 +5994,12 @@ async fn api_connect_inner(
         .map_err(|e| format!("api_config save join: {e}"))?;
     tracing::info!(profile_id = %profile_id, "api connected: chat via API, local resident as agent + fallback");
 
-    // v0.7: shrink the local chat context to the API-mode size (2048). The
-    // local 12B is now just the silent tracking agent (memory + small replies),
-    // not the narrator — the API carries narration. Take + shutdown the
-    // resident 4000-ctx backend, re-spawn from shared weights at 2048.
-    //
-    // Weights stay leaked (shared_model singleton); only the KV context is
-    // reallocated. The swap-lock lease is NOT acquired here — we synchronize
-    // on state.backend directly (the same primitive the chat teardown closure
-    // uses at line ~2350). Acquiring the lease would just drop immediately
-    // and not protect the spawn window; the backend mutex does.
-    //
-    // Safe degradation: if spawn_from_shared returns None (shared_model not
-    // loaded — shouldn't happen post-boot), we leave the slot empty;
-    // chat_send's slow path will lazily re-spawn at effective_local_ctx(Api)
-    // = 2048 on the next turn.
-    {
-        let api_ctx = effective_local_ctx(api::ModelSource::Api, &{
-            let s = state.settings.lock().expect("settings mutex");
-            s.clone()
-        });
-        let mut g = state.backend.lock().expect("backend mutex");
-        if let Some(old) = g.take() {
-            old.shutdown();
-            tracing::info!("api_connect: chat backend torn down + re-spawning at smaller context");
-        }
-        let new_backend = llm::LlamaCppBackend::spawn_from_shared(
-            api_ctx,
-            Box::new(move |result| {
-                if let Err(e) = &result {
-                    tracing::warn!(error = %e, "api_connect: chat backend re-spawn reported error");
-                }
-            }),
-        );
-        if let Some(b) = new_backend {
-            *g = Some(b);
-            tracing::info!(n_ctx = api_ctx, "api_connect: chat backend re-spawned at API-mode context");
-        } else {
-            tracing::warn!("api_connect: spawn_from_shared returned None (shared_model not loaded); leaving slot empty");
-        }
-    }
+    // Wupi chat is LOCAL-ONLY (2026-08-08 override): the chat backend ALWAYS
+    // runs at 2048 regardless of API connection state. There is NO context
+    // shrink on connect anymore — the backend stays resident at 2048. This
+    // whole block used to tear down + re-spawn the backend at a different ctx;
+    // now it's a no-op (the chat backend is untouched). api_connect is pure
+    // bookkeeping: flip model_source to Api + persist (done above).
     // Emit model-status so the title indicator flips to the API model name.
     // The local backend is also still ready (never torn down) — the frontend
     // reads `localReady` from model_source_get to show "local: active" too.
@@ -6009,35 +6038,12 @@ async fn api_disconnect(app: tauri::AppHandle, state: tauri::State<'_, AppState>
         .await
         .map_err(|e| format!("api_config save join: {e}"))?;
 
-    // v0.7: restore the local chat context to the Local-mode size (the user's
-    // tuned settings.context_size, default 4096). Symmetric to api_connect's
-    // shrink: take + shutdown the 2048-ctx backend, re-spawn at the full size
-    // since the local 12B is now the primary chat + narrator model again.
-    {
-        let local_ctx = effective_local_ctx(api::ModelSource::Local, &{
-            let s = state.settings.lock().expect("settings mutex");
-            s.clone()
-        });
-        let mut g = state.backend.lock().expect("backend mutex");
-        if let Some(old) = g.take() {
-            old.shutdown();
-            tracing::info!("api_disconnect: chat backend torn down + re-spawning at full context");
-        }
-        let new_backend = llm::LlamaCppBackend::spawn_from_shared(
-            local_ctx,
-            Box::new(move |result| {
-                if let Err(e) = &result {
-                    tracing::warn!(error = %e, "api_disconnect: chat backend re-spawn reported error");
-                }
-            }),
-        );
-        if let Some(b) = new_backend {
-            *g = Some(b);
-            tracing::info!(n_ctx = local_ctx, "api_disconnect: chat backend re-spawned at Local-mode context");
-        } else {
-            tracing::warn!("api_disconnect: spawn_from_shared returned None; leaving slot empty");
-        }
-    }
+    // Wupi chat is LOCAL-ONLY (2026-08-08 override): the chat backend ALWAYS
+    // runs at 2048 regardless of API connection state. There is NO context
+    // restore on disconnect anymore — the backend was already at 2048 under
+    // the API and stays at 2048 after disconnect. This whole block used to
+    // tear down + re-spawn at 4096; now it's a no-op. api_disconnect is pure
+    // bookkeeping: flip model_source to Local + persist (done above).
 
     // Emit model-status: the local backend is what's serving now.
     let _ = app.emit(
@@ -6736,7 +6742,7 @@ async fn seed_quick_play_world(
     // Acquire the schema lease + spawn-or-reuse the schema engine under the
     // VRAM swap-lock (same as route_to_fable_manager). The lease guard is
     // held for the duration of the seed; dropping it marks the slot free.
-    let (schema_engine, _schema_lease) = acquire_schema_engine(state).await?;
+    let (schema_engine, _schema_lease, _model_guard) = acquire_schema_engine(state).await?;
 
     // Snapshot the just-seated (empty) world schema. The seed diffs against
     // this; for a fresh run it's the empty default.
@@ -6828,6 +6834,71 @@ async fn fable_quick_play_resume(
         &state,
     )
     .await
+}
+
+/// The cold-start anchor bootstrap (2026-08-10): derive starting clock + weather
+/// (+ opening location) from a card's `.intro` text via ONE schema-engine pass,
+/// for cards that ship no `<start>` block. The cold-start hole: a dormant
+/// clock/weather renders no `clock:`/`weather:` line in `<world_state>` → the
+/// tracker has nothing to maintain → `[TIME]`/`[WEATHER]` never fire. This
+/// reads the intro (the one-shot first narrator beat, normally UI-only) + asks
+/// the model to extract the implied time/weather/location, returning anchors
+/// the caller seeds directly into the dormant fields (bypassing `apply_delta`,
+/// which is test-pinned to never touch clock/weather — mirrors the `<start>`
+/// block seed).
+///
+/// Sibling of `seed_quick_play_world` (same schema-engine lease + spawn pattern,
+/// same best-effort contract). Single raw generation — NO 3-pass repair loop
+/// (the bootstrap is best-effort; a failure returns `None` + the caller's
+/// sensible-defaults fallback takes over). Runs at `enter_fable_session` time
+/// (NOT inside `fable_send`): the schema engine's VRAM lease conflicts with the
+/// Fable lease held mid-turn, so launch-time is the only safe window. Costs one
+/// local decode (~1-2s) when entering a game with a dormant clock/weather.
+///
+/// Returns `None` on any failure (schema engine unavailable, decode error,
+/// unparseable JSON). The caller falls through to sensible defaults — never
+/// fatal to game entry.
+async fn bootstrap_anchors_from_intro(
+    state: &tauri::State<'_, AppState>,
+    intro_text: &str,
+    setting: Option<&str>,
+    tone: Option<&str>,
+    player_name: Option<&str>,
+) -> Option<schema::BootstrapAnchors> {
+    // Acquire the schema lease + local-model turn lock (same as Quick Play
+    // seed). Hold both for the single decode; dropping releases.
+    let (schema_engine, _schema_lease, _model_guard) = acquire_schema_engine(state).await.ok()?;
+    let prompt = fable_command::render_bootstrap_prompt(intro_text, setting, tone, player_name);
+    let reply_rx = schema_engine.request_bootstrap(prompt).ok()?;
+    let reply = tokio::task::spawn_blocking(move || reply_rx.recv())
+        .await
+        .map_err(|e| tracing::warn!(error = %format!("{e}"), "bootstrap reply join failed"))
+        .ok()?
+        .map_err(|e| tracing::warn!(error = %format!("{e}"), "bootstrap reply channel closed"))
+        .ok()?;
+    if !reply.error.is_empty() {
+        tracing::warn!(error = %reply.error, "bootstrap generation failed; falling back to defaults");
+        return None;
+    }
+    match schema::BootstrapAnchors::from_model_output(&reply.raw_output) {
+        Ok(anchors) => {
+            tracing::info!(
+                has_time = anchors.time_minutes.is_some(),
+                has_weather = anchors.weather.is_some(),
+                has_location = anchors.location.is_some(),
+                "fable_start: derived cold-start anchors from intro"
+            );
+            Some(anchors)
+        }
+        Err(e) => {
+            tracing::warn!(
+                error = %format!("{e}"),
+                raw_len = reply.raw_output.len(),
+                "bootstrap JSON parse failed; falling back to defaults"
+            );
+            None
+        }
+    }
 }
 
 /// The shared "stash model path + swap id + load state + seat card" tail of
@@ -6966,17 +7037,41 @@ async fn enter_fable_session(
             // player's authored identity — the narrator + retrieval see
             // them as ground truth about WHO the player is, decoupled
             // from the card's world/setting (which stays the card's).
+            // (Values are `Value::String` — these are flat prose fields, not
+            // structured data; the widened entity type keeps them as strings.)
             if let Some(d) = sp.description.as_deref().filter(|s| !s.trim().is_empty()) {
-                prior_schema.entities.insert("player.description".into(), d.trim().to_owned());
+                prior_schema.entities.insert(
+                    "player.description".into(),
+                    serde_json::Value::String(d.trim().to_owned()),
+                );
             }
             if let Some(a) = sp.appearance.as_deref().filter(|s| !s.trim().is_empty()) {
-                prior_schema.entities.insert("player.appearance".into(), a.trim().to_owned());
+                prior_schema.entities.insert(
+                    "player.appearance".into(),
+                    serde_json::Value::String(a.trim().to_owned()),
+                );
             }
             if let Some(p) = sp.personality.as_deref().filter(|s| !s.trim().is_empty()) {
-                prior_schema.entities.insert("player.personality".into(), p.trim().to_owned());
+                prior_schema.entities.insert(
+                    "player.personality".into(),
+                    serde_json::Value::String(p.trim().to_owned()),
+                );
             }
             if let Some(ac) = sp.accessories.as_deref().filter(|s| !s.trim().is_empty()) {
-                prior_schema.entities.insert("player.accessories".into(), ac.trim().to_owned());
+                prior_schema.entities.insert(
+                    "player.accessories".into(),
+                    serde_json::Value::String(ac.trim().to_owned()),
+                );
+            }
+            // Backstory (2026-08-11): seed the authored history as a
+            // `player.backstory` entity so the narrator + retrieval see the
+            // character's history from turn 1. Same trust class as the legacy
+            // prose above — identity ground truth, not gameplay state.
+            if let Some(b) = sp.backstory.as_deref().filter(|s| !s.trim().is_empty()) {
+                prior_schema.entities.insert(
+                    "player.backstory".into(),
+                    serde_json::Value::String(b.trim().to_owned()),
+                );
             }
             // Seed the per-run live appearance layer (Phase 4 Component 5,
             // 2026-08-04). The structured trait fields the Player Creator
@@ -7021,6 +7116,11 @@ async fn enter_fable_session(
             tracing::warn!(player_id = pid, "saved player not found at attach time; proceeding with card default");
         }
     }
+    // Store the player id (None for playerless games like Quick Play) so the
+    // chat UI can resolve the player portrait via fable_active_card_get.
+    // Placed after the attach block so it always stores the authoritative id
+    // (Some or None) — never leaves a stale id from a prior session.
+    *state.active_player_id.lock().expect("active_player_id mutex") = player_id.clone();
     // Fable Phase 4 Component 3 (2026-07-28): seed the travel graph from the
     // card's `<locations>` block IF the resolved schema has no graph yet.
     // This is the load-bearing fix for Components 3 + 4 being dead in live
@@ -7085,6 +7185,139 @@ async fn enter_fable_session(
             ids = ?card.cast.iter().map(|n| n.id.as_str()).collect::<Vec<_>>(),
             "fable_start: seeded npc_registry from card <cast>"
         );
+    }
+    // Cold-start anchors (2026-08-10, Issue #2): seed the world clock + weather
+    // from the card's <start> block IF they're still dormant. The tracker
+    // renders no clock:/weather: line while these are unset → it has nothing to
+    // maintain → [TIME]/[WEATHER] never fire (the cold-start hole). Seeding
+    // them gives the tracker the anchors it needs from turn 1. Mirrors the
+    // travel_graph/npc_registry seeds' gate shape: only seed when dormant, so a
+    // resumed save that already advanced the clock (or set weather) is left
+    // alone (the player's [TIME]/[WEATHER] progress is preserved).
+    //
+    // Clock: write BOTH current_minutes AND last_tick_minutes so the seed
+    // counts as the baseline — the World Progression tick's first-call rule
+    // (no fire on the first [TIME]) is honored (a campaign doesn't simulate a
+    // day it just established). Weather: stamp started_at_minutes to the seeded
+    // clock so the persistence curve has a sane origin (0 when the clock is
+    // also unseeded — harmless, the drift DC just starts from baseline).
+    if let Some(mins) = card.start.time_minutes {
+        if !prior_schema.world_clock.is_set() {
+            prior_schema.world_clock.current_minutes = mins;
+            prior_schema.world_clock.last_tick_minutes = mins;
+            tracing::info!(
+                start_minutes = mins,
+                "fable_start: seeded world_clock from card <start><time>"
+            );
+        }
+    }
+    if let Some(condition) = card.start.weather.as_deref() {
+        if !prior_schema.weather.is_set() {
+            prior_schema.weather.condition = condition.to_string();
+            prior_schema.weather.started_at_minutes =
+                prior_schema.world_clock.current_minutes;
+            tracing::info!(
+                condition = %condition,
+                "fable_start: seeded weather from card <start><weather>"
+            );
+        }
+    }
+    // Cold-start anchor bootstrap (2026-08-10): if the clock and/or weather are
+    // STILL dormant after the <start> seed (no <start> block, or it seeded only
+    // one of the two), derive them from the card's .intro via one schema-engine
+    // pass. This closes the cold-start hole for Creator-authored cards that
+    // ship no <start>: the tracker renders no clock:/weather: line while dormant
+    // → it has nothing to maintain → [TIME]/[WEATHER] never fire. Seeding from
+    // the intro gives the tracker its baseline from turn 1. Best-effort +
+    // detached from game-entry: a failure falls through to sensible defaults
+    // below, never blocks the launch. (The .intro is normally read once for the
+    // UI at line ~7077; for the bootstrap we re-read here — cheap, small file.)
+    if !prior_schema.world_clock.is_set() || !prior_schema.weather.is_set() {
+        let intro_text = resolve_fable_cards_dir(app)
+            .and_then(|root| load_card_intro(&root, &card.id));
+        let derived = if let Some(intro) = intro_text.as_deref().filter(|s| !s.trim().is_empty()) {
+            bootstrap_anchors_from_intro(
+                state,
+                intro,
+                card.setting.as_deref(),
+                card.tone.as_deref(),
+                card.player_name.as_deref(),
+            )
+            .await
+        } else {
+            None
+        };
+        // Apply derived anchors (each only to its still-dormant field).
+        if let Some(ref a) = derived {
+            if let Some(mins) = a.time_minutes {
+                if !prior_schema.world_clock.is_set() {
+                    prior_schema.world_clock.current_minutes = mins;
+                    prior_schema.world_clock.last_tick_minutes = mins;
+                    tracing::info!(start_minutes = mins, "bootstrap: seeded clock from intro");
+                }
+            }
+            if let Some(ref condition) = a.weather {
+                if !prior_schema.weather.is_set() {
+                    prior_schema.weather.condition = condition.clone();
+                    prior_schema.weather.started_at_minutes =
+                        prior_schema.world_clock.current_minutes;
+                    tracing::info!(condition = %condition, "bootstrap: seeded weather from intro");
+                }
+            }
+            // Location: only when the graph is still empty (a resumed save with
+            // an existing graph is preserved). upsert_node + set current_node.
+            if let Some((ref id, ref name)) = a.location {
+                if prior_schema.travel_graph.nodes.is_empty() {
+                    let node = schema::Node {
+                        id: id.clone(),
+                        name: name.clone(),
+                        neighbors: vec![],
+                        setting: String::new(),
+                    };
+                    if prior_schema.travel_graph.upsert_node(node) {
+                        prior_schema.travel_graph.current_node = Some(id.clone());
+                        tracing::info!(node_id = %id, "bootstrap: seeded opening location from intro");
+                    }
+                }
+            }
+        }
+        // Sensible-defaults fallback: the "always get the tracker flow going"
+        // guarantee. If a field is STILL dormant (bootstrap returned None, or
+        // returned None for that specific field), seed a neutral default so the
+        // tracker has an anchor. Location is deliberately left dormant (the
+        // [DISCOVER] path handles it organically on turn 1 — forcing a default
+        // location would be a guess).
+        if !prior_schema.world_clock.is_set() {
+            // Day 1, 09:00 = 540 minutes. Neutral mid-morning — the most
+            // generic non-zero anchor (lets the tracker advance from a sane
+            // baseline regardless of when the scene "actually" starts).
+            prior_schema.world_clock.current_minutes = 540;
+            prior_schema.world_clock.last_tick_minutes = 540;
+            tracing::info!("bootstrap: seeded default clock (Day 1, 09:00)");
+        }
+        if !prior_schema.weather.is_set() {
+            // Derive from tone if it mentions weather; else "clear".
+            let default_weather = card
+                .tone
+                .as_deref()
+                .map(|t| {
+                    let tl = t.to_lowercase();
+                    if tl.contains("fog") || tl.contains("mist") {
+                        "fog"
+                    } else if tl.contains("rain") || tl.contains("storm") {
+                        "heavy rain"
+                    } else if tl.contains("snow") {
+                        "snowfall"
+                    } else {
+                        "clear"
+                    }
+                })
+                .unwrap_or("clear");
+            prior_schema.weather.condition = default_weather.to_string();
+            prior_schema.weather.started_at_minutes =
+                prior_schema.world_clock.current_minutes;
+            tracing::info!(condition = %default_weather, "bootstrap: seeded default weather");
+        }
     }
     *state.fable_schema.lock().await = prior_schema;
     clear_fable_history(&state).await;
@@ -7213,7 +7446,10 @@ fn build_narrator_prompt(system_prompt: &str, window: &[session::Message]) -> St
     // Always-on thinking: inject the Gemma4 `<|think|>` control token at the
     // end of the system turn so the tracker always reasons before its brackets.
     // (The narrator is the API — it uses OpenAI format and never sees this fn.)
-    prompt.push_str("<|think|>");
+    // DISABLED 2026-08-09 (`THINKING_ENABLED`) — see settings.rs.
+    if crate::settings::THINKING_ENABLED {
+        prompt.push_str("<|think|>");
+    }
     prompt.push_str("<turn|>\n");
     for m in window {
         let role = match m.role {
@@ -7229,6 +7465,34 @@ fn build_narrator_prompt(system_prompt: &str, window: &[session::Message]) -> St
     }
     prompt.push_str("<|turn>model\n");
     prompt
+}
+
+/// Cap each assistant message's content to `cap` chars (2026-08-10, T52
+/// overflow fix). The tracker window feeds the API narrator's full beat (up to
+/// ~4700 chars ≈ ~1200 tokens) into the local tracker's 3072-token context,
+/// which blew the 2922 budget 7 times in T52 and front-chopped the bracket
+/// protocol. The tracker only needs the gist to decide whether brackets fire,
+/// so capping assistant prose mathematically bounds the window. User messages
+/// are NOT capped (they're the player's action — the trigger the tracker keys
+/// off). UTF-8-safe: truncates at a char boundary + appends `[…]`. Pure + unit-
+/// tested (no model, no GPU).
+pub(crate) fn cap_assistant_prose(
+    mut window: Vec<session::Message>,
+    cap: usize,
+) -> Vec<session::Message> {
+    for m in window.iter_mut() {
+        if m.role == session::Role::Assistant && m.content.len() > cap {
+            let cut = m
+                .content
+                .char_indices()
+                .nth(cap)
+                .map(|(idx, _)| idx)
+                .unwrap_or(m.content.len());
+            m.content.truncate(cut);
+            m.content.push_str(" […]\n");
+        }
+    }
+    window
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -7309,13 +7573,28 @@ fn assemble_narrator_skeleton(
 /// break state tracking with no compile error to catch it).
 fn build_narrator_system_prompt(
     prompts: &prompts::FablePrompts,
-    card: &sim_card::SimCard,
+    _card: &sim_card::SimCard,
     world_state: Option<&str>,
     pacing: schema::ScenePacing,
     player_action: Option<&str>,
     memory_block: Option<&str>,
 ) -> String {
-    let mut out = String::with_capacity(3072);
+    let mut out = String::with_capacity(2048);
+
+    // The tracker is a STATE LEDGER, not a narrator. It needs ONLY:
+    //   (a) the AGENT directive (how to track — from fable.prompt)
+    //   (b) the live state delta (world_state — the current truth it mutates)
+    //   (c) the bracket syntax reference (the mechanical interface)
+    //
+    // Card identity (setting/plot/tone/core_persona) is NARRATOR FLAVOR — it
+    // belongs only in build_api_narrator_system_prompt (the API path). The
+    // tracker doesn't need to know the setting is "a fogbound marsh-edge town"
+    // to emit [TRAVEL market_square] or [NPC_REGISTER mara]. All world state
+    // (NPCs, locations, player appearance, equipment) is already seeded into
+    // the schema at fable_start + surfaced to the tracker via <world_state>.
+    // Including the card here was ~400 tokens of bloat that contributed to the
+    // prompt-overflow → bracket-protocol-chopped → zero-brackets bug.
+    // (2026-08-09: card param kept as `_card` for signature stability.)
 
     // (a) Authored agent/tracker prose (from fable.prompt's AGENT section).
     let agent = prompts.agent.trim();
@@ -7324,53 +7603,36 @@ fn build_narrator_system_prompt(
         out.push_str("\n\n");
     }
 
-    // (b) Card identity (from the active .sim scenario card). Pure flavor.
-    out.push_str("Scenario: ");
-    out.push_str(card.name.trim());
-    out.push('\n');
-    if let Some(setting) = card.setting.as_deref().filter(|s| !s.trim().is_empty()) {
-        out.push_str("Setting: ");
-        out.push_str(setting.trim());
-        out.push('\n');
-    }
-    if let Some(plot) = card.plot.as_deref().filter(|s| !s.trim().is_empty()) {
-        out.push_str("Plot: ");
-        out.push_str(plot.trim());
-        out.push('\n');
-    }
-    if let Some(tone) = card.tone.as_deref().filter(|s| !s.trim().is_empty()) {
-        out.push_str("Tone: ");
-        out.push_str(tone.trim());
-        out.push('\n');
-    }
-    let core = card.core_persona.trim();
-    if !core.is_empty() {
-        out.push_str(core);
-        out.push('\n');
-    }
-    out.push('\n');
-
-    // (c) Live per-turn state blocks (world_state, retrieved_knowledge,
+    // (b) Live per-turn state blocks (world_state, retrieved_knowledge,
     // scene_pacing, player_action). Zero authored prose here.
     out.push_str(&assemble_narrator_skeleton(
         player_action, world_state, pacing, memory_block,
     ));
 
-    // (d) Bracket-command protocol reference. The tracker emits these
-    // alongside its prose so Rust can apply the mechanical truth. One line
-    // each, the bracket forms `bracket_parser::parse` accepts. KEPT IN RUST
-    // — these are engine API endpoints, not narrative flavor.
-    out.push_str("- [TIME Day N, HH:MM] — advance the in-world clock when time passes.\n");
-    out.push_str("- [EFFECT <label> buff|debuff <secs> [kind=disguise]] — apply a status tag.\n");
-    out.push_str("- [MILESTONE <npc_id> <event_id>] — record a relationship milestone.\n");
-    out.push_str("- [TASK <npc> <description> <difficulty> <eta-minutes>] — queue an off-screen task.\n");
-    out.push_str("- [WEATHER <condition>] — change the global weather.\n");
-    out.push_str("- [TRAVEL <node_id>] — move the player to an adjacent node.\n");
-    out.push_str("- [RUMOR <node_id> <rumor_text>] — seed a rumor at a node.\n");
-    out.push_str("- [APPEARANCE <key>=<value>] — record a lasting change to the player's look (hair_color, outfit, eye_color, scars, wounds, tattoos, disguise, body_type, skin_complexion, hair_length, hair_style, breast_size, ears, tail). Use the bare form [APPEARANCE <key>] to clear. Only emit when the turn genuinely changes appearance (a disguise donned, hair cut, fresh scar). Mirror the player's current appearance: block.\n");
-    out.push_str("- [EQUIP slot=<slot> name=<item> (layer=outer|inner) (stats=<note>)] — record a worn item in one of six body slots: head, chest, main_hand, off_hand, legs, feet. layer defaults to outer (the observer-visible garment); use inner for a concealed garment beneath an outer one (e.g. a shirt under a cloak). Quote multi-word names: name=\"Iron Sword\". Use the bare form [EQUIP slot=<slot>] to unequip. Only emit when the turn genuinely equips/unequips — mirror the player's current equipped: block (outer-layer items only).\n");
-    out.push_str("- [BELT name=<item> (qty=N) (stats=<note>)] / [BELT -<name>] — add to (or remove from) the 4-slot quick-access belt for potions, lockpicks, throwables. qty defaults to 1. Quote multi-word names. Emit only when the turn genuinely changes what's on the belt.\n");
-    out.push_str("- [PACK name=<item> (qty=N) (weight=<lbs>) (stats=<note>)] / [PACK -<name>] — add to (or remove from) the deep-storage pack. qty defaults to 1, weight to 1 lb. Quote multi-word names. Emit only when the turn genuinely picks up, drops, or consumes an item.\n");
+    // (c) Bracket-command protocol reference. The tracker emits these
+    // alongside its prose so Rust can apply the mechanical truth. One TIGHT
+    // line each — the syntax only; the WHEN/WHY guidance lives in the AGENT
+    // prose above (the <item_tags> block covers tag classification, the
+    // <restraint> block covers emit-only-on-change). KEPT LEAN per the Prime
+    // Directive: this list is in the always-on system prompt, so every byte
+    // costs context budget on every tracker turn. Detailed bracket semantics
+    // are in the card's codex (retrieved on-demand), NOT here.
+    out.push_str("Track changes with these brackets (emit one per genuine change this turn — see <triggers> for exactly when each fires):\n");
+    out.push_str("- [TIME Day N, HH:MM] — advance the clock when the turn spans hours (travel, sleep, a long task). Use the real time, never a placeholder.\n");
+    out.push_str("- [WEATHER <condition>] — when the narrated weather shifts (fog lifts, rain starts, night falls). One word: fog, rain, snow, clear, overcast, storm, etc.\n");
+    out.push_str("- [TRAVEL <node_id>] — when the player arrives at a different location. Use a node_id from the location line's exits (or one you seed via [DISCOVER]).\n");
+    out.push_str("- [RUMOR <rumor_text>] — when a rumor is actually heard or spread in the scene. The whole phrase is the rumor.\n");
+    out.push_str("- [NPC_REGISTER <npc_id> <name> (role) (tier)] — the FIRST time a named NPC who is NOT in the cast line appears. Register them once, then use [PRESENCE]. tier: minion|soldier|elite|boss|legendary (omit for civilians).\n");
+    out.push_str("- [PRESENCE <npc_id> <stance or micro-location>] — when an NPC enters the scene or is already on-camera. Resolves names from the cast line. Example: [PRESENCE mara \"behind the bar, drying a glass\"].\n");
+    out.push_str("- [DISCOVER <node_id> <name> (setting=indoor|outdoor) (neighbors=<ids>)] — when the player reaches a place that is not yet in the location line's exits. Adds it as a travelable node.\n");
+    out.push_str("- [EFFECT <label> buff|debuff <secs> [kind=disguise]] — when a buff/debuff or disguise takes hold.\n");
+    out.push_str("- [MILESTONE <npc_id> <event_id>] — when a relationship meaningfully shifts (alliance forged, trust broken).\n");
+    out.push_str("- [TASK <npc> <description> <difficulty> <eta-minutes>] — when an NPC starts an off-screen task you should track.\n");
+    out.push_str("- [APPEARANCE key=value] — when the player's look LASTINGLY changes (a disguise applied, hair cut, a scar earned). Keys: hair_color, outfit, eye_color, scars, wounds, tattoos, disguise, body_type, skin_complexion, hair_length, hair_style, breast_size, ears, tail. Bare [APPEARANCE key] clears.\n");
+    out.push_str("- [EQUIP slot=<slot> name=<item> (layer=outer|inner) (stats=<note>) (tags=<tags>)] — when a garment or READY weapon is put ON. Slots: head, chest, main_hand, off_hand, legs, feet. main_hand/off_hand are for readied weapons/tools ONLY — a sheathed or belt-hung blade goes in [BELT], not a hand slot. Bare [EQUIP slot=<slot>] unequips. Quote multi-word names.\n");
+    out.push_str("- [BELT name=<item> (qty=N) (tags=<tags>)] / [BELT -<name>] — when a quick-access item (a belt knife, a potion, a pouch) is gained or stowed. This is where belt-hung knives belong.\n");
+    out.push_str("- [PACK name=<item> (qty=N) (tags=<tags>)] / [PACK -<name>] — when an item is acquired into deep storage or removed. Check the pack line first so you don't re-add what's already there.\n");
+    out.push_str("Tags (EQUIP/BELT/PACK): consumable, equippable, pocketable — see <item_tags> above.\n");
 
     out
 }
@@ -7505,6 +7767,17 @@ fn require_api_for_fable(state: &tauri::State<'_, AppState>) -> Result<(), Strin
         .expect("api_config mutex")
         .active_profile()
         .is_some();
+    // Dev-only bypass (2026-08-08): `npm run dev` / `cargo tauri dev` run with
+    // no reachable API (the browser dev context can't push an API connection),
+    // which otherwise locks Fable behind the title gate + the four `require_
+    // api_for_fable` call sites. In a DEBUG build only, skip the check so the
+    // UI can be edited / narrated locally for development. `cfg!` is a
+    // compile-time literal → this branch is compiled out entirely in the
+    // release build (`cargo build --release`), so the 2026-08-07 API-only
+    // override + all four gates behave identically in shipped `wupi.exe`.
+    if cfg!(debug_assertions) {
+        return Ok(());
+    }
     if !has_profile {
         return Err(
             "Fable requires an active API connection to narrate. Connect an API provider in Settings first.".into(),
@@ -8081,13 +8354,16 @@ async fn fable_send(
     {
         let mut gs = state.fable_session.lock().await;
         if reroll {
-            // Reroll path (swipeable variants, 2026-07-29): the last message is
-            // an assistant turn. Stash its current content/raw into variants so
-            // the old prose survives as a swipeable sibling, then we generate a
-            // fresh variant from the user turn BEFORE it. We do NOT pop the
-            // assistant message — it stays, now with empty content, and the
+            // Reroll path (variant↔schema binding, 2026-08-11): regenerate a
+            // FRESH variant of the trailing assistant turn. The bookkeeping —
+            // stashing the old prose as a swipeable sibling, advancing
+            // active_idx, and appending the new variant's post-tracker schema
+            // — is all handled by `push_variant_with_schema` AFTER generation
+            // (below). We do NOT pop the assistant message; it stays + the
             // window slice below excludes it (last message dropped) so the
-            // model sees only up to the preceding user turn.
+            // model regenerates from the preceding user turn. The schema revert
+            // (so the re-track doesn't double-mutate on top of the prior roll)
+            // + the variant_schemas seed happen in the pre-Stage-1 block below.
             let last_is_assistant = gs
                 .messages
                 .last()
@@ -8097,17 +8373,6 @@ async fn fable_send(
                 return Err(
                     "fable_send: reroll=true but the last message is not an assistant turn".into(),
                 );
-            }
-            if let Some(m) = gs.messages.last_mut() {
-                // Move current content/raw into variants, leave content empty
-                // (the new generation fills it via push_variant below at line
-                // ~7555). active_idx advances to the new tail.
-                let old_content = std::mem::take(&mut m.content);
-                let old_raw = std::mem::take(&mut m.raw_output);
-                m.variants.push(old_content);
-                m.raw_outputs.push(old_raw);
-                // active_idx will be set to variants.len() (= new index) by
-                // push_variant when the new content is installed.
             }
         } else if regenerate {
             // Re-generation path: the user turn to reply to is already the
@@ -8124,14 +8389,19 @@ async fn fable_send(
         }
     }
 
-    // Build a windowed prompt: system + last fable_visible_window messages +
-    // generation cue. Same Gemma4 `<|turn>` protocol the chat path uses
-    // (assistant → "model"). We render inline (no ChatFormat trait dependency)
-    // because the narrator prompt is a single-shot prefill into the FableEngine
-    // (no KV-cache reuse across turns: the FableEngine clears KV every turn,
-    // see fable_engine.rs:375). So cache-coherent re-render from raw_output
-    // isn't required here; cleaned content is fine.
-    let window: Vec<session::Message> = {
+    // Build windowed prompts. Two windows are needed (2026-08-08):
+    //   • `window` (WINDOW_API_FABLE = 16) — the API narrator sees the full
+    //     narrative history (it has the 16k context budget for it).
+    //   • `tracker_window` (WINDOW_TRACKER = 2) — the local tracker sees only
+    //     the last 1 turn (player action + preceding narrator response). It
+    //     does NOT re-read history: it relies on the schema delta (incremental
+    //     state) + Rust state as the authority. Keeping its window to 1 turn
+    //     (the AGENT directive's "this turn") keeps the prompt lean so the
+    //     bracket protocol survives the truncation guard.
+    // Same Gemma4 `<|turn>` protocol the chat path uses (assistant → "model").
+    // Single-shot prefill (FableEngine clears KV every turn), so cleaned
+    // content is fine (no cache-coherent raw_output re-render needed).
+    let (window, tracker_window): (Vec<session::Message>, Vec<session::Message>) = {
         let gs = state.fable_session.lock().await;
         let msgs = &gs.messages;
         // Reroll: the trailing assistant message has empty content (stashed into
@@ -8143,8 +8413,59 @@ async fn fable_send(
         } else {
             msgs.len()
         };
-        let start = end.saturating_sub(fable_visible_window);
-        msgs[start..end].to_vec()
+        let narr_start = end.saturating_sub(fable_visible_window);
+        let track_start = end.saturating_sub(settings::WINDOW_TRACKER);
+        // Cap assistant-message prose in the TRACKER window (2026-08-10, T52
+        // overflow fix). See `cap_assistant_prose` + `TRACKER_ASSISTANT_CHAR_CAP`.
+        // The narrator window (16k API budget) is uncapped.
+        let tracker_window = cap_assistant_prose(
+            msgs[track_start..end].to_vec(),
+            settings::TRACKER_ASSISTANT_CHAR_CAP,
+        );
+        (msgs[narr_start..end].to_vec(), tracker_window)
+    };
+
+    // Variant↔schema binding (2026-08-11): capture the pre-turn base schema
+    // (the world the player acted against) BEFORE the tracker mutates it. For
+    // a reroll, FIRST seed `variant_schemas` with the active variant's schema
+    // (the current live schema) when this is the turn's first reroll, THEN
+    // revert the live schema to the message's stored `base_schema` so the re-
+    // track doesn't double-mutate on top of the prior roll (the fix). The
+    // captured `base_schema_snapshot` is stored on the message after generation
+    // (normal turn); rerolls reuse the base set by the first generation. Locks
+    // are taken in separate scopes (schema, then session) — never nested.
+    let base_schema_snapshot: schema::WorldSchema = {
+        if reroll {
+            // (a) Seed variant_schemas with the active variant's schema when
+            //     this is the first reroll of the turn (empty for a turn made
+            //     before this feature, OR a fresh turn whose post-tracker
+            //     snapshot is pushed after generation below).
+            {
+                let live = state.fable_schema.lock().await.clone();
+                let mut gs = state.fable_session.lock().await;
+                if let Some(m) = gs.messages.last_mut() {
+                    if m.role == session::Role::Assistant && m.variant_schemas.is_empty() {
+                        m.variant_schemas.push(live);
+                    }
+                }
+            }
+            // (b) Revert the live schema to the message's stored base_schema.
+            //     Legacy messages with no base_schema can't revert — they re-
+            //     track on top (the old behavior) until the session refreshes.
+            {
+                let base_opt = {
+                    let gs = state.fable_session.lock().await;
+                    gs.messages
+                        .last()
+                        .filter(|m| m.role == session::Role::Assistant)
+                        .and_then(|m| m.base_schema.clone())
+                };
+                if let Some(b) = base_opt {
+                    *state.fable_schema.lock().await = b;
+                }
+            }
+        }
+        state.fable_schema.lock().await.clone()
     };
 
     // Streaming callback wraps the Channel send.
@@ -8195,9 +8516,20 @@ async fn fable_send(
         // discarded; only its brackets are
         // applied. The no-op on_chunk ensures the tracker's prose/bracket
         // output never reaches the frontend.
+        //
+        // **Local-model turn lock (2026-08-08):** the tracker decode + bracket
+        // application run under the process-wide `local_model_lock` so they
+        // never overlap a concurrent `chat_send` or schema-delta decode on the
+        // local 12B. Whichever local consumer acquires first runs to
+        // completion; the others queue. The guard drops at the end of this
+        // block — BEFORE Stage 2 (the API narrator never takes it).
         let noop_chunk: llm::ChunkFn = Arc::new(|_: &str| {});
-        let tracker_prompt = build_narrator_prompt(&system_prompt, &window);
+        // The tracker uses the tight 1-turn window (WINDOW_TRACKER = 2), NOT
+        // the narrator's 16-message window. It relies on the schema delta +
+        // Rust state, not re-read history (2026-08-10).
+        let tracker_prompt = build_narrator_prompt(&system_prompt, &tracker_window);
         tracing::info!("fable_send: API mode — tracker stage (local) starting");
+        let _tracker_model_guard = state.local_model_lock.lock().await;
         let tracker_reply_opt: Option<fable_engine::FableReply> = match engine
             .request_turn(tracker_prompt, noop_chunk.clone(), cancel.clone(), true)
         {
@@ -8226,6 +8558,19 @@ async fn fable_send(
         if let Some(tracker_reply) = &tracker_reply_opt {
             if tracker_reply.error.is_empty() {
                 let cleaned_tracker = schema::extract_reply_channel(&tracker_reply.raw_output);
+                // TEMP DIAGNOSTIC (2026-08-09): log the tracker's RAW + CLEANED
+                // output so we can see what the local 12B actually emits when
+                // brackets aren't firing. Remove after diagnosis.
+                tracing::info!(
+                    raw_len = tracker_reply.raw_output.len(),
+                    cleaned_len = cleaned_tracker.len(),
+                    "TRACKER DIAGNOSTIC — raw_output (first 800 chars):\n{}",
+                    &tracker_reply.raw_output.chars().take(800).collect::<String>()
+                );
+                tracing::info!(
+                    "TRACKER DIAGNOSTIC — cleaned/extract_reply_channel (first 800 chars):\n{}",
+                    cleaned_tracker.chars().take(800).collect::<String>()
+                );
                 let tracker_parsed = bracket_parser::parse(&cleaned_tracker);
                 if !tracker_parsed.commands.is_empty() {
                     tracing::info!(
@@ -8290,6 +8635,14 @@ async fn fable_send(
             }
         }
 
+        // The tracker's local-model work is done — release the turn lock NOW
+        // so a concurrent chat_send / schema-delta can use the local 12B
+        // while Stage 2 (the API narrator, below) streams over HTTP. The API
+        // never touches the local model, so holding the lock across it would
+        // needlessly block every Wupi-drawer message for the entire narrator
+        // generation. Drop explicitly before the re-render below.
+        drop(_tracker_model_guard);
+
         // Re-render the authoritative world-state for the API narrator. This
         // reflects the tracker's bracket mutations (time advanced, buffs
         // added, milestones recorded, tasks queued). The SAME turn_directives
@@ -8316,23 +8669,91 @@ async fn fable_send(
             memory_block.as_deref(),
         );
 
-        // ---- Stage 2: NARRATOR (API) ----
+        // ---- Stage 2: NARRATOR (API, or LOCAL in dev with no API) ----
         // The launch gate + the top-of-fable_send guard guarantee an active
         // API profile here, so the `None` profile case is purely defensive.
         let profile = {
             let cfg = state.api_config.lock().expect("api_config mutex");
             cfg.active_profile().cloned()
         };
-        let Some(profile) = profile else {
-            // Defensive: no active profile despite the guards (e.g. the
-            // profile was deleted mid-turn). No local fallback — emit
-            // api_lost, autosave, and abort the turn.
-            return emit_fable_api_lost(&on_event, &app, &state, "No active API profile.").await;
-        };
-        // Re-render the windowed history as flat ApiMessages for the HTTP path
-        // (system + windowed turns; the API folds memory + world_state into
-        // the system message itself).
-        let mut api_msgs: Vec<session::ApiMessage> =
+
+        // Dev-only local-narrator bypass (2026-08-08): when running under
+        // `cargo tauri dev` (a DEBUG build) AND no API profile is connected,
+        // route the narrator turn to the already-resident local FableEngine
+        // instead of HttpBackend. The browser dev context can't push an API
+        // connection, so without this the Stage-2 HTTP call would fail →
+        // `api_lost` → composer lockout, making the Fable UI uneditable in
+        // dev. `cfg!(debug_assertions)` is a compile-time literal `false` in
+        // `cargo build --release`, so the optimizer dead-code-eliminates this
+        // arm entirely; the shipped wupi.exe ALWAYS takes the API path below
+        // exactly as the 2026-08-07 override mandates (no local-narrator
+        // fallback in production). Using the `cfg!()` macro (not `#[cfg]`)
+        // keeps the dev arm type-checked in release builds too.
+        //
+        // The local model will produce stat-spammy prose (the override's
+        // exact reason for API-only) — acceptable for UI editing / bracket /
+        // save-state dev work. The engine is already spawned above (Stage 1)
+        // and clears KV every turn, so a second request_turn is a fresh
+        // prefill with no cache concern. The tracker already applied its
+        // brackets; any brackets this pass emits are harmless duplicates
+        // (same contract as the API path: narrator brackets are a no-op for
+        // state, the tracker owns mechanics). tracker_mode=false → creative
+        // sampler for more natural prose to look at while styling.
+        if cfg!(debug_assertions) && profile.is_none() {
+            tracing::info!(
+                "fable_send: DEV MODE — no API profile; narrating via local FableEngine (stat-spammy)"
+            );
+            let narrator_prompt = build_narrator_prompt(&narrator_system_prompt, &window);
+            let dev_reply: fable_engine::FableReply = match engine.request_turn(
+                narrator_prompt,
+                on_chunk.clone(),
+                cancel.clone(),
+                false, // tracker_mode=false → creative sampler
+            ) {
+                Ok(reply_rx) => match tokio::task::spawn_blocking(move || reply_rx.recv()).await {
+                    Ok(Ok(r)) => fable_engine::FableReply {
+                        raw_output: r.raw_output,
+                        error: r.error,
+                        cancelled: r.cancelled,
+                    },
+                    Ok(Err(e)) => {
+                        tracing::warn!(error = %e, "fable_send: DEV local narrator channel recv failed");
+                        return emit_fable_api_lost(
+                            &on_event, &app, &state,
+                            "Dev local narrator failed (see logs).",
+                        )
+                        .await;
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "fable_send: DEV local narrator join failed");
+                        return emit_fable_api_lost(
+                            &on_event, &app, &state,
+                            "Dev local narrator failed (see logs).",
+                        )
+                        .await;
+                    }
+                },
+                Err(e) => {
+                    tracing::warn!(error = %format!("{e:#}"), "fable_send: DEV local narrator request_turn failed");
+                    return emit_fable_api_lost(
+                        &on_event, &app, &state,
+                        "Dev local narrator failed (see logs).",
+                    )
+                    .await;
+                }
+            };
+            dev_reply
+        } else {
+            let Some(profile) = profile else {
+                // Defensive: no active profile despite the guards (e.g. the
+                // profile was deleted mid-turn). No local fallback — emit
+                // api_lost, autosave, and abort the turn.
+                return emit_fable_api_lost(&on_event, &app, &state, "No active API profile.").await;
+            };
+            // Re-render the windowed history as flat ApiMessages for the HTTP path
+            // (system + windowed turns; the API folds memory + world_state into
+            // the system message itself).
+            let mut api_msgs: Vec<session::ApiMessage> =
             Vec::with_capacity(window.len() + 1);
         api_msgs.push(session::ApiMessage {
             role: "system".into(),
@@ -8386,12 +8807,39 @@ async fn fable_send(
                 .await;
             }
         }
+        }  // close else (API path)
     };
 
     // Clear the cancel slot now that the turn is done.
     {
         let mut slot = state.active_fable_cancel.lock().expect("active_fable_cancel mutex");
         *slot = None;
+    }
+
+    // Abort check (Stage 3, 2026-08-11): if `fable_interrupt_reroll` requested
+    // an abort (the user re-pressed › mid-reroll to abandon this roll), discard
+    // it entirely — revert the schema to the pre-turn `base_schema_snapshot`
+    // (undoing this roll's tracker mutations), SKIP the variant install, emit
+    // `cancelled`, + return. The frontend arms a deferred reroll that fires
+    // when it sees the `cancelled` event, so the net effect is
+    // "stop + undo + fresh roll." Read-and-reset (swap) so one request is
+    // consumed once. This is distinct from a soft `fable_stop` cancel
+    // (reply.cancelled without the abort flag), which keeps its partial prose.
+    if state.fable_abort_requested.swap(false, std::sync::atomic::Ordering::Relaxed) {
+        *state.fable_schema.lock().await = base_schema_snapshot.clone();
+        // Defensive: for a normal turn (not reroll) the user message was added
+        // at turn start — pop it so the conversation reverts to its pre-turn
+        // tail. The frontend only triggers abort for the reroll case, so this
+        // branch is normally dead; kept so an unexpected abort never leaves a
+        // dangling user turn.
+        if !reroll {
+            let mut gs = state.fable_session.lock().await;
+            if gs.messages.last().map(|m| m.role == session::Role::User).unwrap_or(false) {
+                gs.messages.pop();
+            }
+        }
+        let _ = on_event.send(serde_json::json!({ "type": "cancelled" }));
+        return Ok(());
     }
 
     if !reply.error.is_empty() {
@@ -8511,16 +8959,27 @@ async fn fable_send(
     // prefill), so cache-coherent raw_output re-render isn't required here
     // (unlike the chat path's Bug #3 fix). The reasoning channel is empty for
     // narrator turns (the bracket parser doesn't extract a thought channel).
+    //
+    // Variant↔schema binding (2026-08-11): capture the post-tracker schema
+    // (the world state THIS roll produced) + store it alongside the variant.
+    // Reroll → push_variant_with_schema appends it as variant_schemas[tail];
+    // normal turn → seed base_schema (captured pre-Stage-1) + variant_schemas
+    // = [post-tracker] so the first variant carries its world-state snapshot.
+    // The narrator (Stage 2) is API + never mutates the schema, so this read
+    // equals the state right after the tracker's brackets landed.
+    let post_tracker_schema = state.fable_schema.lock().await.clone();
     {
         let mut gs = state.fable_session.lock().await;
         if reroll {
-            // Swipeable-variant path (2026-07-29): the trailing assistant message
-            // already exists with its prior content stashed into `variants`.
-            // Install the freshly-generated prose as the NEW active variant via
-            // `push_variant` (old content is already a sibling from the stash
-            // above; this sets content=new + active_idx=tail).
+            // Install the freshly-generated prose as the NEW active variant.
+            // push_variant_with_schema seeds variant 0 from the current content
+            // on the first reroll + appends the new variant + its schema.
             if let Some(m) = gs.messages.last_mut() {
-                m.push_variant(parsed.prose.clone(), reply.raw_output.clone());
+                m.push_variant_with_schema(
+                    parsed.prose.clone(),
+                    reply.raw_output.clone(),
+                    Some(post_tracker_schema.clone()),
+                );
                 // narrator_reasoning is always "" (API narrator never thinks);
                 // kept for payload-shape compat with Message.reasoning.
                 m.reasoning = narrator_reasoning.clone();
@@ -8531,6 +8990,12 @@ async fn fable_send(
                 narrator_reasoning.clone(),
                 reply.raw_output.clone(),
             );
+            // Seed the binding for the first variant: base = the pre-turn world
+            // (captured before Stage 1), variant 0's schema = post-tracker.
+            if let Some(m) = gs.messages.last_mut() {
+                m.base_schema = Some(base_schema_snapshot.clone());
+                m.variant_schemas.push(post_tracker_schema.clone());
+            }
         }
     }
 
@@ -8589,6 +9054,27 @@ async fn fable_send(
 #[tauri::command]
 async fn fable_stop(state: tauri::State<'_, AppState>) -> Result<(), String> {
     tracing::info!("fable_stop requested");
+    let slot = state.active_fable_cancel.lock().expect("active_fable_cancel mutex");
+    if let Some(cancel) = slot.as_ref() {
+        cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+    Ok(())
+}
+
+/// Stage 3 (2026-08-11): the drawer's › interrupt. The user re-pressed ›
+/// mid-reroll to abandon the in-flight roll + start a fresh one. This signals
+/// the cancel token (halt decoding, same as `fable_stop`) AND sets the
+/// `fable_abort_requested` flag, which fable_send's post-reply abort check
+/// reads to discard the partial output + revert the schema to the pre-turn
+/// base + emit `cancelled` (vs `fable_stop`'s soft cancel that keeps its
+/// partial). The frontend awaits that `cancelled` event, then calls
+/// `reroll_last_turn` → `fable_send(reroll=true)` for the fresh roll.
+#[tauri::command]
+async fn fable_interrupt_reroll(state: tauri::State<'_, AppState>) -> Result<(), String> {
+    tracing::info!("fable_interrupt_reroll requested");
+    state
+        .fable_abort_requested
+        .store(true, std::sync::atomic::Ordering::Relaxed);
     let slot = state.active_fable_cancel.lock().expect("active_fable_cancel mutex");
     if let Some(cancel) = slot.as_ref() {
         cancel.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -8675,6 +9161,7 @@ async fn fable_end(
     clear_fable_history(&state).await;
     *state.fable_session.lock().await = session::Conversation::new();
     *state.active_fable_card.lock().expect("active_fable_card mutex") = None;
+    *state.active_player_id.lock().expect("active_player_id mutex") = None;
 
     // 4. Clear any leftover game cancel token.
     *state.active_fable_cancel.lock().expect("active_fable_cancel mutex") = None;
@@ -9121,25 +9608,74 @@ async fn player_state_get(
         .map_err(|e| format!("serialize player state: {e}"))?)
 }
 
-/// Return the identity of the currently-seated fable card as `{ name,
-/// player_name }` — for the stage's "(name) is currently typing.." indicator
-/// AND the message-header names (card name → narrator beats; player_name →
-/// user beats). `player_name` is the empty string when the card omits
-/// `<player_name>`. `None` (serialized as null) when no game is active.
+/// Return the identity of the currently-seated fable card plus the chat-UI
+/// portrait data: `{ name, player_name, card_id, card_portrait_url,
+/// player_portrait_url, npc_names }`.
+///
+/// - `name` / `player_name` — the stage's "(name) is currently typing.."
+///   indicator + message-header names (card name → narrator beats;
+///   player_name → user beats). `player_name` is "" when the card omits
+///   `<player_name>`.
+/// - `card_id` — the seated card's id (for resolving the card portrait
+///   sibling file `cards/<id>/portrait.*`).
+/// - `card_portrait_url` — absolute path to the card/narrator portrait, or
+///   null when no portrait sibling exists. Resolved via the same png/jpg/jpeg
+///   stat-walk as `fable_card_portrait_url`. The narrator + every NPC (NPC
+///   portraits are deferred) fall back to this in the VN chat UI.
+/// - `player_portrait_url` — absolute path to the active saved player's
+///   portrait, or null (Quick Play / playerless game / no portrait). Resolved
+///   via `load_player_portrait` from `active_player_id`.
+/// - `npc_names` — `{ id, name }` pairs from the card's `<cast>`, so the chat
+///   can render real NPC display names on character beats (replaces the old
+///   slug-title-case fallback).
+///
+/// `None` (serialized as null) when no game is active.
 ///
 /// FRONTEND CONTRACT: the JS consumer (stage.js `refreshActiveCardName`)
 /// accepts BOTH this object shape AND a legacy plain-string shape, so a
-/// frontend built against the older `Option<String>` return still works.
-/// Uses the same `fable_is_active` gate as the other read-only fable queries.
+/// frontend built against the older `Option<String>` return still works — it
+/// reads each new field defensively. Uses the same `fable_is_active` gate as
+/// the other read-only fable queries.
 #[tauri::command]
 fn fable_active_card_get(
     state: tauri::State<'_, AppState>,
+    app: tauri::AppHandle,
 ) -> Result<Option<serde_json::Value>, String> {
     let guard = state.active_fable_card.lock().expect("active_fable_card mutex");
     Ok(guard.as_ref().map(|c| {
+        // Resolve the card portrait sibling (png/jpg/jpeg stat-walk, mirrors
+        // fable_card_portrait_url). Best-effort — a missing cards dir degrades
+        // to null.
+        let card_portrait_url = resolve_fable_cards_dir(&app)
+            .map(|root| {
+                let card_dir = resolve_card_dir(&root, &c.id);
+                for ext in ["png", "jpg", "jpeg"] {
+                    let path = card_dir.join(format!("portrait.{ext}"));
+                    if path.is_file() {
+                        return Some(path.to_string_lossy().into_owned());
+                    }
+                }
+                None
+            })
+            .flatten();
+        // Resolve the active player portrait (null for Quick Play / playerless).
+        let player_portrait_url = state
+            .active_player_id
+            .lock()
+            .expect("active_player_id mutex")
+            .as_deref()
+            .and_then(|pid| load_player_portrait(&app, pid));
+        // The cast NPC id→name map (real speaker labels on character beats).
+        let npc_names: Vec<serde_json::Value> = c.cast.iter().map(|n| {
+            serde_json::json!({ "id": n.id, "name": n.name })
+        }).collect();
         serde_json::json!({
             "name": c.name,
             "player_name": c.player_name.clone().unwrap_or_default(),
+            "card_id": c.id,
+            "card_portrait_url": card_portrait_url,
+            "player_portrait_url": player_portrait_url,
+            "npc_names": npc_names,
         })
     }))
 }
@@ -9161,23 +9697,52 @@ async fn fable_schema_get(
 }
 
 /// Replace the live `WorldSchema` with a manually-edited one (from the Tracker
-/// tab). This is a USER-INITIATED edit (the same trust class as `fable_rollback`
-/// + `fable_load_save`): it bypasses the §11.19 immutability lock (that lock
-/// gates LLM-initiated deltas, not user edits). The pre-edit schema is pushed
-/// to the history ring buffer first so the manual edit is undoable via the
-/// existing `fable_rollback` (1-click undo) — mirrors every other mutation
-/// site. `schema_json` is a full serialized `WorldSchema`.
+/// tab OR the Soul Gem inventory panel). This is a USER-INITIATED edit (the
+/// same trust class as `fable_rollback` + `fable_load_save`): it bypasses the
+/// §11.19 immutability lock (that lock gates LLM-initiated deltas, not user
+/// edits). The pre-edit schema is pushed to the history ring buffer first so
+/// the manual edit is undoable via the existing `fable_rollback` (1-click undo)
+/// — mirrors every other mutation site. `schema_json` is a full serialized
+/// `WorldSchema`.
+///
+/// `event_note` (optional, 2026-08-08): when the Soul Gem inventory panel fires
+/// a physical action (EQUIP/CONSUME/POCKET/STORE/DISCARD), it passes a short
+/// past-tense description here ("equipped Iron Sword", "consumed Health Potion").
+/// The note is appended to the installed schema's `recent_events`, which the
+/// next narrator turn renders inside `<world_state>` — so the API narrator is
+/// AWARE of the player's UI action without needing the player to re-type it.
+/// This closes the schema-to-narrator loop: a UI action leaves a trace the
+/// narrator sees, not just a silent state mutation. The Tracker-tab raw editor
+/// passes `None` (no trace — it's a bulk editorial edit, not an in-fiction act).
+/// The note is capped at EVENT_NOTE_MAX chars + trimmed; an empty/whitespace
+/// note is dropped (no trace). The `recent_events` render caps at the last 5,
+/// so older UI-action traces age out naturally as the world moves.
 #[tauri::command]
 async fn fable_schema_set(
     schema_json: serde_json::Value,
+    event_note: Option<String>,
     state: tauri::State<'_, AppState>,
     app: tauri::AppHandle,
 ) -> Result<(), String> {
     if !fable_is_active(&state) {
         return Err("no fable game active: call fable_start first".to_string());
     }
-    let new_schema: schema::WorldSchema = serde_json::from_value(schema_json)
+    let mut new_schema: schema::WorldSchema = serde_json::from_value(schema_json)
         .map_err(|e| format!("deserialize world schema: {e}"))?;
+    // If a UI-action trace was supplied, append it to recent_events so the next
+    // narrator turn sees the physical action in <world_state>. Trim + cap; drop
+    // empty. This runs BEFORE install so the persisted schema carries the trace.
+    if let Some(note) = event_note {
+        let trimmed = note.trim();
+        if !trimmed.is_empty() {
+            let capped = if trimmed.chars().count() > EVENT_NOTE_MAX {
+                trimmed.chars().take(EVENT_NOTE_MAX).collect::<String>()
+            } else {
+                trimmed.to_string()
+            };
+            new_schema.recent_events.push(capped);
+        }
+    }
     // Snapshot the current schema for undo, then install the edit.
     {
         let snap = state.fable_schema.lock().await.clone();
@@ -9193,18 +9758,16 @@ async fn fable_schema_set(
     let roleplay_card_id = state.active_card_id.lock().expect("active_card_id mutex").clone();
     let schema_snapshot = state.fable_schema.lock().await.clone();
     save_schema(&app, &roleplay_card_id, &schema_snapshot).await;
-    tracing::info!(card_id = %roleplay_card_id, "fable_schema_set: manual Tracker edit applied + persisted");
+    tracing::info!(card_id = %roleplay_card_id, "fable_schema_set: manual edit applied + persisted");
     Ok(())
 }
 
-/// The editable slice of the active card, returned to the Card tab (left
-/// drawer). `null` when no game is active. The Card tab edits these fields
-/// live (the changes apply to the next narrator turn immediately via
-/// `fable_card_save`). NOTE (2026-07-31): edits are SESSION-ONLY — they
-/// update the in-memory card + the live persona but are NOT written back to
-/// the `.sim` file on disk (a full round-trip serializer is deferred; this
-/// avoids the data-loss risk of a partial serializer while still delivering
-/// live editing).
+/// The active card's identity slice, returned to the read-only Sim Card tab
+/// (right drawer). `null` when no game is active. The tab renders these as
+/// read-only prose; editing happens via the ✎ raw editor (`fable_card_raw_*`,
+/// which writes the `.sim` on disk) or by talking to WUPI. (The old inline
+/// `fable_card_save` session-only edit path was retired 2026-08-11 when the
+/// tab went read-only.)
 #[tauri::command]
 fn fable_card_get(
     state: tauri::State<'_, AppState>,
@@ -9218,53 +9781,10 @@ fn fable_card_get(
             "plot": c.plot.clone().unwrap_or_default(),
             "tone": c.tone.clone().unwrap_or_default(),
             // opening_scene removed 2026-08-05: the intro lives in a sibling
-            // .intro file, not on the cached card. The Card tab no longer
-            // surfaces a live-editable intro field (it's a one-shot seed, not
-            // a per-turn persona field).
+            // .intro file, not on the cached card.
             "player_name": c.player_name.clone().unwrap_or_default(),
         })
     }))
-}
-
-/// Apply a Card-tab edit to the active card (session-only — see
-/// `fable_card_get`). Updates the editable scalar fields on the in-memory
-/// card so the next narrator turn picks up the new voice/setting/first-
-/// message. Null/absent fields in `fields` are left unchanged. The on-disk
-/// `.sim` file is NOT modified.
-#[tauri::command]
-fn fable_card_save(
-    fields: serde_json::Value,
-    state: tauri::State<'_, AppState>,
-) -> Result<(), String> {
-    let obj = fields.as_object().ok_or("fields must be a JSON object")?;
-    let mut guard = state.active_fable_card.lock().expect("active_fable_card mutex");
-    let card = guard
-        .as_mut()
-        .ok_or("no active fable card: call fable_start first")?;
-    if let Some(name) = obj.get("name").and_then(|v| v.as_str()) {
-        if !name.trim().is_empty() {
-            card.name = name.to_string();
-        }
-    }
-    if let Some(p) = obj.get("core_persona").and_then(|v| v.as_str()) {
-        card.core_persona = p.to_string();
-    }
-    if let Some(s) = obj.get("setting").and_then(|v| v.as_str()) {
-        card.setting = if s.trim().is_empty() { None } else { Some(s.to_string()) };
-    }
-    if let Some(p) = obj.get("plot").and_then(|v| v.as_str()) {
-        card.plot = if p.trim().is_empty() { None } else { Some(p.to_string()) };
-    }
-    if let Some(t) = obj.get("tone").and_then(|v| v.as_str()) {
-        card.tone = if t.trim().is_empty() { None } else { Some(t.to_string()) };
-    }
-    // opening_scene no longer lives on the card (2026-08-05: sibling .intro
-    // file). A stale `opening_scene` key in the payload is silently ignored.
-    if let Some(pn) = obj.get("player_name").and_then(|v| v.as_str()) {
-        card.player_name = if pn.trim().is_empty() { None } else { Some(pn.to_string()) };
-    }
-    tracing::info!("fable_card_save: session-only Card-tab edit applied");
-    Ok(())
 }
 
 // ── Per-card raw-file IPCs (2026-08-01 Fable tab rail + raw editor) ───────
@@ -9311,9 +9831,9 @@ fn fable_card_raw_get(
 /// Validate + atomically write the active card's `.sim` file (the raw editor's
 /// save path for the Sim Card tab). Validates through the REAL parser
 /// (`parse_from_xml_str`) before any disk touch — malformed XML is rejected,
-/// the file untouched. Unlike the session-only `fable_card_save`, this writes
-/// the `.sim` to disk (the raw-editor contract: edit the whole file, persist
-/// it). The live narrator card is NOT re-seated here (the next `fable_start`
+/// the file untouched. This writes the `.sim` to disk (the raw-editor
+/// contract: edit the whole file, persist it). The live narrator card is
+/// NOT re-seated here (the next `fable_start`
 /// picks up the edit); a live re-seat is a future enhancement.
 #[tauri::command]
 fn fable_card_raw_set(
@@ -9662,6 +10182,267 @@ fn fable_card_portrait_url(card_id: String, app: tauri::AppHandle) -> Result<Opt
     Ok(None)
 }
 
+// ─────────────────────────────────────────────────────────────────────────
+// Fable BACKGROUND LIBRARY (2026-08-11): a user-importable image library at
+// `apps/fable/images/backgrounds/` (GLOBAL, shared across cards) + a PER-CARD
+// "active background" selection stored on `WorldSchema.background` (an
+// `Option<String>` filename). The selection rides inside EVERY save — the full
+// schema is snapshotted by `fable_save_now`, the per-turn autosave, + Quick
+// Play's quicksave — and `fable_load_save` restores it, so leaving + continuing
+// brings the background back with the save. The AI tracker never touches it
+// (`apply_delta`/`merge_patch` omit it; `render_for_prompt` doesn't emit it).
+//
+// Import is CROPPER-driven: the frontend picks a file → reads bytes via
+// `fable_player_portrait_read_bytes` (same-origin data URL, avoids canvas
+// tainting) → runs the background cropper → sends the CROPPED bytes here as
+// base64-over-JSON (anti-pattern #5: a bare `Vec<u8>` arg poisons IPC
+// registration). `write_atomic` + a path-traversal guard on the filename.
+// Resolution is uncapped — the frontend paints with `background-size: contain`,
+// so the whole image always shows (non-16:9 / ultrawide → transparent bars =
+// the black void). 1440p 16:9 is the documented sweet spot (UI hint only).
+// ─────────────────────────────────────────────────────────────────────────
+
+/// Resolve the backgrounds library root: `<install_root>/apps/fable/images/
+/// backgrounds/`. Mirrors `resolve_fable_players_dir`. The dir is created
+/// lazily by list/import (mkdir on first use), so a fresh install resolves
+/// even before any import. GLOBAL — shared across all cards (only the
+/// SELECTION on `WorldSchema.background` is per-card).
+fn resolve_fable_backgrounds_dir(app: &tauri::AppHandle) -> std::path::PathBuf {
+    resolve_apps_dir(app).join("fable").join("images").join("backgrounds")
+}
+
+/// One row in the backgrounds library — the shape the frontend gallery renders.
+/// `name` is the filename STEM (no extension) for display; `filename` is the
+/// real on-disk name (case/spaces preserved — it's the user's own import);
+/// `path` is absolute, ready for the frontend's `convertFileSrc`; `ext` is the
+/// normalized "png"/"jpg".
+#[derive(serde::Serialize, Clone)]
+struct BackgroundMeta {
+    name: String,
+    filename: String,
+    path: String,
+    ext: String,
+}
+
+/// Path-traversal + sanity guard shared by import/delete/active_set: the
+/// filename must be a bare file name (no separators, no `..`, no drive/colon,
+/// no NUL), and must end in a png/jpg/jpeg ext. Mirrors the `fable_card_delete`
+/// id guard + the portrait ext allowlist.
+fn validate_bg_filename(filename: &str) -> Result<(), String> {
+    if filename.is_empty()
+        || filename.contains('/')
+        || filename.contains('\\')
+        || filename.contains("..")
+        || filename.contains(':')
+        || filename.contains('\0')
+        || filename.contains(std::path::MAIN_SEPARATOR)
+    {
+        return Err(format!("invalid background filename '{filename}'"));
+    }
+    let lower = filename.to_lowercase();
+    if !(lower.ends_with(".png") || lower.ends_with(".jpg") || lower.ends_with(".jpeg")) {
+        return Err(format!("unsupported background ext '{filename}': png/jpg only"));
+    }
+    Ok(())
+}
+
+/// Build a `BackgroundMeta` from a library file path. The stem is the display
+/// name; `ext` is normalized (jpeg → jpg) so the frontend never branches on it.
+fn bg_meta_from_path(path: &std::path::Path) -> Option<BackgroundMeta> {
+    let fname = path.file_name()?.to_str()?.to_string();
+    let stem = path.file_stem()?.to_str()?.to_string();
+    let ext_raw = path.extension()?.to_str()?.to_lowercase();
+    let ext = if ext_raw == "jpeg" { "jpg".to_string() } else { ext_raw };
+    Some(BackgroundMeta {
+        name: stem,
+        filename: fname,
+        path: path.to_string_lossy().into_owned(),
+        ext,
+    })
+}
+
+/// List every importable background in the library (png/jpg). The dir is
+/// created on first call so a fresh install returns an empty list (NOT an
+/// error) — the gallery shows its empty state + the Import button. Sorted by
+/// display name, case-insensitive (stable order for the gallery tiles).
+#[tauri::command]
+fn fable_backgrounds_list(app: tauri::AppHandle) -> Result<Vec<BackgroundMeta>, String> {
+    let dir = resolve_fable_backgrounds_dir(&app);
+    std::fs::create_dir_all(&dir).map_err(|e| format!("mkdir backgrounds: {e}"))?;
+    let mut out = Vec::new();
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return Ok(out);
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let Some(lower_ext) = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|s| s.to_lowercase())
+        else {
+            continue;
+        };
+        if lower_ext != "png" && lower_ext != "jpg" && lower_ext != "jpeg" {
+            continue;
+        }
+        // Skip the marker file if it ever lands inside the library dir (it
+        // lives one level up, but defensive — never show it as a tile).
+        if path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(|n| n.starts_with(".active_background"))
+            .unwrap_or(false)
+        {
+            continue;
+        }
+        if let Some(meta) = bg_meta_from_path(&path) {
+            out.push(meta);
+        }
+    }
+    out.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+    Ok(out)
+}
+
+/// Import a CROPPED background image (bytes from the frontend cropper) into
+/// the library. Takes `bytes_b64: String` (base64-over-JSON — a bare `Vec<u8>`
+/// arg poisons Tauri v2 IPC registration at startup, anti-pattern #5) +
+/// `filename_stem` (the picker's original stem, threaded through the cropper so
+/// the library shows the user's chosen name). Magic-byte validation is
+/// authoritative: a `.JPEG` source normalizes to `.jpg`, a mis-named file with
+/// real PNG magic bytes lands as `.png` (mirrors `fable_player_portrait_
+/// upload_bytes`). Collisions overwrite atomically. Returns the new row for an
+/// immediate gallery insert + auto-select.
+#[tauri::command]
+fn fable_background_import_bytes(
+    bytes_b64: String,
+    filename_stem: String,
+    app: tauri::AppHandle,
+) -> Result<BackgroundMeta, String> {
+    let bytes = base64_decode(&bytes_b64)?;
+    let detected = player::validate_image_magic(&bytes)?; // "png" | "jpg" (magic-byte authoritative)
+    // Sanitize the caller-supplied stem: strip path separators / traversal so a
+    // hostile or malformed stem can't escape the library dir. Preserve spaces +
+    // case — it's the user's own filename stem + that's the gallery display name.
+    let stem_clean: String = filename_stem
+        .trim()
+        .chars()
+        .filter(|c| !matches!(*c, '/' | '\\' | ':' | '\0') && *c != std::path::MAIN_SEPARATOR)
+        .collect();
+    let stem = if stem_clean.is_empty() || stem_clean.contains("..") {
+        // Defensive fallback for an empty / all-hostile stem.
+        let ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        format!("background_{ms}")
+    } else {
+        stem_clean
+    };
+    let filename = format!("{stem}.{detected}");
+    validate_bg_filename(&filename)?;
+    let dir = resolve_fable_backgrounds_dir(&app);
+    std::fs::create_dir_all(&dir).map_err(|e| format!("mkdir backgrounds: {e}"))?;
+    let path = dir.join(&filename);
+    write_atomic(&path, &bytes).map_err(|e| format!("write background: {e}"))?;
+    tracing::info!(filename = %filename, bytes = bytes.len(), "fable_background_import_bytes: cropped background written");
+    bg_meta_from_path(&path).ok_or_else(|| "imported background vanished".to_string())
+}
+
+/// Delete a background from the library by filename. The caller (frontend)
+/// clears the active card's selection first via `fable_background_active_set
+/// (None)` when the deleted file was the active selection; this command does
+/// NOT touch `WorldSchema.background` — it only removes the library file.
+/// Path-traversal guard before the join. Idempotent: a missing file is Ok.
+#[tauri::command]
+fn fable_background_delete(filename: String, app: tauri::AppHandle) -> Result<(), String> {
+    validate_bg_filename(&filename)?;
+    let dir = resolve_fable_backgrounds_dir(&app);
+    let path = dir.join(&filename);
+    match std::fs::remove_file(&path) {
+        Ok(()) => tracing::info!(filename = %filename, "fable_background_delete: removed"),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(format!("delete background: {e}")),
+    }
+    Ok(())
+}
+
+/// Read the ACTIVE CARD's selected background + resolve it to a
+/// `BackgroundMeta`. The selection lives on `WorldSchema.background` (per-card,
+/// save-persistent). Returns None when no game is active, no selection is set,
+/// OR the referenced library file no longer exists (a deleted background auto-
+/// clears — the stage falls back to the black void). Never errors: a missing
+/// game/selection/stat all degrade to None so the frontend never blocks on it.
+#[tauri::command]
+async fn fable_background_active_get(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+) -> Result<Option<BackgroundMeta>, String> {
+    if !fable_is_active(&state) {
+        return Ok(None);
+    }
+    let filename = state.fable_schema.lock().await.background.clone();
+    let Some(filename) = filename else {
+        return Ok(None);
+    };
+    let path = resolve_fable_backgrounds_dir(&app).join(&filename);
+    if !path.is_file() {
+        return Ok(None);
+    }
+    Ok(bg_meta_from_path(&path))
+}
+
+/// Set (Some) or clear (None) the ACTIVE CARD's selected background. Writes
+/// `WorldSchema.background` + persists the schema per-card (so the selection
+/// survives card re-entry) — and because the full schema is snapshotted by
+/// every save path, the selection rides into the next manual/quick/autosave
+/// automatically. `Some(filename)` must reference an existing library file
+/// (validated before the schema is touched, so the field never points at a
+/// ghost). `None` clears the field (→ the stage reverts to the default black
+/// void).
+#[tauri::command]
+async fn fable_background_active_set(
+    filename: Option<String>,
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+) -> Result<(), String> {
+    if !fable_is_active(&state) {
+        return Err("no fable game active: call fable_start first".to_string());
+    }
+    match filename {
+        None => {
+            {
+                let mut s = state.fable_schema.lock().await;
+                s.background = None;
+            }
+            tracing::info!("fable_background_active_set: cleared");
+        }
+        Some(name) => {
+            validate_bg_filename(&name)?;
+            let path = resolve_fable_backgrounds_dir(&app).join(&name);
+            if !path.is_file() {
+                return Err(format!("background '{name}' not in library"));
+            }
+            {
+                let mut s = state.fable_schema.lock().await;
+                s.background = Some(name.clone());
+            }
+            tracing::info!(filename = %name, "fable_background_active_set: selected");
+        }
+    }
+    // Persist the edited schema per-card (best-effort, mirrors fable_schema_set).
+    let roleplay_card_id = state
+        .active_card_id
+        .lock()
+        .expect("active_card_id mutex")
+        .clone();
+    let schema_snapshot = state.fable_schema.lock().await.clone();
+    save_schema(&app, &roleplay_card_id, &schema_snapshot).await;
+    Ok(())
+}
+
 /// Delete a card's entire per-card folder (`cards/<id>/` — the `.sim` + every
 /// sibling: `.intro`, `.codex`, `world.json`, `player.json`, `npc.json`,
 /// `portrait.*`, the `saves/` tree). Added 2026-08-05 for the LOAD menu's
@@ -9701,12 +10482,13 @@ fn fable_card_delete(card_id: String, app: tauri::AppHandle) -> Result<(), Strin
 
 /// A single entity-key change in a rollback diff (1-click undo, 2026-07-27).
 /// `before`/`after` are `Option` because the diff covers set, change, AND
-/// delete (None = key absent in that snapshot).
+/// delete (None = key absent in that snapshot). Values are `serde_json::Value`
+/// to mirror the widened `WorldSchema.entities` type (2026-08-11).
 #[derive(Clone, Debug, serde::Serialize)]
 struct EntityDiff {
     key: String,
-    before: Option<String>,
-    after: Option<String>,
+    before: Option<serde_json::Value>,
+    after: Option<serde_json::Value>,
 }
 
 /// The structured diff between two consecutive `fable_schema` snapshots.
@@ -10186,6 +10968,29 @@ async fn edit_message(
     Ok(EditResponse { messages, schema_pop_count: 0 })
 }
 
+/// Permanently remove a single message by index + shift subsequent messages
+/// down (the same primitive the model-facing `fable_message_delete` tool uses:
+/// `Conversation::remove_at`). No inference, no schema change (schema_pop_count
+/// = 0 — world state is untouched; deleting a mid-history message does NOT
+/// retroactively undo its tracker mutations, by design). Returns the new
+/// message list. Destructive (no conversation-undo), so the drawer gates it
+/// behind a two-step inline confirm.
+#[tauri::command]
+async fn delete_message(
+    index: usize,
+    state: tauri::State<'_, AppState>,
+    app: tauri::AppHandle,
+) -> Result<EditResponse, String> {
+    let card_id = active_fable_card_id(&state)?;
+    let messages = {
+        let mut gs = state.fable_session.lock().await;
+        gs.remove_at(index)?;
+        project_messages(&gs)
+    };
+    persist_fable_session(&app, &state, &card_id).await?;
+    Ok(EditResponse { messages, schema_pop_count: 0 })
+}
+
 /// Validate that the last message is an assistant turn that can be re-rolled.
 /// With swipeable variants (2026-07-29), the reroll no longer POPS the
 /// assistant message — instead the old content is stashed as a swipeable
@@ -10228,7 +11033,10 @@ async fn swipe_variant(
     app: tauri::AppHandle,
 ) -> Result<EditResponse, String> {
     let card_id = active_fable_card_id(&state)?;
-    let messages = {
+    // Select the variant (swaps content/raw/active_idx) + capture its stored
+    // schema (the variant↔schema binding, 2026-08-11) in ONE session-lock
+    // scope. The schema install below runs in its own scope — no nested locks.
+    let (install_schema, messages) = {
         let mut gs = state.fable_session.lock().await;
         let len = gs.messages.len();
         let msg = gs.messages.get_mut(index).ok_or_else(|| {
@@ -10241,8 +11049,21 @@ async fn swipe_variant(
             ));
         }
         msg.select_variant(variant_idx);
-        project_messages(&gs)
+        // The world state this variant produced. None for legacy messages with
+        // no stored schema → graceful no-op (the alt prose shows, the schema
+        // stays as whatever was last live).
+        let install = msg.variant_schemas.get(variant_idx).cloned();
+        (install, project_messages(&gs))
     };
+    // Install the variant's stored schema as the live world state so the
+    // paperdoll/inventory/etc. match the displayed prose — ZERO local-model
+    // work (no re-tracking, per the binding's design). Push the displaced live
+    // schema to the ring buffer so manual fable_rollback can still return.
+    if let Some(schema) = install_schema {
+        let snap = state.fable_schema.lock().await.clone();
+        push_fable_history_snapshot(&state, snap).await;
+        *state.fable_schema.lock().await = schema;
+    }
     persist_fable_session(&app, &state, &card_id).await?;
     Ok(EditResponse { messages, schema_pop_count: 0 })
 }
@@ -10401,6 +11222,26 @@ fn resolve_fable_players_dir(app: &tauri::AppHandle) -> std::path::PathBuf {
     resolve_apps_dir(app).join("fable").join("players")
 }
 
+/// Resolve a saved player's portrait to an absolute filesystem path (ready
+/// for the frontend's `convertFileSrc`), or `None` when the player has no
+/// portrait or the portrait file is missing/stale. Loads the player JSON,
+/// reads the relative `portrait` filename, and stat-checks the sibling file.
+/// Shared by `fable_player_get` (full player load) and `fable_active_card_get`
+/// (chat portrait bridge) so the resolution logic lives in one place.
+/// Best-effort: a missing player JSON or a stat error degrades to `None`.
+fn load_player_portrait(app: &tauri::AppHandle, id: &str) -> Option<String> {
+    let dir = resolve_fable_players_dir(app);
+    let json_path = dir.join(id).join(format!("{id}.json"));
+    let player = load_player_at(&json_path)?;
+    let fname = player.portrait?;
+    let abs = dir.join(id).join(&fname);
+    if abs.is_file() {
+        Some(abs.to_string_lossy().into_owned())
+    } else {
+        None
+    }
+}
+
 /// Enumerate every saved player's namesake JSON under a players root.
 /// Mirrors `iter_card_sim_paths`: each entry is a per-player folder
 /// `players/<name>/`, and only the namesake file `<name>/<name>.json`
@@ -10493,19 +11334,39 @@ fn fable_player_get(id: String, app: tauri::AppHandle) -> Result<player::SavedPl
     let json_path = dir.join(&id).join(format!("{id}.json"));
     let mut player = load_player_at(&json_path)
         .ok_or_else(|| format!("no saved player with id '{id}'"))?;
-    // Resolve the portrait filename to an absolute path so the frontend
-    // can feed it straight to convertFileSrc (the asset-protocol bridge).
-    if let Some(fname) = player.portrait.clone() {
-        let abs = dir.join(&id).join(&fname);
-        if abs.is_file() {
-            player.portrait = Some(abs.to_string_lossy().into_owned());
-        } else {
-            // Stale portrait ref (file deleted manually). Drop it rather
-            // than hand the frontend a broken path.
-            player.portrait = None;
-        }
-    }
+    // Resolve the portrait filename to an absolute path via the shared
+    // helper (same logic the chat portrait bridge uses).
+    player.portrait = load_player_portrait(&app, &id);
     Ok(player)
+}
+
+/// The SavedPlayer identity attached to the active game, or `None` when no
+/// player is attached (Quick Play, or a game started without choosing a saved
+/// player). The right-drawer Player tab reads this to render the identity +
+/// backstory sections. Reuses `fable_player_get`'s load + portrait-resolve
+/// path over `active_player_id` (set in `enter_fable_session`, cleared in
+/// `fable_end`) so it stays correct across reload/resume — the frontend does
+/// not retain the player id it passed to `fable_start`.
+#[tauri::command]
+fn fable_active_player_get(
+    state: tauri::State<'_, AppState>,
+    app: tauri::AppHandle,
+) -> Result<Option<player::SavedPlayer>, String> {
+    let pid = state
+        .active_player_id
+        .lock()
+        .expect("active_player_id mutex")
+        .clone();
+    let id = match pid {
+        None => return Ok(None),
+        Some(id) => id,
+    };
+    let dir = resolve_fable_players_dir(&app);
+    let json_path = dir.join(&id).join(format!("{id}.json"));
+    let mut player = load_player_at(&json_path)
+        .ok_or_else(|| format!("attached player '{id}' not found on disk"))?;
+    player.portrait = load_player_portrait(&app, &id);
+    Ok(Some(player))
 }
 
 /// Write (create or overwrite) a saved player. Validates via
@@ -10940,50 +11801,63 @@ mod tests {
     use super::*;
 
     #[test]
-    fn effective_local_ctx_local_returns_solo_constant() {
-        // 2026-07-31: context sizes now come from `settings.rs` (the single
-        // source of truth), not the user-tuned `settings.context_size`. Local
-        // mode (no API connected) returns CTX_LOCAL_SOLO regardless of the
-        // (now-ignored) settings value.
-        let settings = WupiSettings {
-            context_size: 4000,
-            conversation_budget: 16000,
-        };
+    fn effective_local_ctx_always_returns_with_api_constant() {
+        // Wupi chat is LOCAL-ONLY (2026-08-08 override): the chat backend
+        // ALWAYS runs at CTX_LOCAL_WITH_API (2048). The 4096 context is
+        // retired for chat — it was for narrative, which the local model no
+        // longer does. The source param is now read-ignored; both variants
+        // return the same constant.
+        let settings = WupiSettings { context_size: 8192, conversation_budget: 16000 };
         assert_eq!(
             effective_local_ctx(api::ModelSource::Local, &settings),
-            settings::CTX_LOCAL_SOLO,
-            "Local mode must return the CTX_LOCAL_SOLO constant from settings.rs"
+            settings::CTX_LOCAL_WITH_API,
+            "Local mode must return CTX_LOCAL_WITH_API (chat is always local-only now)"
         );
-    }
-
-    #[test]
-    fn effective_local_ctx_api_returns_with_api_constant_regardless_of_settings() {
-        // Under API the local chat backend demotes to CTX_LOCAL_WITH_API
-        // (silent-agent mode). The (now-ignored) settings value must NOT leak
-        // through.
-        let settings = WupiSettings {
-            context_size: 8192,
-            conversation_budget: 16000,
-        };
         assert_eq!(
             effective_local_ctx(api::ModelSource::Api, &settings),
             settings::CTX_LOCAL_WITH_API,
-            "API mode must always return CTX_LOCAL_WITH_API regardless of settings.context_size"
+            "API mode must return CTX_LOCAL_WITH_API (the chat context is always 2048)"
+        );
+        // The settings value must NOT leak through (read-ignored).
+        let default = WupiSettings::default();
+        assert_eq!(
+            effective_local_ctx(api::ModelSource::Local, &default),
+            settings::CTX_LOCAL_WITH_API
         );
     }
 
-    #[test]
-    fn effective_local_ctx_default_settings() {
-        // Default settings under Local → CTX_LOCAL_SOLO; under Api →
-        // CT_LOCAL_WITH_API (both constants from settings.rs, not the default).
-        let settings = WupiSettings::default();
+    #[tokio::test]
+    async fn local_model_lock_serializes_consumers() {
+        // The local-model turn lock (2026-08-08) guarantees at most ONE local
+        // decode runs at any instant across chat / tracker / schema. Simulate
+        // two concurrent consumers both holding the lock + a "currently
+        // running" counter; assert it NEVER exceeds 1.
+        let lock = Arc::new(tokio::sync::Mutex::new(()));
+        let running = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let max_seen = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        let mut handles = Vec::new();
+        for _ in 0..2 {
+            let (lock, running, max_seen) =
+                (Arc::clone(&lock), Arc::clone(&running), Arc::clone(&max_seen));
+            handles.push(tokio::spawn(async move {
+                let _g = lock.lock().await;
+                let cur = running.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                max_seen.fetch_max(cur, std::sync::atomic::Ordering::SeqCst);
+                // Yield a few times so the other task gets a chance to race.
+                for _ in 0..5 {
+                    tokio::task::yield_now().await;
+                }
+                running.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+            }));
+        }
+        for h in handles {
+            h.await.unwrap();
+        }
         assert_eq!(
-            effective_local_ctx(api::ModelSource::Local, &settings),
-            settings::CTX_LOCAL_SOLO
-        );
-        assert_eq!(
-            effective_local_ctx(api::ModelSource::Api, &settings),
-            settings::CTX_LOCAL_WITH_API
+            max_seen.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "local-model turn lock must serialize — at most ONE consumer at a time"
         );
     }
 
@@ -11014,6 +11888,7 @@ mod tests {
             player_name: Some("Tester".into()),
             locations: Vec::new(),
             cast: Vec::new(),
+            start: sim_card::CardStart::default(),
         }
     }
 
@@ -11219,6 +12094,7 @@ mod tests {
             declared_activities: Vec::new(),
             locations: Vec::new(),
             cast: Vec::new(),
+            start: crate::sim_card::CardStart::default(),
         };
         let pacing = ScenePacing {
             mode: SceneMode::Exploration,
@@ -11319,7 +12195,8 @@ mod tests {
     fn make_test_schema(entities: &[(&str, &str)]) -> schema::WorldSchema {
         let mut s = schema::WorldSchema::default();
         for (k, v) in entities {
-            s.entities.insert((*k).to_owned(), (*v).to_owned());
+            s.entities
+                .insert((*k).to_owned(), serde_json::Value::String((*v).to_owned()));
         }
         s
     }
@@ -11338,12 +12215,12 @@ mod tests {
         assert_eq!(ring.len(), 5, "ring buffer must cap at FABLE_HISTORY_CAP");
         // FIFO: oldest (turn 2) should be at the front, newest (turn 6) at the back.
         assert_eq!(
-            ring.front().unwrap().entities.get("turn").map(|s| s.as_str()),
+            ring.front().unwrap().entities.get("turn").and_then(|v| v.as_str()),
             Some("2"),
             "FIFO eviction must drop the OLDEST snapshot"
         );
         assert_eq!(
-            ring.back().unwrap().entities.get("turn").map(|s| s.as_str()),
+            ring.back().unwrap().entities.get("turn").and_then(|v| v.as_str()),
             Some("6"),
             "newest snapshot must be at the back"
         );
@@ -11358,8 +12235,8 @@ mod tests {
         assert_eq!(diff.entities_changed.len(), 1, "only the changed key should diff");
         let e = &diff.entities_changed[0];
         assert_eq!(e.key, "gold");
-        assert_eq!(e.before.as_deref(), Some("100"));
-        assert_eq!(e.after.as_deref(), Some("80"));
+        assert_eq!(e.before.as_ref().and_then(|v| v.as_str()), Some("100"));
+        assert_eq!(e.after.as_ref().and_then(|v| v.as_str()), Some("80"));
         assert!(!diff.summary_changed, "summary unchanged");
     }
 
@@ -11384,14 +12261,26 @@ mod tests {
             .map(|e| (e.key.as_str(), e))
             .collect();
         // Value change.
-        assert_eq!(by_key["npc.marcus"].before.as_deref(), Some("tavern"));
-        assert_eq!(by_key["npc.marcus"].after.as_deref(), Some("blacksmith"));
+        assert_eq!(
+            by_key["npc.marcus"].before.as_ref().and_then(|v| v.as_str()),
+            Some("tavern")
+        );
+        assert_eq!(
+            by_key["npc.marcus"].after.as_ref().and_then(|v| v.as_str()),
+            Some("blacksmith")
+        );
         // Removed (before Some, after None).
-        assert_eq!(by_key["item.iron_sword"].before.as_deref(), Some("1"));
+        assert_eq!(
+            by_key["item.iron_sword"].before.as_ref().and_then(|v| v.as_str()),
+            Some("1")
+        );
         assert_eq!(by_key["item.iron_sword"].after, None);
         // Added (before None, after Some).
         assert_eq!(by_key["item.health_potion"].before, None);
-        assert_eq!(by_key["item.health_potion"].after.as_deref(), Some("3"));
+        assert_eq!(
+            by_key["item.health_potion"].after.as_ref().and_then(|v| v.as_str()),
+            Some("3")
+        );
     }
 
     #[test]
@@ -11654,6 +12543,59 @@ mod tests {
             !serialized.contains("timestamp"),
             "timestamp must NOT leak to UI: {serialized}"
         );
+    }
+
+    // ---- cap_assistant_prose (2026-08-10, T52 overflow fix) ---------------
+    // The tracker window must not blow the 2922 budget when the API narrator's
+    // beat is long. These pin the truncation logic without any model/GPU.
+
+    /// Build a small message window for cap tests (avoids the full Message
+    /// constructor's required fields — we only care about role + content).
+    fn make_cap_window(user: &str, assistant: &str) -> Vec<session::Message> {
+        let mut c = session::Conversation::new();
+        c.add_message(session::Role::User, user.into());
+        c.add_message(session::Role::Assistant, assistant.into());
+        c.messages.clone()
+    }
+
+    #[test]
+    fn cap_assistant_prose_truncates_long_assistant_message() {
+        let long = "x".repeat(1000);
+        let window = make_cap_window("go", &long);
+        let capped = cap_assistant_prose(window, 100);
+        // User message untouched.
+        assert_eq!(capped[0].content, "go");
+        // Assistant capped to ~100 chars + ellipsis marker.
+        assert!(capped[1].content.len() < 120, "should be truncated well under original 1000");
+        assert!(capped[1].content.ends_with(" […]\n"), "ellipsis marker appended");
+    }
+
+    #[test]
+    fn cap_assistant_prose_leaves_short_messages_untouched() {
+        let window = make_cap_window("I swing my sword.", "The orc parries.");
+        let capped = cap_assistant_prose(window.clone(), 600);
+        assert_eq!(capped[0].content, window[0].content);
+        assert_eq!(capped[1].content, window[1].content, "short assistant message untouched");
+    }
+
+    #[test]
+    fn cap_assistant_prose_is_utf8_safe_on_multibyte_chars() {
+        // Smart quotes + em-dashes (multi-byte) — must not split mid-char.
+        let prose = "“Hello — world.” ".repeat(80); // ~1120 chars, all multi-byte
+        let window = make_cap_window("act", &prose);
+        let capped = cap_assistant_prose(window, 100);
+        // Must be valid UTF-8 (no panic = the char_indices truncation worked).
+        assert!(capped[1].content.chars().count() <= 105, "truncated near the 100-char cap");
+        assert!(capped[1].content.ends_with(" […]\n"));
+    }
+
+    #[test]
+    fn cap_assistant_prose_does_not_cap_user_messages() {
+        let long_user = "y".repeat(1000);
+        let mut c = session::Conversation::new();
+        c.add_message(session::Role::User, long_user.clone());
+        let capped = cap_assistant_prose(c.messages.clone(), 100);
+        assert_eq!(capped[0].content, long_user, "user messages are never capped");
     }
 
 }
@@ -11933,7 +12875,10 @@ mod phase3_integration_tests {
         // output is a clean one-liner that slots into the <directives> block.
         use std::collections::HashMap;
         let mut entities = HashMap::new();
-        entities.insert("npc.gate_guard.tier".to_string(), "soldier".to_string());
+        entities.insert(
+            "npc.gate_guard.tier".to_string(),
+            serde_json::Value::String("soldier".into()),
+        );
         let tags = vec![consequence::StatusTag {
             label: "city guard uniform".into(),
             polarity: consequence::Polarity::Buff,
@@ -12753,7 +13698,7 @@ mod phase3_wiring_tests {
     // Helper: build a SchemaDelta with a single entity write.
     fn delta_with_entity(key: &str, value: &str) -> SchemaDelta {
         let mut entities = HashMap::new();
-        entities.insert(key.to_string(), Some(value.to_string()));
+        entities.insert(key.to_string(), Some(serde_json::Value::String(value.to_string())));
         SchemaDelta {
             summary: None,
             recent_events: None,
@@ -12776,9 +13721,9 @@ mod phase3_wiring_tests {
             recent_events: None,
             entities: Some({
                 let mut m = HashMap::new();
-                m.insert("rel.npc.marcus".to_string(), Some("trusted".to_string()));
+                m.insert("rel.npc.marcus".to_string(), Some(serde_json::Value::String("trusted".into())));
                 // A legitimate non-rel write that MUST survive the strip.
-                m.insert("weather".to_string(), Some("rainy".to_string()));
+                m.insert("weather".to_string(), Some(serde_json::Value::String("rainy".into())));
                 m
             }),
         };
@@ -12800,7 +13745,7 @@ mod phase3_wiring_tests {
         );
         assert_eq!(
             ents.get("weather"),
-            Some(&Some("rainy".to_string())),
+            Some(&Some(serde_json::Value::String("rainy".into()))),
             "the non-rel key must survive the strip"
         );
         // The schema's relationship map was NOT mutated (the write was
@@ -12903,8 +13848,8 @@ mod phase3_wiring_tests {
             recent_events: Some(vec!["the guard arrived".to_string()]),
             entities: Some({
                 let mut m = HashMap::new();
-                m.insert("weather".to_string(), Some("stormy".to_string()));
-                m.insert("door.cellar".to_string(), Some("open".to_string()));
+                m.insert("weather".to_string(), Some(serde_json::Value::String("stormy".into())));
+                m.insert("door.cellar".to_string(), Some(serde_json::Value::String("open".into())));
                 m
             }),
         };
@@ -13112,8 +14057,8 @@ mod phase3_wiring_tests {
 
         // Entities present but no tier keys.
         let mut entities = HashMap::new();
-        entities.insert("weather".to_string(), "rainy".to_string());
-        entities.insert("npc.marcus.name".to_string(), "Marcus".to_string());
+        entities.insert("weather".to_string(), serde_json::Value::String("rainy".into()));
+        entities.insert("npc.marcus.name".to_string(), serde_json::Value::String("Marcus".into()));
         assert_eq!(
             player_state::select_attacker_tier_from_entities(&entities),
             player_state::AttackerTier::Soldier,
@@ -13126,7 +14071,10 @@ mod phase3_wiring_tests {
     #[test]
     fn wiring_tier_selection_picks_declared_legendary() {
         let mut entities = HashMap::new();
-        entities.insert("npc.dragon.tier".to_string(), "legendary".to_string());
+        entities.insert(
+            "npc.dragon.tier".to_string(),
+            serde_json::Value::String("legendary".into()),
+        );
         assert_eq!(
             player_state::select_attacker_tier_from_entities(&entities),
             player_state::AttackerTier::Legendary,
@@ -13138,9 +14086,9 @@ mod phase3_wiring_tests {
     #[test]
     fn wiring_tier_selection_picks_highest_threat() {
         let mut entities = HashMap::new();
-        entities.insert("npc.thug1.tier".to_string(), "soldier".to_string());
-        entities.insert("npc.dragon.tier".to_string(), "legendary".to_string());
-        entities.insert("npc.goblin1.tier".to_string(), "minion".to_string());
+        entities.insert("npc.thug1.tier".to_string(), serde_json::Value::String("soldier".into()));
+        entities.insert("npc.dragon.tier".to_string(), serde_json::Value::String("legendary".into()));
+        entities.insert("npc.goblin1.tier".to_string(), serde_json::Value::String("minion".into()));
         assert_eq!(
             player_state::select_attacker_tier_from_entities(&entities),
             player_state::AttackerTier::Legendary,

@@ -231,6 +231,14 @@ enum SchemaMsg {
     /// + parser + validator; only the prompt differs. The returned delta is
     /// applied to `game_schema` by the caller.
     RequestWorldProgression(Box<WorldProgressionRequest>),
+    /// Derive the starting clock + weather + opening location from a card's
+    /// `.intro` text (2026-08-10). The cold-start anchor bootstrap for cards
+    /// with no `<start>` block. Single raw generation (NOT a SchemaDelta — the
+    /// reply's raw_output is parsed by the caller via
+    /// `schema::BootstrapAnchors::from_model_output`). Bypasses the 3-pass
+    /// repair loop entirely (the bootstrap is best-effort; a parse failure
+    /// falls through to sensible defaults in the caller).
+    RequestBootstrap(Box<BootstrapRequest>),
     /// Shut the schema thread down cleanly (drop its `LlamaContext`, freeing
     /// its KV cache, then join). Required by the VRAM-hibernate path so the
     /// schema context's ~75MB is reclaimable without process restart. Mirrors
@@ -280,6 +288,21 @@ struct WorldProgressionRequest {
     /// Immutable + existing key sets (same role as in `SchemaRequest`).
     immutable_keys: std::collections::HashSet<String>,
     existing_keys: std::collections::HashSet<String>,
+    /// One-shot reply channel.
+    reply: mpsc::Sender<SchemaReply>,
+}
+
+/// A bootstrap request (2026-08-10): derive the starting clock + weather +
+/// opening location from a card's `.intro`. The pre-built prompt is passed in
+/// (the caller renders it via `fable_command::render_bootstrap_prompt`). The
+/// reply carries ONLY `raw_output` — `delta` is always `None`, `error` is set
+/// only on an infrastructure failure (tokenize/prefill/decode). The caller
+/// parses the raw output via `schema::BootstrapAnchors::from_model_output`.
+/// No deferred-attempts / immutability context: the bootstrap is a single-shot
+/// best-effort extraction, NOT a 3-pass-repair SchemaDelta mutation.
+struct BootstrapRequest {
+    /// The fully-rendered bootstrap prompt (built by the caller).
+    prompt: String,
     /// One-shot reply channel.
     reply: mpsc::Sender<SchemaReply>,
 }
@@ -373,6 +396,57 @@ impl SchemaEngine {
                                 }),
                             );
                             Some((outcome, req.reply))
+                        }
+                        Ok(SchemaMsg::RequestBootstrap(req)) => {
+                            // Cold-start anchor bootstrap (2026-08-10). Single
+                            // raw generation — no SchemaDelta parsing, no 3-pass
+                            // repair. The reply carries raw_output for the
+                            // caller to parse via BootstrapAnchors::from_model_
+                            // output. Best-effort: a failure (panic or decode
+                            // error) returns an empty raw_output + error string;
+                            // the caller falls through to sensible defaults.
+                            let outcome = std::panic::catch_unwind(
+                                std::panic::AssertUnwindSafe(|| {
+                                    runtime.generate_text(&req.prompt)
+                                }),
+                            );
+                            // Map the raw-String outcome to the (outcome, reply)
+                            // shape the shared reply-building block expects. We
+                            // bypass the AttemptOutcome path (it's SchemaDelta-
+                            // shaped) + build the SchemaReply inline.
+                            let reply_msg = match outcome {
+                                Ok(Ok(raw_output)) => SchemaReply {
+                                    raw_output,
+                                    delta: None,
+                                    error: String::new(),
+                                    failed_attempt: None,
+                                },
+                                Ok(Err(e)) => {
+                                    tracing::warn!(error = %format!("{e:#}"), "bootstrap generation failed");
+                                    runtime.ctx.clear_kv_cache();
+                                    SchemaReply {
+                                        raw_output: String::new(),
+                                        delta: None,
+                                        error: format!("{e:#}"),
+                                        failed_attempt: None,
+                                    }
+                                }
+                                Err(_) => {
+                                    tracing::error!("bootstrap generation panicked; clearing KV");
+                                    runtime.ctx.clear_kv_cache();
+                                    SchemaReply {
+                                        raw_output: String::new(),
+                                        delta: None,
+                                        error: "bootstrap generation panicked".to_string(),
+                                        failed_attempt: None,
+                                    }
+                                }
+                            };
+                            // Best-effort reply: a closed channel just means the
+                            // caller dropped the receiver (e.g. the game was
+                            // cancelled mid-start). Logged, never fatal.
+                            let _ = req.reply.send(reply_msg);
+                            continue;
                         }
                         Err(mpsc::RecvError) => {
                             tracing::info!("wupi-schema: all senders dropped, exiting");
@@ -570,6 +644,30 @@ impl SchemaEngine {
         Ok(reply_rx)
     }
 
+    /// Post a BOOTSTRAP request (2026-08-10): derive the starting clock +
+    /// weather + opening location from a card's `.intro`. The caller passes a
+    /// fully-rendered prompt (built via `fable_command::render_bootstrap_prompt`)
+    /// + receives the raw model output on the returned receiver. The reply's
+    /// `delta` is always `None` (the bootstrap is NOT a SchemaDelta — the
+    /// caller parses the raw_output via `schema::BootstrapAnchors::from_model_
+    /// output`); `error` is set only on an infrastructure failure. Single-shot
+    /// best-effort: no 3-pass repair, no deferred-attempt queue. Fires once at
+    /// `enter_fable_session` when the `<start>` block left an anchor dormant.
+    pub fn request_bootstrap(
+        &self,
+        prompt: String,
+    ) -> anyhow::Result<mpsc::Receiver<SchemaReply>> {
+        let (reply_tx, reply_rx) = mpsc::channel::<SchemaReply>();
+        let req = BootstrapRequest {
+            prompt,
+            reply: reply_tx,
+        };
+        self.tx
+            .send(SchemaMsg::RequestBootstrap(Box::new(req)))
+            .map_err(|_| anyhow::anyhow!("schema engine thread closed"))?;
+        Ok(reply_rx)
+    }
+
     fn drain_failed(rx: &mpsc::Receiver<SchemaMsg>, why: String) {
         while let Ok(msg) = rx.recv_timeout(std::time::Duration::from_millis(50)) {
             // Both Request and RequestTranslation carry a reply sender that
@@ -582,6 +680,7 @@ impl SchemaEngine {
                 SchemaMsg::Request(r) => r.reply,
                 SchemaMsg::RequestTranslation(r) => r.reply,
                 SchemaMsg::RequestWorldProgression(r) => r.reply,
+                SchemaMsg::RequestBootstrap(r) => r.reply,
                 // Shutdown during init-failure drain: nothing to reply to,
                 // just drop it (the engine never came up).
                 SchemaMsg::Shutdown => continue,
@@ -1037,7 +1136,10 @@ fn render_delta_prompt(
     // delta pass always reasons before the JSON. The thought body is stripped
     // before parsing by SchemaDelta::from_model_output → extract_reply_channel
     // (the single load-bearing gate; see schema.rs).
-    out.push_str("<|think|>");
+    // DISABLED 2026-08-09 (`THINKING_ENABLED`) — see settings.rs.
+    if crate::settings::THINKING_ENABLED {
+        out.push_str("<|think|>");
+    }
     out.push_str("<turn|>\n");
     out.push_str("<|turn>user\n");
     out.push_str("Current schema:\n");
@@ -1098,7 +1200,10 @@ fn render_world_progression_prompt(
     out.push_str("<|turn>system\n");
     out.push_str(WORLD_PROGRESSION_SYSTEM_INSTRUCTION);
     // Always-on thinking (delta prompt above documents the strip pipeline).
-    out.push_str("<|think|>");
+    // DISABLED 2026-08-09 (`THINKING_ENABLED`) — see settings.rs.
+    if crate::settings::THINKING_ENABLED {
+        out.push_str("<|think|>");
+    }
     out.push_str("<turn|>\n");
     out.push_str("<|turn>user\n");
     out.push_str("Current world state:\n");
@@ -1147,7 +1252,10 @@ fn render_accumulated_repair_prompt(prior_raw: &[String], prior_errors: &[String
         "Your previous output(s) were invalid. Emit ONLY the JSON delta object: no prose, no markdown fences, no commentary. Address EACH error below. If nothing actually changed, emit {}.",
     );
     // Always-on thinking (delta prompt above documents the strip pipeline).
-    out.push_str("<|think|>");
+    // DISABLED 2026-08-09 (`THINKING_ENABLED`) — see settings.rs.
+    if crate::settings::THINKING_ENABLED {
+        out.push_str("<|think|>");
+    }
     out.push_str("<turn|>\n");
     out.push_str("<|turn>user\n");
     out.push_str(&format!("{} prior attempt(s) failed:\n", prior_raw.len()));

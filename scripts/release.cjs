@@ -449,6 +449,31 @@ if (existsSync(srcCardsDir)) {
   console.warn('[release] WARNING: apps/fable/cards/ not found — zip will ship with an empty card picker.');
 }
 
+// apps/fable/images/: the Fable Background Library (2026-08-11). The
+// `backgrounds/` subfolder holds the user-importable stage backdrops; the
+// shipped tree is just the folder + a README (no default image — the stage
+// stays opt-in black). The whole images tree is copied RECURSIVELY so any
+// shipped starter backgrounds + the README land intact. User imports are
+// runtime data → written to the install dir at first use, NOT staged here
+// (the active-bg marker lives one level up at apps/fable/.active_background.json
+// so it's never clobbered by a library refresh).
+const srcImagesDir = join(repoRoot, 'apps', 'fable', 'images');
+if (existsSync(srcImagesDir)) {
+  const dstImagesDir = join(stageWupiDir, 'apps', 'fable', 'images');
+  cpSync(srcImagesDir, dstImagesDir, { recursive: true });
+  // Count shipped backgrounds (png/jpg) for the log line.
+  const shippedBgDir = join(dstImagesDir, 'backgrounds');
+  let stagedBg = 0;
+  if (existsSync(shippedBgDir)) {
+    for (const f of readdirSync(shippedBgDir, { withFileTypes: true })) {
+      if (f.isFile() && /\.(png|jpe?g)$/i.test(f.name)) stagedBg++;
+    }
+  }
+  console.log(`[release] staged ${stagedBg} background(s) from apps/fable/images/backgrounds/`);
+} else {
+  console.warn('[release] WARNING: apps/fable/images/ not found — backgrounds folder will be created on first import.');
+}
+
 // ──────────────────────────────────────────────────────────────────────────
 // CUDA + VC++ RUNTIME DLLs → `bin/` subdirectory (v0.3.7 layout).
 //

@@ -81,18 +81,27 @@ use crate::llm::{shared_backend, shared_model, CancelToken, ChunkFn};
 /// the unified fable.codex, retrieved on-demand via search_fable_visible),
 /// recovering ~3000 tokens. The full narrator prompt is now ~2050 tok;
 /// FABLE_MAX_TOKENS restored 512→1024 and the LOCAL window 6→8 (the
-/// shortcut amputations reversed). FABLE_CTX stays at 4096.
+/// shortcut amputations reversed).
 ///
-/// **VRAM cost:** the Q8_0 KV cache at n_ctx=4096 is ~680 MiB (40 layers,
-/// K+V q8_0, measured live on the RTX 5070 Ti Laptop 12 GB). Under the §2B
-/// swap-lock only ONE of {chat, schema, fable} is resident during a turn,
-/// so worst case is weights (~9.8 GB) + fable KV (680 MiB) + embed
-/// (34 MiB, always resident) + compute buffer (~530 MiB) ≈ 11.0 GB of
-/// 12 GB → ~1 GB headroom. Stable.
+/// **2026-08-08 override: CTX_FABLE set to 3072.** The local 12B's Fable role
+/// is now TRACKING ONLY (bracket commands + schema state) — the API narrates
+/// exclusively (§3A override). The tracker window is 2 messages (1 turn)
+/// — it relies on the schema delta + Rust state, not re-read
+/// history. 3072 fits the fixed overhead (AGENT ~386 + bracket protocol ~477 =
+/// ~860 tok) + world_state + the 1-turn window + the 256-token tracker
+/// generation reserve (TRACKER_MAX_TOKENS; the sniper is the primary stop).
+/// The prior 4096 was for the deleted local-narrator path; 2048 was too tight
+/// (the fixed overhead alone ate nearly half the budget).
 ///
-/// The API path uses a wider 16-message window (the cloud model has the
-/// budget). The front-truncation guard below protects against overflow on
-/// the rare turn where the prompt exceeds `FABLE_CTX - FABLE_MAX_TOKENS`.
+/// **VRAM cost:** the Q8_0 KV cache at n_ctx=3072 is ~510 MiB. Under the §2B
+/// swap-lock + the 2026-08-08 local-model turn lock, only ONE of {chat, schema,
+/// fable} is resident + decoding at a time, so worst case is weights (~9.8 GB)
+/// + one KV (~75-510 MiB) + embed (34 MiB, always resident) + compute buffer
+/// (~530 MiB) ≈ 10.9 GB of 12 GB → ~1.1 GB headroom. Stable.
+///
+/// The front-truncation guard below protects against overflow on the rare
+/// turn where the prompt exceeds `FABLE_CTX - reserve` (reserve is mode-aware:
+/// TRACKER_MAX_TOKENS for the tracker, FABLE_MAX_TOKENS for the narrator).
 const FABLE_CTX: u32 = crate::settings::CTX_FABLE;
 const FABLE_BATCH: u32 = 512;
 /// Cap on generated tokens for a single narrator turn.
@@ -113,6 +122,99 @@ const FABLE_BATCH: u32 = 512;
 /// was a shortcut that amputated generation budget to make room for bloat;
 /// the scrub fixed the bloat instead.
 const FABLE_MAX_TOKENS: i32 = 1024;
+/// The hard ceiling for a TRACKER pass (tracker_mode=true). The tracker's
+/// contract is brackets-only — a typical bracket set is 20-100 tokens, but a
+/// multi-bracket turn (4-item inventory purchase + time + disguise) can reach
+/// 150-200. Raised 150→256 on 2026-08-10 after the T52 playtest showed the 150
+/// wall decapitating mid-bracket on multi-state-change turns (the tracker
+/// emitted `[EQUIP ...]` then started `[BELT name` and was cut — the knife/rope
+/// never landed). The Rust Sniper (§below) is the PRIMARY stop; it proved
+/// itself 5× in T52, killing runaway prose inside ~100ms before KV damage. The
+/// sniper is the true "cut Gemma off" lever; this wall is the backstop behind
+/// it, sized to give the model enough room to finish a full bracket set without
+/// artificial mid-word decapitation.
+const TRACKER_MAX_TOKENS: i32 = 256;
+
+// ---------------------------------------------------------------------------
+// The Rust Sniper — early-stop for tracker rambling (2026-08-10)
+// ---------------------------------------------------------------------------
+//
+// The tracker's contract is BRACKETS ONLY — prose belongs to the Stage-2 API
+// narrator. When the local 12B has emitted its bracket set and then starts
+// generating narrative prose (the failure mode: "ghostlyly quiet...", 460-1024
+// tokens of rambling that never carries a bracket), the sniper detects the
+// bracket→prose transition and BREAKS the decode loop within ~100ms — before
+// the garbage tokens commit to KV or a repetition loop can start.
+//
+// The detection runs on the accumulated REPLY text (post-thought-channel),
+// tracking: have we seen at least one closed bracket `]`, and is the text
+// AFTER the last `]` sustained prose (no new `[` opening)? If a bracket has
+// closed and ≥ SNIPER_PROSE_GRACE_CHARS of non-whitespace non-bracket text has
+// accumulated since, the model has transitioned from tracking to narrating →
+// snipe.
+//
+// This correctly permits multi-bracket turns ([PACK …] [TIME …] — the tail
+// re-opens `[`, no snipe) and only fires on the genuine failure (a bracket set
+// followed by newline + prose). Cheap: one byte scan per token over the tail
+// since the last `]` (the typical tail is < 30 chars).
+//
+// The sniper is the PRIMARY stop. TRACKER_MAX_TOKENS (256) is the wall behind
+// it. Together they guarantee a tracker turn ends in seconds, not minutes.
+
+/// How many non-whitespace, non-bracket chars of prose may follow a closed
+/// bracket before the sniper fires. Tuned for: a short grace window so a `[`
+/// mid-stream (the model opening its next bracket) isn't misread as prose, but
+/// any genuine sentence fragment ("The fog is...") trips well inside it.
+const SNIPER_PROSE_GRACE_CHARS: usize = 8;
+
+struct TrackerSniper {
+    /// True once at least one `]` (a closed bracket) has been seen in the
+    /// reply text. The sniper only fires AFTER a bracket has closed — turns
+    /// that emit no brackets are left to run to EOG/max_tokens (a bracket-less
+    /// tracker turn is a valid "nothing changed" outcome, not rambling).
+    seen_closed_bracket: bool,
+    /// The number of non-whitespace, non-`[`/`]` chars accumulated since the
+    /// last `]`. Reset to 0 whenever a `[` opens (the model started a new
+    /// bracket) or a `]` closes.
+    prose_since_close: usize,
+}
+
+impl TrackerSniper {
+    fn new() -> Self {
+        Self { seen_closed_bracket: false, prose_since_close: 0 }
+    }
+
+    /// Feed one decoded piece (already appended to the reply stream). Returns
+    /// true if the sniper should fire (early-stop the decode).
+    fn feed(&mut self, piece: &str) -> bool {
+        if !self.seen_closed_bracket {
+            // Pre-first-close: scan for the FIRST `]` so we know tracking has
+            // begun. We don't count prose here (a tracker may emit a short
+            // preamble before its first bracket — rare, but tolerated).
+            if piece.contains(']') {
+                self.seen_closed_bracket = true;
+                // Reset the prose counter; start counting AFTER this close.
+                self.prose_since_close = 0;
+            }
+            return false;
+        }
+        // Post-first-close: classify each char. `[` resets (new bracket
+        // opening — not prose). `]` resets (a bracket closed — still
+        // tracking). Anything non-whitespace increments the prose counter.
+        for ch in piece.chars() {
+            match ch {
+                '[' => self.prose_since_close = 0,
+                ']' => self.prose_since_close = 0,
+                c if c.is_whitespace() => { /* whitespace doesn't count */ }
+                _ => self.prose_since_close += 1,
+            }
+            if self.prose_since_close >= SNIPER_PROSE_GRACE_CHARS {
+                return true;
+            }
+        }
+        false
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Control plane: channel types
@@ -526,10 +628,17 @@ impl FableRuntime {
     /// prefill. The accepted §2F cold-reset tax on memory-injected turns
     /// applies here too. Optimize later if TTFT becomes a constraint.
     fn generate_turn(&mut self, req: &FableRequest) -> Result<String, GenerationOutcome> {
+        let tokenize_start = std::time::Instant::now();
         let mut tokens = self
             .model
             .str_to_token(&req.prompt, AddBos::Always)
             .map_err(|e| GenerationOutcome::GenerationErr(anyhow::anyhow!("game tokenize: {e:?}")))?;
+        let tokenize_ms = tokenize_start.elapsed().as_millis();
+        tracing::info!(
+            prompt_tokens = tokens.len(),
+            tokenize_ms,
+            "FABLE DECODE: tokenized prompt"
+        );
         if tokens.is_empty() {
             return Err(GenerationOutcome::GenerationErr(anyhow::anyhow!(
                 "game tokenized prompt is empty"
@@ -538,11 +647,37 @@ impl FableRuntime {
         // Truncate from the front if the prompt alone exceeds context (keep
         // the system prompt's tail + recent turns + generation cue). Mirror
         // of the schema engine's guard.
-        let max_prompt = (FABLE_CTX as usize).saturating_sub(FABLE_MAX_TOKENS as usize);
+        //
+        // WARNING (2026-08-10, 3rd recurrence): a front-drain chops the SYSTEM
+        // PROMPT (the AGENT directive + bracket protocol), which is the exact
+        // bug that silently killed all bracket emission: the tracker ran but
+        // never saw the bracket syntax → zero brackets every turn → frozen
+        // schema. The fix per the Prime Directive is to SHRINK the prompt so
+        // this guard never fires. If it DOES fire (dropped > 0), treat it as a
+        // P0 prompt-bloat regression — the bracket protocol is likely being
+        // chopped. The log line below surfaces it loudly for exactly that reason.
+        //
+        // Reserve is MODE-AWARE (2026-08-10 fix): the tracker needs only
+        // TRACKER_MAX_TOKENS (256) of generation reserve, the narrator needs
+        // FABLE_MAX_TOKENS (1024). The prior bug reserved 1024 for BOTH →
+        // max_prompt = 3072-1024 = 2048 → a ~2500-token tracker prompt
+        // front-truncated 454-1022 tokens EVERY turn, chopping the bracket
+        // protocol → tracker narrated instead of tracking → zero brackets.
+        // With the tracker reserve, max_prompt = 3072-150 = 2922 — the prompt
+        // fits, the bracket protocol survives, the tracker sees its syntax.
+        let reserve = if req.tracker_mode { TRACKER_MAX_TOKENS } else { FABLE_MAX_TOKENS };
+        let max_prompt = (FABLE_CTX as usize).saturating_sub(reserve as usize);
         if tokens.len() > max_prompt {
             let drop = tokens.len() - max_prompt;
             tokens.drain(0..drop);
-            tracing::warn!(dropped = drop, "game prompt exceeded context; truncated from front");
+            tracing::warn!(
+                dropped = drop,
+                total = tokens.len(),
+                max = max_prompt,
+                "⚠ PROMPT OVERFLOW: game prompt exceeded context; front-truncated. \
+                 If the tracker emits no brackets, the system prompt (bracket protocol) \
+                 was likely chopped — shrink the prompt per the Prime Directive."
+            );
         }
 
         // One-shot full prefill each turn (no KV reuse for v1).
@@ -551,6 +686,7 @@ impl FableRuntime {
         let n_prompt = tokens.len() as i32;
         let mut batch = LlamaBatch::new(FABLE_BATCH as usize, 1);
         let mut consumed = 0usize;
+        let prefill_start = std::time::Instant::now();
         while consumed < tokens.len() {
             let take = std::cmp::min(FABLE_BATCH as usize, tokens.len() - consumed);
             let is_last_chunk = consumed + take == tokens.len();
@@ -570,6 +706,13 @@ impl FableRuntime {
                 })?;
             consumed += take;
         }
+        let prefill_ms = prefill_start.elapsed().as_millis();
+        tracing::info!(
+            n_prompt,
+            prefill_ms,
+            prefill_tok_s = if prefill_ms > 0 { (n_prompt as u128 * 1000 / prefill_ms) as u64 } else { 0 },
+            "FABLE DECODE: prefill complete"
+        );
 
         // Locked sampler config (see module doc + AGENTS.md).
         //
@@ -694,7 +837,11 @@ impl FableRuntime {
         let mut n_cur = n_prompt;
         let mut step_batch = LlamaBatch::new(1, 1);
         let mut out = String::new();
-        let max_tokens = FABLE_MAX_TOKENS
+        // The tracker gets a tight 256-token failsafe ceiling (the sniper is
+        // the primary stop; this is the wall behind it). The narrator keeps
+        // the full 1024 budget. Both clamp to the remaining cache space.
+        let base_cap = if req.tracker_mode { TRACKER_MAX_TOKENS } else { FABLE_MAX_TOKENS };
+        let max_tokens = base_cap
             .min((FABLE_CTX as i32 - n_prompt).max(64));
 
         // Protocol marker filter + bracket-command stripper. Same literal
@@ -751,6 +898,11 @@ impl FableRuntime {
         // pull the reasoning out end-of-turn + bracket parsing sees the reply.
         let mut thought_gate = crate::chat_format::ThoughtGate::new();
 
+        let decode_start = std::time::Instant::now();
+        let mut gen_count: i32 = 0;
+        // The sniper only arms for tracker passes (the narrator MUST be allowed
+        // to generate prose — that's its whole job). One instance per turn.
+        let mut sniper = if req.tracker_mode { Some(TrackerSniper::new()) } else { None };
         for _ in 0..max_tokens {
             // Cancellation check at the TOP of the loop (between tokens,
             // never mid-decode: same KV-consistency contract as the chat
@@ -807,6 +959,21 @@ impl FableRuntime {
                         (req.on_chunk)(&cleaned);
                     }
                 }
+                // The Rust Sniper (tracker only): feed the piece + check whether
+                // the model transitioned from tracking (closed bracket) into
+                // sustained prose. If so, break NOW — the bracket set is
+                // already in `out`, the rambling isn't needed, and stopping
+                // here keeps KV pristine + ends the turn in ~100ms.
+                if let Some(sniper) = sniper.as_mut() {
+                    if sniper.feed(&piece) {
+                        tracing::info!(
+                            gen_count,
+                            out_len_chars = out.len(),
+                            "🎯 SNIPER: tracker bracket→prose transition detected; early-stopping decode"
+                        );
+                        break;
+                    }
+                }
             }
 
             // Feed the token back at position n_cur.
@@ -822,6 +989,37 @@ impl FableRuntime {
                     GenerationOutcome::GenerationErr(anyhow::anyhow!("game decode: {e:?}"))
                 })?;
             n_cur += 1;
+            gen_count += 1;
+            // Progress pulse every 100 tokens (the live-engine health signal).
+            // Keeps the log alive during a long decode + gives tok/s for tuning.
+            if gen_count % 100 == 0 {
+                let elapsed_ms = decode_start.elapsed().as_millis();
+                tracing::info!(
+                    gen_count,
+                    elapsed_ms,
+                    tok_s = if elapsed_ms > 0 { (gen_count as u128 * 1000 / elapsed_ms) as u64 } else { 0 },
+                    "FABLE DECODE: progress"
+                );
+            }
+        }
+        // Final decode telemetry (mirrors the chat engine's performance block).
+        // Includes head/tail output samples so a non-terminating or repetitive
+        // decode is diagnosable from the log alone.
+        {
+            let elapsed_ms = decode_start.elapsed().as_millis();
+            let head: String = out.chars().take(200).collect();
+            let tail: String = out.chars().rev().take(200).collect::<Vec<_>>().into_iter().rev().collect();
+            tracing::info!(
+                gen_count,
+                max_tokens,
+                elapsed_ms,
+                tok_s = if elapsed_ms > 0 { (gen_count as u128 * 1000 / elapsed_ms) as u64 } else { 0 },
+                out_len_chars = out.len(),
+                hit_max_tokens = gen_count >= max_tokens,
+                head_200 = %head,
+                tail_200 = %tail,
+                "FABLE DECODE: complete"
+            );
         }
 
         // Flush both filters (thought_gate first, then marker_filter) — same
@@ -878,7 +1076,13 @@ mod tests {
     /// Constants are sane (compile-time sanity check).
     #[test]
     fn constants_are_sane() {
-        assert!(FABLE_CTX >= 3072, "game context must fit system + 4-beat window + gen reserve");
+        // 2026-08-10: CTX_FABLE set to 3072 (tracking-only; the API narrates).
+        // The tracker window is 2 messages (1 turn) — it relies on the schema
+        // delta + Rust state, not re-read history. 3072 fits the
+        // fixed overhead (~860 tok) + world_state + the 2-msg window + the
+        // 256-token tracker generation reserve (TRACKER_MAX_TOKENS, raised
+        // 150→256 post-T52 to end mid-bracket decapitation on multi-item turns).
+        assert!(FABLE_CTX >= 3072, "tracker context must fit system + window + gen reserve + thinking");
         assert!(FABLE_BATCH >= 256, "batch must fit a chunk");
         assert!(FABLE_MAX_TOKENS >= 256, "max tokens must allow a meaty beat");
     }

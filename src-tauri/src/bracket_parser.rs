@@ -216,28 +216,34 @@ pub enum BracketCommand {
     /// `slot` is a canonical `EquipSlot` id (`"main_hand"`); `layer` defaults
     /// to Outer (narrator-visible). A bare `[EQUIP slot]` (no `name=`) is the
     /// unequip form — `item_name` is `None` then. Named `slot`/`layer`/
-    /// `item_name`/`item_stats` to avoid the `kind` discriminator (see the
-    /// enum-level note). See `equipment.rs` for the layering model.
+    /// `item_name`/`item_stats`/`item_tags` to avoid the `kind` discriminator
+    /// (see the enum-level note). See `equipment.rs` for the layering model.
     Equip {
         slot: equipment::EquipSlot,
         layer: equipment::ItemLayer,
         item_name: Option<String>,
         item_stats: Option<String>,
+        /// Behavior tags parsed from `tags=consumable,equippable` (text) or a
+        /// `tags` JSON array. Unknown tags dropped; defaults empty.
+        item_tags: Vec<equipment::ItemTag>,
     },
 
     /// Add to (or remove from) the quick-access belt — a fixed 4-slot rack
     /// (FIFO eviction at the applier). `qty` defaults to 1. The remove form is
     /// `[BELT -name]` → `remove: true`, `qty: 0` (drop the whole stack). Named
-    /// `item_name`/`item_stats`/`qty`/`remove` to avoid `kind`.
+    /// `item_name`/`item_stats`/`qty`/`remove`/`item_tags` to avoid `kind`.
     Belt {
         item_name: String,
         qty: u32,
         item_stats: Option<String>,
         remove: bool,
+        item_tags: Vec<equipment::ItemTag>,
     },
 
-    /// Add to (or remove from) the deep-storage pack (weight-bounded for
-    /// encumbrance). `qty` defaults to 1, `weight` to 1.0 lbs. The remove form
+    /// Add to (or remove from) the deep-storage pack (UNBOUNDED — the
+    /// encumbrance/weight system was permanently removed 2026-08-09). `qty`
+    /// defaults to 1, `weight` to 1.0 lbs (retained for save-compat only). The
+    /// remove form
     /// is `[PACK -name]`. Same field-naming discipline as `Belt`.
     Pack {
         item_name: String,
@@ -245,6 +251,7 @@ pub enum BracketCommand {
         weight: f32,
         item_stats: Option<String>,
         remove: bool,
+        item_tags: Vec<equipment::ItemTag>,
     },
 }
 
@@ -340,9 +347,23 @@ pub fn parse(raw: &str) -> ParsedNarration {
     // body that doesn't yield a valid command is just noise). The bodies
     // were already removed from `prose` by `extract_fenced_json`, so we
     // never re-inject them on failure.
+    //
+    // Hybrid-fence fallback (2026-08-10): models sometimes wrap a TEXT
+    // bracket in a ```json fence (e.g. ```json\n[PACK name=coin]\n```) — a
+    // shape that is neither valid JSON nor visible to the text-bracket scan
+    // above (the fence was stripped). When `parse_json_command` rejects a
+    // body, retry it through the text-bracket path: scan the body for `[...]`
+    // and run `parse_one` on each. This recovers the hybrid case without
+    // weakening the JSON path. Without this, the bracket is lost (stripped
+    // from prose AND rejected as JSON) → the tracker "produces no bracket
+    // commands" → frozen schema.
     for body in &json_bodies {
         if let Some(cmd) = parse_json_command(body) {
             commands.push(cmd);
+        } else {
+            // Retry as text brackets: the body may be a text bracket the
+            // model wrapped in a ```json fence.
+            scan_text_brackets(body, &mut commands);
         }
     }
 
@@ -482,6 +503,10 @@ fn tokenize_kv(tail: &str) -> Vec<(String, String)> {
             break;
         }
         // Read the key up to '=' (or end of token if no '=' — dropped).
+        // Strip a leading '(' so the documented parenthesized form
+        // `[PACK name=X (qty=1) (tags=...)]` parses: '(qty' → 'qty'. The
+        // matching ')' is left as trailing punctuation on the VALUE (parsed
+        // leniently downstream — qty/tags/weight all trim or tolerate it).
         let key_start = i;
         while i < chars.len() && chars[i] != '=' && !chars[i].is_whitespace() {
             i += 1;
@@ -493,7 +518,10 @@ fn tokenize_kv(tail: &str) -> Vec<(String, String)> {
             }
             continue;
         }
-        let key: String = chars[key_start..i].iter().collect();
+        let mut key: String = chars[key_start..i].iter().collect();
+        if key.starts_with('(') {
+            key = key[1..].to_string();
+        }
         i += 1; // consume '='
         // Read the value. If it starts with '"', read until the closing '"'
         // (keeping internal spaces). Otherwise read until next whitespace.
@@ -512,6 +540,52 @@ fn tokenize_kv(tail: &str) -> Vec<(String, String)> {
                 value.push(chars[i]);
                 i += 1;
             }
+            // Auto-quoter (2026-08-10, T52 Open Issue #2): when the model emits
+            // a bare multi-word value WITHOUT quotes (`name=Silver Coin`,
+            // `name=Traveler's Cloak`), the naive read above stops at the first
+            // space → only "Silver" is captured, "Coin" is dropped. The T52
+            // playtest lost 3/3 multi-word item names this way. The fix: after
+            // reading the bare value, look ahead — if the next non-whitespace
+            // token does NOT itself contain `=` (i.e. it's not a new `key=value`
+            // pair nor a parenthesized `(key=value)` field group), it's a
+            // continuation of THIS value. Absorb it + repeat. This retroactively
+            // quotes any unquoted multi-word string up to the next real key.
+            // The paren-form `(qty=1)` is safe: it contains `=` → stops the
+            // absorption. A trailing token that's pure punctuation is also safe:
+            // it contains no `=` but is absorbed into the value (harmless — the
+            // value caps + downstream trim handle stray chars).
+            loop {
+                // Save position to peek; restore if the next token is a new key.
+                let mut peek = i;
+                while peek < chars.len() && chars[peek].is_whitespace() {
+                    peek += 1;
+                }
+                if peek >= chars.len() {
+                    break;
+                }
+                // Read the candidate continuation token up to whitespace.
+                let tok_start = peek;
+                while peek < chars.len() && !chars[peek].is_whitespace() {
+                    peek += 1;
+                }
+                let candidate: String = chars[tok_start..peek].iter().collect();
+                // If the candidate contains '=', it's a new key=value pair (or a
+                // `(key=val)` group) — do NOT absorb; leave i at the whitespace
+                // before it so the outer loop re-parses it as a new field.
+                if candidate.contains('=') {
+                    break;
+                }
+                // Absorb the continuation: join with a space + advance i past it.
+                value.push(' ');
+                value.push_str(&candidate);
+                i = peek;
+            }
+        }
+        // Strip a trailing ')' from the value (the closing paren of a
+        // parenthesized field group): `1)` → `1`, `["pocketable"])` →
+        // `["pocketable"]`. Only the LAST paren (the group closer).
+        if value.ends_with(')') {
+            value.pop();
         }
         if !key.is_empty() {
             out.push((key.to_lowercase(), value));
@@ -682,12 +756,14 @@ fn parse_equip(rest: &str) -> Option<BracketCommand> {
     let mut name = String::new();
     let mut layer_str = String::new();
     let mut stats = String::new();
+    let mut tags_str = String::new();
     for (k, v) in kvs {
         match k.as_str() {
             "slot" | "where" => slot_id = v,
             "name" | "item" => name = v,
             "layer" => layer_str = v.to_lowercase(),
             "stats" | "stat" => stats = v,
+            "tags" | "tag" => tags_str = v,
             _ => {}
         }
     }
@@ -718,11 +794,13 @@ fn parse_equip(rest: &str) -> Option<BracketCommand> {
         }
         Some(s.to_string())
     };
+    let item_tags = equipment::parse_tag_list(&tags_str);
     Some(BracketCommand::Equip {
         slot,
         layer,
         item_name,
         item_stats,
+        item_tags,
     })
 }
 
@@ -752,6 +830,7 @@ fn parse_belt(rest: &str) -> Option<BracketCommand> {
             qty: 0,
             item_stats: None,
             remove: true,
+            item_tags: Vec::new(),
         });
     }
     // Add form: kv tail. `name=` is required; tolerate a bare leading name
@@ -760,11 +839,13 @@ fn parse_belt(rest: &str) -> Option<BracketCommand> {
     let mut name = String::new();
     let mut qty: u32 = 1;
     let mut stats = String::new();
+    let mut tags_str = String::new();
     for (k, v) in kvs {
         match k.as_str() {
             "name" | "item" => name = v,
             "qty" | "count" | "n" => qty = v.parse::<u32>().unwrap_or(1).max(1),
             "stats" | "stat" => stats = v,
+            "tags" | "tag" => tags_str = v,
             _ => {}
         }
     }
@@ -795,6 +876,7 @@ fn parse_belt(rest: &str) -> Option<BracketCommand> {
         qty,
         item_stats,
         remove: false,
+        item_tags: equipment::parse_tag_list(&tags_str),
     })
 }
 
@@ -822,6 +904,7 @@ fn parse_pack(rest: &str) -> Option<BracketCommand> {
             weight: 0.0,
             item_stats: None,
             remove: true,
+            item_tags: Vec::new(),
         });
     }
     let kvs = tokenize_kv(body);
@@ -829,12 +912,14 @@ fn parse_pack(rest: &str) -> Option<BracketCommand> {
     let mut qty: u32 = 1;
     let mut weight: f32 = 1.0;
     let mut stats = String::new();
+    let mut tags_str = String::new();
     for (k, v) in kvs {
         match k.as_str() {
             "name" | "item" => name = v,
             "qty" | "count" | "n" => qty = v.parse::<u32>().unwrap_or(1).max(1),
             "weight" | "lbs" | "w" => weight = v.parse::<f32>().unwrap_or(1.0).max(0.0),
             "stats" | "stat" => stats = v,
+            "tags" | "tag" => tags_str = v,
             _ => {}
         }
     }
@@ -863,6 +948,7 @@ fn parse_pack(rest: &str) -> Option<BracketCommand> {
         weight,
         item_stats,
         remove: false,
+        item_tags: equipment::parse_tag_list(&tags_str),
     })
 }
 
@@ -967,6 +1053,33 @@ pub(crate) fn extract_fenced_json(raw: &str) -> (String, Vec<String>) {
     }
 
     (prose, bodies)
+}
+
+/// Scan a string for `[...]` text brackets and append each recognized command
+/// to `commands`. Used by the hybrid-fence fallback (2026-08-10): when a fence
+/// body fails JSON parsing, the body may actually be a TEXT bracket the model
+/// wrapped in a ```json fence (e.g. `[PACK name=coin (qty=1)]`). This mirrors
+/// the bracket-scan loop in `parse()` but operates on a standalone body string
+/// (no prose interleaving, no CHARACTER_TURN multi-region). Unrecognized
+/// brackets are silently ignored (same contract as `parse()`'s None arm, but
+/// without re-emitting as prose — the body is already fence-only content).
+fn scan_text_brackets(body: &str, commands: &mut Vec<BracketCommand>) {
+    let bytes = body.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let Some(rel) = bytes[i..].iter().position(|&b| b == b'[') else { break };
+        let start = i + rel;
+        let Some(end_rel) = bytes[start..].iter().position(|&b| b == b']') else { break };
+        let end = start + end_rel;
+        let bracket = &body[start + 1..end];
+        let text_after = &body[end + 1..];
+        if let Some((cmd, consumed_after_bracket)) = parse_one(bracket, text_after) {
+            commands.push(cmd);
+            i = end + 1 + consumed_after_bracket;
+        } else {
+            i = end + 1;
+        }
+    }
 }
 
 /// Parse one JSON object body into a `BracketCommand`. Returns `None` on any
@@ -1454,11 +1567,13 @@ fn json_to_equip(obj: &serde_json::Map<String, serde_json::Value>) -> Option<Bra
         }
         Some(stats_raw)
     };
+    let item_tags = parse_json_tags(obj);
     Some(BracketCommand::Equip {
         slot,
         layer,
         item_name,
         item_stats,
+        item_tags,
     })
 }
 
@@ -1502,11 +1617,13 @@ fn json_to_belt(obj: &serde_json::Map<String, serde_json::Value>) -> Option<Brac
     } else {
         Some(stats_raw)
     };
+    let item_tags = parse_json_tags(obj);
     Some(BracketCommand::Belt {
         item_name: name,
         qty,
         item_stats,
         remove,
+        item_tags,
     })
 }
 
@@ -1554,13 +1671,41 @@ fn json_to_pack(obj: &serde_json::Map<String, serde_json::Value>) -> Option<Brac
     } else {
         Some(stats_raw)
     };
+    let item_tags = parse_json_tags(obj);
     Some(BracketCommand::Pack {
         item_name: name,
         qty,
         weight,
         item_stats,
         remove,
+        item_tags,
     })
+}
+
+/// Read the `tags` field off a JSON command body into a deduped
+/// `Vec<ItemTag>`. Tolerates both forms a model might emit:
+///   - a JSON array of snake_case strings: `"tags": ["consumable","pocketable"]`
+///   - a single comma-separated string: `"tags": "consumable, pocketable"`
+/// Unknown tags are dropped (no error). Missing field → empty vec.
+fn parse_json_tags(obj: &serde_json::Map<String, serde_json::Value>) -> Vec<equipment::ItemTag> {
+    let raw = obj.get("tags").or_else(|| obj.get("tag"));
+    match raw {
+        Some(serde_json::Value::Array(arr)) => {
+            let mut out: Vec<equipment::ItemTag> = Vec::new();
+            for v in arr {
+                if let Some(s) = v.as_str() {
+                    if let Some(t) = equipment::ItemTag::from_id(s) {
+                        if !out.contains(&t) {
+                            out.push(t);
+                        }
+                    }
+                }
+            }
+            out
+        }
+        Some(serde_json::Value::String(s)) => equipment::parse_tag_list(s),
+        _ => Vec::new(),
+    }
 }
 
 /// Parse a `{"kind": "travel", ...}` JSON body (Component 3, 2026-07-28).
@@ -1873,7 +2018,9 @@ fn parse_one(bracket: &str, text_after: &str) -> Option<(BracketCommand, usize)>
     }
 
     // [PACK name=<item> (qty=N) (weight=W) (stats=<...>)] / [PACK -name] —
-    // deep-storage pack add/remove (weight feeds encumbrance). See `parse_pack`.
+    // deep-storage pack add/remove (unbounded — encumbrance removed 2026-08-09;
+    // the `weight` field is retained for save-compat + narrator-summary text
+    // only). See `parse_pack`.
     if let Some(rest) = strip_prefix_ci(bracket, "PACK") {
         if let Some(cmd) = parse_pack(rest) {
             return Some((cmd, 0));
@@ -4211,7 +4358,7 @@ mod tests {
         let parsed = parse("[EQUIP slot=main_hand name=\"Iron Sword\" stats=\"+2 ATK\"]");
         assert_eq!(parsed.commands.len(), 1);
         match &parsed.commands[0] {
-            BracketCommand::Equip { slot, layer, item_name, item_stats } => {
+            BracketCommand::Equip { slot, layer, item_name, item_stats, .. } => {
                 assert_eq!(*slot, equipment::EquipSlot::MainHand);
                 assert_eq!(*layer, equipment::ItemLayer::Outer, "default layer is Outer");
                 assert_eq!(item_name.as_deref(), Some("Iron Sword"));
@@ -4353,6 +4500,152 @@ mod tests {
                 assert_eq!(*qty, 1);
             }
             other => panic!("expected Pack from JSON, got {:?}", other),
+        }
+    }
+
+    // ── tags field (2026-08-08) ─────────────────────────────────────────
+
+    #[test]
+    fn equip_bracket_text_tags_parsed() {
+        let parsed = parse("[EQUIP slot=main_hand name=\"Iron Sword\" tags=equippable]");
+        match &parsed.commands[0] {
+            BracketCommand::Equip { item_tags, .. } => {
+                assert_eq!(*item_tags, vec![equipment::ItemTag::Equippable]);
+            }
+            other => panic!("expected Equip, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn belt_bracket_text_tags_multi() {
+        let parsed = parse("[BELT name=\"Healing Potion\" tags=consumable,pocketable]");
+        match &parsed.commands[0] {
+            BracketCommand::Belt { item_tags, .. } => {
+                assert_eq!(*item_tags, vec![equipment::ItemTag::Consumable, equipment::ItemTag::Pocketable]);
+            }
+            other => panic!("expected Belt, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn pack_json_tags_array_parsed() {
+        let body = r#"```json
+{"kind":"pack","name":"Bread","qty":2,"tags":["consumable","pocketable"]}
+```"#;
+        let parsed = parse(body);
+        match &parsed.commands[0] {
+            BracketCommand::Pack { item_tags, .. } => {
+                assert_eq!(*item_tags, vec![equipment::ItemTag::Consumable, equipment::ItemTag::Pocketable]);
+            }
+            other => panic!("expected Pack, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn hybrid_fence_text_bracket_recovered() {
+        // 2026-08-10: the tracker sometimes wraps a TEXT bracket in a ```json
+        // fence — neither valid JSON nor visible to the bracket scan (the
+        // fence was stripped). The hybrid-fence fallback re-scans the fence
+        // body for text brackets so the command isn't lost. This was the
+        // "tracker produced no bracket commands" frozen-schema bug.
+        let body = r#"```json
+[PACK name=Lockpick (qty=3) (tags=["pocketable"])]
+```"#;
+        let parsed = parse(body);
+        assert_eq!(parsed.commands.len(), 1, "hybrid-fence text bracket must be recovered");
+        match &parsed.commands[0] {
+            BracketCommand::Pack { item_name, qty, item_tags, .. } => {
+                assert_eq!(item_name, "Lockpick");
+                assert_eq!(*qty, 3);
+                assert_eq!(*item_tags, vec![equipment::ItemTag::Pocketable]);
+            }
+            other => panic!("expected Pack, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn hybrid_fence_unfenced_text_bracket_still_works() {
+        // Regression guard: the plain (unfenced) text-bracket path must still
+        // work alongside the hybrid-fence fix (no behavior change to the
+        // common case).
+        let parsed = parse("[PACK name=Lockpick (qty=3) (tags=pocketable)]");
+        assert_eq!(parsed.commands.len(), 1);
+        match &parsed.commands[0] {
+            BracketCommand::Pack { item_name, qty, .. } => {
+                assert_eq!(item_name, "Lockpick");
+                assert_eq!(*qty, 3);
+            }
+            other => panic!("expected Pack, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn bracket_unknown_tags_dropped_silently() {
+        let parsed = parse("[PACK name=\"Mystery\" tags=cursed,consumable,junk]");
+        match &parsed.commands[0] {
+            BracketCommand::Pack { item_tags, .. } => {
+                assert_eq!(*item_tags, vec![equipment::ItemTag::Consumable], "unknown tags dropped");
+            }
+            other => panic!("expected Pack, got {:?}", other),
+        }
+    }
+
+    // ---- auto-quoter (2026-08-10, T52 Open Issue #2) ---------------------
+    // The model emits unquoted multi-word item names (`name=Silver Coin`).
+    // tokenize_kv's auto-quoter absorbs trailing bare words (no `=`) into the
+    // preceding value so the full name survives. These pin the fix.
+
+    #[test]
+    fn auto_quoter_captures_unquoted_multiword_equip_name() {
+        // T52 case: name=Silver Coin (layer=outer) → "Silver Coin", not "Silver"
+        let parsed = parse("[EQUIP slot=main_hand name=Silver Coin layer=outer]");
+        match &parsed.commands[0] {
+            BracketCommand::Equip { slot, item_name, layer, .. } => {
+                assert_eq!(*slot, equipment::EquipSlot::MainHand);
+                assert_eq!(item_name.as_deref(), Some("Silver Coin"), "full multi-word name captured");
+                // `layer=outer` must still parse as a separate field, not be absorbed.
+                assert_eq!(*layer, equipment::ItemLayer::Outer);
+            }
+            other => panic!("expected Equip, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn auto_quoter_captures_unquoted_multiword_belt_name_with_tags() {
+        // T52 case: the knife + tags. name=Belt Knife tags=consumable,pocketable
+        let parsed = parse("[BELT name=Belt Knife tags=consumable,pocketable]");
+        match &parsed.commands[0] {
+            BracketCommand::Belt { item_name, item_tags, .. } => {
+                assert_eq!(item_name, "Belt Knife");
+                assert_eq!(*item_tags, vec![equipment::ItemTag::Consumable, equipment::ItemTag::Pocketable]);
+            }
+            other => panic!("expected Belt, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn auto_quoter_stops_at_paren_form() {
+        // The paren form (qty=3) contains '=' → must NOT be absorbed into name.
+        let parsed = parse("[PACK name=Iron Rations (qty=3) (tags=pocketable)]");
+        match &parsed.commands[0] {
+            BracketCommand::Pack { item_name, qty, .. } => {
+                assert_eq!(item_name, "Iron Rations");
+                assert_eq!(*qty, 3);
+            }
+            other => panic!("expected Pack, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn auto_quoter_preserves_single_word_values() {
+        // Single-word bare values must be unchanged (no trailing space, no over-absorption).
+        let parsed = parse("[BELT name=Lockpick qty=5]");
+        match &parsed.commands[0] {
+            BracketCommand::Belt { item_name, qty, .. } => {
+                assert_eq!(item_name, "Lockpick");
+                assert_eq!(*qty, 5);
+            }
+            other => panic!("expected Belt, got {:?}", other),
         }
     }
 }

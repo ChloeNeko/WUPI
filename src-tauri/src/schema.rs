@@ -207,9 +207,12 @@ pub struct Node {
 /// The spatial travel graph (Rust-authoritative — same line as `world_clock` /
 /// `weather`). Nodes + a single `current_node` pointer. v1 is structural
 /// geography: no NPC positions, no tick-resolved traversal mechanics, no
-/// per-node weather. The only writer to `current_node` is the `[TRAVEL]`
-/// bracket command (validated for adjacency); `nodes` itself is seeded once
-/// by the scenario card + treated as read-only thereafter.
+/// per-node weather. Writers to `current_node`: the `[TRAVEL]` bracket (which
+/// also auto-links edges between known non-adjacent nodes, 2026-08-10) + the
+/// first-`[DISCOVER]`-on-empty-graph seed. Writers to `nodes`: the card's
+/// `<locations>` block (seeded once at `fable_start`), `[DISCOVER]` (dynamic
+/// growth), `[TRAVEL]` auto-link (bidirectional edge formation), + the
+/// derive-from-intro bootstrap (`enter_fable_session`).
 ///
 /// `WorldSchema::apply_delta` deliberately does NOT touch this field —
 /// see `apply_delta_does_not_touch_travel_graph`.
@@ -228,6 +231,34 @@ pub struct TravelGraph {
     /// seeds initial location without scenario-card wiring.
     #[serde(default)]
     pub current_node: Option<String>,
+}
+
+/// Normalize a raw diegetic location name to a node-id slug: lowercase +
+/// whitespace runs → single `_`, other non-alphanumerics dropped. Used by
+/// `TravelGraph::resolve_node_id` to fuzzy-match `[TRAVEL Market Square]` →
+/// `market_square`. Keeps `_` and `-` (valid id chars); everything else that
+/// isn't alphanumeric collapses into the underscore stream.
+fn slugify(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut prev_under = false;
+    for c in s.trim().chars() {
+        if c.is_alphanumeric() {
+            for lc in c.to_lowercase() {
+                out.push(lc);
+            }
+            prev_under = false;
+        } else if c == '_' || c == '-' {
+            if !prev_under && !out.is_empty() {
+                out.push('_');
+                prev_under = true;
+            }
+        } else if !prev_under && !out.is_empty() {
+            // Any other char (space, apostrophe, punctuation) → underscore.
+            out.push('_');
+            prev_under = true;
+        }
+    }
+    out.trim_end_matches('_').to_string()
 }
 
 impl TravelGraph {
@@ -263,6 +294,43 @@ impl TravelGraph {
             Some(cur) => cur.neighbors.iter().any(|n| n == to),
             None => false,
         }
+    }
+
+    /// Resolve a raw `[TRAVEL]` destination to a canonical node id, tolerating
+    /// the model's tendency to emit diegetic names instead of bare slugs
+    /// (2026-08-10, T52 Open Issue #1: the model wrote `[TRAVEL Market Square]`
+    /// but the node id is `market_square` → the strict `find_node` rejected it
+    /// → location never advanced across all 52 turns). Tries, in order:
+    ///   1. Exact id match (`find_node`) — the common case, zero cost.
+    ///   2. Normalized slug match: lowercase + spaces→`_` + trim → compare
+    ///      against every node id ("Market Square" → "market_square").
+    ///   3. Diegetic name match: case-insensitive compare against `node.name`
+    ///      ("The Rusty Anchor" → the `rusty_anchor` node).
+    /// Returns the matched node's canonical id, or `None` if nothing fits (the
+    /// caller then emits the reject directive listing known nodes). Cheap: O(n)
+    /// over a small graph, only reached when the exact match misses.
+    pub fn resolve_node_id(&self, raw: &str) -> Option<String> {
+        // 1. Exact id match (the fast path).
+        if self.find_node(raw).is_some() {
+            return Some(raw.to_string());
+        }
+        // 2. Normalized slug match: "Market Square" → "market_square".
+        let normalized = slugify(raw);
+        if normalized != raw && self.find_node(&normalized).is_some() {
+            return Some(normalized);
+        }
+        // 3. Diegetic name match (case-insensitive): compare the raw input
+        // against each node's `name` field. Also try the normalized form.
+        let raw_lower = raw.to_lowercase();
+        for n in &self.nodes {
+            if !n.name.is_empty() {
+                let name_lower = n.name.to_lowercase();
+                if name_lower == raw_lower || name_lower == normalized {
+                    return Some(n.id.clone());
+                }
+            }
+        }
+        None
     }
 
     /// True if the current node's `setting` (lowercased) is "indoor" — gates
@@ -335,11 +403,46 @@ impl TravelGraph {
         }
         true
     }
+
+    /// Bidirectionally link two EXISTING nodes (idempotent). Used by the
+    /// `[TRAVEL]` auto-link (2026-08-10): when the player travels from A to B
+    /// and both are known but not adjacent, the movement itself is evidence the
+    /// two locations are connected — form the edge rather than rejecting the
+    /// move. Adds each id to the other's `neighbors` if missing. No-op (returns
+    /// false) if either id is unknown, identical (`link_nodes(a, a)`), or
+    /// already linked in both directions. Does NOT touch `current_node` (the
+    /// caller advances it). Mirrors the `upsert_node` back-link body.
+    pub fn link_nodes(&mut self, a: &str, b: &str) -> bool {
+        if a.is_empty() || b.is_empty() || a == b {
+            return false;
+        }
+        // Both must exist (link_nodes never creates nodes — use upsert_node +
+        // then link, or DISCOVER + then TRAVEL).
+        if self.find_node(a).is_none() || self.find_node(b).is_none() {
+            return false;
+        }
+        let mut changed = false;
+        // a → b
+        if let Some(n) = self.nodes.iter_mut().find(|n| n.id == a) {
+            if !n.neighbors.iter().any(|x| x == b) {
+                n.neighbors.push(b.to_string());
+                changed = true;
+            }
+        }
+        // b → a (the reverse edge)
+        if let Some(n) = self.nodes.iter_mut().find(|n| n.id == b) {
+            if !n.neighbors.iter().any(|x| x == a) {
+                n.neighbors.push(a.to_string());
+                changed = true;
+            }
+        }
+        changed
+    }
 }
 
 /// One named NPC in the Rust-authoritative registry (Fable Phase 5A,
 /// 2026-07-29). Seeded once from the scenario card's `<cast>` block by
-/// `enter_fable_session`; treated as read-only thereafter (mirrors `Node`).
+/// `enter_fable_session`; grows only via `[NPC_REGISTER]` thereafter.
 /// The registry is the `[PRESENCE]` whitelist the Tracker validates against
 /// (unknown id → reject; the anti-hallucination gate that closes the
 /// "teleporting NPC" bug — the narrator cannot summon an NPC that isn't on
@@ -491,11 +594,12 @@ impl NpcRegistry {
 /// render line in `render_for_prompt` is the whitelist the narrator obeys —
 /// only NPCs in `presences` may speak, act, or be addressed in the scene.
 ///
-/// The `ttl` field implements the 1-turn grace: an NPC not re-asserted by a
+/// The `ttl` field implements the grace window: an NPC not re-asserted by a
 /// `[PRESENCE]` this turn has its `ttl` decremented; it drops when `ttl`
-/// reaches 0. This tolerates a single missed extraction (the §11.51 Tracker
-/// under-emission failure mode) without vaporizing the barkeep. `GRACE_RESET`
-/// is the value fresh/re-asserted presences start at.
+/// reaches 0. `PRESENCE_GRACE_RESET` (4 as of 2026-08-10) is the value
+/// fresh/re-asserted presences start at, so an NPC survives a multi-turn
+/// tracker under-emission streak (the §11.51 failure mode) without vaporizing
+/// mid-conversation.
 ///
 /// NO `Default` (mirrors `rumor::Rumor`): a presence is always authored by
 /// the Tracker, never default-constructed. NO `node_id` (Option B —
@@ -529,12 +633,16 @@ pub struct Presence {
 }
 
 /// The grace-TTL reset value (Phase 5A, 2026-07-29). Fresh + re-asserted
-/// presences start at 2; an NPC survives ONE missed `[PRESENCE]` extraction
-/// (2 → 1 → drop). Tuned to absorb the §11.51 single-miss failure mode
-/// without letting a genuinely-departed NPC linger on-camera for multiple
-/// turns. A single constant so the apply logic + tests reference one source
-/// of truth.
-pub const PRESENCE_GRACE_RESET: u32 = 2;
+/// presences start at 4; an NPC survives THREE missed `[PRESENCE]` extractions
+/// (4 → 3 → 2 → 1 → drop). Raised from 2 on 2026-08-10 (Issue #3): a 2-value
+/// grace (one miss tolerated) was too aggressive for real roleplay — a short
+/// conversation easily spans 3-4 turns where the tracker under-emits, and the
+/// NPC vaporized mid-scene (the cinderfen playtest saw Mara drop at T3 despite
+/// staying on-camera through T10). 4 tolerates a multi-turn tracker under-
+/// emission streak without letting a genuinely-departed NPC linger long. The
+/// prompt-side fix (the `<per_turn_presence>` maintainer discipline) is the
+/// real cure; this TTL is the defensive net beneath it.
+pub const PRESENCE_GRACE_RESET: u32 = 4;
 
 /// The scene pacing mode (Fable Seam #4 expansion, 2026-07-27): a
 /// Rust-computed per-turn classification of the scene's rhythm. Drives:
@@ -677,13 +785,18 @@ pub struct WorldSchema {
 
     /// Flexible key→value store for hard data. Keys are model-defined and
     /// namespaced by convention (e.g. `"item.iron_sword"`,
-    /// `"char.mira.trust"`, `"loc.current"`). Values are strings: structured
-    /// enough to read programmatically, loose enough to hold anything.
+    /// `"char.mira.trust"`, `"loc.current"`). Values are **arbitrary JSON**
+    /// (widened 2026-08-11 from `String` to `serde_json::Value`): a bare
+    /// string (`"rusty knife"`) for simple facts, or a structured object /
+    /// array / number for rich tracking (`{"quest.dragon": {"progress":3,
+    /// "target":5}}`). The model decides per-key how deep to go.
     ///
     /// In a delta, a `None` value (JSON `null`) means "delete this key";
-    /// `Some(v)` means "set/overwrite."
+    /// `Some(v)` means "set/overwrite." A `Value::Null` payload is treated
+    /// as a delete by `apply_delta` (matches the `Option<String>` semantics
+    /// the delta has always used).
     #[serde(default)]
-    pub entities: HashMap<String, String>,
+    pub entities: HashMap<String, serde_json::Value>,
 
     /// The player's canonical state (Fable Seam #7, Player State).
     /// Rust is the SOLE authority here — the schema-delta LLM pass never
@@ -734,11 +847,12 @@ pub struct WorldSchema {
     /// discrete locations (nodes) + adjacency edges + a single current
     /// location pointer. Rust is the SOLE authority — `apply_delta` does NOT
     /// touch this field (mirrors `world_clock` / `weather` / `player_state`).
-    /// The only writer to `current_node` is the `[TRAVEL ...]` bracket command
-    /// (the Tracker owns "the player moved"; Rust validates adjacency + rejects
-    /// non-neighbor moves). `nodes` itself is seeded once by the scenario card
-    /// and treated as read-only thereafter. v1 is geography only: no NPC
-    /// positions, no tick traversal mechanics, no weighted edges.
+    /// Writers to `current_node`: `[TRAVEL]` (the Tracker owns "the player
+    /// moved"; Rust auto-links + allows known moves, rejects unknown ones) +
+    /// the first-`[DISCOVER]`-on-empty-graph seed. `nodes` grows via
+    /// `[DISCOVER]`, the `[TRAVEL]` auto-link, + the card seed/bootstrap. v1
+    /// is geography only: no NPC positions, no tick traversal mechanics, no
+    /// weighted edges.
     /// `#[serde(default)]` keeps pre-Component-3 saves loadable as an empty
     /// graph (dormant — no `location:` line, no adjacency to validate).
     #[serde(default)]
@@ -862,6 +976,23 @@ pub struct WorldSchema {
     /// pass). `#[serde(default)]` keeps pre-Phase-5 saves loadable as empty.
     #[serde(default)]
     pub presences: Vec<Presence>,
+
+    /// Active stage background for this world (2026-08-11 Background Library):
+    /// the FILENAME of the selected image in the shared library at
+    /// `apps/fable/images/backgrounds/`. `None` = no background (the default
+    /// pure-black void). PER-CARD + SAVE-PERSISTENT: this field rides inside
+    /// EVERY save — `fable_save_now`, the per-turn autosave, and Quick Play's
+    /// quicksave all snapshot the full schema, and `fable_load_save` restores
+    /// it — so leaving and continuing a game brings its background back with
+    /// the save. Rust is the SOLE authority: `apply_delta` does NOT touch it
+    /// (the AI tracker can neither read nor write the selection) and
+    /// `render_for_prompt` does NOT emit it (it never reaches the narrator
+    /// prompt). The only writers are the `fable_background_active_set` IPC
+    /// (user selection) and the save/load restore path. The library itself is
+    /// GLOBAL (shared across cards); only THIS selection field is per-card.
+    /// `#[serde(default)]` keeps pre-Background-Library saves loadable as None.
+    #[serde(default)]
+    pub background: Option<String>,
 }
 
 impl WorldSchema {
@@ -901,13 +1032,153 @@ impl WorldSchema {
         }
     }
 
+    /// Merge a partial JSON patch into this schema. Used by the model-facing
+    /// `fable_schema_patch` tool (chat-side stateful tool, dispatched inline
+    /// from `run_agent_loop`). Mirrors the user-facing `fable_schema_set` IPC's
+    /// authority but with field-level granularity: only the top-level keys
+    /// PRESENT in `patch` are replaced; absent keys keep their current value.
+    ///
+    /// # Merge semantics (load-bearing)
+    ///
+    /// - `entities`: shallow-merge by key. For each `(k, v)` in patch.entities:
+    ///   `Value::Null` deletes the key from `self.entities`; any other value
+    ///   upserts. (Lets the model add/remove individual entity keys without
+    ///   resending the whole map.)
+    /// - All other allowed top-level fields: **full-replace** via typed
+    ///   deserialization. The patch value is fed through
+    ///   `serde_json::from_value::<FieldType>`; a type error becomes a
+    ///   model-facing error string (so the repair loop can fold it back).
+    ///
+    /// # Excluded field
+    ///
+    /// `immutable_keys` is REFUSED if present in the patch. The immutability
+    /// lock is the meta-layer protecting other fields from LLM retcons; letting
+    /// the model edit it would let it unlock its own canon. (The user-facing
+    /// `fable_schema_set` IPC bypasses this — user trust = full control; the
+    /// model path doesn't get that trust.)
+    ///
+    /// Returns the list of top-level field names that were merged (for the
+    /// `tool_result` payload so the model can see what it changed).
+    pub fn merge_patch(&mut self, patch: serde_json::Value) -> Result<Vec<String>, String> {
+        let obj = patch
+            .as_object()
+            .ok_or_else(|| "patch must be a JSON object".to_string())?
+            .clone();
+        if obj.contains_key("immutable_keys") {
+            return Err(
+                "immutable_keys is the meta-lock + may not be patched (it would \
+                 let the model unlock its own canon)"
+                    .to_string(),
+            );
+        }
+        let mut merged: Vec<String> = Vec::new();
+        for (key, value) in obj {
+            match key.as_str() {
+                "summary" => {
+                    self.summary =
+                        serde_json::from_value(value).map_err(|e| format!("summary: {e}"))?;
+                    merged.push("summary".into());
+                }
+                "recent_events" => {
+                    self.recent_events = serde_json::from_value(value)
+                        .map_err(|e| format!("recent_events: {e}"))?;
+                    merged.push("recent_events".into());
+                }
+                "entities" => {
+                    // Shallow-merge: Null deletes, any other value upserts.
+                    let map = value
+                        .as_object()
+                        .ok_or_else(|| "entities must be an object".to_string())?;
+                    for (ek, ev) in map {
+                        if ev.is_null() {
+                            self.entities.remove(ek);
+                        } else {
+                            self.entities.insert(ek.clone(), ev.clone());
+                        }
+                    }
+                    merged.push("entities".into());
+                }
+                "player_state" => {
+                    self.player_state = serde_json::from_value(value)
+                        .map_err(|e| format!("player_state: {e}"))?;
+                    merged.push("player_state".into());
+                }
+                "world_clock" => {
+                    self.world_clock = serde_json::from_value(value)
+                        .map_err(|e| format!("world_clock: {e}"))?;
+                    merged.push("world_clock".into());
+                }
+                "weather" => {
+                    self.weather =
+                        serde_json::from_value(value).map_err(|e| format!("weather: {e}"))?;
+                    merged.push("weather".into());
+                }
+                "travel_graph" => {
+                    self.travel_graph = serde_json::from_value(value)
+                        .map_err(|e| format!("travel_graph: {e}"))?;
+                    merged.push("travel_graph".into());
+                }
+                "scene_pacing" => {
+                    self.scene_pacing = serde_json::from_value(value)
+                        .map_err(|e| format!("scene_pacing: {e}"))?;
+                    merged.push("scene_pacing".into());
+                }
+                "status_tags" => {
+                    self.status_tags = serde_json::from_value(value)
+                        .map_err(|e| format!("status_tags: {e}"))?;
+                    merged.push("status_tags".into());
+                }
+                "relationships" => {
+                    self.relationships = serde_json::from_value(value)
+                        .map_err(|e| format!("relationships: {e}"))?;
+                    merged.push("relationships".into());
+                }
+                "offscreen_tasks" => {
+                    self.offscreen_tasks = serde_json::from_value(value)
+                        .map_err(|e| format!("offscreen_tasks: {e}"))?;
+                    merged.push("offscreen_tasks".into());
+                }
+                "rumors" => {
+                    self.rumors =
+                        serde_json::from_value(value).map_err(|e| format!("rumors: {e}"))?;
+                    merged.push("rumors".into());
+                }
+                "npc_registry" => {
+                    self.npc_registry = serde_json::from_value(value)
+                        .map_err(|e| format!("npc_registry: {e}"))?;
+                    merged.push("npc_registry".into());
+                }
+                "presences" => {
+                    self.presences = serde_json::from_value(value)
+                        .map_err(|e| format!("presences: {e}"))?;
+                    merged.push("presences".into());
+                }
+                // Note: `immutable_keys` is refused up top (the meta-lock).
+                unknown => {
+                    return Err(format!(
+                        "unknown top-level field {unknown:?}; allowed: summary, \
+                         recent_events, entities, player_state, world_clock, weather, \
+                         travel_graph, scene_pacing, status_tags, relationships, \
+                         offscreen_tasks, rumors, npc_registry, presences"
+                    ));
+                }
+            }
+        }
+        Ok(merged)
+    }
+
     /// Render the schema into a compact, prompt-friendly string for injection
     /// into the chat turn's `<world_state>` block. Compactness matters: this
     /// goes into the inter-turn region alongside the memory block, and every
-    /// token is prefill cost. We emit the summary, the last few recent events
-    /// (not all: the model doesn't need the deep history list in chat, that's
-    /// what the delta pass sees in full), and the entities as `key: value`
-    /// lines.
+    /// token is prefill cost.
+    ///
+    /// Emits ONLY bounded deterministic anchors: clock, weather, location +
+    /// exits, present NPCs, current-node rumors, summary, the last 5 recent
+    /// events, + player_state (stamina/injuries/equipped/appearance). The
+    /// `entities` map is deliberately NOT rendered (2026-08-10): it was the
+    /// sole unbounded growth source. Entity state stays in the Rust schema
+    /// (God-Tier authority) and reaches the model via the 1-turn bracket
+    /// window — never via this prompt block, never via probabilistic RRF.
     ///
     /// Returns an empty string for an empty schema so the caller can skip
     /// emitting the `<world_state>` block entirely (matches the memory block's
@@ -915,7 +1186,6 @@ impl WorldSchema {
     pub fn render_for_prompt(&self) -> String {
         let empty = self.summary.trim().is_empty()
             && self.recent_events.is_empty()
-            && self.entities.is_empty()
             && self.player_state.is_default()
             && !self.world_clock.is_set()
             && !self.weather.is_set()
@@ -1032,18 +1302,76 @@ impl WorldSchema {
                 out.push('\n');
             }
         }
-        if !self.entities.is_empty() {
-            out.push_str("entities:\n");
-            // Sort keys for deterministic output (stable prompt = stable tokens).
-            let mut keys: Vec<&String> = self.entities.keys().collect();
-            keys.sort();
-            for key in keys {
-                out.push_str("  ");
-                out.push_str(key);
-                out.push_str(": ");
-                out.push_str(&self.entities[key]);
-                out.push('\n');
+        // BOUNDED CARRY-BACK (2026-08-10): the prior "ENTITIES BLOCK REMOVED"
+        // fix correctly killed the uncapped entity dump (every NPC tier, world
+        // fact, and item detail wholesale) — that was the genuine overflow
+        // driver. But going to ZERO carry-back left the tracker blind to three
+        // things it must see to do its job: the NPC roster (so [PRESENCE] has
+        // valid targets), the belt (so [BELT -x] is meaningful), and the pack
+        // (so [PACK x] isn't a blind guess at what's already there). The
+        // tracker lands on "emit nothing" when it can't see current state —
+        // the 2026-08-10 playtest showed 6 brackets across 52 turns + a frozen
+        // world.
+        //
+        // This block is the LEAN carry-back: only the three pieces the tracker
+        // cannot infer from the 1-turn window + Rust anchors, each BOUNDED so
+        // it cannot re-grow the overflow:
+        //   - cast: the roster line (id list, no prose) — the [PRESENCE]
+        //     whitelist source. Empty when no NPCs are registered.
+        //   - belt: the 4-slot quick rack, names only (the [BELT] state).
+        //     Empty when nothing's on the belt.
+        //   - pack: the unbounded deep store, names + qty ONLY, HARD-CAPPED at
+        //     the first 12 entries. Pack can grow large in long sessions; the
+        //     cap keeps the line bounded. (Older entries live in the persisted
+        //     schema + the inventory panel UI — not the prompt.)
+        // Item tags/stats are deliberately NOT rendered here (they're authoring
+        // noise for the tracker; the apply path keeps them on the items). The
+        // narrator sees these too — it's legitimate observer knowledge (what
+        // you carry + who's in the cast).
+        if let Some(cast_line) = self.npc_registry.render_line() {
+            out.push_str("cast: ");
+            out.push_str(&cast_line);
+            out.push('\n');
+        }
+        if !self.player_state.belt.is_empty() {
+            let names: Vec<String> = self
+                .player_state
+                .belt
+                .iter()
+                .map(|i| {
+                    if i.qty > 1 {
+                        format!("{} ×{}", i.name, i.qty)
+                    } else {
+                        i.name.clone()
+                    }
+                })
+                .collect();
+            out.push_str("belt: ");
+            out.push_str(&names.join(", "));
+            out.push('\n');
+        }
+        if !self.player_state.pack.is_empty() {
+            const PACK_PROMPT_CAP: usize = 12;
+            let shown: Vec<String> = self
+                .player_state
+                .pack
+                .iter()
+                .take(PACK_PROMPT_CAP)
+                .map(|i| {
+                    if i.qty > 1 {
+                        format!("{} ×{}", i.name, i.qty)
+                    } else {
+                        i.name.clone()
+                    }
+                })
+                .collect();
+            let overflow = self.player_state.pack.len().saturating_sub(PACK_PROMPT_CAP);
+            out.push_str("pack: ");
+            out.push_str(&shown.join(", "));
+            if overflow > 0 {
+                out.push_str(&format!(" (+{} more)", overflow));
             }
+            out.push('\n');
         }
         // Player state (the Rust Referee's canonical fact block). Rendered
         // LAST in the world-state block so it's the loudest signal — the
@@ -1282,9 +1610,13 @@ fn atomic_write_text(path: &Path, text: &str) -> std::io::Result<()> {
 /// Deserialized from the JSON object the schema-delta model pass emits. The
 /// `entities` field's inner `Option<String>` is load-bearing: outer `Option`
 /// = "did any entity change?", inner `Option` = "is this a delete (`null`)
-/// or a set (`Some`)?". `serde` deserializes JSON `null` to `None` and a
-/// string to `Some(string)`, giving us the unambiguous delete-vs-set signal
-/// for free.
+/// or a set (`Some`)?". `serde` deserializes JSON `null` to `None` and any
+/// other JSON value to `Some(value)`, giving us the unambiguous delete-vs-set
+/// signal for free. Values are `serde_json::Value` (widened 2026-08-11 from
+/// `String`) so a single entity key can carry structured data — e.g. a quest
+/// counter `{"progress":3,"target":5}` — without baking a parallel typed
+/// system. Bare-string values (`"rusty knife"`) round-trip as
+/// `Value::String` for full back-compat with pre-widening saves.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default)]
 pub struct SchemaDelta {
     #[serde(default)]
@@ -1292,7 +1624,7 @@ pub struct SchemaDelta {
     #[serde(default)]
     pub recent_events: Option<Vec<String>>,
     #[serde(default)]
-    pub entities: Option<HashMap<String, Option<String>>>,
+    pub entities: Option<HashMap<String, Option<serde_json::Value>>>,
 }
 
 impl SchemaDelta {
@@ -1339,6 +1671,95 @@ impl SchemaDelta {
                 .as_ref()
                 .map(|m| !m.is_empty())
                 .unwrap_or(false)
+    }
+}
+
+/// The starting world-state anchors derived from a card's `.intro` by the
+/// launch-time bootstrap pass (2026-08-10). A sibling of `CardStart`
+/// (sim_card.rs) — both seed the dormant clock/weather/location at
+/// `enter_fable_session`, but `CardStart` is *authored* (the card's `<start>`
+/// block) while `BootstrapAnchors` is *derived* (one schema-engine pass reads
+/// the intro + extracts the implied time/weather/location). The bootstrap runs
+/// only when the `<start>` block left an anchor dormant (no `<start>` block, or
+/// it seeded only one of clock/weather). Mirrors the cold-start seed discipline:
+/// writes `world_clock` + `weather` + an opening travel-graph node directly
+/// (NOT through `apply_delta`, which is test-pinned to never touch them).
+///
+/// Every field is `Option` — the model may legitimately omit any it can't
+/// derive from the intro (a card with no weather mention → `weather: None` →
+/// the caller's sensible-defaults fallback seeds `"clear"`). A fully-empty
+/// result (all `None`) is valid; the caller falls through to defaults for each
+/// dormant field independently.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BootstrapAnchors {
+    /// Parsed in-world minutes since 0001-01-01 (the same epoch `WorldClock`
+    /// uses). `None` when the intro gives no usable time signal.
+    pub time_minutes: Option<i64>,
+    /// Diegetic weather condition phrase ("thick fog off the marsh"). `None`
+    /// when the intro gives no usable weather signal.
+    pub weather: Option<String>,
+    /// The opening location as `(node_id, diegetic name)`. `None` when the
+    /// intro gives no usable location signal (the `[DISCOVER]` path then
+    /// handles it organically on turn 1). When `Some`, the caller upserts the
+    /// node + sets `current_node` (only when the graph is still empty — a
+    /// resumed save with an existing graph is preserved).
+    pub location: Option<(String, String)>,
+}
+
+impl BootstrapAnchors {
+    /// Parse the bootstrap pass's model output. Mirrors `SchemaDelta::from_
+    /// model_output`'s tolerant pipeline (extract reply channel → strip
+    /// markdown fences → syntactic repair → serde_json::from_str) but parses
+    /// the bootstrap JSON shape `{time, weather, location_id, location_name}`
+    /// (all fields optional). Returns `Ok(Self)` on a clean parse (fields left
+    /// `None` when absent), `Err` on unparseable JSON so the caller can fall
+    /// through to sensible defaults.
+    ///
+    /// `time` is a free-form string ("Day 1, 21:00") parsed to minutes via
+    /// `bracket_parser::parse_in_world_time` (the same parser `[TIME]` uses).
+    /// An unparseable `time` → `time_minutes: None` (NOT an `Err` — the other
+    /// fields may still be valid).
+    pub fn from_model_output(raw: &str) -> Result<Self, serde_json::Error> {
+        let reply = extract_reply_channel(raw);
+        let cleaned = strip_markdown_fences(&reply).trim();
+        let repaired = crate::json_repair::repair(cleaned);
+        #[derive(serde::Deserialize)]
+        struct Raw {
+            #[serde(default)]
+            time: Option<String>,
+            #[serde(default)]
+            weather: Option<String>,
+            #[serde(default, rename = "location_id")]
+            location_id: Option<String>,
+            #[serde(default, rename = "location_name")]
+            location_name: Option<String>,
+        }
+        let parsed: Raw = serde_json::from_str(&repaired)?;
+        // time → minutes (a parse failure is a soft None, not a hard Err).
+        let time_minutes = parsed
+            .time
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .and_then(|s| crate::bracket_parser::parse_in_world_time(s));
+        let weather = parsed
+            .weather
+            .map(|w| w.trim().to_string())
+            .filter(|w| !w.is_empty());
+        // location: require BOTH id + name (a partial pair is useless).
+        let location = match (parsed.location_id, parsed.location_name) {
+            (Some(id), Some(name)) => {
+                let id = id.trim().to_string();
+                let name = name.trim().to_string();
+                if id.is_empty() || name.is_empty() {
+                    None
+                } else {
+                    Some((id, name))
+                }
+            }
+            _ => None,
+        };
+        Ok(Self { time_minutes, weather, location })
     }
 }
 
@@ -1412,13 +1833,19 @@ mod tests {
             summary: None,
             recent_events: None,
             entities: Some(HashMap::from([
-                ("iron_sword".to_string(), Some("acquired".to_string())),
-                ("loc.current".to_string(), Some("tavern".to_string())),
+                ("iron_sword".to_string(), Some(serde_json::Value::String("acquired".into()))),
+                ("loc.current".to_string(), Some(serde_json::Value::String("tavern".into()))),
             ])),
         };
         schema.apply_delta(delta);
-        assert_eq!(schema.entities.get("iron_sword"), Some(&"acquired".to_string()));
-        assert_eq!(schema.entities.get("loc.current"), Some(&"tavern".to_string()));
+        assert_eq!(
+            schema.entities.get("iron_sword").and_then(|v| v.as_str()),
+            Some("acquired")
+        );
+        assert_eq!(
+            schema.entities.get("loc.current").and_then(|v| v.as_str()),
+            Some("tavern")
+        );
     }
 
     #[test]
@@ -1427,8 +1854,8 @@ mod tests {
             summary: String::new(),
             recent_events: vec![],
             entities: HashMap::from([
-                ("iron_sword".to_string(), "acquired".to_string()),
-                ("loc.current".to_string(), "tavern".to_string()),
+                ("iron_sword".to_string(), serde_json::Value::String("acquired".into())),
+                ("loc.current".to_string(), serde_json::Value::String("tavern".into())),
             ]),
             ..Default::default()
         };
@@ -1438,12 +1865,15 @@ mod tests {
             recent_events: None,
             entities: Some(HashMap::from([
                 ("iron_sword".to_string(), None), // delete
-                ("loc.current".to_string(), Some("forest".to_string())),
+                ("loc.current".to_string(), Some(serde_json::Value::String("forest".into()))),
             ])),
         };
         schema.apply_delta(delta);
         assert!(!schema.entities.contains_key("iron_sword"), "null should delete");
-        assert_eq!(schema.entities.get("loc.current"), Some(&"forest".to_string()));
+        assert_eq!(
+            schema.entities.get("loc.current").and_then(|v| v.as_str()),
+            Some("forest")
+        );
     }
 
     #[test]
@@ -1500,13 +1930,159 @@ mod tests {
         let mut schema = WorldSchema {
             summary: "kept".to_string(),
             recent_events: vec!["kept".to_string()],
-            entities: HashMap::from([("k".to_string(), "v".to_string())]),
+            entities: HashMap::from([("k".to_string(), serde_json::Value::String("v".into()))]),
             ..Default::default()
         };
         schema.apply_delta(SchemaDelta::default());
         assert_eq!(schema.summary, "kept");
         assert_eq!(schema.recent_events, vec!["kept"]);
-        assert_eq!(schema.entities.get("k"), Some(&"v".to_string()));
+        assert_eq!(schema.entities.get("k").and_then(|v| v.as_str()), Some("v"));
+    }
+
+    // --- merge_patch (the model-facing fable_schema_patch path, 2026-08-11) ---
+
+    #[test]
+    fn merge_patch_full_replaces_scalar_fields() {
+        let mut schema = WorldSchema {
+            summary: "old".to_string(),
+            ..Default::default()
+        };
+        let patch = serde_json::json!({ "summary": "new summary" });
+        let merged = schema.merge_patch(patch).expect("scalar replace");
+        assert_eq!(merged, vec!["summary".to_string()]);
+        assert_eq!(schema.summary, "new summary");
+    }
+
+    #[test]
+    fn merge_patch_entities_shallow_merges_and_deletes() {
+        let mut schema = WorldSchema::default();
+        schema.entities.insert("keep".into(), serde_json::Value::String("v".into()));
+        schema.entities.insert("drop".into(), serde_json::Value::String("x".into()));
+        let patch = serde_json::json!({
+            "entities": {
+                "add": "added",
+                "drop": null,
+                "structured": { "progress": 3, "target": 5 }
+            }
+        });
+        let merged = schema.merge_patch(patch).expect("entities merge");
+        assert_eq!(merged, vec!["entities".to_string()]);
+        assert_eq!(schema.entities.get("keep").and_then(|v| v.as_str()), Some("v"));
+        assert_eq!(schema.entities.get("add").and_then(|v| v.as_str()), Some("added"));
+        assert!(!schema.entities.contains_key("drop"), "null should delete");
+        // Structured value survives as a JSON object (the widening's point).
+        let mut expected_obj = serde_json::Map::new();
+        expected_obj.insert("progress".to_string(), serde_json::Value::from(3));
+        expected_obj.insert("target".to_string(), serde_json::Value::from(5));
+        assert_eq!(
+            schema.entities.get("structured").and_then(|v| v.as_object()),
+            Some(&expected_obj)
+        );
+    }
+
+    #[test]
+    fn merge_patch_refuses_immutable_keys() {
+        let mut schema = WorldSchema::default();
+        let patch = serde_json::json!({ "immutable_keys": ["npc.marcus.core"] });
+        let err = schema.merge_patch(patch).expect_err("must refuse");
+        assert!(err.contains("immutable_keys"), "error should explain: {err}");
+    }
+
+    #[test]
+    fn merge_patch_unknown_field_errors() {
+        let mut schema = WorldSchema::default();
+        let patch = serde_json::json!({ "totally_made_up": "field" });
+        let err = schema.merge_patch(patch).expect_err("must refuse");
+        assert!(err.contains("unknown top-level field"), "error should explain: {err}");
+    }
+
+    #[test]
+    fn merge_patch_partial_leaves_absent_fields_alone() {
+        // Only `summary` is in the patch; recent_events + entities stay put.
+        let mut schema = WorldSchema {
+            summary: "old".to_string(),
+            recent_events: vec!["kept".to_string()],
+            entities: HashMap::from([("k".into(), serde_json::Value::String("v".into()))]),
+            ..Default::default()
+        };
+        let patch = serde_json::json!({ "summary": "new" });
+        schema.merge_patch(patch).expect("partial patch");
+        assert_eq!(schema.summary, "new");
+        assert_eq!(schema.recent_events, vec!["kept"]);
+        assert_eq!(schema.entities.get("k").and_then(|v| v.as_str()), Some("v"));
+    }
+
+    #[test]
+    fn merge_patch_typed_field_replace_via_deserialize() {
+        // weather is a typed struct; the patch must deserialize cleanly.
+        let mut schema = WorldSchema::default();
+        let patch = serde_json::json!({
+            "weather": { "condition": "rain", "started_at_minutes": 540 }
+        });
+        let merged = schema.merge_patch(patch).expect("typed replace");
+        assert_eq!(merged, vec!["weather".to_string()]);
+        assert_eq!(schema.weather.condition, "rain");
+    }
+
+    #[test]
+    fn merge_patch_malformed_typed_field_errors() {
+        let mut schema = WorldSchema::default();
+        // weather is an object, not an array → type error must surface.
+        let patch = serde_json::json!({ "weather": ["not", "an", "object"] });
+        let err = schema.merge_patch(patch).expect_err("type mismatch");
+        assert!(err.contains("weather"), "error should name the field: {err}");
+    }
+
+    #[test]
+    fn merge_patch_empty_object_is_noop() {
+        let mut schema = WorldSchema {
+            summary: "kept".to_string(),
+            ..Default::default()
+        };
+        let merged = schema.merge_patch(serde_json::json!({})).expect("empty patch");
+        assert!(merged.is_empty(), "no fields merged");
+        assert_eq!(schema.summary, "kept");
+    }
+
+    #[test]
+    fn merge_patch_non_object_errors() {
+        let mut schema = WorldSchema::default();
+        let err = schema
+            .merge_patch(serde_json::json!(["not", "an", "object"]))
+            .expect_err("non-object patch");
+        assert!(err.contains("must be a JSON object"), "error: {err}");
+    }
+
+    #[test]
+    fn entities_legacy_string_value_round_trips_through_save_load() {
+        // The 2026-08-11 widening from HashMap<String, String> to <String, Value>
+        // must NOT break old saves: a bare-string value deserializes cleanly to
+        // Value::String and re-serializes back to the same bytes.
+        let dir = std::env::temp_dir();
+        let path = dir.join("wupi_schema_widening_test.json");
+        let _ = std::fs::remove_file(&path);
+        let schema = WorldSchema {
+            summary: "widening test".to_string(),
+            recent_events: vec![],
+            entities: HashMap::from([
+                ("item.sword".to_string(), serde_json::Value::String("rusty".into())),
+                ("quest.dragon".to_string(), serde_json::json!({"progress": 3, "target": 5})),
+            ]),
+            ..Default::default()
+        };
+        schema.save(&path).unwrap();
+        let loaded = WorldSchema::load(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        // Bare string value survives as Value::String.
+        assert_eq!(
+            loaded.entities.get("item.sword").and_then(|v| v.as_str()),
+            Some("rusty")
+        );
+        // Structured value survives as a JSON object.
+        assert_eq!(
+            loaded.entities.get("quest.dragon").and_then(|v| v.get("progress")).and_then(|v| v.as_u64()),
+            Some(3)
+        );
     }
 
     #[test]
@@ -1555,9 +2131,11 @@ mod tests {
         let raw = r#"{"summary":"new","entities":{"x":"1"}}"#;
         let delta = SchemaDelta::from_model_output(raw).unwrap();
         assert_eq!(delta.summary.as_deref(), Some("new"));
+        // The "1" deserializes as Value::String("1") (bare-string JSON values
+        // are the simple-value case the widening keeps backwards-compatible).
         assert_eq!(
-            delta.entities.unwrap().get("x"),
-            Some(&Some("1".to_string()))
+            delta.entities.unwrap().get("x").and_then(|opt| opt.as_ref().and_then(|v| v.as_str())),
+            Some("1")
         );
     }
 
@@ -1597,7 +2175,7 @@ mod tests {
         let delta = SchemaDelta::from_model_output(raw).unwrap();
         assert_eq!(
             delta.entities.unwrap().get("item.iron_sword"),
-            Some(&Some("acquired".to_string()))
+            Some(&Some(serde_json::Value::String("acquired".into())))
         );
     }
 
@@ -1632,6 +2210,34 @@ mod tests {
     #[test]
     fn render_for_prompt_empty_schema_is_empty_string() {
         assert_eq!(WorldSchema::default().render_for_prompt(), "");
+    }
+
+    #[test]
+    fn render_for_prompt_does_not_render_entities_dump() {
+        // 2026-08-10: the uncapped entities dump is stripped from the prompt.
+        // Entity state stays in the Rust schema (God-Tier authority) + reaches
+        // the model via the 1-turn bracket window — NEVER via this prompt
+        // block. This test pins the contract so a future "helpful" re-add of a
+        // capped entity render is caught immediately (a cap re-grows; the
+        // bracket window is the lightweight carry).
+        let schema = WorldSchema {
+            entities: HashMap::from([
+                ("npc.mara.tier".to_string(), serde_json::Value::String("acquaintance".into())),
+                ("npc.harsk.tier".to_string(), serde_json::Value::String("foe".into())),
+                ("world.fact".to_string(), serde_json::Value::String("the mire is poisonous".into())),
+            ]),
+            // Set one anchor so the function doesn't early-return as empty.
+            summary: "the scene is set".to_string(),
+            ..Default::default()
+        };
+        let rendered = schema.render_for_prompt();
+        // Anchors still render.
+        assert!(rendered.contains("summary: the scene is set"));
+        // NO entity content leaks into the prompt.
+        assert!(!rendered.contains("entities:"), "entities dump must NOT render");
+        assert!(!rendered.contains("npc.mara.tier"), "no entity key in prompt");
+        assert!(!rendered.contains("acquaintance"), "no entity value in prompt");
+        assert!(!rendered.contains("the mire is poisonous"), "no world.fact in prompt");
     }
 
     #[test]
@@ -1684,14 +2290,14 @@ mod tests {
         let schema = WorldSchema {
             summary: "test summary".to_string(),
             recent_events: vec!["e1".to_string()],
-            entities: HashMap::from([("k".to_string(), "v".to_string())]),
+            entities: HashMap::from([("k".to_string(), serde_json::Value::String("v".into()))]),
             ..Default::default()
         };
         schema.save(&path).unwrap();
         let loaded = WorldSchema::load(&path).unwrap();
         assert_eq!(loaded.summary, "test summary");
         assert_eq!(loaded.recent_events, vec!["e1"]);
-        assert_eq!(loaded.entities.get("k"), Some(&"v".to_string()));
+        assert_eq!(loaded.entities.get("k").and_then(|v| v.as_str()), Some("v"));
         let _ = std::fs::remove_file(&path);
     }
 
@@ -1858,7 +2464,7 @@ mod tests {
         schema.world_clock = WorldClock { current_minutes: 1000, last_tick_minutes: 500 };
         let mut ents = HashMap::new();
         // A naive/malicious delta trying to set "world_clock" as an entity.
-        ents.insert("world_clock".to_string(), Some("9999".to_string()));
+        ents.insert("world_clock".to_string(), Some(serde_json::Value::String("9999".into())));
         let delta = SchemaDelta {
             summary: None,
             recent_events: None,
@@ -1871,7 +2477,7 @@ mod tests {
         // The "world_clock" string landed in the entities map (it's just a
         // regular key from apply_delta's perspective). Whether it stays there
         // is the validator's call, not apply_delta's.
-        assert_eq!(schema.entities.get("world_clock").map(|s| s.as_str()), Some("9999"));
+        assert_eq!(schema.entities.get("world_clock").and_then(|s| s.as_str()), Some("9999"));
     }
 
     // ---------- weather (Fable Phase 4 Component 2, 2026-07-28) ----------
@@ -1937,7 +2543,7 @@ mod tests {
         };
         let mut ents = HashMap::new();
         // A naive/malicious delta trying to overwrite weather via entities.
-        ents.insert("weather".to_string(), Some("sunny".to_string()));
+        ents.insert("weather".to_string(), Some(serde_json::Value::String("sunny".into())));
         let delta = SchemaDelta {
             summary: None,
             recent_events: None,
@@ -1948,7 +2554,7 @@ mod tests {
         assert_eq!(schema.weather.condition, "heavy rain");
         assert_eq!(schema.weather.started_at_minutes, 1000);
         // The "weather" string landed in the entities map (legacy convention).
-        assert_eq!(schema.entities.get("weather").map(|s| s.as_str()), Some("sunny"));
+        assert_eq!(schema.entities.get("weather").and_then(|s| s.as_str()), Some("sunny"));
     }
 
     #[test]
@@ -2127,6 +2733,42 @@ mod tests {
         assert!(!g.is_adjacent_to_current("cellar"));
     }
 
+    // ---- resolve_node_id fuzzy matcher (2026-08-10, T52 Open Issue #1) ----
+    // The tracker emits diegetic names ("Market Square") instead of bare slugs
+    // ("market_square"). resolve_node_id normalizes + fuzzy-matches so legal
+    // moves aren't rejected on a casing/spelling technicality.
+
+    #[test]
+    fn resolve_node_id_exact_match_is_fast_path() {
+        let g = sample_travel_graph();
+        assert_eq!(g.resolve_node_id("market_square"), Some("market_square".to_string()));
+        assert_eq!(g.resolve_node_id("tavern"), Some("tavern".to_string()));
+    }
+
+    #[test]
+    fn resolve_node_id_normalizes_diegetic_name_with_spaces() {
+        // T52 case: "Market Square" → "market_square"
+        let g = sample_travel_graph();
+        assert_eq!(g.resolve_node_id("Market Square"), Some("market_square".to_string()));
+        // Case-insensitive.
+        assert_eq!(g.resolve_node_id("MARKET SQUARE"), Some("market_square".to_string()));
+    }
+
+    #[test]
+    fn resolve_node_id_matches_diegetic_name_field() {
+        // "The Rusty Anchor" is the node.name for id "tavern".
+        let g = sample_travel_graph();
+        assert_eq!(g.resolve_node_id("The Rusty Anchor"), Some("tavern".to_string()));
+        assert_eq!(g.resolve_node_id("the rusty anchor"), Some("tavern".to_string()));
+    }
+
+    #[test]
+    fn resolve_node_id_returns_none_for_genuinely_unknown() {
+        let g = sample_travel_graph();
+        assert_eq!(g.resolve_node_id("Mordor"), None);
+        assert_eq!(g.resolve_node_id("nonexistent_node"), None);
+    }
+
     #[test]
     fn travel_graph_render_line_shows_current_and_exits() {
         let g = sample_travel_graph();
@@ -2289,6 +2931,128 @@ mod tests {
         assert!(g.nodes.is_empty());
     }
 
+    // --- link_nodes (the [TRAVEL] auto-link, 2026-08-10) ---
+    // When the player travels between two KNOWN but non-adjacent nodes, the
+    // movement is evidence the locations are connected. link_nodes forms the
+    // bidirectional edge idempotently.
+
+    #[test]
+    fn link_nodes_forms_bidirectional_edge() {
+        // Two known nodes (tavern, market_square) that are already adjacent —
+        // use two NON-adjacent nodes instead. Build a graph where cellar + a
+        // new "docks" node are disconnected.
+        let mut g = TravelGraph {
+            nodes: vec![
+                Node { id: "tavern".into(), name: "Tavern".into(), neighbors: vec!["cellar".into()], setting: "indoor".into() },
+                Node { id: "cellar".into(), name: "Cellar".into(), neighbors: vec!["tavern".into()], setting: "".into() },
+                Node { id: "docks".into(), name: "Docks".into(), neighbors: vec![], setting: "outdoor".into() },
+            ],
+            current_node: Some("tavern".into()),
+        };
+        // docks is known but NOT adjacent to tavern. Link them.
+        let changed = g.link_nodes("tavern", "docks");
+        assert!(changed, "linking two unlinked known nodes must report a change");
+        // Bidirectional: tavern→docks + docks→tavern.
+        assert!(g.find_node("tavern").unwrap().neighbors.contains(&"docks".to_string()));
+        assert!(g.find_node("docks").unwrap().neighbors.contains(&"tavern".to_string()));
+    }
+
+    #[test]
+    fn link_nodes_is_idempotent_when_already_linked() {
+        // tavern ↔ cellar already linked in sample_travel_graph.
+        let mut g = sample_travel_graph();
+        let changed = g.link_nodes("tavern", "cellar");
+        assert!(!changed, "linking two already-linked nodes must report no change");
+        // No duplicate edges.
+        let count = g.find_node("tavern").unwrap().neighbors.iter().filter(|n| *n == "cellar").count();
+        assert_eq!(count, 1, "no duplicate edge after idempotent re-link");
+    }
+
+    #[test]
+    fn link_nodes_noop_for_unknown_id() {
+        let mut g = sample_travel_graph();
+        // One side unknown.
+        assert!(!g.link_nodes("tavern", "nonexistent"));
+        // Both unknown.
+        assert!(!g.link_nodes("ghost_a", "ghost_b"));
+        // tavern's neighbors unchanged.
+        assert_eq!(g.find_node("tavern").unwrap().neighbors.len(), 2);
+    }
+
+    #[test]
+    fn link_nodes_noop_for_identical_ids() {
+        let mut g = sample_travel_graph();
+        assert!(!g.link_nodes("tavern", "tavern"), "self-link is a no-op");
+    }
+
+    // --- BootstrapAnchors::from_model_output (the intro-derived seed parser,
+    // 2026-08-10) ---
+
+    #[test]
+    fn bootstrap_parses_full_extraction() {
+        let raw = r#"{"time":"Day 1, 21:00","weather":"thick fog","location_id":"crooked_lantern","location_name":"The Crooked Lantern"}"#;
+        let a = BootstrapAnchors::from_model_output(raw).expect("full extraction parses");
+        // Day 1 21:00 = 0*1440 + 21*60 = 1260 minutes.
+        assert_eq!(a.time_minutes, Some(1260));
+        assert_eq!(a.weather.as_deref(), Some("thick fog"));
+        assert_eq!(a.location, Some(("crooked_lantern".into(), "The Crooked Lantern".into())));
+    }
+
+    #[test]
+    fn bootstrap_parses_partial_extraction() {
+        // Only time + weather, no location — a valid partial (the intro
+        // mentioned time/weather but no specific place).
+        let raw = r#"{"time":"Day 2, 08:30","weather":"clear morning"}"#;
+        let a = BootstrapAnchors::from_model_output(raw).expect("partial parses");
+        assert_eq!(a.time_minutes, Some(1440 + 8 * 60 + 30));
+        assert_eq!(a.weather.as_deref(), Some("clear morning"));
+        assert!(a.location.is_none(), "absent location → None");
+    }
+
+    #[test]
+    fn bootstrap_empty_object_is_all_none() {
+        // The model may emit `{}` when the intro gives nothing. Not an error —
+        // the caller's sensible-defaults fallback seeds each field.
+        let a = BootstrapAnchors::from_model_output("{}").expect("empty object parses");
+        assert!(a.time_minutes.is_none());
+        assert!(a.weather.is_none());
+        assert!(a.location.is_none());
+    }
+
+    #[test]
+    fn bootstrap_unparseable_time_becomes_none_not_error() {
+        // A bare word like "night" doesn't match the "Day N, HH:MM" parser.
+        // time_minutes → None (soft), but the rest still parses.
+        let raw = r#"{"time":"night","weather":"storm"}"#;
+        let a = BootstrapAnchors::from_model_output(raw).expect("parses despite bad time");
+        assert!(a.time_minutes.is_none(), "unparseable time → None, not Err");
+        assert_eq!(a.weather.as_deref(), Some("storm"));
+    }
+
+    #[test]
+    fn bootstrap_partial_location_pair_is_dropped() {
+        // location_id without location_name (or vice versa) is useless → None.
+        let raw = r#"{"location_id":"tavern"}"#;
+        let a = BootstrapAnchors::from_model_output(raw).expect("parses");
+        assert!(a.location.is_none(), "half a location pair → None");
+    }
+
+    #[test]
+    fn bootstrap_strips_markdown_fences_and_channel_protocol() {
+        // The model may wrap JSON in ```json fences + the Gemma4 channel
+        // protocol. The parser must strip both (mirrors SchemaDelta's pipeline).
+        let raw = "<|channel>thought\nthe scene is at night\n<channel|>```json\n{\"time\":\"Day 1, 22:00\"}\n```";
+        let a = BootstrapAnchors::from_model_output(raw).expect("wrapped JSON parses");
+        assert_eq!(a.time_minutes, Some(22 * 60));
+    }
+
+    #[test]
+    fn bootstrap_unparseable_json_returns_err() {
+        // Genuinely broken JSON → Err (the caller falls through to defaults).
+        let result = BootstrapAnchors::from_model_output("not json at all");
+        assert!(result.is_err());
+    }
+
     #[test]
     fn render_for_prompt_omits_location_when_dormant() {
         // Fresh game (no nodes) → no location line, zero tokens.
@@ -2381,7 +3145,7 @@ mod tests {
         schema.travel_graph = sample_travel_graph();
         let original = schema.travel_graph.clone();
         let mut ents = HashMap::new();
-        ents.insert("travel_graph".to_string(), Some("injected".to_string()));
+        ents.insert("travel_graph".to_string(), Some(serde_json::Value::String("injected".into())));
         let delta = SchemaDelta {
             summary: None,
             recent_events: None,
@@ -2392,7 +3156,7 @@ mod tests {
         assert_eq!(schema.travel_graph, original);
         // The "travel_graph" string landed in the entities map (legacy).
         assert_eq!(
-            schema.entities.get("travel_graph").map(|s| s.as_str()),
+            schema.entities.get("travel_graph").and_then(|s| s.as_str()),
             Some("injected")
         );
     }
@@ -2460,7 +3224,7 @@ mod tests {
         };
         let original = schema.npc_registry.clone();
         let mut ents = HashMap::new();
-        ents.insert("npc_registry".to_string(), Some("injected".to_string()));
+        ents.insert("npc_registry".to_string(), Some(serde_json::Value::String("injected".into())));
         let delta = SchemaDelta {
             summary: None,
             recent_events: None,
@@ -2469,7 +3233,7 @@ mod tests {
         schema.apply_delta(delta);
         assert_eq!(schema.npc_registry, original, "registry must be LLM-immutable");
         assert_eq!(
-            schema.entities.get("npc_registry").map(|s| s.as_str()),
+            schema.entities.get("npc_registry").and_then(|s| s.as_str()),
             Some("injected"),
             "the injected key lands in entities (legacy), NOT the typed field"
         );
@@ -2490,7 +3254,7 @@ mod tests {
         }];
         let original = schema.presences.clone();
         let mut ents = HashMap::new();
-        ents.insert("presences".to_string(), Some("injected".to_string()));
+        ents.insert("presences".to_string(), Some(serde_json::Value::String("injected".into())));
         let delta = SchemaDelta {
             summary: None,
             recent_events: None,

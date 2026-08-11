@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
+use crate::schema::WorldSchema;
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum Role {
@@ -51,6 +53,25 @@ pub struct Message {
     /// Clamped on load by `normalize_variants`.
     #[serde(default)]
     pub active_idx: usize,
+    /// The pre-turn world schema (the state of the world the player acted
+    /// against). Captured once on the first variant's generation + reused
+    /// across rerolls of this turn so each reroll can REVERT to it before
+    /// re-tracking (the variant↔schema binding's double-mutation fix, 2026-08-
+    /// 11). `None` on user/system messages + legacy assistant messages — a
+    /// reroll of a legacy message has nothing to revert to, so it re-tracks on
+    /// top (the old behavior). Only assistant turns ever carry this.
+    #[serde(default)]
+    pub base_schema: Option<WorldSchema>,
+    /// Parallel to `variants`: the post-tracker world schema each roll
+    /// produced. `variant_schemas[i]` is installed as the live schema when the
+    /// user swipes to variant `i`, so the world state always matches the
+    /// displayed prose with ZERO re-tracking (the local model never re-runs on
+    /// a swipe). Empty for user/system messages + legacy assistant saves; swipe
+    /// falls back to a graceful no-op when the target entry is absent.
+    /// Seeded lazily — on the first reroll of a legacy turn, or at creation for
+    /// turns generated after this feature shipped.
+    #[serde(default)]
+    pub variant_schemas: Vec<WorldSchema>,
 }
 
 impl Message {
@@ -86,14 +107,34 @@ impl Message {
     /// the reroll flow: the prior active content survives as a sibling, the
     /// new text becomes active. Mirrors `content`/`raw_output` to the new tail.
     /// For a fresh message (empty `variants`) the prior `content`/`raw_output`
-    /// are seeded as variant 0 first so nothing is orphaned.
+    /// are seeded as variant 0 first so nothing is orphaned. Does NOT touch
+    /// `variant_schemas` (no schema in hand) — use [`push_variant_with_schema`]
+    /// for the variant↔schema binding path.
     pub fn push_variant(&mut self, new_content: String, new_raw: String) {
+        self.push_variant_with_schema(new_content, new_raw, None);
+    }
+
+    /// Same as `push_variant` but also appends `new_schema` to `variant_schemas`
+    /// (aligned with the just-pushed variant). The caller MUST have pre-seeded
+    /// `variant_schemas` for the implicit variant 0 when this is the first
+    /// reroll of the turn (the fable_send reroll path does so by capturing the
+    /// prior live schema before reverting). If `new_schema` is `None`, the
+    /// schema list is left untouched (kept aligned only if it already was).
+    pub fn push_variant_with_schema(
+        &mut self,
+        new_content: String,
+        new_raw: String,
+        new_schema: Option<WorldSchema>,
+    ) {
         if self.variants.is_empty() {
             self.variants.push(self.content.clone());
             self.raw_outputs.push(self.raw_output.clone());
         }
         self.variants.push(new_content.clone());
         self.raw_outputs.push(new_raw.clone());
+        if let Some(s) = new_schema {
+            self.variant_schemas.push(s);
+        }
         self.content = new_content;
         self.raw_output = new_raw;
         self.active_idx = self.variants.len() - 1;
@@ -178,6 +219,8 @@ impl Conversation {
             variants: Vec::new(),
             raw_outputs: Vec::new(),
             active_idx: 0,
+            base_schema: None,
+            variant_schemas: Vec::new(),
         };
         self.messages.push(msg);
         self.messages.last().expect("just pushed")
@@ -202,6 +245,8 @@ impl Conversation {
             variants: Vec::new(),
             raw_outputs: Vec::new(),
             active_idx: 0,
+            base_schema: None,
+            variant_schemas: Vec::new(),
         };
         self.messages.push(msg);
         self.messages.last().expect("just pushed")
@@ -221,6 +266,22 @@ impl Conversation {
     /// send doesn't render two consecutive user turns.
     pub fn pop_last_message(&mut self) {
         self.messages.pop();
+    }
+
+    /// Remove the message at `index` + return it. Subsequent messages shift
+    /// down by one. Used by the model-facing `fable_message_delete` tool (the
+    /// chat-side stateful tool dispatched from `run_agent_loop`). Bounds-
+    /// checked; returns `Err` with a model-friendly message otherwise.
+    /// Mirrors the bounds-error shape `apply_edit` / `apply_rewind_and_edit`
+    /// emit so the agent loop's `invalid args: …` path reads consistently.
+    pub fn remove_at(&mut self, index: usize) -> Result<Message, String> {
+        let len = self.messages.len();
+        if index >= len {
+            return Err(format!(
+                "remove_at: index {index} out of bounds (len {len})"
+            ));
+        }
+        Ok(self.messages.remove(index))
     }
 
     /// Persist the conversation **atomically**: serialize, write to a sibling
@@ -513,6 +574,39 @@ mod tests {
         c
     }
 
+    /// `remove_at` (2026-08-11): the missing structural primitive the
+    /// `fable_message_delete` tool needs. Shifts subsequent messages down + is
+    /// bounds-checked. Mirrors the bounds-error shape the lib.rs appliers emit.
+    #[test]
+    fn remove_at_drops_message_and_shifts_tail() {
+        let mut c = Conversation::new();
+        c.add_message(Role::User, "first".into());
+        c.add_message(Role::Assistant, "second".into());
+        c.add_message(Role::User, "third".into());
+        // Sanity: 3 messages, indexes 0..2.
+        assert_eq!(c.messages.len(), 3);
+        // Drop index 1 (the assistant turn).
+        let removed = c.remove_at(1).expect("index 1 in bounds");
+        assert_eq!(removed.content, "second");
+        assert_eq!(c.messages.len(), 2, "must shrink by 1");
+        // Subsequent messages shift down: old index 2 ("third") is now at 1.
+        assert_eq!(c.messages[0].content, "first");
+        assert_eq!(c.messages[1].content, "third");
+    }
+
+    #[test]
+    fn remove_at_out_of_bounds_errors() {
+        let mut c = Conversation::new();
+        c.add_message(Role::User, "only".into());
+        let err = c.remove_at(5).expect_err("index 5 out of bounds");
+        assert!(err.contains("out of bounds"), "error: {err}");
+        // Index 0 still works.
+        c.remove_at(0).expect("index 0 in bounds");
+        // Now empty — even index 0 is out of bounds.
+        let err = c.remove_at(0).expect_err("empty → 0 is OOB");
+        assert!(err.contains("out of bounds"), "error: {err}");
+    }
+
     /// Clean up both the main file and its sibling temp so the temp dir
     /// doesn't accumulate test artifacts. NotFound is fine.
     fn cleanup(path: &Path) {
@@ -774,7 +868,60 @@ mod tests {
             variants: Vec::new(),
             raw_outputs: Vec::new(),
             active_idx: 0,
+            base_schema: None,
+            variant_schemas: Vec::new(),
         }
+    }
+
+    #[test]
+    fn push_variant_with_schema_keeps_variant_schemas_parallel() {
+        use crate::schema::WorldSchema;
+        let mk = |summary: &str| {
+            let mut s = WorldSchema::default();
+            s.summary = summary.into();
+            s
+        };
+        let mut m = variant_msg();
+        // fable_send seeds variant 0's schema (the post-tracker snapshot) at
+        // creation; the first-reroll pre-Stage-1 block seeds it for legacy turns.
+        m.variant_schemas.push(mk("roll0"));
+        // First reroll appends variant 1 + its schema.
+        m.push_variant_with_schema("second".into(), "<raw2>".into(), Some(mk("roll1")));
+        assert_eq!(m.variant_count(), 2);
+        assert_eq!(m.variant_schemas.len(), 2, "variant_schemas parallels variants");
+        assert_eq!(m.variant_schemas[m.active_idx].summary, "roll1");
+        // Second reroll appends variant 2 + its schema.
+        m.push_variant_with_schema("third".into(), "<raw3>".into(), Some(mk("roll2")));
+        assert_eq!(m.variant_count(), 3);
+        assert_eq!(m.variant_schemas.len(), 3);
+        assert_eq!(m.variant_schemas[m.active_idx].summary, "roll2");
+    }
+
+    #[test]
+    fn variant_schema_round_trips_through_select() {
+        // The swipe path: select_variant swaps content/active_idx, then the
+        // caller installs variant_schemas[variant_idx] as the live schema.
+        // Verify the stored schemas survive the select + stay aligned.
+        use crate::schema::WorldSchema;
+        let mk = |summary: &str| {
+            let mut s = WorldSchema::default();
+            s.summary = summary.into();
+            s
+        };
+        let mut m = variant_msg();
+        m.variant_schemas.push(mk("roll0"));
+        m.push_variant_with_schema("second".into(), "<raw2>".into(), Some(mk("roll1")));
+        // Swipe back to variant 0.
+        assert_eq!(m.variant_schemas.get(0).map(|s| s.summary.as_str()), Some("roll0"));
+        m.select_variant(0);
+        assert_eq!(m.active_idx, 0);
+        // Swipe forward to variant 1.
+        assert_eq!(m.variant_schemas.get(1).map(|s| s.summary.as_str()), Some("roll1"));
+        m.select_variant(1);
+        assert_eq!(m.active_idx, 1);
+        // A legacy message with no stored schema falls back to None (graceful).
+        let mut legacy = variant_msg();
+        assert!(legacy.variant_schemas.get(0).is_none());
     }
 
     #[test]
@@ -884,6 +1031,8 @@ mod tests {
             variants: vec!["a".into(), "b".into()],
             raw_outputs: vec!["<ra>".into()], // short by one
             active_idx: 99,                    // out of range
+            base_schema: None,
+            variant_schemas: Vec::new(),
         };
         m.normalize_variants();
         assert_eq!(m.active_idx, 0, "clamped to 0");

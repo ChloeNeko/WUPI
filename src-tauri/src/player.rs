@@ -75,6 +75,16 @@ pub struct SavedPlayer {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub accessories: Option<String>,
 
+    /// The character's history / backstory prose (NEW 2026-08-11). Optional —
+    /// the Player Creator's Backstory slide can be skipped; a skipped backstory
+    /// stays `None` + is OMITTED from the JSON entirely
+    /// (`skip_serializing_if`, mirroring the conditional traits ears/tail/
+    /// breast). At game attach this is seeded as a `player.backstory` schema
+    /// entity so the narrator + WUPI know the character's history from turn 1.
+    /// Capped at `PROSE_MAX` (4000) by `validate_player`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backstory: Option<String>,
+
     // --- Structured identity/appearance traits (2026-08-04 overhaul).
     // The Player Creator's slide-by-slide wizard writes these directly
     // (typed fields, not composed prose) so the tracker pipeline can
@@ -231,6 +241,7 @@ pub fn validate_player(p: &SavedPlayer) -> Result<(), String> {
         ("Appearance", &p.appearance),
         ("Personality", &p.personality),
         ("Accessories", &p.accessories),
+        ("Backstory", &p.backstory),
     ] {
         if let Some(s) = val {
             let s = s.trim();
@@ -359,6 +370,7 @@ mod tests {
             appearance: None,
             personality: None,
             accessories: None,
+            backstory: None,
             gender: None,
             race: None,
             age: None,

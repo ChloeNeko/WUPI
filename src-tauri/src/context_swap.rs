@@ -202,12 +202,16 @@ impl ContextSwap {
             }
             if s.role == role {
                 // Same-role fast path. The caller already owns a resident
-                // engine; we drop the freshly-supplied teardown (the
-                // already-registered one governs eviction). The caller
-                // detects the resident engine via its AppState slot and
-                // skips re-spawning.
-                tracing::debug!(swap = n, role = role.label(), "context-swap: same-role reuse (no eviction)");
-                drop(teardown);
+                // engine (detected via its AppState slot → skips re-spawning).
+                // REFRESH the registered teardown with the freshly-supplied one
+                // (2026-08-10): the prior teardown may have been consumed by a
+                // cross-role eviction cycle (chat → fable → chat re-spawn),
+                // leaving the slot's teardown stale/None. Both closures capture
+                // the same Arc<Mutex<Option<...>>> backend slot, so they're
+                // functionally equivalent when fresh — but the new one is
+                // guaranteed live, so it governs eviction robustly.
+                tracing::debug!(swap = n, role = role.label(), "context-swap: same-role reuse (teardown refreshed)");
+                s.teardown = Some(teardown);
                 return LeaseGuard {
                     swap: self.clone(),
                     released: false,
@@ -245,6 +249,49 @@ impl ContextSwap {
             swap: self.clone(),
             released: false,
         }
+    }
+
+    /// Register a context that was spawned OUTSIDE an `acquire` call — i.e.
+    /// the boot-spawned chat context (`boot_load_model` spawns the chat
+    /// backend eagerly at boot for fast first-message latency, but does NOT
+    /// take the lease; `chat_send` takes it lazily on first use).
+    ///
+    /// Without this registration, the lease starts in its "idle" default
+    /// state (teardown = None), so a Fable/schema `acquire` that fires
+    /// BEFORE any `chat_send` sees "idle → fable" and skips eviction → the
+    /// boot chat context stays resident in VRAM alongside the new fable
+    /// context → both WUPI.gguf contexts co-resident → VRAM exhausts → the
+    /// fable compute falls back to CPU → a multi-minute PC freeze (the
+    /// 2026-08-10 incident). This is the chat-side analog of the
+    /// eager-schema-spawn bypass fixed at `lib.rs:1917` (§2C).
+    ///
+    /// Call this once at boot, right after the chat model + context finish
+    /// loading, passing the SAME teardown closure `chat_send` later passes to
+    /// `acquire`. It populates `role` + `teardown` WITHOUT acquiring a turn
+    /// (no guard returned) so the first real `chat_send` still works (its
+    /// `acquire` hits the same-role fast path). A subsequent fable/schema
+    /// `acquire` then sees a populated holder → cross-role eviction → chat
+    /// torn down → fable gets VRAM to itself → GPU-speed decode.
+    ///
+    /// Idempotent: if a teardown is already registered (e.g. a `chat_send`
+    /// somehow ran first), this is a no-op (the existing teardown governs).
+    pub async fn register_resident(&self, role: ContextRole, teardown: TeardownFn) {
+        let mut s = self.inner.lock().await;
+        if s.teardown.is_some() {
+            // Already registered (a chat_send won the race, or boot called
+            // twice). Keep the existing teardown — it governs eviction.
+            tracing::debug!(
+                role = role.label(),
+                "context-swap: register_resident skipped (teardown already registered)"
+            );
+            return;
+        }
+        tracing::info!(
+            role = role.label(),
+            "context-swap: boot-resident context registered (cross-role eviction now enabled)"
+        );
+        s.role = role;
+        s.teardown = Some(teardown);
     }
 
     /// Drop-time release: marks the slot idle (no resident context). Called
@@ -341,17 +388,30 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn same_role_reuse_does_not_evict_or_reregister() {
-        // A second acquire of the SAME role should reuse, not evict. The
-        // freshly-supplied teardown is dropped (the original governs
-        // eviction), so the counter must stay at 0.
+    async fn same_role_reuse_does_not_evict_but_refreshes_teardown() {
+        // A second acquire of the SAME role reuses the resident context (no
+        // eviction: t1 must stay 0) but REFRESHES the registered teardown so
+        // the NEXT cross-role eviction uses the latest (t2), not a stale t1
+        // that may have been consumed by a prior eviction cycle. This is the
+        // 2026-08-10 fix: the old behavior (drop the fresh teardown) left the
+        // slot's teardown stale after a chat→fable→chat re-spawn cycle.
         let swap = ContextSwap::new();
         let t1 = StdArc::new(AtomicUsize::new(0));
         let t2 = StdArc::new(AtomicUsize::new(0));
-        let _g1 = swap.acquire(ContextRole::Fable, record_teardown(StdArc::clone(&t1))).await;
-        let _g2 = swap.acquire(ContextRole::Fable, record_teardown(StdArc::clone(&t2))).await;
-        assert_eq!(t1.load(Ordering::SeqCst), 0, "first teardown must not fire on same-role reuse");
-        assert_eq!(t2.load(Ordering::SeqCst), 0, "second teardown must not fire (was dropped on reuse)");
+        {
+            let _g1 = swap.acquire(ContextRole::Fable, record_teardown(StdArc::clone(&t1))).await;
+            let _g2 = swap.acquire(ContextRole::Fable, record_teardown(StdArc::clone(&t2))).await;
+            assert_eq!(t1.load(Ordering::SeqCst), 0, "first teardown must not fire on same-role reuse");
+            assert_eq!(t2.load(Ordering::SeqCst), 0, "second teardown must not fire yet (resident)");
+        }
+        // Guards dropped (resident persists — no eviction on drop). Now evict
+        // via a cross-role acquire: the REFRESHED teardown (t2) must fire, not
+        // the stale t1.
+        let schema_t = StdArc::new(AtomicUsize::new(0));
+        let _g3 = swap.acquire(ContextRole::Schema, record_teardown(StdArc::clone(&schema_t))).await;
+        assert_eq!(t1.load(Ordering::SeqCst), 0, "stale first teardown must NOT fire — refresh replaced it");
+        assert_eq!(t2.load(Ordering::SeqCst), 1, "refreshed teardown (t2) must fire on the cross-role eviction");
+        assert_eq!(schema_t.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
