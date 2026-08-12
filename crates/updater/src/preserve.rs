@@ -7,9 +7,7 @@
 //! vice versa. This is the load-bearing sync contract of the temp-staged
 //! pipeline — edit both together.
 //!
-//! This predicate governs the COPY step only. Explicit deletions from
-//! `delete.json` BYPASS it (they are authoritative removals of shipped files
-//! that may have lived under a preserved dir like `apps/`).
+//! This predicate governs the COPY step only.
 
 use std::path::Path;
 
@@ -62,6 +60,5 @@ mod tests {
         assert!(!is_preserved(Path::new("bin/cublas64_13.dll")));
         assert!(!is_preserved(Path::new("msvcp140.dll")));
         assert!(!is_preserved(Path::new("assets/app.js")));
-        assert!(!is_preserved(Path::new("delete.json")));
     }
 }

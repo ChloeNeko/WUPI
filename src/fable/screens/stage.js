@@ -66,14 +66,10 @@ import { saveNow } from '../engine/saves-io.js';
 import * as backgrounds from '../engine/backgrounds.js';
 import { initPanelManager, summon as summonPanel, dismissPanel, isActive as panelActive } from '../panels/manager.js';
 import { setMapTheme } from '../panels/map.js';
-// DEV PREVIEW placeholders (?dev=preview): static bundled portraits so the
-// VN layout renders with real images without a backend session. Vite hashes
-// these into dist/assets/ like every other static image in the project.
-// (Dev-only sample art: mage.jpg for the narrator, player.jpg for the user.
-// Production uses portraits resolved via fable_active_card_get / the saved
-// player — these imports only flow into the DEV_PREVIEW branch below.)
-import PLACEHOLDER_AI_PORTRAIT from '../assets/mage.jpg';
-import PLACEHOLDER_PLAYER_PORTRAIT from '../assets/player.jpg';
+// DEV PREVIEW (?dev=preview): pure-frontend layout preview with no backend.
+// Portraits render empty in preview — production resolves them via
+// fable_active_card_get / the saved player. (The dev-only sample art that
+// used to live here was removed.)
 
 // DEV PREVIEW flag: pure-frontend layout preview (no backend). Same query/hash
 // parsing as script.js's DEV_PREVIEW_SHORTCUT. False in production.
@@ -1029,8 +1025,8 @@ async function refreshActiveCardName(root) {
   if (DEV_PREVIEW) {
     activeCardName = 'Game Master';
     activePlayerName = 'Wanderer';
-    activeCardPortrait = PLACEHOLDER_AI_PORTRAIT;
-    activePlayerPortrait = PLACEHOLDER_PLAYER_PORTRAIT;
+    activeCardPortrait = '';
+    activePlayerPortrait = '';
     npcNameMap = new Map();
     return;
   }

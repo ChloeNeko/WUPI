@@ -107,21 +107,6 @@ fn run(args: &Args) -> Result<(), String> {
     //    second; the 30s timeout is a generous pathological-case ceiling.
     wait_for_exit(args.pid, 30_000);
 
-    // 1b. Apply any explicit deletions declared in the payload's delete.json
-    //     (the future-proof removal lever — currently empty). These BYPASS the
-    //     preserve rule: they are authoritative removals of shipped files that
-    //     were since deleted from the repo, including ones that lived under a
-    //     preserved dir like apps/. Done before the copy so a file removed from
-    //     the payload can't be re-introduced by it.
-    let deletions = stage::read_delete_manifest(&args.zip);
-    if !deletions.is_empty() {
-        log(format!(
-            "applying {} deletion(s) from delete.json",
-            deletions.len()
-        ));
-        stage::apply_deletions(&args.target_dir, &deletions);
-    }
-
     // 2. Stage to %TEMP% + verify the payload is complete. Target untouched.
     let staging = std::env::temp_dir().join(format!("wupi_stage_{}", args.pid));
     if staging.exists() {

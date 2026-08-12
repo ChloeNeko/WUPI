@@ -476,32 +476,6 @@ for (const f of readdirSync(distDir)) {
 // run and preserved across updates by the updater's preserve rule (§8C).
 cpSync(srcDataDir, join(stageWupiDir, 'data'), { recursive: true });
 
-// delete.json: the cumulative removal manifest read by updater.exe on apply
-// (the temp-staged pipeline's deletion lever — currently empty for v0.18.0;
-// future removals append relative paths). Lives at the zip ROOT so the
-// updater's read_delete_manifest finds it by name. Validate it parses before
-// staging so a malformed manifest can't ship silently + brick an update.
-const deleteJsonSrc = join(repoRoot, 'delete.json');
-if (existsSync(deleteJsonSrc)) {
-  let parsed;
-  try {
-    parsed = JSON.parse(readFileSync(deleteJsonSrc, 'utf8'));
-  } catch (e) {
-    console.error(`[release] !! delete.json is malformed JSON: ${e.message}`);
-    console.error('[release]    updater.exe reads it on every apply — fix before releasing.');
-    process.exit(1);
-  }
-  if (!Array.isArray(parsed.deletions)) {
-    console.error('[release] !! delete.json missing a "deletions" array.');
-    process.exit(1);
-  }
-  copyFileSync(deleteJsonSrc, join(stageWupiDir, 'delete.json'));
-  console.log(`[release] staged delete.json (removal manifest; ${parsed.deletions.length} entries)`);
-} else {
-  console.warn('[release] WARNING: delete.json not found at repo root — updater.exe will have no deletion list.');
-  console.warn('              Create an empty { "deletions": [] } at repo root.');
-}
-
 // apps/fable/cards/: starter scenario cards. Each card lives in a per-card
 // folder `<name>/<name>.sim` (+ optional sibling `.codex`); the 2026-08-01
 // folder reorg moved from a flat `<name>.sim` to this per-card layout. The

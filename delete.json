@@ -1,4 +1,0 @@
-{
-  "_comment": "Cumulative removal manifest for the updater. When a file is removed from the shipped payload, add its forward-slash-relative path (from the install root) to the `deletions` array. The updater.exe reads this from the zip and deletes each path on apply (bypassing the preserve rule — authoritative removals). Idempotent: a path that no longer exists on a given install is a no-op. Currently empty.",
-  "deletions": []
-}

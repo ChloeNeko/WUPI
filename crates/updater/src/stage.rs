@@ -1,4 +1,4 @@
-//! The two-phase apply + the optional `delete.json`-driven deletion pass.
+//! The two-phase apply.
 //!
 //! 1. **Stage** the payload to a fresh `%TEMP%` dir and verify it contains
 //!    `wupi.exe` (bricking-safety gate — a corrupt/truncated/wrong zip is
@@ -6,78 +6,8 @@
 //! 2. **Copy** the staged payload into the install root, honoring the preserve
 //!    rule (skip user data). All locks are released (wupi.exe has exited), so
 //!    plain `std::fs::copy` succeeds.
-//!
-//! The deletion pass reads `delete.json` from the zip and removes listed paths.
-//! It is the future-proof removal lever — currently empty. It BYPASSES the
-//! preserve rule (authoritative removals).
 
 use std::path::{Path, PathBuf};
-use std::io::Read;
-
-/// Read `delete.json` from the zip WITHOUT extracting the whole archive (single
-/// entry read). Returns the deletion list (relative forward-slash paths). A
-/// missing `delete.json` → empty list (no deletions). A malformed one is logged
-/// + treated as empty — we never let a bad manifest block an otherwise-good
-/// update.
-pub fn read_delete_manifest(zip_path: &Path) -> Vec<String> {
-    let file = match std::fs::File::open(zip_path) {
-        Ok(f) => f,
-        Err(_) => return Vec::new(),
-    };
-    let mut archive = match zip::ZipArchive::new(file) {
-        Ok(a) => a,
-        Err(_) => return Vec::new(),
-    };
-    let mut entry = match archive.by_name("delete.json") {
-        Ok(e) => e,
-        Err(_) => return Vec::new(), // no manifest = nothing to delete
-    };
-    let mut buf = String::new();
-    if entry.read_to_string(&mut buf).is_err() {
-        return Vec::new();
-    }
-    // Parse to Value (no serde-derive dep) + read `deletions` as a string
-    // array. Malformed JSON, a missing key, or a non-array `deletions` → empty.
-    let value: serde_json::Value = match serde_json::from_str(&buf) {
-        Ok(v) => v,
-        Err(_) => return Vec::new(),
-    };
-    value
-        .get("deletions")
-        .and_then(|d| d.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|v| v.as_str().map(|s| s.to_string()))
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
-/// Delete each listed path under `target_dir`. Best-effort + idempotent: a
-/// missing file is the desired end state (already gone); an escape attempt
-/// (absolute path, `..`) is refused by the containment check. NOT filtered by
-/// the preserve rule — the manifest is authoritative.
-pub fn apply_deletions(target_dir: &Path, paths: &[String]) {
-    let Ok(target_canon) = target_dir.canonicalize() else {
-        return;
-    };
-    for rel in paths {
-        // canonicalize() resolves `..` + absolute joins; if the resolved path
-        // isn't under the target, skip it (defense against a malicious or
-        // typo'd manifest entry).
-        let candidate = match target_dir.join(rel).canonicalize() {
-            Ok(c) => c,
-            Err(_) => continue, // doesn't exist — already gone (idempotent no-op)
-        };
-        if !candidate.starts_with(&target_canon) {
-            continue; // escape attempt — refuse
-        }
-        // remove_file for files, fall back to remove_dir_all for a directory
-        // entry (a card folder, etc.).
-        let _ = std::fs::remove_file(&candidate)
-            .or_else(|_| std::fs::remove_dir_all(&candidate));
-    }
-}
 
 /// Extract the whole zip into `staging` (a fresh `%TEMP%` dir), then verify the
 /// payload contains `wupi.exe`. Returns the entry count. The live install is
@@ -264,82 +194,5 @@ mod tests {
         make_zip(&zip_path, &[("assets/x.txt", b"x".as_slice())]);
         let err = extract_to_staging(&zip_path, &staging).unwrap_err();
         assert!(err.contains("missing"));
-    }
-
-    #[test]
-    fn delete_manifest_round_trip() {
-        let tmp = TempDir::new().unwrap();
-        let target = tmp.path().join("install");
-        let zip_path = tmp.path().join("payload.zip");
-        std::fs::create_dir_all(target.join("apps/fable/cards/rusty_tavern")).unwrap();
-        std::fs::write(
-            target.join("apps/fable/cards/rusty_tavern/rusty_tavern.sim"),
-            b"PLACEHOLDER",
-        )
-        .unwrap();
-        make_zip(
-            &zip_path,
-            &[(
-                "delete.json",
-                r#"{ "deletions": ["apps/fable/cards/rusty_tavern/rusty_tavern.sim"] }"#
-                    .as_bytes(),
-            )],
-        );
-
-        let dels = read_delete_manifest(&zip_path);
-        assert_eq!(
-            dels,
-            vec!["apps/fable/cards/rusty_tavern/rusty_tavern.sim"]
-        );
-        apply_deletions(&target, &dels);
-        assert!(!target
-            .join("apps/fable/cards/rusty_tavern/rusty_tavern.sim")
-            .exists());
-    }
-
-    #[test]
-    fn delete_manifest_missing_is_empty() {
-        let tmp = TempDir::new().unwrap();
-        let zip_path = tmp.path().join("payload.zip");
-        make_zip(&zip_path, &[("wupi.exe", b"x".as_slice())]);
-        assert!(read_delete_manifest(&zip_path).is_empty());
-    }
-
-    #[test]
-    fn delete_manifest_empty_array_is_noop() {
-        let tmp = TempDir::new().unwrap();
-        let target = tmp.path().join("install");
-        std::fs::create_dir_all(&target).unwrap();
-        let zip_path = tmp.path().join("payload.zip");
-        make_zip(&zip_path, &[("delete.json", b"{ \"deletions\": [] }")]);
-        let dels = read_delete_manifest(&zip_path);
-        assert!(dels.is_empty());
-        apply_deletions(&target, &dels); // no panic, no deletions
-    }
-
-    #[test]
-    fn delete_manifest_rejects_path_escape() {
-        let tmp = TempDir::new().unwrap();
-        let target = tmp.path().join("install");
-        std::fs::create_dir_all(&target).unwrap();
-        // Plant a file OUTSIDE target that the escape attempt would target.
-        let outside = tmp.path().join("outside.txt");
-        std::fs::write(&outside, b"KEEP").unwrap();
-        let zip_path = tmp.path().join("payload.zip");
-        make_zip(
-            &zip_path,
-            &[(
-                "delete.json",
-                format!(
-                    "{{ \"deletions\": [\"{}\"] }}",
-                    outside.display().to_string().replace('\\', "/")
-                )
-                .as_bytes(),
-            )],
-        );
-        let dels = read_delete_manifest(&zip_path);
-        apply_deletions(&target, &dels);
-        // The absolute/escape path was NOT deleted (containment check).
-        assert!(outside.exists());
     }
 }
