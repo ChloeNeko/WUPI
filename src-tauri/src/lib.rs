@@ -341,7 +341,8 @@ pub struct AppState {
     /// The resolved chat-model path, stashed by `setup()` for the deferred
     /// `boot_load_model` IPC. The boot UX defers the actual model spawn until
     /// AFTER the JS-side update check completes: if an update is found, the
-    /// JS calls `updater_apply` + `updater_restart` (model never loads); if
+    /// JS calls `updater_apply` (which exits the process as part of the
+    /// updater.exe handoff — model never loads); if
     /// up-to-date, the JS calls `boot_load_model` which reads this stashed
     /// path + spawns the engine. `None` until `setup()` resolves the path;
     /// stays `None` if no GGUF was found (the frontend's first-run download
@@ -502,13 +503,10 @@ pub fn run() {
         .manage(hardware::AudioRegistry)
         .setup(|app| {
             tracing::info!("setup hook entered");
-            // Best-effort cleanup of `*.old` files from a prior self-update:
-            // both `wupi.exe.old` (the locked-exe swap dance) AND any DLL
-            // remnants (`msvcp140.dll.old`, `cublas64_13.dll.old`, …) left by
-            // `copy_file_robust` when an update had to rename a locked/loaded
-            // file out of the way. By the time this exe runs, the old
-            // process's locks are gone.
-            updater::cleanup_old_files(app.handle());
+            // (The `*.old` remnant sweep lived here — RETIRED with the rename-
+            // dance updater. The temp-staged updater.exe overwrites files
+            // directly after wupi.exe exits; no `.old` files are ever produced.
+            // See updater.rs + crates/updater.)
             // §8C portable layout: four top-level sibling dirs next to
             // wupi.exe hold all user state. Nothing leaves the install
             // folder. Created lazily here at boot so the rest of setup +
@@ -716,7 +714,9 @@ pub fn run() {
             // Resolve the chat-model path and STASH it on AppState. The
             // actual spawn is deferred to the `boot_load_model` IPC (called
             // from JS after the boot update-check gate). If an update is
-            // found, JS calls `updater_apply` + `updater_restart` instead
+            // found, JS calls `updater_apply` (which exits the process via the
+            // updater.exe handoff) instead and the model never loads (no wasted
+            // CPU/VRAM on a doomed process).
             // and the model never loads (no wasted CPU/VRAM on a doomed
             // process). If no GGUF is here at all (fresh install), emit
             // "missing" so the frontend's download overlay takes over —
@@ -1070,7 +1070,7 @@ pub fn run() {
             hardware::bluetooth::bluetooth_pair,
             updater_check,
             updater_apply,
-            updater_restart,
+            updater_consume_result,
             boot_load_model,
             system_menu::set_always_on_top,
         ])
@@ -1864,20 +1864,22 @@ async fn updater_apply(
     updater::perform_update(&app, update).await
 }
 
-/// Relaunch the app after a successful update. Uses Tauri core's
-/// `AppHandle::restart()` — no plugin needed (the JS-side `relaunch()` lives
-/// in `@tauri-apps/plugin-process`, which we removed when we dropped the
-/// installer-only Tauri updater; the Rust side is core API). The swap has
-/// already placed the new `wupi.exe` on disk; restart loads it + drops the
-/// .old on the next boot's `cleanup_old_files`.
+/// Read + clear the updater's result marker (`data/_update_result.json`) so
+/// the UI can surface "Updated to vX.Y.Z" (or the error) exactly once after an
+/// update-driven relaunch. Returns `None` on a normal boot (no marker present).
+/// The apply path (`updater_apply`) never returns to the frontend on success —
+/// wupi.exe exits as part of the handoff — so the relaunched process reads the
+/// outcome here instead. Mirrors the old `updater_restart` slot in the handler.
 #[tauri::command]
-fn updater_restart(app: tauri::AppHandle) {
-    app.restart();
+fn updater_consume_result(app: tauri::AppHandle) -> Option<updater::UpdateResult> {
+    let exe_dir = resolve_install_root(&app);
+    updater::read_and_clear_result(&exe_dir)
 }
 
 /// Deferred chat-model spawn. The boot UX (script.js) calls this AFTER the
 /// boot update-check gate resolves with "up-to-date" — so an update-found
-/// path that calls `updater_apply` + `updater_restart` skips this entirely
+/// path that calls `updater_apply` (which exits the process via the
+/// updater.exe handoff) skips this entirely
 /// (no wasted CPU/VRAM loading a model the process is about to abandon).
 ///
 /// Reads the path stashed by `setup()` from

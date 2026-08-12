@@ -1630,6 +1630,24 @@ function spawnLaunchSparkles(parent, count = 18) {
   //    (network/manifest unreachable): call proceedAfterGate() so a
   //    network blip can't strand the user on the loading screen.
   async function runBootGate() {
+    // Surface the outcome of an update that just relanched us (if any). Rust
+    // consumes (deletes) the marker, so this fires exactly once per update.
+    try {
+      const result = await invoke('updater_consume_result');
+      if (result) {
+        if (result.ok) {
+          appendTerminalLine(`› updated to v${result.version} ✓`, false);
+        } else {
+          appendTerminalLine(
+            `› last update failed: ${String(result.error || '').slice(0, 80)}`,
+            false
+          );
+        }
+      }
+    } catch (e) {
+      /* non-fatal — no marker to read */
+    }
+
     // Stream the gate steps into the boot terminal as they happen so the
     // user sees exactly what's blocking the LOADING OS fill.
     appendTerminalLine('› checking for updates...', false);
@@ -1663,27 +1681,19 @@ function spawnLaunchSparkles(parent, count = 18) {
     // happened to have it open, but on the boot path the terminal lines
     // are the visible cue.
     appendTerminalLine(`› update version ${update.version} found`, false);
-    appendTerminalLine('› Installing update please wait..', false);
+    appendTerminalLine('› installing update please wait..', false);
+    // apply downloads the zip, then spawns updater.exe + EXITS this process
+    // (the temp-staged handoff). The await NEVER resolves on success — the
+    // process is gone; the relaunched boot surfaces the outcome via
+    // updater_consume_result at the top of the next runBootGate. Only a
+    // staging/spawn failure throws, in which case we proceed with the current
+    // binary (the user can retry from the paw-menu panel).
     try {
       await invoke('updater_apply', { update });
     } catch (err) {
-      // Apply failed — proceed with the current binary rather than
-      // strand the user. The user can retry from the paw-menu panel.
       console.error('[Wupi] updater_apply failed during boot gate', err);
       appendTerminalLine(`› update failed: ${String(err?.message || err).slice(0, 80)}`, false);
       appendTerminalLine('› proceeding with current version', false);
-      proceedAfterGate();
-      return;
-    }
-    appendTerminalLine('› update successfully installed', false);
-    appendTerminalLine('› restarting...', false);
-    // Restart into the new binary. This call doesn't return.
-    try {
-      invoke('updater_restart');
-    } catch (err) {
-      // restart() should be infallible; if it ever throws, proceed with
-      // the current binary so the user isn't stuck.
-      console.error('[Wupi] updater_restart failed', err);
       proceedAfterGate();
     }
   }
@@ -2075,13 +2085,13 @@ const dropdownMenu = document.getElementById('dropdownMenu');
       return;
     }
     setUpdateState('installing', { percent: 0 });
+    // apply downloads, then spawns updater.exe + EXITS this process. The await
+    // never resolves on success — the process is gone, + the relaunched boot
+    // surfaces the outcome via updater_consume_result. Only a failure throws.
     try {
       await invoke('updater_apply', { update: pendingUpdate });
+      // Unreachable on success (process exited). Defensive only.
       setUpdateState('installing', { percent: 100 });
-      // Swap is complete + the new exe is on disk. Restart into it.
-      invoke('updater_restart').catch((e) => {
-        setUpdateState('error', { message: 'Install OK, restart failed: ' + String(e?.message || e) });
-      });
     } catch (e) {
       setUpdateState('error', { message: String(e?.message || e) });
     }

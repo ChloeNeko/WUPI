@@ -162,6 +162,28 @@ if (cargoTomlNew !== cargoTomlRaw) {
     console.log(`[release] (dry-run) would sync Cargo.toml version → ${newVersion}`);
   }
 }
+
+// Sync crates/updater/Cargo.toml's [package] version to newVersion (mirrors
+// the src-tauri/Cargo.toml sync above). The updater crate is standalone (own
+// Cargo.lock + target dir) — its version isn't user-facing (wupi.exe's
+// package_info().version is), but keeping it in lockstep avoids drift
+// confusion. Same regex: edit only the [package] version line, leave
+// [dependencies] untouched.
+const updaterCargoPath = join(repoRoot, 'crates', 'updater', 'Cargo.toml');
+const updaterCargoRaw = readFileSync(updaterCargoPath, 'utf8');
+const updaterCargoNew = updaterCargoRaw.replace(
+  /(\[package\]\s*\nname\s*=\s*"[^"]+"\s*\nversion\s*=\s*")[^"]+(")/,
+  `$1${newVersion}$2`
+);
+if (updaterCargoNew !== updaterCargoRaw) {
+  const oldVersion = updaterCargoRaw.match(/(?:\[package\][^\[]*?version\s*=\s*")([^"]+)/)?.[1] ?? 'unknown';
+  if (!dryRun) {
+    writeFileSync(updaterCargoPath, updaterCargoNew);
+    console.log(`[release] crates/updater/Cargo.toml synced: ${oldVersion} → ${newVersion}`);
+  } else {
+    console.log(`[release] (dry-run) would sync crates/updater/Cargo.toml version → ${newVersion}`);
+  }
+}
 const tag = `v${newVersion}`;
 
 // ──────────────────────────────────────────────────────────────────────────
@@ -298,6 +320,36 @@ if (dryRun) {
 }
 
 // ──────────────────────────────────────────────────────────────────────────
+// Step 3.5: Build the standalone updater crate (crates/updater).
+//
+// The temp-staged update pipeline's apply binary. Separate crate — own
+// Cargo.lock + target dir, NO llama/CUDA deps — so this is fast (seconds) +
+// fully independent of the main build. updater.rs copies bin/updater.exe to
+// %TEMP% and spawns it on apply (it overwrites the install after wupi.exe
+// exits, then relaunches). Built BEFORE staging so the exe exists when the
+// bin/ staging step (Step 4) needs it.
+// ──────────────────────────────────────────────────────────────────────────
+const updaterExe = join(repoRoot, 'crates', 'updater', 'target', 'release', 'updater.exe');
+console.log('[release] building updater crate (crates/updater)…');
+if (!dryRun) {
+  const updaterBuild = spawnSync('cargo', [
+    'build', '--release',
+    '--manifest-path', join(repoRoot, 'crates', 'updater', 'Cargo.toml'),
+  ], { stdio: 'inherit', shell: true });
+  if (updaterBuild.status !== 0) {
+    console.error(`[release] updater crate build failed (exit ${updaterBuild.status}).`);
+    process.exit(updaterBuild.status ?? 1);
+  }
+  if (!existsSync(updaterExe)) {
+    console.error(`[release] updater exe not found at ${updaterExe} despite a successful build.`);
+    process.exit(1);
+  }
+  console.log('[release] updater crate built.');
+} else {
+  console.log('[release] (dry-run) skipping updater crate build');
+}
+
+// ──────────────────────────────────────────────────────────────────────────
 // Step 4: Stage the portable-zip layout (AGENTS.md §8C).
 //
 // The IN-ZIP layout is FLAT (files at the zip root, no WUPI/ wrapper).
@@ -423,6 +475,32 @@ for (const f of readdirSync(distDir)) {
 // data/ additions (theme.json, api_config.json, docs/) are created on first
 // run and preserved across updates by the updater's preserve rule (§8C).
 cpSync(srcDataDir, join(stageWupiDir, 'data'), { recursive: true });
+
+// delete.json: the cumulative removal manifest read by updater.exe on apply
+// (the temp-staged pipeline's deletion lever — currently empty for v0.18.0;
+// future removals append relative paths). Lives at the zip ROOT so the
+// updater's read_delete_manifest finds it by name. Validate it parses before
+// staging so a malformed manifest can't ship silently + brick an update.
+const deleteJsonSrc = join(repoRoot, 'delete.json');
+if (existsSync(deleteJsonSrc)) {
+  let parsed;
+  try {
+    parsed = JSON.parse(readFileSync(deleteJsonSrc, 'utf8'));
+  } catch (e) {
+    console.error(`[release] !! delete.json is malformed JSON: ${e.message}`);
+    console.error('[release]    updater.exe reads it on every apply — fix before releasing.');
+    process.exit(1);
+  }
+  if (!Array.isArray(parsed.deletions)) {
+    console.error('[release] !! delete.json missing a "deletions" array.');
+    process.exit(1);
+  }
+  copyFileSync(deleteJsonSrc, join(stageWupiDir, 'delete.json'));
+  console.log(`[release] staged delete.json (removal manifest; ${parsed.deletions.length} entries)`);
+} else {
+  console.warn('[release] WARNING: delete.json not found at repo root — updater.exe will have no deletion list.');
+  console.warn('              Create an empty { "deletions": [] } at repo root.');
+}
 
 // apps/fable/cards/: starter scenario cards. Each card lives in a per-card
 // folder `<name>/<name>.sim` (+ optional sibling `.codex`); the 2026-08-01
@@ -632,6 +710,21 @@ if (!existsSync(vcompSrc)) {
 } else {
   copyFileSync(vcompSrc, join(stageBinDir, 'vcomp140.dll'));
   console.log(`[release] copied vcomp140.dll → bin/ (delay-loaded)`);
+}
+
+// bin/updater.exe: the temp-staged update pipeline's apply binary, built from
+// the standalone crates/updater crate (Step 3.5 above). updater.rs copies it
+// to %TEMP% + spawns it on apply; it overwrites the install after wupi.exe
+// exits (all locks released), then relaunches wupi.exe. Lives in bin/ next to
+// the CUDA DLLs — bin/ is engine content (not preserved), so a future update
+// overwrites it naturally (the "who updates the updater" non-problem: it runs
+// from a %TEMP% copy, so the install's copy is never locked).
+if (existsSync(updaterExe)) {
+  copyFileSync(updaterExe, join(stageBinDir, 'updater.exe'));
+  console.log('[release] copied updater.exe → bin/ (temp-staged update pipeline)');
+} else {
+  console.warn(`[release] WARNING: ${updaterExe} not found — bin/updater.exe will be missing.`);
+  console.warn('              (Expected during --dry-run; a real release must build it first — Step 3.5.)');
 }
 
 console.log(`[release] staged portable layout at ${stageWupiDir} (DLLs in bin/, msvcp140 at root)`);
