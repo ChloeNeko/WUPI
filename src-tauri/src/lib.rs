@@ -672,11 +672,14 @@ pub fn run() {
             // DEAD — deleted 2026-08-14; the updater's §8C purge removes
             // them from upgraded installs.)
             std::fs::create_dir_all(fable_dir.join("cards")).ok();
-            // Phase 5B: the shared scene-image dir. The SD orchestrator
-            // overwrites `backgrounds/scene.png` each turn (one current-scene
-            // image, not a per-card history). Created eagerly so the first
-            // generation never races a missing dir.
-            std::fs::create_dir_all(fable_dir.join("backgrounds")).ok();
+            // The zip ships NO apps/ tree at all (empty dirs = pure zip
+            // noise; 2026-08-14) — THIS block is what materializes apps/ on
+            // a fresh install's first boot. The Background Library lives at
+            // apps/fable/images/backgrounds (§7 "Stage Background Library"),
+            // created eagerly so the first import never races a missing dir
+            // (the old apps/fable/backgrounds scene-art dir was dead —
+            // nothing ever resolved it — and is NOT created).
+            std::fs::create_dir_all(fable_dir.join("images").join("backgrounds")).ok();
             // Saved Players (2026-08-02): a standalone, reusable player
             // identity library at apps/fable/players/<id>/. Sibling root to
             // cards/ — holds authored players that can be attached onto any

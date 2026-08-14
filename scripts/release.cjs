@@ -83,6 +83,17 @@ for (const a of argv) {
 }
 
 // ──────────────────────────────────────────────────────────────────────────
+// Recursive "does this dir hold at least one file" check — gates the apps/
+// staging blocks (an empty apps/ tree ships NOTHING in the zip; boot creates
+// it on first run).
+function dirHasFiles(dir) {
+  for (const e of readdirSync(dir, { withFileTypes: true })) {
+    if (e.isFile()) return true;
+    if (e.isDirectory() && dirHasFiles(join(dir, e.name))) return true;
+  }
+  return false;
+}
+
 // Step 1: Read + bump the version.
 // ──────────────────────────────────────────────────────────────────────────
 const repoRoot = join(__dirname, '..');
@@ -517,8 +528,14 @@ cpSync(srcDataDir, join(stageWupiDir, 'data'), { recursive: true });
 // card picker ships empty. The whole cards tree is copied RECURSIVELY so the
 // per-card folders + any sibling files ship intact. Per-card session/world/
 // player/npc JSON + saves are user data → created on first run, NOT staged.
+// The zip ships NO apps/ tree at all (2026-08-14): apps/ is user state that
+// wupi.exe's setup() materializes on first boot (cards/, images/backgrounds/,
+// players/, prism/gallery/). Staging is CONTENT-GATED — a tree with zero
+// files (the current state: no starter card ships) is skipped entirely so
+// the zip never carries empty folder noise; drop a card/background in and it
+// ships again automatically.
 const srcCardsDir = join(repoRoot, 'apps', 'fable', 'cards');
-if (existsSync(srcCardsDir)) {
+if (existsSync(srcCardsDir) && dirHasFiles(srcCardsDir)) {
   const dstCardsDir = join(stageWupiDir, 'apps', 'fable', 'cards');
   cpSync(srcCardsDir, dstCardsDir, { recursive: true });
   // Count the staged cards (one <name>/<name>.sim per folder) for the log line.
@@ -531,7 +548,7 @@ if (existsSync(srcCardsDir)) {
   }
   console.log(`[release] staged ${staged} scenario card(s) from apps/fable/cards/`);
 } else {
-  console.warn('[release] WARNING: apps/fable/cards/ not found — zip will ship with an empty card picker.');
+  console.log('[release] apps/fable/cards/ empty or absent — NOT staged; created at first boot.');
 }
 
 // apps/fable/images/: the Fable Background Library (2026-08-11). The
@@ -543,7 +560,7 @@ if (existsSync(srcCardsDir)) {
 // (the active-bg marker lives one level up at apps/fable/.active_background.json
 // so it's never clobbered by a library refresh).
 const srcImagesDir = join(repoRoot, 'apps', 'fable', 'images');
-if (existsSync(srcImagesDir)) {
+if (existsSync(srcImagesDir) && dirHasFiles(srcImagesDir)) {
   const dstImagesDir = join(stageWupiDir, 'apps', 'fable', 'images');
   cpSync(srcImagesDir, dstImagesDir, { recursive: true });
   // Count shipped backgrounds (png/jpg) for the log line.
@@ -556,7 +573,7 @@ if (existsSync(srcImagesDir)) {
   }
   console.log(`[release] staged ${stagedBg} background(s) from apps/fable/images/backgrounds/`);
 } else {
-  console.warn('[release] WARNING: apps/fable/images/ not found — backgrounds folder will be created on first import.');
+  console.log('[release] apps/fable/images/ empty or absent — NOT staged; created at first boot.');
 }
 
 // ──────────────────────────────────────────────────────────────────────────
