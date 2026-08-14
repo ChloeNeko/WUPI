@@ -10,20 +10,7 @@
     "beforeBuildCommand": "npm run build"
   },
   "app": {
-    "windows": [
-      {
-        "title": "WUPI",
-        "url": "wupi.html",
-        "width": 1440,
-        "height": 900,
-        "maximized": false,
-        "resizable": false,
-        "fullscreen": true,
-        "decorations": false,
-        "transparent": true,
-        "alwaysOnTop": false
-      }
-    ],
+    "windows": [],
     "security": {
       "csp": null,
       "assetProtocol": {

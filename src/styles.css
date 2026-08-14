@@ -27,6 +27,22 @@ body:not(.booting) {
     background-color: #02040a;
 }
 
+/* ── Global text-selection color ───────────────────────────────────
+   Dark charcoal-gray instead of the browser's default "alarming blue," so
+   a selection reads as subtly emphasized + fits the dark UI (the Fable
+   brass/charcoal palette especially — a blue highlight clashes with the
+   brass accent + the golden-pencil flow). Applied app-wide so every
+   surface — Fable narrator prose, Wupi chat, inputs — matches.
+   (Chloe 2026-08-11.) */
+::selection {
+    background: rgba(60, 54, 52, 0.85);
+    color: #f4f1ef;
+}
+::-moz-selection {     /* Firefox */
+    background: rgba(60, 54, 52, 0.85);
+    color: #f4f1ef;
+}
+
 #aurora-canvas {
     display: block;
     position: absolute;
@@ -824,6 +840,15 @@ body:not(.booting):not(.loading) .dock-trigger-area {
     resize: both;
     min-width: 340px;
     min-height: 360px;
+    /* Container query root for the home chat typography (2026-08-11): the
+       .msg / .chat-input font-size + padding below use cqi units keyed to
+       THIS element's width. The window's default stays 440×560 (byte-
+       identical to before on every resolution) — cqi only changes the text
+       if the user drag-resizes the window (native resize sets inline width
+       → cqi recomputes → text/padding rescale with it). inline-size
+       containment is safe: the window's width is set explicitly above
+       (never derived from its contents). */
+    container-type: inline-size;
 }
 .app-window.chat.dragged {
     transform: none; /* JS sets left/top after a drag */
@@ -1631,9 +1656,9 @@ input[type="password"]::-webkit-credentials-auto-fill-button {
    spot rather than hugging the wall. */
 .msg {
     max-width: 70%;
-    padding: 10px 14px;
+    padding: 0.7em 1em;              /* em rides the clamped font; =9.8/14px at the 14px reference */
     border-radius: 16px;
-    font-size: 14px;
+    font-size: clamp(12px, 3.18cqi, 16px);   /* 3.18cqi·440 ≈ 14px (unchanged on the 440px reference window); 12–16px guard rails */
     line-height: 1.5;
     white-space: pre-wrap;
     word-break: break-word;
@@ -1736,10 +1761,10 @@ input[type="password"]::-webkit-credentials-auto-fill-button {
     background: rgba(0, 0, 0, 0.3);
     border: 1px solid rgba(255, 255, 255, 0.1);
     border-radius: 12px;
-    padding: 10px 12px;
+    padding: 0.7em 0.85em;            /* em rides the clamped font; =9.8/12px at the 14px reference */
     color: #fff;
     font-family: inherit;
-    font-size: 14px;
+    font-size: clamp(12px, 3.18cqi, 16px);   /* mirrors .msg — unchanged on the 440px reference window */
     outline: none;
     resize: none;
     transition: border-color 0.15s, box-shadow 0.15s;
@@ -1763,6 +1788,80 @@ input[type="password"]::-webkit-credentials-auto-fill-button {
    transforms never fight. GPU-accelerated end-to-end (transform + opacity
    only, no layout properties animated).
    ─────────────────────────────────────────────────────────────────────── */
+/* ── fable.exe entry splash (the floating F logo) ───────────────────────
+   Shown ONLY on the fable.exe path (<html>.fable-entry, set by the inline
+   head script in wupi.html). The main window is built hidden (lib.rs) so the
+   WebView2 native-surface flash never reaches the screen; the page paints this
+   splash offscreen, then script.js calls fable_reveal_window → the window
+   appears already showing the F. Holds ~2s while the Fable title initializes
+   underneath, then .fade-out crossfades it away (script.js removes the node
+   after the transition). z-index 200000 sits above #boot-paw (100000) +
+   #fable (1000) so it owns the screen while up. Fully transparent background —
+   just the glowing F floating over the desktop (nothing else). */
+#fable-entry-splash {
+    display: none;                 /* hidden unless <html>.fable-entry */
+}
+html.fable-entry #fable-entry-splash {
+    display: flex;
+    position: fixed;
+    inset: 0;
+    z-index: 200000;
+    align-items: center;
+    justify-content: center;
+    pointer-events: none;
+    background: transparent;        /* no backdrop — the glowing F floats over the desktop */
+    opacity: 1;
+    transition: opacity 600ms ease;
+}
+html.fable-entry #fable-entry-splash.fade-out {
+    opacity: 0;
+}
+html.fable-entry #fable-entry-splash img {
+    /* The F logo at a comfortable centered size with its baked-in glow +
+       outline (the source PNG already carries both, so no filter needed).
+       vmin-scaled so it reads as a proper splash emblem on any display. */
+    width: min(36vmin, 360px);
+    height: min(36vmin, 360px);
+    user-select: none;
+    -webkit-user-drag: none;
+}
+
+/* fable.exe entry hold — the "nothing but the F" guarantee. Two layers would
+   otherwise paint behind the floating F during the ~2s hold (both are
+   blue-violet near-blacks that read as a purple backdrop over the desktop):
+   the body's solid OS base (#02040a, once script.js drops .booting) and
+   #fable's void backdrop (#05040a, once .show is set). Both stay transparent
+   for the whole hold so the window's own transparency shows the DESKTOP:
+   - the body rule is scoped to html.fable-entry (stamped by the inline head
+     script; script.js's fadeSplash teardown removes it once the splash node
+     is gone, restoring the OS base behind the now-visible app);
+   - .fable-entry-hold is added to #fable by the FABLE_ENTRY / DIRECT_LAUNCH
+     branches (fable.js) and dropped the instant real content reveals
+     (showScreen / resumeSave) so the void never bleeds through the title's
+     fade-in. */
+html.fable-entry body:not(.booting) {
+    background-color: transparent;
+}
+.app-window.fable-app.fable-entry-hold {
+    background: transparent;
+    pointer-events: none; /* clicks fall through to the desktop, like the boot paw */
+}
+/* Same hold covers the OS chrome: script.js drops .booting the moment the
+   check_models IPC resolves, which starts the top-bar's 0.6s opacity fade-in
+   WHILE body.fable-active's 320ms slide-away is still mid-flight (and the
+   dock trigger enables outright) → the glass bar + clock flicker in over the
+   splash before finishing its slide off-screen. Keeping both fully hidden
+   for the whole hold closes the race; at hold teardown the slide completed
+   long ago, so the opacity reveal lands invisibly off-screen. */
+html.fable-entry body:not(.booting) .top-bar {
+    opacity: 0;
+    pointer-events: none;
+}
+html.fable-entry body:not(.booting):not(.loading) .dock-trigger-area {
+    opacity: 0;
+    pointer-events: none;
+}
+
 #boot-paw {
     position: fixed;
     left: 0;
@@ -1934,13 +2033,16 @@ input[type="password"]::-webkit-credentials-auto-fill-button {
        real time. line-height:1 tightens the element box to the glyph cap-height
        so the mirror starts right at the baseline (no line-box gap); the -8px
        below offset pulls the reflection UP a tiny smidge toward the text
-       (2026-08-04: a touch closer than the prior 0px gap). The mask is
-       deliberately gentle — it holds near-full opacity through the first third
-       then eases out, so the FULL reflection shows (not cut in half). The long
-       soft fade gives a watery/blurry quality that reads as neon rippling on
-       water. Chromium (WebView2) supports -webkit-box-reflect; WUPI is a
-       Tauri/Chromium-only target so no fallback is needed (one property). */
-    -webkit-box-reflect: below -8px linear-gradient(to bottom, rgba(255,255,255,0.55), rgba(255,255,255,0.40) 30%, rgba(255,255,255,0.20) 60%, transparent 100%);
+       (2026-08-04: a touch closer than the prior 0px gap).
+       2026-08-13: the mask previously STARTED at only 0.55 alpha at the top of
+       the reflection, which immediately attenuated the glyph's text-shadow glow
+       halo and produced a visible hard seam/cutoff at the top of the reflected
+       words (the glow got clipped where the steep gradient met the outer blur).
+       The mask now holds FULL opacity (1.0) through the top portion so the
+       glow's full field renders unclipped, then eases out later + softer —
+       the reflection's near edge now matches the real text's glow with no
+       border. The watery fade at the far edge is preserved. */
+    -webkit-box-reflect: below -8px linear-gradient(to bottom, rgba(255,255,255,1) 0%, rgba(255,255,255,0.95) 20%, rgba(255,255,255,0.55) 55%, rgba(255,255,255,0.18) 80%, transparent 100%);
 }
 .boot-loading-text span {
     display: inline-block;

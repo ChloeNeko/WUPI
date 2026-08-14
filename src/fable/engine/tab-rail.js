@@ -161,7 +161,7 @@ async function renderTab(key, el) {
 // ── Player tab (character sheet, READ-ONLY) ─────────────────────────────
 // Pulls from THREE sources + renders each section only when it has content:
 //   • fable_active_player_get → identity (name/race/gender/age/height/weight)
-//     + backstory. None for a playerless game (Quick Play) → section hidden.
+//     + backstory. None for a playerless game → section hidden.
 //   • player_state_get        → appearance deltas, vitals, injuries, inventory.
 //   • fable_schema_get        → relationships (keyed by npc id). Best-effort.
 // Editing happens via the ✎ raw editor or by talking to WUPI; nothing here
@@ -174,7 +174,7 @@ async function renderPlayer(bodyEl) {
     bodyEl.innerHTML = emptyBox('No active game.');
     return;
   }
-  // Identity + relationships schema are best-effort: a Quick Play game has no
+  // Identity + relationships schema are best-effort: a playerless game has no
   // attached player (identity stays hidden) + a schema read failure just hides
   // relationships. Vitals/injuries/inventory always come from player_state.
   const [player, schema] = await Promise.all([

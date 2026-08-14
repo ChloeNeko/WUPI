@@ -5,8 +5,8 @@
 // A single overlay element mounted ONCE into #fable (above every New-
 // Game-flow screen). It is NEVER part of any burned content area, so
 // it never moves or flickers during the burn/reverse-spawn transitions.
-// Only the ‹ button's visibility changes (hidden on Pair 1 / Create-
-// Load Sim; visible from Pair 2 onward + on the creators/pickers);
+// Only the ‹ button's visibility changes (hidden on the Player pair
+// (slide 1); visible from the SIM pair onward + on the creators/pickers);
 // ⌂ is always present.
 //
 // CONTRACT:
@@ -96,11 +96,9 @@ function bindController(chrome) {
     // Re-route click handlers (clone-detach prevents stacking).
     onBack(fn) { backRef = setHandler(backRef, fn); },
     onHome(fn) { homeRef = setHandler(homeRef, fn); },
-    // Set the visual variant: 'newgame' (brass) or 'quickplay' (white). The
-    // Quick Play home button reads as a bright white glyph over the void
-    // (Chloe 2026-08-05) instead of the New Game flow's aged brass.
+    // Set the visual variant (e.g. 'newgame' → aged brass glyphs).
     setVariant(variant) {
-      chrome.classList.remove('fable-flow-chrome--quickplay', 'fable-flow-chrome--newgame');
+      chrome.classList.remove('fable-flow-chrome--newgame');
       if (variant) chrome.classList.add(`fable-flow-chrome--${variant}`);
     },
     // Full teardown (on Fable close).

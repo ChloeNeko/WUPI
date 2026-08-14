@@ -65,18 +65,6 @@
     pointer-events: none;
     transform: translateX(-6px);
 }
-/* Quick Play variant (2026-08-05): the home button reads as a bright WHITE
-   glyph over the void instead of the New Game flow's aged brass. The ‹ back
-   button keeps the brass treatment (it shares the screen with the void-form
-   which has no other chrome). Applied via setVariant('quickplay'). */
-.fable-flow-chrome--quickplay .fable-flow-chrome__btn--home {
-    color: #f4f1ef;
-    filter: drop-shadow(0 0 10px rgba(244, 241, 239, 0.45));
-}
-.fable-flow-chrome--quickplay .fable-flow-chrome__btn--home:hover {
-    color: #ffffff;
-    filter: drop-shadow(0 0 16px rgba(244, 241, 239, 0.9));
-}
 
 /* --- Burn transition: the overlay twin + hot edge ---------------- */
 /* The twin is a fixed-position clone of a button, placed exactly over
@@ -126,7 +114,7 @@
     position: relative;
 }
 
-/* --- Player Pair 2 tiles: person silhouette + small badge --------- */
+/* --- Player picker grid tiles: person silhouette + small badge ----- */
 /* Both player tiles use a PERSON silhouette (not the reused create/load
    glyphs). A small badge in the bottom-right distinguishes Create (+)
    from Load (folder). The silhouette is the dominant icon; the badge is
@@ -1509,6 +1497,300 @@
     filter: drop-shadow(0 0 12px rgba(230, 213, 138, 0.6));
 }
 
+/* --- ID Card (compact license-card face + bronze-arrow disclosure) ---------
+   2026-08-13 (Chloe): the review card now leads with a COMPACT core grid —
+   Player/NPC show 8 fields (Name, Gender, Race, Age, Hair Color, Eye Color,
+   Height, Weight); World/Scenario show a TYPE banner + Name/Setting/Purpose/
+   Tone. NO section headers on the core (a flat <dl> — real-life state-license
+   look). Every remaining tag lives behind a small bronze arrow on the card's
+   right edge → expands the .fable-id-card-extra disclosure (the full
+   section/h3/dl grid, reused wholesale for a clean, parseable read). The card
+   markup comes from screens/id-card.js; the model from buildIdCard. */
+.fable-id-card { position: relative; }     /* anchor for the absolute arrow */
+
+/* Compact core grid — no <h3> dividers. Mirrors the .fable-player-review-section
+   dl look (2-col, uppercase values) but stands alone (no section wrapper). */
+.fable-id-card-core {
+    margin: 0;
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 10px 48px;
+    width: 100%;
+    max-width: 520px;
+    font-size: 1.05rem;
+}
+.fable-id-card-core > div { display: flex; flex-direction: column; gap: 0; }
+.fable-id-card-core dt { color: var(--fable-text-faint); font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.06em; }
+.fable-id-card-core dd { margin: 0; color: var(--fable-text); font-size: 1.05rem; text-transform: uppercase; line-height: 1.15; }
+
+/* World/Scenario: a prominent centered TYPE banner, then a 1-col core (the
+   setting/purpose values are prose-y, so a single full-width column reads
+   cleaner than the 2-col player grid). The body column centers everything. */
+.fable-id-card--world .fable-player-review-body { align-items: center; text-align: center; }
+.fable-id-card--world .fable-id-card-core { grid-template-columns: 1fr; max-width: 580px; }
+.fable-id-card--world .fable-id-card-core > div { align-items: center; }
+.fable-id-card-banner {
+    width: 100%;
+    box-sizing: border-box;
+    padding: 0 56px 12px 0;          /* right clearance so the headline clears the arrow */
+    margin: 0 0 16px;
+    border-bottom: 1px solid rgba(197, 179, 88, 0.3);
+    font-family: 'Almendra', var(--fable-font-serif);
+    font-weight: 700;
+    font-size: 30px;
+    color: var(--fable-brass);
+    text-transform: uppercase;
+    letter-spacing: 0.18em;
+    text-align: center;
+    text-shadow: 0 0 12px var(--fable-brass-glow);
+}
+/* NPC: a subtle brass corner chip (so an NPC reads distinct from a player,
+   but otherwise shares the player layout). Sits at the top of the body. */
+.fable-id-card-tag {
+    align-self: flex-start;
+    margin: 0 0 14px;
+    padding: 3px 12px;
+    border: 1px solid rgba(197, 179, 88, 0.4);
+    border-radius: 999px;
+    background: rgba(197, 179, 88, 0.08);
+    color: var(--fable-brass-bright);
+    font-size: 0.72rem;
+    letter-spacing: 0.18em;
+    text-transform: uppercase;
+}
+
+/* The bronze arrow toggle — small circular brass button at the card's top-right
+   edge. Rotates 90° (points down) when expanded. */
+.fable-id-card-expand {
+    position: absolute;
+    top: 22px;
+    right: 22px;
+    width: 46px;
+    height: 46px;
+    z-index: 2;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 0;
+    border: 1px solid rgba(197, 179, 88, 0.45);
+    border-radius: 50%;
+    background: rgba(197, 179, 88, 0.12);
+    color: var(--fable-brass-bright);
+    cursor: pointer;
+    transition: transform 240ms ease, background 160ms ease, box-shadow 160ms ease;
+}
+.fable-id-card-expand svg { width: 22px; height: 22px; display: block; }
+.fable-id-card-expand:hover {
+    background: rgba(197, 179, 88, 0.22);
+    box-shadow: 0 0 16px rgba(230, 213, 138, 0.45);
+}
+.fable-id-card.is-expanded .fable-id-card-expand { transform: rotate(90deg); }
+
+/* The disclosure — the full section/h3/dl grid reused from the review card.
+   Hidden via the [hidden] attr until the arrow is pressed; once shown it flexes
+   to fill the card's leftover height + scrolls internally (the review-mode card
+   cap stays, so CREATE never leaves screen; the Load modal scrolls its own
+   panel). A full-width filament divides it from the compact face. */
+.fable-id-card-extra {
+    flex: 1 1 auto;
+    min-height: 0;
+    width: 100%;
+    overflow-y: auto;
+    margin-top: 10px;
+    padding: 18px 6px 4px 0;
+    border-top: 1px solid rgba(140, 120, 50, 0.45);
+    scrollbar-width: none;              /* hidden scrollbar (clean read) */
+}
+.fable-id-card-extra::-webkit-scrollbar { display: none; }
+.fable-id-card-extra .fable-player-review-section { margin-bottom: 16px; }
+
+/* --- Creator Chat (minimal two-block UI) ----------------------------------
+   2026-08-13 Chloe: the GLM-conversational wizards (Player/Sim/Codex) render
+   as a single AI prompt block + a single textarea — no chat log, no bubbles.
+   Reuses .fable-player-wizard's centering + the glowing divider so it matches
+   the rest of the creator suite. Narrower (720px) than the slide wizard
+   (1000px) so the prompt + composer read as a focused column. The intro
+   wizard inherits this DOM too (its auto-send path runs unchanged). */
+.fable-creator-chat {
+    /* Override the slide wizard's bottom padding (140px clears nav arrows,
+       which this UI doesn't have) + narrow the frame. */
+    width: 80vw;
+    max-width: 720px;
+    padding: 24px 32px 48px;
+    gap: 0;
+}
+/* Small brass label at the top — quieter than the slide titles (those are
+   104px Cinzel banners; this is a 28px header so the AI prompt dominates). */
+.fable-creator-chat-title {
+    margin: 0 0 0;
+    font-family: 'Almendra', var(--fable-font-serif);
+    font-weight: 700;
+    font-size: clamp(28px, 3.2vw, 40px);
+    color: var(--fable-brass-bright);
+    text-shadow: 0 0 16px var(--fable-brass-glow);
+    letter-spacing: 0.14em;
+    text-align: center;
+    text-transform: uppercase;
+    line-height: 1;
+}
+/* Tighten the divider's bottom margin so the prompt block hugs it (the slide
+   wizard uses 60px; here 24px keeps the column compact). */
+.fable-creator-chat > .fable-wizard-slide-divider {
+    margin: 12px auto 24px;
+}
+/* The stage holds the prompt block + (hidden) review card. It is content-
+   height (`flex: 0 1 auto`, NOT grow) so the wizard frame's `justify-content:
+   center` can gather the title + divider + prompt + composer as one centered
+   group (the prior `flex: 1 1 auto` ate all slack and pinned the prompt to the
+   top + the composer to the bottom). In review mode the review card takes over
+   (the prompt + composer are hidden via the inline `hidden` attr + the
+   `[hidden]` overrides below). */
+.fable-creator-chat-stage {
+    width: 100%;
+    flex: 0 1 auto;
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
+    align-items: stretch;
+    justify-content: center;
+    gap: 16px;
+}
+/* The AI prompt block — the single surface for GLM's text. Glass surface
+   matching the review card's treatment (rgba(255,255,255,0.035) + blur + a
+   brass-tinted border). min-height so it doesn't collapse when only the
+   typing indicator is showing. */
+.fable-creator-chat-prompt {
+    position: relative;
+    flex: 0 1 auto;
+    min-height: 140px;
+    padding: 32px 36px;
+    background: rgba(255, 255, 255, 0.035);
+    backdrop-filter: blur(8px);
+    -webkit-backdrop-filter: blur(8px);
+    border: 1px solid rgba(230, 213, 138, 0.28);
+    border-radius: 16px;
+    box-shadow: 0 8px 28px rgba(0, 0, 0, 0.55), 0 0 24px rgba(230, 213, 138, 0.12);
+    overflow: hidden;
+}
+.fable-creator-chat-prompt-body {
+    font-family: var(--fable-font-body);
+    font-size: 1.25rem;
+    line-height: 1.65;
+    color: var(--fable-text);
+    text-align: left;
+    white-space: pre-wrap;
+    word-break: break-word;
+    /* The fade transition: opacity carries the atomic-reveal swap (fadeSwap
+       in creator-chat.js toggles opacity 1→0→swap→0→1). The timing here is
+       deliberately a touch longer than the JS setTimeouts (150 out / 200 in)
+       so the transition never clips the swap midpoint. */
+    transition: opacity 160ms ease;
+    opacity: 1;
+}
+/* The processing indicator: three pulsing brass dots centered in the prompt
+   block. Replaces the prompt body while a turn streams (atomic reveal —
+   chunks don't touch the DOM, only the indicator shows until `done`). */
+.fable-creator-chat-prompt.is-typing .fable-creator-chat-prompt-body {
+    /* Hide the body text while the dots show (the body is still populated
+       with the PRIOR turn's text; we don't clear it, just veil it). */
+    opacity: 0;
+}
+.fable-creator-chat-prompt.is-typing::after {
+    content: '';
+    position: absolute;
+    top: 50%;
+    left: 50%;
+    width: 54px;
+    height: 14px;
+    transform: translate(-50%, -50%);
+    background-image:
+        radial-gradient(circle, var(--fable-brass) 0 5px, transparent 6px),
+        radial-gradient(circle, var(--fable-brass) 0 5px, transparent 6px),
+        radial-gradient(circle, var(--fable-brass) 0 5px, transparent 6px);
+    background-position: 0 50%, 27px 50%, 54px 50%;
+    background-repeat: no-repeat;
+    background-size: 14px 14px;
+    filter: drop-shadow(0 0 6px var(--fable-brass-glow));
+    animation: creatorTypingPulse 1.4s ease-in-out infinite;
+}
+@keyframes creatorTypingPulse {
+    0%, 100% { opacity: 0.45; }
+    50%      { opacity: 1; }
+}
+/* The composer: textarea (flex-grow) + Send button. Anchored at the bottom of
+   the wizard frame. The textarea reuses the slide-wizard input vocabulary
+   (brass border on focus, emboss shadow, dark fill) but multi-line + left-
+   aligned (prose entry, not single-line centered labels). */
+.fable-creator-chat-composer {
+    flex: 0 0 auto;
+    width: 100%;
+    display: flex;
+    flex-direction: row;
+    align-items: stretch;
+    gap: 12px;
+    margin-top: 20px;
+    transition: opacity 200ms ease;
+}
+.fable-creator-chat-composer.is-busy {
+    opacity: 0.5;
+    pointer-events: none;
+}
+/* Author `display: flex` on the composer overrides the UA `[hidden]` rule, so
+   `composerEl.hidden = true` in showReview() silently no-ops → the input row
+   lingers over the CREATE/back buttons (the review-screen leak bug). These
+   restore `[hidden]` precedence for the chat-only surfaces. */
+.fable-creator-chat-composer[hidden],
+.fable-creator-chat-prompt[hidden] {
+    display: none !important;
+}
+.fable-creator-chat-input {
+    flex: 1 1 auto;
+    min-width: 0;
+    box-sizing: border-box;
+    padding: 16px 20px;
+    min-height: calc(1.25rem * 2 + 32px + 2px);  /* ~2 lines + padding + borders */
+    max-height: 220px;
+    resize: none;
+    background: rgba(28, 22, 16, 0.7);
+    border: 1px solid var(--fable-glass-line);
+    border-radius: 8px;
+    color: var(--fable-text);
+    font-family: var(--fable-font-body);
+    font-size: 1.15rem;
+    line-height: 1.5;
+    text-align: left;
+    outline: none;
+    transition: border-color 160ms ease, box-shadow 160ms ease;
+}
+.fable-creator-chat-input:focus {
+    border-color: var(--fable-brass);
+    box-shadow: var(--fable-emboss-strong);
+}
+.fable-creator-chat-input:disabled {
+    cursor: not-allowed;
+}
+/* The review container sits in the stage; when hidden the attr takes care of
+   it. When shown (review mode), the existing .fable-player-wizard.is-review-
+   mode rules + .fable-player-review-card CSS paint it wholesale. Widen the
+   wizard back to 1100px in review mode so the 1060px card fits (matches the
+   slide wizard's review-mode width). */
+.fable-creator-chat.is-review-mode {
+    max-width: 1100px;
+    padding: 24px 32px 24px;
+    justify-content: flex-end;
+}
+.fable-creator-chat-review { width: 100%; }
+
+/* Cinematic launch fade (launchGame): the current screen fades to opacity 0 so
+   only the background + music remain while the intro generates + fable_start
+   captures the schema, before the fade-to-black + stage swap. Generic across
+   the chat shell + the tile pickers (both carry .fable-screen). */
+.fable-screen.is-launching {
+    opacity: 0 !important;
+    transition: opacity 600ms ease;
+    pointer-events: none;
+}
+
 /* --- Picker grid mini-cards ---------------------------------------------
    2026-08-05 Chloe pass: the grid fits a 5×2 pattern of compact cards in the
    screen's center. Each card shows ONLY portrait + a thin themed divider
@@ -1558,27 +1840,25 @@
     background: linear-gradient(90deg, transparent, rgba(197, 179, 88, 0.5) 30%, rgba(230, 213, 138, 0.7) 50%, rgba(197, 179, 88, 0.5) 70%, transparent);
     box-shadow: 0 0 6px rgba(230, 213, 138, 0.35);
 }
-/* 2026-08-05 overhaul: name + gender glyph on ONE HORIZONTAL ROW (gender to the
-   RIGHT of the name). The row centers as a unit; a long name truncates (with
-   ellipsis) instead of wrapping under the glyph — Chloe: "it can't go
-   underneath the name." Row-aligned, nowrap, gap between name + glyph. */
+/* The info row holds ONLY the centered name (2026-08-13: the gender glyph is
+   gone — name only). A long name truncates with an ellipsis instead of
+   wrapping. Same row on player + sim mini-cards. */
 .fable-player-mini-info {
     display: flex;
     flex-direction: row;
     align-items: center;
     justify-content: center;
-    gap: 10px;
     width: 100%;
     padding: 0 6px;
     box-sizing: border-box;
 }
 .fable-player-mini-name {
-    /* 2026-08-05 overhaul: slightly smaller (34 → 30px) + nowrap + ellipsis so a
-       long name shares the row with the glyph instead of wrapping beneath it. */
+    /* 2026-08-13 (Chloe): ivory white, nowrap + ellipsis. Centered under the
+       divider on BOTH player + sim mini-cards. */
     font-family: 'Almendra', var(--fable-font-serif);
     font-weight: 700;
     font-size: 30px;
-    color: var(--fable-text);
+    color: #FFF6E0;                 /* ivory white */
     line-height: 1.05;
     text-align: center;
     white-space: nowrap;
@@ -1587,33 +1867,22 @@
     flex: 1 1 auto;
     min-width: 0;
 }
-/* Gender glyph wrap — the sharp Mars/Venus SVG (same geometry as the Creator).
-   A fixed-size flex-shrink:0 box keeps the glyph's scale compact + guarantees
-   it never gets squeezed off the row by a long name. Sits RIGHT of the name. */
-.fable-player-mini-gender-wrap {
-    display: block;
-    flex: 0 0 auto;
-    width: 30px;
-    height: 36px;
-}
-.fable-player-mini-glyph {
+/* The TYPE label row (NPC CARD / WORLD CARD / SCENARIO CARD) — centered ABOVE
+   the portrait on SIM mini-cards only (players have none). Glowy light brass,
+   small + widely tracked so it reads as metadata, not a name. */
+.fable-player-mini-type {
+    font-family: 'Almendra', var(--fable-font-serif);
+    font-weight: 700;
+    font-size: 15px;
+    color: var(--fable-brass-bright);
+    text-transform: uppercase;
+    letter-spacing: 0.22em;
+    text-align: center;
+    text-shadow: 0 0 4px var(--fable-brass-glow), 0 0 9px var(--fable-brass-glow);
     width: 100%;
-    height: 100%;
-    display: block;
-    color: var(--fable-brass);
+    padding: 0 6px;
+    box-sizing: border-box;
 }
-.fable-player-mini-glyph .glyph-stroke {
-    fill: none;
-    stroke: currentColor;
-    stroke-width: 12;
-    stroke-linecap: butt;
-    stroke-linejoin: miter;
-    stroke-miterlimit: 4;
-}
-/* Tint the glyph the same navy/scarlet as the Creator's selected state so the
-   read matches (a male card shows a navy outline, a female card a scarlet one). */
-.fable-player-mini-card[data-gender="male"] .fable-player-mini-glyph { color: #2E54B5; }
-.fable-player-mini-card[data-gender="female"] .fable-player-mini-glyph { color: #F04A6A; }
 
 /* --- The expand-to-center modal -----------------------------------------
    2026-08-05 Chloe pass: the modal body is now the SAME .fable-player-review-card

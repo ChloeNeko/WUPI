@@ -16,8 +16,43 @@
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Fredoka:wght@500;600;700&family=Uncial+Antiqua&family=Almendra:wght@700;800&display=swap" rel="stylesheet">
+    <!-- fable.exe entry splash. The main window is built HIDDEN for fable.exe
+         (lib.rs setup: .visible(false)) because the WebView2 native surface
+         flashes a purple/system cast for the first frame(s) before ANY HTML can
+         paint — no in-page CSS can beat that. Instead the page paints this
+         floating F-logo splash offscreen while the window is hidden; once it's
+         rendered, script.js calls the `fable_reveal_window` IPC → Rust shows
+         the window, so the FIRST visible frame is already the F logo (never the
+         native surface). The splash holds ~2s while the Fable title initializes
+         underneath, then crossfades out. This inline head script runs before
+         first paint: it marks the html/body so the splash shows (the window
+         itself is fully transparent — only the floating F is visible, nothing
+         else). CSS can't read location.hash, hence the synchronous snippet.
+         wupi.exe (no #fable hash) is entirely unaffected → keeps its
+         transparent boot paw animation. -->
+    <script>
+      (function () {
+        try {
+          var h = (location.hash || '').replace(/^#/, '');
+          var fableEntry = h === 'fable' || h.indexOf('fable=') === 0 ||
+            new URLSearchParams(location.search).has('fable');
+          if (fableEntry) {
+            /* transparent — only the floating F is visible, no backdrop */
+            document.documentElement.style.background = 'transparent';
+            document.documentElement.classList.add('fable-entry');
+          }
+        } catch (e) {}
+      })();
+    </script>
 </head>
 <body class="booting">
+    <!-- fable.exe entry splash: the floating F logo shown while the (hidden)
+         main window finishes loading. Driven by the inline head script above +
+         script.js (which calls fable_reveal_window + later fades it out). Only
+         visible when <html> carries .fable-entry (fable.exe path). -->
+    <div id="fable-entry-splash" aria-hidden="true">
+        <img src="fable_icon.png" alt="" />
+    </div>
     <!-- Boot phase: the OS window is transparent (tauri.conf.json) and STAYS
          transparent for its lifetime. What hides the desktop is the BODY
          background-color. During boot (body.booting) body is transparent so
@@ -395,7 +430,7 @@
                      The centered glowing + button at the bottom commits. -->
                 <div class="ai-editor" id="apiEditor">
                     <label class="field-label">Name</label>
-                    <input type="text" id="apiName" class="field-input" />
+                    <input type="text" id="apiName" class="field-input" placeholder="My Profile" />
                     <label class="field-label">API URL</label>
                     <input type="text" id="apiEndpoint" class="field-input" />
                     <label class="field-label">API key</label>

@@ -277,6 +277,44 @@ export function buildSoulGems(root, backpack, img, gender) {
 // gems snap to their new positions instantly; only bloom/retract animates.
 //
 // LOAD-WAIT: the paperdoll <img> uses width:auto, so before it loads its
+// Clamp the #inventory-panel-slot's height so its TOP edge can never climb
+// past the astrolabe/time-bar header at the top of the drawer. The panel is
+// bottom-anchored (its bottom sits a fixed gap above the backpack) + grows
+// upward via min-height/max-height; on shorter viewports (or tall content)
+// its top edge was colliding with + overlapping the time bar. This measures
+// the astrolabe header's bottom edge live, then caps max-height to the
+// vertical space between that + the panel's bottom anchor. When content is
+// shorter than the cap, max-height is a no-op; when taller, the panel
+// shrinks + its internal scroll viewport takes over (no time-bar overlap).
+// Also relaxes the CSS min-height (300px) when the cap is tighter, so the
+// floor can't force the panel past the astrolabe. ASTROLABE_FLOOR_PX is the
+// fallback when the header element can't be measured (matches its CSS box:
+// top:6px + ~64px of font/padding/border ≈ 72px; 80px gives a small breath).
+const ASTROLABE_FLOOR_PX = 80;
+function clampSlotBelowAstrolabe(slot, rootBox) {
+  if (!slot || !rootBox) return;
+  const header = drawerRoot.querySelector('[data-astrolabe-header]');
+  let astrolabeBottomFromDrawerTop = ASTROLABE_FLOOR_PX;
+  if (header) {
+    const hBox = header.getBoundingClientRect();
+    astrolabeBottomFromDrawerTop = hBox.bottom - rootBox.top;
+  }
+  // The slot's bottom edge (from the drawer's top) = drawer height − the
+  // bottom offset we just wrote. Available height for the panel = that bottom
+  // edge − the astrolabe's bottom edge, minus a 6px breath so the panel
+  // doesn't kiss the time bar.
+  const bottomOffset = parseFloat(slot.style.bottom) || 0;
+  const slotBottomFromDrawerTop = rootBox.height - bottomOffset;
+  const available = slotBottomFromDrawerTop - astrolabeBottomFromDrawerTop - 6;
+  if (available > 0) {
+    slot.style.maxHeight = available + 'px';
+    // If the CSS min-height (300px) would force the top past the astrolabe,
+    // relax it to the available space so the floor can't override the cap.
+    if (available < 300) slot.style.minHeight = available + 'px';
+    else slot.style.minHeight = '';
+  }
+}
+
 // getBoundingClientRect() has zero width → the body targets would land at
 // the anchor. We defer to the img's load event in that case.
 export function repositionToBody() {
@@ -372,6 +410,7 @@ export function repositionToBody() {
         const bpTopFromDrawerBottom = rootBox.bottom - bpBox.top;
         slot.style.bottom = (bpTopFromDrawerBottom + SLOT_GAP_ABOVE_BACKPACK) + 'px';
         slot.style.top = 'auto';
+        clampSlotBelowAstrolabe(slot, rootBox);
       }
     }
 
@@ -428,6 +467,7 @@ export function repositionSlotOnly() {
   const bpTopFromDrawerBottom = rootBox.bottom - bpBox.top;
   slot.style.bottom = (bpTopFromDrawerBottom + SLOT_GAP_ABOVE_BACKPACK) + 'px';
   slot.style.top = 'auto';
+  clampSlotBelowAstrolabe(slot, rootBox);
 }
 
 // ── The master toggle: bloom ↔ retract ───────────────────────────

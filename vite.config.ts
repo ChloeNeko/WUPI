@@ -7,7 +7,7 @@ import { fileURLToPath } from "node:url";
 // By default Vite injects an HMR client that, on any file change, tries to
 // hot-update. This codebase has ZERO `import.meta.hot` acceptance boundaries,
 // so JS edits fall back to a FULL PAGE RELOAD — which wipes your in-app state
-// (e.g. a half-filled Quick Play form) on every small JS tweak. Chloe finds
+// (e.g. a half-filled form) on every small JS tweak. Chloe finds
 // the constant auto-refresh disruptive ("I hate it"), so this plugin changes
 // the policy:
 //   • CSS edits → still hot-swap silently (instant, state preserved — the

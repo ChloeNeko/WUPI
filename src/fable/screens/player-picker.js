@@ -24,10 +24,11 @@
 // =============================================================
 
 import { invoke, convertFileSrc } from '@tauri-apps/api/core';
-import { createEmbers } from './embers.js';
 import { openPortraitCropper } from './portrait-cropper.js';
 import { bytesToBase64 } from './wizard-engine.js';
 import { open as openDialog } from '@tauri-apps/plugin-dialog';
+import { buildIdCard } from '../engine/creator-engine.js';
+import { renderIdCard, wireIdCard } from './id-card.js';
 
 function esc(s) {
   return String(s || '')
@@ -35,32 +36,11 @@ function esc(s) {
     .replace(/"/g, '&quot;');
 }
 
-// Mars (♂) + Venus (♀) symbols as inline SVG paths — the SAME sharp outline
-// geometry used by the Player Creator's gender toggle (player-creator.js).
-// Kept in sync so the load-card glyph reads identically to the creator glyph.
-// Outline-only (fill:none), MITER joins + BUTT caps — matches the creator's
-// .fable-wizard-glyph-svg / .glyph-stroke styling.
-const MARS_SVG = `<svg class="fable-player-mini-glyph" viewBox="0 0 100 120" aria-hidden="true" focusable="false">
-  <g class="glyph-stroke">
-    <circle cx="36" cy="80" r="28"/>
-    <line x1="56" y1="60" x2="94" y2="22"/>
-    <polyline points="72,22 94,22 94,44"/>
-  </g>
-</svg>`;
-const VENUS_SVG = `<svg class="fable-player-mini-glyph" viewBox="0 0 100 120" aria-hidden="true" focusable="false">
-  <g class="glyph-stroke">
-    <circle cx="50" cy="38" r="28"/>
-    <line x1="50" y1="66" x2="50" y2="110"/>
-    <polyline points="30,92 50,110 70,92"/>
-  </g>
-</svg>`;
-
-function genderSVG(g) {
-  const v = (g || '').toLowerCase();
-  if (v === 'male') return MARS_SVG;
-  if (v === 'female') return VENUS_SVG;
-  return '';
-}
+// NOTE 2026-08-13 (Chloe): the ♂/♀ gender glyph was REMOVED from the mini-card
+// ("completely removed so it only shows the name"). The card now shows ONLY the
+// portrait + the centered ivory name below. The MARS_SVG / VENUS_SVG /
+// genderSVG helpers that fed the glyph are deleted with it. The full identity
+// (gender included) still surfaces in the centered modal on click.
 
 export function buildPlayerPicker(handlers) {
   const root = document.createElement('section');
@@ -68,7 +48,6 @@ export function buildPlayerPicker(handlers) {
   root.dataset.fableScreen = 'player-picker';
   root.hidden = true;
   root.innerHTML = `
-    <div class="fable-ember-host" aria-hidden="true"></div>
     <div class="fable-player-grid" data-host></div>
     <div class="fable-player-modal-overlay" data-modal hidden>
       <div class="fable-player-modal-backdrop" data-modal-backdrop></div>
@@ -84,11 +63,10 @@ export function buildPlayerPicker(handlers) {
       </div>
     </div>
   `;
-  // Ambient embers.
-  const emberHost = root.querySelector('.fable-ember-host');
-  let embers = null;
-  root._startAmbient = () => { if (!embers) embers = createEmbers(emberHost); };
-  root._stopAmbient = () => { if (embers) { embers.destroy(); embers = null; } };
+  // NOTE: the deep-void background + hearth glow + rising embers NO LONGER
+  // live here — they were hoisted to a persistent .fable-flow-ambiance layer
+  // on #fable (fable.js) so the background stays consistent across screen
+  // swaps. This screen now carries ONLY the foreground UI (the player grid).
   return root;
 }
 
@@ -102,9 +80,11 @@ export async function renderPlayerPicker(root, handlers) {
   let players = [];
   try {
     players = await invoke('fable_players_list');
-  } catch (err) {
-    host.innerHTML = `<div class="fable-flow-empty"><p>Couldn't load players: ${esc(err)}</p></div>`;
-    return;
+  } catch (_) {
+    // Swallow: the user never needs to see a load failure here. Fall through
+    // to the empty-state below ("No saved players yet") so the picker stays
+    // usable + navigable instead of surfacing a raw TypeError.
+    players = [];
   }
   if (!players.length) {
     host.innerHTML = `<div class="fable-flow-empty">
@@ -118,27 +98,19 @@ export async function renderPlayerPicker(root, handlers) {
     tile.className = 'fable-player-mini-card';
     tile.type = 'button';
     tile.dataset.playerId = p.id;
-    const gkey = (p.gender || '').toLowerCase();
-    if (gkey === 'male' || gkey === 'female') tile.dataset.gender = gkey;
     tile.title = p.name;
     tile.setAttribute('aria-label', `View player ${p.name}`);
     const portraitHTML = p.has_portrait
       ? `<div class="fable-player-mini-portrait" data-lazy-portrait="${esc(p.id)}"></div>`
       : `<div class="fable-player-mini-portrait fable-player-mini-portrait--placeholder" aria-hidden="true"></div>`;
-    // 2026-08-05 Chloe pass: the card shows ONLY portrait + name + gender SVG
-    // + a thin themed divider. The race/age/height/weight strip is GONE — the
-    // full identity surfaces in the centered modal on click.
-    // 2026-08-05 overhaul: name + gender glyph share ONE HORIZONTAL row (gender
-    // on the RIGHT of the name, never underneath). The info row is a flex row
-    // that centers as a unit; a long name truncates so it never wraps under the
-    // glyph. Divider widened to match the new card width.
-    const glyph = genderSVG(p.gender);
+    // 2026-08-13 (Chloe): the mini-card shows ONLY the portrait + the centered
+    // ivory name below the divider. The gender glyph is gone; the full identity
+    // surfaces in the centered modal on click.
     tile.innerHTML = `
       ${portraitHTML}
       <div class="fable-player-mini-divider" aria-hidden="true"></div>
       <div class="fable-player-mini-info">
         <span class="fable-player-mini-name">${esc(p.name)}</span>
-        ${glyph ? `<span class="fable-player-mini-gender-wrap">${glyph}</span>` : ''}
       </div>`;
     tile.addEventListener('click', () => openModal(root, p));
     host.appendChild(tile);
@@ -267,6 +239,8 @@ async function openModal(root, meta) {
   card.querySelector('[data-modal-delete]').addEventListener('click', () => {
     confirmDelete(root, full);
   });
+  // Bronze-arrow expand/collapse on the ID card.
+  wireIdCard(card);
 }
 
 function closeModal(root) {
@@ -290,63 +264,18 @@ const SILHOUETTE_SVG = `<svg class="fable-portrait-silhouette" viewBox="0 0 120 
   <path fill="currentColor" d="M60 16c-13 0-23 11-23 25 0 9 4 16 11 21-15 6-27 19-30 36-1 6 4 12 11 12h62c7 0 12-6 11-12-3-17-15-30-30-36 7-5 11-12 11-21 0-14-10-25-23-25z"/>
 </svg>`;
 
-// 2026-08-05 overhaul (Chloe): the modal renders the SAME ID-card markup the
-// Player Creator's review (slide 16) emits — .fable-player-review-card with a
-// .fable-player-review-top row (portrait + Identity/Appearance body) and the
-// .fable-player-review-clothing section centered BELOW. Same classes → same
-// CSS → pixel-identical look. The three action buttons live in a centered
-// wrapper BELOW the card (mirrors the CREATE/back layout under the review).
+// 2026-08-13 (Chloe): the modal renders the compact ID card (8 core fields,
+// portrait left) shared with the Creator review — via buildIdCard +
+// renderIdCard. Everything else (hair length/style, build, distinctive
+// features, clothing, accessories, inventory, background, …) lives behind the
+// bronze arrow. The portrait stays clickable (data-modal-portrait) to re-pick;
+// the three action buttons live in a centered wrapper BELOW the card.
 function renderModalCard(sp) {
   const portraitHTML = sp.portrait
     ? `<img src="${esc(convertFileSrc(sp.portrait))}" alt="" onerror="this.style.display='none'">`
     : `<span class="fable-player-review-portrait-fallback" aria-hidden="true">${SILHOUETTE_SVG}</span>`;
-  const identityRows = [
-    ['Name', sp.name],
-    ['Gender', sp.gender],
-    ['Race', sp.race],
-    ['Age', sp.age],
-    ['Height', sp.height],
-    ['Weight', sp.weight],
-  ].filter(([, v]) => (v || '').toString().trim());
-  const appearanceRows = [
-    ['Hair Color', sp.hair_color],
-    ['Hair Length', sp.hair_length],
-    ['Hair Style', sp.hair_style],
-    ['Body', sp.body_type],
-    ['Skin', sp.skin_complexion],
-    ['Eyes', sp.eye_color],
-    ['Breast', sp.breast_size],
-    ['Ears', sp.ears],
-    ['Tail', sp.tail],
-  ].filter(([, v]) => (v || '').toString().trim());
-  const clothing = Array.isArray(sp.clothing) && sp.clothing.length ? sp.clothing : null;
-
-  // Each trait wraps in a <div> so the dl's 2-col grid treats one trait as
-  // one grid cell — mirrors the creator's renderReview exactly.
-  const pair = ([k, v]) => `<div><dt>${esc(k)}</dt><dd>${esc(v)}</dd></div>`;
-  const identityHTML = identityRows.length
-    ? `<section class="fable-player-review-section"><h3>Identity</h3><dl>${identityRows.map(pair).join('')}</dl></section>`
-    : '';
-  const appearanceHTML = appearanceRows.length
-    ? `<section class="fable-player-review-section"><h3>Appearance</h3><dl>${appearanceRows.map(pair).join('')}</dl></section>`
-    : '';
-  // Clothing is its OWN entity, centered UNDERNEATH the portrait+ID/Appearance
-  // row (2026-08-05 overhaul) — same structure as the review card.
-  const clothingHTML = `<section class="fable-player-review-section fable-player-review-clothing">
-    <h3>Clothing</h3>
-    <div class="fable-player-review-chips">${clothing ? clothing.map((c) => `<span class="fable-wizard-chip">${esc(c)}</span>`).join('') : '<span class="fable-player-review-chips-empty">No garments</span>'}</div>
-  </section>`;
-
-  return `
-    <div class="fable-player-review-card">
-      <div class="fable-player-review-top">
-        <div class="fable-player-review-portrait" data-modal-portrait>${portraitHTML}</div>
-        <div class="fable-player-review-body">
-          ${identityHTML}${appearanceHTML}
-        </div>
-      </div>
-      ${clothingHTML}
-    </div>
+  const model = buildIdCard('player', sp);
+  return renderIdCard(model, { portraitClickable: false, portraitHtml: portraitHTML }) + `
     <div class="fable-player-modal-actions">
       <button type="button" class="fable-player-modal-btn fable-player-modal-btn--load" data-modal-load>LOAD</button>
       <button type="button" class="fable-player-modal-btn fable-player-modal-btn--edit" data-modal-edit>EDIT</button>

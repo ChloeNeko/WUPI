@@ -1,10 +1,11 @@
-//! Multi-slot save files for the Games app.
+//! Multi-slot save files for the Fable app.
 //!
 //! ## Layout
-//! Saves live at `<exe_dir>/apps/games/saves/<card_id>/<save_id>.json`. One
-//! file per save = atomic write + trivial listing by directory walk (no
-//! separate index manifest that can desync). `<save_id>` is either the
-//! reserved `autosave` sentinel or a `save_<unix_ms>` stamp for named slots.
+//! Saves live at `<exe_dir>/apps/fable/cards/<card_id>/saves/<save_id>.json`
+//! (a sibling INSIDE the per-card folder, §6B). One file per save = atomic
+//! write + trivial listing by directory walk (no separate index manifest
+//! that can desync). `<save_id>` is either the reserved `autosave` sentinel
+//! or a `save_<unix_ms>` stamp for named slots.
 //!
 //! ## Why per-card subdir
 //! A single flat `saves/` dir would interleave saves from different scenarios;
@@ -35,22 +36,6 @@ use crate::sim_card::SimCard;
 /// every turn end; it's the "Continue" option on the launcher.
 pub const AUTOSAVE_ID: &str = "autosave";
 
-/// The reserved save_id for the Quick Play slot. Quick Play is single-slot
-/// persistence: one quicksave at a time, auto-written on `fable_end`
-/// (bundling the seated card so resume rebuilds the narrator prompt without
-/// re-reading `data/fable.sim`), overwritten by each new Quick Play start.
-/// Excluded from the `AUTOSAVE_ID` filter in `fable_continue_target` so the
-/// title's CONTINUE button (which is New-Game-only) never collides with
-/// Quick Play's own Resume path.
-pub const QUICKSAVE_ID: &str = "quicksave";
-
-/// The fixed card_id Quick Play always runs under. One slot, no name
-/// collisions — `fable_quick_play_start` overrides the card's id to this
-/// sentinel so the per-card saves/sessions/schemas dirs are stable across
-/// Quick Play runs, and `most_recent_continue_target` skips it (Quick Play
-/// owns its own Resume flow).
-pub const QUICK_PLAY_CARD_ID: &str = "__quickplay__";
-
 /// Metadata for the Load Game list. Returned by `list_saves`. Excludes the
 /// heavy session/schema payloads (the UI fetches those via `load_save`
 /// only when the user actually picks one).
@@ -68,13 +53,6 @@ pub struct SaveMeta {
 
 /// The on-disk save shape. Designed so `load_save` can restore state with a
 /// single `serde_json::from_slice`.
-///
-/// `card` is `Option<SimCard>` with `#[serde(default)]` so older saves
-/// (written before Quick Play) load with `card=None`. Quick Play is the only
-/// path that sets it: the bundled card lets a later resume rebuild the
-/// narrator prompt without re-reading `data/fable.sim` (which may have been
-/// edited since the quicksave was written). Manual + autosave slots leave
-/// `card=None` (they re-read the on-disk `.sim` from `apps/fable/cards/`).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SaveFile {
     pub card_id: String,
@@ -85,12 +63,6 @@ pub struct SaveFile {
     pub is_autosave: bool,
     pub session: Conversation,
     pub schema: WorldSchema,
-    /// Quick Play only: the seated narrator card (loaded from
-    /// `data/fable.sim`), bundled so resume can rebuild the narrator prompt
-    /// without re-reading the file. `None` on manual/autosave slots and on
-    /// saves written before this field existed.
-    #[serde(default)]
-    pub card: Option<SimCard>,
 }
 
 /// Resolve `<cards_root>/<card_id>/saves/` — the per-card saves subdir inside
@@ -100,8 +72,7 @@ pub struct SaveFile {
 /// relevant ones.
 ///
 /// Takes `fable_root` (= `apps/fable/`) for signature continuity with the many
-/// call sites; the cards tree is `fable_root/cards/`. Quick Play's reserved
-/// card id (`__quickplay__`) gets a folder of its own under the same tree.
+/// call sites; the cards tree is `fable_root/cards/`.
 pub fn resolve_saves_dir(fable_root: &Path, card_id: &str) -> PathBuf {
     fable_root.join("cards").join(card_id).join("saves")
 }
@@ -136,9 +107,6 @@ pub fn write_save(
         is_autosave,
         session: session.clone(),
         schema: schema.clone(),
-        // Manual + autosave slots never bundle a card — Quick Play is the
-        // only path that does, via `write_quick_save`.
-        card: None,
     };
 
     let final_path = resolve_save_path(fable_root, &card.id, save_id);
@@ -159,73 +127,6 @@ pub fn write_save(
     Ok(save)
 }
 
-/// Write the Quick Play quicksave. The single reserved slot under
-/// `saves/__quickplay__/quicksave.json` — auto-written by `fable_end` (the
-/// "auto on exit" contract: one slot, refreshed on every Home/Exit) and
-/// overwritten by each new Quick Play start. Bundles `card` (the seated
-/// narrator card from `data/fable.sim`) so resume rebuilds the narrator
-/// prompt without re-reading the file.
-///
-/// `is_autosave = false` (the slot is a real quicksave, not the autosave
-/// sentinel). Quick Play is excluded from `most_recent_continue_target` by
-/// its `__quickplay__` card_id, not by this flag.
-pub fn write_quick_save(
-    fable_root: &Path,
-    card: &SimCard,
-    session: &Conversation,
-    schema: &WorldSchema,
-) -> std::io::Result<SaveFile> {
-    let dir = resolve_saves_dir(fable_root, QUICK_PLAY_CARD_ID);
-    std::fs::create_dir_all(&dir)?;
-
-    let timestamp = current_unix_ms();
-    let summary = derive_summary(session, schema);
-    let save = SaveFile {
-        card_id: QUICK_PLAY_CARD_ID.to_owned(),
-        save_id: QUICKSAVE_ID.to_owned(),
-        name: "Quick Play".to_owned(),
-        summary,
-        timestamp,
-        is_autosave: false,
-        session: session.clone(),
-        schema: schema.clone(),
-        card: Some(card.clone()),
-    };
-
-    let final_path = resolve_save_path(fable_root, QUICK_PLAY_CARD_ID, QUICKSAVE_ID);
-    let json = serde_json::to_vec_pretty(&save)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
-    let tmp_path = final_path.with_extension("json.tmp");
-    {
-        use std::io::Write;
-        let mut f = std::fs::File::create(&tmp_path)?;
-        f.write_all(&json)?;
-        f.sync_all()?;
-    }
-    atomic_rename(&tmp_path, &final_path)?;
-    Ok(save)
-}
-
-/// Load the Quick Play quicksave. Errors if absent or corrupt (the frontend
-/// only calls this after `quick_save_exists` returns true, so an absent file
-/// is unexpected — surfaces as an error rather than a silent fallback).
-pub fn load_quick_save(fable_root: &Path) -> std::io::Result<SaveFile> {
-    load_save(fable_root, QUICK_PLAY_CARD_ID, QUICKSAVE_ID)
-}
-
-/// Whether a Quick Play quicksave exists on disk. Drives the title-screen
-/// inline choice: no quicksave → Quick Play goes straight into a fresh run;
-/// quicksave present → offer Start New (overwrites) vs Resume Last.
-pub fn quick_save_exists(fable_root: &Path) -> bool {
-    resolve_save_path(fable_root, QUICK_PLAY_CARD_ID, QUICKSAVE_ID).exists()
-}
-
-/// Wipe the Quick Play quicksave (idempotent). Called by
-/// `fable_quick_play_start` before a brand-new run so the new game starts
-/// from a clean slate (the "new overwrites old" contract).
-pub fn delete_quick_save(fable_root: &Path) -> std::io::Result<()> {
-    delete_save(fable_root, QUICK_PLAY_CARD_ID, QUICKSAVE_ID)
-}
 
 /// List all saves for a card. Sorted: most-recent first (the natural order
 /// for a Load Game list). Returns an empty Vec when no saves dir exists
@@ -351,6 +252,7 @@ mod tests {
             id: "test_card".into(),
             name: "Test Scenario".into(),
             card_type: "roleplay".into(),
+            subtype: None,
             core_persona: String::new(),
             traits: String::new(),
             appearance: String::new(),
@@ -359,6 +261,7 @@ mod tests {
             conversational_rules: String::new(),
             technical_rules: String::new(),
             introductions: Vec::new(),
+            intro: String::new(),
             setting: Some("A test place.".into()),
             plot: None,
             tone: None,
@@ -368,6 +271,7 @@ mod tests {
             locations: Vec::new(),
             cast: Vec::new(),
             start: crate::sim_card::CardStart::default(),
+            custom_tags: Default::default(),
         }
     }
 
@@ -509,75 +413,4 @@ mod tests {
         assert!(summary.ends_with('…'));
     }
 
-    // ── Quick Play save tests ──────────────────────────────────────────
-
-    #[test]
-    fn quick_save_bundles_card() {
-        let tmp = tempdir().unwrap();
-        let card = fake_card();
-        let session = session_with("I enter the simulation.");
-        let schema = WorldSchema::default();
-
-        let saved = write_quick_save(tmp.path(), &card, &session, &schema).unwrap();
-        assert_eq!(saved.card_id, QUICK_PLAY_CARD_ID);
-        assert_eq!(saved.save_id, QUICKSAVE_ID);
-        assert!(!saved.is_autosave);
-        // The bundled card survives the write.
-        assert!(saved.card.is_some());
-        assert_eq!(saved.card.as_ref().unwrap().id, "test_card");
-
-        // And it round-trips through load.
-        assert!(quick_save_exists(tmp.path()));
-        let loaded = load_quick_save(tmp.path()).unwrap();
-        assert_eq!(loaded.card_id, QUICK_PLAY_CARD_ID);
-        assert!(loaded.card.is_some());
-        assert_eq!(loaded.card.as_ref().unwrap().name, "Test Scenario");
-        assert_eq!(loaded.card.as_ref().unwrap().player_name.as_deref(), Some("Tester"));
-        assert_eq!(loaded.session.messages.len(), 2);
-    }
-
-    #[test]
-    fn quick_save_exists_false_when_absent() {
-        let tmp = tempdir().unwrap();
-        assert!(!quick_save_exists(tmp.path()));
-    }
-
-    #[test]
-    fn delete_quick_save_is_idempotent() {
-        let tmp = tempdir().unwrap();
-        let card = fake_card();
-        write_quick_save(tmp.path(), &card, &session_with("x"), &WorldSchema::default()).unwrap();
-        assert!(quick_save_exists(tmp.path()));
-        delete_quick_save(tmp.path()).unwrap();
-        assert!(!quick_save_exists(tmp.path()));
-        // Second delete must not error.
-        delete_quick_save(tmp.path()).unwrap();
-    }
-
-    /// Backward compat: a save JSON written BEFORE the `card` field existed
-    /// (no `card` key at all) must still deserialize, with `card=None`. This
-    /// is the load-bearing `#[serde(default)]` contract on `SaveFile::card`.
-    #[test]
-    fn save_without_card_field_loads_as_none() {
-        let tmp = tempdir().unwrap();
-        let dir = resolve_saves_dir(tmp.path(), "legacy_card");
-        std::fs::create_dir_all(&dir).unwrap();
-        // Hand-write a save JSON with NO `card` key (the pre-Quick Play shape).
-        let legacy_json = r#"{
-            "card_id": "legacy_card",
-            "save_id": "save_legacy",
-            "name": "Legacy",
-            "summary": "old save",
-            "timestamp": 1700000000000,
-            "is_autosave": false,
-            "session": { "messages": [] },
-            "schema": { "summary": "", "recent_events": [], "entities": {} }
-        }"#;
-        let path = resolve_save_path(tmp.path(), "legacy_card", "save_legacy");
-        std::fs::write(&path, legacy_json).unwrap();
-
-        let loaded = load_save(tmp.path(), "legacy_card", "save_legacy").unwrap();
-        assert_eq!(loaded.card_id, "legacy_card");
-        assert!(loaded.card.is_none(), "legacy save must load with card=None");
-    }
 }

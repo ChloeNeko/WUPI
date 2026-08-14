@@ -1,11 +1,29 @@
 [package]
 name = "wupi"
-version = "0.17.0"
+version = "0.18.0"
 edition = "2021"
+# Two [[bin]] targets exist (wupi + fable). default-run picks wupi.exe as the
+# primary for `cargo run` / `tauri dev` — without it, multiple bins + no
+# default-run makes `cargo run` error ("requires choosing a binary"). `cargo
+# build` still builds BOTH bins regardless.
+default-run = "wupi"
 
 [lib]
 name = "wupi_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
+
+# Two launcher binaries share the wupi_lib boot code (model load, memory DB,
+# tray, IPCs). Listing them explicitly disables bin auto-discovery so exactly
+# these two build: `wupi.exe` (normal OS boot) + `fable.exe` (sets the
+# fable-entry flag → main window loads `wupi.html#fable` → skips straight to
+# the Fable title). `npx tauri build` emits both into target/release/.
+[[bin]]
+name = "wupi"
+path = "src/main.rs"
+
+[[bin]]
+name = "fable"
+path = "src/bin/fable.rs"
 
 [features]
 # Phase 5B: local Stable Diffusion scene-image generation (wraps
@@ -30,9 +48,14 @@ diffusion-rs = ["dep:diffusion-rs", "dep:diffusion-rs-sys"]
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
+# Used by build.rs to locate rc.exe (the MSVC resource compiler) via the same
+# VS-toolchain lookup tauri-winres uses, so the F-icon resource is compiled +
+# linked into fable.exe only. Already a transitive dep (via tauri-build →
+# tauri-winres → cc); adding it directly just exposes the API to build.rs.
+cc = "1"
 
 [dependencies]
-tauri = { version = "2", features = ["tray-icon", "protocol-asset"] }
+tauri = { version = "2", features = ["tray-icon", "protocol-asset", "image-png"] }
 # Native OS file-open dialog for the card-import folder-picker fallback
 # (Slice D of the "Create vs Import" flow, 2026-07-29). The drag-drop path is
 # primary; this is the guaranteed-working fallback for users who prefer a
@@ -142,6 +165,11 @@ windows = { version = "0.58", features = [
     "Win32_Media_Audio",
     "Win32_Media_Audio_Endpoints",
     "Win32_UI_Shell_PropertiesSystem",
+    # IShellLinkW + IPersistFile (Windows .lnk shortcut generation, shortcut.rs)
+    # + SHGetKnownFolderPath (desktop-dir resolution). The COM init/creation
+    # surface under Win32_System_Com is already enabled above.
+    "Win32_UI_Shell",
+    "Win32_UI_Shell_Common",
     "Win32_System_Variant",
     "Devices_Bluetooth",
     "Devices_Enumeration",

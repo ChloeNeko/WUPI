@@ -3,13 +3,12 @@
 // Pure-DOM: builds the title screen markup, exposes onAction callbacks.
 // Button order (top→bottom): Continue / New Game / Load / Exit.
 //
-// MENU STATE: all 4 menu buttons (Continue / New Game / Quick Play / Load)
+// MENU STATE: the menu buttons (Continue / New Game / Load / Online / Exit)
 // are wired to real handlers in fable.js. Continue resumes the freshest New
-// Game save (target stashed by _refreshContinue); New Game opens the card
-// picker; Quick Play throws you straight into the placeless Narrative
-// Simulator (its own single quicksave slot, refreshed on exit — see
-// _refreshQuickPlay); Load opens the worlds → saves picker. EXIT is the
-// only close path (closes the app via the lifecycle manager).
+// Game save (target stashed by _refreshTitleGate); New Game opens the card
+// picker; Load opens the worlds → saves picker; Online opens the in-Fable API
+// connection window. EXIT is the only close path
+// (closes the app via the lifecycle manager).
 //
 // PARTICLES: the floating pollen/spore motes are a canvas particle system
 // (see particles.js) mounted into .fable-title-leaves. It's started when
@@ -107,24 +106,23 @@ export function buildTitle(handlers) {
     <!-- Menu buttons — independent of the wordmark. Positioned via
          .fable-title-actions in fable.css. -->
     <div class="fable-title-actions">
+      <!-- Bold brass "API NOT CONNECTED" warning — sits directly above the
+           Continue button. Shown by _refreshTitleGate ONLY when no API is
+           connected; hidden (via [hidden]) the moment an API connects. -->
+      <div class="fable-api-warn" hidden>API Not Connected</div>
       <!-- All menu buttons are wired to handlers in fable.js.
-           CONTINUE + NEW GAME ship DISABLED by default (the safe state — dim
-           + no click). CONTINUE is enabled by _refreshContinue once a New
-           Game resume target is confirmed via fable_continue_target. NEW
-           GAME is enabled once its handler is wired in fable.js (remove the
-           disabled attr then). This load-bearing default keeps them dim +
-           unclickable in a fresh browser build with no backend rather than
-           firing a no-op click.
-           QUICK PLAY is always enabled: clicking it checks for a quicksave
-           (fable_quick_play_status) — if one exists, an inline Start-New /
-           Resume-Last choice appears; if not, it goes straight into a fresh
-           run. The status is refreshed on every title show via
-           _refreshQuickPlay.
-           LOAD: the worlds → saves picker (resume any New Game save). -->
+           CONTINUE / NEW GAME / LOAD all ship DISABLED by default (the safe
+           state — dim + no click). _refreshTitleGate enables NEW + LOAD once
+           an API is connected, and CONTINUE once an API is connected AND a
+           resume target is confirmed via fable_continue_target. ONLINE opens
+           the in-Fable API connection window (between Load and Exit); EXIT
+           closes the app. This load-bearing default keeps the game buttons
+           dim + unclickable in a fresh build with no backend / no API rather
+           than firing a no-op click. -->
       <button class="fable-title-btn" data-act="continue" disabled>Continue</button>
-      <button class="fable-title-btn" data-act="new">New Game</button>
-      <button class="fable-title-btn" data-act="quickplay">Quick Play</button>
-      <button class="fable-title-btn" data-act="load">Load</button>
+      <button class="fable-title-btn" data-act="new" disabled>New Game</button>
+      <button class="fable-title-btn" data-act="load" disabled>Load Game</button>
+      <button class="fable-title-btn fable-title-btn--online" data-act="online">Online</button>
       <button class="fable-title-btn" data-act="exit">Exit</button>
     </div>
   `;
@@ -146,11 +144,9 @@ export function buildTitle(handlers) {
       // stacked overlays crossfade, and the title briefly shows through in the
       // gap between their midpoints (the black → menu → black flicker). So
       // 'new' + 'load' run their handlers directly.
-      // CONTINUE + QUICK PLAY are left to their own handlers too — those
-      // internally route through enterStageViaTransition (which already fades)
-      // or show an inline overlay (Quick Play's Start-New/Resume-Last choice),
-      // so a title-level fade would either double-fade or wrongly hide the
-      // choice card.
+      // CONTINUE is left to its own handler too — it internally routes
+      // through enterStageViaTransition (which already fades), so a title-level
+      // fade here would double-fade.
       // EXIT is the only one wrapped: it jumps (closes the app) with no
       // transition of its own, so the 2s fade-to-black → close gives it the
       // same hand-off as the other buttons.
@@ -178,46 +174,57 @@ export function buildTitle(handlers) {
   // continue handler in fable.js (onContinueClicked) resumes it via
   // fable_start — no second IPC round-trip needed.
   const continueBtn = root.querySelector('[data-act="continue"]');
-  root._refreshContinue = async () => {
+  const newBtn = root.querySelector('[data-act="new"]');
+  const loadBtn = root.querySelector('[data-act="load"]');
+  const apiWarnEl = root.querySelector('.fable-api-warn');
+
+  // ── Title API + resume gate (the new Fable entry contract) ─────────
+  // Replaces the old CONTINUE-only _refreshContinue. Narration is API-only,
+  // so the three game buttons (Continue / New Game / Load) are grayed out
+  // (disabled) until an API is connected; a bold brass "API NOT CONNECTED"
+  // label sits above Continue while that's the case. The ONLINE button (never
+  // disabled) opens the in-Fable API window; once an API connects it calls
+  // back here to re-enable the buttons + hide the warning. Called on every
+  // title show via _startAmbient + best-effort (an IPC error leaves the game
+  // buttons disabled — the safe default).
+  root._refreshTitleGate = async () => {
+    // API state from the backend — the same check launchFable used to make.
+    let apiReady = false;
+    try {
+      const extra = await invoke('model_source_get');
+      apiReady = !!(extra && extra.source === 'api' && extra.apiReady);
+    } catch (err) {
+      // IPC failure: treat as not-ready (the safe default — game buttons stay
+      // disabled + the warning shows). Don't dead-lock: the ONLINE button is
+      // always clickable so the user can still attempt a connection.
+      console.error('[fable] model_source_get failed; leaving game buttons disabled', err);
+    }
+    // NEW / LOAD: need only an API connection.
+    if (newBtn) newBtn.disabled = !apiReady;
+    if (loadBtn) loadBtn.disabled = !apiReady;
+    // The brass warning tracks the API state exactly.
+    if (apiWarnEl) apiWarnEl.hidden = apiReady;
+    // CONTINUE: needs an API connection AND a resume target. Stashes the
+    // target (card_id + save_id) so onContinueClicked resumes it without a
+    // second IPC round-trip.
     if (!continueBtn) return;
+    if (!apiReady) {
+      // No API → no point querying saves; keep CONTINUE disabled.
+      continueBtn.disabled = true;
+      return;
+    }
     try {
       const target = await invoke('fable_continue_target');
       // target is null when no manual/quick save exists → dim CONTINUE.
       // A returned SaveMeta → enable it.
       continueBtn.disabled = !target;
-      // Stash the target so the (future) continue handler can resume it
-      // without a second IPC round-trip.
       root._continueTarget = target || null;
     } catch (err) {
-      // IPC failure: leave CONTINUE DISABLED (the safe default). The button
-      // ships disabled in markup; without a confirmed resume target from
-      // the backend we can't know whether a save exists, so dim + lock it.
-      // This is the load-bearing "Continue must be unclickable in a fresh
-      // browser build" behavior — the prior "default to enabled" path let
-      // a no-op click fire when the IPC was unreachable.
+      // IPC failure: leave CONTINUE DISABLED (the safe default). Without a
+      // confirmed resume target we can't know whether a save exists.
       console.error('[fable] continue-target check failed, leaving disabled', err);
       continueBtn.disabled = true;
       root._continueTarget = null;
-    }
-  };
-
-  // ── QUICK PLAY quicksave state (the Start-New/Resume gate) ────────
-  // QUICK PLAY is always clickable; what changes is what a click DOES. This
-  // refresh stashes whether a quicksave exists (+ its metadata) so the click
-  // handler in fable.js (onQuickPlayClicked) can decide: quicksave present →
-  // inline Start-New / Resume-Last choice; absent → straight into a fresh
-  // run. Mirrors _refreshContinue's fire-and-forget pattern (called on every
-  // title show so a quicksave written/loaded since the last visit is picked
-  // up). The button itself stays enabled regardless — a backend error just
-  // means "behave as if no quicksave" (fresh run), never a dead button.
-  root._refreshQuickPlay = async () => {
-    try {
-      const save = await invoke('fable_quick_play_status');
-      // save is null when no quicksave exists → fresh run on click.
-      root._quickPlaySave = save || null;
-    } catch (err) {
-      console.error('[fable] quick-play status check failed, assuming no quicksave', err);
-      root._quickPlaySave = null;
     }
   };
 
@@ -246,11 +253,10 @@ export function buildTitle(handlers) {
     if (!leaves)    leaves    = createWindLeaves(leavesHost);
     if (!clouds)    clouds    = createCloudLayer(cloudHost);
     if (!sparkle)   sparkle   = createTitleSparkle(sparkleHost);
-    // Refresh the CONTINUE button's resume state + the QUICK PLAY quicksave
-    // state on every show (a save may have been written/loaded since the last
-    // visit). Fire-and-forget — the ambient show shouldn't block on the IPCs.
-    if (root._refreshContinue) root._refreshContinue();
-    if (root._refreshQuickPlay) root._refreshQuickPlay();
+    // Refresh the API + resume gate on every show (an API may have been
+    // connected/disconnected, or a save written/loaded, since the last
+    // visit). Fire-and-forget — the ambient show shouldn't block on the IPC.
+    if (root._refreshTitleGate) root._refreshTitleGate();
   };
   root._stopAmbient = () => {
     if (particles) { particles.destroy(); particles = null; }

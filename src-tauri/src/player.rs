@@ -92,9 +92,15 @@ pub struct SavedPlayer {
     // and so the SIM-card review screen can render a clean breakdown.
     // All optional + defaulted for back-compat with pre-overhaul JSON.
 
-    /// `"male"` | `"female"`. The paperdoll driver — written to the
-    /// SAME `localStorage['wupi.paperdoll.gender']` key the Left Drawer
-    /// HUD reads, and round-tripped here so a reattach keeps the choice.
+    /// Free-form gender / identity text (e.g. "female", "masculine",
+    /// "nonbinary"). 2026-08-13: NO LONGER restricted to "male"/"female" —
+    /// the validator accepts any non-empty value ≤ `TRAIT_MAX`. This is
+    /// identity text only; the Left Drawer paperdoll is a SEPARATE manual
+    /// ♂/♀ HUD toggle (`localStorage['wupi.paperdoll.gender'`) that does NOT
+    /// read this field, and the narrator's build/frame signal is `body_type`
+    /// (seeded into the appearance layer at attach). Seeded as a
+    /// `player.gender` entity so the narrator can reference the character's
+    /// identity from turn 1.
     #[serde(default)]
     pub gender: Option<String>,
 
@@ -146,12 +152,52 @@ pub struct SavedPlayer {
     pub ears: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tail: Option<String>,
+    /// Horns (the non-human trait; "curled ram", "spiral"). Conditional —
+    /// the Wizard asks only when the race is non-human (context clues).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub horn: Option<String>,
 
     /// Clothing / outfit items as a chip list from the dynamic-list
     /// slide. Each entry is one garment ("travel cloak", "leather
     /// boots"). None when the slide was left empty (omitted from JSON).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub clothing: Option<Vec<String>>,
+
+    // --- Optional descriptive identity fields (2026-08-13). The Player
+    // Wizard's GLM interview MAY surface these; all optional + omitted from
+    // JSON when None. At game attach each seeds a `player.*` schema entity
+    // (mirrors `backstory`) so the narrator reads them as identity ground
+    // truth — NOT gameplay state (no body/wealth mutation; the identity-only
+    // invariant, §6C, holds).
+    /// Occupation / trade ("blacksmith", "caravan guard"). Optional.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub job: Option<String>,
+    /// Character flaw / vice ("prone to rage", "greedy"). Optional.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub weakness: Option<String>,
+    /// Visible identifying marks — scars / tattoos / birthmarks. Optional.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub distinguishing_marks: Option<String>,
+    /// Carried gear chip list (like `clothing`). Optional.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gear: Option<Vec<String>>,
+    /// Carried tools chip list. Optional.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tools: Option<Vec<String>>,
+    /// Carried weapons chip list. Optional.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub weapons: Option<Vec<String>>,
+
+    // --- Custom extensions (2026-08-13). Any extra stat / asset /
+    // reputation / currency / tracker the player requests that does NOT fit
+    // a standard schema key. A flat key→value string map (BTreeMap for
+    // deterministic save ordering — functionally the "flat key-value object
+    // of string pairs"). At game attach each entry seeds a `player.<key>`
+    // schema entity. This is DISTINCT from the named `wealth`/`reputation`
+    // optional fields — those are transient (seed `PlayerState` at attach,
+    // never persisted here; §6C identity-only lock preserved).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub custom_tags: Option<std::collections::BTreeMap<String, String>>,
 
     /// Relative portrait filename within the player folder (e.g.
     /// "portrait.png"). None when no portrait was uploaded. The read
@@ -206,6 +252,13 @@ pub struct PlayerMeta {
 const NAME_MAX: usize = 64;
 const PROSE_MAX: usize = 4000;
 const TRAIT_MAX: usize = 128;
+/// Per-key cap for `custom_tags` keys (short identifiers like
+/// "starting_currency", "guard_reputation"). Tighter than a trait — these
+/// are field names, not values.
+const CUSTOM_TAG_KEY_MAX: usize = 64;
+/// Per-value cap for `custom_tags` values ("200 gold", "-20"). Roomier than
+/// a trait label but tighter than prose — these are short stats/amounts.
+const CUSTOM_TAG_VALUE_MAX: usize = 500;
 
 /// Validate a SavedPlayer's structure + content. The authoritative gate
 /// (runs server-side in `fable_player_write`). Returns a human-readable
@@ -216,10 +269,12 @@ const TRAIT_MAX: usize = 128;
 ///   • name required + non-empty after trim + ≤ NAME_MAX chars
 ///   • each prose field (if present) ≤ PROSE_MAX chars
 ///   • each trait field (if present) ≤ TRAIT_MAX chars + non-empty
-///     after trim (empty traits should be None, not "")
-///   • gender (if present) ∈ {"male", "female"}
-///   • clothing (if present): each entry ≤ TRAIT_MAX + non-empty +
-///     no control chars
+///     after trim (empty traits should be None, not ""). Gender is a
+///     free-form trait (2026-08-13: no longer restricted to male/female).
+///   • each chip list — clothing / gear / tools / weapons (if present):
+///     each entry ≤ TRAIT_MAX + non-empty + no control chars
+///   • custom_tags (if present): keys ≤ CUSTOM_TAG_KEY_MAX, values ≤
+///     CUSTOM_TAG_VALUE_MAX, no control chars
 ///   • NO control characters ([\x00-\x08\x0B\x0C\x0E-\x1F]) in any
 ///     string field — the load-bearing sanitization the frontend XML
 ///     sniff does not do. Newlines (\x0A) + tabs (\x09) are allowed
@@ -253,15 +308,9 @@ pub fn validate_player(p: &SavedPlayer) -> Result<(), String> {
             }
         }
     }
-    // Gender: if present must be one of the two paperdoll-driving values.
-    if let Some(g) = &p.gender {
-        let g = g.trim();
-        if !g.eq_ignore_ascii_case("male") && !g.eq_ignore_ascii_case("female") {
-            return Err("Gender must be 'male' or 'female'.".into());
-        }
-    }
-    // Single-value trait fields. These come from wizard slides; an empty
-    // string is a mistake (the slide should have left the field None).
+    // Single-value trait fields (gender included as a free-form trait,
+    // 2026-08-13). These come from wizard slides; an empty string is a
+    // mistake (the slide should have left the field None).
     for (label, val) in trait_fields(p) {
         if let Some(s) = val {
             let s = s.trim();
@@ -276,18 +325,53 @@ pub fn validate_player(p: &SavedPlayer) -> Result<(), String> {
             }
         }
     }
-    // Clothing chip list: each entry must be a non-empty, bounded label.
-    if let Some(items) = &p.clothing {
-        for c in items {
+    // Chip lists: clothing / gear / tools / weapons. Each entry must be a
+    // non-empty, bounded label.
+    validate_chip_list("Clothing", &p.clothing)?;
+    validate_chip_list("Gear", &p.gear)?;
+    validate_chip_list("Tools", &p.tools)?;
+    validate_chip_list("Weapons", &p.weapons)?;
+    // Custom extensions: flat key→value string map. Keys are short ids;
+    // values are short stats/amounts.
+    if let Some(tags) = &p.custom_tags {
+        for (k, v) in tags {
+            let kt = k.trim();
+            if kt.is_empty() {
+                return Err("Custom tag keys cannot be empty.".into());
+            }
+            if kt.len() > CUSTOM_TAG_KEY_MAX {
+                return Err(format!("Custom tag keys must be {} characters or fewer.", CUSTOM_TAG_KEY_MAX));
+            }
+            if has_control_chars(kt) {
+                return Err("A custom tag key contains invalid control characters.".into());
+            }
+            let vt = v.trim();
+            if vt.len() > CUSTOM_TAG_VALUE_MAX {
+                return Err(format!("Custom tag values must be {} characters or fewer.", CUSTOM_TAG_VALUE_MAX));
+            }
+            if has_control_chars(vt) {
+                return Err("A custom tag value contains invalid control characters.".into());
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Validate a chip-list field (`clothing` / `gear` / `tools` / `weapons`):
+/// each entry non-empty after trim, ≤ `TRAIT_MAX`, no control chars. Shared
+/// so the four lists share one rule.
+fn validate_chip_list(label: &str, items: &Option<Vec<String>>) -> Result<(), String> {
+    if let Some(list) = items {
+        for c in list {
             let c = c.trim();
             if c.is_empty() {
-                return Err("Clothing entries cannot be empty.".into());
+                return Err(format!("{} entries cannot be empty.", label));
             }
             if c.len() > TRAIT_MAX {
-                return Err(format!("Each clothing entry must be {} characters or fewer.", TRAIT_MAX));
+                return Err(format!("Each {} entry must be {} characters or fewer.", label, TRAIT_MAX));
             }
             if has_control_chars(c) {
-                return Err("A clothing entry contains invalid control characters.".into());
+                return Err(format!("A {} entry contains invalid control characters.", label));
             }
         }
     }
@@ -299,6 +383,7 @@ pub fn validate_player(p: &SavedPlayer) -> Result<(), String> {
 /// them. Keeps the trait set in one place (add a slide → add one line).
 fn trait_fields(p: &SavedPlayer) -> Vec<(&'static str, &Option<String>)> {
     vec![
+        ("Gender", &p.gender),
         ("Race", &p.race),
         ("Age", &p.age),
         ("Height", &p.height),
@@ -312,6 +397,10 @@ fn trait_fields(p: &SavedPlayer) -> Vec<(&'static str, &Option<String>)> {
         ("Breast size", &p.breast_size),
         ("Ears", &p.ears),
         ("Tail", &p.tail),
+        ("Horn", &p.horn),
+        ("Job", &p.job),
+        ("Weakness", &p.weakness),
+        ("Distinguishing marks", &p.distinguishing_marks),
     ]
 }
 
@@ -385,7 +474,15 @@ mod tests {
             breast_size: None,
             ears: None,
             tail: None,
+            horn: None,
             clothing: None,
+            job: None,
+            weakness: None,
+            distinguishing_marks: None,
+            gear: None,
+            tools: None,
+            weapons: None,
+            custom_tags: None,
             portrait: None,
             created_at_ms: 0,
         }
@@ -425,9 +522,20 @@ mod tests {
     }
 
     #[test]
-    fn validate_rejects_bad_gender() {
+    fn validate_accepts_freeform_gender() {
+        // 2026-08-13: gender is no longer restricted to male/female — any
+        // non-empty value ≤ TRAIT_MAX is valid identity text.
+        let mut ok = p("Alex");
+        ok.gender = Some("helicopter".into());
+        assert!(validate_player(&ok).is_ok());
+        ok.gender = Some("nonbinary demigirl".into());
+        assert!(validate_player(&ok).is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_oversize_gender() {
         let mut bad = p("Alex");
-        bad.gender = Some("helicopter".into());
+        bad.gender = Some("x".repeat(TRAIT_MAX + 1));
         assert!(validate_player(&bad).is_err());
     }
 
@@ -460,30 +568,89 @@ mod tests {
     }
 
     #[test]
+    fn validate_rejects_empty_gear_entry() {
+        // The shared chip-list rule applies to gear/tools/weapons too.
+        let mut bad = p("Alex");
+        bad.gear = Some(vec!["rope".into(), "".into()]);
+        assert!(validate_player(&bad).is_err());
+        let mut bad2 = p("Alex");
+        bad2.weapons = Some(vec!["   ".into()]);
+        assert!(validate_player(&bad2).is_err());
+    }
+
+    #[test]
+    fn validate_accepts_horn_trait() {
+        let mut ok = p("Kaelen");
+        ok.race = Some("tiefling".into());
+        ok.horn = Some("curled, deep red".into());
+        assert!(validate_player(&ok).is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_oversize_custom_tag_value() {
+        let mut bad = p("Alex");
+        let mut tags = std::collections::BTreeMap::new();
+        tags.insert("starting_currency".into(), "x".repeat(CUSTOM_TAG_VALUE_MAX + 1));
+        bad.custom_tags = Some(tags);
+        assert!(validate_player(&bad).is_err());
+    }
+
+    #[test]
+    fn validate_rejects_empty_custom_tag_key() {
+        let mut bad = p("Alex");
+        let mut tags = std::collections::BTreeMap::new();
+        tags.insert("   ".into(), "200 gold".into());
+        bad.custom_tags = Some(tags);
+        assert!(validate_player(&bad).is_err());
+    }
+
+    #[test]
+    fn validate_accepts_custom_tags() {
+        let mut ok = p("Alex");
+        let mut tags = std::collections::BTreeMap::new();
+        tags.insert("starting_currency".into(), "200 gold".into());
+        tags.insert("guard_reputation".into(), "-20".into());
+        ok.custom_tags = Some(tags);
+        assert!(validate_player(&ok).is_ok());
+    }
+
+    #[test]
     fn validate_accepts_full_trait_set() {
         let mut ok = p("Kaelen");
-        ok.gender = Some("male".into());
+        ok.gender = Some("nonbinary".into());
         ok.race = Some("half-elf".into());
         ok.age = Some("32".into());
         ok.hair_color = Some("raven black".into());
         ok.breast_size = None; // conditional toggle was No → omitted
         ok.tail = Some("panther, prehensile".into());
+        ok.horn = None; // human-leaning → no horns
         ok.clothing = Some(vec!["travel cloak".into(), "leather boots".into()]);
+        ok.job = Some("cartographer".into());
+        ok.weakness = Some("terrified of deep water".into());
+        ok.gear = Some(vec!["brass compass".into(), "charcoal".into()]);
+        let mut tags = std::collections::BTreeMap::new();
+        tags.insert("starting_currency".into(), "200 gold".into());
+        ok.custom_tags = Some(tags);
         assert!(validate_player(&ok).is_ok());
     }
 
     #[test]
     fn conditional_traits_omitted_from_json_when_none() {
-        // The skip_serializing_if contract: breast_size/ears/tail/clothing
-        // vanish from the serialized JSON when None (the Yes/No toggle was No).
+        // The skip_serializing_if contract: breast_size/ears/tail/horn/clothing
+        // + the new optional fields + custom_tags vanish from the serialized
+        // JSON when None (the Yes/No toggle was No / the field was skipped).
         let mut sp = p("Alex");
         sp.gender = Some("female".into());
-        // breast_size / ears / tail / clothing left None
+        // breast_size / ears / tail / horn / clothing / job / custom_tags left None
         let json = serde_json::to_string(&sp).unwrap();
         assert!(!json.contains("breast_size"));
         assert!(!json.contains("\"ears\""));
         assert!(!json.contains("\"tail\""));
+        assert!(!json.contains("\"horn\""));
         assert!(!json.contains("clothing"));
+        assert!(!json.contains("\"job\""));
+        assert!(!json.contains("gear"));
+        assert!(!json.contains("custom_tags"));
         assert!(json.contains("\"gender\":\"female\""));
     }
 

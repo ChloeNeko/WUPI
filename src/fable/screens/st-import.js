@@ -20,9 +20,15 @@
 // =============================================================
 
 import { open as openDialog } from '@tauri-apps/plugin-dialog';
-import { invoke, convertFileSrc } from '@tauri-apps/api/core';
-import { bytesToBase64 } from './wizard-engine.js';
+import { invoke } from '@tauri-apps/api/core';
 import { openPortraitCropper } from './portrait-cropper.js';
+import {
+  findCharaChunk,
+  base64ToUtf8,
+  normalizeCharJson,
+  normalizeLorebookJson,
+  lorebookToCodexEntries,
+} from '../engine/creator-engine.js';
 
 // Read a file's bytes as a Uint8Array via the existing portrait-bytes IPC
 // (server-side read + magic-byte validation + base64 encode → data URL).
@@ -35,131 +41,23 @@ async function readImageAsDataUrl(srcPath) {
   }
 }
 
-// Read a small JSON file's text via a fetch against its asset URL. Used for
-// plain .json lorebook/character imports (not PNG). Returns parsed object
-// or throws.
+// Read a small JSON file's text via the server-side import-text IPC. Used for
+// plain .json lorebook/character imports (not PNG). Returns parsed object or
+// throws. Server-side read is load-bearing: `convertFileSrc` (`asset://`) is
+// gated by the asset protocol scope (apps/fable/... only), so a user-picked
+// .json from anywhere else 403s → import failed. `creator_read_import_text`
+// reads OS-native paths directly (the same pattern as the portrait-bytes IPC).
 async function readJsonFile(srcPath) {
-  // convertFileSrc yields an asset:// URL the webview can fetch (cross-
-  // origin-safe for read). The file is user-selected so it's in scope.
-  const url = convertFileSrc(srcPath);
-  const res = await fetch(url);
-  if (!res.ok) throw new Error(`read json failed: ${res.status}`);
-  return res.json();
+  const text = await invoke('creator_read_import_text', { srcPath });
+  return JSON.parse(text);
 }
 
-// --- PNG chunk walker -----------------------------------------------------
-// PNG = 8-byte signature + a sequence of (length:u32be, type:4bytes,
-// data:length bytes, crc:u32be) chunks. We walk until we find a `tEXt` or
-// `iTXt` chunk whose keyword is `chara` (SillyTavern's convention). tEXt
-// stores `keyword\0value` (Latin-1); iTXt stores
-// `keyword\0compressionFlag\0compressionMethod\0langTag\0translatedKey\0text`
-// (UTF-8). The value is base64; decode → JSON.
-function decodeLatin1(bytes) {
-  let s = '';
-  for (let i = 0; i < bytes.length; i++) s += String.fromCharCode(bytes[i]);
-  return s;
-}
-
-function findCharaChunk(u8) {
-  // PNG signature.
-  const SIG = [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
-  if (u8.length < 8) return null;
-  for (let i = 0; i < 8; i++) if (u8[i] !== SIG[i]) return null;
-  let off = 8;
-  const dv = new DataView(u8.buffer, u8.byteOffset, u8.byteLength);
-  while (off + 8 <= u8.length) {
-    const len = dv.getUint32(off);
-    const type = decodeLatin1(u8.subarray(off + 4, off + 8));
-    const dataStart = off + 8;
-    const dataEnd = dataStart + len;
-    if (dataEnd > u8.length) return null; // truncated
-    if (type === 'tEXt' || type === 'iTXt') {
-      // Find the null terminator after the keyword.
-      const chunk = u8.subarray(dataStart, dataEnd);
-      let nul = -1;
-      for (let i = 0; i < chunk.length; i++) {
-        if (chunk[i] === 0) { nul = i; break; }
-      }
-      if (nul > 0) {
-        const keyword = decodeLatin1(chunk.subarray(0, nul));
-        if (keyword === 'chara') {
-          let value;
-          if (type === 'tEXt') {
-            value = decodeLatin1(chunk.subarray(nul + 1));
-          } else {
-            // iTXt: compressionFlag(1) + compressionMethod(1) + langTag\0 +
-            // translatedKey\0 + text(UTF-8). Skip the fixed + two null-
-            // terminated fields.
-            let p = nul + 1;
-            p += 1 + 1; // flag + method
-            // langTag
-            while (p < chunk.length && chunk[p] !== 0) p++;
-            p++; // past null
-            // translatedKey
-            while (p < chunk.length && chunk[p] !== 0) p++;
-            p++; // past null
-            value = new TextDecoder('utf-8').decode(chunk.subarray(p));
-          }
-          return value; // base64 string
-        }
-      }
-    }
-    off = dataEnd + 4; // skip data + crc
-  }
-  return null;
-}
-
-function base64ToUtf8(b64) {
-  const bin = atob(b64.replace(/\s/g, ''));
-  const bytes = new Uint8Array(bin.length);
-  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
-  return new TextDecoder('utf-8').decode(bytes);
-}
-
-// Normalize the parsed JSON into a flat character-data object regardless
-// of V2/V3 wrapper or plain shape. Returns { name, description, persona,
-// personality, scenario, first_mes, mes_example, creator_notes,
-// character_book, spec }.
-function normalizeCharJson(obj) {
-  if (!obj || typeof obj !== 'object') return null;
-  // V2/V3 wraps the real data under `data`.
-  const data = (obj.spec && obj.data && typeof obj.data === 'object')
-    ? obj.data
-    : obj;
-  return {
-    spec: obj.spec || 'plain',
-    name: data.name || obj.name || '',
-    description: data.description || '',
-    personality: data.personality || '',
-    scenario: data.scenario || '',
-    first_mes: data.first_mes || '',
-    mes_example: data.mes_example || '',
-    creator_notes: data.creator_notes || '',
-    // character_book is the lorebook (V2/V3).
-    character_book: data.character_book || null,
-  };
-}
-
-// Convert a character_book (SillyTavern lorebook) into the codex_entries
-// shape the Attach Codex slide + the serializer expect. Each entry:
-// { title, tags, body }. The lorebook's entries have keys like keys,
-// content, comment, enabled, etc.
-function lorebookToCodexEntries(book) {
-  if (!book || !Array.isArray(book.entries)) return [];
-  // book.entries may be an array OR an object keyed by index.
-  const raw = book.entries;
-  const list = Array.isArray(raw) ? raw : Object.values(raw);
-  return list
-    .filter((e) => e && (e.content || e.comment))
-    .map((e, i) => ({
-      title: (e.comment || e.name || `Entry ${i + 1}`).toString().slice(0, 128),
-      tags: Array.isArray(e.key)
-        ? e.key.slice(0, 8).map((k) => String(k).slice(0, 64))
-        : (e.key ? [String(e.key).slice(0, 64)] : []),
-      body: (e.content || '').toString(),
-    }))
-    .filter((e) => e.body.trim());
-}
+// --- PNG chunk walker + JSON normalize ------------------------------------
+// The pure parse primitives (findCharaChunk, base64ToUtf8, normalizeCharJson,
+// normalizeLorebookJson, lorebookToCodexEntries) live in
+// engine/creator-engine.js so they're unit-testable + shared with the
+// codex-import path. This module keeps only the Tauri-coupled I/O
+// (readImageAsDataUrl / readJsonFile) + the import entry points.
 
 // --- Schema maps ----------------------------------------------------------
 // Each creator's config declares which wizard field each ST field maps to.
@@ -235,6 +133,79 @@ export function mapImport(charData, schemaKey) {
   Object.assign(fields, accum);
   const codexEntries = lorebookToCodexEntries(charData.character_book);
   return { fields, codexEntries };
+}
+
+// --- GLM-creator import: parse without the cropper/mapImport -------------
+// A slim variant of openImportDialog for the conversational creator: open the
+// picker, parse the .png/.json to a normalized charData object (for GLM to
+// refine via the import_data IPC arg), + return the raw portrait data URL
+// (uncropped) so the review slot can pre-fill + crop on click. Does NOT run
+// the cropper or mapImport (GLM does its own field mapping). Returns
+// { charData, portraitDataUrl?, portraitExt?, portraitBytes? } or null on
+// cancel. `portraitBytes` carries the RAW PNG bytes so the imported portrait
+// is saved on CREATE even if the user never re-opens the cropper — without
+// it the review preview shows a portrait that `doCreate` silently drops
+// (state.portraitBytes stays null). A later cropper confirm overrides these
+// with the cropped bytes (cropped always wins when the user crops).
+export async function parseImportFile(screenEl) {
+  void screenEl; // kept for signature parity with openImportDialog
+  let picked;
+  try {
+    picked = await openDialog({
+      multiple: false,
+      filters: [{ name: 'Character / World', extensions: ['png', 'json'] }],
+    });
+  } catch (_) {
+    return null;
+  }
+  if (!picked) return null;
+  const srcPath = typeof picked === 'string' ? picked : (picked.path || picked);
+  if (!srcPath) return null;
+  const lower = srcPath.toLowerCase();
+
+  let charData = null;
+  let portraitDataUrl = null;
+  let portraitExt = null;
+  let portraitBytes = null;
+  if (lower.endsWith('.png')) {
+    const dataUrl = await readImageAsDataUrl(srcPath);
+    if (!dataUrl) throw new Error('could not read PNG');
+    const res = await fetch(dataUrl);
+    const u8 = new Uint8Array(await res.arrayBuffer());
+    const b64 = findCharaChunk(u8);
+    if (!b64) throw new Error('no SillyTavern character data found in this PNG');
+    const json = JSON.parse(base64ToUtf8(b64));
+    charData = normalizeCharJson(json);
+    if (!charData) throw new Error('embedded character JSON is empty');
+    portraitDataUrl = dataUrl; // uncropped preview — the review slot crops on click
+    portraitExt = 'png';
+    // Keep the raw PNG bytes as the save fallback (see jsdoc above).
+    portraitBytes = u8;
+  } else if (lower.endsWith('.json')) {
+    const json = await readJsonFile(srcPath);
+    // Try a character shape first (V2/V3 wrapper or plain), then a standalone
+    // lorebook ({ entries } with no character fields) — both surface as a
+    // charData object so GLM/the codex path convert them uniformly.
+    charData = normalizeCharJson(json) || normalizeLorebookJson(json);
+    if (!charData) throw new Error('character or lorebook JSON is empty / unrecognized');
+  } else {
+    throw new Error('select a .png or .json file');
+  }
+  // Mechanically capture the SillyTavern greetings (first_mes + alternate_
+  // greetings) as the opening-beat text — NOT left to GLM's refinement, so the
+  // authored greetings survive verbatim. The flow carries this into the SIM
+  // card's `<intro>` (via the serializer's draft.intro), where Rust reads it as
+  // the Fable opening beat. One greeting per line (matches wupi.sim's shape).
+  const introText = charData
+    ? [
+        charData.first_mes,
+        ...(Array.isArray(charData.alternate_greetings) ? charData.alternate_greetings : []),
+      ]
+        .map((s) => (s == null ? '' : String(s)).trim())
+        .filter(Boolean)
+        .join('\n')
+    : '';
+  return { charData, portraitDataUrl, portraitExt, portraitBytes, introText };
 }
 
 // --- The public entry: openImportDialog ----------------------------------

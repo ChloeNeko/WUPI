@@ -177,6 +177,12 @@ function buildTwin(btn) {
   twin.style.width = rect.width + 'px';
   twin.style.height = rect.height + 'px';
   twin.style.margin = '0';
+  // Clear any inherited transform (e.g. a translateX(-50%) centering trick
+  // on the source button) — the twin is placed via fixed left/top, so a
+  // leftover transform would offset it from its captured rect. This is the
+  // fix for the absolutely-positioned IMPORT mini tile rendering off-center
+  // during burn/spawn then teleporting on handoff.
+  twin.style.transform = 'none';
   twin.style.pointerEvents = 'none';
   twin.style.zIndex = '5999';
   twin.style.filter = `url(#${FILTER_ID})`;
@@ -311,6 +317,11 @@ export function playReverseSpawn(btns = []) {
       twin.style.width = rect.width + 'px';
       twin.style.height = rect.height + 'px';
       twin.style.margin = '0';
+      // Clear any inherited transform (e.g. translateX(-50%) on a center-
+      // pinned source) so the twin lands exactly on its captured rect —
+      // same fix as buildTwin above. Without this the twin offsets left
+      // and the real button "teleports" to center on handoff.
+      twin.style.transform = 'none';
       twin.style.pointerEvents = 'none';
       twin.style.zIndex = '5999';
       twin.style.opacity = '1';

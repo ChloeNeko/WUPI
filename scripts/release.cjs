@@ -350,6 +350,34 @@ if (!dryRun) {
 }
 
 // ──────────────────────────────────────────────────────────────────────────
+// Step 3.6: Build fable.exe — the Fable-only launcher binary (a second
+// [[bin]] in src-tauri/Cargo.toml, same crate as wupi.exe). `npx tauri build`
+// runs `cargo build --release` which typically emits BOTH bins, but we build
+// fable explicitly to GUARANTEE it exists for staging (cheap — the main build
+// already compiled the lib + every heavy dep, so this is just fable.rs +
+// link). Sets the same window attrs as wupi.exe but boots straight to the
+// Fable title via the `wupi.html#fable` entry marker.
+// ──────────────────────────────────────────────────────────────────────────
+const builtFableExe = join(cargoTargetDir, 'release', 'fable.exe');
+console.log('[release] building fable.exe (src/bin/fable.rs)…');
+if (!dryRun) {
+  const fableBuild = spawnSync('cargo', [
+    'build', '--release', '--bin', 'fable',
+  ], { stdio: 'inherit', cwd: join(repoRoot, 'src-tauri'), shell: true });
+  if (fableBuild.status !== 0) {
+    console.error(`[release] fable build failed (exit ${fableBuild.status}).`);
+    process.exit(fableBuild.status ?? 1);
+  }
+  if (!existsSync(builtFableExe)) {
+    console.error(`[release] fable.exe not found at ${builtFableExe} despite a successful build.`);
+    process.exit(1);
+  }
+  console.log('[release] fable.exe built.');
+} else {
+  console.log('[release] (dry-run) skipping fable.exe build');
+}
+
+// ──────────────────────────────────────────────────────────────────────────
 // Step 4: Stage the portable-zip layout (AGENTS.md §8C).
 //
 // The IN-ZIP layout is FLAT (files at the zip root, no WUPI/ wrapper).
@@ -377,14 +405,12 @@ if (!dryRun) {
 //   │                              so the loader finds them in bin/ on first
 //   │                              call. See the DLL block below for the full
 //   │                              rationale.)
-//   data/                         (engine-shipped identity content)
+//   data/                         (engine-shipped identity content; the
+//   │                              whole repo data/ dir is cpSync'd below)
 //   ├── wupi.sim                  (Wupi's ACTIVE persona, lowercase w,
 //   │                              single copy — Chloe's personal content)
-//   ├── fable.sim                 (the Quick Play narrator card — the
-//   │                              placeless Narrative Simulator identity;
-//   │                              loaded by fable_quick_play_start)
 //   ├── wupi.codex                (Wupi's static playbook — engine content)
-//   ├── fable.codex               (the unified Fable playbook — engine content)
+//   ├── wupi.prompt / fable.prompt (authored prompt prose — engine content)
 //   └── user.xml                  (EMPTY template — user authors via the
 //                                  User Editor; preserved on update)
 //   (no memory/, models/, apps/ — those are USER DATA, created on first
@@ -458,6 +484,13 @@ mkdirSync(stageWupiDir, { recursive: true });
 
 // wupi.exe at the zip root.
 copyFileSync(builtExe, join(stageWupiDir, 'wupi.exe'));
+// fable.exe at the zip root — the Fable-only launcher (built in Step 3.6).
+// Same crate as wupi.exe; boots straight to the Fable title via the #fable
+// entry marker. The updater extracts the whole zip + copies every non-
+// preserved file, so fable.exe flows through updates automatically once staged
+// here (no updater manifest change). builtFableExe was declared + verified in
+// the build step above.
+copyFileSync(builtFableExe, join(stageWupiDir, 'fable.exe'));
 // dist/ contents (wupi.html, paw.png, assets/) at the zip root — flat, NOT
 // under a dist/ subdir. This matches the resolve_*_path walkers which expect
 // assets next to wupi.exe.

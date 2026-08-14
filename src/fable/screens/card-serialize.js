@@ -1,9 +1,10 @@
 // =============================================================
-// CARD SERIALIZE — flat-format <sim_card> XML builders for the three
-// new creators (NPC / World / Scenario). Shared helpers + one builder
-// per schema so the XML shape is auditable in one place.
+// CARD SERIALIZE — the flat-format <sim_card> XML builders for the
+// GLM-conversational Creator. The single polymorphic `serializeSimCard`
+// routes on `draft.card_type` (npc | scenario | world — the retired
+// per-kind builders were deleted once it absorbed their schemas).
 //
-// All three emit the canonical flat format (AGENTS.md §6):
+// It emits the canonical flat format (AGENTS.md §6):
 //   <sim_card>
 //     <metadata><type>roleplay</type></metadata>   ← required for the
 //                                                    New Game picker
@@ -12,13 +13,18 @@
 //     <cast>…</cast> (optional)
 //   </sim_card>
 //
-// THE INTRO IS NOT IN THE XML. The opening narrator beat (the one-shot
-// first-turn seed) lives in a SIBLING `.intro` file, not inside the cached
-// `<sim_card>` (2026-08-05). Baking it into the system prompt would inflate
-// every turn's KV cache with text only relevant to turn 1 — a prime-directive
-// violation. Each builder returns { xml, intro } where `intro` is the plain
-// text for the `.intro` file (empty string when the wizard collected none);
-// the write path writes them as two siblings.
+// THE INTRO LIVES AFTER </sim_card>, NOT INSIDE IT — exactly the shape
+// `data/wupi.sim` uses. The opening narrator beat (the one-shot first-turn
+// seed) is appended as a SIBLING `<intro>` element AFTER `</sim_card>` in the
+// same `.sim` file. Baking it INTO `<sim_card>` would inflate every turn's KV
+// cache with text only relevant to turn 1 — a prime-directive violation — so
+// it rides outside the cached root. `serializeSimCard` returns { xml, intro }
+// where `xml` already carries the appended `<intro>` block when non-empty, so
+// ONE `fable_write_card` write persists both. (The dedicated intro step +
+// import path replace it post-create via the Rust `fable_card_set_intro`
+// IPC. NO separate `.intro` files are written — the in-file sibling is the
+// canonical home; Rust parses the two-root shape by slicing at the first
+// `</sim_card>`, see sim_card.rs `parse`.)
 //
 // CDATA wraps all prose (smart quotes, literal <>, auto-merged by
 // roxmltree). The Rust parser (sim_card.rs) is the validator of record;
@@ -57,115 +63,269 @@ function composeLabeled(pairs) {
   return out.join('\n\n');
 }
 
-// --- NPC ------------------------------------------------------------------
-// The NPC's persona is composed from Personality + Backstory + Likes/
-// Dislikes + Mission. Occupation → a <traits> line. Conversation Style →
-// folded into <tone>. Appearance traits → <appearance>. Intro → the sibling
-// .intro file (NOT in the XML). The card is a roleplay card whose single
-// <cast> entry IS this NPC (so fable_start seeds it as a present NPC).
-//
-// Returns { xml, intro }: xml is the <sim_card>, intro is the plain text for
-// the .intro sibling (empty string when the wizard collected no intro).
-export function serializeNpcCard(f) {
-  const name = (f.name || '').trim();
-  const persona = composeLabeled([
-    ['Personality', f.personality],
-    ['Backstory', f.backstory],
-    ['Likes', f.likes],
-    ['Dislikes', f.dislikes],
-    ['Core Mission', f.core_mission],
-    ['Miscellaneous', f.miscellaneous],
-  ]);
-  const occupation = (f.occupation || '').trim();
-  const conversationStyle = (f.conversation_style || '').trim();
-  const intro = (f.intro_message || '').trim();
-
-  // Appearance from the structured traits (same vocabulary as the Player
-  // Creator). Conditional traits only when enabled.
-  const appearanceParts = [];
-  const push = (label, v) => { const s = (v || '').trim(); if (s) appearanceParts.push(`${label}: ${s}`); };
-  push('Gender', f.gender);
-  push('Race', f.race);
-  push('Age', f.age);
-  push('Height', f.height);
-  push('Weight', f.weight);
-  push('Hair Color', f.hair_color);
-  push('Hair Length', f.hair_length);
-  push('Hair Style', f.hair_style);
-  push('Body', f.body_type);
-  push('Skin', f.skin_complexion);
-  push('Eyes', f.eye_color);
-  if (f.breast_size_enabled) push('Breast', f.breast_size);
-  if (f.ears_enabled) push('Ears', f.ears);
-  if (f.tail_enabled) push('Tail', f.tail);
-  if (Array.isArray(f.clothing) && f.clothing.length) {
-    appearanceParts.push(`Clothing: ${f.clothing.join(', ')}`);
+// --- Player (SavedPlayer JSON, not a sim card) ---------------------------
+// Build the SavedPlayer object (§6C) from the GLM draft. All structured
+// traits are Option<String> on the Rust side; conditional + optional fields
+// (breast/ears/tail/horn, clothing, job/weakness/distinguishing_marks,
+// gear/tools/weapons, custom_tags) are omitted entirely when absent so the
+// JSON stays clean. `gender` is free-form identity text (2026-08-13: no
+// longer restricted to male/female, no longer force-lowercased — preserved
+// as the user typed it). The transient gameplay fields (wealth/reputation/
+// fame) are deliberately NOT serialized here — they seed PlayerState at
+// attach, never the identity file (§6C identity-only lock). Returns
+// { id, player } for fable_player_write({ id, player }).
+export function serializePlayer(draft) {
+  const d = draft || {};
+  const name = (d.name || '').trim();
+  const opt = (v) => {
+    const s = (v == null ? '' : String(v)).trim();
+    return s || null;
+  };
+  // Chip-list normalizer: trim + drop blanks; null when nothing remains.
+  const chipList = (arr) => {
+    if (!Array.isArray(arr) || !arr.length) return null;
+    const items = arr.map((s) => String(s).trim()).filter(Boolean);
+    return items.length ? items : null;
+  };
+  const player = {
+    id: slugify(name) || 'player',
+    name: name || 'Unnamed',
+    gender: opt(d.gender),
+    race: opt(d.race),
+    age: opt(d.age),
+    height: opt(d.height),
+    weight: opt(d.weight),
+    hair_color: opt(d.hair_color),
+    hair_length: opt(d.hair_length),
+    hair_style: opt(d.hair_style),
+    body_type: opt(d.body_type),
+    skin_complexion: opt(d.skin_complexion),
+    eye_color: opt(d.eye_color),
+    backstory: opt(d.backstory),
+  };
+  // Conditional + optional fields — include only when GLM supplied them.
+  const breast = opt(d.breast_size); if (breast) player.breast_size = breast;
+  const ears = opt(d.ears); if (ears) player.ears = ears;
+  const tail = opt(d.tail); if (tail) player.tail = tail;
+  const horn = opt(d.horn); if (horn) player.horn = horn;
+  const job = opt(d.job); if (job) player.job = job;
+  const weakness = opt(d.weakness); if (weakness) player.weakness = weakness;
+  const marks = opt(d.distinguishing_marks); if (marks) player.distinguishing_marks = marks;
+  const clothing = chipList(d.clothing); if (clothing) player.clothing = clothing;
+  const gear = chipList(d.gear); if (gear) player.gear = gear;
+  const tools = chipList(d.tools); if (tools) player.tools = tools;
+  const weapons = chipList(d.weapons); if (weapons) player.weapons = weapons;
+  // Custom extensions: flat string→string map (drop blank keys/values).
+  if (d.custom_tags && typeof d.custom_tags === 'object' && !Array.isArray(d.custom_tags)) {
+    const tags = {};
+    for (const [k, v] of Object.entries(d.custom_tags)) {
+      const kk = String(k || '').trim();
+      const vv = opt(v);
+      if (kk && vv) tags[kk] = vv;
+    }
+    if (Object.keys(tags).length) player.custom_tags = tags;
   }
-  const appearance = appearanceParts.join('\n');
+  return { id: player.id, player };
+}
+
+// --- Sim Card (the GLM sim wizard's polymorphic Type-Router card) ---------
+// The GLM sim wizard's Turn 1 is a TYPE ROUTER: it picks card_type ∈
+// {npc, scenario, world} + name, then gathers only that branch's fields.
+// `<type>` is ALWAYS "roleplay" (so fable_cards_list + fable_start match); the
+// discriminator rides in `<subtype>` (2026-08-13). UNIVERSAL world anchors
+// (date/time/weather/location) are gathered for every branch + never empty
+// (GLM supplies defaults). Per-type fields compose into existing XML slots
+// (per the SIM Wizard spec): NPC identity → <appearance>, dialogue_style →
+// <conversational_style>, scenario specifics → <plot>, directive → <persona>.
+// `custom_tags` (all branches) → <custom_tags><entry key="…">value</entry>.
+// Cast ids are slugged bare; <name> carries the diegetic label. Returns
+// { xml, intro }.
+export function serializeSimCard(f) {
+  const d = f || {};
+  const subtype = (d.card_type || '').trim().toLowerCase(); // npc | scenario | world
+  const name = (d.name || '').trim();
+  const tone = (d.tone || '').trim();
+  const date = (d.date || '').trim();
+  const time = (d.time || d.start_time || '').trim();
+  const weather = (d.weather || d.start_weather || '').trim();
+  const location = (d.location || '').trim();
+  const locations = Array.isArray(d.locations) ? d.locations : [];
+  const cast = Array.isArray(d.cast) ? d.cast : [];
+  const intro = (d.intro || '').trim();
+
+  // Branch-specific <persona> composition.
+  let persona = '';
+  if (subtype === 'npc') {
+    persona = composeLabeled([
+      ['Personality', d.personality],
+      ['Flaws', d.flaws],
+      ['Occupation', d.job],
+      ['Backstory', d.backstory],
+    ]);
+  } else {
+    // scenario + world: the directive is the core premise / purpose.
+    persona = (d.directive || '').trim();
+  }
 
   let xml = '<sim_card>\n';
-  xml += '  <metadata><type>roleplay</type></metadata>\n';
+  xml += '  <metadata><type>roleplay</type>';
+  if (subtype) xml += `<subtype>${escapeXml(subtype)}</subtype>`;
+  xml += '</metadata>\n';
   xml += '  <identity>\n';
   xml += `    <name>${escapeXml(name)}</name>\n`;
   if (persona) xml += `    <persona>${cdata(persona)}</persona>\n`;
-  if (occupation) xml += `    <traits>${cdata(`Occupation: ${occupation}`)}</traits>\n`;
   xml += '  </identity>\n';
-  if (appearance) xml += `  <appearance>${cdata(appearance)}</appearance>\n`;
-  if (conversationStyle) xml += `  <tone>${cdata(conversationStyle)}</tone>\n`;
-  // Cast: this card's NPC is present at scene start (slug id from name).
-  xml += '  <cast>\n';
-  const npcId = slugify(name) || 'npc';
-  xml += `    <npc id="${escapeXml(npcId)}">\n      <name>${escapeXml(name)}</name>\n`;
-  if (occupation) xml += `      <role>${cdata(occupation)}</role>\n`;
-  xml += '    </npc>\n';
-  xml += '  </cast>\n';
+
+  // NPC: physical identity → <appearance> (the 12 Player Wizard traits +
+  // contextual breast/ears/tail/horn). Same vocabulary the tracker's
+  // [APPEARANCE] allowlist speaks.
+  if (subtype === 'npc') {
+    const appearance = buildNpcAppearance(d);
+    if (appearance) xml += `  <appearance>${cdata(appearance)}</appearance>\n`;
+  }
+
+  // World: the world's identity → <setting>.
+  if (subtype === 'world') {
+    const setting = (d.setting || '').trim();
+    if (setting) xml += `  <setting>${cdata(setting)}</setting>\n`;
+  }
+
+  // Scenario: the event spec → <plot> as labeled prose.
+  if (subtype === 'scenario') {
+    const plot = composeLabeled([
+      ['Trigger', d.trigger_condition],
+      ['Objective', d.primary_objective],
+      ['Actors', d.participating_actors],
+      ['Hazards', d.environmental_hazards],
+      ['Outcomes', d.outcomes],
+    ]);
+    if (plot) xml += `  <plot>${cdata(plot)}</plot>\n`;
+  }
+
+  // NPC: dialogue_style → <conversational_style> (existing slot).
+  if (subtype === 'npc') {
+    const ds = (d.dialogue_style || '').trim();
+    if (ds) xml += `  <conversational_style>\n    <rules>${cdata(ds)}</rules>\n  </conversational_style>\n`;
+  }
+
+  if (tone) xml += `  <tone>${cdata(tone)}</tone>\n`;
+
+  // Universal cold-start anchors: <start> seeds clock + weather + the calendar
+  // label from turn 1 (the wizard guarantees date/time/weather non-empty).
+  if (date || time || weather) {
+    xml += '  <start>\n';
+    if (date) xml += `    <date>${cdata(date)}</date>\n`;
+    if (time) xml += `    <time>${escapeXml(time)}</time>\n`;
+    if (weather) xml += `    <weather>${cdata(weather)}</weather>\n`;
+    xml += '  </start>\n';
+  }
+
+  // Travel graph (flat-first; parser reads top-level <locations>). The
+  // `location` anchor is the FIRST node; the graph grows in play. If the
+  // wizard supplied a graph, use it; else synthesize one node from `location`.
+  const nodes = locations.length
+    ? locations
+    : (location ? [{ name: location }] : []);
+  if (nodes.length) {
+    xml += '  <locations>\n';
+    for (const loc of nodes) {
+      const lid = slugify(loc.name || loc.id || '');
+      if (!lid) continue;
+      const lname = (loc.name || '').trim();
+      const neigh = Array.isArray(loc.neighbors) ? loc.neighbors : [];
+      xml += `    <node id="${escapeXml(lid)}">\n`;
+      if (lname) xml += `      <name>${escapeXml(lname)}</name>\n`;
+      for (const nb of neigh) {
+        const nid = slugify(String(nb || ''));
+        if (nid) xml += `      <neighbor>${escapeXml(nid)}</neighbor>\n`;
+      }
+      xml += '    </node>\n';
+    }
+    xml += '  </locations>\n';
+  }
+
+  // Cast roster (flat-first; parser reads top-level <cast>). NPC branch: the
+  // card's single NPC is the cast entry (role = job). scenario/world: any
+  // starting cast the wizard declared (optional).
+  const castList = subtype === 'npc'
+    ? [{ name, identity: (d.job || '').trim() }]
+    : cast;
+  if (castList.length) {
+    xml += '  <cast>\n';
+    for (const c of castList) {
+      const cid = slugify(c.name || c.id || '');
+      if (!cid) continue;
+      const cname = (c.name || '').trim();
+      const cidentity = (c.identity || c.role || '').trim();
+      xml += `    <npc id="${escapeXml(cid)}">\n`;
+      if (cname) xml += `      <name>${escapeXml(cname)}</name>\n`;
+      if (cidentity) xml += `      <role>${cdata(cidentity)}</role>\n`;
+      xml += '    </npc>\n';
+    }
+    xml += '  </cast>\n';
+  }
+
+  // Custom extensions (all branches): flat string→string map.
+  const tagsXml = buildCustomTagsXml(d.custom_tags);
+  if (tagsXml) xml += tagsXml;
+
   xml += '</sim_card>\n';
+  // The opening beat lives as a SIBLING `<intro>` AFTER </sim_card> (canonical,
+  // 2026-08-13) — kept out of `<sim_card>` so it never inflates the cached
+  // system prompt (prime directive). Rust reads it as the Fable opening beat.
+  if (intro) {
+    xml += `\n<intro>${cdata(intro)}</intro>\n`;
+  }
   return { xml, intro };
 }
 
-// --- World ----------------------------------------------------------------
-// A world card: the persona is the Directive (the world's driving
-// principle). Setting + Tone are first-class. No cast, no intro (a world is
-// a stage, not a character — it has no opening beat). Returns { xml, intro }
-// with intro always '' for worlds.
-export function serializeWorldCard(f) {
-  const name = (f.name || '').trim();
-  const directive = (f.directive || '').trim();
-  const setting = (f.setting || '').trim();
-  const tone = (f.tone || '').trim();
-
-  let xml = '<sim_card>\n';
-  xml += '  <metadata><type>roleplay</type></metadata>\n';
-  xml += '  <identity>\n';
-  xml += `    <name>${escapeXml(name)}</name>\n`;
-  if (directive) xml += `    <persona>${cdata(directive)}</persona>\n`;
-  xml += '  </identity>\n';
-  if (setting) xml += `  <setting>${cdata(setting)}</setting>\n`;
-  if (tone) xml += `  <tone>${cdata(tone)}</tone>\n`;
-  xml += '</sim_card>\n';
-  return { xml, intro: '' };
+// NPC <appearance> from the Player Wizard identity vocabulary. Each trait → a
+// `tag: value` line (the parser reads <appearance> children as `tag: text`).
+// Conditional traits (breast/ears/tail/horn) only when present.
+function buildNpcAppearance(d) {
+  const parts = [];
+  const push = (tag, v) => {
+    const s = (v == null ? '' : String(v)).trim();
+    if (s) parts.push(`${tag}: ${s}`);
+  };
+  push('Gender', d.gender);
+  push('Race', d.race);
+  push('Age', d.age);
+  push('Height', d.height);
+  push('Weight', d.weight);
+  push('Hair color', d.hair_color);
+  push('Hair length', d.hair_length);
+  push('Hair style', d.hair_style);
+  push('Body', d.body_type);
+  push('Skin', d.skin_complexion);
+  push('Eyes', d.eye_color);
+  if (Array.isArray(d.clothing) && d.clothing.length) {
+    const clothes = d.clothing.map((s) => String(s).trim()).filter(Boolean);
+    if (clothes.length) parts.push(`Clothing: ${clothes.join(', ')}`);
+  }
+  push('Breast', d.breast_size);
+  push('Ears', d.ears);
+  push('Tail', d.tail);
+  push('Horn', d.horn);
+  return parts.join('\n');
 }
 
-// --- Scenario -------------------------------------------------------------
-// A scenario card: Directive → persona, Setting + Tone first-class, Intro →
-// the sibling .intro file (NOT in the XML). No cast. Returns { xml, intro }.
-export function serializeScenarioCard(f) {
-  const name = (f.name || '').trim();
-  const directive = (f.directive || '').trim();
-  const setting = (f.setting || '').trim();
-  const tone = (f.tone || '').trim();
-  const intro = (f.intro_message || '').trim();
-
-  let xml = '<sim_card>\n';
-  xml += '  <metadata><type>roleplay</type></metadata>\n';
-  xml += '  <identity>\n';
-  xml += `    <name>${escapeXml(name)}</name>\n`;
-  if (directive) xml += `    <persona>${cdata(directive)}</persona>\n`;
-  xml += '  </identity>\n';
-  if (setting) xml += `  <setting>${cdata(setting)}</setting>\n`;
-  if (tone) xml += `  <tone>${cdata(tone)}</tone>\n`;
-  xml += '</sim_card>\n';
-  return { xml, intro };
+// <custom_tags><entry key="…">value</entry>…</custom_tags> from a flat object.
+// Empty string when no non-blank entries. Keys are attribute-safe (quotes
+// escaped); values are CDATA-wrapped (handles any prose safely).
+function buildCustomTagsXml(tags) {
+  if (!tags || typeof tags !== 'object' || Array.isArray(tags)) return '';
+  const entries = [];
+  for (const [k, v] of Object.entries(tags)) {
+    const kk = String(k || '').trim();
+    const vv = (v == null ? '' : String(v)).trim();
+    if (kk && vv) {
+      const keyAttr = escapeXml(kk).replace(/"/g, '&quot;');
+      entries.push(`    <entry key="${keyAttr}">${cdata(vv)}</entry>`);
+    }
+  }
+  if (!entries.length) return '';
+  return `  <custom_tags>\n${entries.join('\n')}\n  </custom_tags>\n`;
 }
 
 export function slugify(s) {

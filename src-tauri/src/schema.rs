@@ -28,7 +28,7 @@
 //! Atomic save (temp + fsync + rename), same pattern as
 //! [`crate::session::Conversation::save`]. Loaded at startup into `AppState`.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 
 // Pull the player-state types in at the top of schema.rs so the new
@@ -106,6 +106,21 @@ impl WorldClock {
         let h24 = rem / 60;
         let m = rem % 60;
         Some(format!("Day {day}, {h24:02}:{m:02}"))
+    }
+
+    /// Render the time-of-day ONLY ("14:00"), suppressing the "Day N" prefix.
+    /// Used when a rich calendar label (`WorldSchema.calendar`) is set: the
+    /// day/date is carried by the `date:` line, so the `clock:` line shows just
+    /// the time-of-day to avoid a redundant day counter. Returns `None` when
+    /// the clock is unset.
+    pub fn render_time_of_day(&self) -> Option<String> {
+        if !self.is_set() {
+            return None;
+        }
+        let rem = self.current_minutes % 1440;
+        let h24 = rem / 60;
+        let m = rem % 60;
+        Some(format!("{h24:02}:{m:02}"))
     }
 }
 
@@ -843,6 +858,28 @@ pub struct WorldSchema {
     #[serde(default)]
     pub weather: Weather,
 
+    /// Free-form calendar label (2026-08-13): a verbatim date string
+    /// ("3rd of Harvest, Year 1247, Market Day") — month/year/type-of-day, NOT
+    /// just "Day N". Seeded from the card's `<start><date>` + advanced in play
+    /// by the `[DATE]` bracket (the tracker rewrites the label — no Rust
+    /// calendar arithmetic). When set, `render_for_prompt` emits `date:` +
+    /// renders the clock as time-of-day only (suppressing "Day N"). When unset
+    /// (None — legacy cards / pre-2026-08-13 saves), the legacy
+    /// `clock: Day N, HH:MM` render is preserved. `#[serde(default)]` keeps old
+    /// saves loadable as dormant (None → no `date:` line).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calendar: Option<String>,
+
+    /// Custom extensions (2026-08-13): a flat key→value string map seeded from
+    /// the card's `<custom_tags>` (sim) + the SavedPlayer's `custom_tags`
+    /// (player attach) — any extra stat / faction standing / curse / currency /
+    /// attribute that doesn't fit a standard field. Rendered as a bounded
+    /// `custom:` line so it reaches the narrator (entities themselves are
+    /// persisted but NOT prompted). `#[serde(default)]` keeps old saves
+    /// loadable as empty (dormant — no `custom:` line).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub custom_tags: BTreeMap<String, String>,
+
     /// The spatial travel graph (Fable Phase 4 Component 3, 2026-07-28):
     /// discrete locations (nodes) + adjacency edges + a single current
     /// location pointer. Rust is the SOLE authority — `apply_delta` does NOT
@@ -981,8 +1018,8 @@ pub struct WorldSchema {
     /// the FILENAME of the selected image in the shared library at
     /// `apps/fable/images/backgrounds/`. `None` = no background (the default
     /// pure-black void). PER-CARD + SAVE-PERSISTENT: this field rides inside
-    /// EVERY save — `fable_save_now`, the per-turn autosave, and Quick Play's
-    /// quicksave all snapshot the full schema, and `fable_load_save` restores
+    /// EVERY save — `fable_save_now` + the per-turn autosave both snapshot
+    /// the full schema, and `fable_load_save` restores
     /// it — so leaving and continuing a game brings its background back with
     /// the save. Rust is the SOLE authority: `apply_delta` does NOT touch it
     /// (the AI tracker can neither read nor write the selection) and
@@ -1172,10 +1209,11 @@ impl WorldSchema {
     /// goes into the inter-turn region alongside the memory block, and every
     /// token is prefill cost.
     ///
-    /// Emits ONLY bounded deterministic anchors: clock, weather, location +
-    /// exits, present NPCs, current-node rumors, summary, the last 5 recent
-    /// events, + player_state (stamina/injuries/equipped/appearance). The
-    /// `entities` map is deliberately NOT rendered (2026-08-10): it was the
+    /// Emits ONLY bounded deterministic anchors: clock (or `date:` + time-of-day
+    /// when a calendar label is set), weather, location + exits, present NPCs,
+    /// current-node rumors, summary, the last 5 recent events, a bounded
+    /// `custom:` line, + player_state (stamina/injuries/equipped/appearance).
+    /// The `entities` map is deliberately NOT rendered (2026-08-10): it was the
     /// sole unbounded growth source. Entity state stays in the Rust schema
     /// (God-Tier authority) and reaches the model via the 1-turn bracket
     /// window — never via this prompt block, never via probabilistic RRF.
@@ -1192,7 +1230,9 @@ impl WorldSchema {
             && !self.travel_graph.is_set()
             && self.rumors.is_empty()
             && !self.npc_registry.is_set()
-            && self.presences.is_empty();
+            && self.presences.is_empty()
+            && self.calendar.as_deref().filter(|s| !s.is_empty()).is_none()
+            && self.custom_tags.is_empty();
         if empty {
             return String::new();
         }
@@ -1202,7 +1242,22 @@ impl WorldSchema {
         // time as its top-of-mind anchor so its [TIME ...] emissions advance
         // it coherently. Without seeing the current time, the narrator would
         // emit inconsistent timestamps. ~30 tokens; zero when unset.
-        if let Some(clock_line) = self.world_clock.render_clock_line() {
+        //
+        // Calendar coupling (2026-08-13): when a rich `calendar` label is set
+        // (month/year/type-of-day, advanced via `[DATE]`), emit `date:` + render
+        // the clock as time-of-day ONLY ("14:00") — the day/date is carried by
+        // the label, so a "Day N" counter would be redundant/conflicting. When
+        // unset (legacy cards), the "clock: Day N, HH:MM" render stands.
+        if let Some(cal) = self.calendar.as_deref().filter(|s| !s.is_empty()) {
+            out.push_str("date: ");
+            out.push_str(cal);
+            out.push('\n');
+            if let Some(tod) = self.world_clock.render_time_of_day() {
+                out.push_str("clock: ");
+                out.push_str(&tod);
+                out.push('\n');
+            }
+        } else if let Some(clock_line) = self.world_clock.render_clock_line() {
             out.push_str("clock: ");
             out.push_str(&clock_line);
             out.push('\n');
@@ -1368,6 +1423,28 @@ impl WorldSchema {
             let overflow = self.player_state.pack.len().saturating_sub(PACK_PROMPT_CAP);
             out.push_str("pack: ");
             out.push_str(&shown.join(", "));
+            if overflow > 0 {
+                out.push_str(&format!(" (+{} more)", overflow));
+            }
+            out.push('\n');
+        }
+        // Custom extensions (2026-08-13): authored key→value pairs from the
+        // card's `<custom_tags>` + the attached player's `custom_tags` (stats,
+        // faction standings, curses, currencies — anything that doesn't fit a
+        // standard field). BOUNDED like the pack line so a large map can't
+        // re-grow the prompt; entries beyond the cap are summarized as
+        // `(+N more)`. Empty map → no line (zero tokens for a fresh game).
+        if !self.custom_tags.is_empty() {
+            const CUSTOM_PROMPT_CAP: usize = 12;
+            let shown: Vec<String> = self
+                .custom_tags
+                .iter()
+                .take(CUSTOM_PROMPT_CAP)
+                .map(|(k, v)| format!("{k}: {v}"))
+                .collect();
+            let overflow = self.custom_tags.len().saturating_sub(CUSTOM_PROMPT_CAP);
+            out.push_str("custom: ");
+            out.push_str(&shown.join("; "));
             if overflow > 0 {
                 out.push_str(&format!(" (+{} more)", overflow));
             }
@@ -2210,6 +2287,43 @@ mod tests {
     #[test]
     fn render_for_prompt_empty_schema_is_empty_string() {
         assert_eq!(WorldSchema::default().render_for_prompt(), "");
+    }
+
+    #[test]
+    fn render_calendar_label_suppresses_day_counter() {
+        // 2026-08-13: when a calendar label is set, `date:` renders + the clock
+        // shows time-of-day ONLY (no redundant "Day N"). Without a label, the
+        // legacy "Day N, HH:MM" render stands.
+        let mut schema = WorldSchema::default();
+        // Day 2, 14:00 = 1440 + 14*60 = 2280 minutes.
+        schema.world_clock.current_minutes = 2280;
+        schema.world_clock.last_tick_minutes = 2280;
+        // No calendar yet → legacy render.
+        let legacy = schema.render_for_prompt();
+        assert!(legacy.contains("clock: Day 2, 14:00"));
+        assert!(!legacy.contains("date:"));
+        // With a calendar → date: + time-of-day clock:.
+        schema.calendar = Some("3rd of Harvest, Year 1247".into());
+        let labeled = schema.render_for_prompt();
+        assert!(labeled.contains("date: 3rd of Harvest, Year 1247"));
+        assert!(labeled.contains("clock: 14:00"));
+        assert!(!labeled.contains("Day 2"), "Day N suppressed when calendar is set");
+    }
+
+    #[test]
+    fn render_custom_tags_as_bounded_line() {
+        // custom_tags render as a bounded `custom:` line so they reach the
+        // narrator (entities themselves are NOT rendered).
+        let mut schema = WorldSchema::default();
+        schema.summary = "scene set".into(); // keep it non-empty
+        schema.custom_tags = BTreeMap::from([
+            ("starting_currency".into(), "200 gold".into()),
+            ("guard_reputation".into(), "-20".into()),
+        ]);
+        let rendered = schema.render_for_prompt();
+        assert!(rendered.contains("custom:"));
+        assert!(rendered.contains("starting_currency: 200 gold"));
+        assert!(rendered.contains("guard_reputation: -20"));
     }
 
     #[test]

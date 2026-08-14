@@ -242,12 +242,10 @@ fn is_denied(rel_str: &str) -> bool {
     }
     // Wupi's own persona + playbook (engine content per §8C, replaced on
     // update). She authors USER codex in data/docs/, never her own docs.
-    // Same carve-out for the Quick Play narrator card + the Fable playbook —
-    // engine content (the placeless Narrative Simulator identity for Quick
-    // Play + the simulation narrator reference), never tool-authored.
+    // Same carve-out for the Fable playbook — engine content (the simulation
+    // narrator reference), never tool-authored.
     if rel_str == "data/wupi.sim"
         || rel_str == "data/wupi.codex"
-        || rel_str == "data/fable.sim"
         || rel_str == "data/fable.codex"
     {
         return true;
@@ -1096,7 +1094,6 @@ mod tests {
         assert!(!is_writable(Path::new("memory/memory.sqlite")));
         assert!(!is_writable(Path::new("memory/memory.sqlite-wal")));
         assert!(!is_writable(Path::new("data/wupi.sim")));
-        assert!(!is_writable(Path::new("data/fable.sim"))); // 2026-07-29 rename of gm.sim
         assert!(!is_writable(Path::new("data/api_config.json")));
         assert!(!is_writable(Path::new("data/theme.json")));
         assert!(!is_writable(Path::new("target/debug/wupi.exe")));
@@ -1292,8 +1289,11 @@ mod tests {
         });
         let t = CreateSimCard;
         t.execute(&payload, &ctx).unwrap();
-        // File exists at the right path.
-        let written = ctx.resolve("apps/fable/cards/test_scenario.sim").unwrap();
+        // File exists at the right path — the per-card folder layout (§6B):
+        // apps/fable/cards/<stem>/<stem>.sim.
+        let written = ctx
+            .resolve("apps/fable/cards/test_scenario/test_scenario.sim")
+            .unwrap();
         assert!(written.exists(), "card should be written");
         // Round-trips through the parser.
         let loaded = crate::sim_card::load_or_fallback(&written);

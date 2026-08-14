@@ -59,6 +59,14 @@ pub enum BracketCommand {
     /// enum's `#[serde(tag = "kind")]` external discriminator (same reason
     /// `Effect.tag_kind` isn't named `kind`, see above).
     Weather { condition: String },
+    /// The free-form calendar label advanced (2026-08-13). Single-region like
+    /// WEATHER/TIME. `value` is the NEW verbatim date label ("4th of Harvest,
+    /// Year 1247, Market Day") — month/year/type-of-day, authored richly (NOT
+    /// just "Day N"). The Rust side owns `WorldSchema.calendar`; the tracker
+    /// rewrites the whole label on advance (no arithmetic — Option 2 of the
+    /// calendar design). Named `value` (not `kind`/`date`) to avoid colliding
+    /// with this enum's `#[serde(tag = "kind")]` external discriminator.
+    Date { value: String },
     /// The player moved to a new node (Fable Phase 4 Component 3, 2026-07-28).
     /// Single-region like WEATHER/TIME. `destination` is a bare node id
     /// ("cellar", "market_square") — NOT the diegetic name, NOT "node.cellar"
@@ -657,6 +665,7 @@ const APPEARANCE_KEYS: &[&str] = &[
     "hair_color",
     "hair_length",
     "hair_style",
+    "horn",
     "outfit",
     "scars",
     "skin_complexion",
@@ -670,6 +679,11 @@ const APPEARANCE_KEYS: &[&str] = &[
 /// a multi-garment outfit line ("bloodstained leather, travel cloak,
 /// muddy boots").
 const APPEARANCE_VALUE_MAX: usize = 200;
+
+/// Per-value cap for `[DATE value]` (2026-08-13). A rich calendar label
+/// ("4th of Harvest, Year 1247, Market Day") is short; 200 chars is ample
+/// while bounding prompt cost. Matches `APPEARANCE_VALUE_MAX`.
+const DATE_VALUE_MAX: usize = 200;
 
 /// Parse the `key=value` (or bare `key`) tail of an `[APPEARANCE ...]`
 /// bracket. Returns `None` for unknown keys, empty keys, or contaminated /
@@ -1138,6 +1152,7 @@ fn json_value_to_command(obj: &serde_json::Map<String, serde_json::Value>) -> Op
         "object" => json_to_object(obj),
         "fx" | "effect_fx" | "scene_fx" => json_to_fx(obj),
         "weather" => json_to_weather(obj),
+        "date" | "calendar" => json_to_date(obj),
         "travel" | "move" | "arrive" | "go" => json_to_travel(obj),
         "rumor" | "gossip" | "hearsay" => json_to_rumor(obj),
         "presence" | "onscreen" | "onstage" | "present" => json_to_presence(obj),
@@ -1466,6 +1481,27 @@ fn json_to_weather(obj: &serde_json::Map<String, serde_json::Value>) -> Option<B
         return None;
     }
     Some(BracketCommand::Weather { condition })
+}
+
+/// Parse a `{"kind": "date", ...}` JSON body into `BracketCommand::Date`
+/// (2026-08-13). Single field `value` (aliased `date` / `calendar` / `label`);
+/// mirrors `json_to_weather`'s leniency. Caps at `DATE_VALUE_MAX`; empty → None.
+fn json_to_date(obj: &serde_json::Map<String, serde_json::Value>) -> Option<BracketCommand> {
+    let value = obj
+        .get("value")
+        .or_else(|| obj.get("date"))
+        .or_else(|| obj.get("calendar"))
+        .or_else(|| obj.get("label"))
+        .and_then(|v| v.as_str())?
+        .trim()
+        .to_string();
+    if value.is_empty() || value.len() > DATE_VALUE_MAX {
+        return None;
+    }
+    if has_control_chars(&value) {
+        return None;
+    }
+    Some(BracketCommand::Date { value })
 }
 
 /// Parse a `{"kind": "appearance", ...}` JSON body into
@@ -2040,6 +2076,22 @@ fn parse_one(bracket: &str, text_after: &str) -> Option<(BracketCommand, usize)>
         let condition = rest.trim().to_string();
         if !condition.is_empty() {
             return Some((BracketCommand::Weather { condition }, 0));
+        }
+        return None;
+    }
+
+    // [DATE <new label>] (2026-08-13). Single-region like WEATHER/TIME. The
+    // body is the NEW verbatim calendar label ("4th of Harvest, Year 1247,
+    // Market Day") — month/year/type-of-day. The tracker rewrites the whole
+    // label on a calendar advance (no arithmetic). Empty body → None (literal
+    // prose). Oversize / control-char bodies → None (silent drop, same
+    // leniency). Case-insensitive via `strip_prefix_ci` (ASCII-safe). The JSON
+    // form `{"kind": "date", "value": "..."}` is handled by `parse_json_command`'s
+    // `date` arm + `json_to_date` helper.
+    if let Some(rest) = strip_prefix_ci(bracket, "DATE") {
+        let value = rest.trim().to_string();
+        if !value.is_empty() && value.len() <= DATE_VALUE_MAX && !has_control_chars(&value) {
+            return Some((BracketCommand::Date { value }, 0));
         }
         return None;
     }
@@ -2845,6 +2897,39 @@ mod tests {
         assert!(parsed.prose.contains("The sky darkens."));
         assert!(parsed.prose.contains("Drops hammer the roof."));
         assert!(!parsed.prose.contains("[WEATHER"));
+    }
+
+    #[test]
+    fn extracts_date_command() {
+        // 2026-08-13: [DATE <new label>] rewrites the calendar verbatim. The
+        // whole label is the value (spaces, commas allowed); the bracket is
+        // stripped from prose.
+        let raw = "Dawn breaks. [DATE 4th of Harvest, Year 1247, Market Day] The market stirs.";
+        let parsed = parse(raw);
+        assert_eq!(parsed.commands.len(), 1);
+        assert_eq!(
+            parsed.commands[0],
+            BracketCommand::Date { value: "4th of Harvest, Year 1247, Market Day".into() }
+        );
+        assert!(parsed.prose.contains("Dawn breaks."));
+        assert!(parsed.prose.contains("The market stirs."));
+        assert!(!parsed.prose.contains("[DATE"));
+    }
+
+    #[test]
+    fn extracts_date_command_case_insensitive_and_json() {
+        let parsed = parse("[date 5th of Harvest, Year 1247]");
+        assert_eq!(
+            parsed.commands[0],
+            BracketCommand::Date { value: "5th of Harvest, Year 1247".into() }
+        );
+        // JSON dual path (fenced — the only unfenced-JSON surface the
+        // parser accepts, same as the weather/travel dual-path tests).
+        let parsed = parse("```json\n{\"kind\":\"date\",\"value\":\"6th of Harvest, Year 1247\"}\n```");
+        assert_eq!(
+            parsed.commands[0],
+            BracketCommand::Date { value: "6th of Harvest, Year 1247".into() }
+        );
     }
 
     #[test]

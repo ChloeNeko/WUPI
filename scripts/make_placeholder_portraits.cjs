@@ -1,4 +1,4 @@
-// Generates two placeholder portrait PNGs for the Fable dev-quickplay preview:
+// Generates two placeholder portrait PNGs for the Fable dev-preview:
 //   src/fable/assets/placeholder_ai.png     (slate-blue, labeled AI)
 //   src/fable/assets/placeholder_player.png (ash-gray, labeled P)
 // Pure Node (zlib only) — builds a valid PNG with raw filter-byte scanlines.

@@ -45,7 +45,6 @@ const FILE_FOR = {
 let overlayEl = null;     // the .fable-raw-editor-overlay
 let titleEl = null;       // the modal title bar
 let textareaEl = null;    // the editor textarea
-let statusEl = null;      // the inline status line
 let saveBtn = null;
 let revertBtn = null;
 let closeBtn = null;
@@ -72,12 +71,10 @@ export function buildRawEditor() {
         </div>
       </div>
       <textarea class="fable-raw-editor-text" data-raw-text spellcheck="false"></textarea>
-      <div class="fable-raw-editor-status" data-raw-status></div>
     </div>
   `;
   titleEl = overlayEl.querySelector('[data-raw-title]');
   textareaEl = overlayEl.querySelector('[data-raw-text]');
-  statusEl = overlayEl.querySelector('[data-raw-status]');
   saveBtn = overlayEl.querySelector('[data-raw-save]');
   revertBtn = overlayEl.querySelector('[data-raw-revert]');
   closeBtn = overlayEl.querySelector('[data-raw-close]');
@@ -104,8 +101,6 @@ export async function openRawEditor(kind, onSaved) {
   current = file;
   onSavedCb = onSaved || null;
   titleEl.textContent = file.title;
-  statusEl.textContent = 'Loading…';
-  statusEl.className = 'fable-raw-editor-status';
   textareaEl.value = '';
   overlayEl.hidden = false;
   try {
@@ -115,11 +110,9 @@ export async function openRawEditor(kind, onSaved) {
     textareaEl.value = text || '';
     lastGood = text || '';
     revalidate();
-    if (isValid) statusEl.textContent = '';
     setTimeout(() => textareaEl.focus(), 30);
   } catch (err) {
-    statusEl.textContent = `Load failed: ${err}`;
-    statusEl.className = 'fable-raw-editor-status bad';
+    console.warn('[fable] raw editor load failed', err);
   }
 }
 
@@ -135,8 +128,6 @@ export function onEsc() {
   if (isValid) {
     onClose();
   } else {
-    statusEl.textContent = 'Invalid — fix errors or hit ↻ to revert.';
-    statusEl.className = 'fable-raw-editor-status bad';
     textareaEl.classList.add('shake');
     setTimeout(() => textareaEl.classList.remove('shake'), 320);
   }
@@ -148,20 +139,17 @@ async function onSave() {
   if (!current || !isValid) return;
   const text = textareaEl.value;
   saveBtn.disabled = true;
-  statusEl.textContent = 'Saving…';
-  statusEl.className = 'fable-raw-editor-status';
   try {
     await current.save(text);
     lastGood = text;             // snapshot the saved text as the new last-good
-    statusEl.textContent = 'Saved.';
     if (onSavedCb) try { onSavedCb(); } catch (_) {}
     closeModal();                // ✓ on success closes (per spec)
   } catch (err) {
     // Server-side validation rejected it (e.g. the XML sniff missed something
     // the real parser catches). Keep the modal open; the file is untouched
-    // (write_atomic only runs after the backend parse succeeds).
-    statusEl.textContent = `Save failed: ${err}`;
-    statusEl.className = 'fable-raw-editor-status bad';
+    // (write_atomic only runs after the backend parse succeeds). Status bar
+    // removed 2026-08-12 per Chloe — failures log silently.
+    console.warn('[fable] raw editor save failed', err);
     saveBtn.disabled = false;
   }
 }
@@ -170,8 +158,6 @@ function onRevert() {
   // Reset the textarea to the last-good text. Always works (no validity gate).
   textareaEl.value = lastGood;
   revalidate();
-  statusEl.textContent = 'Reverted.';
-  statusEl.className = 'fable-raw-editor-status';
   textareaEl.focus();
 }
 
@@ -191,7 +177,6 @@ function closeModal() {
   onSavedCb = null;
   textareaEl.value = '';
   lastGood = '';
-  statusEl.textContent = '';
   textareaEl.classList.remove('invalid');
   saveBtn.disabled = false;
 }
@@ -220,12 +205,6 @@ function setValid(ok) {
   isValid = ok;
   textareaEl.classList.toggle('invalid', !ok);
   saveBtn.disabled = !ok;
-  if (ok) {
-    if (!statusEl.classList.contains('bad')) statusEl.textContent = '';
-  } else {
-    statusEl.textContent = 'Invalid format — fix errors, hit ↻ to revert, or ✕ to discard.';
-    statusEl.className = 'fable-raw-editor-status bad';
-  }
 }
 
 // A cheap XML well-formedness check: balanced tags + a single root. NOT a full

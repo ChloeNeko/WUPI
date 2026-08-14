@@ -6,8 +6,7 @@
 //   { save_id, name, summary, timestamp, turn_count, is_autosave }
 //
 // The per-turn AUTOSAVE is promoted to a one-click "Resume Latest" button at
-// the top of the list — it IS the world's latest state. (There is no separate
-// per-card quicksave: "quicksave" is a Quick-Play-only concept. Resume Latest
+// the top of the list — it IS the world's latest state. (Resume Latest
 // reuses the autosave, which is exactly what CONTINUE on the title screen
 // resumes too.) The list below shows the MANUAL saves only (most-recent
 // first; the backend sorts by timestamp desc). Each manual row is Load +
@@ -65,8 +64,8 @@ export async function renderSaves(root, cardId, onSelect, cardName) {
   }
   // The autosave is the per-turn checkpoint = the world's latest state. Promote
   // it to a one-click Resume Latest button at the top; the list below shows the
-  // manual saves only. (No per-card quicksave exists — Resume Latest reuses the
-  // autosave, the same slot CONTINUE on the title screen resumes.)
+  // manual saves only. (Resume Latest reuses the autosave, the same slot
+  // CONTINUE on the title screen resumes.)
   const autosave = saves.find((s) => s.is_autosave) || null;
   const manuals = saves.filter((s) => !s.is_autosave);
 

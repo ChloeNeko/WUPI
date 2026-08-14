@@ -452,57 +452,37 @@ function animate() {
 let paused = true;
 let bootDone = false;
 
-// ── DEV SHORTCUT: ?dev=fable ──────────────────────────────────
-// Visiting the app at .../wupi.html?dev=fable (e.g. the Vite dev server at
-// localhost:1420) SKIPS the entire OS boot ceremony — the 1s blank, the paw
-// entry/hop/flight animation, the 8s loading screen, the aurora reveal — and
-// launches straight into Fable, also skipping Fable's own fog gate + boot
-// transition (see openFable's DEV shortcut branch). The net effect: refresh
-// lands on Fable's title screen in well under a second, so iterating on the
-// Fable UI doesn't cost ~16s of unskippable cinematics per change.
+// ── FABLE ENTRY (fable.exe / #fable) ──────────────────────────
+// When active, the app SKIPS the entire OS boot ceremony — the 1s blank, the
+// paw entry/hop/flight animation, the 8s loading screen, the aurora reveal —
+// and launches straight into Fable, also skipping Fable's own fog gate + boot
+// transition (see openFable's FABLE_ENTRY branch). The net effect: landing on
+// Fable's title screen in well under a second — the fable.exe launcher's whole
+// purpose, and handy for dev iteration (no ~16s of unskippable cinematics).
 //
-// Production is UNAFFECTED: Tauri loads wupi.html with no query string under
-// its custom protocol, so this is false in shipped builds. There is no Rust,
-// no feature flag, no build change — delete this const + its 3 call sites to
-// fully remove the shortcut. The model still loads (boot_load_model fires
-// here) + the canvas gate opens (bootDone flips here); only the cinematic
-// choreography is bypassed.
+// PRODUCTION LAUNCHER (fable.exe): this IS true in shipped fable.exe. fable.exe
+// is a second launcher binary whose Rust setup() builds the main window with
+// the URL `wupi.html#fable` (the FABLE_ENTRY marker) instead of `wupi.html`.
+// wupi.exe loads plain `wupi.html` → FABLE_ENTRY is false there → normal OS
+// boot. The model still loads (boot_load_model fires here) + the canvas gate
+// opens (bootDone flips here); only the cinematic choreography is bypassed.
 //
-// Trigger forms (either works): ?dev=fable (query) or #dev=fable (hash). The
-// hash form lets you use it under Tauri dev by setting devUrl to
-// "http://localhost:1420/wupi.html#dev=fable" (some Tauri versions strip a
-// query on devUrl but preserve the hash). Production loads wupi.html with
-// neither → false.
-const DEV_FABLE_SHORTCUT = (() => {
+// Trigger forms (all equivalent): #fable (the production marker — bare hash),
+// ?fable (query), OR the legacy dev forms #dev=fable / ?dev=fable kept for
+// `npm run dev` iteration (devUrl "http://localhost:1420/wupi.html#dev=fable").
+// The hash form is preferred — some Tauri versions strip a query on devUrl /
+// under the custom protocol but preserve the hash.
+const FABLE_ENTRY = (() => {
   try {
-    const q = new URLSearchParams(window.location.search).get('dev');
-    if (q === 'fable') return true;
-    // Hash form: #dev=fable (no leading ?). Parse the substring after '#'.
+    // True if `fable` is present (bare #fable → value "") or `dev=fable`.
+    const has = (p) => p && (p.get('fable') !== null || p.get('dev') === 'fable');
+    if (has(new URLSearchParams(window.location.search))) return true;
     const h = window.location.hash.replace(/^#/, '');
-    return new URLSearchParams(h).get('dev') === 'fable';
+    if (h === 'fable') return true;          // bare #fable
+    return has(new URLSearchParams(h));      // #fable=… / #dev=fable
   } catch (_) { return false; }
 })();
 
-// DEV SHORTCUT: ?dev=quickplay (or #dev=quickplay). A sibling of the fable
-// shortcut that goes ONE step further — it skips Fable's title screen + the
-// Quick Play void-form entirely and drops you straight into the roleplay chat
-// stage. Auto-resumes an existing Quick Play quicksave if one exists;
-// otherwise seeds a fresh world from baked-in default descriptions (see
-// fable.js's DEFAULT_QUICKPLAY_VALUES + devQuickPlayEnter). The actual entry
-// logic lives in fable.js (openFable's DEV branch routes to devQuickPlayEnter
-// instead of showing the title).
-//
-// This shortcut shares the OS boot-skip below (the guard checks for either),
-// so refresh lands in the stage in well under a second. Same production-safety
-// story as DEV_FABLE_SHORTCUT: false under Tauri's custom protocol.
-const DEV_QUICKPLAY_SHORTCUT = (() => {
-  try {
-    const q = new URLSearchParams(window.location.search).get('dev');
-    if (q === 'quickplay') return true;
-    const h = window.location.hash.replace(/^#/, '');
-    return new URLSearchParams(h).get('dev') === 'quickplay';
-  } catch (_) { return false; }
-})();
 // DEV SHORTCUT (?dev=preview or #dev=preview): a PURE-FRONTEND layout preview
 // that skips the OS boot, skips Fable's title, skips ALL backend/IPC (no model
 // load, no API, no fable_send), and drops straight into the chat stage with 4
@@ -1028,15 +1008,15 @@ function spawnLaunchSparkles(parent, count = 18) {
 // listener above keeps its title-indicator job; this is a SEPARATE listener
 // so the title's `typing` no-op guard can't swallow the wake signal.
 (async function setupBootSplash() {
-  // ── DEV SHORTCUT (?dev=fable / ?dev=quickplay): skip the entire OS boot ceremony. ──
-  // When EITHER shortcut is active, the paw hops, the 8s loading screen, and
+  // ── FABLE ENTRY (#fable / fable.exe): skip the entire OS boot ceremony. ──
+  // When FABLE_ENTRY is active, the paw hops, the 8s loading screen, and
   // the aurora reveal are all bypassed. We instead: tear down the boot DOM
   // nodes (so they can't cover Fable), drop the body boot classes (so the OS
   // chrome behaves as already-revealed), fire boot_load_model (so the Fable
   // narrator has its model — without this the engine never spawns), and flip
   // bootDone (so the canvas gate is open for when the user later EXITS Fable
   // back to the OS desktop). The actual Fable launch is wired later, after
-  // initFable() runs (see the DEV_*_SHORTCUT block in the app wiring). We
+  // initFable() runs (see the FABLE_ENTRY block in the app wiring). We
   // still honor check_models: on first-run (models missing) we let the
   // download overlay do its job and bail just like the normal path.
   // DEV PREVIEW: pure-frontend layout preview — no models, no API, no IPC.
@@ -1051,16 +1031,60 @@ function spawnLaunchSparkles(parent, count = 18) {
     return;
   }
 
-  if (DEV_FABLE_SHORTCUT || DEV_QUICKPLAY_SHORTCUT) {
-    const tag = DEV_QUICKPLAY_SHORTCUT ? 'dev-quickplay' : 'dev-fable';
+  if (FABLE_ENTRY) {
+    const tag = 'fable-entry';
+
+    // Reveal the (hidden) main window NOW. It was built .visible(false) in Rust
+    // (lib.rs setup) to hide the WebView2 native-surface flash during init; the
+    // F-logo splash (#fable-entry-splash, painted by static HTML + the inline
+    // head script) is already composited, so this is the FIRST visible frame —
+    // never the native surface. The splash holds ~2s while the Fable title
+    // initializes underneath (launchFable runs during module eval, in parallel
+    // with the check_models await below), then crossfades out (fadeSplash).
+    invoke('fable_reveal_window').catch((e) =>
+      console.warn(`[Wupi] ${tag}: fable_reveal_window failed`, e),
+    );
+    const splash = document.getElementById('fable-entry-splash');
+    const fadeSplash = () => {
+      if (!splash) {
+        // No splash node → nothing to fade, but the html.fable-entry hold
+        // (body-transparent + OS-chrome suppression, styles.css) MUST still
+        // end or the OS chrome stays hidden forever. Drop it now.
+        document.documentElement.classList.remove('fable-entry');
+        return;
+      }
+      // Shared teardown (transitionend + the 1s safety net both land here;
+      // every op is idempotent): once the splash NODE is gone, the
+      // html.fable-entry class has nothing left to gate (the splash's display
+      // rule keys on it) — dropping it also ends the entry hold's
+      // body-transparent override (styles.css), restoring the OS base color
+      // safely behind the now-visible Fable app.
+      const teardown = () => {
+        splash.remove();
+        document.documentElement.classList.remove('fable-entry');
+      };
+      splash.classList.add('fade-out');
+      splash.addEventListener(
+        'transitionend',
+        teardown,
+        { once: true },
+      );
+      // Safety net: remove after the transition regardless (transitionend can
+      // be missed if the tab is backgrounded mid-fade).
+      setTimeout(teardown, 1000);
+    };
+    // Hold the splash ~2s so any remaining init quirks stay hidden behind it,
+    // then dissolve into the now-rendered title screen underneath.
+    setTimeout(fadeSplash, 2000);
+
     try {
       const status = await invoke('check_models');
       if (status?.wupi === 'missing' || status?.embed === 'missing') {
-        console.log(`[Wupi] ${tag} shortcut: models missing, deferring to download overlay`);
+        console.log(`[Wupi] ${tag}: models missing, deferring to download overlay`);
         return;
       }
     } catch (err) {
-      console.warn(`[Wupi] ${tag} shortcut: check_models failed, proceeding`, err);
+      console.warn(`[Wupi] ${tag}: check_models failed, proceeding`, err);
     }
     // Remove the boot DOM so it can't sit on top of Fable.
     document.getElementById('boot-paw')?.remove();
@@ -1082,9 +1106,9 @@ function spawnLaunchSparkles(parent, count = 18) {
     // Fable narrator's first turn needs the WUPI.gguf load to have started;
     // without this the engine thread never spawns in dev mode.
     invoke('boot_load_model').catch((e) => {
-      console.error(`[Wupi] boot_load_model failed (${tag} shortcut)`, e);
+      console.error(`[Wupi] boot_load_model failed (${tag})`, e);
     });
-    console.log(`[Wupi] ${tag} shortcut active — skipping OS boot, launching Fable`);
+    console.log(`[Wupi] ${tag} active — skipping OS boot, launching Fable`);
     return;
   }
 
@@ -1176,7 +1200,11 @@ function spawnLaunchSparkles(parent, count = 18) {
   // hop-2 launches HOP_2_DELAY_MS into the clip so its visual apex lands on
   // the clip's second attack. Each hop's up+down is HOP_DURATION; the gap
   // between hop-1 landing and hop-2 launching is the clip's inter-hop rest.
-  const HOP_DURATION = 175;       // each hop (up + down) — slowed a touch (was 150)
+  // 2026-08-13: whole paw boot + audio sped up 20% per Chloe. HOP_DURATION
+  // scaled 175 → 140 (×0.8) + the hop CLIP rate raised 1.2× → 1.5× (×1.25,
+  // the inverse of 0.8) so the audio quickens to match the hops. The two
+  // stay locked: faster hops + faster clip, apex-synced as before.
+  const HOP_DURATION = 140;       // each hop (up + down) — 20% faster (was 175)
   const HOP_APEX = HOP_DURATION / 2;
   const HOP_HEIGHT = 70;          // px the inner img rises per hop
   // hop-2 launch offset (wall-clock ms after hop-1 launched at clip-start).
@@ -1187,14 +1215,14 @@ function spawnLaunchSparkles(parent, count = 18) {
   // symptom. hop-1 launches at clip-start so its apex naturally lands on
   // attack 1; hop-2's launch was set to the attack TIME, not attack-minus-apex.)
   // So: launch = (attackClipTime / rate) − HOP_APEX.
-  // At 1.2×: (780 / 1.2) − 87.5 = 650 − 87.5 = 562.5 → 563ms.
-  const HOP_2_DELAY_MS = 563;
-  // The clip plays at 1.2× — a gentle quicken from its natural 1× (which read
-  // as a touch slow / dragged) but well shy of the rushed 1.7× (which collapsed
-  // the two hops into one "hop-hop"). 1.2× keeps the clip's own resonant decay
-  // tail (NOT silence) between the two boings while tightening the cadence.
+  // At 1.5×: (780 / 1.5) − 70 = 520 − 70 = 450ms.
+  const HOP_2_DELAY_MS = 450;
+  // The clip plays at 1.5× (raised from 1.2× on the 20%-faster pass). Still
+  // shy of the rushed 1.7× (which collapsed the two hops into one "hop-hop").
+  // 1.5× keeps the clip's own resonant decay tail (NOT silence) between the
+  // two boings while tightening the cadence to match the 20%-faster hops.
   // HOP_2_DELAY_MS above is apex-synced for THIS rate; recompute if it changes.
-  const HOP_PLAYBACK_RATE = 1.2;
+  const HOP_PLAYBACK_RATE = 1.5;
   // Sparkle trail: a sparkle spawns every TRAIL_INTERVAL ms along the paw's
   // path during entry + flight (NOT during hops — those get the escalating
   // bursts). Tuned for perf: tighter interval was creating ~150 concurrent
@@ -1205,9 +1233,11 @@ function spawnLaunchSparkles(parent, count = 18) {
   // smaller"), still prominent in the middle of the screen during the hops.
   const PAW_BOOT_SCALE = 2.8;
   const PAW_REST_SIZE = 45;
-  // Loiter after hop 2 before the corner flight fires. ~1s gives the hop-2
-  // sparkle burst its spotlight before the paw lifts off for the corner.
-  const POST_HOP_LOITER_MS = 1000;
+  // Loiter after hop 2 before the corner flight fires. 2026-08-13: cut 1000 →
+  // 500 per Chloe ("have it move to the top left .5 seconds quicker so it
+  // doesn't linger as long"). The hop-2 sparkle burst still gets a beat, just a
+  // shorter one, before the paw lifts off for the corner.
+  const POST_HOP_LOITER_MS = 500;
   // Straight-line corner flight: fires after the post-hop loiter. Per spec
   // ("just make it a straight line, you aren't curving it correctly") the
   // flight is a single CSS transition to the corner — no WAAPI arc. ~720ms
@@ -2884,7 +2914,7 @@ const dropdownMenu = document.getElementById('dropdownMenu');
           }
           setStatus('');
         })
-        .catch((err) => setStatus('Load failed: ' + err, 'err'));
+        .catch((err) => console.warn('[wupi] load failed', err));
     });
 
     saveBtn?.addEventListener('click', () => {
@@ -3119,7 +3149,7 @@ const dropdownMenu = document.getElementById('dropdownMenu');
         updateConnectEnabled();
         setStatus('');
       } catch (err) {
-        setStatus('Load failed: ' + err, 'err');
+        console.warn('[wupi] load failed', err);
       }
     }
 
@@ -3499,22 +3529,22 @@ initFable({
   closeWindow,
 });
 
-// DEV SHORTCUT (?dev=fable / ?dev=quickplay): now that Fable is registered +
+// DEV SHORTCUT (?dev=fable / ?dev=preview): now that Fable is registered +
 // its openHook is wired, launch it immediately. openFable() (fired by
 // launchFable → AppLifecycle.launchApp) shows #fable, activates chrome, and
 // would normally play the fog gate + boot transition — but its DEV shortcut
 // branch (see openFable in fable.js) skips those cinematics too. From there
 // openFable branches on which shortcut is active: ?dev=fable shows the title
-// screen; ?dev=quickplay skips the title + void-form and drops straight into
-// the roleplay stage (auto-resume if a quicksave exists, else a fresh seed
-// from DEFAULT_QUICKPLAY_VALUES). Production builds never hit this (the param
-// is absent under Tauri's custom protocol).
-if (DEV_FABLE_SHORTCUT || DEV_QUICKPLAY_SHORTCUT || DEV_PREVIEW_SHORTCUT) {
-  // launchFable is now async + API-gated (2026-08-07); the gate popup will
-  // fire if no API is connected, even on the dev shortcut. The dev-preview
-  // path is pure-frontend (no backend) — the import.meta.env.DEV bypass in
-  // launchFable already skips the API gate for it.
-  launchFable().catch((e) => console.error('[Wupi] dev auto-launch failed', e));
+// screen; ?dev=preview drops straight into a pure-frontend stage preview.
+// Production builds never hit this (the param is absent under Tauri's custom
+// protocol).
+if (FABLE_ENTRY || DEV_PREVIEW_SHORTCUT) {
+  // FABLE_ENTRY is true for fable.exe (loaded `wupi.html#fable`) OR the legacy
+  // dev hash; DEV_PREVIEW_SHORTCUT is the pure-frontend layout preview. Both
+  // auto-launch Fable now that it's registered. launchFable() no longer API-
+  // gates entry (the title screen's own buttons gray out without an API), so
+  // this lands on the title screen directly.
+  launchFable().catch((e) => console.error('[Wupi] auto-launch failed', e));
 }
 
 // === PRISM APP WIRING (2026-07-31) =====================================

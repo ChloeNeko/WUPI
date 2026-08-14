@@ -116,12 +116,12 @@ pub fn compose_scene_prompt(s: &WorldSchema) -> String {
 }
 
 /// Phase 5B (2026-07-30): build a scene-image prompt when the travel graph has
-/// no current node. This is the Quick Play / unseeded-graph fallback — without
+/// no current node. This is the unseeded-graph fallback — without
 /// it, `compose_scene_prompt` returned empty + the orchestrator silently
 /// `Skipped` image gen (no image, no toast, no warn-level log), which made SD
-/// appear broken in Quick Play (the §11.48 "graph never seeded on a fresh
-/// game" gap, recurring in a new form). The fallback keeps SD working in
-/// EVERY mode by drawing the scene from whatever state IS available:
+/// appear broken on a fresh game whose graph hadn't seeded yet. The fallback
+/// keeps SD working in EVERY mode by drawing the scene from whatever state IS
+/// available:
 ///
 /// Priority order (first non-empty wins the "where" anchor):
 ///   1. `entities["loc.current"]` — the documented location convention
@@ -138,7 +138,7 @@ pub fn compose_scene_prompt(s: &WorldSchema) -> String {
 /// Returns empty ONLY when there's truly nothing to depict (no loc.current,
 /// no summary, no presences, no clock) — in which case `Skipped` is still the
 /// correct outcome (genuinely nothing to draw). But that's now the rare case,
-/// not the default Quick Play path.
+/// not the default cold-start path.
 fn compose_no_graph_fallback(s: &WorldSchema) -> String {
     let mut parts: Vec<String> = Vec::new();
 
@@ -248,8 +248,9 @@ mod tests {
     }
 
     /// Phase 5B fallback (2026-07-30): no travel graph, but a `loc.current`
-    /// entity is set → the prompt uses it as the "where" anchor. This is the
-    /// Quick Play unblock — SD generates from the entity even without a graph.
+    /// entity is set → the prompt uses it as the "where" anchor. This unblocks
+    /// SD to generate from the entity even without a graph (the cold-start
+    /// case before the travel graph seeds).
     #[test]
     fn compose_no_graph_falls_back_to_loc_current_entity() {
         let mut s = WorldSchema::default();

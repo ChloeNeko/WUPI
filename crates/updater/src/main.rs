@@ -26,16 +26,26 @@
 //! 3. Copy the staged payload into `--target-dir`, honoring the §8C preserve
 //!    rule (skip user data: `data/{user.xml,...}`, `memory/`, `models/`,
 //!    `apps/`). Everything else overwrites in place.
-//! 4. Clean up the staging dir + the downloaded zip, spawn the new
+//! 4. **Purge legacy dead paths** (`purge.rs`) — the compile-time removal
+//!    list (dead pre-reorg state folders, retired engine files). Best-effort;
+//!    a locked path never fails the update.
+//! 5. Clean up the staging dir + the downloaded zip, spawn the new
 //!    `<target>/wupi.exe`, write a result marker, and exit.
 //!
-//! ## Why it runs from %TEMP%
+//! ## Why it runs from %TEMP% — and why it self-deletes
 //!
 //! The install's own `bin/updater.exe` would be locked if we tried to run it
 //! in place (and the payload might want to overwrite it). Running a temp COPY
 //! means the install's `bin/updater.exe` is just an ordinary unlocked file —
-//! the next update overwrites it naturally as part of the payload. Windows temp
-//! cleanup eventually sweeps the stale copy.
+//! the next update overwrites it naturally as part of the payload.
+//!
+//! The temp copy + its debug log are then REMOVED by `self_delete_temp_copy`
+//! before exit: this binary is the one-shot "file deleter" of the §8C purge
+//! design, and it leaves no remnants of itself anywhere — not in the install,
+//! not in `%TEMP%`. (A running Windows exe can't delete its own image, so the
+//! delete is done by a tiny detached `cmd` that outlives this process by ~2s;
+//! guarded to ONLY fire when actually running from `%TEMP%` so dev builds in
+//! `target/` never eat their own binary.)
 //!
 //! ## Failure model
 //!
@@ -51,6 +61,7 @@ use std::path::Path;
 
 mod cli;
 mod preserve;
+mod purge;
 mod stage;
 
 use cli::Args;
@@ -95,6 +106,10 @@ fn main() {
     // the launched exe may be inconsistent — the documented residual risk.)
     spawn_wupi(&args.target_dir);
 
+    // Remove our own %TEMP% copy + log (the no-remnants rule). No-op when not
+    // running from %TEMP% (dev builds) or on non-Windows.
+    self_delete_temp_copy();
+
     std::process::exit(if ok { 0 } else { 1 });
 }
 
@@ -119,8 +134,17 @@ fn run(args: &Args) -> Result<(), String> {
     // 3. Copy into the live install (preserve rule applied). All locks released.
     stage::copy_into_target(&staging, &args.target_dir)?;
 
+    // 3.5. Purge legacy dead paths (§8C purge.rs). Runs AFTER the copy so a
+    //     failed copy never leaves the install half-cleaned, and BEFORE the
+    //     relaunch so the new wupi.exe boots into a clean tree. Best-effort —
+    //     must not fail the update.
+    let purged = purge::purge_legacy(&args.target_dir);
+    if purged > 0 {
+        log(format!("purged {purged} legacy path(s)"));
+    }
+
     // 4. Clean up. Best-effort: a locked staging dir defers to Windows temp
-    //    cleanup; the zip dir is the `data/_update/` the download created.
+    // cleanup; the zip dir is the `data/_update/` the download created.
     let _ = std::fs::remove_dir_all(&staging);
     if let Some(update_dir) = args.zip.parent() {
         let _ = std::fs::remove_dir_all(update_dir);
@@ -210,6 +234,48 @@ fn exe_basename() -> String {
         "wupi".to_string()
     }
 }
+
+/// Remove this binary's own `%TEMP%` copy + its debug log AFTER we exit —
+/// the "no remnants of the file deleter" rule (§8C). A running Windows exe
+/// cannot delete its own image, so we spawn a tiny detached `cmd` that waits
+/// ~2s (by which point this process has exited) and then deletes both files.
+///
+/// GUARDED to only fire when the running exe actually lives under `%TEMP%`
+/// (the normal wupi.exe handoff) — a dev invocation straight from
+/// `crates/updater/target/release/` must not eat its own build output.
+/// Best-effort throughout: a failed delete just leaves the sweep to Windows
+/// temp cleanup, same as the pre-self-delete behavior.
+#[cfg(windows)]
+fn self_delete_temp_copy() {
+    let exe = match std::env::current_exe() {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+    let temp = std::env::temp_dir();
+    if !exe.starts_with(&temp) {
+        return; // Not the %TEMP% handoff copy (dev build) — leave it alone.
+    }
+    let log_path = temp.join(format!("wupi_updater_{}.log", std::process::id()));
+    // `ping -n 3` ≈ 2s sleep (the canonical console-free wait; `timeout`
+    // misbehaves with redirected stdin). Quoted paths; %TEMP% never needs
+    // escaping beyond quotes for cmd.
+    let script = format!(
+        "ping -n 3 127.0.0.1 >nul & del /f /q \"{}\" & del /f /q \"{}\"",
+        exe.display(),
+        log_path.display()
+    );
+    use std::os::windows::process::CommandExt;
+    const DETACHED_PROCESS: u32 = 0x0000_0008;
+    const CREATE_NO_WINDOW: u32 = 0x0200_0000;
+    let _ = std::process::Command::new("cmd.exe")
+        .args(["/C", &script])
+        .creation_flags(DETACHED_PROCESS | CREATE_NO_WINDOW)
+        .spawn();
+}
+
+/// Non-Windows stub: the temp-copy handoff + self-delete are Windows-only.
+#[cfg(not(windows))]
+fn self_delete_temp_copy() {}
 
 /// Headless debug log: append a line to `%TEMP%/wupi_updater_<pid>.log`. There
 /// is no console (the launcher uses CREATE_NO_WINDOW), so this file is the only

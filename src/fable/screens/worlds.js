@@ -10,14 +10,13 @@
 // NAME ONLY), each expanding into a centered modal on click.
 //
 // THE MODAL carries four actions: NEW / LOAD / EDIT / DELETE.
-//   • NEW     → fade transition into Pair 2 (Create/Load Player), reverse-
-//     spawn the buttons, then the New Game flow continues with this card
-//     pre-selected (the player chooses/creates a player → fresh game).
+//   • NEW     → fade transition into the Player pair (slide 1), reverse-
+//     spawn the buttons, then the New Game flow continues (the player
+//     chooses/creates a player → SIM pair → Codex → Intro → fresh game).
 //   • LOAD    → the saves list for this card (screens/saves.js). The per-turn
 //     autosave is promoted to a one-click "Resume Latest" button at the top;
 //     the list below shows the manual saves (most-recent first; the backend
-//     already sorts by timestamp desc). There is NO per-card quicksave — the
-//     autosave IS the latest world state.
+//     already sorts by timestamp desc). The autosave IS the latest world state.
 //   • EDIT    → the raw XML editor (engine/raw-editor.js) loaded with the
 //     card's <sim_card> via fable_card_raw_get_by_id, saved via
 //     fable_card_raw_set_by_id. The <persona> block is a lossy merge of
@@ -32,12 +31,11 @@
 // Game (started/stopped in fable.js onLoadClicked / exitLoadToTitle).
 //
 // Reads FableCardMeta from fable_cards_list:
-//   { id, name, card_type, setting_preview, tone, opening_scene_preview,
-//     player_name, has_saves, portrait, has_portrait }
+//   { id, name, card_type, subtype, setting_preview, tone,
+//     opening_scene_preview, player_name, has_saves, portrait, has_portrait }
 // =============================================================
 
 import { invoke, convertFileSrc } from '@tauri-apps/api/core';
-import { createEmbers } from './embers.js';
 import { openPortraitCropper } from './portrait-cropper.js';
 import { bytesToBase64 } from './wizard-engine.js';
 import { open as openDialog } from '@tauri-apps/plugin-dialog';
@@ -54,7 +52,6 @@ export function buildWorlds(handlers) {
   root.dataset.fableScreen = 'worlds';
   root.hidden = true;
   root.innerHTML = `
-    <div class="fable-ember-host" aria-hidden="true"></div>
     <div class="fable-player-grid" data-host></div>
     <div class="fable-player-modal-overlay" data-modal hidden>
       <div class="fable-player-modal-backdrop" data-modal-backdrop></div>
@@ -70,19 +67,11 @@ export function buildWorlds(handlers) {
       </div>
     </div>
   `;
-  // No ‹ Back header here — the worlds screen mirrors the Player Picker
-  // exactly (embers + grid + modal, no header bar). The flow-chrome ⌂ home
-  // button (top-right) is mounted by fable.js::onLoadClicked and returns to
-  // the title via exitLoadToTitle. (`handlers` is unused at build time — the
-  // per-card modal handlers are passed to renderWorlds — but kept for
-  // signature symmetry with the other picker builders.)
-  // Ambient ember lifecycle (mirrors newgame-split.js). Fresh on show,
-  // destroyed on hide — no RAF leak. The newgame.mp3 + fire.mp3 pair is
-  // started/stopped by fable.js at the title↔worlds transition midpoints.
-  const emberHost = root.querySelector('.fable-ember-host');
-  let embers = null;
-  root._startAmbient = () => { if (!embers) embers = createEmbers(emberHost); };
-  root._stopAmbient = () => { if (embers) { embers.destroy(); embers = null; } };
+  // NOTE: the deep-void background + hearth glow + rising embers NO LONGER
+  // live here — they were hoisted to a persistent .fable-flow-ambiance layer
+  // on #fable (fable.js) so the background stays consistent across screen
+  // swaps (the worlds grid shares the Player Picker's exact layout). This
+  // screen now carries ONLY the foreground UI (the worlds grid + modal).
   return root;
 }
 
@@ -93,11 +82,27 @@ export function buildWorlds(handlers) {
 //
 // The grid + mini-card markup is the EXACT SAME `.fable-player-grid` +
 // `.fable-player-mini-card` language the Player Picker uses (Chloe 2026-08-05:
-// "make the load sim card the SAME as the load player card"). The only delta:
-// a card shows NAME ONLY under the divider (no gender glyph — cards have no
-// gender); a player shows name + gender glyph.
+// "make the load sim card the SAME as the load player card"). 2026-08-13 delta:
+// a SIM card carries a centered TYPE label row (NPC CARD / WORLD CARD /
+// SCENARIO CARD, from <subtype>) ABOVE the portrait, with the name below it.
+// Player cards show name only (the gender glyph was removed from both).
+
+// The card-type label for a SIM mini-card, from its <metadata><subtype>
+// ("npc" | "scenario" | "world"). Old / pre-router cards have no subtype → ''
+// (no label — they render like a plain named card).
+function subtypeLabel(subtype) {
+  const v = (subtype || '').toLowerCase();
+  if (v === 'npc') return 'NPC CARD';
+  if (v === 'scenario') return 'SCENARIO CARD';
+  if (v === 'world') return 'WORLD CARD';
+  return '';
+}
 export async function renderWorlds(root, handlers) {
   root._handlers = handlers || {};
+  // pickMode: a plain "pick a card" grid (no NEW/LOAD/EDIT/DELETE modal). A
+  // card click calls handlers.onSelect(card) instead of openModal. Used by the
+  // New Game flow's LOAD SIM CARD step.
+  const pickMode = !!(handlers && handlers.pickMode && handlers.onSelect);
   const host = root.querySelector('[data-host]');
   host.innerHTML = '';
   closeModal(root);
@@ -126,15 +131,20 @@ export async function renderWorlds(root, handlers) {
     const portraitHTML = card.has_portrait && card.portrait_url
       ? `<div class="fable-player-mini-portrait"><img class="fable-player-mini-portrait-img" src="${esc(convertFileSrc(card.portrait_url))}" alt="" onerror="this.parentNode.classList.add('fable-player-mini-portrait--placeholder')"></div>`
       : `<div class="fable-player-mini-portrait fable-player-mini-portrait--placeholder" aria-hidden="true"></div>`;
-    // NAME ONLY under the divider (per Chloe: "Nothing will show under the
-    // mini cards in load besides name"). No gender glyph (cards have none).
+    // A centered TYPE label (NPC/WORLD/SCENARIO CARD) sits in its own row
+    // ABOVE the portrait; the name stays below the divider (2026-08-13).
+    const typeLabel = subtypeLabel(card.subtype);
     tile.innerHTML = `
+      ${typeLabel ? `<div class="fable-player-mini-type">${esc(typeLabel)}</div>` : ''}
       ${portraitHTML}
       <div class="fable-player-mini-divider" aria-hidden="true"></div>
       <div class="fable-player-mini-info">
         <span class="fable-player-mini-name">${esc(card.name)}</span>
       </div>`;
-    tile.addEventListener('click', () => openModal(root, card));
+    tile.addEventListener('click', () => {
+      if (pickMode) handlers.onSelect(card);
+      else openModal(root, card);
+    });
     host.appendChild(tile);
   }
 }

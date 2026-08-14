@@ -160,7 +160,7 @@ export function paintInjuryHeatmap(sectionEl, gender, bodyMap, detailsMap) {
   const priorTooltip = sectionEl.querySelector(`[${TOOLTIP_DATA_ATTR}]`);
   if (priorTooltip) priorTooltip.remove();
 
-  // No body map → nothing to render. (Dormant / Quick Play pre-seed / IPC
+  // No body map → nothing to render. (Dormant / pre-seed / IPC
   // failure — all route here. Leaves the paperdoll clean.)
   if (!bodyMap || typeof bodyMap !== 'object') return;
 

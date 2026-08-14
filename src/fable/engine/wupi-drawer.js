@@ -56,7 +56,7 @@ let edgeLockVisible = () => false;
 // now opens EMPTY — the user's first message is the first thing in the
 // panel. No intro text explaining "edit NPCs / world" or similar; the
 // panel is a clean slate until the user types.
-const IDLE_PLACEHOLDER = 'Ask Wupi anything…';
+const IDLE_PLACEHOLDER = 'Ask WUPI anything…';
 const STOP_PLACEHOLDER = 'Press Enter to stop…';
 
 export function initWupiDrawer(opts) {

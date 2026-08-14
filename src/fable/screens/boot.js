@@ -7,14 +7,14 @@
 // screen is already visible but the MENU BUTTONS STAY HIDDEN for a deliberate
 // beat (REVEAL_DELAY_MS) so the title art + ambient scene get to breathe on
 // their own. Then the welcome arrives: theme music fades in, the magical
-// ripple aura blooms on the Quick Play button, the ripple SFX plays, and the
-// buttons cascade in (Quick Play → New Game → Load → Continue → Exit). Then
+// ripple aura blooms on the New Game button, the ripple SFX plays, and the
+// buttons cascade in (New Game → Continue + Load → Exit). Then
 // the aura fades and the ripple SFX tails off.
 //
 // TIMELINE (relative to playBootTransition being called = fog just cleared):
 //   t=0.0s   Buttons hidden. Title screen + ambient visible, no menu.
-//   t=1.0s   Music fade-in starts. Ripple Aura spawns on Quick Play.
-//            Buttons stagger-reveal (Quick Play → … → Exit).
+//   t=1.0s   Music fade-in starts. Ripple Aura spawns on New Game.
+//            Buttons stagger-reveal (New Game → … → Exit).
 //   t=2.5s   Aura removed (1s + 1.5s life).
 //   t=3.0s   Ripple SFX fades out.
 //   (Chloe 2026-08-03: REVEAL_DELAY lowered 2s → 1s so the welcome arrives

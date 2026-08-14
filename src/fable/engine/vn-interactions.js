@@ -49,16 +49,14 @@
 // Tuning constants. The flank band mirrors stage.js's EDGE_HIT_PX (14px)
 // so the drawer-trigger shrink + the flank-toggle coexist.
 //
-// History reveal is a binary OPEN/CLOSE: wheel up at the top opens the
-// whole archive in one smooth drop (recent 2 stay pinned); wheel down at
-// the bottom edge snaps it shut again. In between, the open archive is
-// explored with NATIVE scroll (scroll up past the recent beats to read
-// older history). See onFeedWheel + openHistory/closeHistory below.
+// History reveal is a binary OPEN/CLOSE driven by an opacity FADE (no drop,
+// no slide, no height animation): wheel up at the top fades the archive in,
+// wheel down at the bottom edge fades it out. The recent 2 are sticky-pinned
+// (fable.css) so they never move; scrollTop is never touched so the page
+// never scrolls. In between, the open archive is read with NATIVE scroll.
 const RECENT_BEATS = 2;             // last N dialogue beats tagged vn-recent
 const FLANK_BAND_PX = 14;           // dblclick-within-X-px-of-edge toggles portraits
-const REVEAL_DURATION_MS = 340;     // open animation length (one smooth drop)
-const COLLAPSE_DURATION_MS = 130;   // close animation length (fast "pull back up")
-const HISTORY_MARGIN_PX = 10;       // per-beat margin on revealed archive beats (+2 2026-08-11: old beats spaced further apart). Visible gap between adjacent archive beats = 2× this (top+bottom margins sum — flex doesn't collapse).
+const FADE_DURATION_MS = 260;       // matches the .vn-history opacity transition in fable.css — close collapses height only after this fades out
 
 // Module state — all listeners + observers are owned here so teardown()
 // can release every one. The stage DOM is reused across entries (see
@@ -96,177 +94,90 @@ export function refreshHistory() {
 
   // Sync the binary reveal state. When the beat SET changes (a new beat
   // landed, or a load/rebuild rewrote the feed), snap the archive shut
-  // INSTANTLY (no animation) so the new layout settles before the user
-  // re-opens it — chasing a moving beat set mid-open is janky.
+  // instantly so the new layout settles before the user re-opens it.
   const historyCount = Math.max(0, total - RECENT_BEATS);
   if (historyCount !== state.lastHistoryCount) {
     state.lastHistoryCount = historyCount;
     if (state.revealed) {
-      cancelHistoryAnim();
       state.revealed = false;
-      settleClosed(state.feedEl.querySelectorAll('.fable-mes.vn-history'));
+      closeHistory();
     }
   }
 }
 
-// ── Binary wheel-driven history reveal ──────────────────────────
-// The archive is FULLY off-screen at rest (height 0, visibility hidden).
-// Revealing it is a single binary gesture, NOT a per-beat crawl:
-//   • wheel UP at the top (collapsed)   → open the WHOLE archive in one
-//     smooth drop. The drop is bottom-anchored, so the recent 2 stay
-//     pinned at the bottom while the history fills the space above them.
-//   • wheel DOWN at the bottom edge (open) → snap the archive shut fast
-//     (a quick "pull back up" — one block, not a per-message animation).
-//   • everything else → NATIVE scroll. Once open you read the archive by
-//     scrolling normally — scroll up to move past the recent beats into
-//     the older history, scroll back down to return. Only when you reach
-//     the very bottom edge again does it collapse.
+// ── Binary wheel-driven history reveal (opacity FADE) ───────────
+// The archive is fully off-screen at rest (height 0, opacity 0). The reveal
+// is a SMOOTH OPACITY FADE — no drop, no slide, no height animation:
+//   • wheel UP at the top (collapsed)   → open: history snaps to its natural
+//     height (invisibly, at opacity 0) and FADES IN. preventDefault so the
+//     page never scrolls. The sticky recent 2 don't move.
+//   • wheel DOWN at the bottom edge (open) → close: history FADES OUT (height
+//     held during the fade so it doesn't vanish instantly), then collapses
+//     once invisible. preventDefault; recent don't move.
+//   • everything else → NATIVE scroll to read the open archive.
 //
-// The open/close are JS height tweens (height:auto isn't interpolable):
-// every beat animates from its current height to its target (natural on
-// open, 0 on close) as one block. Both directions bottom-anchor scrollTop
-// each frame so the recent 2 stay pinned and never jump.
+// Driven entirely by CSS classes on the feed (.vn-revealed / .vn-fading) +
+// the opacity transition on .vn-history in fable.css. No rAF, no scrollTop
+// manipulation, no per-beat inline styles.
 
 function onFeedWheel(e) {
   if (!state || !state.feedEl) return;
   const feedEl = state.feedEl;
-  const atTop = feedEl.scrollTop <= 0;
-  const atBottom = feedEl.scrollTop + feedEl.clientHeight >= feedEl.scrollHeight - 1;
   const dy = e.deltaY;
-  if (!state.revealed && atTop && dy < 0) {
-    // Collapsed + wheel up at the top → open the archive in one smooth drop.
+  if (!state.revealed && dy < 0) {
+    // Collapsed + ANY wheel up → fade the archive in. We preventDefault so the
+    // page never scrolls on activation — the recent beats must not move. There's
+    // no atTop gate: at rest the feed may be slightly scrolled (or a single
+    // notch takes it off 0), and gating on scrollTop===0 made the first wheel-up
+    // scroll the page instead of activating. The gesture is "wheel up = open",
+    // unconditional while collapsed.
     e.preventDefault();
     openHistory();
-  } else if (state.revealed && atBottom && dy > 0) {
-    // Open + wheel down at the very bottom edge → snap it shut immediately.
-    e.preventDefault();
-    closeHistory();
+  } else if (state.revealed && dy > 0) {
+    const atBottom = feedEl.scrollTop + feedEl.clientHeight >= feedEl.scrollHeight - 1;
+    if (atBottom) {
+      // Open + wheel down at the very bottom edge → fade the archive out.
+      e.preventDefault();
+      closeHistory();
+    }
+    // Else: open but not at the bottom → let native scroll move through the
+    // archive (don't preventDefault). Only the bottom edge closes it.
   }
-  // Otherwise: native scroll — explore the open archive in either direction,
-  // or scroll within tall recent beats.
+  // Otherwise (revealed + wheel up, or no gesture matched) → native scroll.
 }
 
-// Open: every history beat tweens 0 → natural height as one block, over
-// REVEAL_DURATION_MS. Bottom-anchored so the recent 2 stay pinned at the
-// bottom and the archive drops into the space above them.
+// Open: add .vn-revealed (history beats take their natural height, fading in),
+// then PIN scrollTop to the BOTTOM. The height change makes the feed tall;
+// without pinning, scrollTop stays 0 and the view jumps to the TOP (oldest
+// history) — the "teleport above the recent beats." Pinning to the bottom keeps
+// the recent beats exactly where they were (at the viewport bottom), with the
+// history fading in ABOVE them. The user then scrolls UP to read older history.
 function openHistory() {
   const feedEl = state.feedEl;
-  const beats = Array.from(feedEl.querySelectorAll('.fable-mes.vn-history'));
-  if (beats.length === 0) { state.revealed = true; return; }
-  cancelHistoryAnim();
+  if (state.fadeTimer) { clearTimeout(state.fadeTimer); state.fadeTimer = null; }
   state.revealed = true;
-  const targets = captureAndMeasure(beats);
-  const startTime = performance.now();
-  function frame(now) {
-    const p = Math.min(1, (now - startTime) / REVEAL_DURATION_MS);
-    const e = 1 - Math.pow(1 - p, 3);                 // easeOutCubic — settles like a drop
-    for (const t of targets) tweenBeat(t, t.natH, HISTORY_MARGIN_PX, HISTORY_MARGIN_PX, e);
-    feedEl.scrollTop = feedEl.scrollHeight - feedEl.clientHeight;   // bottom-anchor
-    if (p < 1) state.raf = requestAnimationFrame(frame);
-    else settleOpen(beats);
-  }
-  state.raf = requestAnimationFrame(frame);
+  feedEl.classList.remove('vn-fading');
+  feedEl.classList.add('vn-revealed');
+  // Reading scrollHeight forces layout to commit the new (taller) height, then
+  // we pin to the bottom so recent beats stay put.
+  feedEl.scrollTop = feedEl.scrollHeight;
 }
 
-// Close: every history beat tweens natural → 0 as one block, fast
-// (COLLAPSE_DURATION_MS). Bottom-anchored so the recent 2 stay visible as
-// the archive pulls back up. Called from the bottom-edge wheel-down AND
-// from refreshHistory when the beat set changes (a layout reset).
+// Close: fade opacity OUT first (via .vn-fading, which holds height:auto so
+// the beats keep their space while fading), then collapse the height AFTER
+// the fade finishes (removing .vn-fading) — collapsing mid-fade would make
+// them vanish instantly instead of fading. The duration matches the CSS
+// transition (fable.css .vn-history transition: opacity 260ms).
 function closeHistory() {
   const feedEl = state.feedEl;
-  const beats = Array.from(feedEl.querySelectorAll('.fable-mes.vn-history'));
   state.revealed = false;
-  if (beats.length === 0) return;
-  cancelHistoryAnim();
-  const targets = captureAndMeasure(beats);
-  const startTime = performance.now();
-  function frame(now) {
-    const p = Math.min(1, (now - startTime) / COLLAPSE_DURATION_MS);
-    const e = 1 - Math.pow(1 - p, 3);                 // easeOutCubic — quick pull-up
-    for (const t of targets) tweenBeat(t, 0, 0, 0, e);
-    feedEl.scrollTop = feedEl.scrollHeight - feedEl.clientHeight;   // bottom-anchor
-    if (p < 1) state.raf = requestAnimationFrame(frame);
-    else settleClosed(beats);
-  }
-  state.raf = requestAnimationFrame(frame);
-}
-
-// ── reveal helpers ──────────────────────────────────────────────
-
-// Capture each beat's CURRENT height + margin as the tween start (pinning
-// it inline so it holds still through the natural-height measurement), and
-// measure its NATURAL height (height:auto + archive margin) in the same
-// pass — restoring the pinned start before returning so the browser never
-// paints at the auto height (no flash).
-function captureAndMeasure(beats) {
-  return beats.map((el) => {
-    el.style.boxSizing = 'border-box';
-    el.style.overflow = 'hidden';
-    el.style.marginLeft = 'auto';
-    el.style.marginRight = 'auto';
-    const startH = el.getBoundingClientRect().height;
-    const cs = getComputedStyle(el);
-    const startMT = parseFloat(cs.marginTop) || 0;
-    const startMB = parseFloat(cs.marginBottom) || 0;
-    el.style.height = 'auto';
-    el.style.marginTop = HISTORY_MARGIN_PX + 'px';
-    el.style.marginBottom = HISTORY_MARGIN_PX + 'px';
-    const natH = el.getBoundingClientRect().height;
-    el.style.height = startH + 'px';
-    el.style.marginTop = startMT + 'px';
-    el.style.marginBottom = startMB + 'px';
-    return { el, startH, startMT, startMB, natH };
-  });
-}
-
-// Write one beat's interpolated height + margin for tween progress e.
-function tweenBeat(t, endH, endMT, endMB, e) {
-  const h = t.startH + (endH - t.startH) * e;
-  const mt = t.startMT + (endMT - t.startMT) * e;
-  const mb = t.startMB + (endMB - t.startMB) * e;
-  t.el.style.height = h + 'px';
-  t.el.style.marginTop = mt + 'px';
-  t.el.style.marginBottom = mb + 'px';
-  t.el.style.visibility = h < 1 ? 'hidden' : 'visible';
-}
-
-// Settle open: revealed beats keep an inline natural height of `auto`
-// (responsive to resize/reflow, not a frozen px) + the archive margin.
-function settleOpen(beats) {
-  state.raf = null;
-  for (const el of beats) {
-    el.style.boxSizing = '';
-    el.style.marginLeft = '';
-    el.style.marginRight = '';
-    el.style.height = 'auto';
-    el.style.marginTop = HISTORY_MARGIN_PX + 'px';
-    el.style.marginBottom = HISTORY_MARGIN_PX + 'px';
-    el.style.overflow = '';
-    el.style.visibility = 'visible';
-  }
-}
-
-// Settle closed: clear every inline prop so the .vn-history CSS resting
-// state (height:0, margin:0, hidden) governs again.
-function settleClosed(beats) {
-  state.raf = null;
-  for (const el of beats) {
-    el.style.boxSizing = '';
-    el.style.height = '';
-    el.style.marginTop = '';
-    el.style.marginBottom = '';
-    el.style.marginLeft = '';
-    el.style.marginRight = '';
-    el.style.overflow = '';
-    el.style.visibility = '';
-  }
-}
-
-function cancelHistoryAnim() {
-  if (state && state.raf) {
-    cancelAnimationFrame(state.raf);
-    state.raf = null;
-  }
+  feedEl.classList.remove('vn-revealed');
+  feedEl.classList.add('vn-fading');
+  if (state.fadeTimer) clearTimeout(state.fadeTimer);
+  state.fadeTimer = setTimeout(() => {
+    state.fadeTimer = null;
+    if (state && state.feedEl) state.feedEl.classList.remove('vn-fading');
+  }, FADE_DURATION_MS);
 }
 
 // ── Portrait corner snaps (delegated click) ─────────────────────
@@ -276,8 +187,9 @@ function cancelHistoryAnim() {
 // a control never accidentally snaps. No-op on .no-avatar beats (the
 // closest('.fable-mes-avatar-img') resolves null).
 function onFeedClick(e) {
-  // Don't snap when the user is interacting with the side-drawer.
-  if (e.target.closest('.fable-mes-drawer')) return;
+  // Don't snap when the user is interacting with the side-drawer or the
+  // history-beat iron tools column.
+  if (e.target.closest('.fable-mes-drawer, .fable-mes-histools')) return;
   const img = e.target.closest('.fable-mes-avatar-img');
   if (!img) return;
   e.preventDefault();
@@ -303,7 +215,7 @@ function onStageDblClick(e) {
   // Ignore dblclicks that originate on interactive feed content (the
   // editor textarea, control buttons) — those have their own dblclick
   // semantics + shouldn't toggle portrait visibility.
-  if (e.target.closest('.fable-mes-editor, .fable-mes-drawer, .fable-mes-text')) return;
+  if (e.target.closest('.fable-mes-editor, .fable-mes-drawer, .fable-mes-histools, .fable-mes-text')) return;
   const vw = window.innerWidth;
   if (e.clientX <= FLANK_BAND_PX) {
     state.feedEl.classList.toggle('vn-hide-ai-portraits');
@@ -355,8 +267,8 @@ export function init({ stageRoot, feedEl, onEditBeat }) {
     feedEl,
     onEditBeat,
     revealed: false,         // archive open/closed (binary, wheel-triggered)
-    lastHistoryCount: -1,    // last seen history-beat count (change detection → instant collapse)
-    raf: null,               // in-flight open/close tween
+    lastHistoryCount: -1,    // last seen history-beat count (change detection → close)
+    fadeTimer: null,         // close collapses height only after the fade finishes
     observer: null,
   };
 
@@ -388,31 +300,18 @@ export function init({ stageRoot, feedEl, onEditBeat }) {
 
 export function teardown() {
   if (!state) return;
-  // Stop any in-flight reveal tween first so it doesn't fire frames at a
-  // torn-down feed.
-  cancelHistoryAnim();
+  // Cancel the pending close-collapse timer so it can't fire at a torn-down feed.
+  if (state.fadeTimer) { clearTimeout(state.fadeTimer); }
   const { stageRoot, feedEl, boundWheel, boundDblClickStage, boundClickFeed, boundDblClickFeed, observer } = state;
   if (feedEl && boundWheel) feedEl.removeEventListener('wheel', boundWheel);
   if (stageRoot && boundDblClickStage) stageRoot.removeEventListener('dblclick', boundDblClickStage);
   if (feedEl && boundClickFeed) feedEl.removeEventListener('click', boundClickFeed);
   if (feedEl && boundDblClickFeed) feedEl.removeEventListener('dblclick', boundDblClickFeed);
   if (observer) observer.disconnect();
-  // Clear any vn-* state classes we put on the feed so a re-entry isn't
-  // stuck revealed / portrait-hidden.
+  // Clear the reveal/fade classes we put on the feed so a re-entry doesn't
+  // inherit a stuck-open archive, plus the portrait-toggle classes.
   if (feedEl) {
-    feedEl.classList.remove('vn-revealed', 'vn-hide-ai-portraits', 'vn-hide-user-portraits');
-    // Clear any inline height/margin/visibility left on history beats by a
-    // mid-tween teardown so a re-entry doesn't inherit stale overrides.
-    feedEl.querySelectorAll('.fable-mes.vn-history').forEach((el) => {
-      el.style.boxSizing = '';
-      el.style.height = '';
-      el.style.marginTop = '';
-      el.style.marginBottom = '';
-      el.style.marginLeft = '';
-      el.style.marginRight = '';
-      el.style.overflow = '';
-      el.style.visibility = '';
-    });
+    feedEl.classList.remove('vn-revealed', 'vn-fading', 'vn-hide-ai-portraits', 'vn-hide-user-portraits');
   }
   // Clear snapped portraits so a re-entry doesn't inherit orphan fixed sprites.
   if (feedEl) {

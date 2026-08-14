@@ -12,7 +12,7 @@
 // SCENARIO) stay one line. The split is pure (no DOM), returns an HTML
 // string of <span class="fable-tile-line">…</span> rows; CSS makes each
 // row display:block so they stack. Used by every screen that renders a
-// .fable-newgame-tile-caption (newgame-split, quickplay-split, creator
+// .fable-newgame-tile-caption (newgame-split, creator
 // gates, + rebuildSplitTiles in fable.js) so the rule lives in ONE place.
 // =============================================================
 

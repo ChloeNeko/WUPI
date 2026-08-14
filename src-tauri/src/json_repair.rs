@@ -29,9 +29,11 @@
 //! 1. Smart quotes → ASCII quotes (`"` `"` `''` `'` → `"` `'`).
 //! 2. Trailing commas (`{"a":1,}` → `{"a":1}`).
 //! 3. Unquoted object keys (`{a:1}` → `{"a":1}`).
-//! 4. Unescaped newlines inside string values (`"a\nb"` where the `\n` is a
+//! 4. Top-level brace-less object bodies (`"a":1` → `{"a":1}` — the outer
+//!    `{}` dropped entirely; a truncation artifact).
+//! 5. Unescaped newlines inside string values (`"a\nb"` where the `\n` is a
 //!    LITERAL newline, not the escape sequence → `"a\\nb"`).
-//! 5. Unbalanced brackets/braces (best-effort: append the missing closers or
+//! 6. Unbalanced brackets/braces (best-effort: append the missing closers or
 //!    drop a stray closer — a common truncation artifact when the model runs
 //!    into `max_tokens`).
 //! 6. Markdown fences (belt-and-suspenders with `extract_reply_channel`: a
@@ -57,9 +59,54 @@ pub fn repair(raw: &str) -> String {
     let s = normalize_quotes(&s);
     let s = strip_trailing_commas(&s);
     let s = quote_unquoted_keys(&s);
+    let s = wrap_bare_object(&s);
     let s = escape_bare_newlines_in_strings(&s);
     let s = strip_stray_code_fences(&s);
     balance_brackets(&s)
+}
+
+/// Wrap a top-level brace-less object body in `{…}`. A truncated/mangled LLM
+/// emit can drop the outer braces entirely (`"summary": "ok"` — smart quotes
+/// normalized, keys quoted, but no `{`/`}` in sight). Unambiguous shape: the
+/// trimmed input STARTS with a string opener AND contains a top-level `:`
+/// (outside any string). A bare top-level JSON string (`"hello"` — no
+/// top-level colon), number, bool, or already-braced/bracketed value is left
+/// alone (they're valid JSON as-is; wrapping would corrupt them).
+fn wrap_bare_object(s: &str) -> String {
+    let t = s.trim();
+    if !t.starts_with('"') {
+        return s.to_string();
+    }
+    // Scan for a top-level colon (outside strings) — same string-state
+    // machine as balance_brackets, byte-linear per §1B.2.
+    let mut in_string = false;
+    let mut escape_next = false;
+    let mut has_top_level_colon = false;
+    for b in t.bytes() {
+        if in_string {
+            if escape_next {
+                escape_next = false;
+            } else if b == b'\\' {
+                escape_next = true;
+            } else if b == b'"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match b {
+            b'"' => in_string = true,
+            b':' => {
+                has_top_level_colon = true;
+                break;
+            }
+            _ => {}
+        }
+    }
+    if has_top_level_colon {
+        format!("{{{t}}}")
+    } else {
+        s.to_string()
+    }
 }
 
 /// Normalize smart quotes to ASCII. LLMs trained on prose corpora emit `" "`

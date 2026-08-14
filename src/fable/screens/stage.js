@@ -21,9 +21,8 @@
 // BACKGROUND + WEATHER STRIPPED: the bg <img>, the tone-keyword bg picker,
 // and (2026-08-03) the entire atmosphere system (time-of-day background
 // filter, keyword-scan weather particles, and mouse parallax) were all
-// removed. The stage is a pure black void for ALL games now — Quick Play
-// lands here straight from the void interview, and the manual-card path no
-// longer has a tavern card to source a bg from. The `.fable-stage-bg`
+// removed. The stage is a pure black void for ALL games now — no card
+// sources a background. The `.fable-stage-bg`
 // element stays in the DOM as a no-op over the black .fable-stage so a
 // future bg re-add is a one-line structural change. Explicit narrator
 // [FX ...] brackets still drive fx/effects.js (a separate, opt-in path).
@@ -31,7 +30,6 @@
 
 import * as beats from '../engine/beats.js';
 import * as narrator from '../engine/narrator.js';
-import { swipeNextAction } from '../engine/drawer-logic.js';
 import * as wupiDrawer from '../engine/wupi-drawer.js';
 import * as leftDrawer from '../engine/left-drawer.js';
 // VN INTERACTIONS (2026-08-11): the behavior layer over the .fable-mes feed
@@ -42,6 +40,10 @@ import * as leftDrawer from '../engine/left-drawer.js';
 // stage.js stores the handle + tears it down in teardownStage so the reused
 // stage DOM doesn't accumulate listeners/observer across entries.
 import * as vn from '../engine/vn-interactions.js';
+// SLICE REGENERATE (golden pencil, 2026-08-11): highlights a span of an AI
+// message → floating brass pencil → click regenerates only that span in
+// place. Self-contained + removable (mirrors vn: returns { teardown }).
+import { initSliceRegen } from '../engine/slice-regen.js';
 // isActionPopupOpen feeds the left drawer's mouseleave guard: the action popup
 // is appended to document.body, so reaching for CONSUME/EQUIP/etc. would
 // otherwise fire the drawer's mouseleave + yank it in mid-click. See
@@ -64,6 +66,11 @@ import { saveNow } from '../engine/saves-io.js';
 // (one marker file, not per-card). Self-contained: builds + caches its own
 // overlay appended to the stage (mirrors the save-overlay pattern).
 import * as backgrounds from '../engine/backgrounds.js';
+// ONLINE PANEL (2026-08-14): the 5th WUPI-drawer foot button (API). Opens the
+// same in-Fable API connection window the title's ONLINE button uses
+// (buildOnlinePanel — body-mounted, self-contained close) so the player can
+// swap provider/model mid-roleplay without leaving the stage.
+import { buildOnlinePanel } from './online.js';
 import { initPanelManager, summon as summonPanel, dismissPanel, isActive as panelActive } from '../panels/manager.js';
 import { setMapTheme } from '../panels/map.js';
 // DEV PREVIEW (?dev=preview): pure-frontend layout preview with no backend.
@@ -130,6 +137,9 @@ let stageListeners = [];
 // module-internal details stage.js shouldn't enumerate) — its teardown() is
 // the single release point.
 let vnApi = null;
+// Slice-regen handle ({ teardown } from initSliceRegen). Same discipline as
+// vnApi: stored here so teardownStage releases it; null when no live session.
+let sliceApi = null;
 
 export function buildStage() {
   const root = document.createElement('section');
@@ -203,7 +213,7 @@ export function buildStage() {
       <div class="fable-tab-rail-mount" data-tab-rail-mount></div>
       <div class="fable-wupi-messages" data-wupi-messages></div>
       <form class="fable-wupi-input-row" data-wupi-form>
-        <textarea class="fable-wupi-input" data-wupi-input rows="1" placeholder="Ask Wupi anything…"></textarea>
+        <textarea class="fable-wupi-input" data-wupi-input rows="1" placeholder="Ask WUPI anything…"></textarea>
       </form>
       <!-- Drawer footer: the stage's save/load/home controls as ICON
            buttons. Phase 2: the native emoji glyphs (💾 📂 🏠) were replaced
@@ -216,9 +226,8 @@ export function buildStage() {
         <div class="fable-wupi-foot-actions">
           <!-- Background Library (2026-08-11): the 4th foot tool, FIRST child
                so it lands far-left (the flex row is DOM-ordered LTR, centered).
-               Opens the gallery modal over the stage. Visible in ALL modes
-               (including Quick Play — backgrounds are global, unlike
-               Save/Load which Quick Play hides). -->
+               Opens the gallery modal over the stage. Visible in ALL modes —
+               backgrounds are global. -->
           <button class="fable-foot-icon" data-foot-bg aria-label="Background" title="Background">
             <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="5" width="18" height="14" rx="2" fill="none" stroke="currentColor" stroke-width="1.6"/><circle cx="8.5" cy="10" r="1.6" fill="currentColor"/><path d="M3 16l4.5-4 3.5 3 4-5 6 6" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round" stroke-linecap="round"/></svg>
           </button>
@@ -227,6 +236,14 @@ export function buildStage() {
           </button>
           <button class="fable-foot-icon" data-foot-load aria-label="Load" title="Load">
             <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 7a2 2 0 0 1 2-2h5l2 2h7a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7z" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/><path d="M12 17V9M12 9l-3 3M12 9l3 3" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          </button>
+          <!-- API (2026-08-14): the 5th foot tool, 2nd-to-last (between Load
+               and Home). Opens the in-Fable API connection window (the SAME
+               buildOnlinePanel the title's ONLINE button opens) so the player
+               can swap provider/model mid-roleplay without leaving the stage.
+               Also the reconnect path after a mid-session api_lost. -->
+          <button class="fable-foot-icon" data-foot-api aria-label="API" title="API">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 8V3M15 8V3" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/><path d="M6 8h12v5a4 4 0 0 1-4 4h-4a4 4 0 0 1-4-4V8z" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/><path d="M12 17v4" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>
           </button>
           <button class="fable-foot-icon" data-foot-home aria-label="Home" title="Home">
             <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 11l8-7 8 7" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/><path d="M6 10v9a1 1 0 0 0 1 1h10a1 1 0 0 0 1-1v-9" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/><path d="M10 20v-5h4v5" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/></svg>
@@ -293,7 +310,104 @@ export async function wireStage(root, hooks) {
 
   // Engine init (composition root). beats owns the [data-feed] dialogue
   // surface; hand it the element so its builders can append cards.
-  beats.initBeats(root.querySelector('[data-feed]'));
+  const feedEl = root.querySelector('[data-feed]');
+  beats.initBeats(feedEl);
+  // HOVER TOOLRAIL click routing (2026-08-14): one delegated listener on
+  // the feed routes [data-drawer-act] button clicks to the narrator.js
+  // mutation wrappers. vn-interactions already short-circuits its
+  // snap/dblclick handlers for .fable-mes-drawer, so these clicks are
+  // isolated. Gated on isGenerating/isRerolling so no mid-stream mutation —
+  // EXCEPT › during an in-flight REROLL (the interrupt-and-restart affordance).
+  //   edit   → enterEditMode (user → rewindAndEditUser, AI → editMessage);
+  //            a SECOND press while the editor is open SAVES the edit
+  //            (commit — the ✎ toggles, mirroring Enter; Esc cancels)
+  //   delete → deleteMessage (with a confirm — destructive)
+  //   prev   → swipeVariant(index, active-1)
+  //   next   → swipeNextAction: swipe to the next variant, OR reroll at the
+  //            last variant. There is NO dedicated Regenerate button
+  //            (permanently removed 2026-08-14) — the ▼ arrow IS the
+  //            regenerate feature (cut the local tracker + switch back and
+  //            forth); engine/drawer-logic.js pins the fold branch.
+  //
+  // SINGLE-EDITOR DISCIPLINE (2026-08-14): the feed allows ONE inline editor.
+  // Every action below first commits any OTHER open editor + waits out its
+  // save — a second editor's text would otherwise be silently lost when the
+  // first save's feed rebuild lands (the rebuild replaces every node, and a
+  // user-beat save REWINDS, which truncates beats + shifts indexes).
+  feedEl.addEventListener('click', async (e) => {
+    // Both control surfaces route here: the .vn-recent hover toolrail AND
+    // the .vn-history iron tools column (same data-drawer-act hooks).
+    const btn = e.target.closest(
+      '.fable-mes-drawer [data-drawer-act], .fable-mes-histools [data-drawer-act]');
+    if (!btn || btn.disabled) return;
+    let beat = btn.closest('.fable-mes');
+    if (!beat) return;
+    const index = Number.parseInt(beat.dataset.index || '-1', 10);
+    const role = beat.dataset.role;
+    const act = btn.dataset.drawerAct;
+    if (narrator.isGenerating() || narrator.isRerolling()) {
+      // Mid-turn, exactly ONE control stays live (Stage 3): › during an
+      // in-flight REROLL aborts the roll (discard the partial + revert the
+      // schema to base) and immediately starts a fresh one. Everything else
+      // waits for the turn to finish.
+      if (act === 'next' && narrator.isRerolling()) narrator.interruptAndReroll();
+      return;
+    }
+    if (act === 'edit' && beats.exitEditMode(beat, true)) {
+      // Same-beat ✎ toggle: the edit just SAVED. Its save (tracker
+      // re-track) is now in flight — every other action waits it out via
+      // the isGenerating gate above.
+      return;
+    }
+    if (act === 'delete' && beats.isEditing(beat)) {
+      // Deleting the beat being edited: DISCARD the editor (no save — the
+      // beat is about to vanish; saving + re-tracking it first would be
+      // pure waste).
+      beats.exitEditMode(beat, false);
+    }
+    // A DIFFERENT beat's editor may still be open — commit it + let the
+    // save settle before mutating anything else.
+    const openBeat = beats.openEditingBeat();
+    const pendingSave = beats.commitOpenEditor();
+    if (pendingSave) {
+      await pendingSave;
+      if (narrator.isGenerating() || narrator.isRerolling()) return;
+      // A user-beat save rewound the timeline (truncation + regen): indexes
+      // shifted — bail + let the user re-orient. An AI-beat save
+      // (editMessage) rebuilds the feed WITHOUT shifting indexes →
+      // re-resolve the target node (the rebuild replaced it) + continue.
+      if (openBeat && openBeat.dataset.role === 'user') return;
+      const fresh = feedEl.querySelector(`.fable-mes[data-index="${index}"]`);
+      if (!fresh) return;
+      beat = fresh;
+    }
+    if (act === 'edit') {
+      beats.enterEditMode(beat, {
+        onSave: (text) => {
+          // Player → rewind + branch + regen ("I changed what I did");
+          // AI beat → edit + schema re-track ("the beat now says something
+          // else — undo its last track + re-track the new information").
+          // Mirrors the onEditBeat hook above (the ✎/dblclick routing).
+          // The returned promise propagates through exitEditMode/
+          // commitOpenEditor so the single-editor handoff can await it.
+          if (role === 'user') return narrator.rewindAndEditUser(index, text);
+          return narrator.editMessage(index, text);
+        },
+      });
+    } else if (act === 'delete') {
+      if (!window.confirm('Delete this message?')) return;
+      narrator.deleteMessage(index);
+    } else if (act === 'prev') {
+      const active = Number.parseInt(beat.dataset.variantActive || '0', 10);
+      if (active > 0) narrator.swipeVariant(index, active - 1);
+    } else if (act === 'next') {
+      const count = Number.parseInt(beat.dataset.variantCount || '1', 10);
+      const active = Number.parseInt(beat.dataset.variantActive || '0', 10);
+      const action = beats.swipeNextAction({ count, active });
+      if (action.kind === 'swipe') narrator.swipeVariant(index, action.variantIdx);
+      else narrator.rerollLastTurn();
+    }
+  });
   // VN INTERACTIONS: attach the behavior layer (history mask, snaps, flank
   // dblclick, dblclick-to-edit) to the same feed + stage. Initialized AFTER
   // beats.initBeats so the feedEl ref is live + any seed beats (opening scene
@@ -304,16 +418,36 @@ export async function wireStage(root, hooks) {
   vnApi = vn.init({
     stageRoot: root,
     feedEl: root.querySelector('[data-feed]'),
-    onEditBeat: (beat) => {
-      if (narrator.isGenerating()) return;
+    onEditBeat: async (beat) => {
+      if (narrator.isGenerating() || narrator.isRerolling()) return;
+      // Same-beat dblclick → SAVE (same as the ✎ toggle + Enter; Esc is
+      // the cancel gesture), never a re-enter (which would nest editors +
+      // drop the in-progress edits).
+      if (beats.exitEditMode(beat, true)) return;
+      // Another beat's editor is open → commit it + wait out its save
+      // (single-editor discipline — see the feed click handler above).
+      const openBeat = beats.openEditingBeat();
+      const pendingSave = beats.commitOpenEditor();
+      if (pendingSave) {
+        await pendingSave;
+        if (narrator.isGenerating() || narrator.isRerolling()) return;
+        // A user-beat save rewound the timeline — bail; otherwise the
+        // editMessage rebuild replaced the nodes → re-resolve by index.
+        if (openBeat && openBeat.dataset.role === 'user') return;
+        const fresh = feedEl.querySelector(`.fable-mes[data-index="${beat.dataset.index}"]`);
+        if (!fresh) return;
+        beat = fresh;
+      }
       const index = Number.parseInt(beat.dataset.index || '-1', 10);
       const isUser = beat.dataset.role === 'user';
       beats.enterEditMode(beat, {
         onSave: (text) => {
           // Player → rewind + branch + regen ("I changed what I did"); AI
-          // beat → in-place prose tweak (no inference). Inverted from the
-          // prior wiring (which called rewind_and_edit_user on assistant
-          // beats — that errors: the command requires a user target).
+          // beat → edit + schema re-track (the backend reverts to the
+          // message's base_schema + re-runs the local tracker). Inverted
+          // from the prior wiring (which called rewind_and_edit_user on
+          // assistant beats — that errors: the command requires a user
+          // target).
           if (isUser) narrator.rewindAndEditUser(index, text);
           else narrator.editMessage(index, text);
         },
@@ -380,6 +514,16 @@ export async function wireStage(root, hooks) {
     },
   });
 
+  // Golden-pencil slice regen: highlight a span of an AI message → a brass
+  // pencil floats at the selection's right edge → click regenerates only that
+  // span in place. isGenerating gates it off during any turn; the regen routes
+  // through narrator.regenerateSlice (own Channel + slice_done protocol).
+  // Torn down in teardownStage alongside vnApi.
+  sliceApi = initSliceRegen({
+    isGenerating: narrator.isGenerating,
+    onRegenerate: narrator.regenerateSlice,
+  });
+
   // Panel manager: overlay + host. onDismiss hides the overlay element.
   const panelOverlay = root.querySelector('[data-panel-overlay]');
   const panelHost = root.querySelector('[data-panel-host]');
@@ -416,11 +560,22 @@ export async function wireStage(root, hooks) {
   // focusable + enabled during generation so the empty-Enter-to-stop works.
   const inputForm = root.querySelector('[data-input-form]');
   const input = root.querySelector('[data-input]');
-  on(inputForm, 'submit', (e) => {
+  on(inputForm, 'submit', async (e) => {
     e.preventDefault();
     const text = input.value.trim();
     // Block new turns while a narrator turn is in flight.
     if (!text || narrator.isGenerating()) return;
+    // Single-editor discipline: settle any open inline editor BEFORE the
+    // turn starts — a save fired mid-generation would be dropped by
+    // narrator's generating guard while its optimistic DOM update had
+    // already landed (silent desync). Committing a USER-beat editor here
+    // runs its rewind + regen first; the composer text then sends as the
+    // follow-up turn (correct order, nothing lost).
+    const pendingSave = beats.commitOpenEditor();
+    if (pendingSave) {
+      await pendingSave;
+      if (narrator.isGenerating() || narrator.isRerolling()) return;
+    }
     input.value = '';
     input.style.height = 'auto';
     narrator.sendFableTurn(text);
@@ -435,8 +590,12 @@ export async function wireStage(root, hooks) {
         return;
       }
       if (narrator.isGenerating() && !input.value.trim()) {
-        // Empty Enter mid-generation → stop. The seamless stop affordance.
-        narrator.stopFableTurn();
+        // Empty Enter mid-generation → stop. Route to the slice cancel slot
+        // if a golden-pencil regen is in flight (distinct from the full-turn
+        // fable_stop slot — Bug #7 cross-wire lesson); otherwise the normal
+        // narrator stop. The seamless stop affordance.
+        if (narrator.isSliceRegenerating()) narrator.stopSliceRegen();
+        else narrator.stopFableTurn();
         return;
       }
       inputForm.requestSubmit();
@@ -445,86 +604,12 @@ export async function wireStage(root, hooks) {
   on(input, 'input', () => autoGrow(input));
   setGenerating(false);
 
-  // Per-beat UX controls: a single delegated click handler on the feed
-  // routes the drawer's data-action buttons to the narrator API. The
-  // backend (edit_message / rewind_and_edit_user / reroll_last_turn /
-  // swipe_variant / delete_message) is the source of truth — the DOM is
-  // regenerated from the returned messages[] where applicable. The drawer
-  // (built by beats.renderMessageDrawer) lives in beats.js; this handler
-  // only routes clicks. Regenerate is FOLDED INTO › (there is no separate
-  // ↻ button): › at the last variant of the trailing assistant beat rerolls.
-  // All actions except the two-step delete-confirm arm are blocked while a
-  // turn is in flight (the ›-during-generation interrupt is wired later).
-  // Tracked via on() so teardown removes it.
-  const feed = root.querySelector('[data-feed]');
-  on(feed, 'click', (e) => {
-    const btn = e.target.closest('[data-action]');
-    if (!btn) return;
-    const beat = btn.closest('.fable-mes');
-    if (!beat) return;
-    const action = btn.dataset.action;
-    const index = Number.parseInt(beat.dataset.index || '-1', 10);
-
-    // Two-step inline delete confirm: first click arms a 3.5s window + morphs
-    // the button to a check; a second click within it confirms. A timeout
-    // (or any re-render) restores the default delete button. No native dialog.
-    if (action === 'delete') {
-      if (narrator.isGenerating()) return;
-      btn.dataset.action = 'delete-confirm';
-      btn.classList.add('is-confirming');
-      btn.setAttribute('title', 'Click again to confirm delete');
-      btn.innerHTML = '<svg viewBox="0 0 24 24" aria-hidden="true" focusable="false" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>';
-      if (btn._deleteTimer) clearTimeout(btn._deleteTimer);
-      btn._deleteTimer = setTimeout(() => { beats.renderMessageDrawer(beat); }, 3500);
-      return;
-    }
-    if (action === 'delete-confirm') {
-      if (btn._deleteTimer) { clearTimeout(btn._deleteTimer); btn._deleteTimer = null; }
-      if (narrator.isGenerating()) return;
-      narrator.deleteMessage(index);
-      return;
-    }
-
-    // › during an in-flight REROLL: interrupt it + auto-reroll (Stage 3,
-    // 2026-08-11). The drawer only enables › at the trailing assistant beat's
-    // last variant; mid-reroll that's the beat being re-streamed, so re-pressing
-    // › abandons this roll + starts a fresh one (cancel → revert schema to base
-    // → reroll). A normal turn in flight is left alone (its streaming beat has
-    // no drawer; › on an older beat mid-turn would reroll the wrong turn).
-    if (action === 'swipe-next' && narrator.isGenerating()) {
-      if (narrator.isRerolling()) narrator.interruptAndReroll();
-      return;
-    }
-
-    // Everything below is blocked mid-generation.
-    if (narrator.isGenerating()) return;
-
-    if (action === 'swipe-prev') {
-      const active = Number.parseInt(beat.dataset.variantActive || '0', 10);
-      if (active <= 0) return;
-      narrator.swipeVariant(index, active - 1);
-    } else if (action === 'swipe-next') {
-      const count = Number.parseInt(beat.dataset.variantCount || '1', 10);
-      const active = Number.parseInt(beat.dataset.variantActive || '0', 10);
-      const next = swipeNextAction({ count, active });
-      if (next.kind === 'swipe') {
-        narrator.swipeVariant(index, next.variantIdx);
-      } else {
-        // At the last variant → fold into Regenerate. The drawer only enables ›
-        // here on the trailing assistant beat, so this is the reroll trigger.
-        narrator.rerollLastTurn();
-      }
-    } else if (action === 'edit') {
-      // Player message → rewind + branch + regen; AI beat → in-place edit.
-      const isUser = beat.dataset.role === 'user';
-      beats.enterEditMode(beat, {
-        onSave: (text) => {
-          if (isUser) narrator.rewindAndEditUser(index, text);
-          else narrator.editMessage(index, text);
-        },
-      });
-    }
-  });
+  // Per-beat UX controls (edit / delete / ‹ › variant nav) are RETIRED
+  // (2026-08-11): the hover side-drawer UI was removed pending a redesign.
+  // The backend mutation API is untouched in narrator.js (editMessage /
+  // deleteMessage / swipeVariant / rerollLastTurn / rewindAndEditUser) +
+  // the pure decision logic survives in engine/drawer-logic.js, ready to
+  // wire to whatever per-beat surface replaces the drawer.
 
   // Wupi trigger: invisible right-edge strip with a 300ms dwell.
   // No visible button (decision 1). The strip element is sized/positioned
@@ -706,17 +791,8 @@ export async function wireStage(root, hooks) {
   const footBg = root.querySelector('[data-foot-bg]');
   const footSave = root.querySelector('[data-foot-save]');
   const footLoad = root.querySelector('[data-foot-load]');
+  const footApi = root.querySelector('[data-foot-api]');
   const footHome = root.querySelector('[data-foot-home]');
-
-  // Quick Play mode: the session auto-saves its single quicksave slot on
-  // fable_end (Home/Exit) — there is no manual save list + no load list. Hide
-  // the Save + Load footer buttons so the only affordance is Home (which
-  // triggers the auto-quicksave). The narrator feed, Wupi drawer, and all UX
-  // chat controls stay fully active.
-  if (hooks.isQuickPlay) {
-    if (footSave) footSave.hidden = true;
-    if (footLoad) footLoad.hidden = true;
-  }
 
   // Save icon → open the modal + focus the name input.
   on(footSave, 'click', () => {
@@ -776,6 +852,16 @@ export async function wireStage(root, hooks) {
     wupiDrawer.closeDrawer();
     backgrounds.openBackgroundsPanel(root);
   });
+  // API foot button (2026-08-14): open the in-Fable API connection window (the
+  // same panel the title's ONLINE button opens). Close the drawer first (the
+  // popup is body-mounted above everything; an open drawer would sit under
+  // its backdrop). Connecting from here is ALSO the recovery path for a
+  // composer locked by a mid-session api_lost — see onStageApiChanged.
+  on(footApi, 'click', () => {
+    if (footApi.disabled) return;
+    wupiDrawer.closeDrawer();
+    openStageOnlinePanel();
+  });
 
   // Esc: dismiss panel → close wupi.
   document.addEventListener('keydown', onKeyDown, true);
@@ -788,7 +874,7 @@ export async function wireStage(root, hooks) {
   //   - hooks.openingScene: a fresh game's one-shot narrator beat (the
   //     card's .intro), rendered as the sole assistant card. Used only
   //     when there's no history to rebuild from.
-  // A cold Quick Play start has neither — the first fable_send turn
+  // A cold start has neither — the first fable_send turn
   // streams the opening beat live.
   beats.clearFeed();
   if (Array.isArray(hooks.loadMessages) && hooks.loadMessages.length) {
@@ -821,11 +907,32 @@ export async function wireStage(root, hooks) {
 // 2026-08-02: "automatically size the box as you type in more lines with
 // a max limit of 4 lines"). Beyond 4 lines the field scrolls internally
 // (the scrollbar is hidden via CSS — still scrollable, no visual handle).
-// 4 lines × line-height 1.5 × 17px = 102px + 26px vertical padding = 128px.
-const INPUT_MAX_HEIGHT = 128;
+// Cap the auto-grow at exactly 2 rendered lines. Computed from the textarea's
+// LIVE computed style (font-size × line-height) + its vertical padding so the
+// cap tracks the real metrics instead of drifting on a magic pixel constant.
+// (Was 4 lines; capped at 2 lines 2026-08-14 per Chloe.)
+const INPUT_MAX_LINES = 2;
+function inputMaxHeightPx(el) {
+  const cs = getComputedStyle(el);
+  const lineHeight = parseFloat(cs.lineHeight) || (parseFloat(cs.fontSize) * 1.5);
+  const padTop = parseFloat(cs.paddingTop) || 0;
+  const padBottom = parseFloat(cs.paddingBottom) || 0;
+  return Math.ceil(lineHeight * INPUT_MAX_LINES + padTop + padBottom);
+}
 function autoGrow(el) {
   el.style.height = 'auto';
-  el.style.height = Math.min(el.scrollHeight, INPUT_MAX_HEIGHT) + 'px';
+  const max = inputMaxHeightPx(el);
+  // Cap at the 2-line height; if content exceeds it, CLAMP to the cap and let
+  // the textarea scroll internally (overflow flipped to auto in CSS once over).
+  // Setting exactly `max` (not scrollHeight) means the box never grows to show
+  // a 3rd line peeking — the 3rd line lives below the fold, scrollable but
+  // invisible until the user scrolls.
+  const clamped = Math.min(el.scrollHeight, max);
+  el.style.height = clamped + 'px';
+  // Once content overflows the 2-line cap, switch to auto overflow so the
+  // cursor can still navigate the hidden 3rd+ lines; otherwise hidden so no
+  // half-line peeks at the bottom edge.
+  el.style.overflow = el.scrollHeight > max + 1 ? 'auto' : 'hidden';
 }
 
 // Track a stage-element listener so teardownStage can remove it (prevents
@@ -922,8 +1029,58 @@ async function retryIfApiReady() {
   }
 }
 
+// ── In-stage API connection window (2026-08-14) ──────────────────────────
+// The Wupi drawer's API foot button opens the SAME panel the title's ONLINE
+// button opens (buildOnlinePanel — body-mounted above every stage surface,
+// self-contained ✕/Esc/backdrop close). Mounted with the same ritual as
+// fable.js's openOnlinePanel: singleton guard + append + reflow + .is-open.
+// The title needs no refresh ping from here — _startAmbient re-runs
+// _refreshTitleGate on every title show, so the gate reflects whatever API
+// state the player left behind when they return Home.
+function openStageOnlinePanel() {
+  if (document.querySelector('.fable-online-popup')) return;  // already open
+  const panel = buildOnlinePanel({ onChanged: onStageApiChanged });
+  document.body.appendChild(panel);
+  // Force a reflow so the opacity transition runs (mounts at 0).
+  void panel.offsetWidth;
+  panel.classList.add('is-open');
+}
+
+// The panel's onChanged (fires on connect/disconnect/profile edits + close).
+// Stage-side concern only: if the narrator composer is locked by a mid-session
+// api_lost and an API is (re)connected through the panel, unlock it + restore
+// the stashed pending turn into the box so the player can resume with one
+// Enter. No-op otherwise (probe-gated; profile edits while disconnected
+// change nothing).
+async function onStageApiChanged() {
+  if (!composerLocked) return;
+  let extra = null;
+  try {
+    extra = await invoke('model_source_get');
+  } catch (_) {
+    return;  // IPC failure: leave the lock alone (Enter-probe still works)
+  }
+  if (!(extra && extra.source === 'api' && extra.apiReady)) return;
+  const text = pendingTurnText;
+  pendingTurnText = '';
+  unlockComposer();
+  if (text) {
+    const input = stageRoot && stageRoot.querySelector('[data-input]');
+    if (input) {
+      input.value = text;
+      input.style.height = 'auto';
+    }
+  }
+}
+
 function onKeyDown(e) {
   if (e.key !== 'Escape') return;
+  // Online/API popup FIRST: it's body-mounted above every stage surface
+  // (z:100100), so while it's open it owns Esc — its own document-level
+  // listener (bubble phase, after this capture one) closes it. Bail without
+  // acting so the stage doesn't close a surface UNDERNEATH the popup (e.g.
+  // the left drawer) on the same keypress.
+  if (document.querySelector('.fable-online-popup')) return;
   // Priority order: raw editor → save modal → modal panel → wupi drawer →
   // left drawer. Innermost surface dismisses first so a player with stacked
   // surfaces can Esc them one at a time. The raw editor is highest (it darkens
@@ -1017,11 +1174,13 @@ export function loadHistory(messages) {
 // We accept BOTH shapes so this UI works whether or not that Rust edit has
 // landed yet (a string → name only, player_name stays ''; an object → both).
 async function refreshActiveCardName(root) {
-  // DEV PREVIEW: skip the IPC entirely — inject the placeholder identities +
-  // portraits directly. The preview has no backend, so fable_active_card_get
-  // would fail/return empty. The AI/narrator identity is "Game Master" (the
-  // default narrator), the player is "Wanderer". NPCs fall back to the AI
-  // portrait (per the deferred-NPC-portrait rule).
+  // DEV PREVIEW: skip the IPC entirely — inject the placeholder identities
+  // directly. The preview has no backend, so fable_active_card_get would
+  // fail/return empty. The AI/narrator identity is "Game Master" (the default
+  // narrator), the player is "Wanderer". Portraits stay '' — the renderer
+  // (beats.buildMes) now fills an empty portrait with a sleek silhouette
+  // placeholder, so dev-preview shows silhouettes on both sides. NPCs fall
+  // back to the AI portrait (per the deferred-NPC-portrait rule).
   if (DEV_PREVIEW) {
     activeCardName = 'Game Master';
     activePlayerName = 'Wanderer';
@@ -1114,6 +1273,9 @@ export function teardownStage() {
   // childList mutation doesn't fire a now-orphaned refreshHistory pass, +
   // the snapped-portrait cleanup runs while the <img> nodes still exist.
   if (vnApi) { vnApi.teardown(); vnApi = null; }
+  // Release the golden-pencil selection layer (selectionchange/mouseup/keyup
+  // listeners + the floating pencil element) before the feed is wiped.
+  if (sliceApi) { sliceApi.teardown(); sliceApi = null; }
   // Wipe the dialogue feed so a prior session's cards don't leak into the
   // next entry (the stage DOM is reused across games).
   beats.clearFeed();
@@ -1131,7 +1293,8 @@ export function teardownStage() {
   // always the last successfully-saved state regardless.
   resetTabRail();
   resetRawEditor();
-  // Selection popup teardown removed (the selection module + its regenerate_slice
-  // IPC are dead). The stageListeners loop above already removes every tracked
-  // stage-element listener, so nothing leaks.
+  // Selection popup teardown: the golden-pencil slice-regen layer (sliceApi
+  // above) owns its own document-level listeners + the floating pencil element
+  // + releases them in its teardown(). The stageListeners loop above already
+  // removes every tracked stage-element listener, so nothing else leaks.
 }

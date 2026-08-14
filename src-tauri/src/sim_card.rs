@@ -17,6 +17,7 @@
 //! a minimal stub persona so the app still boots. The persona is best-effort;
 //! a bad card must never kill the OS.
 
+use std::collections::BTreeMap;
 use std::path::Path;
 
 use rand::seq::IndexedRandom;
@@ -148,13 +149,21 @@ pub struct CardStart {
     /// baseline, harmless).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub weather: Option<String>,
+    /// Free-form calendar label (2026-08-13): the verbatim `<date>` string —
+    /// month/year/type-of-day ("3rd of Harvest, Year 1247, Market Day"), NOT
+    /// just "Day 1". Seeded into `WorldSchema.calendar` + rendered as `date:`;
+    /// advanced in play by the `[DATE]` bracket (the tracker rewrites the
+    /// label — no Rust calendar arithmetic). `None` when absent → the engine
+    /// falls back to the legacy "Day N, HH:MM" clock render.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub date: Option<String>,
 }
 
 /// One Simulation Card, parsed from a `.sim` file. Owned and immutable for the
 /// process lifetime after `setup()` loads it.
 ///
-/// `Serialize` + `Deserialize` (added for Quick Play so a generated card can
-/// be bundled inside the quicksave file) — every field is a primitive
+/// `Serialize` + `Deserialize` (so a card can round-trip through JSON) — every
+/// field is a primitive
 /// `String`/`Option<String>`/`Vec<String>`, so serde handles the round trip
 /// with no custom impl. `#[serde(default)]` on the `Option` fields keeps older
 /// save JSON (written before a field existed) loading cleanly.
@@ -166,6 +175,15 @@ pub struct SimCard {
     /// future scenario cards. Drives behavior upstream (e.g. whether the card
     /// owns a resumable session + schema).
     pub card_type: String,
+    /// The polymorphic SIM Wizard discriminator (2026-08-13): `"npc"` |
+    /// `"scenario"` | `"world"` | None. `<type>` STAYS `"roleplay"` for every
+    /// playable card (so the `fable_cards_list` + `find_card_by_id` filters
+    /// are unchanged — non-breaking); `<subtype>` carries the wizard's Type
+    /// Router choice for serializer/review routing + a future picker badge.
+    /// None on pre-2026-08-13 cards (the distinction was purely implicit in
+    /// which optional fields the author filled).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subtype: Option<String>,
     pub core_persona: String,
     pub traits: String,
     pub appearance: String,
@@ -182,7 +200,7 @@ pub struct SimCard {
     ///
     /// This field is retained as a **dormant back-compat shim**: it renders
     /// NOTHING when empty (see `render_for_prompt`), so the shipped `wupi.sim`
-    /// and `fable.sim` cards leave it unset → zero tokens + zero behavior
+    /// card leaves it unset → zero tokens + zero behavior
     /// change. A user-authored `.sim` card that still includes a
     /// `<technical_protocols>` block parses and renders it unchanged (graceful
     /// migration; the field is not ripped to avoid a wide blast radius +
@@ -192,6 +210,17 @@ pub struct SimCard {
     /// omits the block. Used by [`random_intro`] for the boot flourish.
     #[serde(default)]
     pub introductions: Vec<String>,
+    /// The card's intro text — a SIBLING `<intro>` (canonical) or
+    /// `<introduction>` (legacy alias) element AFTER `</sim_card>`, kept OUT of
+    /// `<sim_card>` so it never inflates the cached system prompt (prime
+    /// directive). For roleplay cards this is the Fable opening narrator beat
+    /// (surfaced on `FableLoadResult.intro`); for `wupi.sim` it's the multi-line
+    /// boot-greeting block (each line a `random_intro` pick). 2026-08-13: the
+    /// prior parser only read `<introductions>` (plural) INSIDE `<sim_card>`, so
+    /// `wupi.sim`'s sibling `<introduction>` was silently dropped — now read.
+    /// Empty when the card carries neither form.
+    #[serde(default)]
+    pub intro: String,
     // All `None` / empty for the system card (Wupi). A roleplay scenario card
     // carries a `<scenario>` block that populates these. The parser already
     // handles optional elements via `nested_text` returning `None` for absent
@@ -272,7 +301,7 @@ pub struct SimCard {
     /// `Vec<CardNode>` (not `schema::TravelGraph` directly) to keep
     /// `sim_card` free of the `schema` module dependency — `fable_start`
     /// does the one-line conversion. `#[serde(default)]` keeps older
-    /// quicksave JSON (bundled cards written before this field existed)
+    /// card JSON (written before this field existed)
     /// loading cleanly.
     #[serde(default)]
     pub locations: Vec<CardNode>,
@@ -288,8 +317,8 @@ pub struct SimCard {
     /// `Vec<CardNpc>` (not `schema::NpcRegistry` directly) to keep `sim_card`
     /// free of the `schema` module dependency — `enter_fable_session` does the
     /// one-line conversion (mirrors the `locations`/`CardNode` precedent).
-    /// `#[serde(default)]` keeps older quicksave JSON (bundled cards written
-    /// before this field existed) loading cleanly.
+    /// `#[serde(default)]` keeps older card JSON (written before this field
+    /// existed) loading cleanly.
     ///
     /// This is the load-bearing fix for the "teleporting NPC" problem: before
     /// Phase 5A there was no Rust-owned authoritative NPC id set, so the
@@ -307,6 +336,14 @@ pub struct SimCard {
     /// the anchors it needs to maintain them. See [`CardStart`].
     #[serde(default)]
     pub start: CardStart,
+    /// Custom extensions (2026-08-13): a flat key→value string map authored
+    /// via the SIM Wizard's optional `custom_tags` (any extra stat / faction
+    /// standing / curse / currency / attribute that doesn't fit a standard
+    /// field). Parsed from `<custom_tags><entry key="...">value</entry>…
+    /// </custom_tags>`. At game start these seed `WorldSchema.custom_tags`
+    /// (rendered as a bounded `custom:` line) so they reach the narrator.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub custom_tags: BTreeMap<String, String>,
 }
 
 impl SimCard {
@@ -410,6 +447,7 @@ pub fn fallback() -> SimCard {
         id: FALLBACK_ID.to_owned(),
         name: "Wupi".to_owned(),
         card_type: "system".to_owned(),
+        subtype: None,
         core_persona: String::new(),
         traits: String::new(),
         appearance: String::new(),
@@ -418,6 +456,7 @@ pub fn fallback() -> SimCard {
         conversational_rules: String::new(),
         technical_rules: String::new(),
         introductions: Vec::new(),
+        intro: String::new(),
         // Roleplay-only fields: all empty for the system-card fallback.
         setting: None,
         plot: None,
@@ -428,6 +467,7 @@ pub fn fallback() -> SimCard {
         locations: Vec::new(),
         cast: Vec::new(),
         start: CardStart::default(),
+        custom_tags: BTreeMap::new(),
     }
 }
 
@@ -465,13 +505,12 @@ fn try_load(path: &Path) -> anyhow::Result<SimCard> {
 }
 
 /// Parse a `.sim` card from its XML text. Public entry point for callers that
-/// have the XML in memory (not on disk): the Quick Play interview's
-/// `interview_finalize` step parses the model's `<sim_card>...</sim_card>`
-/// output this way without writing a temp file. Mirrors `try_load`'s parser
+/// have the XML in memory (not on disk): parses a `<sim_card>...</sim_card>`
+/// string this way without writing a temp file. Mirrors `try_load`'s parser
 /// exactly (delegates to the same private `parse`).
 ///
 /// Returns `Err` on malformed XML or a missing `<sim_card>` root — the caller
-/// decides the fallback (Quick Play surfaces the error to the UI for a retry).
+/// decides the fallback.
 pub fn parse_from_xml_str(xml: &str) -> anyhow::Result<SimCard> {
     parse(xml)
 }
@@ -479,7 +518,20 @@ pub fn parse_from_xml_str(xml: &str) -> anyhow::Result<SimCard> {
 /// Parse a `.sim` card from its XML text. Separated from `try_load` so the
 /// unit tests can exercise the parser without touching the filesystem.
 fn parse(xml: &str) -> anyhow::Result<SimCard> {
-    let doc = roxmltree::Document::parse(xml)
+    // A `.sim` file is a TWO-ROOT document: `<sim_card>…</sim_card>` + an
+    // optional sibling `<intro>`/`<introduction>` AFTER it (§6B — the intro
+    // stays out of the cached card so it never inflates the system prompt).
+    // roxmltree (0.10) REJECTS multi-root documents outright ("unknown
+    // token"), so slice at the first `</sim_card>` + parse the head as the
+    // document; the TAIL (everything after) is re-parsed below, wrapped in a
+    // synthetic root, to fish out the sibling intro. A string with no
+    // `</sim_card>` (the Creator's draft output, in-memory parses) slices to
+    // itself + an empty tail — behavior unchanged.
+    let (head, tail) = match xml.find("</sim_card>") {
+        Some(i) => xml.split_at(i + "</sim_card>".len()),
+        None => (xml, ""),
+    };
+    let doc = roxmltree::Document::parse(head)
         .map_err(|e| anyhow::anyhow!("parsing card XML: {e}"))?;
     let root = doc
         .root_element()
@@ -499,6 +551,7 @@ fn parse(xml: &str) -> anyhow::Result<SimCard> {
     let id = nested_text(root, "metadata", "id")
         .unwrap_or_else(|| name.to_lowercase());
     let card_type = nested_text(root, "metadata", "type").unwrap_or_else(|| "system".to_owned());
+    let subtype = nested_text(root, "metadata", "subtype").filter(|s| !s.is_empty());
 
     let identity = first_child(root, "identity");
     let core_persona = identity
@@ -543,11 +596,22 @@ fn parse(xml: &str) -> anyhow::Result<SimCard> {
     // now Rust-injected per pass (prompts::WUPI_AGENT_PROTOCOL for the chat
     // agent pass; the narrator/tracker/scribe builders for Fable). Retained as
     // a dormant back-compat shim — see the field doc on `SimCard.technical_rules`.
-    // Shipped cards (wupi.sim, fable.sim) no longer carry this block; user
+    // The shipped `wupi.sim` card no longer carries this block; user
     // cards that still do parse + render it unchanged.
     let technical_rules = first_child(root, "technical_protocols")
         .and_then(|n| child_text(n, "rules"))
         .unwrap_or_default();
+
+    // `<intro>` (canonical) / `<introduction>` (legacy alias) as a SIBLING
+    // element after `</sim_card>` — the Fable opening beat + wupi.sim's
+    // boot-greeting block. Kept OUT of `<sim_card>` so it never inflates
+    // the cached system prompt (prime directive). Lives in the post-close
+    // TAIL sliced off above (roxmltree can't parse the two-root file
+    // whole); the tail is wrapped in a synthetic root so stray text nodes
+    // + whitespace can't break the parse. The prior parser only read
+    // `<introductions>` (plural) INSIDE `<sim_card>`, so wupi.sim's sibling
+    // block was silently dropped — fixed 2026-08-13.
+    let intro = extract_sibling_intro(tail);
 
     let introductions = first_child(root, "introductions")
         .map(|n| {
@@ -560,13 +624,28 @@ fn parse(xml: &str) -> anyhow::Result<SimCard> {
                 .map(|l| l.strip_prefix("- ").unwrap_or(l).trim().to_owned())
                 .collect::<Vec<_>>()
         })
-        .unwrap_or_default();
+        .unwrap_or_else(|| {
+            // No legacy inside-`<sim_card>` `<introductions>` block: seed the
+            // greeting list from the sibling `<intro>`/`<introduction>` block's
+            // non-empty lines so `random_intro` (wupi.sim's boot splash) works.
+            // Each line is a standalone greeting; strip an optional `- ` prefix.
+            if intro.is_empty() {
+                Vec::new()
+            } else {
+                intro
+                    .lines()
+                    .map(|l| l.trim())
+                    .filter(|l| !l.is_empty())
+                    .map(|l| l.strip_prefix("- ").unwrap_or(l).trim().to_owned())
+                    .collect()
+            }
+        });
 
     // ── World/scenario fields ──────────────────────────────────────────────
     // FLAT-FIRST parse (2026-08-01 reorg): `setting`/`plot`/`tone`/
     // `opening_scene`/`player_name`/`start_npcs`/`activities`/`locations`/
     // `cast` are read as DIRECT children of `<sim_card>` (the canonical
-    // shape authored by `data/fable.sim` + the Creator). Each falls back to
+    // shape authored by the Creator). Each falls back to
     // the legacy `<scenario>` wrapper if the top-level read returns None, so
     // cards authored before the reorg (e.g. `rusty_tavern.sim` at migration
     // time, and old user cards in the wild) still load unchanged. The flat
@@ -658,6 +737,30 @@ fn parse(xml: &str) -> anyhow::Result<SimCard> {
         })
         .unwrap_or_default();
 
+    // Custom extensions (2026-08-13): optional <custom_tags> block. Each
+    // <entry key="...">value</entry> becomes one key→value pair (CDATA-safe via
+    // text_content). Absent → empty map (dormant). At game start these seed
+    // WorldSchema.custom_tags so they reach the narrator via the `custom:` line.
+    let custom_tags = field_node_or(root, scenario, "custom_tags")
+        .map(|ct_el| {
+            ct_el
+                .children()
+                .filter(|c| c.is_element() && c.has_tag_name("entry"))
+                .filter_map(|entry_el| {
+                    let key = entry_el.attribute("key").unwrap_or("").trim().to_owned();
+                    if key.is_empty() {
+                        return None;
+                    }
+                    let value = text_content(entry_el).trim().to_owned();
+                    if value.is_empty() {
+                        return None;
+                    }
+                    Some((key, value))
+                })
+                .collect::<BTreeMap<_, _>>()
+        })
+        .unwrap_or_default();
+
     // Fable Phase 5A (2026-07-29): optional <cast> block. Each <npc> has an
     // `id` attribute, an optional `tier` attribute, a <name> child, a <role>
     // child, and 0+ <alias> children (alternate surface forms). Absent on
@@ -719,7 +822,8 @@ fn parse(xml: &str) -> anyhow::Result<SimCard> {
             });
         let weather = child_text(start_el, "weather")
             .filter(|s| !s.is_empty());
-        CardStart { time_minutes, weather }
+        let date = child_text(start_el, "date").filter(|s| !s.is_empty());
+        CardStart { time_minutes, weather, date }
     } else {
         CardStart::default()
     };
@@ -728,6 +832,7 @@ fn parse(xml: &str) -> anyhow::Result<SimCard> {
         id,
         name,
         card_type,
+        subtype,
         core_persona,
         traits,
         appearance,
@@ -736,6 +841,7 @@ fn parse(xml: &str) -> anyhow::Result<SimCard> {
         conversational_rules,
         technical_rules,
         introductions,
+        intro,
         setting,
         plot,
         tone,
@@ -745,6 +851,7 @@ fn parse(xml: &str) -> anyhow::Result<SimCard> {
         locations,
         cast,
         start,
+        custom_tags,
     })
 }
 
@@ -764,6 +871,37 @@ fn parse_bullet_list(text: &str) -> Vec<String> {
 // roxmltree's API is verbose; these thin wrappers keep the parser readable.
 // CDATA is already merged into `.text()` by roxmltree, so `text_content`
 // returns the full text of a node regardless of how it was wrapped.
+
+/// Read the sibling `<intro>`/`<introduction>` from the TAIL of a `.sim`
+/// file (everything after the first `</sim_card>`). The tail is wrapped in a
+/// synthetic root so whitespace + stray text between the two real roots
+/// can't break the parse (roxmltree rejects bare multi-root/text documents).
+/// Absent / empty / unparsable tail → `String::new()` (the common no-intro
+/// card case, never an error — the intro is an optional flourish).
+fn extract_sibling_intro(tail: &str) -> String {
+    if tail.trim().is_empty() {
+        return String::new();
+    }
+    let wrapped = format!("<wupi_sim_siblings>{tail}</wupi_sim_siblings>");
+    let doc = match roxmltree::Document::parse(&wrapped) {
+        Ok(d) => d,
+        Err(e) => {
+            tracing::warn!(?e, "sim_card: unparsable post-</sim_card> tail — ignoring");
+            return String::new();
+        }
+    };
+    doc.root_element()
+        .children()
+        .find(|n| {
+            n.is_element() && {
+                let name = n.tag_name().name();
+                name == "intro" || name == "introduction"
+            }
+        })
+        .map(|n| text_content(n).trim().to_owned())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_default()
+}
 
 /// The concatenated text of a node (CDATA + plain text children merged).
 fn text_content(node: roxmltree::Node) -> String {
@@ -893,6 +1031,56 @@ mod tests {
     }
 
     #[test]
+    fn parse_reads_sibling_intro_after_sim_card() {
+        // wupi.sim's actual shape: `<introduction>` (singular) as a SIBLING
+        // after `</sim_card>`. The prior parser only read `<introductions>`
+        // (plural) inside `<sim_card>`, so this block was silently dropped.
+        // 2026-08-13: the sibling `<intro>`/`<introduction>` is now the canonical
+        // intro home (drives the Fable opening beat + seeds the greeting list).
+        let xml = r#"<?xml version="1.0"?>
+<sim_card>
+  <identity><name>Wupi</name></identity>
+</sim_card>
+
+<introduction><![CDATA[
+Hello, Master~ ฅ^>⩊<^ฅ
+Booted up, nya~!
+]]></introduction>"#;
+        let card = parse(xml).expect("sibling intro parses");
+        // `intro` carries the full block (the Fable opening beat).
+        assert!(card.intro.contains("Hello, Master~"));
+        assert!(card.intro.contains("Booted up, nya~!"));
+        // The greeting list is seeded from the block's lines (random_intro).
+        assert_eq!(card.introductions.len(), 2);
+        assert!(card.introductions[0].contains("Hello, Master~"));
+    }
+
+    #[test]
+    fn parse_reads_canonical_intro_tag_alias() {
+        // `<intro>` (canonical) + `<introduction>` (legacy alias) both read.
+        // Empty/whitespace-only block → empty intro + empty greeting list.
+        let xml = r#"<sim_card><identity><name>X</name></identity></sim_card>
+<intro><![CDATA[The fog rolls in over Aldermoor.]]></intro>"#;
+        let card = parse(xml).expect("canonical <intro> parses");
+        assert_eq!(card.intro, "The fog rolls in over Aldermoor.");
+        // A single-paragraph Fable beat still yields one greeting-list entry.
+        assert_eq!(card.introductions, vec!["The fog rolls in over Aldermoor.".to_string()]);
+    }
+
+    #[test]
+    fn parse_intro_absent_when_card_has_no_sibling() {
+        // A roleplay card with neither sibling `<intro>` nor inside
+        // `<introductions>` → both empty (the common Fable card case).
+        let xml = r#"<sim_card>
+  <metadata><type>roleplay</type></metadata>
+  <identity><name>Aldermoor</name></identity>
+</sim_card>"#;
+        let card = parse(xml).expect("parses");
+        assert!(card.intro.is_empty());
+        assert!(card.introductions.is_empty());
+    }
+
+    #[test]
     fn render_for_prompt_emits_tagged_sections() {
         let card = parse(SAMPLE).expect("parses");
         let rendered = card.render_for_prompt();
@@ -947,6 +1135,7 @@ mod tests {
             id: "x".into(),
             name: "x".into(),
             card_type: "system".into(),
+            subtype: None,
             core_persona: String::new(),
             traits: String::new(),
             appearance: String::new(),
@@ -955,6 +1144,7 @@ mod tests {
             conversational_rules: String::new(),
             technical_rules: String::new(),
             introductions: Vec::new(),
+            intro: String::new(),
             setting: None,
             plot: None,
             tone: None,
@@ -964,6 +1154,7 @@ mod tests {
             locations: Vec::new(),
             cast: Vec::new(),
             start: CardStart::default(),
+            custom_tags: BTreeMap::new(),
         };
         assert!(card.random_intro().is_none());
     }
@@ -1059,8 +1250,8 @@ shelter here before braving the ruined keep to the north.
     /// `tone` as DIRECT children of `<sim_card>` (no `<scenario>` wrapper),
     /// plus the `<persona>` tag (renamed from `<core_persona>`). (The opening
     /// beat moved to a sibling `.intro` file 2026-08-05 — no longer a card
-    /// field.) This is the shape `data/fable.sim` ships + what
-    /// the Creator emits. The `<plot>` field is new to the reorg — it pins
+    /// field.) This is the flat shape the Creator emits. The `<plot>` field
+    /// is new to the reorg — it pins
     /// that top-level `<plot>` parses into `SimCard.plot`.
     #[test]
     fn parse_flat_format_top_level_fields() {
@@ -1117,16 +1308,16 @@ shelter here before braving the ruined keep to the north.
         assert!(card.player_name.is_none());
     }
 
-    /// Quick Play bundles the generated card inside the quicksave file as
-    /// JSON. This pins the Serialize/Deserialize round trip so the bundle
-    /// survives write + read intact (the roleplay fields are the load-bearing
-    /// ones for the narrator prompt after resume).
+    /// Pins the Serialize/Deserialize round trip so a card survives
+    /// write + read intact (the roleplay fields are the load-bearing
+    /// ones for the narrator prompt).
     #[test]
     fn simcard_serializes_to_json_roundtrip() {
         let original = SimCard {
             id: "qp_test".into(),
             name: "Test Sim".into(),
             card_type: "roleplay".into(),
+            subtype: None,
             core_persona: "cp".into(),
             traits: "t".into(),
             appearance: "a".into(),
@@ -1135,6 +1326,7 @@ shelter here before braving the ruined keep to the north.
             conversational_rules: "cr".into(),
             technical_rules: "tr".into(),
             introductions: vec!["hi".into()],
+            intro: String::new(),
             setting: Some("A test place.".into()),
             plot: None,
             tone: Some("grim".into()),
@@ -1144,6 +1336,7 @@ shelter here before braving the ruined keep to the north.
             locations: Vec::new(),
             cast: Vec::new(),
             start: CardStart::default(),
+            custom_tags: BTreeMap::new(),
         };
         let json = serde_json::to_string(&original).expect("serialize");
         let back: SimCard = serde_json::from_str(&json).expect("deserialize");
@@ -1158,9 +1351,9 @@ shelter here before braving the ruined keep to the north.
         assert_eq!(back.introductions, original.introductions);
     }
 
-    /// `parse_from_xml_str` is the public entry the Quick Play `finalize`
-    /// step uses to parse the model's `<sim_card>` output. Pins that it
-    /// accepts the same shape as the on-disk parser. Uses the modern
+    /// `parse_from_xml_str` is the public entry for parsing an in-memory
+    /// `<sim_card>` string. Pins that it accepts the same shape as the on-disk
+    /// parser. Uses the modern
     /// `<player_name>` tag.
     #[test]
     fn parse_from_xml_str_works() {
@@ -1181,6 +1374,41 @@ shelter here before braving the ruined keep to the north.
         assert_eq!(card.card_type, "roleplay");
         assert_eq!(card.player_name.as_deref(), Some("Kaelen"));
         assert_eq!(card.start_npc_ids, vec!["npc_a".to_string()]);
+    }
+
+    /// The 2026-08-13 SIM Wizard fields parse + round-trip: `<subtype>`, the
+    /// `<start><date>` calendar anchor, + the `<custom_tags>` map.
+    #[test]
+    fn parses_subtype_date_and_custom_tags() {
+        let xml = r#"<sim_card>
+  <metadata><type>roleplay</type><subtype>npc</subtype></metadata>
+  <identity><name>Mara</name></identity>
+  <start>
+    <date>3rd of Harvest, Year 1247</date>
+    <time>Day 1, 09:00</time>
+    <weather>clear</weather>
+  </start>
+  <custom_tags>
+    <entry key="faction">thieves guild</entry>
+    <entry key="bounty">500 gold</entry>
+  </custom_tags>
+</sim_card>"#;
+        let card = parse_from_xml_str(xml).expect("parses");
+        assert_eq!(card.card_type, "roleplay");
+        assert_eq!(card.subtype.as_deref(), Some("npc"));
+        assert_eq!(card.start.date.as_deref(), Some("3rd of Harvest, Year 1247"));
+        assert_eq!(card.start.weather.as_deref(), Some("clear"));
+        assert_eq!(
+            card.custom_tags.get("faction").map(|s| s.as_str()),
+            Some("thieves guild")
+        );
+        assert_eq!(card.custom_tags.get("bounty").map(|s| s.as_str()), Some("500 gold"));
+        // Round-trip through JSON keeps the new fields.
+        let json = serde_json::to_string(&card).expect("serialize");
+        let back: SimCard = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back.subtype.as_deref(), Some("npc"));
+        assert_eq!(back.start.date.as_deref(), Some("3rd of Harvest, Year 1247"));
+        assert_eq!(back.custom_tags.get("faction").map(|s| s.as_str()), Some("thieves guild"));
     }
 
     /// Legacy auto-migration: an old `.sim` file using the pre-rename tag
@@ -1219,7 +1447,7 @@ shelter here before braving the ruined keep to the north.
     }
 
     /// A JSON object missing the roleplay fields (an older save, or a
-    /// minimal Quick Play card) must deserialize with those fields at their
+    /// minimal card) must deserialize with those fields at their
     /// defaults, NOT fail. `#[serde(default)]` is the load-bearing attribute.
     #[test]
     fn simcard_deserialize_partial_json_fills_defaults() {
@@ -1570,8 +1798,7 @@ shelter here before braving the ruined keep to the north.
     }
 
     /// Phase 5A (2026-07-29): serde round trip for CardNpc + the cast field
-    /// (Quick Play bundles the card inside quicksave JSON — the round trip
-    /// must survive write + read, same contract as `locations`).
+    /// (the round trip must survive write + read, same contract as `locations`).
     #[test]
     fn card_cast_serializes_roundtrip() {
         let original = CardNpc {

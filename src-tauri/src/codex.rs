@@ -67,6 +67,7 @@ pub struct ReconcileReport {
 /// so it's promoted to the module's public API for the read/edit feature.
 /// The seed path (`seed_compound_codex`) still owns the SQLite insert; this
 /// struct is the shared "parsed entry" type both paths use.
+#[derive(Clone)]
 pub struct ParsedEntry {
     pub title: String,
     pub tags: Vec<String>,
@@ -155,6 +156,13 @@ async fn seed_compound_codex<E: Embedder>(
         return Ok(report);
     }
 
+    // Embed-cap gate: split any entry whose body exceeds the 1400-char bge-small
+    // window into paginated "Title - Part N" children BEFORE the reconcile loop.
+    // Post-parse/pre-reconcile placement keeps the parts the canonical title-
+    // keyed set (idempotent re-seeds) and guarantees every body reaching
+    // `add_codex_entry` is ≤1400 (see memory.rs's clamp for the final backstop).
+    let sources = expand_oversize_entries(sources);
+
     // Reconcile diff: title-keyed, hash-detected.
     let existing = engine.list_codex_entries(card_id).await?;
     let mut existing_by_title: HashMap<String, (MemoryId, Option<String>)> = HashMap::new();
@@ -234,6 +242,61 @@ async fn seed_compound_codex<E: Embedder>(
     Ok(report)
 }
 
+/// Expand any entry whose body exceeds the 1400-character embedding cap into
+/// paginated `"{title} - Part N"` children. Each part is ≤1300 chars, split on
+/// sentence/paragraph boundaries via [`crate::memory::chunk_text`] (reused from
+/// the episodic chunker — its 1300 budget sits safely under the 1400 cap; bge-
+/// small silently truncates anything longer, corrupting the vector).
+///
+/// **Placement matters:** called post-parse + pre-reconcile in
+/// [`seed_compound_codex`], so the parts become the canonical title-keyed set.
+/// Re-seeding stays idempotent — the same source body yields the same parts +
+/// per-part hashes → "unchanged", not churn (a split at insert-time would key
+/// the reconcile on the original title + orphan the parts every boot).
+///
+/// Each part's hash is `DefaultHasher` over its part body (deterministic), so a
+/// body edit changes the parts' hashes + triggers an `updated` reconcile.
+/// Entries already ≤1400 pass through unchanged. A single-chunk split (the body
+/// fit one chunk, e.g. a 1401-char body) collapses back to the original title
+/// (no spurious "Part 1").
+pub(crate) fn expand_oversize_entries(sources: Vec<ParsedEntry>) -> Vec<ParsedEntry> {
+    const CAP: usize = 1400;
+    let mut out = Vec::with_capacity(sources.len());
+    for src in sources {
+        if src.body.len() <= CAP {
+            out.push(src);
+            continue;
+        }
+        let chunks = crate::memory::chunk_text(&src.body);
+        let n = chunks.len();
+        tracing::warn!(
+            title = %src.title,
+            body_chars = src.body.len(),
+            parts = n,
+            "codex entry exceeds the 1400-char embedding cap; auto-splitting into paginated parts"
+        );
+        for (i, body) in chunks.into_iter().enumerate() {
+            let title = if n > 1 {
+                format!("{} - Part {}", src.title, i + 1)
+            } else {
+                src.title.clone()
+            };
+            let hash = {
+                let mut h = std::hash::DefaultHasher::new();
+                body.hash(&mut h);
+                h.finish()
+            };
+            out.push(ParsedEntry {
+                title,
+                tags: src.tags.clone(),
+                hash,
+                body,
+            });
+        }
+    }
+    out
+}
+
 /// Insert one parsed entry via `add_codex_entry`, building its `metadata_json`.
 /// Salience is flat 1.0 (matches episodic; salience weighting is deferred per
 /// the salience-landmine). `namespace` flows into the metadata so the entry's
@@ -244,16 +307,17 @@ async fn insert_entry(
     card_id: &str,
     namespace: &str,
 ) -> anyhow::Result<()> {
-    // Body-length guard: warn (don't reject) when the body exceeds the
-    // ~350-token heuristic budget. The entry still seeds: the operator sees
-    // the warning and can split the file.
+    // Defensive sanity log: `expand_oversize_entries` splits oversize bodies
+    // pre-embed (pre-reconcile), so the seed path never reaches here with a body
+    // >1400. If this fires, a future caller bypassed the split — the final
+    // backstop in `add_codex_entry` (memory.rs) clamps the embed input regardless.
     const BUDGET_CHARS: usize = 1400;
     if src.body.len() > BUDGET_CHARS {
-        tracing::warn!(
+        tracing::error!(
             title = %src.title,
             body_chars = src.body.len(),
             budget = BUDGET_CHARS,
-            "codex entry exceeds the ~350-token budget; bge-small may truncate the embedding. Split into smaller entries."
+            "codex entry >1400 reached insert_entry; expand_oversize_entries should have split it. add_codex_entry will clamp the embed input."
         );
     }
 
@@ -678,5 +742,81 @@ mod tests {
             h.finish()
         };
         assert_eq!(e1, e2);
+    }
+
+    #[test]
+    fn expand_oversize_entries_splits_long_bodies() {
+        // A body well over the 1400 cap, with paragraph breaks so chunk_text
+        // splits on boundaries (paragraph → sentence), not one hard cut.
+        let para = "Sentence one is here. Sentence two follows. Sentence three ends it.\n\n";
+        let long_body = para.repeat(40); // ~2800 chars
+        assert!(long_body.len() > 1400);
+        let src = ParsedEntry {
+            title: "Dwarven Kingdoms".to_string(),
+            tags: vec!["dwarf".to_string(), "lore".to_string()],
+            body: long_body.clone(),
+            hash: 1, // arbitrary; expand recomputes per-part
+        };
+        let out = expand_oversize_entries(vec![src]);
+        assert!(out.len() >= 2, "should split into >=2 parts, got {}", out.len());
+        // Every part body fits the embed cap.
+        for p in &out {
+            assert!(p.body.len() <= 1400, "part '{}' is {} chars (>1400)", p.title, p.body.len());
+        }
+        // Paginated titles.
+        let titles: Vec<&str> = out.iter().map(|p| p.title.as_str()).collect();
+        assert_eq!(titles[0], "Dwarven Kingdoms - Part 1");
+        assert_eq!(titles[1], "Dwarven Kingdoms - Part 2");
+        // Tags carry through to every part.
+        for p in &out {
+            assert_eq!(p.tags, vec!["dwarf".to_string(), "lore".to_string()]);
+        }
+        // No content lost: every sentence survives across the parts.
+        let joined: String = out.iter().map(|p| p.body.as_str()).collect();
+        for sentence in ["Sentence one is here.", "Sentence two follows.", "Sentence three ends it."] {
+            assert_eq!(
+                long_body.matches(sentence).count(),
+                joined.matches(sentence).count(),
+                "sentence '{sentence}' count diverged across the split",
+            );
+        }
+    }
+
+    #[test]
+    fn expand_oversize_entries_passes_short_through_unchanged() {
+        let src = ParsedEntry {
+            title: "Short".to_string(),
+            tags: vec!["a".to_string()],
+            body: "tiny body.".to_string(),
+            hash: 42,
+        };
+        let out = expand_oversize_entries(vec![src.clone()]);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].title, "Short");
+        assert_eq!(out[0].body, "tiny body.");
+        assert_eq!(out[0].hash, 42); // pass-through keeps the original hash
+    }
+
+    /// Same source ⇒ same parts + same per-part hashes ⇒ the reconcile reports
+    /// `unchanged` on re-seed (no churn). This is the idempotence invariant.
+    #[test]
+    fn expand_oversize_entries_is_deterministic() {
+        let para = "Alpha beta gamma delta epsilon zeta eta theta iota.\n\n";
+        let long_body = para.repeat(50);
+        let mk = || ParsedEntry {
+            title: "Lore".to_string(),
+            tags: vec![],
+            body: long_body.clone(),
+            hash: 0,
+        };
+        let a = expand_oversize_entries(vec![mk()]);
+        let b = expand_oversize_entries(vec![mk()]);
+        assert_eq!(a.len(), b.len());
+        assert!(a.len() >= 2);
+        for (x, y) in a.iter().zip(b.iter()) {
+            assert_eq!(x.title, y.title);
+            assert_eq!(x.body, y.body);
+            assert_eq!(x.hash, y.hash);
+        }
     }
 }

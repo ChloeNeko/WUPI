@@ -48,6 +48,14 @@ let rerolling = false;     // true when the current turn is a swipeable-variant
 // in-flight roll is discarded + the schema reverted to base; onCancelled
 // consumes this flag to fire the fresh reroll. Cleared on any turn end.
 let deferredReroll = false;
+// Slice regenerate (golden pencil, 2026-08-11): the beat + streaming span
+// for the in-flight partial regen. Null when no slice is running. Tracked
+// separately from `activeBeat` (a full narrator turn) so the two flows can't
+// collide + so isSliceRegenerating() can gate the stop button to the right
+// cancel slot (fable_slice_stop vs fable_stop).
+let sliceBeat = null;
+let sliceSpan = null;
+let sliceEscapeFn = null;   // transient Escape listener, removed on turn end
 
 // The unlisten handle for the `fable-session-changed` Tauri event (set up in
 // initNarrator, torn down in resetNarrator). Captured at module scope so re-
@@ -127,12 +135,23 @@ export function resetNarrator() {
   activeBeat = null;
   generating = false;
   rerolling = false;
+  clearSliceState();
   // Tear down the session-changed listener — the stage is exiting, no more
   // chat-side mutations should rebuild the (now-hidden) feed.
   if (sessionChangedUnlisten) {
     try { sessionChangedUnlisten(); } catch (_) {}
     sessionChangedUnlisten = null;
   }
+}
+
+// Clear all slice-regen state (called from finishTurn / resetNarrator).
+function clearSliceState() {
+  if (sliceEscapeFn) {
+    document.removeEventListener('keydown', sliceEscapeFn);
+    sliceEscapeFn = null;
+  }
+  sliceBeat = null;
+  sliceSpan = null;
 }
 
 // Send a narrator turn. Options:
@@ -270,11 +289,17 @@ function finishTurn() {
   generating = false;
   activeBeat = null;
   rerolling = false;
+  clearSliceState();
   if (onTurnEnd) onTurnEnd();
 }
 
 export function isGenerating() { return generating; }
 export function isRerolling() { return rerolling; }
+// True while a golden-pencil slice regen is streaming. The composer's stop
+// button reads this to route the cancel to `fable_slice_stop` (the slice
+// cancel slot) instead of `fable_stop` (the full-turn slot) — Bug #7 cross-
+// wire lesson.
+export function isSliceRegenerating() { return sliceBeat !== null; }
 
 export async function stopFableTurn() {
   try { await invoke('fable_stop'); } catch (_) {}
@@ -335,10 +360,14 @@ function onCancelled() {
 // blocks too because the round-trip shouldn't race a concurrent send.
 // =============================================================
 
-// In-place typo/content fix for either a user or assistant message. Does
-// NOT re-trigger inference (per spec §1) and does NOT touch the schema
-// (schema_pop_count is always 0, but we still hand it to onSchemaPop for
-// contract symmetry — it's a no-op there).
+// In-place edit for either a user or assistant message. The backend
+// persists the prose; for ASSISTANT messages it also RE-TRACKS (2026-08-14):
+// reverts the live schema to the message's base_schema (undoing the turn's
+// last track) + re-runs the local tracker over the edited beat, storing the
+// fresh snapshot into the variant↔schema binding. That tracker pass is a
+// local decode (a few seconds) — `generating` stays true across it so the
+// composer + drawer wait it out. schema_pop_count is 0 (the ring-buffer
+// push happens inside the backend, the swipe precedent).
 export async function editMessage(index, newText) {
   if (generating) return false;
   generating = true;
@@ -485,6 +514,101 @@ export async function rewindAndEditUser(index, newText) {
   generating = false;
   await sendFableTurn(newText, { regenerate: true });
   return true;
+}
+
+// =============================================================
+// SLICE REGENERATE — the golden pencil (2026-08-11).
+//
+// Partial in-place regen of a highlighted span inside an assistant message.
+// The frontend's slice-regen.js computed the authoritative 3-way split
+// (pre/selection/post) from the DOM Selection; the backend (fable_regenerate
+// _slice) asks the API to rewrite ONLY the selection, splicing cleanly, then
+// streams the replacement into a streaming span between `pre` and `post`.
+// On slice_done the beat is re-rendered from the final full text.
+//
+// API-only, no tracker, no schema mutation, in-place, no undo. Guard on
+// isGenerating() like the other mutators. Cancellable via Escape (or the
+// composer stop button when isSliceRegenerating()) → fable_slice_stop.
+// =============================================================
+export async function regenerateSlice({ index, pre, selection, post }) {
+  if (generating) return false;
+  generating = true;
+  if (onTurnStart) onTurnStart();
+
+  const beat = beats.beatByIndex(index);
+  if (!beat) {
+    beats.addErrorBeat('Cannot regenerate: message not found.');
+    finishTurn();
+    return false;
+  }
+
+  // Split the beat body into pre + streaming span + post.
+  sliceBeat = beat;
+  sliceSpan = beats.beginSliceRegen(beat, { pre, post });
+
+  // Transient Escape → cancel. Removed on finishTurn via clearSliceState.
+  sliceEscapeFn = (e) => {
+    if (e.key === 'Escape') {
+      e.preventDefault();
+      e.stopPropagation();
+      stopSliceRegen();
+    }
+  };
+  document.addEventListener('keydown', sliceEscapeFn, true);
+
+  const channel = new Channel();
+  channel.onmessage = (msg) => handleSliceEvent(msg);
+
+  try {
+    await invoke('fable_regenerate_slice', { index, pre, selection, post, onEvent: channel });
+  } catch (err) {
+    // Restore the beat to its pre-regen prose + surface the error.
+    if (sliceBeat) beats.cancelSliceRegen(sliceBeat);
+    beats.addErrorBeat(String(err));
+    finishTurn();
+    return false;
+  }
+  return true;
+}
+
+// Slice channel event router. Distinct from handleEvent (the fable_send path)
+// because the finalization event is `slice_done` (not `done`) + the streaming
+// target is `sliceSpan` (not `activeBeat`).
+function handleSliceEvent(msg) {
+  if (!msg || typeof msg !== 'object') return;
+  switch (msg.type) {
+    case 'chunk':
+      if (sliceSpan) beats.streamSliceChunk(sliceSpan, msg.text);
+      break;
+    case 'slice_done':
+      if (sliceBeat) beats.finalizeSliceRegen(sliceBeat, msg.final_text);
+      finishTurn();
+      break;
+    case 'error':
+      if (sliceBeat) beats.cancelSliceRegen(sliceBeat);
+      beats.addErrorBeat(msg.message || 'Slice regeneration failed.');
+      finishTurn();
+      break;
+    case 'cancelled':
+      if (sliceBeat) beats.cancelSliceRegen(sliceBeat);
+      finishTurn();
+      break;
+    case 'api_lost':
+      // Same lockout contract as a full-turn api_lost: restore the beat, lock
+      // the composer via the onApiLost hook so the player reconnects + retries.
+      if (sliceBeat) beats.cancelSliceRegen(sliceBeat);
+      if (onApiLost) onApiLost(msg.message || 'The API connection was lost.');
+      finishTurn();
+      break;
+  }
+}
+
+// Cancel the in-flight slice regen (Escape or the composer stop button).
+// Signals the reserved fable_slice_stop slot. The backend breaks the HTTP
+// stream + emits `cancelled`, which handleSliceEvent routes to a beat restore.
+export async function stopSliceRegen() {
+  if (!sliceBeat) return;
+  try { await invoke('fable_slice_stop'); } catch (_) {}
 }
 
 // npc_id → display name. Cards declare start_npcs as ids; the model

@@ -1,11 +1,10 @@
 //! The §8C preserve rule — which paths the updater must NOT overwrite because
 //! they hold user state.
 //!
-//! **DUPLICATED from `src-tauri/src/updater.rs::is_preserved`** because this
-//! crate is standalone (it cannot import `wupi_lib`). The two implementations
-//! MUST stay in lockstep: a path preserved here must be preserved there, and
-//! vice versa. This is the load-bearing sync contract of the temp-staged
-//! pipeline — edit both together.
+//! This is the SINGLE implementation (the old duplicate in
+//! `src-tauri/src/updater.rs` was deleted when the apply pipeline moved into
+//! this crate). The authoritative prose lives in AGENTS.md §8C "Preserve
+//! rule" — keep the two in sync when editing.
 //!
 //! This predicate governs the COPY step only.
 
@@ -13,13 +12,13 @@ use std::path::Path;
 
 /// Returns true for paths that must NOT be overwritten by an update (user data).
 pub fn is_preserved(rel: &Path) -> bool {
-    // data/: preserved EXCEPT the four engine-content files, which ship in the
+    // data/: preserved EXCEPT the engine-content files, which ship in the
     // zip and overwrite the local copy verbatim on update.
     if rel.starts_with("data") {
         return rel != Path::new("data/wupi.sim")
             && rel != Path::new("data/wupi.codex")
-            && rel != Path::new("data/fable.sim")
-            && rel != Path::new("data/fable.codex");
+            && rel != Path::new("data/fable.prompt")
+            && rel != Path::new("data/wupi.prompt");
     }
     // memory/, models/, apps/: fully preserved.
     rel.starts_with("memory") || rel.starts_with("models") || rel.starts_with("apps")
@@ -41,8 +40,8 @@ mod tests {
     fn overwrites_engine_content_under_data() {
         assert!(!is_preserved(Path::new("data/wupi.sim")));
         assert!(!is_preserved(Path::new("data/wupi.codex")));
-        assert!(!is_preserved(Path::new("data/fable.sim")));
-        assert!(!is_preserved(Path::new("data/fable.codex")));
+        assert!(!is_preserved(Path::new("data/wupi.prompt")));
+        assert!(!is_preserved(Path::new("data/fable.prompt")));
     }
 
     #[test]

@@ -4845,6 +4845,7 @@ dependencies = [
  "heck 0.5.0",
  "http",
  "http-range",
+ "image",
  "jni",
  "libc",
  "log",
@@ -6617,9 +6618,10 @@ dependencies = [
 
 [[package]]
 name = "wupi"
-version = "0.17.0"
+version = "0.18.0"
 dependencies = [
  "anyhow",
+ "cc",
  "diffusion-rs",
  "diffusion-rs-sys",
  "encoding_rs",

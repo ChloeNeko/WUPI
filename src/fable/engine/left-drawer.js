@@ -1021,8 +1021,8 @@ export async function refreshAll() {
           invoke('fable_schema_get').catch(() => null),
         ]);
     // fable_active_card_get → { name, player_name } (object) when a game is
-    // active, or null when none is. The player_name is the empty string in
-    // Quick Play (no SavedPlayer attached) — fall back to the card name, then
+    // active, or null when none is. The player_name may be the empty string
+    // (no SavedPlayer attached) — fall back to the card name, then
     // to a neutral 'WANDERER' so the header is never blank.
     if (cardRes && typeof cardRes === 'object') {
       cardName = typeof cardRes.name === 'string' ? cardRes.name : '';

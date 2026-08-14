@@ -922,7 +922,25 @@ impl<E: Embedder> MemoryEngine<E> {
         salience: f32,
         metadata_json: String,
     ) -> anyhow::Result<MemoryId> {
-        let embedding = self.embedder.embed(text.clone()).await?;
+        // Embed-cap backstop: bge-small silently truncates bodies >~1400 chars,
+        // corrupting the vector. The codex seed path splits pre-embed
+        // (codex::expand_oversize_entries), so this should be unreachable; if a
+        // future caller bypasses it, NEVER hand >1400 to the embedder — clamp
+        // the embed input to the last char boundary ≤1400. The full body is
+        // still stored below for retrieval display.
+        const EMBED_CAP: usize = 1400;
+        let embed_input: String = if text.len() > EMBED_CAP {
+            let cut = floor_char_boundary(&text, EMBED_CAP);
+            tracing::error!(
+                len = text.len(),
+                cut,
+                "add_codex_entry: body >1400 reached the embed call (seed-path split should have prevented this); clamping the embed input. Full body still stored."
+            );
+            text[..cut].to_string()
+        } else {
+            text.clone()
+        };
+        let embedding = self.embedder.embed(embed_input).await?;
 
         let conn = self.conn.clone();
         let card_id = card_id.to_owned();
@@ -938,8 +956,10 @@ impl<E: Embedder> MemoryEngine<E> {
                 salience,
                 0,
                 Some(&metadata),
-                None, // codex entries are authored short (BUDGET_CHARS=1400 in
-                      // codex.rs enforces this at authoring time): never chunked.
+                None, // codex entries are never chunked mid-row: the seed path
+                      // splits oversize bodies into "Part N" entries pre-embed
+                      // (codex::expand_oversize_entries), + add_codex_entry
+                      // clamps the embed input as a final backstop.
                 &embedding,
             )
         })
@@ -1029,7 +1049,22 @@ impl<E: Embedder> MemoryEngine<E> {
     /// text moves. Silent no-op (returns Ok) if `id` doesn't exist; the
     /// caller's UI refresh will simply show nothing changed.
     pub async fn update_memory(&self, id: MemoryId, text: String) -> anyhow::Result<()> {
-        let embedding = self.embedder.embed(text.clone()).await?;
+        // Embed-cap backstop (mirrors add_codex_entry): the Codex browser's
+        // inline editor can reach this with an oversize body; never embed >1400
+        // (bge-small would silently truncate). Clamp the embed input; store full.
+        const EMBED_CAP: usize = 1400;
+        let embed_input: String = if text.len() > EMBED_CAP {
+            let cut = floor_char_boundary(&text, EMBED_CAP);
+            tracing::error!(
+                len = text.len(),
+                cut,
+                "update_memory: body >1400 reached the embed call; clamping the embed input. Full body still stored."
+            );
+            text[..cut].to_string()
+        } else {
+            text.clone()
+        };
+        let embedding = self.embedder.embed(embed_input).await?;
         let conn = self.conn.clone();
         tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
             let c = conn.lock().expect("memory conn mutex");
@@ -1390,6 +1425,20 @@ fn migrate_add_column(
 ///
 /// Returns at least one chunk (empty input → one empty chunk, which the caller
 /// filters before embedding: `add_memory` skips empty chunks).
+/// Largest index ≤ `idx` that falls on a UTF-8 char boundary in `s`. Used by
+/// the codex embed-cap backstops (`add_codex_entry` / `update_memory`) to clamp
+/// an oversize body to ≤1400 bytes without splitting a multi-byte character.
+/// (stdlib gained `str::floor_char_boundary` in 1.80; this avoids pinning MSRV.)
+fn floor_char_boundary(s: &str, mut idx: usize) -> usize {
+    if idx >= s.len() {
+        return s.len();
+    }
+    while !s.is_char_boundary(idx) {
+        idx -= 1;
+    }
+    idx
+}
+
 pub fn chunk_text(text: &str) -> Vec<String> {
     if text.len() <= CHUNK_CHAR_BUDGET {
         return vec![text.to_owned()];

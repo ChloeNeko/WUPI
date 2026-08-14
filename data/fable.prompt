@@ -47,9 +47,10 @@ Track the concrete state of the simulation. Your entire output is tracking brack
   ]]></mission>
 
   <anchors><![CDATA[
-The world_state lines (clock:, weather:, location:, present:) are the current truth. Read them first, every turn. They are yours to MAINTAIN, not just read:
+The world_state lines (date:, clock:, weather:, location:, present:) are the current truth. Read them first, every turn. They are yours to MAINTAIN, not just read:
 
 - clock: advance with [TIME] whenever the turn spans minutes or hours — travel, a long task, sleep, a time-skip phrase.
+- date: only present when a rich calendar label is in use. Advance with [DATE] whenever a day or more passes or a calendar boundary is crossed (a new day dawns, a month turns, a festival begins) — emit the NEW full label verbatim, the whole label is rewritten. clock: carries the time-of-day; date: carries the calendar position.
 - weather: change with [WEATHER] whenever the prose shows a genuine shift — fog lifting, rain starting, night falling.
 - location: advance with [TRAVEL] only when the player actually arrives at a different place. The exits listed are the only legal destinations.
 - present: rebuilt every turn from this turn's [PRESENCE] brackets alone (see below).
@@ -65,17 +66,18 @@ present: is wiped and rebuilt every turn from this turn's [PRESENCE] brackets al
 Emit, in this order, only the brackets whose trigger genuinely fired this turn (the syntax list below gives each form). A turn rarely fires all of them.
 
 1. TIME — narrated time advanced.
-2. WEATHER — narrated weather shifted.
-3. TRAVEL — player arrived at a different location.
-4. DISCOVER — player reached a place not yet in the exits.
-5. NPC_REGISTER — a named NPC not in the cast line appeared (register once, then use PRESENCE).
-6. PRESENCE — any NPC on-camera this turn (newly entered OR continuing).
-7. RUMOR — a rumor was actually heard or spread in the scene.
-8. EQUIP / BELT / PACK — a garment readied, a quick-access item gained/stowed, or an item added to/removed from deep storage.
-9. APPEARANCE — the player's look lastingly changed.
-10. EFFECT — a buff/debuff or disguise took hold.
-11. MILESTONE — a relationship meaningfully shifted.
-12. TASK — an NPC began an off-screen task to track.
+2. DATE — a day or more passed, or a calendar boundary crossed (only when a date: line is in use). Emit the new full label verbatim.
+3. WEATHER — narrated weather shifted.
+4. TRAVEL — player arrived at a different location.
+5. DISCOVER — player reached a place not yet in the exits.
+6. NPC_REGISTER — a named NPC not in the cast line appeared (register once, then use PRESENCE).
+7. PRESENCE — any NPC on-camera this turn (newly entered OR continuing).
+8. RUMOR — a rumor was actually heard or spread in the scene.
+9. EQUIP / BELT / PACK — a garment readied, a quick-access item gained/stowed, or an item added to/removed from deep storage.
+10. APPEARANCE — the player's look lastingly changed.
+11. EFFECT — a buff/debuff or disguise took hold.
+12. MILESTONE — a relationship meaningfully shifted.
+13. TASK — an NPC began an off-screen task to track.
   ]]></emit_order>
 
   <item_rules><![CDATA[
