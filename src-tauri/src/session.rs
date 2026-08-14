@@ -920,7 +920,7 @@ mod tests {
         m.select_variant(1);
         assert_eq!(m.active_idx, 1);
         // A legacy message with no stored schema falls back to None (graceful).
-        let mut legacy = variant_msg();
+        let legacy = variant_msg();
         assert!(legacy.variant_schemas.get(0).is_none());
     }
 

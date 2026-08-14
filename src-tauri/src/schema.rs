@@ -2816,7 +2816,6 @@ mod tests {
 
     #[test]
     fn travel_graph_is_adjacent_to_current_false_for_non_neighbor() {
-        let g = sample_travel_graph();
         // cellar is in the graph but NOT adjacent to tavern (one-way edge).
         // Wait — sample graph has cellar→tavern; tavern's neighbors are
         // cellar + market_square, so cellar IS adjacent to tavern. Use a node
