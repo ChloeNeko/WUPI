@@ -1,6 +1,6 @@
 [package]
 name = "wupi"
-version = "0.19.0"
+version = "0.19.1"
 edition = "2021"
 # Two [[bin]] targets exist (wupi + fable). default-run picks wupi.exe as the
 # primary for `cargo run` / `tauri dev` — without it, multiple bins + no
