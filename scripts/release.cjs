@@ -203,7 +203,21 @@ const tag = `v${newVersion}`;
 // ──────────────────────────────────────────────────────────────────────────
 if (bumpKind && !dryRun) {
   console.log(`[release] committing version bump for ${tag}…`);
-  const commit = spawnSync('git', ['add', tauriConfPath], { stdio: 'inherit' });
+  // Stage EVERY file Step 1 synced (tauri.conf.json + package.json + the two
+  // Cargo.tomls + their Cargo.locks), not just the primary conf — the old
+  // tauriConfPath-only add left the secondary version syncs as loose working-
+  // tree writes after the release (v0.19.0 shipped its bump commit with ONLY
+  // tauri.conf.json; the rest lingered uncommitted + had to be swept up
+  // separately).
+  const versionFiles = [
+    tauriConfPath,
+    pkgPath,
+    join(repoRoot, 'src-tauri', 'Cargo.toml'),
+    join(repoRoot, 'src-tauri', 'Cargo.lock'),
+    updaterCargoPath,
+    join(repoRoot, 'crates', 'updater', 'Cargo.lock'),
+  ].filter((f) => existsSync(f));
+  const commit = spawnSync('git', ['add', ...versionFiles], { stdio: 'inherit' });
   if (commit.status !== 0) { console.error('[release] git add failed'); process.exit(1); }
   const cm = spawnSync('git', ['commit', '-m', `release: ${tag}`], { stdio: 'inherit' });
   if (cm.status !== 0) { console.error('[release] git commit failed'); process.exit(1); }
