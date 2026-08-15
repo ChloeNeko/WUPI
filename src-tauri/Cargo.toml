@@ -1,6 +1,6 @@
 [package]
 name = "wupi"
-version = "0.19.2"
+version = "0.19.3"
 edition = "2021"
 # Two [[bin]] targets exist (wupi + fable). default-run picks wupi.exe as the
 # primary for `cargo run` / `tauri dev` — without it, multiple bins + no
@@ -17,6 +17,9 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 # these two build: `wupi.exe` (normal OS boot) + `fable.exe` (sets the
 # fable-entry flag → main window loads `wupi.html#fable` → skips straight to
 # the Fable title). `npx tauri build` emits both into target/release/.
+# NOTE (2026-08-14, Chloe's call): the exe name stays `fable.exe` even though
+# Discord's game detection matches it to the 2005 "Fable: The Lost Chapters"
+# (that game's exe is literally Fable.exe). Do NOT rename to dodge Discord.
 [[bin]]
 name = "wupi"
 path = "src/main.rs"
