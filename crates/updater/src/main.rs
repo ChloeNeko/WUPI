@@ -57,6 +57,14 @@
 //! can leave a partially-updated install — the residual bricking surface,
 //! documented in AGENTS.md; it requires a disk-space fix + a clean redownload.
 
+// Headless binary: no console is ever allocated for it, even if a future
+// spawn site drops the creation flag (belt-and-braces alongside the
+// CREATE_NO_WINDOW spawn flag in wupi.exe). Debug builds keep the console
+// subsystem so `cargo run` diagnostics still print. Same convention as
+// src-tauri/src/main.rs. Safe because this crate never prints — all
+// diagnostics go through `log()` to a %TEMP% file.
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+
 use std::path::Path;
 
 mod cli;
@@ -203,7 +211,10 @@ fn spawn_wupi(target_dir: &Path) {
         // app with default flags gets a NEW VISIBLE console for it. Lifetime
         // is not a concern either — Windows children always outlive their
         // parent, so the new wupi.exe survives this updater's exit regardless.
-        const CREATE_NO_WINDOW: u32 = 0x0200_0000;
+        // 0x0800_0000 per winbase.h — 0x0200_0000 is a different flag
+        // (CREATE_PRESERVE_CODE_AUTHZ_LEVEL, a no-op) and leaves console
+        // children with a VISIBLE window.
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
         if let Err(e) = std::process::Command::new(&exe)
             .creation_flags(CREATE_NO_WINDOW)
             .spawn()
@@ -280,7 +291,10 @@ fn self_delete_temp_copy() {
     // CREATE_NO_WINDOW alone, cmd gets a HIDDEN console that ping inherits:
     // nothing is ever visible. (Grandchildren only flash when the parent is
     // console-less; a hidden console is inherited silently.)
-    const CREATE_NO_WINDOW: u32 = 0x0200_0000;
+    // 0x0800_0000 per winbase.h — 0x0200_0000 is a different flag
+    // (CREATE_PRESERVE_CODE_AUTHZ_LEVEL, a no-op) and leaves cmd with a
+    // VISIBLE console window.
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
     let mut cmd = std::process::Command::new("cmd.exe");
     // raw_arg, not args: std's default Windows argument quoting wraps the
     // script in quotes and escapes the inner path quotes as \" — cmd.exe

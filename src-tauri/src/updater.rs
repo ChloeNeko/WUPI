@@ -179,7 +179,10 @@ pub async fn perform_update(
         // hidden console its own grandchildren inherit — fully invisible.
         // (Lifetime is not a concern: Windows children always outlive their
         // parent; there is no "tied child" to detach from.)
-        const CREATE_NO_WINDOW: u32 = 0x0200_0000;
+        // 0x0800_0000 per winbase.h. Do NOT "correct" this to 0x0200_0000 —
+        // that is CREATE_PRESERVE_CODE_AUTHZ_LEVEL, a no-op that leaves the
+        // console-subsystem updater.exe with a VISIBLE console window.
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
         cmd.creation_flags(CREATE_NO_WINDOW);
     }
     cmd.spawn().map_err(|e| format!("spawn updater: {e}"))?;
