@@ -180,28 +180,51 @@ body.fable-active.fable-chrome-peek .top-bar { transform: translateY(0); }
    On the fable.exe path the floating-F splash (#fable-entry-splash, owned by
    script.js) holds ~2s then crossfades out over 600ms. openFable reveals the
    title screen at the same instant (FABLE_SPLASH_HOLD_MS in fable.js), so
-   adding .fable-title-enter rides a 700ms opacity fade-in on the title that
-   matches the splash's 600ms fade-out → the F logo dissolves INTO the menu
-   instead of a hard cut. The class is added once by openFable right after
-   showScreen('title') on the FABLE_ENTRY path and self-removes on
+   adding .fable-title-enter rides a 1000ms TOP-TO-BOTTOM fade on the title:
+   a soft mask edge (~15% of screen height) sweeps down the whole screen over
+   exactly 1s → the menu fills in from top to bottom as the F logo crossfades
+   out instead of a hard cut. The reveal is a MASK sweep, not an opacity fade
+   (every layer is already composited behind the hold — §the 2s hold below —
+   so a uniform 0→1 opacity ramp and the mask sweep cost the same; the sweep
+   just reads as a cinematic wipe). --fable-reveal-edge is registered via
+   @property so the gradient stop position is animatable (WebView2/Chromium;
+   unregistered custom props don't interpolate). The class is added once by
+   revealTitleUnderSplash right after showScreen('title') and self-removes on
    animationend so it never interferes with later title re-shows (New Game ⌂
    back, Load back) — those reveal with no animation, as before. */
+@property --fable-reveal-edge {
+    syntax: '<percentage>';
+    inherits: false;
+    initial-value: 100%; /* fully revealed when not animating */
+}
 .fable-title-screen.fable-title-enter {
-    animation: fableTitleEnter 700ms ease both;
+    animation: fableTitleEnter 1000ms ease both;
+    -webkit-mask-image: linear-gradient(
+        to bottom,
+        black var(--fable-reveal-edge),
+        transparent calc(var(--fable-reveal-edge) + 15%)
+    );
+    mask-image: linear-gradient(
+        to bottom,
+        black var(--fable-reveal-edge),
+        transparent calc(var(--fable-reveal-edge) + 15%)
+    );
 }
 @keyframes fableTitleEnter {
-    from { opacity: 0; }
-    to   { opacity: 1; }
+    /* -15% → the whole screen sits below the soft band (fully hidden);
+       100% → the soft band has swept past the bottom (fully visible). */
+    from { --fable-reveal-edge: -15%; }
+    to   { --fable-reveal-edge: 100%; }
 }
 /* ── The 2s transparency hold (load-behind-the-F) ──
    On the fable.exe path the title screen is shown IMMEDIATELY (t=0), held at
    opacity 0 behind the floating-F splash: every layer — bg image, dim, grass,
    particles, clouds, wordmark — composites + warms during the 2s hold, so
-   the reveal is a pure opacity ramp with zero pop-in, and WUPI's purple boot
-   base never shows (the splash owns the pixels while the menu warms up).
-   Dropped by revealTitleUnderSplash at FABLE_SPLASH_HOLD_MS, right before
-   .fable-title-enter rides the 0→1 fade. `animation: none` so the pair can
-   never half-animate if both classes ever coexist. */
+   the reveal is a pure top-to-bottom sweep with zero pop-in, and WUPI's
+   purple boot base never shows (the splash owns the pixels while the menu
+   warms up). Dropped by revealTitleUnderSplash at FABLE_SPLASH_HOLD_MS,
+   right before .fable-title-enter rides the 1s wipe. `animation: none` so
+   the pair can never half-animate if both classes ever coexist. */
 .fable-title-screen.fable-title-held {
     opacity: 0;
     animation: none;

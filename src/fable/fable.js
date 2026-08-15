@@ -153,7 +153,7 @@ const revealTitleUnderSplash = (fableRoot) => {
   if (titleEl) {
     // Drop the 2s transparency hold FIRST (fable.css): the title was shown at
     // t=0 behind the F splash, held at opacity 0 while it warmed up — the
-    // enter animation then rides the full 0→1 fade.
+    // enter animation then rides the full 1s top-to-bottom mask sweep.
     titleEl.classList.remove('fable-title-held');
     titleEl.classList.remove('fable-title-enter');
     void titleEl.offsetWidth; // reflow so re-adding restarts the animation
@@ -1613,9 +1613,9 @@ function openFable() {
     // no paint can land between them. The reveal fires at SPLASH_HOLD_MS
     // (matching script.js's splash fade start) via the shared
     // revealTitleUnderSplash choreography: the held class drops, the
-    // .fable-title-enter fade rides 0→1 (700ms) as the F logo crossfades out
-    // (600ms) → the F dissolves INTO the menu, and the theme music starts
-    // its fade-in at that same 2s mark (never during the hold).
+    // .fable-title-enter wipe fades in top-to-bottom (1000ms) as the F logo
+    // crossfades out (600ms) → the F dissolves INTO the menu, and the theme
+    // music starts its fade-in at that same 2s mark (never during the hold).
     showScreen('title');
     if (screens.title) screens.title.classList.add('fable-title-held');
     setTimeout(() => revealTitleUnderSplash(fableRoot), FABLE_SPLASH_HOLD_MS);
