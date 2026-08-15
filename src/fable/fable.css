@@ -3624,6 +3624,11 @@ body.fable-active.fable-chrome-peek .top-bar { transform: translateY(0); }
     font-size: 13px;
     letter-spacing: 0.02em;
 }
+/* Import/read failure notices surface on the hint line (backgrounds.js
+   showNotice) — warm red, same family as the error beats. */
+.fable-bg-hint.is-err {
+    color: #f4a0a0;
+}
 /* The gallery grid. auto-fill minmax so it wraps 4–5 per row on desktop,
    fewer on the narrow drawer. Scrolls internally if the library grows. */
 .fable-bg-grid {

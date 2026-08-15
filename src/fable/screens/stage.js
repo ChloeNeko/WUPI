@@ -334,7 +334,12 @@ export async function wireStage(root, hooks) {
   // save — a second editor's text would otherwise be silently lost when the
   // first save's feed rebuild lands (the rebuild replaces every node, and a
   // user-beat save REWINDS, which truncates beats + shifts indexes).
-  feedEl.addEventListener('click', async (e) => {
+  // (P1 fix) Routed through `on()` like every other stage-element listener:
+  // the stage DOM persists across entries and wireStage re-runs each entry —
+  // a raw addEventListener double-binds, making every ✎/🗑/‹› click fire N
+  // times (a doubled ✎ opened-then-saved instantly, breaking inline editing
+  // from session 2 onward; on a user beat that fired rewind+regen).
+  on(feedEl, 'click', async (e) => {
     // Both control surfaces route here: the .vn-recent hover toolrail AND
     // the .vn-history iron tools column (same data-drawer-act hooks).
     const btn = e.target.closest(
@@ -343,6 +348,7 @@ export async function wireStage(root, hooks) {
     let beat = btn.closest('.fable-mes');
     if (!beat) return;
     const index = Number.parseInt(beat.dataset.index || '-1', 10);
+    if (index < 0) return; // unindexed beat (e.g. system/error) — not a message
     const role = beat.dataset.role;
     const act = btn.dataset.drawerAct;
     if (narrator.isGenerating() || narrator.isRerolling()) {
@@ -439,6 +445,7 @@ export async function wireStage(root, hooks) {
         beat = fresh;
       }
       const index = Number.parseInt(beat.dataset.index || '-1', 10);
+      if (index < 0) return; // unindexed beat — not a backend message
       const isUser = beat.dataset.role === 'user';
       beats.enterEditMode(beat, {
         onSave: (text) => {
@@ -447,9 +454,11 @@ export async function wireStage(root, hooks) {
           // message's base_schema + re-runs the local tracker). Inverted
           // from the prior wiring (which called rewind_and_edit_user on
           // assistant beats — that errors: the command requires a user
-          // target).
-          if (isUser) narrator.rewindAndEditUser(index, text);
-          else narrator.editMessage(index, text);
+          // target). (P1 fix) RETURN the promise — without it a second
+          // dblclick treated the save as not-pending and reopened a doomed
+          // editor whose text the rebuild vaporized.
+          if (isUser) return narrator.rewindAndEditUser(index, text);
+          return narrator.editMessage(index, text);
         },
       });
     },
@@ -803,14 +812,19 @@ export async function wireStage(root, hooks) {
     // Focus the input after the un-hide frame so the user can type immediately.
     setTimeout(() => saveNameInput && saveNameInput.focus(), 30);
   });
-  // Quick Save (autosave slot, no name).
+  // Quick Save (autosave slot, no name). The closed-modal guard eats
+  // programmatic .click()s on a hidden overlay (Enter auto-repeat in the
+  // name field re-fires the handler); doSave's in-flight latch coalesces
+  // any remaining double-fire into one write.
   on(root.querySelector('[data-save-quick]'), 'click', () => {
+    if (saveOverlay && saveOverlay.hidden) return;
     doSave('autosave', 'Autosave', 'Quick saved.');
     closeSaveModal();
   });
   // Named Save (timestamped slot with the typed name; falls back to autosave
   // when the name is blank — same behavior as Quick Save in that case).
   on(root.querySelector('[data-save-named]'), 'click', () => {
+    if (saveOverlay && saveOverlay.hidden) return;
     const name = saveNameInput.value.trim();
     if (name) {
       doSave(String(Date.now()), name, 'Saved "' + name + '".');
@@ -840,7 +854,13 @@ export async function wireStage(root, hooks) {
     wupiDrawer.closeDrawer();
     if (onLoadHook) onLoadHook();
   });
+  // Home double-click latch: the exit path is async (the title transition) —
+  // a second click mid-transition must not re-fire it. Closure-scoped so a
+  // fresh session's wireStage resets it.
+  let homeFired = false;
   on(footHome, 'click', () => {
+    if (homeFired) return;
+    homeFired = true;
     wupiDrawer.closeDrawer();
     if (onExitHook) onExitHook();
   });
@@ -954,9 +974,22 @@ function setGenerating(on) {
   const input = stageRoot && stageRoot.querySelector('[data-input]');
   if (!input) return;
   if (on) {
-    input.dataset.idlePlaceholder = input.placeholder;
+    // Idempotent stash: reroll / rewind-edit fire onTurnStart, then
+    // sendFableTurn fires it AGAIN — the second call must not stash the
+    // BUSY placeholder over the idle one (else the composer forever reads
+    // "Press Enter to stop…" after the turn).
+    if (input.dataset.idlePlaceholder == null) {
+      input.dataset.idlePlaceholder = input.placeholder;
+    }
     input.placeholder = 'Press Enter to stop…';
   } else {
+    // A locked composer (mid-turn api_lost) keeps its red lock message —
+    // the stash restore must not clobber it; unlockComposer resets the
+    // placeholder itself.
+    if (composerLocked) {
+      delete input.dataset.idlePlaceholder;
+      return;
+    }
     if (input.dataset.idlePlaceholder != null) {
       input.placeholder = input.dataset.idlePlaceholder;
       delete input.dataset.idlePlaceholder;
@@ -1135,12 +1168,17 @@ function cancelLeftCornerDwell() {
   if (leftCornerDwellTimer) { clearTimeout(leftCornerDwellTimer); leftCornerDwellTimer = null; }
 }
 
+let saveInFlight = false;
 async function doSave(saveId, name, msg) {
+  if (saveInFlight) return; // a double-fired save coalesces into the first
+  saveInFlight = true;
   try {
     await saveNow(saveId, name);
     toast(msg || 'Saved.');
   } catch (err) {
     toast('Save failed: ' + err);
+  } finally {
+    saveInFlight = false;
   }
 }
 

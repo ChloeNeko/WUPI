@@ -713,10 +713,12 @@ impl AttackerTier {
         }
     }
 
-    /// Lethality DC modifier — added to the base DC for the lethal-blow roll.
-    /// Higher tiers make lethal outcomes more likely. Pure Rust math: a d20
-    /// is rolled, compared against `BASE_LETHAL_DC + tier_modifier +
-    /// condition_penalty`. If the roll falls short, the blow is lethal.
+    /// Lethality DC modifier — added to the base DC for the lethal-blow SAVE.
+    /// Higher tiers LOWER the save DC, making lethal outcomes more likely
+    /// (the player needs a lower roll to fail the save and drop). Pure Rust
+    /// math: a d20 is rolled, compared against `BASE_LETHAL_DC + tier_modifier
+    /// + condition_penalty`. If the roll meets or beats the DC, the blow is
+    /// lethal.
     fn lethality_dc_mod(self) -> i32 {
         match self {
             AttackerTier::Minion => 8,    // almost never lethal
@@ -740,7 +742,7 @@ impl AttackerTier {
     }
 }
 
-/// The base DC for the lethality roll. A roll < this (modified) means the
+/// The base DC for the lethality SAVE. A roll >= this (modified) means the
 /// blow is lethal. Tuned so a Legendary's full hit on a Battered defender
 /// is almost always lethal, and a Minion's is almost never.
 const BASE_LETHAL_DC: i32 = 18;
@@ -890,7 +892,7 @@ fn roll_injury_descriptor(roller: &mut Roller, tier: AttackerTier, state: BodyPa
 /// (Wupi-as-game-manager resolution, NPC stat declaration, the [COMBAT]
 /// block's tier field) should call [`referee_evaluate_with_tier`] instead.
 pub fn referee_evaluate(text: &str, state: &PlayerState) -> Option<RefereeOutcome> {
-    referee_evaluate_with_tier(text, state, AttackerTier::Soldier)
+    referee_evaluate_with_tier(text, state, AttackerTier::Soldier, 0, 0)
 }
 
 /// Select the attacker tier for a combat turn from the schema's entity map
@@ -913,18 +915,49 @@ pub fn referee_evaluate(text: &str, state: &PlayerState) -> Option<RefereeOutcom
 ///
 /// Pure fn — no I/O. The entity map is `&HashMap<String, String>` (the
 /// WorldSchema's `entities` field shape).
+/// Substring keyword match with a LEADING word boundary: the character
+/// before the hit (if any) must be non-alphanumeric. Kills the worst false
+/// positives ("I light the camp**fire**", "**run** a bath" style compounds)
+/// while preserving inflections — there is deliberately NO trailing
+/// boundary, so "attacks"/"swings" still match "attack"/"swing".
+fn keyword_present(lower: &str, kw: &str) -> bool {
+    let mut from = 0;
+    while let Some(pos) = lower[from..].find(kw) {
+        let at = from + pos;
+        // ASCII keywords can only match at char boundaries, so `at` is one.
+        let leading_ok = lower[..at]
+            .chars()
+            .next_back()
+            .map(|c| !c.is_alphanumeric())
+            .unwrap_or(true);
+        if leading_ok {
+            return true;
+        }
+        from = at + kw.len().max(1);
+    }
+    false
+}
+
 pub fn select_attacker_tier_from_entities(
     entities: &std::collections::HashMap<String, serde_json::Value>,
+    present_npc_ids: &[String],
 ) -> AttackerTier {
-    // Single-pass scan: collect every npc.*.tier value, parse each, keep the
-    // max. Cheap (entity maps are small — typically <50 keys). Tier keys are
-    // conventionally bare strings ("Elite", "Boss"); a structured value at a
-    // .tier key is unrecognized noise — skip it.
+    // Single-pass scan: collect every npc.<id>.tier value for an NPC that is
+    // ON-CAMERA this turn, parse each, keep the max. (P2 fix: the old scan
+    // took the max over the WHOLE world — one npc.dragon.tier entity key
+    // (which nothing ever removes) permanently escalated every subsequent
+    // fight's severity + lethality DC, including bar brawls on the other
+    // side of the map.) Tier keys are conventionally bare strings ("Elite",
+    // "Boss"); a structured value at a .tier key is unrecognized noise —
+    // skip it. Empty presence list → the Soldier default.
     let mut best: Option<AttackerTier> = None;
-    for (key, value) in entities.iter() {
-        if !key.starts_with("npc.") || !key.ends_with(".tier") {
+    if present_npc_ids.is_empty() {
+        return AttackerTier::Soldier;
+    }
+    for id in present_npc_ids {
+        let Some(value) = entities.get(&format!("npc.{id}.tier")) else {
             continue;
-        }
+        };
         let Some(s) = value.as_str() else { continue };
         if let Some(tier) = parse_attacker_tier(s) {
             best = Some(match best {
@@ -982,9 +1015,11 @@ pub fn referee_evaluate_with_tier(
     text: &str,
     state: &PlayerState,
     attacker_tier: AttackerTier,
+    buff_tag_count: usize,
+    debuff_tag_count: usize,
 ) -> Option<RefereeOutcome> {
     let lower = text.to_lowercase();
-    let triggered = COMBAT_KEYWORDS.iter().any(|kw| lower.contains(kw));
+    let triggered = COMBAT_KEYWORDS.iter().any(|kw| keyword_present(&lower, kw));
     if !triggered {
         return None;
     }
@@ -1054,7 +1089,7 @@ pub fn referee_evaluate_with_tier(
     // coupling. The Referee stays pure-Rust; the consequence module owns
     // the label taxonomy.
     let derived =
-        crate::consequence::derive_condition(&state.body, 0, 0);
+        crate::consequence::derive_condition(&state.body, buff_tag_count, debuff_tag_count);
     let condition_penalty = match derived {
         crate::consequence::Condition::Downed => -20, // already down → any hit finishes
         crate::consequence::Condition::Critical => -10,
@@ -1065,7 +1100,12 @@ pub fn referee_evaluate_with_tier(
     };
     let lethality_dc = BASE_LETHAL_DC + attacker_tier.lethality_dc_mod() + condition_penalty;
     let lethality_roll = roll_d20(&mut roller);
-    let lethal = (lethality_roll as i32) < lethality_dc;
+    // `>=` (P0 fix): the roll is a SAVE — meeting or beating the (modified)
+    // DC means the player shrugs the blow off; only a roll that FAILS the
+    // save (`>=` the DC) drops them. The prior `<` inverted every tier
+    // (default Soldier DC 22 > max d20 → EVERY hit was lethal; Minions
+    // always lethal, Legendary 45%, a Downed player unfinishable).
+    let lethal = (lethality_roll as i32) >= lethality_dc;
 
     // Narrative hint: a short second-person prose seed. The narrator reads the
     // canonical body-state change as hard fact; this hint just nudges prose.
@@ -1132,11 +1172,16 @@ pub fn apply_outcome(state: &mut PlayerState, outcome: &RefereeOutcome) {
     if outcome.new_state == BodyPartState::Black {
         state.injury_details.insert(outcome.part, vec![outcome.injury_desc.clone()]);
     } else if !outcome.injury_desc.is_empty() {
-        state
+        let v = state
             .injury_details
             .entry(outcome.part)
-            .or_default()
-            .push(outcome.injury_desc.clone());
+            .or_default();
+        v.push(outcome.injury_desc.clone());
+        // (P3 fix) Bound the per-zone wound history: a zone hit 50 times
+        // over a long campaign otherwise contributes 50 noun phrases of
+        // permanent prompt prefill + save bloat. Keep the most recent 5.
+        let overflow = v.len().saturating_sub(5);
+        v.drain(..overflow);
     }
 }
 
@@ -1276,7 +1321,7 @@ pub fn referee_evaluate_skill_checks(text: &str, pacing_dc_mod: i32) -> Vec<Skil
     let text_hash = hash_text(text);
     let mut out = Vec::new();
     for (idx, spec) in SKILL_TABLE.iter().enumerate() {
-        let triggered = spec.keywords.iter().any(|kw| lower.contains(kw));
+        let triggered = spec.keywords.iter().any(|kw| keyword_present(&lower, kw));
         if !triggered {
             continue;
         }
@@ -1403,7 +1448,7 @@ pub fn find_disguise_tag(tags: &[crate::consequence::StatusTag]) -> Option<&crat
 /// to revoke the auto-pass.
 pub fn has_suspicious_action(text: &str) -> bool {
     let lower = text.to_lowercase();
-    SUSPICIOUS_ACTIONS.iter().any(|kw| lower.contains(kw))
+    SUSPICIOUS_ACTIONS.iter().any(|kw| keyword_present(&lower, kw))
 }
 
 /// The outcome of the disguise gate for one turn. Carries everything the
@@ -1450,6 +1495,14 @@ impl DisguiseDirective {
             ),
         }
     }
+
+    /// True when the gate's dice say the disguise is BLOWN and the caller
+    /// (which holds the schema lock) must mechanically remove the disguise
+    /// StatusTag. (P2 fix: a failed scrutiny used to emit prose only — the
+    /// tag survived until its expiry and the auto-pass resumed next turn.)
+    pub fn should_revoke(&self) -> bool {
+        matches!(self, DisguiseDirective::Scrutinized { success: false, .. })
+    }
 }
 
 /// Seeds for the Scrutinized outcome. Mirrors SkillSpec.success_seed /
@@ -1461,30 +1514,54 @@ const SCRUTINIZED_FAIL_SEED: &str = "the act cracks under scrutiny; the disguise
 ///
 /// Returns:
 ///   - `None` when there's no active disguise tag (nothing to gate).
-///   - `None` when an NPC tier above Soldier is present (Elite+ scrutinize
-///     by default; the normal §11.21 skill-check Referee handles the roll).
+///   - `Some(Scrutinized)` when an Elite+ NPC is present: they scrutinize by
+///     default, so a Deception check is rolled HERE (P2 fix — the old
+///     `return None` assumed the §11.21 skill referee would roll it, but
+///     that referee only fires on deceive-keywords: a disguised player
+///     walking past a captain with neutral text got NO check at all).
 ///   - `Some(AutoPass)` when disguised + low-tier NPCs + no suspicious action.
 ///   - `Some(Scrutinized)` when disguised + low-tier NPCs + suspicious action
 ///     (the auto-pass is revoked; a Deception roll fires here).
 ///
-/// `entities` is the WorldSchema entity map (read for `npc.*.tier` keys via
-/// the existing `select_attacker_tier_from_entities`). `pacing_dc_mod` is
-/// the ScenePacing DC modifier (Combat +2, Exploration 0, Downtime −2) —
-/// threaded into the Scrutinized DC exactly as the skill-check Referee does.
+/// On any Scrutinized FAIL the caller should honor `should_revoke()` and
+/// mechanically remove the disguise tag.
+///
+/// `entities` + `present_npc_ids` scope the tier selection to the NPCs
+/// actually on-camera this turn. `pacing_dc_mod` is the ScenePacing DC
+/// modifier (Combat +2, Exploration 0, Downtime −2) — threaded into the
+/// Scrutinized DC exactly as the skill-check Referee does.
 pub fn evaluate_disguise_gate(
     text: &str,
     tags: &[crate::consequence::StatusTag],
     entities: &HashMap<String, serde_json::Value>,
+    present_npc_ids: &[String],
     pacing_dc_mod: i32,
 ) -> Option<DisguiseDirective> {
     let disguise = find_disguise_tag(tags)?;
     let label = disguise.label.clone();
-    let tier = select_attacker_tier_from_entities(entities);
-    // Elite+ (captains, bosses, legendary creatures) scrutinize by default.
-    // They know their people. Return None → the normal skill-check Referee
-    // runs a plain Deception roll with no disguise framing.
+    let tier = select_attacker_tier_from_entities(entities, present_npc_ids);
+    // Elite+ (captains, bosses, legendary creatures) scrutinize by default —
+    // they know their people. Roll the Deception check NOW, at a harder DC
+    // (they are harder to fool than a doorway guard).
     if tier > AttackerTier::Soldier {
-        return None;
+        // Distinct dice from the low-tier scrutinized roll (different offset).
+        let seed = hash_text(text).wrapping_add(0xE117E5);
+        let mut roller = Roller::new(seed);
+        let roll = roll_d20(&mut roller);
+        let dc = (DECEPTION_BASE_DC as i32 + 3 + pacing_dc_mod).clamp(1, 30) as u32;
+        let success = roll >= dc;
+        let s = if success {
+            "the player's composure withstands a captain's eye; the disguise holds — for now"
+        } else {
+            "an Elite's scrutiny pierces the disguise; it is challenged and blown"
+        };
+        return Some(DisguiseDirective::Scrutinized {
+            label,
+            dc,
+            roll,
+            success,
+            seed: s,
+        });
     }
     // Low-tier rank-and-file. Auto-pass UNLESS the player acts suspiciously.
     if !has_suspicious_action(text) {
@@ -2280,6 +2357,8 @@ mod tests {
             "I swing my longsword at the goblin chieftain",
             &s,
             AttackerTier::Soldier,
+            0,
+            0,
         );
         assert_eq!(a, b, "default and explicit-Soldier paths must agree");
     }
@@ -2288,13 +2367,21 @@ mod tests {
     fn referee_outcome_carries_lethality_fields() {
         // Every outcome now has the lethal flag + directive string, even
         // when non-lethal (the fields default to false / empty). This pins
-        // the API contract so callers can rely on them.
+        // the API contract so callers can rely on them. A fresh body vs the
+        // default Soldier tier (save DC 22) is UNREACHABLE on a d20 — the
+        // outcome must be non-lethal with an empty directive. Under the old
+        // inverted comparison this failed on both counts.
         let s = fresh_state();
         let outcome = referee_evaluate("I attack the goblin.", &s).expect("should fire");
-        // Non-lethal outcomes have an empty directive (the caller only wraps
-        // non-empty directives in the [DIRECTIVE: ...] block).
-        assert!(!outcome.directive.is_empty() || !outcome.lethal,
-            "directive must be empty when non-lethal");
+        assert!(
+            !outcome.lethal,
+            "Soldier vs fresh body: save DC 22 exceeds the d20 — never lethal"
+        );
+        assert!(
+            outcome.directive.is_empty(),
+            "non-lethal outcome must carry no directive (got: {})",
+            outcome.directive
+        );
     }
 
     #[test]
@@ -2302,17 +2389,17 @@ mod tests {
         // The architect's defining example: a Legendary-tier attacker on a
         // badly-wounded body should be lethal most of the time. We can't
         // pin a specific roll (RNG), but across many trials lethality must
-        // fire at least once. The threshold math (BASE 18 + Legendary −8 +
-        // Battered −4 = DC 6, so any roll 1..=5 is lethal) makes this very
-        // likely — the test would only fail if the lethality judgment were
-        // broken or the condition penalty weren't applied.
+        // fire most of the time. The save math (BASE 18 + Legendary −8 +
+        // Battered −4 = DC 6, so any roll 6..=20 fails the save = 75%
+        // per trial) makes the half-bound below a polarity discriminator:
+        // the old inverted comparison sat at 25% and cannot reach 32/64.
         let mut s = fresh_state();
         // Battered: one Heavy wound.
         s.body.insert(BodyPart::UpperTorso, BodyPartState::Red);
         let mut lethal_count = 0;
         for i in 0..64 {
             let text = format!("I attack the dragon again, turn {i}");
-            if let Some(o) = referee_evaluate_with_tier(&text, &s, AttackerTier::Legendary) {
+            if let Some(o) = referee_evaluate_with_tier(&text, &s, AttackerTier::Legendary, 0, 0) {
                 if o.lethal {
                     lethal_count += 1;
                     // Lethal outcomes MUST carry a non-empty directive.
@@ -2329,27 +2416,39 @@ mod tests {
             }
         }
         assert!(
-            lethal_count > 0,
-            "Legendary vs Battered must be lethal in at least one of 64 trials (got 0)"
+            lethal_count >= 32,
+            "Legendary vs Battered must be lethal in at least half of 64 trials (got {lethal_count}/64); \
+             less indicates the lethality save comparison is inverted again"
         );
     }
 
     #[test]
     fn referee_lethality_rarely_fires_for_minion_on_healthy_body() {
         // The opposite extreme: a Minion attacking a fresh body should
-        // almost never be lethal. DC = 18 + 8 (Minion) + 0 (Unscathed) = 26,
-        // so only a natural 1 on the d20 triggers it (1/20 = 5% per turn).
-        // Across 100 trials we expect ~5 lethals — allow up to 15 (3σ slack).
+        // almost never be lethal. Save DC = 18 + 8 (Minion) + 0 (Unscathed)
+        // = 26 — UNREACHABLE on a d20 (max 20), so a healthy player can
+        // never be lethally dropped by a Minion. The text MUST contain a
+        // combat keyword ("attacks", not "bites" — the old text never fired
+        // the referee, making this test vacuous). Across 100 trials we
+        // allow a small slack bound, but under the corrected comparison the
+        // expected count is exactly 0; the old inverted comparison scored
+        // 100/100.
         let s = fresh_state();
         let mut lethal_count = 0;
+        let mut fired = 0;
         for i in 0..100 {
-            let text = format!("the rat bites me, turn {i}");
-            if let Some(o) = referee_evaluate_with_tier(&text, &s, AttackerTier::Minion) {
+            let text = format!("the rat attacks me, turn {i}");
+            if let Some(o) = referee_evaluate_with_tier(&text, &s, AttackerTier::Minion, 0, 0) {
+                fired += 1;
                 if o.lethal {
                     lethal_count += 1;
                 }
             }
         }
+        assert!(
+            fired > 0,
+            "test text must actually trigger the combat referee (vacuous otherwise)"
+        );
         assert!(
             lethal_count <= 15,
             "Minion vs Unscathed should be lethal ≤15/100 trials (got {lethal_count}/100); \
@@ -2368,7 +2467,7 @@ mod tests {
         for i in 0..200 {
             // Vary the text to spread the RNG across parts.
             let text = format!("I strike the bandit, exchange {i}");
-            if let Some(o) = referee_evaluate_with_tier(&text, &s, AttackerTier::Elite) {
+            if let Some(o) = referee_evaluate_with_tier(&text, &s, AttackerTier::Elite, 0, 0) {
                 if o.part == BodyPart::UpperTorso {
                     torso_hits += 1;
                     assert!(
@@ -2443,16 +2542,19 @@ mod tests {
     fn disguise_gate_none_when_no_disguise_tag() {
         // No disguise tag → nothing to gate, regardless of tier or behavior.
         let entities = entities_with_tier("soldier");
-        assert!(evaluate_disguise_gate("I walk past the guard", &[generic_tag("Blessed")], &entities, 0).is_none());
+        let present = vec!["guard1".to_string()];
+        assert!(evaluate_disguise_gate("I walk past the guard", &[generic_tag("Blessed")], &entities, &present, 0).is_none());
     }
 
     #[test]
     fn disguise_gate_autopass_minion_confident_walkby() {
         let entities = entities_with_tier("minion");
+        let present = vec!["guard1".to_string()];
         let out = evaluate_disguise_gate(
             "I nod to the drunk guard and march into the keep.",
             &[disguise_tag("city guard uniform")],
             &entities,
+            &present,
             0,
         ).expect("minion + confident → AutoPass");
         match out {
@@ -2469,49 +2571,63 @@ mod tests {
         // The goldilocks cutoff: Soldier is the v1 default tier, so most
         // NPCs auto-pass. This is the "confident walk-by" fantasy.
         let entities = entities_with_tier("soldier");
+        let present = vec!["guard1".to_string()];
         let out = evaluate_disguise_gate(
             "I flash my badge and stride through the gate.",
             &[disguise_tag("city guard uniform")],
             &entities,
+            &present,
             0,
         ).expect("soldier + confident → AutoPass");
         assert!(matches!(out, DisguiseDirective::AutoPass { tier_tag: "soldier", .. }));
     }
 
     #[test]
-    fn disguise_gate_none_elite_confident() {
-        // Elite+ scrutinize by default. Even a confident walk-by forces a
-        // roll (handled by the §11.21 skill-check Referee, not here).
+    fn disguise_gate_elite_confident_rolls_scrutiny() {
+        // (P2 contract) Elite+ scrutinize by default — the gate NOW rolls the
+        // Deception check itself (the old None assumed the keyword-gated
+        // skill referee would roll it, which it never does on neutral text).
+        // Even a confident walk-by faces a harder DC (14 + 3).
         let entities = entities_with_tier("elite");
+        let present = vec!["guard1".to_string()];
         let out = evaluate_disguise_gate(
             "I nod to the captain and walk past.",
             &[disguise_tag("city guard uniform")],
             &entities,
+            &present,
             0,
-        );
-        assert!(out.is_none(), "Elite+ must NOT auto-pass: {out:?}");
+        ).expect("Elite+ + disguise -> Scrutinized (rolled here)");
+        let dc_seen = match &out {
+            DisguiseDirective::Scrutinized { dc, .. } => *dc,
+            _ => panic!("expected Scrutinized, got {out:?}"),
+        };
+        assert_eq!(dc_seen, 17, "Elite DC = DECEPTION_BASE_DC + 3 scrutiny");
     }
 
     #[test]
-    fn disguise_gate_none_legendary_confident() {
+    fn disguise_gate_legendary_confident_rolls_scrutiny() {
         let entities = entities_with_tier("legendary");
+        let present = vec!["guard1".to_string()];
         let out = evaluate_disguise_gate(
             "I salute the dragon and walk past.",
             &[disguise_tag("city guard uniform")],
             &entities,
+            &present,
             0,
-        );
-        assert!(out.is_none(), "Legendary must NOT auto-pass: {out:?}");
+        ).expect("Legendary + disguise -> Scrutinized (rolled here)");
+        assert!(matches!(out, DisguiseDirective::Scrutinized { .. }));
     }
 
     #[test]
     fn disguise_gate_scrutinized_minion_suspicious() {
         // Suspicious behavior revokes the auto-pass even for minions.
         let entities = entities_with_tier("minion");
+        let present = vec!["guard1".to_string()];
         let out = evaluate_disguise_gate(
             "I sweat nervously, avoid eye contact, and try to slip past.",
             &[disguise_tag("city guard uniform")],
             &entities,
+            &present,
             0,
         ).expect("suspicious → Scrutinized");
         match out {
@@ -2528,28 +2644,34 @@ mod tests {
     #[test]
     fn disguise_gate_scrutinized_soldier_suspicious() {
         let entities = entities_with_tier("soldier");
+        let present = vec!["guard1".to_string()];
         let out = evaluate_disguise_gate(
             "I stammer, fumble my badge, and mumble an excuse.",
             &[disguise_tag("city guard uniform")],
             &entities,
+            &present,
             0,
         ).expect("soldier + suspicious → Scrutinized");
         assert!(matches!(out, DisguiseDirective::Scrutinized { .. }));
     }
 
     #[test]
-    fn disguise_gate_none_elite_suspicious() {
-        // Elite+ return None even when suspicious — the normal skill-check
-        // Referee handles the Deception roll there (no disguise framing
-        // needed; the captain would have challenged anyway).
+    fn disguise_gate_elite_suspicious_rolls_scrutiny() {
+        // (P2 contract) Elite+ suspicious -> the same harder-DC Scrutinized
+        // roll (never a silent None).
         let entities = entities_with_tier("elite");
+        let present = vec!["guard1".to_string()];
         let out = evaluate_disguise_gate(
             "I sweat nervously and stammer at the captain.",
             &[disguise_tag("city guard uniform")],
             &entities,
+            &present,
             0,
-        );
-        assert!(out.is_none());
+        ).expect("Elite+ + suspicious → Scrutinized");
+        match out {
+            DisguiseDirective::Scrutinized { dc, .. } => assert_eq!(dc, 17),
+            _ => panic!("expected Scrutinized, got {out:?}"),
+        }
     }
 
     #[test]
@@ -2557,16 +2679,19 @@ mod tests {
         // Combat (+2) makes scrutiny harder; Downtime (−2) easier. Same shape
         // as the §11.21 skill-check DC threading.
         let entities = entities_with_tier("soldier");
+        let present = vec!["guard1".to_string()];
         let combat = evaluate_disguise_gate(
             "I sweat and stammer.",
             &[disguise_tag("city guard uniform")],
             &entities,
+            &present,
             2,
         ).unwrap();
         let downtime = evaluate_disguise_gate(
             "I sweat and stammer.",
             &[disguise_tag("city guard uniform")],
             &entities,
+            &present,
             -2,
         ).unwrap();
         match (combat, downtime) {

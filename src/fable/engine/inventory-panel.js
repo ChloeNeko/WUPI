@@ -91,6 +91,7 @@ let activeGemId = null;        // the selected gem id
 let currentItems = [];         // the normalized items for the active gem
 let cachedSchema = null;       // last-fetched full schema (so actions can mutate without a refetch race)
 let wheelAccumulator = 0;      // accumulates sub-step wheel deltas until a full step
+let renderSeq = 0;             // render-ownership token (see renderInventoryPanel)
 
 // ── Normalization: turn the raw schema payload into flat item records ──────
 // A normalized item is { id, name, qty, source, slot, layer, tags } where:
@@ -185,6 +186,12 @@ function readTags(rawTags) {
 export async function renderInventoryPanel(slotBodyEl, gemId) {
   activeSlotEl = slotBodyEl;
   activeGemId = gemId;
+  // Render-ownership token: a rapid gem switch starts a second render before
+  // the first's schema fetch resolves — the slower one must NOT paint over
+  // the newer one's list (both share ONE slot-body element, so element
+  // identity can't discriminate; the seq can). clearInventoryPanel bumps it
+  // too, so a hide mid-fetch also voids the pending paint.
+  const seq = ++renderSeq;
   wheelAccumulator = 0;
   if (!slotBodyEl) return;
 
@@ -194,8 +201,10 @@ export async function renderInventoryPanel(slotBodyEl, gemId) {
   let schema = null;
   try {
     schema = isDevPreview() ? getDevSchema() : await invoke('fable_schema_get');
+    if (seq !== renderSeq) return; // superseded by a newer render / clear
     cachedSchema = schema;
   } catch (_) {
+    if (seq !== renderSeq) return;
     cachedSchema = null;
     currentItems = [];
     paintEmpty(slotBodyEl, 'No inventory data.');
@@ -208,6 +217,7 @@ export async function renderInventoryPanel(slotBodyEl, gemId) {
 
 // ── Public: clear state (called by hideInventorySlot) ──────────────────────
 export function clearInventoryPanel() {
+  renderSeq++;             // void any render still awaiting its schema fetch
   activeSlotEl = null;
   activeGemId = null;
   currentItems = [];
@@ -670,7 +680,12 @@ async function handleAction(action, item, bodyEl) {
   let mutated = false;
   let verb = '';   // the past-tense trace for recent_events (empty = no trace)
   try {
-    const schema = cachedSchema || (isDevPreview() ? getDevSchema() : await invoke('fable_schema_get'));
+    // (P1 fix) ALWAYS refetch fresh in production — cachedSchema goes stale
+    // across narrator turns (refreshAll deliberately does not re-render an
+    // open panel), and fable_schema_set installs wholesale: acting on the
+    // pre-turn cache silently rolled back the turn's tracker mutations.
+    // The one-IPC refetch is cheap next to a whole-schema overwrite.
+    const schema = isDevPreview() ? getDevSchema() : await invoke('fable_schema_get');
     cachedSchema = schema;
     const ps = schema.player_state || {};
 
@@ -725,7 +740,9 @@ async function handleEquip(item, dest, bodyEl) {
   let mutated = false;
   let verb = '';
   try {
-    const schema = cachedSchema || (isDevPreview() ? getDevSchema() : await invoke('fable_schema_get'));
+    // (P1 fix) Same discipline as handleAction: refetch, never act on the
+    // possibly-stale cache.
+    const schema = isDevPreview() ? getDevSchema() : await invoke('fable_schema_get');
     cachedSchema = schema;
     const ps = schema.player_state || {};
 

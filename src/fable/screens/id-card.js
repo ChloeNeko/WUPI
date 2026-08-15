@@ -3,17 +3,18 @@
 // NPC, World, + Scenario cards (2026-08-13).
 //
 // The card has two faces:
-//   • CORE  — a flat label/value grid of the few always-visible fields
-//             (Player/NPC: Name, Gender, Race, Age, Hair Color, Eye Color,
-//              Height, Weight; World/Scenario: a TYPE banner + Name, Setting,
-//              Purpose, Tone). NO section headers — a real-life state-license
+//   • CORE  — a NAME/TYPE header (centered over the information space, gold
+//             rule fitted to the text width) + a label/value license grid
+//             (Player/NPC: Race/Gender, Age/Skin/Body, Height/Weight, the
+//             stacked Hair cell + Eye Color; World/Scenario: Name, Setting,
+//             Purpose, Tone). NO section headers — a real-life state-license
 //             look. The portrait sits on the LEFT like a physical ID.
 //   • EXTRA — every remaining tag, grouped under small section headers, held
 //             in an inert <template> on the card (never rendered inline). The
-//             small brass CARD-ICON button on the card's top-right edge opens
-//             the full set in a CENTERED details popup (2026-08-14, Chloe:
-//             replaces the old bronze-arrow inline disclosure — the card
-//             itself never expands anymore).
+//             small brass CARD-ICON button in the headrow's corner cluster
+//             opens the full set in a CENTERED details popup (2026-08-14,
+//             Chloe: replaces the old bronze-arrow inline disclosure — the
+//             card itself never expands anymore).
 //
 // The data model comes from engine/creator-engine.js::buildIdCard (pure,
 // unit-tested). This module owns ONLY the HTML string + the popup wiring —
@@ -35,7 +36,10 @@ export const PENCIL_SVG = `<svg viewBox="0 0 24 24" fill="none" stroke="currentC
 </svg>`;
 
 // Render ONLY the ID-card markup (no action buttons).
-//   model: { variant:'player'|'world', banner?, tag?, core:[[l,v]], extra:[[title,[[l,v]]]] }
+//   model: { variant:'player'|'world', title?, banner?, tag?, core:[cell],
+//            extra:[[title, [[l,v]]]] }
+//     core cell: { label, value } | { label, value, third:true } |
+//                { label, sub:[[sublabel, value], ...] }
 //   opts:
 //     portraitClickable: bool      — Creator review slot opens the cropper
 //                                    (emits data-portrait-slot); the load modal
@@ -48,6 +52,13 @@ export const PENCIL_SVG = `<svg viewBox="0 0 24 24" fill="none" stroke="currentC
 //                                    PENCIL beside the card-icon details
 //                                    button (data-review-pencil → the creator's
 //                                    edit popup). The pickers never pass it.
+//
+// LAYOUT (2026-08-15 Chloe): the header (player/NPC NAME, world/scenario TYPE
+// banner) lives in a HEADROW — [invisible spacer | centered header + gold rule
+// | corner buttons] — so the header is centered over the card's INFORMATION
+// space (right of the portrait) and the details/pencil buttons physically
+// cannot push or overlap it. The rule is fitted to the header text width plus
+// a little breathing room on each side, not the card width.
 export function renderIdCard(model, opts = {}) {
   const esc = escapeXml;
   const m = model || {};
@@ -66,17 +77,66 @@ export function renderIdCard(model, opts = {}) {
     ? 'data-portrait-slot title="Click to choose or crop a portrait"'
     : 'data-modal-portrait';
 
-  // Banner (world/scenario: prominent, centered) OR tag (NPC: subtle chip).
-  // Mutually exclusive with each other; player cards have neither.
-  const bannerHTML = m.banner
-    ? `<div class="fable-id-card-banner">${esc(m.banner)}</div>` : '';
+  // The header: the NAME (player/NPC) or the TYPE banner (world/scenario).
+  const headText = m.title || m.banner;
+  const headHTML = headText
+    ? `<div class="fable-id-card-headwrap">
+          <span class="fable-id-card-head-text">${esc(headText)}</span>
+          <span class="fable-id-card-head-rule" aria-hidden="true"></span>
+        </div>`
+    : '';
+  // NPC's subtle corner chip sits ABOVE the headrow (world cards have neither).
   const tagHTML = m.tag
     ? `<div class="fable-id-card-tag">${esc(m.tag)}</div>` : '';
 
-  // Compact core grid — a flat <dl>, NO section headers.
-  const coreRows = (m.core || []).map(([l, v]) =>
-    `<div><dt>${esc(l)}</dt><dd>${esc(v)}</dd></div>`).join('');
-  const coreHTML = coreRows ? `<dl class="fable-id-card-core">${coreRows}</dl>` : '';
+  // Core cells — plain pairs, narrow thirds (the AGE/SKIN/BODY row), and the
+  // stacked HAIR cell (Color/Length/Style sub-lines, smaller + differently
+  // colored via .fable-id-card-hair-line). The renderer simulates the CSS
+  // grid's row flow (halves span 3 of 6 tracks, thirds span 2) to tag each
+  // HALF cell with its column side — the --half-l/--half-r padding pulls the
+  // left column's content right + the right column's left so every row reads
+  // as a tight divided cluster, matching the thirds row (2026-08-15 Chloe).
+  const cellSideClass = (cells) => {
+    let col = 0;
+    const cls = cells.map((c) => {
+      const span = c && c.third ? 2 : 3;
+      if (col + span > 6) col = 0;
+      let side = '';
+      if (!c || !c.third) side = col === 0 ? ' fable-id-card-cell--half-l' : ' fable-id-card-cell--half-r';
+      col += span;
+      if (col >= 6) col = 0;
+      return side;
+    });
+    // The HAIR pair breaks the inward pull (2026-08-15 Chloe): HAIR centers
+    // under AGE and EYE COLOR under BODY — the outer thirds' centers —
+    // widening the last row out of the 31/69 column rhythm. Only when the
+    // age/skin/body trio exists (its thirds define the 15/85 targets); on a
+    // trio-less card the pair keeps the normal inward halves.
+    const hasTrio = cells.some((c) => c && c.third);
+    if (hasTrio) {
+      const hairIdx = cells.findIndex((c) => c && Array.isArray(c.sub));
+      if (hairIdx !== -1) {
+        cls[hairIdx] = ' fable-id-card-cell--half-out-l';
+        if (hairIdx + 1 < cls.length) cls[hairIdx + 1] = ' fable-id-card-cell--half-out-r';
+      }
+    }
+    return cls;
+  };
+  const cellHTML = (c, sideCls) => {
+    if (!c) return '';
+    if (Array.isArray(c.sub)) {
+      const lines = c.sub
+        .map(([l, v]) => `<span class="fable-id-card-hair-line"><i>${esc(l)}:</i>${esc(v)}</span>`)
+        .join('');
+      return `<div class="fable-id-card-cell fable-id-card-cell--hair${sideCls}"><dt>${esc(c.label)}</dt><dd>${lines}</dd></div>`;
+    }
+    const third = c.third ? ' fable-id-card-cell--third' : '';
+    return `<div class="fable-id-card-cell${third}${sideCls}"><dt>${esc(c.label)}</dt><dd>${esc(c.value)}</dd></div>`;
+  };
+  const sides = cellSideClass(m.core || []);
+  const coreHTML = (m.core || []).length
+    ? `<dl class="fable-id-card-core">${(m.core || []).map((c, i) => cellHTML(c, sides[i])).join('')}</dl>`
+    : '';
 
   // Extra disclosure content — the full section/h3/dl grid reused from the
   // review card (clean, easy to parse), held in an inert <template>. The
@@ -95,28 +155,37 @@ export function renderIdCard(model, opts = {}) {
   const extraHTML = hasExtra
     ? `<template data-id-extra>${extraInner}</template>` : '';
 
-  // The brass card-icon trigger (card's top-right edge). Only when there's
-  // extra to show. Opens the centered details popup (wireIdCard). When the
-  // card is editable (Creator review), the pencil sits to its RIGHT in the
-  // same top-right corner cluster — with no details button it takes the
-  // corner spot alone.
+  // The corner cluster rides INSIDE the headrow (in-flow, right-aligned) so it
+  // can never overlap the centered header — the brass card-icon trigger opens
+  // the details popup (wireIdCard), the pencil (Creator review only) sits to
+  // its right.
   const expandHTML = hasExtra
     ? `<button type="button" class="fable-id-card-expand" data-id-expand aria-label="Show all details" aria-haspopup="dialog" aria-expanded="false" title="Show all details">${CARD_SVG}</button>` : '';
   const editHTML = opts.editable
-    ? `<button type="button" class="fable-id-card-edit${hasExtra ? '' : ' fable-id-card-edit--solo'}" data-review-pencil title="Edit" aria-label="Edit card">${PENCIL_SVG}</button>` : '';
+    ? `<button type="button" class="fable-id-card-edit" data-review-pencil title="Edit" aria-label="Edit card">${PENCIL_SVG}</button>` : '';
+  const cornerHTML = (expandHTML || editHTML)
+    ? `<div class="fable-id-card-corner">${expandHTML}${editHTML}</div>` : '';
+  // The spacer mirrors the corner cluster's EXACT footprint (46px per button
+  // + 10px gap) so the header between them is truly centered — the pickers
+  // show one button, the Creator review two.
+  const btnW = (expandHTML ? 46 : 0) + (editHTML ? 46 : 0) + ((expandHTML && editHTML) ? 10 : 0);
+  const spacerHTML = cornerHTML
+    ? `<span class="fable-id-card-head-spacer" style="width:${btnW}px" aria-hidden="true"></span>` : '';
+  const headrowHTML = (headText || cornerHTML)
+    ? `<div class="fable-id-card-headrow">${spacerHTML}${headHTML}${cornerHTML}</div>`
+    : '';
 
   return `
     <div class="${cardClass}">
       <div class="fable-player-review-top">
         <div class="fable-player-review-portrait" ${slotAttr}>${portraitInner}</div>
         <div class="fable-player-review-body">
-          ${bannerHTML}${tagHTML}
+          ${tagHTML}
+          ${headrowHTML}
           ${coreHTML}
         </div>
       </div>
       ${extraHTML}
-      ${expandHTML}
-      ${editHTML}
     </div>`;
 }
 

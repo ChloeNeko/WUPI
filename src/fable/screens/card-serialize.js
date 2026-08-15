@@ -43,11 +43,29 @@ export function cdata(text) {
   return `<![CDATA[${String(text || '').replace(/]]>/g, ']]]]><![CDATA[>')}]]>`;
 }
 
+// Coerce ANY GLM draft value into a serialize-safe string. GLM occasionally
+// emits numbers ("age": 24), arrays ("participating_actors": [...]), or
+// nulls/objects despite the string schema — calling (v || '').trim() on those
+// crashes CREATE with "(a || \"\").trim is not a function". Arrays join with
+// ', ' (a list-ish value stays readable); booleans + plain objects are
+// unrenderable → '' so the field reads as absent instead of poisoning the
+// card with "[object Object]".
+export function text(v) {
+  if (v == null || typeof v === 'boolean') return '';
+  if (Array.isArray(v)) return v.map(text).filter(Boolean).join(', ');
+  if (typeof v === 'object') return '';
+  return String(v);
+}
+
 export function escapeXml(s) {
+  // `"` is escaped too so the fn is safe in ATTRIBUTE contexts (<node id="…">,
+  // <entry key="…">) as well as element text — an unescaped quote in an
+  // attribute emits broken XML caught server-side as a parse-error toast.
   return String(s || '')
     .replace(/&/g, '&amp;')
     .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;');
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
 }
 
 // Compose an array of [label, prose] pairs into a single CDATA block,
@@ -57,7 +75,7 @@ export function escapeXml(s) {
 function composeLabeled(pairs) {
   const out = [];
   for (const [label, prose] of pairs) {
-    const s = (prose || '').trim();
+    const s = text(prose).trim();
     if (s) out.push(`${label}: ${s}`);
   }
   return out.join('\n\n');
@@ -76,15 +94,18 @@ function composeLabeled(pairs) {
 // { id, player } for fable_player_write({ id, player }).
 export function serializePlayer(draft) {
   const d = draft || {};
-  const name = (d.name || '').trim();
+  const name = text(d.name).trim();
   const opt = (v) => {
-    const s = (v == null ? '' : String(v)).trim();
+    const s = text(v).trim();
     return s || null;
   };
   // Chip-list normalizer: trim + drop blanks; null when nothing remains.
-  const chipList = (arr) => {
+  // Accepts an array OR a comma-separated string (GLM sometimes emits
+  // "tunic, boots" for an array field) — both become clean item lists.
+  const chipList = (v) => {
+    const arr = typeof v === 'string' ? v.split(',') : v;
     if (!Array.isArray(arr) || !arr.length) return null;
-    const items = arr.map((s) => String(s).trim()).filter(Boolean);
+    const items = arr.map((s) => text(s).trim()).filter(Boolean);
     return items.length ? items : null;
   };
   const player = {
@@ -142,16 +163,16 @@ export function serializePlayer(draft) {
 // { xml, intro }.
 export function serializeSimCard(f) {
   const d = f || {};
-  const subtype = (d.card_type || '').trim().toLowerCase(); // npc | scenario | world
-  const name = (d.name || '').trim();
-  const tone = (d.tone || '').trim();
-  const date = (d.date || '').trim();
-  const time = (d.time || d.start_time || '').trim();
-  const weather = (d.weather || d.start_weather || '').trim();
-  const location = (d.location || '').trim();
+  const subtype = text(d.card_type).trim().toLowerCase(); // npc | scenario | world
+  const name = text(d.name).trim();
+  const tone = text(d.tone).trim();
+  const date = text(d.date).trim();
+  const time = text(d.time || d.start_time).trim();
+  const weather = text(d.weather || d.start_weather).trim();
+  const location = text(d.location).trim();
   const locations = Array.isArray(d.locations) ? d.locations : [];
   const cast = Array.isArray(d.cast) ? d.cast : [];
-  const intro = (d.intro || '').trim();
+  const intro = text(d.intro).trim();
 
   // Branch-specific <persona> composition.
   let persona = '';
@@ -164,7 +185,7 @@ export function serializeSimCard(f) {
     ]);
   } else {
     // scenario + world: the directive is the core premise / purpose.
-    persona = (d.directive || '').trim();
+    persona = text(d.directive).trim();
   }
 
   let xml = '<sim_card>\n';
@@ -186,7 +207,7 @@ export function serializeSimCard(f) {
 
   // World: the world's identity → <setting>.
   if (subtype === 'world') {
-    const setting = (d.setting || '').trim();
+    const setting = text(d.setting).trim();
     if (setting) xml += `  <setting>${cdata(setting)}</setting>\n`;
   }
 
@@ -204,7 +225,7 @@ export function serializeSimCard(f) {
 
   // NPC: dialogue_style → <conversational_style> (existing slot).
   if (subtype === 'npc') {
-    const ds = (d.dialogue_style || '').trim();
+    const ds = text(d.dialogue_style).trim();
     if (ds) xml += `  <conversational_style>\n    <rules>${cdata(ds)}</rules>\n  </conversational_style>\n`;
   }
 
@@ -228,15 +249,17 @@ export function serializeSimCard(f) {
     : (location ? [{ name: location }] : []);
   if (nodes.length) {
     xml += '  <locations>\n';
-    for (const loc of nodes) {
-      const lid = slugify(loc.name || loc.id || '');
+    for (const raw of nodes) {
+      // A bare string entry ("Village Square") is tolerated as {name}.
+      const loc = typeof raw === 'string' ? { name: raw } : (raw || {});
+      const lid = slugify(loc.name || loc.id);
       if (!lid) continue;
-      const lname = (loc.name || '').trim();
+      const lname = text(loc.name).trim();
       const neigh = Array.isArray(loc.neighbors) ? loc.neighbors : [];
       xml += `    <node id="${escapeXml(lid)}">\n`;
       if (lname) xml += `      <name>${escapeXml(lname)}</name>\n`;
       for (const nb of neigh) {
-        const nid = slugify(String(nb || ''));
+        const nid = slugify(text(nb));
         if (nid) xml += `      <neighbor>${escapeXml(nid)}</neighbor>\n`;
       }
       xml += '    </node>\n';
@@ -248,15 +271,17 @@ export function serializeSimCard(f) {
   // card's single NPC is the cast entry (role = job). scenario/world: any
   // starting cast the wizard declared (optional).
   const castList = subtype === 'npc'
-    ? [{ name, identity: (d.job || '').trim() }]
+    ? [{ name, identity: text(d.job).trim() }]
     : cast;
   if (castList.length) {
     xml += '  <cast>\n';
-    for (const c of castList) {
-      const cid = slugify(c.name || c.id || '');
+    for (const raw of castList) {
+      // A bare string entry ("Mara the innkeep") is tolerated as {name}.
+      const c = typeof raw === 'string' ? { name: raw } : (raw || {});
+      const cid = slugify(c.name || c.id);
       if (!cid) continue;
-      const cname = (c.name || '').trim();
-      const cidentity = (c.identity || c.role || '').trim();
+      const cname = text(c.name).trim();
+      const cidentity = text(c.identity || c.role).trim();
       xml += `    <npc id="${escapeXml(cid)}">\n`;
       if (cname) xml += `      <name>${escapeXml(cname)}</name>\n`;
       if (cidentity) xml += `      <role>${cdata(cidentity)}</role>\n`;
@@ -285,7 +310,7 @@ export function serializeSimCard(f) {
 function buildNpcAppearance(d) {
   const parts = [];
   const push = (tag, v) => {
-    const s = (v == null ? '' : String(v)).trim();
+    const s = text(v).trim();
     if (s) parts.push(`${tag}: ${s}`);
   };
   push('Gender', d.gender);
@@ -300,7 +325,7 @@ function buildNpcAppearance(d) {
   push('Skin', d.skin_complexion);
   push('Eyes', d.eye_color);
   if (Array.isArray(d.clothing) && d.clothing.length) {
-    const clothes = d.clothing.map((s) => String(s).trim()).filter(Boolean);
+    const clothes = d.clothing.map((s) => text(s).trim()).filter(Boolean);
     if (clothes.length) parts.push(`Clothing: ${clothes.join(', ')}`);
   }
   push('Breast', d.breast_size);
@@ -317,10 +342,10 @@ function buildCustomTagsXml(tags) {
   if (!tags || typeof tags !== 'object' || Array.isArray(tags)) return '';
   const entries = [];
   for (const [k, v] of Object.entries(tags)) {
-    const kk = String(k || '').trim();
-    const vv = (v == null ? '' : String(v)).trim();
+    const kk = text(k).trim();
+    const vv = text(v).trim();
     if (kk && vv) {
-      const keyAttr = escapeXml(kk).replace(/"/g, '&quot;');
+      const keyAttr = escapeXml(kk);
       entries.push(`    <entry key="${keyAttr}">${cdata(vv)}</entry>`);
     }
   }
@@ -328,9 +353,22 @@ function buildCustomTagsXml(tags) {
   return `  <custom_tags>\n${entries.join('\n')}\n  </custom_tags>\n`;
 }
 
+// Windows reserved base names (reserved with ANY extension — a folder or file
+// stem hitting these makes create_dir_all / File::create fail opaquely).
+const WINDOWS_RESERVED = new Set([
+  'con', 'prn', 'aux', 'nul', 'conin$', 'conout$',
+  ...Array.from({ length: 9 }, (_, i) => `com${i + 1}`),
+  ...Array.from({ length: 9 }, (_, i) => `lpt${i + 1}`),
+]);
+
 export function slugify(s) {
-  return (s || '').trim().toLowerCase()
+  const slug = text(s).trim().toLowerCase()
     .replace(/[^a-z0-9_-]+/g, '-').replace(/^-+|-+$/g, '');
+  // A card named "Nul" or "Com1" must not slug onto a reserved name —
+  // append a suffix so the folder create succeeds (the slug stays unique
+  // per name; "nul" and "nul-card" can't collide).
+  if (WINDOWS_RESERVED.has(slug)) return `${slug}-card`;
+  return slug;
 }
 
 // Convert the codex_entries array (from the Attach Codex slide) into the
@@ -339,13 +377,23 @@ export function slugify(s) {
 // on CREATE (written via fable_codex_raw_set after the card folder exists).
 export function codexEntriesToCompound(entries) {
   if (!Array.isArray(entries) || !entries.length) return '';
-  return entries.map((e) => {
-    const title = (e.title || 'untitled').trim();
-    const tags = Array.isArray(e.tags) ? e.tags.filter(Boolean) : [];
-    const body = (e.body || '').trim();
-    let block = `---\ntitle: ${title}\n`;
-    if (tags.length) block += `tags: ${tags.join(', ')}\n`;
-    block += `---\n\n${body}`;
+  // Normalize + drop entries with no body (an empty body would emit a junk
+  // front-matter-only block the codex parser reads as an empty entry).
+  const clean = entries.map((e) => {
+    const src = e && typeof e === 'object' ? e : {};
+    const rawTags = Array.isArray(src.tags)
+      ? src.tags
+      : (typeof src.tags === 'string' && src.tags.trim() ? [src.tags] : []);
+    return {
+      title: text(src.title).trim() || 'untitled',
+      tags: rawTags.map((t) => text(t).trim()).filter(Boolean),
+      body: text(src.body).trim(),
+    };
+  }).filter((e) => e.body);
+  return clean.map((e) => {
+    let block = `---\ntitle: ${e.title}\n`;
+    if (e.tags.length) block += `tags: ${e.tags.join(', ')}\n`;
+    block += `---\n\n${e.body}`;
     return block;
   }).join('\n\n');
 }

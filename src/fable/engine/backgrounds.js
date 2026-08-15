@@ -45,7 +45,7 @@ export async function applyBackground(stageEl) {
   if (meta && meta.path) {
     // ?t= cache-busts so a re-import (same filename, new bytes) repaints
     // immediately instead of serving the cached asset:// image.
-    bgLayer.style.backgroundImage = `url("${convertFileSrc(meta.path)}?t=${Date.now()}")`;
+    bgLayer.style.backgroundImage = `url("${cssUrl(`${convertFileSrc(meta.path)}?t=${Date.now()}`)}")`;
     bgLayer.style.display = 'block';
     activeFilename = meta.filename;
     // has-bg scopes the readability card panels (.fable-mes-block glass) to
@@ -102,7 +102,7 @@ function ensureOverlay(stageEl) {
         </button>
         <button class="fable-bg-close" data-bg-close aria-label="Close">✕</button>
       </header>
-      <div class="fable-bg-hint">1440p · 16:9 · PNG or JPG — the name shows without its extension.</div>
+      <div class="fable-bg-hint">${HINT_TEXT}</div>
       <div class="fable-bg-grid" data-bg-grid></div>
     </div>`;
   // Single event delegate over the overlay. Delete is checked BEFORE tile so a
@@ -184,7 +184,7 @@ function renderTile(meta, isActive) {
   const activeCls = isActive ? ' is-active' : '';
   return `<div class="fable-bg-cell${activeCls}">
     <button class="fable-bg-tile" data-bg-tile data-filename="${attr(meta.filename)}" title="${attr(meta.name)}">
-      <div class="fable-bg-thumb" style="background-image:url('${url}')"></div>
+      <div class="fable-bg-thumb" style="background-image:url('${cssUrl(url)}')"></div>
       <span class="fable-bg-name">${escapeHtml(meta.name)}</span>
     </button>
     <button class="fable-bg-delete" data-bg-delete data-filename="${attr(meta.filename)}" title="Delete" aria-label="Delete ${attr(meta.name)}">
@@ -232,6 +232,7 @@ async function onImport() {
     dataUrl = await invoke('fable_player_portrait_read_bytes', { srcPath });
   } catch (err) {
     console.warn('[backgrounds] read picked image failed:', err);
+    showNotice('Could not read that image — is it a valid PNG/JPG?');
     return;
   }
   if (!dataUrl) return;
@@ -250,6 +251,7 @@ async function onImport() {
     });
   } catch (err) {
     console.warn('[backgrounds] import failed:', err);
+    showNotice(`Import failed: ${String(err)}`);
     return;
   }
   // Auto-select the just-imported background (you import because you want to
@@ -284,6 +286,32 @@ async function onDelete(filename) {
 // ---------------------------------------------------------------
 // Tiny HTML helpers (no template dependency).
 // ---------------------------------------------------------------
+const HINT_TEXT = '1440p · 16:9 · PNG or JPG — the name shows without its extension.';
+
+// Escape for interpolation inside a CSS url('...') string — a quote or
+// backslash in a library filename must not break out of the style string.
+function cssUrl(u) {
+  return String(u)
+    .replace(/\\/g, '\\\\')
+    .replace(/'/g, "\\'")
+    .replace(/"/g, '\\"');
+}
+
+// Surface an in-UI failure on the hint line (import errors used to be
+// console-only). Reverts to the stock hint after a beat.
+let noticeTimer = null;
+function showNotice(message) {
+  const hint = overlayEl && overlayEl.querySelector('.fable-bg-hint');
+  if (!hint) return;
+  hint.textContent = message;
+  hint.classList.add('is-err');
+  if (noticeTimer) clearTimeout(noticeTimer);
+  noticeTimer = setTimeout(() => {
+    hint.textContent = HINT_TEXT;
+    hint.classList.remove('is-err');
+  }, 4200);
+}
+
 function attr(s) {
   return String(s).replace(/"/g, '&quot;');
 }

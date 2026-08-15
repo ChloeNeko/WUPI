@@ -98,6 +98,7 @@ export function buildRawEditor() {
 export async function openRawEditor(kind, onSaved) {
   const file = FILE_FOR[kind];
   if (!file || !overlayEl) return;
+  saveEpoch++;               // invalidate any save still resolving from a prior session
   current = file;
   onSavedCb = onSaved || null;
   titleEl.textContent = file.title;
@@ -135,16 +136,26 @@ export function onEsc() {
 }
 
 // ── controls ────────────────────────────────────────────────────────────
+// Ownership token for in-flight saves: a ✕ (or Esc / backdrop / teardown /
+// reopen) while `current.save(text)` is still resolving must invalidate that
+// save's continuation — otherwise the stale resolve closes the FRESH editor
+// + stomps its last-good. Bumped on every open + close; the save only
+// commits its results when its epoch is still current.
+let saveEpoch = 0;
+
 async function onSave() {
   if (!current || !isValid) return;
   const text = textareaEl.value;
+  const epoch = ++saveEpoch;
   saveBtn.disabled = true;
   try {
     await current.save(text);
+    if (epoch !== saveEpoch) return; // superseded by a close/reopen mid-save
     lastGood = text;             // snapshot the saved text as the new last-good
     if (onSavedCb) try { onSavedCb(); } catch (_) {}
     closeModal();                // ✓ on success closes (per spec)
   } catch (err) {
+    if (epoch !== saveEpoch) return; // the editor it failed in is gone
     // Server-side validation rejected it (e.g. the XML sniff missed something
     // the real parser catches). Keep the modal open; the file is untouched
     // (write_atomic only runs after the backend parse succeeds). Status bar
@@ -172,6 +183,7 @@ function onClose() {
 
 function closeModal() {
   if (!overlayEl) return;
+  saveEpoch++;               // any in-flight save's continuation is now stale
   overlayEl.hidden = true;
   current = null;
   onSavedCb = null;

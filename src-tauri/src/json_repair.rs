@@ -129,32 +129,39 @@ fn normalize_quotes(s: &str) -> String {
 /// training corpora include lenient JSON5-style examples.
 ///
 /// A single char-walk with a `prev_significant` cursor: when we hit `}` or `]`
-/// and the last non-whitespace char was `,`, drop that comma.
+/// (OUTSIDE a string) and the last non-whitespace char was `,`, drop that
+/// comma. String-aware + char-based (P0 fix): a `,` before a `}`/`]` inside a
+/// string VALUE is content, not syntax — and iterating bytes while pushing
+/// `byte as char` re-encoded every multi-byte UTF-8 char as Latin-1 mojibake.
 fn strip_trailing_commas(s: &str) -> String {
-    let bytes = s.as_bytes();
     let mut out = String::with_capacity(s.len());
-    let mut last_significant: Option<u8> = None;
-    let mut i = 0;
-    while i < bytes.len() {
-        let b = bytes[i];
-        // Track the last non-whitespace byte we emitted.
-        if b == b'}' || b == b']' {
-            if last_significant == Some(b',') {
-                // Trim back the trailing comma we already pushed.
-                while out.ends_with(',') || out.ends_with(' ') || out.ends_with('\n')
-                    || out.ends_with('\t') || out.ends_with('\r')
-                {
-                    out.pop();
-                }
+    let mut in_string = false;
+    let mut escape_next = false;
+    let mut last_significant: Option<char> = None;
+    for ch in s.chars() {
+        if in_string {
+            out.push(ch);
+            if escape_next {
+                escape_next = false;
+            } else if ch == '\\' {
+                escape_next = true;
+            } else if ch == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+        if (ch == '}' || ch == ']') && last_significant == Some(',') {
+            // Trim back the trailing comma we already pushed (plus any
+            // whitespace between it and the closer). Stops at the closing
+            // quote of a preceding string value — never pops into content.
+            while matches!(out.chars().next_back(), Some(',' | ' ' | '\n' | '\t' | '\r')) {
+                out.pop();
             }
         }
-        out.push(b as char);
-        if b == b' ' || b == b'\n' || b == b'\t' || b == b'\r' {
-            // whitespace — don't update last_significant
-        } else {
-            last_significant = Some(b);
+        out.push(ch);
+        if !matches!(ch, ' ' | '\n' | '\t' | '\r') {
+            last_significant = Some(ch);
         }
-        i += 1;
     }
     out
 }
@@ -167,23 +174,27 @@ fn strip_trailing_commas(s: &str) -> String {
 /// like `char.mira.trust`) that sits in "key position": immediately after `{`
 /// or after a `,` at the object level, followed by `:`. We only rewrite when
 /// all three hold AND we're not inside a string.
+///
+/// Char-based (P0 fix): the prior byte loop pushed `byte as char`, so every
+/// multi-byte UTF-8 char in a value (em-dashes, accents, CJK) was re-encoded
+/// as Latin-1 mojibake — valid JSON, silently wrong data.
 fn quote_unquoted_keys(s: &str) -> String {
-    let bytes = s.as_bytes();
+    let chars: Vec<char> = s.chars().collect();
     let mut out = String::with_capacity(s.len());
     let mut in_string = false;
     let mut escape_next = false;
     let mut i = 0;
 
-    while i < bytes.len() {
-        let b = bytes[i];
+    while i < chars.len() {
+        let ch = chars[i];
 
         if in_string {
-            out.push(b as char);
+            out.push(ch);
             if escape_next {
                 escape_next = false;
-            } else if b == b'\\' {
+            } else if ch == '\\' {
                 escape_next = true;
-            } else if b == b'"' {
+            } else if ch == '"' {
                 in_string = false;
             }
             i += 1;
@@ -191,33 +202,33 @@ fn quote_unquoted_keys(s: &str) -> String {
         }
 
         // Not in a string.
-        if b == b'"' {
+        if ch == '"' {
             in_string = true;
-            out.push(b as char);
+            out.push(ch);
             i += 1;
             continue;
         }
 
         // Detect an unquoted key: preceded by `{` or `,` (ignoring whitespace),
         // is a run of key-chars, followed by optional whitespace then `:`.
-        if is_key_char(b) {
+        if is_key_char(ch) {
             // Confirm we're in key position: look back at the last non-ws char.
-            let back_ok = last_non_ws(&out) == Some(b'{') || last_non_ws(&out) == Some(b',');
+            let back_ok = last_non_ws(&out) == Some('{') || last_non_ws(&out) == Some(',');
             // Collect the candidate key run.
             let start = i;
-            while i < bytes.len() && is_key_char(bytes[i]) {
+            while i < chars.len() && is_key_char(chars[i]) {
                 i += 1;
             }
-            let key_bytes = &s[start..i];
+            let key: String = chars[start..i].iter().collect();
             // Look ahead for `:` (skipping whitespace).
             let mut j = i;
-            while j < bytes.len() && (bytes[j] == b' ' || bytes[j] == b'\t' || bytes[j] == b'\n' || bytes[j] == b'\r') {
+            while j < chars.len() && matches!(chars[j], ' ' | '\t' | '\n' | '\r') {
                 j += 1;
             }
-            if back_ok && j < bytes.len() && bytes[j] == b':' {
+            if back_ok && j < chars.len() && chars[j] == ':' {
                 // It's a real unquoted key — quote it. Re-escape any internal
                 // `"` just in case (rare for an unquoted run, but safe).
-                let quoted = key_bytes.replace('\\', "\\\\").replace('"', "\\\"");
+                let quoted = key.replace('\\', "\\\\").replace('"', "\\\"");
                 out.push('"');
                 out.push_str(&quoted);
                 out.push('"');
@@ -225,12 +236,12 @@ fn quote_unquoted_keys(s: &str) -> String {
             } else {
                 // Not a key (e.g. a bare value like `true`, a number). Emit
                 // verbatim — don't risk mangling valid bare tokens.
-                out.push_str(key_bytes);
+                out.push_str(&key);
                 continue;
             }
         }
 
-        out.push(b as char);
+        out.push(ch);
         i += 1;
     }
     out
@@ -366,14 +377,14 @@ fn balance_brackets(s: &str) -> String {
 // ── helpers ──
 
 #[inline]
-fn is_key_char(b: u8) -> bool {
-    b.is_ascii_alphanumeric() || b == b'_' || b == b'-' || b == b'.'
+fn is_key_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.'
 }
 
-/// The last non-whitespace byte in `s`, as a raw byte. Used to detect key
+/// The last non-whitespace char in `s`. Used to detect key
 /// position without scanning back through the whole output.
-fn last_non_ws(s: &str) -> Option<u8> {
-    s.bytes().rev().find(|&b| !(b == b' ' || b == b'\n' || b == b'\t' || b == b'\r'))
+fn last_non_ws(s: &str) -> Option<char> {
+    s.chars().rev().find(|&c| !matches!(c, ' ' | '\n' | '\t' | '\r'))
 }
 
 #[cfg(test)]
@@ -501,6 +512,26 @@ mod tests {
         // A `{` inside a string must NOT count toward the stack.
         let r = repair("{\"note\":\"has {brace\"}");
         assert_eq!(r, "{\"note\":\"has {brace\"}");
+    }
+
+    #[test]
+    fn preserves_multibyte_chars() {
+        // P0 regression: the byte-as-char pushes re-encoded every multi-byte
+        // UTF-8 char as Latin-1 mojibake ("Zoë — 刀" → "ZoÃ« â€” åˆ€").
+        let r = repair("{\"summary\":\"Zoë — 刀\",\"note\":\"ok\"}");
+        assert!(r.contains("Zoë — 刀"), "non-ASCII must survive repair verbatim: {r}");
+        let v: serde_json::Value = serde_json::from_str(&r).unwrap();
+        assert_eq!(v["summary"], "Zoë — 刀");
+    }
+
+    #[test]
+    fn leaves_comma_before_bracket_inside_string_alone() {
+        // P0 regression: the comma stripper wasn't string-aware — a `,`
+        // immediately before `]`/`}` inside a string VALUE was deleted.
+        let r = repair("{\"note\":\"bought bread, milk]\",\"a\":1}");
+        assert!(r.contains("bought bread, milk]"), "intra-string `,]` is content: {r}");
+        let v: serde_json::Value = serde_json::from_str(&r).unwrap();
+        assert_eq!(v["note"], "bought bread, milk]");
     }
 
     // ---------- end-to-end: serde round-trips ----------

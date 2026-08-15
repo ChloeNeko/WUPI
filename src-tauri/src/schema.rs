@@ -1054,6 +1054,13 @@ impl WorldSchema {
         }
         if let Some(mut events) = delta.recent_events {
             self.recent_events.append(&mut events);
+            // (P3 fix) Bound the stored history: the render reads only the
+            // last 5, but the stored vec grew unbounded over a long campaign
+            // (save bloat + prompt-path drift). Keep the most recent 50.
+            let overflow = self.recent_events.len().saturating_sub(50);
+            if overflow > 0 {
+                self.recent_events.drain(..overflow);
+            }
         }
         if let Some(ents) = delta.entities {
             for (key, value) in ents {

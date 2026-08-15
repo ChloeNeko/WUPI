@@ -2,12 +2,17 @@
 // Plain Node ESM — no test runner. Run: `node tests/creator-engine.test.mjs`.
 // Exits non-zero on any failure so it can gate CI.
 import { strict as assert } from 'node:assert';
+import zlib from 'node:zlib';
 import {
   parseEnvelope,
   stripToJsonFallback,
   mergeDraft,
   buildReviewSections,
+  buildIdCard,
+  missingMandatoryFields,
+  MANDATORY_LABELS,
   findCharaChunk,
+  readCharaChunk,
   base64ToUtf8,
   normalizeCharJson,
   normalizeLorebookJson,
@@ -212,6 +217,54 @@ test('findCharaChunk: too short → null', () => {
   assert.equal(findCharaChunk(new Uint8Array([0x89, 0x50])), null);
 });
 
+// Build a PNG carrying one iTXt chunk (compressed or not). Layout after the
+// keyword NUL: compressionFlag(1) compressionMethod(1) langTag\0 transKey\0
+// payload — both tags empty here.
+function buildPngWithITXt(keyword, payloadBytes, compress = false) {
+  const sig = [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
+  const type = [0x69, 0x54, 0x58, 0x74]; // 'iTXt'
+  const kw = Array.from(keyword, (c) => c.charCodeAt(0));
+  const data = [...kw, 0, compress ? 1 : 0, 0, 0, 0, ...payloadBytes];
+  const len = [0, 0, 0, data.length];
+  const crc = [0, 0, 0, 0];
+  const iend = [0, 0, 0, 0, 0x49, 0x45, 0x4e, 0x44, 0, 0, 0, 0];
+  return new Uint8Array([...sig, ...len, ...type, ...data, ...crc, ...iend]);
+}
+
+test('findCharaChunk: ccv3-only V3 card imports (uncompressed iTXt)', async () => {
+  const json = JSON.stringify({ spec: 'chara_card_v3', data: { name: 'V3', description: 'x' } });
+  const b64 = Buffer.from(json, 'utf-8').toString('base64');
+  const payload = Array.from(Buffer.from(b64, 'latin1'));
+  const u8 = buildPngWithITXt('ccv3', payload, false);
+  assert.equal(findCharaChunk(u8), b64);
+  assert.equal(await readCharaChunk(u8), b64);
+});
+
+test('findCharaChunk: chara wins over ccv3 when both are present', async () => {
+  const a = Buffer.from(JSON.stringify({ name: 'A' }), 'utf-8').toString('base64');
+  const b = Buffer.from(JSON.stringify({ name: 'B' }), 'utf-8').toString('base64');
+  // Two tEXt chunks in one PNG: chara first, ccv3 second.
+  const sig = [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
+  const chunk = (kw, val) => {
+    const data = [...Array.from(kw, (c) => c.charCodeAt(0)), 0, ...Array.from(Buffer.from(val, 'latin1'))];
+    return [0, 0, 0, data.length, ...[0x74, 0x45, 0x58, 0x74], ...data, 0, 0, 0, 0];
+  };
+  const u8 = new Uint8Array([...sig, ...chunk('chara', a), ...chunk('ccv3', b), 0, 0, 0, 0, 0x49, 0x45, 0x4e, 0x44, 0, 0, 0, 0]);
+  assert.equal(findCharaChunk(u8), a);
+  assert.equal(await readCharaChunk(u8), a);
+});
+
+test('readCharaChunk: inflates zlib-compressed iTXt', async () => {
+  const json = JSON.stringify({ name: 'Zipped' });
+  const b64 = Buffer.from(json, 'utf-8').toString('base64');
+  const zipped = Array.from(zlib.deflateSync(Buffer.from(b64, 'latin1')));
+  const u8 = buildPngWithITXt('ccv3', zipped, true);
+  // The sync walker can't inflate — it must skip the compressed candidate.
+  assert.equal(findCharaChunk(u8), null);
+  // The async reader inflates it.
+  assert.equal(await readCharaChunk(u8), b64);
+});
+
 // ── base64ToUtf8 ───────────────────────────────────────────────────────────
 test('base64ToUtf8: round-trips UTF-8', () => {
   const orig = 'héllo 世界 — "quotes"';
@@ -303,6 +356,83 @@ test('lorebookToCodexEntries: drops empty-body entries', () => {
 test('lorebookToCodexEntries: no book → []', () => {
   assert.deepEqual(lorebookToCodexEntries(null), []);
   assert.deepEqual(lorebookToCodexEntries({}), []);
+});
+
+// ── the mandatory-field gate (2026-08-15 Chloe) ────────────────────────────
+// A `ready` missing ANY mandatory field must never reach the review screen.
+const FULL_PLAYER = {
+  name: 'Kael', gender: 'male', age: '28', race: 'human',
+  skin_complexion: 'tan', height: "6'1\"", weight: '180 lb', body_type: 'lean',
+  hair_color: 'black', hair_length: 'short', hair_style: 'messy',
+  eye_color: 'green', clothing: ['tunic'],
+};
+const SIM_BASE = { date: '3rd of Harvest', time: '09:00', weather: 'fog', location: 'Square' };
+
+test('missingMandatoryFields: a complete player draft passes', () => {
+  assert.deepEqual(missingMandatoryFields('player', FULL_PLAYER), []);
+});
+
+test('missingMandatoryFields: body_type:null is MISSING (the bug Chloe hit)', () => {
+  const d = { ...FULL_PLAYER, body_type: null };
+  assert.deepEqual(missingMandatoryFields('player', d), ['body_type']);
+  // Blank string + absent are equally rejected.
+  assert.deepEqual(missingMandatoryFields('player', { ...FULL_PLAYER, body_type: '  ' }), ['body_type']);
+  const { body_type, ...noBody } = FULL_PLAYER;
+  assert.deepEqual(missingMandatoryFields('player', noBody), ['body_type']);
+});
+
+test('missingMandatoryFields: numbers count as filled; booleans/objects do not', () => {
+  assert.deepEqual(missingMandatoryFields('player', { ...FULL_PLAYER, age: 28 }), []);
+  assert.deepEqual(missingMandatoryFields('player', { ...FULL_PLAYER, gender: true }), ['gender']);
+  assert.deepEqual(missingMandatoryFields('player', { ...FULL_PLAYER, race: { bad: true } }), ['race']);
+  assert.deepEqual(missingMandatoryFields('player', { ...FULL_PLAYER, clothing: [] }), ['clothing']);
+});
+
+test('missingMandatoryFields: sim npc requires the full identity set + persona + anchors', () => {
+  const npc = { ...FULL_PLAYER, card_type: 'npc', personality: 'warm', flaws: 'curious',
+    job: 'smith', backstory: 'b', dialogue_style: 'gruff', tone: 'cozy',
+    ...SIM_BASE, intro: 'You wake.' };
+  assert.deepEqual(missingMandatoryFields('sim', npc), []);
+  const incomplete = { ...npc, body_type: null, personality: '' };
+  delete incomplete.body_type;
+  assert.deepEqual(missingMandatoryFields('sim', incomplete), ['body_type', 'personality']);
+});
+
+test('missingMandatoryFields: sim scenario/world branch sets + the router itself', () => {
+  const scen = { card_type: 'scenario', name: 'Ambush', directive: 'd',
+    trigger_condition: 't', primary_objective: 'o', participating_actors: ['bandits'],
+    tone: 'tense', ...SIM_BASE, intro_answered: false };
+  assert.deepEqual(missingMandatoryFields('sim', scen), []);
+  const world = { card_type: 'world', name: 'W', directive: 'd', setting: 's', tone: 'grim', ...SIM_BASE, intro: 'x' };
+  assert.deepEqual(missingMandatoryFields('sim', world), []);
+  // No card_type at all → the router never ran → card_type + the world branch set.
+  const pre = missingMandatoryFields('sim', {});
+  assert.ok(pre.includes('card_type'));
+  assert.ok(pre.includes('directive'));
+});
+
+test('missingMandatoryFields: sim requires an intro ANSWER (agreed text or explicit no)', () => {
+  const world = { card_type: 'world', name: 'W', directive: 'd', setting: 's', tone: 'grim', ...SIM_BASE };
+  // No intro + no marker → the question was never asked.
+  assert.deepEqual(missingMandatoryFields('sim', world), ['intro_answer']);
+  // Explicit decline marker → complete.
+  assert.deepEqual(missingMandatoryFields('sim', { ...world, intro_answered: false }), []);
+  // Agreed text → complete.
+  assert.deepEqual(missingMandatoryFields('sim', { ...world, intro: 'You wake.' }), []);
+});
+
+test('missingMandatoryFields: codex requires ≥1 entry with a body', () => {
+  assert.deepEqual(missingMandatoryFields('codex', { entries: [{ title: 'T', body: 'lore' }] }), []);
+  assert.deepEqual(missingMandatoryFields('codex', { entries: [] }), ['entries']);
+  assert.deepEqual(missingMandatoryFields('codex', {}), ['entries']);
+  assert.deepEqual(missingMandatoryFields('codex', { entries: [{ title: 'T', body: '   ' }] }), ['entries']);
+});
+
+test('missingMandatoryFields: every missing key has a friendly label', () => {
+  const missing = missingMandatoryFields('player', {});
+  for (const k of missing) {
+    assert.ok(MANDATORY_LABELS[k], `no label for ${k}`);
+  }
 });
 
 // ── summary ────────────────────────────────────────────────────────────────

@@ -23,7 +23,7 @@ import { open as openDialog } from '@tauri-apps/plugin-dialog';
 import { invoke } from '@tauri-apps/api/core';
 import { openPortraitCropper } from './portrait-cropper.js';
 import {
-  findCharaChunk,
+  readCharaChunk,
   base64ToUtf8,
   normalizeCharJson,
   normalizeLorebookJson,
@@ -172,7 +172,7 @@ export async function parseImportFile(screenEl) {
     if (!dataUrl) throw new Error('could not read PNG');
     const res = await fetch(dataUrl);
     const u8 = new Uint8Array(await res.arrayBuffer());
-    const b64 = findCharaChunk(u8);
+    const b64 = await readCharaChunk(u8);
     if (!b64) throw new Error('no SillyTavern character data found in this PNG');
     const json = JSON.parse(base64ToUtf8(b64));
     charData = normalizeCharJson(json);
@@ -246,7 +246,7 @@ export async function openImportDialog(screenEl, schemaKey) {
     const res = await fetch(dataUrl);
     const buf = await res.arrayBuffer();
     const u8 = new Uint8Array(buf);
-    const b64 = findCharaChunk(u8);
+    const b64 = await readCharaChunk(u8);
     if (!b64) throw new Error('no SillyTavern character data found in this PNG');
     let json;
     try {

@@ -129,5 +129,67 @@ test('pipeline: a malformed GLM reply (no JSON) does not crash the chain', () =>
   assert.ok(xml.includes('<sim_card>'));
 });
 
+// ── the 2026-08-15 regression pack ─────────────────────────────────────────
+// 1. The exact "Create failed: (a || \"\").trim is not a function" report: GLM
+//    emitted ARRAYS for scenario list fields (actors/hazards/outcomes) +
+//    numbers elsewhere. parseEnvelope → mergeDraft → serializeSimCard must
+//    all survive + produce valid XML.
+test('pipeline: hostile-shape ready envelope (arrays/numbers) serializes without crashing', () => {
+  const env = parseEnvelope(JSON.stringify({
+    action: 'ready',
+    draft: {
+      card_type: 'scenario', name: 7, directive: 'bandits strike',
+      trigger_condition: 'leaving at night', primary_objective: 'survive',
+      participating_actors: ['Bandits', 'Toll Guards'],
+      environmental_hazards: ['mud'], outcomes: ['richer', 'dead'],
+      tone: 'tense', date: '3rd of Harvest', time: 2100,
+      weather: 'rain', location: ['the Old Road'],
+      intro: ['You walk the road.'],
+    },
+  }));
+  assert.ok(env, 'envelope parsed');
+  const draft = {};
+  mergeDraft(draft, env.draft);
+  const { xml, intro } = serializeSimCard(draft);
+  assert.ok(xml.includes('<name>7</name>'));
+  assert.ok(xml.includes('Bandits, Toll Guards'));
+  assert.equal(intro, 'You walk the road.');
+});
+
+// 2. The mandatory gate: a ready missing body_type is REJECTED (never shows
+//    the review screen), then GLM's corrective ready completes the draft.
+//    This mirrors creator-chat.js handleDone's gate exactly.
+import { missingMandatoryFields } from '../src/fable/engine/creator-engine.js';
+
+test('pipeline: ready missing body_type is gated, then the corrective turn fills it', () => {
+  const draft = {};
+  // Turns 1..n accumulate a nearly-complete player.
+  mergeDraft(draft, {
+    name: 'Kael', gender: 'male', age: 28, race: 'human',
+    skin_complexion: 'tan', height: "6'1\"", weight: '180 lb',
+    hair_color: 'black', hair_length: 'short', hair_style: 'messy',
+    eye_color: 'green', clothing: ['tunic'],
+  });
+  // The buggy ready GLM emitted (body_type: null — mergeDraft skips null, so
+  // the key never lands; an explicit null passes through Object.assign on the
+  // edit path — both must gate identically).
+  const buggy = parseEnvelope(JSON.stringify({
+    action: 'ready',
+    draft: { body_type: null },
+  }));
+  mergeDraft(draft, buggy.draft);
+  assert.deepEqual(missingMandatoryFields('player', draft), ['body_type']);
+  // The corrective turn (the alert GLM receives) produces the fill.
+  const fix = parseEnvelope(JSON.stringify({
+    action: 'ready',
+    draft: { body_type: 'lean' },
+  }));
+  mergeDraft(draft, fix.draft);
+  assert.deepEqual(missingMandatoryFields('player', draft), []);
+  // CREATE then serializes cleanly.
+  const { player } = serializePlayer(draft);
+  assert.equal(player.body_type, 'lean');
+});
+
 console.log('\n%s passed, %s failed', passed, failed);
 process.exit(failed === 0 ? 0 : 1);

@@ -274,7 +274,12 @@ pub struct DebugScores {
 /// time: if the header text changes here, the gate marker changes with it.
 /// Do NOT change this string without also auditing the echo-skip gate in
 /// `lib.rs::chat_send`.
-pub const CODEX_FRAME_MARKER: &str = "Reference knowledge";
+pub const CODEX_FRAME_MARKER: &str = "Reference knowledge: factual background";
+// (P3 hardening) The full frame HEADER, not the bare two-word prefix: an
+// episodic memory whose stored text merely contains the phrase "Reference
+// knowledge" (e.g. a turn quoting the frame after a debug session) must not
+// trip the echo-skip gate. The rendered block always starts with
+// MARKER + ": factual background you possess." so this prefix is exact.
 
 /// Render a ranked hit list as the framed injection block for the
 /// `<retrieved_memory>` region of the prompt (AGENTS.md §2M, Codex class-split
@@ -759,11 +764,19 @@ impl<E: Embedder> MemoryEngine<E> {
             // Merge across partitions. The candidate ids are unique across
             // partitions (a memory row belongs to exactly one card_id), so a
             // simple concatenation is correct: no dedup needed at the id
-            // level. RRF will re-rank the union.
+            // level. (P2 fix) RE-SORT by raw score before fusion: RRF ranks
+            // by list POSITION, so the concatenated system entries would
+            // otherwise occupy ranks 65+ regardless of their score — a
+            // globally-best playbook hit got roughly half the contribution
+            // of an active-card rank-1. Scores are globally comparable
+            // across partitions (one shared BM25 corpus, one query vector,
+            // one metric); both lists are best-first ascending.
             let mut sparse: Vec<(MemoryId, f32)> = sparse_active;
             sparse.extend(sparse_system);
+            sparse.sort_unstable_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
             let mut dense: Vec<(MemoryId, f32)> = dense_active;
             dense.extend(dense_system);
+            dense.sort_unstable_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
 
             let floor = dense_floor.unwrap_or(crate::memory_rrf::DENSE_COSINE_FLOOR);
 
@@ -858,13 +871,19 @@ impl<E: Embedder> MemoryEngine<E> {
             let dense_system = vec0_top_k(&c, &embedding, FABLE_SYSTEM_CARD_ID, RETRIEVAL_DEPTH)?;
             let dense_codex = vec0_top_k(&c, &embedding, CODEX_CARD_ID, RETRIEVAL_DEPTH)?;
 
-            // Merge across partitions (ids unique per card_id; no dedup needed).
+            // Merge across partitions (ids unique per card_id; no dedup
+            // needed). (P2 fix) Re-sort by raw score before fusion — see
+            // search_wupi_visible: RRF ranks by position, so unsorted
+            // concatenation would bury system/codex entries at ranks 65+
+            // regardless of their score.
             let mut sparse: Vec<(MemoryId, f32)> = sparse_active;
             sparse.extend(sparse_system);
             sparse.extend(sparse_codex);
+            sparse.sort_unstable_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
             let mut dense: Vec<(MemoryId, f32)> = dense_active;
             dense.extend(dense_system);
             dense.extend(dense_codex);
+            dense.sort_unstable_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
 
             let floor = dense_floor.unwrap_or(crate::memory_rrf::DENSE_COSINE_FLOOR);
 
@@ -1727,19 +1746,21 @@ fn sanitize_fts5_query(input: &str) -> String {
         .join(" OR ")
 }
 
-/// Cosine (dense) search. Returns `(rowid, distance)` best-first (smallest
-/// distance first), up to `limit`. vec0's `distance` for cosine is
-/// `1 - cos_sim`, so ASC order already puts the most-similar first. The
-/// `distance` is carried through to fusion where it is converted to cosine
-/// and floored: this is the rejection authority for cross-topic bleed.
+/// Dense (vector) search. Returns `(rowid, distance)` best-first (smallest
+/// distance first), up to `limit`. vec0's DEFAULT metric is L2 (Euclidean)
+/// — the DDL does not declare distance_metric=cosine — so ASC order puts the
+/// most-similar first (L2 is monotone in cosine for unit vectors). The L2
+/// distance is carried through to fusion where it is converted to TRUE
+/// cosine (cos = 1 − d²/2, exact for the embedder's unit-normalized
+/// vectors) and floored: this is the rejection authority for cross-topic
+/// bleed.
 ///
 /// Scoped to `card_id` via a subquery against `memories` (mirrors
-/// [`fts5_top_k`]'s scoping). sqlite-vec's KNN `MATCH` combined with a
-/// `rowid IN (...)` predicate is the one technical uncertainty flagged in
-/// AGENTS.md §2M: if vec0 ignores the predicate or scans the whole table,
-/// the fallback is to over-fetch here and Rust-filter by card_id after. The
-/// query is structured so the fallback is a one-line change (drop the
-/// subquery, raise the limit).
+/// [`fts5_top_k`]'s scoping). sqlite-vec 0.1.9 applies the `rowid IN (...)`
+/// predicate as a KNN pre-filter (bitmap before distance computation), so
+/// scoping is correct with no over-fetch needed; if a future sqlite-vec
+/// regresses to post-filtering, the fallback is to over-fetch here and
+/// Rust-filter by card_id after (drop the subquery, raise the limit).
 fn vec0_top_k(
     conn: &Connection,
     query_embedding: &[f32],

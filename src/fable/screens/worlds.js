@@ -39,6 +39,8 @@ import { invoke, convertFileSrc } from '@tauri-apps/api/core';
 import { openPortraitCropper } from './portrait-cropper.js';
 import { bytesToBase64 } from './wizard-engine.js';
 import { open as openDialog } from '@tauri-apps/plugin-dialog';
+import { buildIdCard } from '../engine/creator-engine.js';
+import { renderIdCard, wireIdCard } from './id-card.js';
 
 function esc(s) {
   return String(s || '')
@@ -155,6 +157,7 @@ async function openModal(root, meta) {
   // modal-open isn't one). Prevents a double-fetch + double-mount.
   if (root._modalOpen) return;
   root._modalOpen = true;
+  root._actionConsumed = false; // fresh open → fresh action latch
   // Invalidate any in-flight close (see closeModal) — the same stale-timer
   // fix as player-picker: a re-click inside the 260ms close window must
   // never be hidden by the previous close's deferred hide.
@@ -183,8 +186,11 @@ async function openModal(root, meta) {
     root._modalCleanup = null;
   };
 
-  // The card meta already has everything we need (no second IPC).
-  card.innerHTML = renderModalCard(meta);
+  // The card meta seeds the model; the raw XML parse (best-effort) fills the
+  // full draft. renderModalCard renders through the shared ID-card face.
+  card.innerHTML = await renderModalCard(meta);
+  // Card-icon details popup (Session/Opening/anchors sections).
+  wireIdCard(card);
 
   // Portrait click → cropper → fable_card_portrait_write.
   const portraitSlot = card.querySelector('[data-modal-portrait]');
@@ -233,18 +239,29 @@ async function openModal(root, meta) {
     });
   }
 
-  // Bind the four action buttons.
-  card.querySelector('[data-modal-new]').addEventListener('click', () => {
+  // Bind the four action buttons. The NAVIGATING actions are one-per-open:
+  // closeModal's hide is deferred through the ~260ms close-fade, so the
+  // second click of a double-click still lands on live buttons — without
+  // the latch it re-fires onResume → openWorldSaves (a double-rendered
+  // saves list). _actionConsumed is reset by every openModal. Delete is
+  // NOT latched (a declined confirm must stay retryable) — its own
+  // confirmDelete carries the already-open guard instead.
+  const consumeOnce = (fn) => () => {
+    if (root._actionConsumed) return;
+    root._actionConsumed = true;
+    fn();
+  };
+  card.querySelector('[data-modal-new]').addEventListener('click', consumeOnce(() => {
     closeModal(root);
     if (root._handlers.onNewGame) root._handlers.onNewGame(meta);
-  });
-  card.querySelector('[data-modal-resume]').addEventListener('click', () => {
+  }));
+  card.querySelector('[data-modal-resume]').addEventListener('click', consumeOnce(() => {
     closeModal(root);
     if (root._handlers.onResume) root._handlers.onResume(meta);
-  });
-  card.querySelector('[data-modal-edit]').addEventListener('click', () => {
+  }));
+  card.querySelector('[data-modal-edit]').addEventListener('click', consumeOnce(() => {
     if (root._handlers.onEdit) root._handlers.onEdit(meta);
-  });
+  }));
   card.querySelector('[data-modal-delete]').addEventListener('click', () => {
     confirmDelete(root, meta);
   });
@@ -300,35 +317,101 @@ const SILHOUETTE_SVG = `<svg class="fable-portrait-silhouette" viewBox="0 0 120 
 // right (name + tone + setting/intro blurb + player_name + saves state), +
 // four action buttons in a centered row BELOW (NEW / LOAD / EDIT / DELETE).
 // Reuses the player modal's classes so the look matches.
-function renderModalCard(card) {
+// Parse the card's raw .sim XML into a creator-engine draft so the modal can
+// render through buildIdCard — the SAME license face the Creator review uses
+// (2026-08-15 Chloe: the load menu must match the review exactly). The .sim is
+// TWO-ROOT (<sim_card> + the <intro> sibling), so slice at </sim_card> first —
+// the same trick sim_card.rs::parse uses; DOMParser rejects two-root documents.
+// Best-effort: any failure returns {} and the caller falls back to list-meta.
+function parseSimDraft(xmlText, subtype) {
+  const out = { card_type: subtype || '' };
+  try {
+    const end = xmlText.indexOf('</sim_card>');
+    const head = end === -1 ? xmlText : xmlText.slice(0, end + 11);
+    const doc = new DOMParser().parseFromString(head, 'text/xml');
+    if (doc.querySelector('parsererror')) return out;
+    const q = (sel) => {
+      const el = doc.querySelector(sel);
+      return el ? el.textContent.trim() : '';
+    };
+    out.name = q('identity > name') || q('name');
+    out.setting = q('setting');
+    out.tone = q('tone');
+    const persona = q('identity > persona') || q('persona');
+    out.dialogue_style = q('conversational_style > rules');
+    const npcRole = q('cast > npc > role');
+    if (npcRole) out.job = npcRole;
+    out.date = q('start > date');
+    out.time = q('start > time');
+    out.weather = q('start > weather');
+    // The NPC <appearance> block: `Tag: value` lines in the exact vocabulary
+    // buildNpcAppearance writes (card-serialize.js) — reverse-mapped onto the
+    // wizard's draft keys so playerIdCard renders the full license grid.
+    const appearance = q('appearance');
+    if (appearance) {
+      const MAP = {
+        Gender: 'gender', Race: 'race', Age: 'age', Height: 'height', Weight: 'weight',
+        'Hair color': 'hair_color', 'Hair length': 'hair_length', 'Hair style': 'hair_style',
+        Body: 'body_type', Skin: 'skin_complexion', Eyes: 'eye_color',
+        Breast: 'breast_size', Ears: 'ears', Tail: 'tail', Horn: 'horn',
+      };
+      for (const line of appearance.split(/\r?\n/)) {
+        const m = line.match(/^\s*([^:]+?)\s*:\s*(.+?)\s*$/);
+        if (!m) continue;
+        if (m[1] === 'Clothing') {
+          out.clothing = m[2].split(',').map((s) => s.trim()).filter(Boolean);
+        } else if (MAP[m[1]]) {
+          out[MAP[m[1]]] = m[2];
+        }
+      }
+    }
+    // persona reads as the world/scenario Purpose (the serializer wrote the
+    // directive there); on an NPC it's labeled persona prose → backstory.
+    if (persona) {
+      if ((subtype || '').toLowerCase() === 'npc') out.backstory = persona;
+      else out.directive = persona;
+    }
+  } catch (_) { /* best-effort — meta fallback */ }
+  return out;
+}
+
+// The modal card: the shared ID-card renderer over the parsed draft — the
+// SAME face the Creator review shows (header + license grid + corner cluster
+// + details popup). List-meta fields cover the fallback; Session info (bound
+// player + saves) rides as an extra section behind the details popup.
+async function buildModalModel(meta) {
+  let draft = { card_type: meta.subtype || '', name: meta.name, setting: meta.setting_preview, tone: meta.tone };
+  try {
+    const xml = await invoke('fable_card_raw_get_by_id', { cardId: meta.id });
+    draft = { ...draft, ...parseSimDraft(xml, meta.subtype) };
+  } catch (_) { /* unreadable card — meta-only draft */ }
+  const model = buildIdCard('sim', draft);
+  if (!model) return null;
+  const sessRows = [];
+  if (meta.player_name) sessRows.push(['Player', meta.player_name]);
+  sessRows.push(['Saves', meta.has_saves ? 'Has saved games' : 'No saves yet']);
+  model.extra.push(['Session', sessRows]);
+  if (meta.opening_scene_preview) {
+    model.extra.push(['Opening scene', [['Preview', String(meta.opening_scene_preview)]]]);
+  }
+  return model;
+}
+
+async function renderModalCard(card) {
+  const model = await buildModalModel(card);
   const portraitSrc = (card.has_portrait && card.portrait_url) ? convertFileSrc(card.portrait_url) : '';
   const portraitHTML = portraitSrc
     ? `<img src="${esc(portraitSrc)}" alt="" onerror="this.style.display='none'">`
     : `<span class="fable-player-review-portrait-fallback" aria-hidden="true">${SILHOUETTE_SVG}</span>`;
-  const rows = [];
-  if (card.tone) rows.push(['Tone', card.tone]);
-  if (card.player_name) rows.push(['Player', card.player_name]);
-  rows.push(['Saves', card.has_saves ? 'Has saved games' : 'No saves yet']);
-  const blurb = card.setting_preview || card.opening_scene_preview || '';
-  const blurbHTML = blurb
-    ? `<p class="fable-world-modal-blurb">${esc(blurb)}</p>`
-    : '';
-  const rowsHTML = rows.length
-    ? `<dl class="fable-world-modal-rows">${rows.map(([k, v]) => `<div><dt>${esc(k)}</dt><dd>${esc(v)}</dd></div>`).join('')}</dl>`
-    : '';
-  return `
-    <div class="fable-player-review-card fable-world-modal-card">
-      <div class="fable-player-review-top">
+  const cardHTML = model
+    ? renderIdCard(model, { portraitClickable: false, portraitHtml: portraitHTML })
+    // Defensive fallback (buildIdCard never returns null for 'sim', but the
+    // modal must never blank): the old hand-rolled section card.
+    : `<div class="fable-player-review-card"><div class="fable-player-review-top">
         <div class="fable-player-review-portrait" data-modal-portrait>${portraitHTML}</div>
-        <div class="fable-player-review-body">
-          <section class="fable-player-review-section">
-            <h3>${esc(card.name)}</h3>
-            ${blurbHTML}
-            ${rowsHTML}
-          </section>
-        </div>
-      </div>
-    </div>
+        <div class="fable-player-review-body"><section class="fable-player-review-section">
+          <h3>${esc(card.name)}</h3></section></div></div></div>`;
+  return cardHTML + `
     <div class="fable-player-modal-actions">
       <button type="button" class="fable-player-modal-btn fable-player-modal-btn--load" data-modal-new>NEW</button>
       <button type="button" class="fable-player-modal-btn fable-player-modal-btn--load" data-modal-resume>LOAD</button>
@@ -340,6 +423,11 @@ function renderModalCard(card) {
 // --- Delete confirmation (mirrors player-picker.confirmDelete) ------------
 function confirmDelete(root, card) {
   const confirmEl = root.querySelector('[data-confirm]');
+  // Already-open guard: a double-click on the modal's delete button re-enters
+  // here while the confirm is up — without this, every re-entry stacks another
+  // yes/no listener pair (one click = N deletes). A declined confirm closes
+  // fully, so a fresh delete click re-runs cleanly.
+  if (!confirmEl.hidden && confirmEl.classList.contains('is-open')) return;
   const msg = root.querySelector('[data-confirm-msg]');
   const yes = root.querySelector('[data-confirm-yes]');
   const no = root.querySelector('[data-confirm-no]');

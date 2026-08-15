@@ -211,22 +211,30 @@ pub enum OutcomeSeverity {
 }
 
 impl OutcomeSeverity {
-    /// Map a d20 margin (roll − DC) to a severity tier. The mapping:
-    /// - roll < DC by 10+ → CatastrophicFailure
-    /// - roll < DC → Failure
-    /// - roll ≥ DC, margin < 5 → ComplicatedSuccess (a near thing)
-    /// - roll ≥ DC by 5+ → Success
-    /// - roll ≥ DC by 10+ → CriticalSuccess
-    /// - natural 1 → CatastrophicFailure regardless of margin
-    /// - natural 20 → CriticalSuccess regardless of margin
-    pub fn from_margin(roll: u32, dc: u32) -> OutcomeSeverity {
-        // Natural 1 / natural 20 override the margin math.
-        if roll == 1 {
+    /// Map a d20 result to a severity tier. `raw_roll` is the unmodified die
+    /// (the ONLY value the natural-1/20 override may judge); `effective_roll`
+    /// is the suitability-adjusted value the margin math uses. The mapping:
+    /// - effective roll < DC by 10+ → CatastrophicFailure
+    /// - effective roll < DC → Failure
+    /// - effective roll ≥ DC, margin < 5 → ComplicatedSuccess (a near thing)
+    /// - effective roll ≥ DC by 5+ → Success
+    /// - effective roll ≥ DC by 10+ → CriticalSuccess
+    /// - RAW natural 1 → CatastrophicFailure regardless of margin
+    /// - RAW natural 20 → CriticalSuccess regardless of margin
+    ///
+    /// A modified value of 1 or 20 is NOT a natural — raw 15 + Ideal(+5)
+    /// reaching 20 is a strong hit that earns its tier by margin, not an
+    /// auto-crit (and raw 6 + Hopeless(−5) reaching 1 is a bad miss, not an
+    /// auto-catastrophe).
+    pub fn from_margin(raw_roll: u32, effective_roll: u32, dc: u32) -> OutcomeSeverity {
+        // Natural 1 / natural 20 override the margin math — RAW die only.
+        if raw_roll == 1 {
             return OutcomeSeverity::CatastrophicFailure;
         }
-        if roll == 20 {
+        if raw_roll == 20 {
             return OutcomeSeverity::CriticalSuccess;
         }
+        let roll = effective_roll;
         if roll + 10 <= dc {
             OutcomeSeverity::CatastrophicFailure
         } else if roll < dc {
@@ -320,7 +328,7 @@ pub fn resolve_task(task: &OffScreenTask) -> TaskResolution {
     let raw_roll = roll_d20(&mut roller);
     let modified = (raw_roll as i32 + task.suitability.modifier()).clamp(1, 30) as u32;
     let dc = task.difficulty.dc();
-    let severity = OutcomeSeverity::from_margin(modified, dc);
+    let severity = OutcomeSeverity::from_margin(raw_roll, modified, dc);
 
     let directive = format!(
         "Off-screen task — {} ({}): {}. {}. Narrate the NPC's return and the local consequences; do not invent global or world-shaking repercussions.",
@@ -528,38 +536,58 @@ mod tests {
 
     #[test]
     fn natural_1_is_alwayscatastrophic() {
-        let sev = OutcomeSeverity::from_margin(1, 5);
+        let sev = OutcomeSeverity::from_margin(1, 1, 5);
         assert_eq!(sev, OutcomeSeverity::CatastrophicFailure);
         // Even against a Trivial DC.
-        let sev = OutcomeSeverity::from_margin(1, 5);
+        let sev = OutcomeSeverity::from_margin(1, 1, 5);
         assert_eq!(sev, OutcomeSeverity::CatastrophicFailure);
     }
 
     #[test]
     fn natural_20_is_always_critical() {
-        let sev = OutcomeSeverity::from_margin(20, 25);
+        let sev = OutcomeSeverity::from_margin(20, 20, 25);
         assert_eq!(sev, OutcomeSeverity::CriticalSuccess);
         // Even against NearImpossible.
-        let sev = OutcomeSeverity::from_margin(20, 25);
+        let sev = OutcomeSeverity::from_margin(20, 20, 25);
         assert_eq!(sev, OutcomeSeverity::CriticalSuccess);
+    }
+
+    #[test]
+    fn modified_20_is_not_an_auto_crit() {
+        // raw 15 + Ideal(+5) = effective 20 vs DC 15 → Success by margin
+        // (margin 5), NOT a natural-20 CriticalSuccess.
+        assert_eq!(
+            OutcomeSeverity::from_margin(15, 20, 15),
+            OutcomeSeverity::Success
+        );
+    }
+
+    #[test]
+    fn modified_1_is_not_an_auto_catastrophe() {
+        // raw 6 + Hopeless(−5) = effective 1 vs DC 5 → plain Failure — the
+        // natural-1 override must NOT fire on the adjusted value.
+        assert_eq!(
+            OutcomeSeverity::from_margin(6, 1, 5),
+            OutcomeSeverity::Failure
+        );
     }
 
     #[test]
     fn outcome_failure_by_margin() {
         // roll 8 vs DC 15 → Failure (missed by 7, not by 10+).
-        assert_eq!(OutcomeSeverity::from_margin(8, 15), OutcomeSeverity::Failure);
+        assert_eq!(OutcomeSeverity::from_margin(8, 8, 15), OutcomeSeverity::Failure);
         // roll 5 vs DC 15 → CatastrophicFailure (missed by 10).
-        assert_eq!(OutcomeSeverity::from_margin(5, 15), OutcomeSeverity::CatastrophicFailure);
+        assert_eq!(OutcomeSeverity::from_margin(5, 5, 15), OutcomeSeverity::CatastrophicFailure);
     }
 
     #[test]
     fn outcome_success_by_margin() {
         // roll 16 vs DC 15 → ComplicatedSuccess (made by 1, margin < 5).
-        assert_eq!(OutcomeSeverity::from_margin(16, 15), OutcomeSeverity::ComplicatedSuccess);
+        assert_eq!(OutcomeSeverity::from_margin(16, 16, 15), OutcomeSeverity::ComplicatedSuccess);
         // roll 19 vs DC 15 → Success (made by 4 — still < 5).
-        assert_eq!(OutcomeSeverity::from_margin(19, 15), OutcomeSeverity::ComplicatedSuccess);
+        assert_eq!(OutcomeSeverity::from_margin(19, 19, 15), OutcomeSeverity::ComplicatedSuccess);
         // roll 20 vs DC 15 → CriticalSuccess (natural 20 overrides).
-        assert_eq!(OutcomeSeverity::from_margin(20, 15), OutcomeSeverity::CriticalSuccess);
+        assert_eq!(OutcomeSeverity::from_margin(20, 20, 15), OutcomeSeverity::CriticalSuccess);
     }
 
     // ---- resolve_task ----

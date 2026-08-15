@@ -289,6 +289,10 @@ function finishTurn() {
   generating = false;
   activeBeat = null;
   rerolling = false;
+  // (P3 fix) Disarm the deferred reroll: if interruptAndReroll's invoke
+  // resolved after the roll had already finalized, the flag stayed armed and
+  // a LATER `cancelled` event fired a spurious reroll of the wrong beat.
+  deferredReroll = false;
   clearSliceState();
   if (onTurnEnd) onTurnEnd();
 }

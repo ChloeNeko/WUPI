@@ -140,6 +140,7 @@ async function openModal(root, meta) {
   // transition — this local gate prevents the double-fetch + double-mount).
   if (root._modalOpen) return;
   root._modalOpen = true;
+  root._actionConsumed = false; // fresh open → fresh action latch
   // Invalidate any in-flight close (see closeModal): a re-click inside the
   // 260ms close window must never be hidden by the previous close's stale
   // transitionend/timer — that left the modal invisible with _modalOpen
@@ -245,15 +246,26 @@ async function openModal(root, meta) {
     });
   }
 
-  // Bind the three action buttons.
-  card.querySelector('[data-modal-load]').addEventListener('click', () => {
+  // Bind the three action buttons. The NAVIGATING actions are one-per-open:
+  // closeModal's hide is deferred through the ~260ms close-fade, so the
+  // second click of a double-click still lands on live buttons — without
+  // the latch onSelect double-runs flowSimPair (a double-rendered SIM
+  // pair). _actionConsumed is reset by every openModal. Delete is NOT
+  // latched (a declined confirm must stay retryable) — its own
+  // confirmDelete carries the already-open guard instead.
+  const consumeOnce = (fn) => () => {
+    if (root._actionConsumed) return;
+    root._actionConsumed = true;
+    fn();
+  };
+  card.querySelector('[data-modal-load]').addEventListener('click', consumeOnce(() => {
     closeModal(root);
     if (root._handlers.onSelect) root._handlers.onSelect(full);
-  });
-  card.querySelector('[data-modal-edit]').addEventListener('click', () => {
+  }));
+  card.querySelector('[data-modal-edit]').addEventListener('click', consumeOnce(() => {
     closeModal(root);
     if (root._handlers.onEdit) root._handlers.onEdit(full);
-  });
+  }));
   card.querySelector('[data-modal-delete]').addEventListener('click', () => {
     confirmDelete(root, full);
   });
@@ -337,6 +349,11 @@ function renderModalCard(sp) {
 // --- Delete confirmation (the one irreversible action) -------------------
 function confirmDelete(root, sp) {
   const confirmEl = root.querySelector('[data-confirm]');
+  // Already-open guard: a double-click on the modal's delete button re-enters
+  // here while the confirm is up — without this, every re-entry stacks another
+  // yes/no listener pair (one click = N deletes). A declined confirm closes
+  // fully, so a fresh delete click re-runs cleanly.
+  if (!confirmEl.hidden && confirmEl.classList.contains('is-open')) return;
   const msg = root.querySelector('[data-confirm-msg]');
   const yes = root.querySelector('[data-confirm-yes]');
   const no = root.querySelector('[data-confirm-no]');

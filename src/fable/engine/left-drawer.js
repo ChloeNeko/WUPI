@@ -215,6 +215,27 @@ let lastBodyMap = null;
 // null when no game / dormant schema → the tooltip renders the header only.
 let lastDetailsMap = null;
 
+// rAF-coalesced heatmap repaint for the resize listener (registered next to
+// soul-gem's repositionOnResize in buildLeftDrawer). Mirrors the gender-
+// toggle repaint: paintInjuryHeatmap is idempotent + a no-op with no cached
+// injuries, so the common healthy state costs one early-return query.
+let heatResizeRaf = 0;
+function repaintHeatmapOnResize() {
+  if (heatResizeRaf) return;
+  heatResizeRaf = requestAnimationFrame(() => {
+    heatResizeRaf = 0;
+    const section = drawerEl && drawerEl.querySelector('.hud-paperdoll-section');
+    if (!section || !lastBodyMap) return; // nothing painted → nothing to re-glue
+    const img = drawerEl.querySelector('[data-paperdoll-img]');
+    if (img && !img.complete) return;     // mid-swap PNG → stale box; skip this frame
+    try {
+      paintInjuryHeatmap(section, normGender(gender), lastBodyMap, lastDetailsMap);
+    } catch (e) {
+      console.warn('[left-drawer] heatmap repaint on resize failed:', e);
+    }
+  });
+}
+
 // ===========================================================================
 // §1  PAPERDOLL — static silhouette
 // ===========================================================================
@@ -335,6 +356,13 @@ export function buildLeftDrawer() {
     // itself suppresses the bloom transition so the gems SNAP, not spring.
     window.addEventListener('load', repositionToBody, { once: true });
     window.addEventListener('resize', repositionOnResize);
+    // Heatmap resize follow: the paperdoll is fluid (clamp(510px, 76.85vh,
+    // 1200px)), so a viewport resize moves the img box the bruises are glued
+    // to. Repaint from the cached lastBodyMap (same no-injuries no-op as the
+    // gender-toggle path) — own rAF token so it coalesces with, not inside,
+    // soul-gem's resize path. Skipped while the PNG is mid-swap (an
+    // incomplete img measures a stale box; the next refreshAll corrects).
+    window.addEventListener('resize', repaintHeatmapOnResize);
   }
   renderGenderGlyph(); // paint the initial glyph + color
   // Paint the fixed Sun/Moon glyphs (these never change), then load the live

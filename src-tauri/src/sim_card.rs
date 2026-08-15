@@ -515,6 +515,49 @@ pub fn parse_from_xml_str(xml: &str) -> anyhow::Result<SimCard> {
     parse(xml)
 }
 
+/// Find the byte offset just past the `</sim_card>` close tag terminating the
+/// root element — CDATA/comment-aware + whitespace-tolerant (P2 hardening).
+/// The naive `xml.find("</sim_card>")` broke on (a) the literal string inside
+/// authored CDATA prose (legal XML — the slice cut mid-CDATA, the head became
+/// unparseable, and the card silently degraded to the fallback stub) and
+/// (b) whitespace before `>` (`</sim_card >` — valid XML the find missed).
+fn find_root_close(xml: &str) -> Option<usize> {
+    let b = xml.as_bytes();
+    let starts = |i: usize, pat: &[u8]| b.len() >= i + pat.len() && &b[i..i + pat.len()] == pat;
+    let mut i = 0;
+    while i < b.len() {
+        if starts(i, b"<![CDATA[") {
+            // CDATA runs to the first `]]>` — everything inside is literal text.
+            let mut j = i + 9;
+            while j + 3 <= b.len() && !starts(j, b"]]>") {
+                j += 1;
+            }
+            i = (j + 3).min(b.len());
+            continue;
+        }
+        if starts(i, b"<!--") {
+            let mut j = i + 4;
+            while j + 3 <= b.len() && !starts(j, b"-->") {
+                j += 1;
+            }
+            i = (j + 3).min(b.len());
+            continue;
+        }
+        if starts(i, b"</sim_card") {
+            let mut j = i + b"</sim_card".len();
+            while j < b.len() && (b[j] as char).is_ascii_whitespace() {
+                j += 1;
+            }
+            if j < b.len() && b[j] == b'>' {
+                return Some(j + 1);
+            }
+            // Not the close tag (e.g. `</sim_cardboard`) — keep scanning.
+        }
+        i += 1;
+    }
+    None
+}
+
 /// Parse a `.sim` card from its XML text. Separated from `try_load` so the
 /// unit tests can exercise the parser without touching the filesystem.
 fn parse(xml: &str) -> anyhow::Result<SimCard> {
@@ -522,34 +565,58 @@ fn parse(xml: &str) -> anyhow::Result<SimCard> {
     // optional sibling `<intro>`/`<introduction>` AFTER it (§6B — the intro
     // stays out of the cached card so it never inflates the system prompt).
     // roxmltree (0.10) REJECTS multi-root documents outright ("unknown
-    // token"), so slice at the first `</sim_card>` + parse the head as the
+    // token"), so slice at the root's closing tag + parse the head as the
     // document; the TAIL (everything after) is re-parsed below, wrapped in a
     // synthetic root, to fish out the sibling intro. A string with no
-    // `</sim_card>` (the Creator's draft output, in-memory parses) slices to
+    // close tag (the Creator's draft output, in-memory parses) slices to
     // itself + an empty tail — behavior unchanged.
-    let (head, tail) = match xml.find("</sim_card>") {
-        Some(i) => xml.split_at(i + "</sim_card>".len()),
+    let (head, tail) = match find_root_close(xml) {
+        Some(end) => xml.split_at(end),
         None => (xml, ""),
     };
-    let doc = roxmltree::Document::parse(head)
-        .map_err(|e| anyhow::anyhow!("parsing card XML: {e}"))?;
+    let doc = roxmltree::Document::parse(head).map_err(|e| {
+        let hint = if tail.trim().is_empty() {
+            String::new()
+        } else {
+            " (a sibling <intro> tail exists after the root — the head is unbalanced; \
+             check for an unclosed tag or CDATA section inside <sim_card>)"
+                .to_string()
+        };
+        anyhow::anyhow!("parsing card XML: {e}{hint}")
+})?;
     let root = doc
         .root_element()
         .has_tag_name("sim_card")
         .then_some(doc.root_element())
         .ok_or_else(|| anyhow::anyhow!("root element must be <sim_card>"))?;
 
-    // `id` is OPTIONAL and derived from <identity><name> (lowercased) when
-    // <metadata> is absent. The metadata block is NOT part of the card format
-    // by design: cards stay clean and persona-only. The id is vestigial today
-    // anyway: memory partitioning uses the WUPI_CARD_ID sentinel, not the
-    // card's id. Keeping a derived id preserves the field for a future
-    // roleplay-card partition path without forcing metadata onto every card.
+    // `id` is OPTIONAL and derived from <identity><name> when <metadata> is
+    // absent. Whatever its source, the id is NORMALIZED through the SAME slug
+    // rules `fable_write_card` uses for the folder stem (lowercase, non-
+    // [alphanumeric_-]→'-', dashes trimmed). The parsed id and the on-disk
+    // folder must agree or every by-id path (state saves, codex seed, portrait,
+    // raw editor, auto .lnk) lands in a phantom folder — the multi-word-name
+    // bug ("Mistwood Vale" → id "mistwood vale" vs folder "mistwood-vale").
+    // A metadata id that normalizes onto a memory sentinel is ignored: a card
+    // must never share a partition key with __wupi__/__codex__ etc.
     let name = first_child(root, "identity")
         .and_then(|n| child_text(n, "name"))
         .unwrap_or_else(|| "unknown".to_owned());
+    let is_sentinel = |s: &str| {
+        matches!(
+            s,
+            crate::memory::WUPI_CARD_ID
+                | crate::memory::WUPI_SYSTEM_CARD_ID
+                | crate::memory::FABLE_SYSTEM_CARD_ID
+                | crate::memory::CODEX_CARD_ID
+        )
+    };
     let id = nested_text(root, "metadata", "id")
-        .unwrap_or_else(|| name.to_lowercase());
+        .as_deref()
+        .and_then(crate::slugify_card_stem)
+        .filter(|v| !is_sentinel(v))
+        .or_else(|| crate::slugify_card_stem(&name))
+        .unwrap_or_else(|| "unknown".to_owned());
     let card_type = nested_text(root, "metadata", "type").unwrap_or_else(|| "system".to_owned());
     let subtype = nested_text(root, "metadata", "subtype").filter(|s| !s.is_empty());
 

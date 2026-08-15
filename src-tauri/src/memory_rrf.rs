@@ -72,30 +72,38 @@ use crate::memory::{DebugScores, MemoryId, RankedMemory};
 pub const RRF_K: u32 = 60;
 
 /// Default hard cosine floor for the dense path. Memories whose query→memory
-/// cosine similarity falls below this are REJECTED before fusion: they never
-/// contribute to the prompt. This is the rejection authority for cross-topic
-/// bleed (AGENTS.md §2L problem #1, §2M fix).
+/// TRUE cosine similarity falls below this are REJECTED before fusion: they
+/// never contribute to the prompt. This is the rejection authority for
+/// cross-topic bleed (AGENTS.md §2L problem #1, §2M fix).
 ///
-/// Calibrated against real retrieval data 2026-07-14 (post embedder-fix +
-/// asymmetric query-prefix verification). A multi-topic seed conversation
-/// (butter, platinum, diamonds, tiramisu, carbon) queried with the single
-/// word "butter" showed a clean ~4× gap between relevant and irrelevant:
-///   - relevant (butter Q&A)      : cosine 0.317: 0.376
-///   - irrelevant (all 7 others)  : cosine 0.006: 0.094
-/// A floor of 0.25 sits in the wide gap: keeps the relevant matches with
-/// ~0.07 margin and rejects every off-topic result with ~0.16 margin.
+/// # Scale history (P1 scale fix, 2026-08-15)
 ///
-/// The earlier 0.40 const was a guess from the synthetic self-test probe;
-/// it sat ABOVE the real relevant matches (0.32-0.38) and would have
-/// rejected the very memories it should keep. Single-word queries score
-/// lower than full-sentence queries because there's little context to build
-/// meaning from, so the floor must accommodate the weak end of legitimate
-/// matches, not the strong end.
+/// vec0's default metric is L2, and until 2026-08-15 the fusion code computed
+/// `cosine = 1.0 - distance` — the 1−L2 scale, NOT cosine. All historical
+/// numbers (including the 2026-07-14 calibration below) were read through
+/// that axis. On TRUE cosine (cos = 1 − d²/2, exact for the embedder's
+/// unit-normalized vectors):
+///   - the old `0.25` const ⇔ an effective true-cosine floor of 0.71875
+///   - the calibration's "relevant 0.317-0.376" ⇔ true cosine 0.77-0.81
+///   - the calibration's "irrelevant 0.006-0.094" ⇔ true cosine 0.51-0.59
+/// The conversion + this 0.72 const preserve the shipped selectivity exactly
+/// (0.719 ≈ 0.72) while putting every number on the true axis — comparable
+/// with the startup self-test's Rust-computed cosines and with bge literature.
 ///
-/// This is a PROVISIONAL value: recalibrate as more query shapes come in.
-/// The 🧠 debug panel's `dense_floor` override (`cos ≥`) lets you test
-/// alternatives live without a rebuild (AGENTS.md §2M Checkpoint E).
-pub const DENSE_COSINE_FLOOR: f32 = 0.25;
+/// # Original calibration (2026-07-14, on the 1−L2 scale)
+///
+/// A multi-topic seed conversation (butter, platinum, diamonds, tiramisu,
+/// carbon) queried with the single word "butter" showed a clean ~4× gap
+/// between relevant and irrelevant on the old axis; the floor sat in the wide
+/// gap. The earlier 0.40 const was a guess from the synthetic self-test probe
+/// that sat ABOVE the real relevant matches and would have rejected the very
+/// memories it should keep.
+///
+/// This is a PROVISIONAL value: recalibrate as more query shapes come in,
+/// NOW on the true-cosine axis. The 🧠 debug panel's `dense_floor` override
+/// (`cos ≥`) lets you test alternatives live without a rebuild (AGENTS.md
+/// §2M Checkpoint E).
+pub const DENSE_COSINE_FLOOR: f32 = 0.72;
 
 /// The dense cosine floor for Codex (authored reference lore) entries.
 ///
@@ -109,13 +117,16 @@ pub const DENSE_COSINE_FLOOR: f32 = 0.25;
 /// though they're the same topic. This is standard domain asymmetry in RAG
 /// retrieval (Codex v1, 2026-07-14, §2P).
 ///
-/// Expecting technical reference prose to clear the same 0.25 hurdle as casual
+/// Expecting technical reference prose to clear the same 0.72 hurdle as casual
 /// chat history is like expecting a textbook to read like a DM. The lower
 /// floor for Codex is the principled fix: per-domain flooring is best-
 /// practice RAG design, not a hack. The 🧠 panel's `cos ≥` override does NOT
 /// affect this: it overrides the EPISODIC floor only; the Codex floor is
 /// applied independently in `fuse_scored_rrf` via the `codex_ids` set.
-pub const CODEX_DENSE_FLOOR: f32 = 0.10;
+///
+/// (Scale fix 2026-08-15: the old `0.10` on the 1−L2 axis ⇔ true cosine
+/// 0.595; this 0.60 preserves the shipped selectivity on the true axis.)
+pub const CODEX_DENSE_FLOOR: f32 = 0.60;
 
 /// Per-list weights for weighted RRF. Both default to 0.5 (standard RRF -
 /// equal contribution). Tilting `dense` higher biases toward semantic
@@ -186,7 +197,14 @@ pub fn fuse_scored_rrf(
     let dense_survivors: Vec<(MemoryId, f32)> = dense
         .iter()
         .filter(|(id, distance)| {
-            let cosine = 1.0 - distance;
+            // vec0's DEFAULT metric is L2 (Euclidean), NOT cosine — the DDL
+            // does not declare distance_metric=cosine, and sqlite-vec 0.1.9
+            // defaults to L2. For the L2-normalized vectors the embedder
+            // emits, L2² = 2 − 2·cos, so cos = 1 − d²/2 is EXACT. The prior
+            // `1.0 - distance` sat on the wrong (1−L2) scale: monotone in
+            // cosine, so RANKING was always correct, but every floor and
+            // panel number was on an unlabeled axis (P1 scale fix).
+            let cosine = 1.0 - distance * distance / 2.0;
             let floor = if codex_ids.contains(id) {
                 codex_floor
             } else {
@@ -224,7 +242,8 @@ pub fn fuse_scored_rrf(
     // Dense contributions (post-floor survivors only).
     for (i, (id, distance)) in dense_survivors.iter().enumerate() {
         let rank = (i as u32) + 1; // 1-based, among survivors
-        let cosine = 1.0 - distance;
+        // L2 → true cosine (see the floor filter above): cos = 1 − d²/2.
+        let cosine = 1.0 - distance * distance / 2.0;
         let contribution = weights.dense / (RRF_K as f32 + rank as f32);
         let a = acc.entry(*id).or_default();
         a.score += contribution;
@@ -279,10 +298,12 @@ mod tests {
         out.iter().map(|r| r.entry.id).collect()
     }
 
-    /// Dense list helper: `(id, distance)`. distance = 1 - cosine, so cosine
-    /// 0.9 → distance 0.1. Lower distance = better.
+    /// Dense list helper: `(id, distance)`. Production converts vec0's L2
+    /// distance to TRUE cosine via cos = 1 − d²/2 (exact for the embedder's
+    /// unit-normalized vectors), so the helper inverts it: intended cosine →
+    /// L2 distance via d = √(2 − 2·cos). Lower distance = better.
     fn dense(id: MemoryId, cosine: f32) -> (MemoryId, f32) {
-        (id, 1.0 - cosine)
+        (id, (2.0 - 2.0 * cosine).sqrt())
     }
 
     /// Sparse list helper: `(id, bm25)`. More-negative = better; the exact

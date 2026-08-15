@@ -156,7 +156,12 @@ impl StreamFilter {
         //   [BELT name=...]                (inventory, 2026-08-07)
         //   [PACK name=...]                (inventory, 2026-08-07)
         //   [DATE <new calendar label>]   (calendar, 2026-08-13)
-        let pattern = r"\[(?:CHARACTER_TURN:(?:end|[A-Za-z0-9_-]+)|OBJECT\s+[^\]]+|FX\s+[^\]]+|TIME\s+[^\]]+|DATE\s+[^\]]+|WEATHER\s+[^\]]+|TRAVEL\s+[^\]]+|EFFECT\s+[^\]]+|MILESTONE\s+[^\]]+|TASK\s+[^\]]+|RUMOR\s+[^\]]+|PRESENCE\s+[^\]]+|DISCOVER\s+[^\]]+|NPC_REGISTER\s+[^\]]+|APPEARANCE\s+[^\]]+|EQUIP\s+[^\]]+|BELT\s+[^\]]+|PACK\s+[^\]]+)\]";
+        // (P2 fix) (?i): the parser accepts every verb case-insensitively (live-
+        // observed [CHARACTER_Turn:end] variants), so the streaming strip must
+        // too — a mixed-case bracket used to leak raw into the live stream.
+        // The CHARACTER_TURN id class is widened to any non-]/non-ws run so
+        // dotted ids (npc.mara) strip like the parser accepts them.
+        let pattern = r"(?i)\[(?:CHARACTER_TURN:(?:end|[^\]\s]+)|OBJECT\s+[^\]]+|FX\s+[^\]]+|TIME\s+[^\]]+|DATE\s+[^\]]+|WEATHER\s+[^\]]+|TRAVEL\s+[^\]]+|EFFECT\s+[^\]]+|MILESTONE\s+[^\]]+|TASK\s+[^\]]+|RUMOR\s+[^\]]+|PRESENCE\s+[^\]]+|DISCOVER\s+[^\]]+|NPC_REGISTER\s+[^\]]+|APPEARANCE\s+[^\]]+|EQUIP\s+[^\]]+|BELT\s+[^\]]+|PACK\s+[^\]]+)\]";
         self.bracket_re = Some(Regex::new(pattern).expect("bracket regex always compiles"));
         // Longest realistic bracket: `[TASK npc.marcus scout the bandit camp |
         // challenging adequate 1440]` ≈ 70 chars; an EFFECT with a long label

@@ -83,7 +83,8 @@ function esc(s) {
   return String(s == null ? '' : s)
     .replace(/&/g, '&amp;')
     .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;');
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
 }
 
 export function renderMarkdown(text) {
@@ -450,6 +451,22 @@ export { swipeNextAction };
 
 function appendMes(root) {
   if (!feedEl) return null;
+  // Auto-stamp the backend message index (P1 fix): the feed is 1:1 with the
+  // session's message list — role-bearing beats (user/assistant) map exactly
+  // to backend indexes. rebuildFromMessages stamps explicitly; the LIVE
+  // builders never did, so beats appended since the last rebuild (the two
+  // newest — exactly the .vn-recent toolrail targets) carried no index and
+  // edit/delete/swipe IPC-failed on -1. Rerolls REUSE the last assistant
+  // beat (beginReroll), so every role-bearing append is one new tail
+  // message — the pre-append count IS its index.
+  if (root.dataset.index === undefined) {
+    const role = root.dataset.role;
+    if (role === 'user' || role === 'assistant') {
+      root.dataset.index = String(
+        feedEl.querySelectorAll('.fable-mes[data-role="user"],.fable-mes[data-role="assistant"]').length
+      );
+    }
+  }
   feedEl.appendChild(root);
   scrollDown();
   return root;
@@ -522,13 +539,18 @@ export function appendChunk(beat, text) {
   if (!beat || text == null) return;
   const body = bodyEl(beat);
   if (!body) return;
+  // Only auto-follow when the reader is already near the bottom — measure
+  // BEFORE the append grows scrollHeight, so a reader scrolled up during a
+  // live narration is never yanked down per chunk.
+  const nearBottom =
+    !feedEl || feedEl.scrollHeight - feedEl.scrollTop - feedEl.clientHeight < 80;
   beat.classList.add('streaming');
   // Stash raw on the dataset so the next append concatenates cleanly.
   const prev = beat.dataset.raw || '';
   const next = prev + String(text);
   beat.dataset.raw = next;
   body.innerHTML = renderMarkdown(next);
-  scrollDown();
+  if (nearBottom) scrollDown();
 }
 
 // Finalize a beat: write the final prose (preferred over the streamed

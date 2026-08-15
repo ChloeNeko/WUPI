@@ -82,6 +82,12 @@ function resolveSelection() {
   // Empty-string selection guard (a click can leave a non-collapsed range
   // whose toString is whitespace-only).
   if (!range.toString().trim()) return null;
+  // Detached-DOM guard (P2 fix): after a feed rebuild (chat-side messages
+  // event, an edit/rewind elsewhere) the Range still resolves on the
+  // DETACHED tree — closest() works on detached nodes. Clicking the pencil
+  // then splices stale pre/selection/post into whatever message now holds
+  // the stale dataset.index. Only live beats are eligible.
+  if (!beat.isConnected) return null;
   return { beat, textEl: startText, range };
 }
 

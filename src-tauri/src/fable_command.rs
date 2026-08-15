@@ -103,10 +103,24 @@ pub fn classify(text: &str) -> FableCommand {
 /// For MVP this is a simple last-word grab; Phase 2 will use the LLM.
 fn extract_focus(text: &str) -> String {
     // Take the last whitespace-delimited token, stripped of punctuation.
-    text.split_whitespace()
-        .last()
-        .map(|w| w.trim_matches(|c: char| !c.is_alphanumeric()).to_string())
+    // (P2 fix) Trailing conversation stopwords are dropped first: "what's
+    // the weather like?" used to yield focus "like" (no entity match -> the
+    // whole pretty-printed world JSON dumped into the chat bubble).
+    const STOPWORDS: &[&str] = &[
+        "like", "please", "now", "today", "here", "there", "again", "about",
+        "exactly", "currently", "right",
+    ];
+    let tokens: Vec<&str> = text
+        .split_whitespace()
+        .map(|w| w.trim_matches(|c: char| !c.is_alphanumeric()))
         .filter(|w| !w.is_empty())
+        .collect();
+    let mut idx = tokens.len();
+    while idx > 0 && STOPWORDS.contains(&tokens[idx - 1].to_lowercase().as_str()) {
+        idx -= 1;
+    }
+    tokens.get(idx.saturating_sub(1))
+        .map(|w| w.to_string())
         .unwrap_or_else(|| "state".to_string())
 }
 

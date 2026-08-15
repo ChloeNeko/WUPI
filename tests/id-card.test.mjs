@@ -20,36 +20,49 @@ function test(name, fn) {
 const byTitle = (model) => Object.fromEntries(model.extra);
 
 // ── player ─────────────────────────────────────────────────────────────────
-test('buildIdCard: player core = the 8 license fields, in order, no extras in core', () => {
+test('buildIdCard: player = NAME header + license rows (race/gender, age/skin/body, height/weight, hair/eyes)', () => {
   const m = buildIdCard('player', {
     name: 'Kael', gender: 'male', race: 'human', age: '28',
-    hair_color: 'black', eye_color: 'green', height: "6'1\"", weight: '180 lb',
-    // extra-only fields:
-    hair_length: 'short', hair_style: 'messy', body_type: 'lean',
-    skin_complexion: 'tan', clothing: ['tunic', 'boots'], job: 'ranger',
-    backstory: 'orphan', personality: 'stoic', wealth: '50 gold',
+    hair_color: 'black', hair_length: 'short', hair_style: 'messy',
+    eye_color: 'green', height: "6'1\"", weight: '180 lb',
+    body_type: 'lean', skin_complexion: 'tan', clothing: ['tunic', 'boots'],
+    job: 'ranger', backstory: 'orphan', personality: 'stoic', wealth: '50 gold',
   });
   assert.equal(m.variant, 'player');
+  assert.equal(m.title, 'Kael');          // the NAME is the header (2026-08-15)
   assert.equal(m.banner, null);
   assert.equal(m.tag, null);
-  assert.deepEqual(m.core, [
-    ['Name', 'Kael'], ['Gender', 'male'], ['Race', 'human'], ['Age', '28'],
-    ['Hair Color', 'black'], ['Eye Color', 'green'], ["Height", "6'1\""], ['Weight', '180 lb'],
+  // The license grid, in Chloe's specified row order. The age/skin/body trio
+  // packs as narrow thirds; hair stacks Color/Length/Style sub-lines.
+  assert.deepEqual(m.core.map((c) => c.label), [
+    'Race', 'Gender', 'Age', 'Skin', 'Body', 'Height', 'Weight', 'Hair', 'Eye Color',
   ]);
-  // None of the 8 core labels leak into extra, and the extra-only fields land
-  // in their groups.
+  assert.deepEqual(m.core.map((c) => c.value || c.sub), [
+    'human', 'male', '28', 'tan', 'lean', "6'1\"", '180 lb',
+    [['Color', 'black'], ['Length', 'short'], ['Style', 'messy']],
+    'green',
+  ]);
+  assert.deepEqual(m.core.filter((c) => c.third).map((c) => c.label), ['Age', 'Skin', 'Body']);
+  // Hair + physique live ON the face now — no Hair/Physique sections in extra.
   const e = byTitle(m);
-  assert.deepEqual(e.Hair, [['Length', 'short'], ['Style', 'messy']]);
-  assert.deepEqual(e.Physique, [['Body', 'lean'], ['Skin', 'tan']]);
+  assert.ok(!('Hair' in e));
+  assert.ok(!('Physique' in e));
   assert.deepEqual(e.Clothing, [['Outfit', 'tunic, boots']]);
   assert.deepEqual(e['Starting conditions'], [['Wealth', '50 gold']]);
 });
 
-test('buildIdCard: player drops empty core rows + empty extra sections', () => {
+test('buildIdCard: player missing body → age/skin fall back to half cells, no ragged gap', () => {
+  const m = buildIdCard('player', { name: 'Nyx', age: '120', skin_complexion: 'pale' });
+  assert.ok(m.core.every((c) => !c.third));
+  assert.deepEqual(m.core.map((c) => c.label), ['Age', 'Skin']);
+});
+
+test('buildIdCard: player drops empty cells + empty extra sections', () => {
   const m = buildIdCard('player', { name: 'Nyx', gender: 'female', hair_color: 'red' });
-  // Only the 3 present core fields survive; missing ones are dropped (not null).
-  assert.deepEqual(m.core, [['Name', 'Nyx'], ['Gender', 'female'], ['Hair Color', 'red']]);
-  // No Hair section (length/style both empty), no Clothing, etc. → extra is [].
+  // Only the present cells survive; missing ones are dropped (not null).
+  assert.deepEqual(m.core.map((c) => c.label), ['Gender', 'Hair']);
+  assert.deepEqual(m.core[1].sub, [['Color', 'red']]);
+  // No Distinctive/Clothing/etc. → extra is [].
   assert.deepEqual(m.extra, []);
 });
 
@@ -68,24 +81,24 @@ test('buildIdCard: player surfaces distinctive, inventory, accessories, custom t
 });
 
 // ── NPC ────────────────────────────────────────────────────────────────────
-test('buildIdCard: sim npc = player layout + subtle NPC CARD tag', () => {
+test('buildIdCard: sim npc = player layout (NAME header) + subtle NPC CARD tag', () => {
   const m = buildIdCard('sim', {
     card_type: 'npc', name: 'Mara', gender: 'female', race: 'human', age: '40',
     hair_color: 'auburn', eye_color: 'brown', height: "5'6\"", weight: '130 lb',
     personality: 'warm', flaws: 'curious', dialogue_style: 'cheery', tone: 'cozy',
   });
   assert.equal(m.variant, 'player');
+  assert.equal(m.title, 'Mara');
   assert.equal(m.tag, 'NPC CARD');
   assert.equal(m.banner, null);
-  assert.equal(m.core.length, 8);
-  assert.equal(m.core[0][0], 'Name');
+  assert.ok(m.core.find((c) => c.label === 'Race'));
   const e = byTitle(m);
   // NPC-only persona fields surface.
   assert.ok(e.Persona && e.Persona.find(([l]) => l === 'Dialogue style'));
 });
 
 // ── world ──────────────────────────────────────────────────────────────────
-test('buildIdCard: sim world = WORLD CARD banner + Name/Setting/Purpose/Tone core', () => {
+test('buildIdCard: sim world = WORLD CARD banner header + Name/Setting/Purpose/Tone core', () => {
   const m = buildIdCard('sim', {
     card_type: 'world', name: 'Cinderfen', directive: 'a cursed fen',
     setting: 'dying village', tone: 'grim',
@@ -93,9 +106,10 @@ test('buildIdCard: sim world = WORLD CARD banner + Name/Setting/Purpose/Tone cor
   });
   assert.equal(m.variant, 'world');
   assert.equal(m.banner, 'WORLD CARD');
+  assert.equal(m.title, null);           // the banner is the header, not a name
   assert.equal(m.tag, null);
   // directive shows as "Purpose".
-  assert.deepEqual(m.core, [
+  assert.deepEqual(m.core.map((c) => [c.label, c.value]), [
     ['Name', 'Cinderfen'], ['Setting', 'dying village'],
     ['Purpose', 'a cursed fen'], ['Tone', 'grim'],
   ]);
@@ -114,7 +128,7 @@ test('buildIdCard: sim scenario = SCENARIO CARD banner + Scenario extras', () =>
     participating_actors: 'bandits, guards',
   });
   assert.equal(m.banner, 'SCENARIO CARD');
-  assert.deepEqual(m.core[0], ['Name', 'Ambush']);
+  assert.deepEqual(m.core[0], { label: 'Name', value: 'Ambush' });
   const e = byTitle(m);
   assert.ok(e.Scenario && e.Scenario.find(([l]) => l === 'Trigger'));
   assert.ok(e.Scenario.find(([l]) => l === 'Objective'));
@@ -124,6 +138,20 @@ test('buildIdCard: sim with no card_type defaults to WORLD CARD', () => {
   const m = buildIdCard('sim', { name: 'Aldermoor', directive: 'survive', setting: 'a bog', tone: 'grim' });
   assert.equal(m.banner, 'WORLD CARD');
   assert.equal(m.variant, 'world');
+});
+
+// ── hostile GLM shapes never crash the model ───────────────────────────────
+test('buildIdCard: numbers/arrays/nulls/objects in the draft coerce safely', () => {
+  const m = buildIdCard('player', {
+    name: 42, age: 28, race: ['human', 'elf'], hair_color: null,
+    body_type: { bad: 'shape' }, eye_color: true,
+  });
+  assert.equal(m.title, '42');                 // numbers stringify
+  assert.deepEqual(m.core.find((c) => c.label === 'Age').value, '28');
+  assert.deepEqual(m.core.find((c) => c.label === 'Race').value, 'human, elf');
+  assert.ok(!m.core.find((c) => c.label === 'Body'));   // object → absent
+  assert.ok(!m.core.find((c) => c.label === 'Hair'));   // null → absent
+  assert.ok(!m.core.find((c) => c.label === 'Eye Color')); // boolean → absent
 });
 
 // ── non-ID kinds ───────────────────────────────────────────────────────────
@@ -137,6 +165,7 @@ test('buildIdCard: codex is not an ID card → null (unknown kinds too)', () => 
 test('buildIdCard: empty/unknown draft is safe', () => {
   const m = buildIdCard('player', {});
   assert.equal(m.variant, 'player');
+  assert.equal(m.title, '');
   assert.deepEqual(m.core, []);
   assert.deepEqual(m.extra, []);
   assert.equal(buildIdCard('unknown', { name: 'x' }), null);

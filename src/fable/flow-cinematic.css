@@ -518,37 +518,7 @@
    holds; max-width on the grid container was widened to keep gutters. */
 .fable-player-mini-card { width: 100%; max-width: 260px; }
 
-/* --- Worlds (Load menu) modal content (2026-08-05) ----------------------
-   The Load menu reuses the Player Picker's `.fable-player-grid` +
-   `.fable-player-mini-card` verbatim (identical look). Only the MODAL body
-   differs: a card shows a setting/intro blurb + tone/player/saves rows
-   alongside the portrait. These style that card-specific content. */
-.fable-world-modal-blurb {
-    margin: 8px 0 12px;
-    color: var(--fable-text-dim);
-    font-size: 14px;
-    line-height: 1.55;
-    font-style: italic;
-}
-.fable-world-modal-rows {
-    display: grid;
-    grid-template-columns: auto 1fr;
-    gap: 4px 14px;
-    margin: 0;
-}
-.fable-world-modal-rows dt {
-    color: var(--fable-brass);
-    font-size: 13px;
-    letter-spacing: 0.04em;
-}
-.fable-world-modal-rows dd {
-    margin: 0;
-    color: var(--fable-text);
-    font-size: 14px;
-}
-/* The worlds modal widens a touch so the blurb + rows breathe alongside the
-   portrait. */
-.fable-world-modal-card { width: 100%; }
+
 .fable-player-card {
     display: flex;
     flex-direction: column;
@@ -778,10 +748,12 @@
     /* The base wizard reserves 140px bottom padding for the slide nav arrows,
        but review mode HIDES the nav (the review has its own CREATE + back).
        Drop that reservation so CREATE + the card get the full viewport height.
-       Widen the wizard so the wider 1060px review card fits (base is 1000px). */
+       2026-08-15 Chloe: narrower frame to seat the 1000px card. The
+       creator-chat review override below additionally lifts the whole stack
+       off the bottom edge. */
     padding-bottom: 24px;
     width: 80vw;
-    max-width: 1100px;
+    max-width: 1070px;
 }
 .fable-player-wizard.is-review-mode .fable-wizard-slide-title.is-review-title {
     /* Nudge the whole review group down (Chloe: "move the review + create + whole
@@ -1209,17 +1181,14 @@
        (portrait LEFT, Identity + Appearance body centered to its right) with
        Clothing as its OWN centered entity BELOW. No more side-by-side clothing
        column (it kept collapsing under the portrait).
-       HEIGHT CAP: the card is capped (viewport-relative) so a tall wardrobe
-       can NEVER push the title off the top NOR hide CREATE (which sits below
-       the card as a stage sibling). The TOP row (portrait + traits) is fixed;
-       clothing's chip cluster flexes to absorb overflow + scrolls internally
-       (hidden scrollbar). The cap is fixed-pixel against the viewport — the
-       earlier `max-height: 100%` resolved against an indeterminate stage and
-       collapsed clothing to 0px. */
+       2026-08-15 Chloe pass: NARROWER (1060 → 960, then re-tuned from a too-
+       slim 880) + taller — the license face reads as a portrait card, not a
+       thin wide rectangle; the info text grows + spreads vertically (see
+       .fable-id-card-core). */
     display: flex;
     flex-direction: column;
-    gap: 12px;                    /* tight (was 22): frees room so 2 clothing rows show */
-    padding: 24px;
+    gap: 16px;
+    padding: 26px 34px;
     background: rgba(255, 255, 255, 0.035);
     backdrop-filter: blur(8px);
     -webkit-backdrop-filter: blur(8px);
@@ -1227,7 +1196,7 @@
     border-radius: 16px;
     box-shadow: 0 8px 28px rgba(0, 0, 0, 0.55), 0 0 24px rgba(230, 213, 138, 0.12);
     text-align: left;
-    width: 1060px;                /* a touch wider (was 1000) for breathing room */
+    width: 1000px;                /* 2026-08-15 Chloe: slightly bigger to fit all tags */
     max-width: 100%;
     /* In the Creator review, cap so title (above) + CREATE (below) stay on-
        screen; clothing scrolls inside. The Load modal reuses this class but
@@ -1237,21 +1206,22 @@
 }
 /* Review-mode-only card cap (the Load modal reuses .fable-player-review-card but
    is not inside .is-review-mode, so it's unaffected + scrolls its own panel).
-   flex-shrink:0 so the flex-end wizard doesn't compress the card below its cap —
-   the card takes its natural content height (up to the cap), and clothing scrolls
-   internally when the cap is hit. Without this, flex-shrink:1 crushed the card,
-   collapsing clothing to ~2px. */
+   flex-shrink:0 so the centering wizard doesn't compress the card below its
+   cap — the card takes its natural content height (up to the cap), then
+   scrolls internally (hidden scrollbar, per the no-visible-scrolls rule —
+   overflow:hidden previously CLIPPED long codex reviews with no way to read
+   the lower entries). */
 .fable-player-wizard.is-review-mode .fable-player-review-card {
     flex-shrink: 0;
-    /* Clearance: title (~100) + divider (~6) + create-wrap (~193) + wizard
-       padding (48) → ~347, round to 360. The card caps so CREATE (below) +
-       title (above) stay pinned on any viewport. The card is a flex column:
-       the top row (portrait + traits) is fixed, clothing flexes + its chip
-       cluster scrolls internally (hidden scrollbar) when the wardrobe is large.
-       overflow:hidden so clothing's scroll (not the card's) absorbs overflow. */
-    max-height: calc(100vh - 360px);
+    /* Clearance for CREATE (~193) + create-wrap margin (16) + wizard padding.
+       The card caps so CREATE (below) stays pinned on any viewport. */
+    max-height: calc(100vh - 330px);
     min-height: 0;
-    overflow: hidden;
+    overflow-y: auto;
+    scrollbar-width: none;          /* Firefox + WebView2-Chrome (standard) */
+}
+.fable-player-wizard.is-review-mode .fable-player-review-card::-webkit-scrollbar {
+    display: none;                  /* WebKit/Chromium */
 }
 /* The TOP row: portrait on the LEFT, Identity + Appearance centered in the
    remaining space. 2026-08-05 fix: the traits (Name/Race/Height/Hair/Skin) sit
@@ -1262,13 +1232,18 @@
     display: flex;
     flex-direction: row;
     align-items: flex-start;
-    gap: 50px;                    /* breathing room between portrait + Identity/Appearance */
+    gap: 44px;                  /* breathing room between portrait + info body */
     width: 100%;
 }
 .fable-player-review-portrait {
     flex: 0 0 auto;
-    width: 312px;               /* 2026-08-05: ~4% bigger (was 300×420) */
-    height: 437px;
+    /* 2026-08-15 Chloe: the portrait is LOCKED to the cropper's 2:3 ratio —
+       a fixed 320×480 box in the review AND the picker modal (sized up so
+       the card reads taller + the rows get room to breathe). The card's
+       height (driven by trait text) must NEVER stretch the image. */
+    width: 320px;
+    aspect-ratio: 2 / 3;
+    height: auto;
     border-radius: 12px;
     background: rgba(255, 255, 255, 0.035);
     border: 1px solid rgba(230, 213, 138, 0.25);
@@ -1278,13 +1253,10 @@
     align-items: center;
     justify-content: center;
 }
-/* Review-mode portrait is viewport-responsive (2026-08-05): the Creator review
-   caps the card so CREATE + title stay pinned. The portrait is TALL (Chloe
-   2026-08-05: "needs to be taller, it's too short now") — clamps high. The Load
-   modal reuses this class but is NOT in .is-review-mode → keeps 437. */
-.fable-player-wizard.is-review-mode .fable-player-review-portrait {
-    height: clamp(340px, 42vh, 420px);
-}
+/* (The review-mode portrait clamp was REMOVED 2026-08-15: the 52vh clamp
+   elongated the box past 2:3 on tall viewports and let the card's text height
+   read as "the image stretched". The base 2:3 aspect-ratio above governs
+   every surface — review + picker modal — unconditionally.) */
 .fable-player-review-portrait img { width: 100%; height: 100%; object-fit: cover; }
 .fable-player-review-portrait-fallback {
     position: absolute; inset: 0;
@@ -1433,21 +1405,23 @@
         linear-gradient(rgba(197, 179, 88, 0.28), rgba(197, 179, 88, 0.28)) bottom center / 880px 1px no-repeat;
 }
 /* Two-column trait grid — the dl renders as a 2-col grid so the trait pairs
-   pack side-by-side instead of one tall column. */
+   pack side-by-side instead of one tall column. 2026-08-15 Chloe: bigger text
+   (labels 0.8 → 0.95rem, values 1.05 → 1.3rem) + more vertical air (row gap
+   9 → 16px) — the review card's information was too small + cramped. */
 .fable-player-review-section dl {
     margin: 0;
     display: grid;
     grid-template-columns: 1fr 1fr;
-    gap: 9px 70px;                /* column gap 70px → right column traits sit further right; row gap 9px */
-    font-size: 1.05rem;
+    gap: 16px 56px;
+    font-size: 1.3rem;
 }
 .fable-player-review-section dl > div {
     display: flex;
     flex-direction: column;
-    gap: 0px;
+    gap: 2px;
 }
-.fable-player-review-section dt { color: var(--fable-text-faint); font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.06em; }
-.fable-player-review-section dd { margin: 0; color: var(--fable-text); font-size: 1.05rem; text-transform: uppercase; line-height: 1.15; }   /* ID-card values uppercase */
+.fable-player-review-section dt { color: var(--fable-text-faint); font-size: 0.95rem; text-transform: uppercase; letter-spacing: 0.06em; }
+.fable-player-review-section dd { margin: 0; color: var(--fable-text); font-size: 1.3rem; text-transform: uppercase; line-height: 1.2; }   /* ID-card values uppercase */
 /* Clothing chips render in the user's original casing (Chloe 2026-08-05: no
    uppercasing on clothing anywhere). The chip cluster layout lives in the
    .fable-player-review-clothing .fable-player-review-chips rule above. */
@@ -1510,63 +1484,190 @@
     filter: drop-shadow(0 0 12px rgba(230, 213, 138, 0.6));
 }
 
-/* --- ID Card (compact license-card face + card-icon details popup) ---------
-   2026-08-13 (Chloe): the review card now leads with a COMPACT core grid —
-   Player/NPC show 8 fields (Name, Gender, Race, Age, Hair Color, Eye Color,
-   Height, Weight); World/Scenario show a TYPE banner + Name/Setting/Purpose/
-   Tone. NO section headers on the core (a flat <dl> — real-life state-license
-   look). Every remaining tag lives behind a small brass CARD-ICON button on
-   the card's top-right edge (2026-08-14, Chloe: replaces the bronze arrow +
-   its inline slide-out disclosure — removed outright) → opens the
-   .fable-id-details-* CENTERED popup (the full section/h3/dl grid, reused
-   wholesale for a clean, parseable read; the card itself never expands).
+/* --- ID Card (header + license grid + card-icon details popup) -------------
+   2026-08-13 (Chloe): the review card leads with a COMPACT core grid.
+   2026-08-15 (Chloe) rework: a HEADROW opens the info body — the NAME (player/
+   NPC) or the TYPE banner (world/scenario) sits CENTERED over the card's
+   information space (right of the portrait) on a bold gold rule fitted to the
+   HEADER TEXT width (+ breathing room each side), with the details/pencil
+   buttons in the headrow's corner cluster — in-flow, so they can never push
+   or overlap the header. The core is a license grid:
+     player/NPC: RACE|GENDER / AGE|SKIN|BODY (3 narrow cells) / HEIGHT|WEIGHT
+                 / the stacked HAIR cell|EYE COLOR
+     world/scenario: the banner header + a 1-col core (Name/Setting/Purpose/
+                 Tone). Every remaining tag lives behind the brass CARD-ICON
+   button → the centered .fable-id-details-* popup (the card never expands).
    The card markup comes from screens/id-card.js; the model from buildIdCard. */
-.fable-id-card { position: relative; }     /* anchor for the absolute arrow */
+.fable-id-card { position: relative; }
 
-/* Compact core grid — no <h3> dividers. Mirrors the .fable-player-review-section
-   dl look (2-col, uppercase values) but stands alone (no section wrapper). */
-.fable-id-card-core {
-    margin: 0;
-    display: grid;
-    grid-template-columns: 1fr 1fr;
-    gap: 10px 48px;
-    width: 100%;
-    max-width: 520px;
-    font-size: 1.05rem;
+/* The info body: content anchors to the TOP (2026-08-15 Chloe: "so much
+   space on top of the header — move it up") — the header sits high against
+   the card's top edge and the license grid below spreads through the
+   portrait's full height (the grid owns the breathing, via
+   align-content:space-evenly on the core). */
+.fable-id-card .fable-player-review-body {
+    align-items: center;
+    justify-content: flex-start;
+    gap: 20px;
+    align-self: stretch;
 }
-.fable-id-card-core > div { display: flex; flex-direction: column; gap: 0; }
-.fable-id-card-core dt { color: var(--fable-text-faint); font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.06em; }
-.fable-id-card-core dd { margin: 0; color: var(--fable-text); font-size: 1.05rem; text-transform: uppercase; line-height: 1.15; }
 
-/* World/Scenario: a prominent centered TYPE banner, then a 1-col core (the
-   setting/purpose values are prose-y, so a single full-width column reads
-   cleaner than the 2-col player grid). The body column centers everything. */
-.fable-id-card--world .fable-player-review-body { align-items: center; text-align: center; }
-.fable-id-card--world .fable-id-card-core { grid-template-columns: 1fr; max-width: 580px; }
-.fable-id-card--world .fable-id-card-core > div { align-items: center; }
-.fable-id-card-banner {
+/* HEADROW — [invisible spacer | centered header | corner buttons]. The
+   spacer mirrors the corner cluster's width so the header is TRULY centered
+   in the information space; the corner cluster is in-flow (top-right of the
+   card visually) so the buttons can never overlap the header text. */
+.fable-id-card-headrow {
+    display: flex;
+    flex-direction: row;
+    align-items: flex-start;
+    justify-content: center;
+    gap: 14px;
     width: 100%;
-    box-sizing: border-box;
-    /* right clearance so the headline clears the top-right corner cluster
-       (details + pencil, up to ~124px from the right edge in the Creator
-       review; the pickers show only the details button). */
-    padding: 0 132px 12px 0;
-    margin: 0 0 16px;
-    border-bottom: 1px solid rgba(197, 179, 88, 0.3);
+}
+.fable-id-card-head-spacer {
+    flex: 0 0 auto;
+    width: 102px;                 /* mirrors .fable-id-card-corner's footprint */
+    margin-right: auto;         /* auto-margin sandwich: pins LEFT edge... */
+    align-self: flex-start;
+}
+/* The header wrapper shrink-wraps its text so the gold rule can size to it. */
+.fable-id-card-headwrap {
+    flex: 0 1 auto;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+}
+.fable-id-card-head-text {
+    display: block;
+    max-width: 100%;
+    overflow-wrap: anywhere;
     font-family: 'Almendra', var(--fable-font-serif);
     font-weight: 700;
-    font-size: 30px;
+    font-size: 32px;
+    line-height: 1.2;
     color: var(--fable-brass);
     text-transform: uppercase;
-    letter-spacing: 0.18em;
+    letter-spacing: 0.16em;
     text-align: center;
     text-shadow: 0 0 12px var(--fable-brass-glow);
 }
+/* The bold gold rule: fitted to the HEADER TEXT width plus extra space each
+   side (NOT the card width). 100% resolves against the shrink-wrapped
+   headwrap = the text; the +60px overhang splits evenly via the centered
+   flex (2026-08-15 Chloe: "a bit more bold and gold"). */
+.fable-id-card-head-rule {
+    display: block;
+    width: calc(100% + 60px);
+    margin-top: 10px;
+    height: 3px;
+    border-radius: 2px;
+    background: linear-gradient(90deg,
+        rgba(230, 213, 138, 0.15) 0%,
+        var(--fable-brass) 22%,
+        #F7EAAD 50%,
+        var(--fable-brass) 78%,
+        rgba(230, 213, 138, 0.15) 100%);
+    box-shadow: 0 0 10px rgba(230, 213, 138, 0.55), 0 1px 3px rgba(0, 0, 0, 0.6);
+}
+
+/* The corner cluster — the brass card-icon (details) + pencil (Creator
+   review edit), in-flow at the headrow's right = the card's top-right corner.
+   NO auto margins: the head-spacer mirrors this cluster's exact width so the
+   header stays truly centered between them. */
+.fable-id-card-corner {
+    flex: 0 0 auto;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    margin-left: auto;            /* ...and pins the corner flush into the top-right (2026-08-15 Chloe) */
+}
+
+/* License grid — a 6-column track: plain cells span 3 (halves), the
+   AGE|SKIN|BODY trio spans 2 (thirds). Bigger text + generous vertical
+   spacing (2026-08-15 Chloe). */
+.fable-id-card-core {
+    margin: 0;
+    display: grid;
+    grid-template-columns: repeat(6, 1fr);
+    gap: 16px 36px;               /* minimum spacing — space-evenly adds the rest */
+    align-content: space-evenly; /* rows spread through the portrait height */
+    flex: 1 1 auto;
+    width: 100%;
+    font-size: 1.25rem;
+}
+/* Cells CENTER their content on BOTH axes: horizontally under the label, and
+   vertically within the grid row — a one-line AGE next to a wrapped SKIN
+   centers in place instead of stranding a void underneath (2026-08-15 Chloe:
+   "empty space around age… texts all over the place"). */
+.fable-id-card-cell {
+    grid-column: span 3;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    text-align: center;
+    gap: 3px;
+    min-width: 0;
+}
+.fable-id-card-cell--third { grid-column: span 2; }
+/* HALF cells pull INWARD (2026-08-15 Chloe: "the age/skin/body row is
+   perfectly divided into 3s but not the others — move race/height/hair a
+   bit right, gender/weight/eye a bit left"). The renderer tracks the grid
+   flow and tags each half with its column side; padding on the cell's
+   OUTER edge shrinks the content box from that side, moving the centered
+   content toward the middle (LEFT cell = padding-LEFT, RIGHT cell =
+   padding-RIGHT — inward, never outward). The HAIR|EYE COLOR pairing
+   stays untouched (last row). */
+.fable-id-card-cell--half-l { padding-left: 92px; }
+.fable-id-card-cell--half-r { padding-right: 92px; }
+/* OUTWARD halves — the last row (HAIR | EYE COLOR) breaks the inward pull
+   (2026-08-15 Chloe: "remove eye color and hair from the alignment — hair
+   under age, eye color under body"): padding on the INNER edge pushes the
+   centered content OUT to the outer thirds' centers, mirroring the trio
+   row above and opening the middle. Only emitted when the trio exists. */
+.fable-id-card-cell--half-out-l { padding-right: 100px; }
+.fable-id-card-cell--half-out-r { padding-left: 100px; }
+.fable-id-card-core dt { color: var(--fable-text-faint); font-size: 0.95rem; text-transform: uppercase; letter-spacing: 0.06em; }
+.fable-id-card-core dd { margin: 0; color: var(--fable-text); font-size: 1.25rem; text-transform: uppercase; line-height: 1.25; overflow-wrap: anywhere; }
+
+/* The HAIR cell — stacked Color/Length/Style sub-lines under the one HAIR
+   label (2026-08-15 Chloe: "different colored and smaller text"). Each line:
+   the sub-label (with its colon) in brass, the answer in the same white as
+   the main values — 2026-08-15 follow-up: labels NOT italicized. */
+.fable-id-card-cell--hair { gap: 5px; }
+.fable-id-card-cell--hair dd {
+    display: flex;
+    flex-direction: column;
+    align-items: center;           /* each sub-line centers under the HAIR label */
+    gap: 3px;
+    font-size: 1.05rem;
+}
+.fable-id-card-hair-line {
+    display: block;
+    color: var(--fable-text);      /* the answers stay white (parchment ivory) */
+    line-height: 1.25;
+    text-transform: uppercase;
+    letter-spacing: 0.03em;
+}
+.fable-id-card-hair-line i {
+    font-style: normal;            /* no italics on Color/Length/Style */
+    color: var(--fable-brass-bright);
+    margin-right: 7px;
+}
+
+/* World/Scenario: the TYPE banner is the headrow header; a 1-col core (the
+   setting/purpose values are prose-y, so a single full-width column reads
+   cleaner than the multi-col player grid). */
+.fable-id-card--world .fable-player-review-body { align-items: center; text-align: center; }
+.fable-id-card--world .fable-id-card-core { grid-template-columns: 1fr; gap: 20px; }
+.fable-id-card--world .fable-id-card-core .fable-id-card-cell { grid-column: 1 / -1; align-items: center; }
+
 /* NPC: a subtle brass corner chip (so an NPC reads distinct from a player,
    but otherwise shares the player layout). Sits at the top of the body. */
 .fable-id-card-tag {
     align-self: flex-start;
-    margin: 0 0 14px;
+    margin: 0 0 6px;
     padding: 3px 12px;
     border: 1px solid rgba(197, 179, 88, 0.4);
     border-radius: 999px;
@@ -1577,15 +1678,12 @@
     text-transform: uppercase;
 }
 
-/* The brass card-icon trigger — small circular brass button at the card's
-   top-right edge. Opens the centered details popup (.fable-id-details-*). */
+/* The brass card-icon trigger — small circular brass button in the corner
+   cluster. Opens the centered details popup (.fable-id-details-*). */
 .fable-id-card-expand {
-    position: absolute;
-    top: 22px;
-    right: 22px;
+    flex: 0 0 auto;
     width: 46px;
     height: 46px;
-    z-index: 2;
     display: flex;
     align-items: center;
     justify-content: center;
@@ -1855,13 +1953,14 @@
 }
 /* The review container sits in the stage; when hidden the attr takes care of
    it. When shown (review mode), the existing .fable-player-wizard.is-review-
-   mode rules + .fable-player-review-card CSS paint it wholesale. Widen the
-   wizard back to 1100px in review mode so the 1060px card fits (matches the
-   slide wizard's review-mode width). */
+   mode rules + .fable-player-review-card CSS paint it wholesale. 2026-08-15
+   Chloe: the frame seats the 1000px card AND the stack is lifted off
+   the bottom edge — vertical-center with an upward bias (was flex-end: the
+   card + CREATE + back hugged the screen's floor). */
 .fable-creator-chat.is-review-mode {
-    max-width: 1100px;
-    padding: 24px 32px 24px;
-    justify-content: flex-end;
+    max-width: 1070px;
+    padding: 24px 32px 8vh;
+    justify-content: center;
 }
 .fable-creator-chat-review { width: 100%; }
 
@@ -1869,16 +1968,14 @@
    Chloe: "remove the edit button completely for the review screens and add
    an edit button (pencil icon) to the right of the show-all-details button
    so it's in the top right corner." Same circular brass language as the
-   card-icon trigger; sits to its RIGHT when both exist, alone in the corner
-   otherwise (—solo). Only the Creator review renders it (opts.editable) —
-   never the picker modals. */
+   card-icon trigger; both ride the .fable-id-card-corner cluster IN-FLOW
+   (2026-08-15 pass 2: absolute positioning pushed/overlapped the centered
+   header — the headrow reserves the corner physically). Only the Creator
+   review renders it (opts.editable) — never the picker modals. */
 .fable-id-card-edit {
-    position: absolute;
-    top: 22px;
-    right: 78px;                    /* beside the 46px details button + 10px gap */
+    flex: 0 0 auto;
     width: 46px;
     height: 46px;
-    z-index: 2;
     display: flex;
     align-items: center;
     justify-content: center;
@@ -1890,15 +1987,14 @@
     cursor: pointer;
     transition: background 160ms ease, box-shadow 160ms ease;
 }
-.fable-id-card-edit--solo { right: 22px; }
 .fable-id-card-edit svg { width: 22px; height: 22px; display: block; }
 .fable-id-card-edit:hover {
     background: rgba(197, 179, 88, 0.22);
     box-shadow: 0 0 16px rgba(230, 213, 138, 0.45);
 }
-/* The codex review grid anchors its solo pencil (the generic card needs a
-   positioning context — the ID cards are already position:relative). */
-.fable-codex-review-card { position: relative; }
+/* The codex review grid opens with the same headrow the ID cards use (the
+   pencil rides its corner cluster in-flow — no absolute anchor needed). */
+.fable-codex-review-card .fable-id-card-headrow { margin-bottom: 4px; }
 
 /* A failure surfaced ON the review card (CREATE rejections etc. — the prompt
    block is hidden in review mode, so this is the only visible surface). */
@@ -2024,7 +2120,13 @@
    On ENTER the popup disappears + this takes over: the whole screen blurs
    under a dark veil while the SAME bronze loading ring the chat's typing
    indicator uses spins dead-center. ESC while it spins cuts generation off
-   (creator_assistant_stop → the veil lifts, review restored untouched). */
+   (creator_assistant_stop → the veil lifts, review restored untouched).
+   2026-08-15 fix (Chloe: "the loading circle keeps drifting toward the top
+   left then teleports back"): the ring is a FLEX-CENTERED child (no
+   top/left:50%), so it must NOT reuse creatorTypingSpin — that keyframe's
+   translate(-50%, -50%) (correct for the ::after typing dot) made the ring
+   drift up-left across each cycle + snap back on loop restart. It gets its
+   own pure-rotate keyframes now. */
 .fable-creator-genring {
     position: absolute;
     inset: 0;
@@ -2041,7 +2143,7 @@
     height: 64px;
     border-radius: 50%;
     /* The same metallic bronze sweep as the prompt block's typing ring —
-       identical gradient + keyframes, scaled up for the full-screen read. */
+       identical gradient, scaled up for the full-screen read. */
     background: conic-gradient(from 0deg,
         rgba(122, 94, 44, 0) 0deg,
         #7a5e2c 80deg,
@@ -2053,7 +2155,10 @@
     -webkit-mask: radial-gradient(farthest-side, transparent calc(100% - 6px), #000 calc(100% - 5px));
     mask: radial-gradient(farthest-side, transparent calc(100% - 6px), #000 calc(100% - 5px));
     filter: drop-shadow(0 0 10px var(--fable-brass-glow));
-    animation: creatorTypingSpin 1.1s linear infinite;
+    animation: creatorRingSpin 1.1s linear infinite;
+}
+@keyframes creatorRingSpin {
+    to { transform: rotate(360deg); }
 }
 
 /* Cinematic launch fade (launchGame): the current screen fades to opacity 0 so
@@ -2191,9 +2296,9 @@
 .fable-player-modal {
     position: relative;
     z-index: 2;
-    /* Tight modal: hugs the ~1007px card (5% smaller) with trimmed padding (was
-       28px → 16px) so there's no excess empty side/top space. Cap by viewport. */
-    width: min(1040px, 94vw);
+    /* Tight modal: hugs the 1000px review card with trimmed padding so there's
+       no excess empty side/top space. Cap by viewport. */
+    width: min(1070px, 94vw);
     max-height: 90vh;
     overflow-y: auto;
     padding: 16px 16px 22px;      /* trimmed: top/sides 16 (was 28), bottom a touch more for the action row */
@@ -2213,10 +2318,11 @@
 }
 /* The review card inside the modal drops its own outer chrome (the modal already
    provides the panel + shadow) so it reads as the card content, not a nested box.
-   2026-08-05: 5% smaller in the modal (Chloe) — 1060 → 1007px — + no padding so
-   the tight modal hugs it. */
+   2026-08-15: seats the 1000px card. */
 .fable-player-modal .fable-player-review-card {
-    width: 1007px;
+    width: 100%;
+    max-width: 1000px;
+    margin: 0 auto;
     padding: 0;                   /* the modal's own padding frames the card now */
     background: transparent;
     border: none;

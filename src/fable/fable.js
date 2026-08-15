@@ -90,6 +90,13 @@ let flowState = {
   pendingImport: null,    // a SillyTavern import { charData, portraitDataUrl?, portraitExt? } seeded by the IMPORT tile → the Player Wizard
   pendingSimIntro: null,  // imported first_mes + alternate_greetings carried into the SIM card's <intro> (set by the IMPORT tile)
 };
+// The blank flowState every full reset stamps (exitFlowToTitle + closeFable).
+// A surviving state would resume a stale step on the next flow entry — worse,
+// a surviving pendingSimIntro can seed a fresh session's SIM card with an
+// old import's greeting.
+function freshFlowState() {
+  return { step: null, slideOneHasBack: false, selectedCardId: null, selectedPlayerId: null, playerDraft: null, simDraft: null, pendingImport: null, pendingSimIntro: null };
+}
 
 // Start/stop the persistent New Game / Load flow ambiance (deep void +
 // hearth glow + rising embers on the #fable root). Called at flow entry
@@ -375,6 +382,12 @@ async function resumeSave(cardId, saveId, opts = {}) {
   } catch (err) {
     console.error('[fable] fable_start (resume) failed — entering stage without engine', err);
     engineStarted = false;
+    // (P2 fix) Direct-launch contract: "any failure falls back to the title
+    // so a broken shortcut never strands the window". Swallowing the error
+    // here booted a dead, engine-less stage (stale .lnk, deleted card) —
+    // rethrow under the splash so the DIRECT_LAUNCH catch routes to
+    // revealTitleAfterSplash instead.
+    if (opts && opts.underSplash) throw err;
   }
 
   enterStageViaTransition(openingScene, loadMessages, opts);
@@ -712,7 +725,7 @@ function exitFlowToTitle() {
     // exiting the flow (the chrome overlay persists; both buttons go dark).
     flowChrome.hideHome();
   }
-  flowState = { step: null, slideOneHasBack: false, selectedCardId: null, selectedPlayerId: null, playerDraft: null, simDraft: null, pendingImport: null, pendingSimIntro: null };
+  flowState = freshFlowState();
   showScreen('title');
 }
 
@@ -915,7 +928,8 @@ async function flowImportPlayer(selectedBtn) {
         onCreated: ({ playerId, draft }) => {
           flowState.selectedPlayerId = playerId;
           flowState.playerDraft = draft;
-          flowSimPair();
+          // keepStaleIntro: the import's greetings ride into the SIM card.
+          flowSimPair(true);
         },
         back: () => returnToPlayerPair(),
       });
@@ -971,6 +985,10 @@ function flowEditPlayer(player) {
 // transient starting conditions are seeded at launch.)
 function advanceAfterPlayer(playerId) {
   flowState.selectedPlayerId = playerId;
+  // (P2 fix) Clear any CREATEd player's draft: after CREATE → back → LOAD,
+  // the stale draft made the LOADED player inherit the CREATED one's
+  // wealth/reputation via buildStartingConditions.
+  flowState.playerDraft = null;
   flowSimPair();
 }
 
@@ -1030,7 +1048,12 @@ function spawnFlowTiles() {
 }
 
 // --- SIM pair: NEW SIM CARD / LOAD SIM CARD / IMPORT ---------------------
-function flowSimPair() {
+// `keepStaleIntro` is passed ONLY by the player-IMPORT path — its
+// pendingSimIntro (the imported first_mes/greetings) must survive into
+// flowCreateSim's fallback. Every non-import entry clears it so a stale
+// import greeting can never seed a fresh SIM card.
+function flowSimPair(keepStaleIntro = false) {
+  if (!keepStaleIntro) flowState.pendingSimIntro = null;
   buildFlowPairTiles({
     pair: [
       { caption: 'NEW SIM CARD', act: 'new-sim', onClick: (b) => burnPairTile(b, () => flowCreateSim()) },
@@ -1543,8 +1566,12 @@ function openFable() {
         // API gate: fable_start refuses without a connected API. Falling back
         // to the title (instead of a dead stage) lets the player connect via
         // the ONLINE button + retry — a persisted API connection carries over.
+        // (P2 fix) Check BOTH flags: apiReady alone stays true after an
+        // api_disconnect (the profile persists), which booted a dead stage
+        // on a stale .lnk. Every other gate (title, stage, Rust's
+        // require_api_for_fable) requires source === 'api'.
         const src = await invoke('model_source_get').catch(() => null);
-        if (!src || !src.apiReady) { revealTitleAfterSplash(); return; }
+        if (!src || src.source !== 'api' || !src.apiReady) { revealTitleAfterSplash(); return; }
         // underSplash: resumeSave → enterStageViaTransition delays the stage
         // to the 2s splash window + runs the shared entry wipe (the reveal is
         // identical to the fable.exe title path).
@@ -1795,6 +1822,17 @@ function closeFable() {
     // New Game tracks: immediate teardown (no fade — the app is closing, no
     // point in a 1.5s fade-out after the window is gone).
     stopNewGameMusic(fableRoot, { immediate: true });
+    // Reset the New Game flow machine + chrome (mirrors exitFlowToTitle):
+    // closeFable can fire mid-flow, and a surviving flowState would resume a
+    // stale step on reopen — worse, a surviving pendingSimIntro could seed
+    // the NEXT session's fresh SIM card with this session's old import
+    // greeting.
+    stopFlowAmbiance();
+    if (flowChrome) {
+      flowChrome.hideBack();
+      flowChrome.hideHome();
+    }
+    flowState = freshFlowState();
   } catch (err) {
     console.error('[fable] teardown threw, continuing with OS restore', err);
   } finally {

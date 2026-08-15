@@ -56,6 +56,19 @@ export function mergeDraft(dst, src) {
   return dst;
 }
 
+// toText: coerce ANY GLM draft value to a clean string (the same discipline as
+// card-serialize.js::text — arrays join, numbers stringify, booleans/objects/
+// null collapse to ''). Kept local so this DOM-free module has zero imports.
+// Every value pulled out of a draft flows through this — GLM emits numbers,
+// arrays, and nulls where the schema says string, and a raw (v || '').trim()
+// on those throws.
+function toText(v) {
+  if (v == null || typeof v === 'boolean') return '';
+  if (Array.isArray(v)) return v.map(toText).filter(Boolean).join(', ');
+  if (typeof v === 'object') return '';
+  return String(v).trim();
+}
+
 // --- Review-section model -------------------------------------------------
 
 // Build the review card's [title, [[label, value], ...]] section list for a
@@ -63,15 +76,7 @@ export function mergeDraft(dst, src) {
 // empty sections are filtered out. `row` returns null for absent values so the
 // filter chain drops them.
 export function buildReviewSections(kind, d) {
-  const row = (label, v) => {
-    if (v == null) return null;
-    if (Array.isArray(v)) {
-      if (!v.length) return null;
-      v = v.join(', ');
-    }
-    const s = String(v).trim();
-    return s ? [label, s] : null;
-  };
+  const row = (label, v) => toText(v) ? [label, toText(v)] : null;
   if (kind === 'player') {
     const customRows = d.custom_tags && typeof d.custom_tags === 'object' && !Array.isArray(d.custom_tags)
       ? Object.entries(d.custom_tags)
@@ -94,7 +99,7 @@ export function buildReviewSections(kind, d) {
     ].filter(([, rows]) => rows.length);
   }
   if (kind === 'sim') {
-    const subtype = (d.card_type || '').trim();
+    const subtype = toText(d.card_type).trim();
     const customRows = d.custom_tags && typeof d.custom_tags === 'object' && !Array.isArray(d.custom_tags)
       ? Object.entries(d.custom_tags).map(([k, v]) => row(String(k), v)).filter(Boolean)
       : [];
@@ -129,7 +134,7 @@ export function buildReviewSections(kind, d) {
     if (customRows.length) sections.push(['Custom tags', customRows]);
     // The intro the SIM Wizard gathered (its mandatory question — 2026-08-15
     // the intro is the wizard's job, not a post-card step). Absent → dropped.
-    if ((d.intro || '').trim()) sections.push(['Intro', [['Text', String(d.intro).trim()]]]);
+    if (toText(d.intro)) sections.push(['Intro', [['Text', toText(d.intro)]]]);
     return sections.filter(([, rows]) => rows.length);
   }
   if (kind === 'codex') {
@@ -142,26 +147,31 @@ export function buildReviewSections(kind, d) {
   return [];
 }
 
-// --- ID-card model (compact core + bronze-arrow extra disclosure) ----------
+// --- ID-card model (NAME header + license grid + card-icon disclosure) -----
 
-// The ID card splits a draft into a COMPACT always-visible "core" face (a flat
-// label/value grid, NO section headers — a real-life state-license look) and an
-// "extra" disclosure of every remaining tag, revealed by the bronze arrow
-// (§6C/§6D, 2026-08-13). Player/NPC share the player layout (8 core fields);
-// world/scenario get a TYPE banner + a 4-field core. codex is NOT an ID
-// card → returns null (it keeps the generic review-section rendering, so
-// buildReviewSections + its tests stay intact).
+// The ID card splits a draft into a HEADER (the player/NPC NAME in caps, or
+// the WORLD/SCENARIO CARD type banner — centered over the information space
+// with a gold rule fitted to the text width), a COMPACT license grid ("core"),
+// and an "extra" disclosure of every remaining tag held in an inert
+// <template> + revealed by the corner card-icon button.
+//
+// Core layout (player/NPC, 2026-08-15 Chloe):
+//   RACE | GENDER
+//   AGE  | SKIN | BODY      ← 3 narrow cells when all three exist (Body sits
+//                             alongside Skin; old cards missing one fall back
+//                             to tidy half-width cells)
+//   HEIGHT | WEIGHT
+//   HAIR (stacked Color/Length/Style sub-lines) | EYE COLOR
+// World/Scenario keep a 1-column core (Name/Setting/Purpose/Tone) under the
+// TYPE banner. codex is NOT an ID card → returns null (it keeps the generic
+// review-section rendering, so buildReviewSections + its tests stay intact).
+//
+// Core cells: { label, value } | { label, value, third:true } |
+// { label, sub:[[sublabel, value], ...] } (the HAIR stack). Values are RAW
+// (escaping is the renderer's job).
 
-// idRow mirrors buildReviewSections' `row`: arrays join to a comma string;
-// null/undefined/empty/blank → null so the caller's filter chain drops them.
-// Values are RAW (escaping is the renderer's job).
 function idRow(label, v) {
-  if (v == null) return null;
-  if (Array.isArray(v)) {
-    if (!v.length) return null;
-    v = v.join(', ');
-  }
-  const s = String(v).trim();
+  const s = toText(v);
   return s ? [label, s] : null;
 }
 
@@ -171,17 +181,35 @@ function customTagRows(d) {
     : [];
 }
 
-// Returns { variant, banner, tag, core, extra } or null for non-ID kinds.
+// A plain core cell (dropped when the value is empty).
+function idCell(label, v, third) {
+  const s = toText(v);
+  return s ? { label, value: s, ...(third ? { third: true } : {}) } : null;
+}
+
+// The HAIR cell: label "Hair" + stacked Color/Length/Style sub-lines (smaller,
+// differently colored in the renderer). Null when no hair trait exists.
+function hairCell(d) {
+  const sub = [
+    idRow('Color', d.hair_color),
+    idRow('Length', d.hair_length),
+    idRow('Style', d.hair_style),
+  ].filter(Boolean);
+  return sub.length ? { label: 'Hair', sub } : null;
+}
+
+// Returns { variant, title, banner, tag, core, extra } or null for non-ID kinds.
 //   variant: 'player' | 'world'
+//   title:   the NAME header (player/NPC only — uppercase is a renderer concern)
 //   banner:  'WORLD CARD' | 'SCENARIO CARD' | null  (world/scenario only)
 //   tag:     'NPC CARD' | null                        (npc only — subtle corner tag)
-//   core:    [[label, value], ...]   always-visible compact grid (no headers)
-//   extra:   [[title, [[label, value], ...]], ...]   revealed by the bronze arrow
+//   core:    cell objects (above) in render order
+//   extra:   [[title, [[label, value], ...]], ...]   revealed by the card-icon
 export function buildIdCard(kind, d) {
   const draft = d || {};
   if (kind === 'player') return playerIdCard(draft, false);
   if (kind === 'sim') {
-    const subtype = (draft.card_type || '').trim().toLowerCase();
+    const subtype = toText(draft.card_type).toLowerCase();
     if (subtype === 'npc') return playerIdCard(draft, true);
     if (subtype === 'scenario') return worldIdCard(draft, 'SCENARIO CARD');
     return worldIdCard(draft, 'WORLD CARD'); // world, pre-router, or unknown
@@ -189,25 +217,29 @@ export function buildIdCard(kind, d) {
   return null; // codex is not an ID card
 }
 
-// Player + NPC share the 8-field core. The only difference is the subtle
-// 'NPC CARD' corner tag (isNpc). Extra groups surface EVERY remaining tag,
-// filter-emptied: Hair length/style, Physique, Distinctive features, Clothing,
-// Accessories (legacy), Inventory, Persona, Background, transient Starting
-// conditions, and Custom tags.
+// Player + NPC share the license face. The only difference is the subtle
+// 'NPC CARD' corner tag (isNpc). Hair length/style + body/skin live ON the
+// face now (the HAIR stack + the AGE/SKIN/BODY row), so the extra disclosure
+// carries only the remaining groups: Distinctive, Clothing, Accessories,
+// Inventory, Persona, Background, transient Starting conditions, Custom tags,
+// and (NPC) the intro.
 function playerIdCard(d, isNpc) {
+  const title = toText(d.name);
+  // The AGE|SKIN|BODY row packs three narrow cells when complete; a card
+  // missing any of the three degrades to half-width cells (no ragged gap).
+  const thirds = !!(toText(d.age) && toText(d.skin_complexion) && toText(d.body_type));
   const core = [
-    idRow('Name', d.name),
-    idRow('Gender', d.gender),
-    idRow('Race', d.race),
-    idRow('Age', d.age),
-    idRow('Hair Color', d.hair_color),
-    idRow('Eye Color', d.eye_color),
-    idRow('Height', d.height),
-    idRow('Weight', d.weight),
+    idCell('Race', d.race),
+    idCell('Gender', d.gender),
+    idCell('Age', d.age, thirds),
+    idCell('Skin', d.skin_complexion, thirds),
+    idCell('Body', d.body_type, thirds),
+    idCell('Height', d.height),
+    idCell('Weight', d.weight),
+    hairCell(d),
+    idCell('Eye Color', d.eye_color),
   ].filter(Boolean);
   const extra = [
-    ['Hair', [idRow('Length', d.hair_length), idRow('Style', d.hair_style)].filter(Boolean)],
-    ['Physique', [idRow('Body', d.body_type), idRow('Skin', d.skin_complexion)].filter(Boolean)],
     ['Distinctive', [idRow('Breast', d.breast_size), idRow('Ears', d.ears), idRow('Tail', d.tail), idRow('Horn', d.horn)].filter(Boolean)],
     ['Clothing', [idRow('Outfit', d.clothing)].filter(Boolean)],
     ['Accessories', [idRow('Items', d.accessories)].filter(Boolean)],
@@ -221,29 +253,30 @@ function playerIdCard(d, isNpc) {
     ['Custom tags', customTagRows(d)],
     // The intro the SIM Wizard gathered for an NPC card (mandatory question —
     // 2026-08-15). Player cards never carry one → dropped.
-    ...((d.intro || '').trim() ? [['Intro', [['Text', String(d.intro).trim()]]]] : []),
+    ...(toText(d.intro) ? [['Intro', [['Text', toText(d.intro)]]]] : []),
   ].filter(([, rows]) => rows.length);
-  return { variant: 'player', banner: null, tag: isNpc ? 'NPC CARD' : null, core, extra };
+  return { variant: 'player', title, banner: null, tag: isNpc ? 'NPC CARD' : null, core, extra };
 }
 
-// World + Scenario share a banner + a 4-field core (Name/Setting/Purpose/Tone).
-// directive is shown as "Purpose". Scenario-specific fields, world anchors,
-// locations, cast, custom tags, and the intro all live in the disclosure.
+// World + Scenario share a TYPE banner header + a 1-column core
+// (Name/Setting/Purpose/Tone). directive is shown as "Purpose".
+// Scenario-specific fields, world anchors, locations, cast, custom tags, and
+// the intro all live in the disclosure.
 function worldIdCard(d, banner) {
   const core = [
-    idRow('Name', d.name),
-    idRow('Setting', d.setting),
-    idRow('Purpose', d.directive),   // directive shown as "Purpose"
-    idRow('Tone', d.tone),
+    idCell('Name', d.name),
+    idCell('Setting', d.setting),
+    idCell('Purpose', d.directive),   // directive shown as "Purpose"
+    idCell('Tone', d.tone),
   ].filter(Boolean);
   const locSrc = Array.isArray(d.locations) && d.locations.length
     ? d.locations
     : (d.location ? [{ name: d.location }] : []);
   const locRows = locSrc
-    .map((l) => idRow(l.name || l.id, Array.isArray(l.neighbors) ? l.neighbors.join(', ') : ''))
+    .map((l) => idRow(toText(l && (l.name || l.id)) || 'Location', Array.isArray(l && l.neighbors) ? l.neighbors : ''))
     .filter(Boolean);
   const castRows = (Array.isArray(d.cast) ? d.cast : [])
-    .map((c) => idRow(c.name || c.id, c.identity || c.role))
+    .map((c) => idRow(toText(c && (c.name || c.id)), c && (c.identity || c.role)))
     .filter(Boolean);
   const extra = [
     ['World anchors', [idRow('Date', d.date), idRow('Time', d.time || d.start_time), idRow('Weather', d.weather || d.start_weather), idRow('Location', d.location)].filter(Boolean)],
@@ -255,8 +288,94 @@ function worldIdCard(d, banner) {
   if (castRows.length) extra.push(['Cast', castRows]);
   extra.push(['Custom tags', customTagRows(d)]);
   // The intro the SIM Wizard gathered (mandatory question). Absent → dropped.
-  if ((d.intro || '').trim()) extra.push(['Intro', [['Text', String(d.intro).trim()]]]);
-  return { variant: 'world', banner, tag: null, core, extra: extra.filter(([, rows]) => rows.length) };
+  if (toText(d.intro)) extra.push(['Intro', [['Text', toText(d.intro)]]]);
+  return { variant: 'world', title: null, banner, tag: null, core, extra: extra.filter(([, rows]) => rows.length) };
+}
+
+// --- Mandatory-field gate (2026-08-15 Chloe) --------------------------------
+//
+// A `ready` draft missing ANY mandatory field must NEVER reach the review
+// screen — the review card is the human-in-the-loop contract that the card is
+// complete. The lists mirror build_creator_assistant_system_prompt's schema
+// exactly (player CORE FIELDS, sim per-branch mandatory sets, codex entries);
+// body_type was promoted to mandatory 2026-08-15 after a player card was
+// created with "body_type": null.
+
+export const MANDATORY_LABELS = {
+  name: 'name', gender: 'gender', age: 'age', race: 'race',
+  skin_complexion: 'skin', height: 'height', weight: 'weight',
+  body_type: 'body (build)', hair_color: 'hair color',
+  hair_length: 'hair length', hair_style: 'hair style', eye_color: 'eye color',
+  clothing: 'clothing',
+  card_type: 'card type', directive: 'directive', setting: 'setting', tone: 'tone',
+  trigger_condition: 'trigger', primary_objective: 'objective',
+  participating_actors: 'actors',
+  personality: 'personality', flaws: 'flaws', job: 'job/occupation',
+  backstory: 'backstory', dialogue_style: 'dialogue style',
+  date: 'date anchor', time: 'time anchor', weather: 'weather anchor',
+  location: 'location anchor', intro_answer: 'the intro question',
+  entries: 'at least one lore entry (title + body)',
+};
+
+// The player identity set shared by the Player Wizard + the SIM npc branch.
+const MANDATORY_IDENTITY = [
+  'name', 'gender', 'age', 'race', 'skin_complexion', 'height', 'weight',
+  'body_type', 'hair_color', 'hair_length', 'hair_style', 'eye_color',
+  'clothing',
+];
+const SIM_ANCHORS = ['date', 'time', 'weather', 'location'];
+
+function mandatoryKeys(kind, d) {
+  if (kind === 'player') return MANDATORY_IDENTITY;
+  if (kind === 'sim') {
+    const subtype = toText(d && d.card_type).toLowerCase();
+    if (subtype === 'npc') {
+      return [
+        ...MANDATORY_IDENTITY,
+        'personality', 'flaws', 'job', 'backstory', 'dialogue_style', 'tone',
+        ...SIM_ANCHORS,
+      ];
+    }
+    if (subtype === 'scenario') {
+      return [
+        'card_type', 'name', 'directive', 'trigger_condition',
+        'primary_objective', 'participating_actors', 'tone', ...SIM_ANCHORS,
+      ];
+    }
+    // world, pre-router, or unknown — the router itself must complete first.
+    return ['card_type', 'name', 'directive', 'setting', 'tone', ...SIM_ANCHORS];
+  }
+  return []; // codex's only mandatory is the entries array (checked below)
+}
+
+// A mandatory value counts as filled when it coerces to content: non-empty
+// arrays, non-blank strings, numbers (GLM emits "age": 24). Booleans, null,
+// objects, blanks, and empty arrays do NOT count.
+function mandatoryFilled(v) {
+  if (Array.isArray(v)) return v.length > 0;
+  if (v === null || v === undefined || v === '' || typeof v === 'boolean') return false;
+  if (typeof v === 'object') return false;
+  return String(v).trim() !== '';
+}
+
+// Returns the list of MISSING mandatory field keys for kind/draft ([] = the
+// draft may finalize). The sim intro is special: an ABSENCE is incomplete —
+// the wizard must have an explicit answer (agreed text or a confirmed "no",
+// marked intro_answered:false). Codex requires ≥1 entry with a body.
+export function missingMandatoryFields(kind, d) {
+  const draft = d || {};
+  const missing = mandatoryKeys(kind, draft).filter((k) => !mandatoryFilled(draft[k]));
+  if (kind === 'sim' && missing.length === 0) {
+    // The mandatory INTRO question: either a non-empty intro or an explicit
+    // no-intro marker (intro_answered === false, set when the player declines).
+    if (!toText(draft.intro) && draft.intro_answered !== false) missing.push('intro_answer');
+  }
+  if (kind === 'codex') {
+    const entries = Array.isArray(draft.entries) ? draft.entries : [];
+    const ok = entries.some((e) => e && toText(e.body));
+    if (!ok) missing.push('entries');
+  }
+  return missing;
 }
 
 // --- SillyTavern import primitives (pure) ---------------------------------
@@ -268,20 +387,24 @@ function decodeLatin1(bytes) {
 }
 
 // PNG = 8-byte signature + (length:u32be, type:4, data, crc:u32be) chunks.
-// Walk until a tEXt/iTXt chunk keyed `chara` (SillyTavern's convention); return
-// its base64 value, or null if not found / not a PNG.
-export function findCharaChunk(u8) {
+// Walk the tEXt/iTXt chunks keyed `chara` (SillyTavern's V2 convention) or
+// `ccv3` (the V3 convention — some V3 cards carry ONLY ccv3). Returns the
+// candidates in file order: {keyword, text} for values decodable in place,
+// {keyword, compressed} for iTXt with the compression flag set (a zlib
+// stream — needs async inflation, see readCharaChunk). Pure.
+function walkCharaCandidates(u8) {
   const SIG = [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
-  if (u8.length < 8) return null;
-  for (let i = 0; i < 8; i++) if (u8[i] !== SIG[i]) return null;
+  if (u8.length < 8) return [];
+  for (let i = 0; i < 8; i++) if (u8[i] !== SIG[i]) return [];
   let off = 8;
   const dv = new DataView(u8.buffer, u8.byteOffset, u8.byteLength);
+  const out = [];
   while (off + 8 <= u8.length) {
     const len = dv.getUint32(off);
     const type = decodeLatin1(u8.subarray(off + 4, off + 8));
     const dataStart = off + 8;
     const dataEnd = dataStart + len;
-    if (dataEnd > u8.length) return null; // truncated
+    if (dataEnd > u8.length) return out; // truncated
     if (type === 'tEXt' || type === 'iTXt') {
       const chunk = u8.subarray(dataStart, dataEnd);
       let nul = -1;
@@ -290,26 +413,70 @@ export function findCharaChunk(u8) {
       }
       if (nul > 0) {
         const keyword = decodeLatin1(chunk.subarray(0, nul));
-        if (keyword === 'chara') {
-          let value;
+        if (keyword === 'chara' || keyword === 'ccv3') {
           if (type === 'tEXt') {
-            value = decodeLatin1(chunk.subarray(nul + 1));
+            out.push({ keyword, text: decodeLatin1(chunk.subarray(nul + 1)) });
           } else {
-            // iTXt: flag(1)+method(1)+langTag\0+translatedKey\0+text(utf-8).
-            let p = nul + 1 + 1 + 1;
+            // iTXt: keyword\0 compressionFlag(1) compressionMethod(1)
+            // langTag\0 translatedKey\0 text(utf-8).
+            const compressed = chunk[nul + 1] === 1;
+            let p = nul + 3;
             while (p < chunk.length && chunk[p] !== 0) p++;
             p++;
             while (p < chunk.length && chunk[p] !== 0) p++;
             p++;
-            value = new TextDecoder('utf-8').decode(chunk.subarray(p));
+            const payload = chunk.subarray(p);
+            if (compressed) out.push({ keyword, compressed: payload });
+            else out.push({ keyword, text: new TextDecoder('utf-8').decode(payload) });
           }
-          return value;
         }
       }
     }
     off = dataEnd + 4; // skip data + crc
   }
-  return null;
+  return out;
+}
+
+// The sync accessor (pure, unit-tested): the first uncompressed `chara`
+// value, else the first uncompressed `ccv3`. Compressed iTXt candidates are
+// skipped — only the async readCharaChunk can inflate them.
+export function findCharaChunk(u8) {
+  const cands = walkCharaCandidates(u8);
+  const pick = (kw) => cands.find((c) => c.keyword === kw && c.text != null);
+  const hit = pick('chara') || pick('ccv3');
+  return hit ? hit.text : null;
+}
+
+// Inflate a zlib stream (PNG iTXt compressionMethod 0 = RFC-1950 zlib).
+// DecompressionStream('deflate') IS the zlib-wrapped flavor ('deflate-raw'
+// is raw). Shipped by WebView2 + Node ≥18 alike.
+async function inflateZlib(bytes) {
+  if (typeof DecompressionStream === 'undefined') {
+    throw new Error('this PNG stores its character data compressed, which this runtime cannot inflate');
+  }
+  const stream = new Blob([bytes]).stream().pipeThrough(new DecompressionStream('deflate'));
+  const buf = await new Response(stream).arrayBuffer();
+  return new Uint8Array(buf);
+}
+
+// The full import path (async): `chara` first, then `ccv3`; inflates
+// compressed iTXt payloads; a candidate that fails to inflate falls through
+// to the next one rather than aborting the import. Returns null when no
+// usable candidate exists.
+export async function readCharaChunk(u8) {
+  const cands = walkCharaCandidates(u8);
+  const tryKeys = async (kw) => {
+    for (const c of cands) {
+      if (c.keyword !== kw) continue;
+      try {
+        return c.text != null ? c.text : new TextDecoder('utf-8').decode(await inflateZlib(c.compressed));
+      } catch (_) { /* fall through to the next candidate */ }
+    }
+    return null;
+  };
+  const chara = await tryKeys('chara');
+  if (chara != null) return chara;
+  return tryKeys('ccv3');
 }
 
 export function base64ToUtf8(b64) {

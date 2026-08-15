@@ -852,12 +852,21 @@ fn parse_belt(rest: &str) -> Option<BracketCommand> {
     let kvs = tokenize_kv(body);
     let mut name = String::new();
     let mut qty: u32 = 1;
+    let mut qty_zero_remove = false;
     let mut stats = String::new();
     let mut tags_str = String::new();
     for (k, v) in kvs {
         match k.as_str() {
             "name" | "item" => name = v,
-            "qty" | "count" | "n" => qty = v.parse::<u32>().unwrap_or(1).max(1),
+            "qty" | "count" | "n" => {
+                // An explicit 0 means REMOVE (the documented contract — the
+                // old .max(1) coerced it to an add-1, a dead applier branch).
+                qty = v.parse::<u32>().unwrap_or(1);
+                if qty == 0 {
+                    qty_zero_remove = true;
+                    qty = 1;
+                }
+            }
             "stats" | "stat" => stats = v,
             "tags" | "tag" => tags_str = v,
             _ => {}
@@ -889,7 +898,7 @@ fn parse_belt(rest: &str) -> Option<BracketCommand> {
         item_name: n.to_string(),
         qty,
         item_stats,
-        remove: false,
+        remove: qty_zero_remove,
         item_tags: equipment::parse_tag_list(&tags_str),
     })
 }
@@ -924,14 +933,34 @@ fn parse_pack(rest: &str) -> Option<BracketCommand> {
     let kvs = tokenize_kv(body);
     let mut name = String::new();
     let mut qty: u32 = 1;
+    let mut qty_zero_remove = false;
     let mut weight: f32 = 1.0;
     let mut stats = String::new();
     let mut tags_str = String::new();
     for (k, v) in kvs {
         match k.as_str() {
             "name" | "item" => name = v,
-            "qty" | "count" | "n" => qty = v.parse::<u32>().unwrap_or(1).max(1),
-            "weight" | "lbs" | "w" => weight = v.parse::<f32>().unwrap_or(1.0).max(0.0),
+            "qty" | "count" | "n" => {
+                // Explicit 0 = remove (documented; the old .max(1) made it a
+                // dead branch that added 1 instead).
+                qty = v.parse::<u32>().unwrap_or(1);
+                if qty == 0 {
+                    qty_zero_remove = true;
+                    qty = 1;
+                }
+            }
+            "weight" | "lbs" | "w" => {
+                // Finite clamp (P1 save-bricking fix): "inf"/"1e40" parse to
+                // infinity — .max(0.0) clamps the floor, not the ceiling, and
+                // an inf f32 serializes as null + fails every later load of
+                // the card's saves.
+                weight = v
+                    .parse::<f32>()
+                    .ok()
+                    .filter(|w| w.is_finite())
+                    .map(|w| w.clamp(0.0, 999.0))
+                    .unwrap_or(1.0);
+            }
             "stats" | "stat" => stats = v,
             "tags" | "tag" => tags_str = v,
             _ => {}
@@ -961,7 +990,7 @@ fn parse_pack(rest: &str) -> Option<BracketCommand> {
         qty,
         weight,
         item_stats,
-        remove: false,
+        remove: qty_zero_remove,
         item_tags: equipment::parse_tag_list(&tags_str),
     })
 }
@@ -1617,7 +1646,7 @@ fn json_to_equip(obj: &serde_json::Map<String, serde_json::Value>) -> Option<Bra
 /// `qty`/`count` (default 1); `stats`/`stat`; `remove` (bool) or a leading `-`
 /// on the name. Same caps + reject as the text form.
 fn json_to_belt(obj: &serde_json::Map<String, serde_json::Value>) -> Option<BracketCommand> {
-    let remove = obj
+    let mut remove = obj
         .get("remove")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
@@ -1629,18 +1658,34 @@ fn json_to_belt(obj: &serde_json::Map<String, serde_json::Value>) -> Option<Brac
         .trim()
         .to_string();
     // Leading `-` on the name also signals remove (parity with the text form).
+    // (P2 fix) The dash must actually SET remove — it was only stripped, so
+    // `{"kind":"belt","name":"-Lockpick"}` ADDED a Lockpick instead of
+    // removing one (the JSON/bracket duals produced opposite state).
     if name.starts_with('-') {
         name = name[1..].trim().to_string();
+        remove = true;
     }
     if name.is_empty() || name.len() > INV_NAME_MAX || has_control_chars(&name) {
         return None;
     }
-    let qty = obj
+    let qty_raw = obj
         .get("qty")
         .or_else(|| obj.get("count"))
-        .and_then(|v| v.as_u64())
-        .map(|n| (n as u32).max(1))
+        .and_then(|v| v.as_u64());
+    let qty = qty_raw
+        .map(|n| {
+            // Saturate instead of wrap (qty 4294967297 used to truncate to 1
+            // via `as u32`); an explicit 0 = remove (text-path parity).
+            if n == 0 {
+                1
+            } else {
+                n.min(u32::MAX as u64) as u32
+            }
+        })
         .unwrap_or(1);
+    if qty_raw == Some(0) {
+        remove = true;
+    }
     let stats_raw = obj
         .get("stats")
         .or_else(|| obj.get("stat"))
@@ -1666,7 +1711,7 @@ fn json_to_belt(obj: &serde_json::Map<String, serde_json::Value>) -> Option<Brac
 /// Parse a `{"kind": "pack", ...}` JSON body. Same shape as `json_to_belt`
 /// plus a `weight`/`lbs` field (default 1.0, clamped ≥0).
 fn json_to_pack(obj: &serde_json::Map<String, serde_json::Value>) -> Option<BracketCommand> {
-    let remove = obj
+    let mut remove = obj
         .get("remove")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
@@ -1677,23 +1722,33 @@ fn json_to_pack(obj: &serde_json::Map<String, serde_json::Value>) -> Option<Brac
         .unwrap_or("")
         .trim()
         .to_string();
+    // (P2 fix) The leading-dash form must SET remove (parity with the text
+    // form + json_to_belt) — it was only stripped, inverting the intent.
     if name.starts_with('-') {
         name = name[1..].trim().to_string();
+        remove = true;
     }
     if name.is_empty() || name.len() > INV_NAME_MAX || has_control_chars(&name) {
         return None;
     }
-    let qty = obj
+    let qty_raw = obj
         .get("qty")
         .or_else(|| obj.get("count"))
-        .and_then(|v| v.as_u64())
-        .map(|n| (n as u32).max(1))
+        .and_then(|v| v.as_u64());
+    let qty = qty_raw
+        .map(|n| if n == 0 { 1 } else { n.min(u32::MAX as u64) as u32 })
         .unwrap_or(1);
+    if qty_raw == Some(0) {
+        remove = true;
+    }
     let weight = obj
         .get("weight")
         .or_else(|| obj.get("lbs"))
         .and_then(|v| v.as_f64())
-        .map(|f| (f as f32).max(0.0))
+        // Finite clamp (P1 save-bricking fix): JSON `1e400` parses to inf —
+        // an inf f32 serializes as null and bricks every later save load.
+        .map(|f| (f as f32).clamp(0.0, 999.0))
+        .filter(|w| w.is_finite())
         .unwrap_or(1.0);
     let stats_raw = obj
         .get("stats")
@@ -2672,6 +2727,17 @@ fn parse_task_no_pipe(rest: &str) -> Option<(BracketCommand, usize)> {
 /// (`fable_send` checks `current - last_fired >= interval`), exactly mirroring
 /// Multihog's design but in Rust and on a typed field.
 pub fn parse_in_world_time(s: &str) -> Option<i64> {
+    // (P3 hardening) Magnitude clamps applied to the RESULT: parsed clock
+    // fragments are model output ("25:99" used to parse verbatim); an absurd
+    // hour could overflow i64 minute arithmetic in release builds. Cap the
+    // total at 4e9 minutes (the calendar-date sentinel parses above 1e9 —
+    // pinned by parse_in_world_time_calendar_date — so the cap must clear it
+    // comfortably while staying far from i64 overflow in downstream sums).
+    let raw = parse_in_world_time_inner(s);
+    raw.map(|m| m.clamp(0, 4_000_000_000))
+}
+
+fn parse_in_world_time_inner(s: &str) -> Option<i64> {
     let s = s.trim();
     if s.is_empty() {
         return None;

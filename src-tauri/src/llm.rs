@@ -141,6 +141,10 @@ impl GenerationClient for EchoBackend {
 /// Gemma4 thought channel. `ParsedOutput.reasoning` + `.raw` are left empty
 /// (the post-generation archiving + schema-delta pipeline keys off `.content`
 /// only, so this is safe).
+/// Cloning is cheap (`reqwest::Client` is an `Arc` pool internally) and is
+/// how the AppState-level cache shares one warm client (connection pool +
+/// TLS session) across turns — see `http_backend_cached` in lib.rs.
+#[derive(Clone)]
 pub struct HttpBackend {
     profile: crate::api::ApiProfile,
     client: reqwest::Client,
@@ -384,7 +388,13 @@ impl GenerationClient for HttpBackend {
             // `data:` (comments, event headers) are ignored.
             use futures_util::StreamExt;
             let mut stream = response.bytes_stream();
-            let mut buffer = String::new();
+            // Byte buffer (P0 fix): a TCP read can split a multi-byte UTF-8
+            // char across chunk boundaries. Decoding each raw chunk lossily
+            // replaced the split char's halves with two U+FFFDs — permanent
+            // corruption in the streamed + stored narration. SSE lines are
+            // framed by ASCII b'\n', so buffering BYTES and decoding each
+            // complete line is always UTF-8-aligned.
+            let mut buffer: Vec<u8> = Vec::new();
             let mut full_content = String::new();
             // §11.43 — streaming repetition kill switch. The API path gets no
             // DRY sampler + no Rust-side sampler chain (providers lock those
@@ -407,10 +417,15 @@ impl GenerationClient for HttpBackend {
             // the deadline is retired: a slow-but-working stream is NEVER
             // killed mid-flight.
             let mut got_first_token = false;
+            let mut stream_done = false;
             let timeout_dur =
                 std::time::Duration::from_millis(crate::settings::API_FIRST_TOKEN_TIMEOUT_MS);
 
             loop {
+                // The server signalled end-of-stream ([DONE]) — stop reading.
+                if stream_done {
+                    break;
+                }
                 // Honor cancel: stop reading + return what we have so far.
                 if cancel.load(std::sync::atomic::Ordering::Relaxed) {
                     break;
@@ -437,19 +452,23 @@ impl GenerationClient for HttpBackend {
                 };
                 let Some(chunk_res) = chunk_res else { break };
                 let bytes = chunk_res.map_err(|e| anyhow::anyhow!("SSE read error: {e}"))?;
-                // The chunk may not be UTF8-aligned at boundaries; lossy-convert
-                // since SSE is ASCII-framed and the JSON payloads are UTF8.
-                buffer.push_str(&String::from_utf8_lossy(&bytes));
+                buffer.extend_from_slice(&bytes);
 
                 // Process complete lines. Keep any trailing partial line in buffer.
-                while let Some(newline_pos) = buffer.find('\n') {
-                    let line = buffer[..newline_pos].trim().to_string();
-                    buffer = buffer[newline_pos + 1..].to_string();
+                while let Some(newline_pos) = buffer.iter().position(|&b| b == b'\n') {
+                    let line = String::from_utf8_lossy(&buffer[..newline_pos]).trim().to_string();
+                    drop(buffer.drain(..=newline_pos));
                     if line.is_empty() || !line.starts_with("data:") {
                         continue;
                     }
                     let data = line["data:".len()..].trim();
                     if data == "[DONE]" {
+                        // (P3 fix) Terminate the OUTER read loop too — the
+                        // old `break` only exited this line-parse while, so
+                        // termination relied on the server closing the
+                        // connection; a provider that keeps it open hung the
+                        // turn until the client timeout.
+                        stream_done = true;
                         buffer.clear();
                         break;
                     }

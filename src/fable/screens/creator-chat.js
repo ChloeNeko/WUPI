@@ -40,6 +40,8 @@ import {
   mergeDraft,
   buildReviewSections,
   buildIdCard,
+  missingMandatoryFields,
+  MANDATORY_LABELS,
 } from '../engine/creator-engine.js';
 import { renderIdCard, wireIdCard, PENCIL_SVG } from './id-card.js';
 
@@ -113,6 +115,15 @@ export function renderCreatorChat(root, config) {
     busy: false,
     done: false,
   };
+  // (P1 fix) Stale-turn firewall: ‹/⌂ stay clickable during a GLM turn, so
+  // exiting mid-generation left the turn running — its `done` handler then
+  // corrupted the NEXT wizard run on this shared screen (hid the prompt
+  // block, popped the OLD draft's review card). Abort the in-flight turn +
+  // stamp an epoch every render; callApi's channel ignores events from any
+  // prior epoch.
+  root._creatorEpoch = (root._creatorEpoch || 0) + 1;
+  const epoch = root._creatorEpoch;
+  invoke('creator_assistant_stop').catch(() => {});
   // Pre-seed the draft's `intro` from an import's captured greetings
   // (first_mes + alternate_greetings). GLM may still override it on a later
   // turn (mergeDraft overwrites with non-empty), but the mechanically-captured
@@ -199,8 +210,10 @@ export function renderCreatorChat(root, config) {
     state.history.push({ role: 'user', content: text });
     // No user-side bubble: the minimal two-block UI surfaces only the AI
     // prompt + the textarea. The user's turn is carried in state.history.
-    // A fresh user send resets the codex validation-retry counter (Gate 1).
+    // A fresh user send resets both validation-retry counters (codex Gate 1 +
+    // the mandatory-field gate).
     state.codexValidationRetries = 0;
+    state.mandatoryRetries = 0;
     trace(`user (${creatorKind}): ${text.slice(0, 140)}`);
     await callApi();
   }
@@ -252,6 +265,8 @@ export function renderCreatorChat(root, config) {
     let acc = '';
     const channel = new Channel();
     channel.onmessage = (msg) => {
+      // Stale-epoch turn (this render was replaced mid-generation) — ignore.
+      if (epoch !== root._creatorEpoch) return;
       if (msg.type === 'chunk') {
         // Atomic reveal: accumulate chunks but do NOT touch the DOM. The
         // typing indicator stays up until `done`, then the new text fades in.
@@ -310,6 +325,41 @@ export function renderCreatorChat(root, config) {
     }
   }
 
+  // --- the mandatory-field gate (2026-08-15 Chloe) ------------------------
+  // A `ready` draft missing ANY mandatory field must NEVER reach the review
+  // screen. The gate runs on the MERGED draft (fields accumulate across turns
+  // + seeds, so only the frontend can judge completeness), pushes GLM's reply
+  // + a corrective alert into history, and auto-retries — the same loop shape
+  // as the codex validation_error path. Capped so a stuck model surfaces the
+  // gap to the user instead of looping.
+  function rejectReady(missing, bubble, editMode) {
+    const MAX_RETRIES = 2;
+    const alert = `SYSTEM ALERT: your ready draft is missing mandatory fields: ${missing.join(', ')}. ` +
+      'Do not emit ready until every mandatory field is filled. Fill the missing fields now ' +
+      'from the conversation — ask the user only for what you cannot infer.';
+    state.history.push({ role: 'user', content: alert });
+    state.mandatoryRetries = (state.mandatoryRetries || 0) + 1;
+    const labels = missing.map((k) => MANDATORY_LABELS[k] || k).join(', ');
+    trace(`ready REJECTED — missing mandatory [${missing.join(', ')}]; retry ${state.mandatoryRetries}/${MAX_RETRIES}`);
+    if (state.mandatoryRetries <= MAX_RETRIES) {
+      if (bubble) {
+        bubble.setTyping(false);
+        bubble.update('⚠ The draft was missing mandatory fields — asking the assistant to fill them…');
+      }
+      // Brief pause so the notice is readable before the retry overwrites it
+      // (the ring persists across the pause in edit mode — beginEditGen
+      // dedupes on the retried callApi).
+      setTimeout(() => callApi({ editMode }), 900);
+    } else {
+      const msg = `⚠ The assistant could not fill the mandatory fields: ${labels}. Tell it the missing details and it will finalize.`;
+      if (editMode) { endEditGen(); showReviewError(msg); }
+      else if (bubble) { bubble.setTyping(false); bubble.update(msg); }
+      setBusy(false);
+      state.mandatoryRetries = 0;
+      trace('mandatory retries exhausted — user intervention needed');
+    }
+  }
+
   function handleDone(text, bubble, editMode = false) {
     state.history.push({ role: 'assistant', content: text });
     const env = parseEnvelope(text);
@@ -330,6 +380,13 @@ export function renderCreatorChat(root, config) {
     if (env.draft && typeof env.draft === 'object') mergeDraft(state.draft, env.draft);
     trace(`envelope action=${env.action || '(none)'} draftKeys=[${Object.keys(env.draft || {}).join(',')}]`);
     if (env.action === 'ready') {
+      // The gate: no incomplete draft ever shows the review card. Runs on the
+      // merged draft (accumulated across turns + seed/import presets).
+      const missing = missingMandatoryFields(creatorKind, state.draft);
+      if (missing.length) {
+        rejectReady(missing, bubble, editMode);
+        return;
+      }
       if (editMode) {
         endEditGen();
         showReview();          // fresh review card from the merged draft
@@ -471,6 +528,7 @@ export function renderCreatorChat(root, config) {
   function requestEdit(text) {
     state.history.push({ role: 'user', content: text });
     state.codexValidationRetries = 0;
+    state.mandatoryRetries = 0;
     trace(`edit (${creatorKind}): ${text.slice(0, 140)}`);
     callApi({ editMode: true });
   }
@@ -560,6 +618,32 @@ export function renderCreatorChat(root, config) {
     btn.textContent = 'Creating...';
     trace(`CREATE: kind=${creatorKind} cardId=${cardId || '-'} portrait=${!!state.portraitBytes}`);
     try {
+      // Final backstop: the ready gate should make this unreachable, but a
+      // seeded/edited draft could still sneak a gap through — never WRITE an
+      // incomplete card. Surfaces on the review card via the catch below.
+      // (P2 fix) SKIPPED for edit runs (seedDraft): a legitimately-saved
+      // legacy player missing optional fields could otherwise never re-save
+      // ("Create failed … fix the concept" with no field editor).
+      const missing = config.seedDraft ? [] : missingMandatoryFields(creatorKind, state.draft);
+      if (missing.length) {
+        const labels = missing.map((k) => MANDATORY_LABELS[k] || k).join(', ');
+        throw new Error(`the draft is missing mandatory fields: ${labels}`);
+      }
+      // (P1 fix) Duplicate-name guard: both write IPCs are silent atomic
+      // OVERWRITES — a CREATE reusing an existing slug replaced the prior
+      // card/player (authored content lost, its saves orphaned). Edit runs
+      // (seedDraft present) re-save the same entity and are exempt.
+      if (!config.seedDraft && (creatorKind === 'player' || creatorKind === 'sim')) {
+        const target = creatorKind === 'player'
+          ? serializePlayer(state.draft).id
+          : (slugify(state.draft.name || '') || 'world');
+        const existing = creatorKind === 'player'
+          ? (await invoke('fable_players_list').catch(() => []))
+          : (await invoke('fable_cards_list').catch(() => []));
+        if (existing.some((m) => m.id === target)) {
+          throw new Error(`a ${creatorKind === 'player' ? 'player' : 'world'} named "${state.draft.name || target}" already exists — choose a different name`);
+        }
+      }
       if (creatorKind === 'player') {
         const { id, player } = serializePlayer(state.draft);
         trace(`serializePlayer → id=${id} fields=[${Object.keys(player).join(',')}]`);
@@ -692,13 +776,13 @@ function fadeSwap(el, newText) {
 }
 
 // Render the review card HTML. Player + sim (npc/scenario/world) render as
-// the compact ID card (core face + card-icon extra disclosure) via the
-// shared id-card renderer; codex keeps the generic section grid (no
+// the compact ID card (header + license grid + card-icon extra disclosure) via
+// the shared id-card renderer; codex keeps the generic section grid (no
 // portrait). CREATE/‹ live in the .fable-player-review-create-wrap row
 // appended under whichever card shape was produced. The edit affordance is
-// the CORNER PENCIL (2026-08-15 Chloe): beside the card-icon details button
-// on ID cards, top-right on the codex grid — never a button in the CREATE
-// row (the old "Edit" button is gone).
+// the CORNER PENCIL in the headrow (2026-08-15 Chloe): beside the card-icon
+// details button on ID cards, alone in the headrow's corner on the codex
+// grid — in-flow, so it can never overlap content.
 function renderReviewCard(kind, d, portraitPreview, sections) {
   const esc = escapeXml;
   const createWrap = `
@@ -711,10 +795,16 @@ function renderReviewCard(kind, d, portraitPreview, sections) {
   if (idModel) {
     return renderIdCard(idModel, { portraitClickable: true, portraitPreview, editable: true }) + createWrap;
   }
-  // codex: generic section grid, no portrait slot. The pencil anchors to the
-  // card's top-right corner (same spot as the ID card's cluster).
+  // codex: generic section grid, no portrait slot. The pencil rides the same
+  // headrow corner the ID cards use (in-flow top-right, no overlap).
   const pencil = `
-    <button type="button" class="fable-id-card-edit fable-id-card-edit--solo" data-review-pencil title="Edit" aria-label="Edit card">${PENCIL_SVG}</button>`;
+      <button type="button" class="fable-id-card-edit" data-review-pencil title="Edit" aria-label="Edit card">${PENCIL_SVG}</button>`;
+  const headrow = `
+    <div class="fable-id-card-headrow">
+      <span class="fable-id-card-head-spacer" style="width:46px" aria-hidden="true"></span>
+      <div class="fable-id-card-headwrap"></div>
+      <div class="fable-id-card-corner">${pencil}</div>
+    </div>`;
   const sectionsHtml = sections.map(([title, rows]) => {
     const pairHtml = rows.map(([label, val]) => {
       if (Array.isArray(val)) {
@@ -727,9 +817,8 @@ function renderReviewCard(kind, d, portraitPreview, sections) {
   }).join('');
   return `
     <div class="fable-player-review-card fable-codex-review-card">
-      ${pencil}
       <div class="fable-player-review-top">
-        <div class="fable-player-review-body">${sectionsHtml}</div>
+        <div class="fable-player-review-body">${headrow}${sectionsHtml}</div>
       </div>
     </div>` + createWrap;
 }

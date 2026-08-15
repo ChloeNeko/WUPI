@@ -434,20 +434,23 @@ pub fn format_compound_text(entries: &[ParsedEntry]) -> String {
 
 /// Split a compound codex file into its top-level entries. Each entry is the
 /// text from one `---\n` opener up to (but not including) the next `---\n`
-/// opener that begins a new entry (i.e. one preceded by a blank line, so
-/// `---` inside a body doesn't trigger a false split — the load-bearing rule
-/// for entries that contain fenced code blocks).
+/// opener that begins a new entry (i.e. one preceded by a blank line AND
+/// followed by a `title:` line, so `---` inside a body doesn't trigger a
+/// false split — the load-bearing rule for entries that contain fenced code
+/// blocks or horizontal rules).
 pub fn split_compound(text: &str) -> Vec<&str> {
     // Walk line by line. An "entry-start fence" is a line that is exactly
     // `---` (after trimming) AND is preceded by either the start of the file
-    // or a blank line. This mirrors how the front-matter parser treats the
-    // opener and avoids splitting on `---` that appears mid-body.
+    // or a blank line AND whose next non-empty line starts a `title:` front-
+    // matter key — the shape `format_compound_text` always emits after an
+    // opener. A bare blank-preceded `---` (a body horizontal rule or a
+    // fenced-code delimiter) stays inside the current entry.
     let lines: Vec<&str> = text.lines().collect();
     let mut starts: Vec<usize> = Vec::new();
     for (i, line) in lines.iter().enumerate() {
         if line.trim() == "---" {
             let prev_blank = i == 0 || lines[i - 1].trim().is_empty();
-            if prev_blank {
+            if prev_blank && opens_entry(&lines, i) {
                 starts.push(i);
             }
         }
@@ -485,6 +488,20 @@ pub fn split_compound(text: &str) -> Vec<&str> {
         }
     }
     out
+}
+
+/// True when the `---` line at `fence_idx` opens a NEW entry rather than
+/// sitting inside a body: the next non-empty line must start a `title:`
+/// front-matter key (case-insensitive leniency — `parse_front_matter` still
+/// reads the exact lowercase key, so a mixed-case `Title:` merely falls back
+/// to the stem title rather than corrupting the split).
+fn opens_entry(lines: &[&str], fence_idx: usize) -> bool {
+    lines
+        .iter()
+        .skip(fence_idx + 1)
+        .find(|l| !l.trim().is_empty())
+        .map(|l| l.trim_start().to_ascii_lowercase().starts_with("title:"))
+        .unwrap_or(false)
 }
 
 /// Split an entry's text into `(front_matter, body)`. Front-matter is the
@@ -660,6 +677,30 @@ mod tests {
             1,
             "a --- inside a fenced body must not split the entry"
         );
+    }
+
+    /// A blank-line-preceded `---` that is NOT followed by a `title:` line
+    /// (a body horizontal rule, or imported lore prose that happens to
+    /// contain the fence sequence) stays inside the current entry.
+    #[test]
+    fn split_compound_does_not_split_on_bare_fence_without_title() {
+        let text = "---\ntitle: Chronicle\ntags: war\n---\n\nThe march began.\n\n---\n\nThe war ended.\n";
+        let parts = split_compound(text);
+        assert_eq!(parts.len(), 1);
+        let (_, body) = split_front_matter(parts[0]);
+        assert!(body.contains("The march began."));
+        assert!(body.contains("---"));
+        assert!(body.contains("The war ended."));
+    }
+
+    #[test]
+    fn split_compound_still_splits_real_entry_with_title() {
+        // Sanity for the tightened rule: a genuine opener (blank-preceded
+        // `---` + `title:`) still splits even when the previous body ends
+        // without a trailing blank issue.
+        let text = "---\ntitle: One\n---\n\nbody one.\n\n---\ntitle: Two\n---\n\nbody two.\n";
+        let parts = split_compound(text);
+        assert_eq!(parts.len(), 2);
     }
 
     #[test]

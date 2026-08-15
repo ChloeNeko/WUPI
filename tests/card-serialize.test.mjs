@@ -30,9 +30,25 @@ test('slugify: lowercases + hyphenates', () => {
   assert.equal(slugify('   '), '');
 });
 
+test('slugify: Windows reserved names get a suffix', () => {
+  // create_dir_all on Windows fails opaquely for reserved base names — the
+  // slug must never land on one.
+  assert.equal(slugify('Nul'), 'nul-card');
+  assert.equal(slugify('CON'), 'con-card');
+  assert.equal(slugify('Com7'), 'com7-card');
+  assert.equal(slugify('LPT1'), 'lpt1-card');
+  // Only the EXACT base name is reserved — a hyphenated slug is a legal name.
+  assert.equal(slugify('LPT1 Device'), 'lpt1-device');
+  assert.equal(slugify('Null Void'), 'null-void');
+});
+
 // ── escapeXml ──────────────────────────────────────────────────────────────
 test('escapeXml: escapes & < >', () => {
   assert.equal(escapeXml('a & b < c > d'), 'a &amp; b &lt; c &gt; d');
+});
+
+test('escapeXml: escapes double quotes (attribute contexts)', () => {
+  assert.equal(escapeXml('say "hi"'), 'say &quot;hi&quot;');
 });
 
 // ── serializePlayer ────────────────────────────────────────────────────────
@@ -207,6 +223,62 @@ test('codexEntriesToCompound: joins multiple entries with blank line', () => {
 test('codexEntriesToCompound: empty → ""', () => {
   assert.equal(codexEntriesToCompound([]), '');
   assert.equal(codexEntriesToCompound(null), '');
+});
+
+// ── hostile GLM draft shapes (2026-08-15: the "Create failed: (a || "").trim
+//    is not a function" regression — GLM emits numbers/arrays/nulls/objects
+//    where the schema says string; the serializers must COERCE, never throw) ──
+test('serializeSimCard: scenario arrays (actors/hazards/outcomes) serialize, no crash', () => {
+  // The exact crash shape: participating_actors etc. as ARRAYS hit
+  // composeLabeled's (prose || '').trim().
+  const { xml } = serializeSimCard({
+    card_type: 'scenario', name: 'Ambush', directive: 'bandits strike',
+    trigger_condition: 'leaving at night', primary_objective: 'survive',
+    participating_actors: ['Bandits', 'Toll Guards'],
+    environmental_hazards: ['mud', 'darkness'],
+    outcomes: ['richer', 'dead'],
+    tone: 'tense', date: 'D1', time: '21:00', weather: 'rain', location: 'Road',
+    intro: 'You walk into it.',
+  });
+  assert.ok(xml.includes('Bandits, Toll Guards'));
+  assert.ok(xml.includes('<plot>'));
+});
+
+test('serializeSimCard: numbers/nulls/objects across every scalar field never throw', () => {
+  const { xml, intro } = serializeSimCard({
+    card_type: 42, name: 7, directive: { bad: 1 }, setting: ['a', 'b'],
+    tone: null, date: true, time: 900, weather: { x: 1 }, location: ['road'],
+    intro: ['line one', 'line two'], custom_tags: { k: { v: 1 }, ok: 'yes' },
+    cast: ['Mara the innkeep'], locations: ['Village Square'],
+  });
+  assert.ok(xml.includes('<sim_card>'));
+  assert.equal(intro, 'line one, line two');
+  // A bare-string cast/location entry is tolerated as {name}.
+  assert.ok(xml.includes('village-square'));
+  assert.ok(xml.includes('mara-the-innkeep'));
+  // Object custom-tag VALUE drops (never "[object Object]"); the clean one stays.
+  assert.ok(!xml.includes('[object Object]'));
+  assert.ok(xml.includes('yes'));
+});
+
+test('serializePlayer: hostile shapes (numeric age, null traits, object custom tag) never throw', () => {
+  const { player } = serializePlayer({
+    name: 42, age: 28, race: ['human'], body_type: null,
+    clothing: 'cloak, boots', custom_tags: { curse: { deep: true }, mood: 'grim' },
+  });
+  assert.equal(player.name, '42');
+  assert.equal(player.age, '28');
+  assert.equal(player.race, 'human');
+  assert.equal(player.body_type, null);        // null → JSON null (Rust Option::None)
+  assert.deepEqual(player.clothing, ['cloak', 'boots']);  // string → chip list
+  assert.deepEqual(player.custom_tags, { mood: 'grim' }); // object value dropped
+});
+
+test('slugify: numbers/arrays/nulls never throw', () => {
+  assert.equal(slugify(42), '42');
+  assert.equal(slugify(['A', 'B']), 'a-b');
+  assert.equal(slugify(null), '');
+  assert.equal(slugify({}), '');
 });
 
 // ── summary ────────────────────────────────────────────────────────────────

@@ -79,7 +79,18 @@ pub fn resolve_saves_dir(fable_root: &Path, card_id: &str) -> PathBuf {
 
 /// Resolve a single save file's path.
 pub fn resolve_save_path(fable_root: &Path, card_id: &str, save_id: &str) -> PathBuf {
-    resolve_saves_dir(fable_root, card_id).join(format!("{save_id}.json"))
+    // (P2 hardening) Sanitize BOTH ids to bare slug segments: separators,
+    // parent refs, or drive prefixes in a caller-supplied id can never
+    // escape the saves tree (fable_delete_save is a destructive consumer).
+    let clean = |id: &str| -> String {
+        let s: String = id
+            .chars()
+            .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '-' })
+            .collect();
+        let s = s.trim_matches('-').to_string();
+        if s.is_empty() { "__unknown__".to_string() } else { s }
+    };
+    resolve_saves_dir(fable_root, &clean(card_id)).join(format!("{}.json", clean(save_id)))
 }
 
 /// Write a save atomically (temp + rename) so a crashed write never leaves
@@ -117,13 +128,20 @@ pub fn write_save(
     // fsync + rename. The temp lives in the same dir/volume so the rename
     // is atomic on Windows (MOVEFILE_REPLACE_EXISTING).
     let tmp_path = final_path.with_extension("json.tmp");
-    {
+    let _ = std::fs::remove_file(&tmp_path); // clear a stale temp from a prior crash
+    let write_result: std::io::Result<()> = (|| {
         use std::io::Write;
         let mut f = std::fs::File::create(&tmp_path)?;
         f.write_all(&json)?;
         f.sync_all()?;
+        atomic_rename(&tmp_path, &final_path)
+    })();
+    if let Err(e) = write_result {
+        // Never leave the temp behind on a failed write (list_saves ignores
+        // it, but a stale *.json.tmp in the slot dir is grime).
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(e);
     }
-    atomic_rename(&tmp_path, &final_path)?;
     Ok(save)
 }
 
