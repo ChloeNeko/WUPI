@@ -975,14 +975,17 @@ function spawnLaunchSparkles(parent, count = 18) {
 // CHOREOGRAPHY (per spec, refined):
 //   0.0s  Blank screen (paw parked below the bottom edge, off-screen,
 //         opacity:0 so no top-left flash).
+//   0-1s  Pre-cache runway (ENTRY_DELAY): muted SFX decode warm-up + the
+//         visual pre-cache (paw PNG decode + rAF heartbeat) — the pipeline
+//         is hot before the first animated frame (2026-08-14).
 //   1.0s  Paw ENTERS from the bottom, RISES to center, then ZOOMS in a
 //         sporadic fairy path: dart LEFT → dart RIGHT → return CENTER.
 //         Sparkle TRAIL follows the paw's path (small fixed-position
 //         sparkles spawned every ~25ms) — reads as a comet tail.
-//   ~3.0s Two QUICK hops. Each apex spawns a sparkle burst that ESCALATES:
+//   ~2.5s Two QUICK hops. Each apex spawns a sparkle burst that ESCALATES:
 //         hop 1 = 8 small sparkles, hop 2 = 16 bigger multi-colored ones.
 //         Trail is paused during the hops so the bursts get the spotlight.
-//   ~3.8s Paw FLIES to its home spot in the top-left (the real .paw-img
+//   ~3.6s Paw FLIES to its home spot in the top-left (the real .paw-img
 //         rect), shrinking ~153px → 45px as it travels. Trail restarts
 //         for the flight.
 //   land  Final big multi-colored burst (capstone), then LOADING SCREEN
@@ -1171,27 +1174,51 @@ function spawnLaunchSparkles(parent, count = 18) {
     } catch (e) { /* warm is best-effort */ }
   }
 
+  // ── Visual pre-cache during the ENTRY_DELAY runway (2026-08-14). The SFX
+  //    loop above warms the AUDIO path; this warms the RENDER path so the
+  //    paw's first frames aren't the pipeline's first frames:
+  //    (1) Force the paw PNG's decode NOW. <img> decode is lazy — without
+  //        this it lands on the entry animation's first frame (a 45→126px
+  //        scaled decode = the opening stutter). decode() resolves once the
+  //        bitmap is resident; best-effort, ignored if it rejects.
+  //    (2) A rAF heartbeat for the whole runway. Each callback drives one
+  //        full style/paint/composite pass, so the compositor keeps
+  //        producing frames + GPU surfaces stay warm through the blank
+  //        second — the entry animation then starts on an already-hot
+  //        pipeline instead of a cold one. The loop self-terminates the
+  //        moment the runway ends (the paw's own rAF/animation frames take
+  //        over from there).
+  try {
+    const pawImg = document.querySelector('#boot-paw .boot-paw-img');
+    if (pawImg && typeof pawImg.decode === 'function') pawImg.decode().catch(() => {});
+  } catch (e) { /* warm is best-effort */ }
+  const warmStart = performance.now();
+  (function warmHeartbeat(now) {
+    if (now - warmStart < ENTRY_DELAY) requestAnimationFrame(warmHeartbeat);
+  })(performance.now());
+
   // Timing constants (ms).
-  // ENTRY_DELAY was a blank-screen pause before the paw entered (it doubled as
-  // the runway for the muted SFX warm-up loop above). Removed completely per
-  // Chloe 2026-08-04 — the paw now enters immediately. The warm-up elements are
-  // still created synchronously here + decode as fast as the browser allows;
-  // the tradeoff of no runway is the first move-whoosh MAY lag slightly on a
-  // truly cold launch (the warm decode may not finish before liftoff).
-  const ENTRY_DELAY = 0;          // no intro delay — paw enters immediately
+  // ENTRY_DELAY is a blank-screen runway before the paw enters. History:
+  // removed 2026-08-04 (Chloe wanted the paw immediately), RESTORED at 1000ms
+  // 2026-08-14 — on a cold wupi.exe launch the WebView2's first second lags
+  // badly + skips frames (JS parse/JIT, first style/paint/composite passes,
+  // GPU surface creation all landing on the animation's opening frames). The
+  // runway shifts all of that ahead of the choreography; the visual pre-cache
+  // block above warms the specific paw pipeline during it.
+  const ENTRY_DELAY = 1000;
   // Fairy-tour choreography: RISE STRAIGHT TO TOP-LEFT MIDDLE → dart to
   // TOP-RIGHT MIDDLE → dart to CENTER. Each dart is a hard ZOOM_EASE in/out
   // so the paw reads as a fairy teleporting with momentum. The rise gets the
   // biggest slice (longest distance). The TOTAL duration is LOAD-BEARING for
   // audio sync: the three move-whooshes fire at the rise/dart-right/dart-
   // center keyframe offsets (0 / 0.39 / 0.78), so at this duration they land
-  // at 0 / 1092 / 2184ms — ~1.09s apart, enough for each ~1.25s whoosh's
-  // decay to clear before the next fires (the prior 1.65s entry fired all
-  // three within 1.2s → full overlap → the "out of sync" muddy wash). Slowed
-  // back down from the over-tightened 1.65s per the "moves too fast + audio
-  // out of sync" pass. If you retune ENTRY_DURATION, keep the whoosh fire
-  // offsets ≥1.0s apart or the overlap roar returns.
-  const ENTRY_DURATION = 2800;
+  // at 0 / 585 / 1170ms.
+  // 2026-08-14 final: the 1800ms pass was "almost perfect, a tiny bit fast
+  // needed"; 1200ms was too fast. Chloe's call: the SWEET SPOT between the
+  // two — 1500ms, keeping the original fractional keyframe structure (rise
+  // 450 / hold 135 / dart 210 / hold 450 / dart 180 / hold 150). Hops
+  // untouched throughout.
+  const ENTRY_DURATION = 1500;
   // Sharp accel + sharp decel — the "fairy dart" easing. Most of the
   // motion happens in the middle of the segment, with hard start/stop.
   const ZOOM_EASE = 'cubic-bezier(0.65, 0, 0.35, 1)';
@@ -1223,6 +1250,15 @@ function spawnLaunchSparkles(parent, count = 18) {
   // two boings while tightening the cadence to match the 20%-faster hops.
   // HOP_2_DELAY_MS above is apex-synced for THIS rate; recompute if it changes.
   const HOP_PLAYBACK_RATE = 1.5;
+  // The move-whoosh rate for the FOUR travel movements (3 entry darts + the
+  // corner flight). 2026-08-14 final: mid-point of the tuning history like
+  // the durations — 1.55× (the 1800ms pass) felt right, 2.3× (the 1200ms
+  // pass) over-quick; 1.85 ≈ 2800/1500 tracks the entry's cumulative
+  // speed-up (the flight's 720/350 ≈ 2.06 — one shared rate, weighted toward
+  // the three entry whooshes). Tails shrink to ~0.68s vs the 0.59s fire
+  // spacing: barely a kiss, no overlap roar. The hops themselves are
+  // UNTOUCHED (HOP_DURATION / HOP_2_DELAY_MS / HOP_PLAYBACK_RATE unchanged).
+  const INTRO_MOVE_PLAYBACK_RATE = 1.85;
   // Sparkle trail: a sparkle spawns every TRAIL_INTERVAL ms along the paw's
   // path during entry + flight (NOT during hops — those get the escalating
   // bursts). Tuned for perf: tighter interval was creating ~150 concurrent
@@ -1240,11 +1276,12 @@ function spawnLaunchSparkles(parent, count = 18) {
   const POST_HOP_LOITER_MS = 500;
   // Straight-line corner flight: fires after the post-hop loiter. Per spec
   // ("just make it a straight line, you aren't curving it correctly") the
-  // flight is a single CSS transition to the corner — no WAAPI arc. ~720ms
-  // so the move-whoosh (~1.25s) has room to breathe under the motion and the
-  // finish-SFX lead-in (fired FLIGHT - 120ms before land) lands its attack on
-  // touchdown, not after. Slowed back from the over-tightened 480ms.
-  const FLIGHT_DURATION_MS = 720;
+  // flight is a single CSS transition to the corner — no WAAPI arc. Tuning
+  // history: 720 → 575 → 490 → 400 (the "almost perfect" pass) → 300 (too
+  // fast) → 350 (the sweet spot, 2026-08-14 final). Its whoosh plays at
+  // INTRO_MOVE_PLAYBACK_RATE to match. The finish-SFX lead-in (fired FLIGHT -
+  // 120ms before land) still lands its attack on touchdown.
+  const FLIGHT_DURATION_MS = 350;
   // Staged-reveal delays (ms) measured from flight-land (transitionend).
   // Top-bar fade is 0.6s in CSS; aurora wipe arms AFTER it finishes so the
   // two blur costs never overlap.
@@ -1373,15 +1410,18 @@ function spawnLaunchSparkles(parent, count = 18) {
     // Movement SFX #1: plays as the paw lifts off for its first flight (the
     // rise to top-left). Schedules the two dart move sounds to fire at the
     // exact WAAPI offsets where those segments begin (dart-right + dart-center
-    // keyframes below) so each "flight" cue lands on its motion. The offsets
-    // are spaced ≥1.0s apart so the ~1.25s whoosh tails don't stack into a
-    // muddy roar (the prior 0.41/0.73 split on a 1.65s entry fired all three
-    // within 1.2s → full overlap → the "out of sync" wash).
-    try { playSfx(INTRO_MOVE_SRC); } catch (e) { /* autoplay blocked: silent */ }
-    const dartRightAt = ENTRY_DURATION * 0.39;  // ~1092ms
-    const dartCenterAt = ENTRY_DURATION * 0.78; // ~2184ms
-    setTimeout(() => { try { playSfx(INTRO_MOVE_SRC); } catch (e) {} }, dartRightAt);
-    setTimeout(() => { try { playSfx(INTRO_MOVE_SRC); } catch (e) {} }, dartCenterAt);
+    // keyframes below) so each "flight" cue lands on its motion. All three
+    // play at INTRO_MOVE_PLAYBACK_RATE (2026-08-14 final: 1.85×, matched to
+    // the 1500ms entry).
+    try { playSfx(INTRO_MOVE_SRC, { playbackRate: INTRO_MOVE_PLAYBACK_RATE }); } catch (e) { /* autoplay blocked: silent */ }
+    // Dart-whoosh timers at the keyframe offsets where those segments begin
+    // (dart-right + dart-center keyframes below) so each "flight" cue lands
+    // on its motion: ~585ms / ~1170ms at the 1500ms entry — 0.59s apart vs
+    // the ~0.68s tails at 1.85×, no overlap roar.
+    const dartRightAt = ENTRY_DURATION * 0.39;  // ~585ms
+    const dartCenterAt = ENTRY_DURATION * 0.78; // ~1170ms
+    setTimeout(() => { try { playSfx(INTRO_MOVE_SRC, { playbackRate: INTRO_MOVE_PLAYBACK_RATE }); } catch (e) {} }, dartRightAt);
+    setTimeout(() => { try { playSfx(INTRO_MOVE_SRC, { playbackRate: INTRO_MOVE_PLAYBACK_RATE }); } catch (e) {} }, dartCenterAt);
 
     // Entry path: RISE STRAIGHT TO TOP-LEFT MIDDLE → dart to TOP-RIGHT
     // MIDDLE → dart to CENTER. The "fairy-tour": each dart is a hard
@@ -1514,13 +1554,15 @@ function spawnLaunchSparkles(parent, count = 18) {
     flightApproved = true;
     if (!bootPaw) { startLoadingScreen(); return; }
 
-    // Movement SFX: the corner flight. Fires now (liftoff). The finish SFX is
-    // triggered just before landing (see the pre-land timer below) so its
-    // tail rings out through + past touchdown rather than starting cold at the
-    // transitionend instant. playSfx appends the node to document.body + self
-    // cleans on 'ended', so the paw removal in onLand never truncates it —
-    // the clip plays in full regardless of the boot paw's lifecycle.
-    try { playSfx(INTRO_MOVE_SRC); } catch (e) { /* autoplay blocked: silent */ }
+    // Movement SFX: the corner flight (movement #4). Fires now (liftoff) at
+    // INTRO_MOVE_PLAYBACK_RATE to match the ×0.8 flight (2026-08-14). The
+    // finish SFX is triggered just before landing (see the pre-land timer
+    // below) so its tail rings out through + past touchdown rather than
+    // starting cold at the transitionend instant. playSfx appends the node to
+    // document.body + self-cleans on 'ended', so the paw removal in onLand
+    // never truncates it — the clip plays in full regardless of the boot paw's
+    // lifecycle.
+    try { playSfx(INTRO_MOVE_SRC, { playbackRate: INTRO_MOVE_PLAYBACK_RATE }); } catch (e) { /* autoplay blocked: silent */ }
     // Pre-land lead-in for the finish SFX: trigger it ~120ms before touchdown
     // so the finale's attack lands as the paw settles, not after.
     setTimeout(() => {

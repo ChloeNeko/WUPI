@@ -136,6 +136,36 @@ const FABLE_ENTRY = (() => {
 // background is transparent, so an earlier reveal shows the menu THROUGH the
 // splash). Kept as a named constant here so the two sites stay synchronized.
 const FABLE_SPLASH_HOLD_MS = 2000;
+// Title-reveal choreography shared by the FABLE_ENTRY + DIRECT_LAUNCH title
+// paths: drop the transparency hold FIRST (the void backdrop paints
+// instantly, so the title's fade-in runs over the solid void, never over the
+// desktop), then showScreen('title') + the .fable-title-enter dissolve +
+// theme-music fade-in. Defined ONCE so the direct-launch fallbacks can't
+// drift out of sync with the plain-entry reveal again — the 2026-08-14
+// "menu spawns beside the F on .lnk launches" bug was exactly that drift:
+// the fallbacks called revealHold()+showScreen('title') bare, skipping the
+// hold window + dissolve entirely (the async IPC handoff resolves in tens
+// of ms, so the title appeared while the F splash was still in its 2s hold).
+const revealTitleUnderSplash = (fableRoot) => {
+  fableRoot.classList.remove('fable-entry-hold');
+  showScreen('title');
+  const titleEl = screens.title;
+  if (titleEl) {
+    // Drop the 2s transparency hold FIRST (fable.css): the title was shown at
+    // t=0 behind the F splash, held at opacity 0 while it warmed up — the
+    // enter animation then rides the full 0→1 fade.
+    titleEl.classList.remove('fable-title-held');
+    titleEl.classList.remove('fable-title-enter');
+    void titleEl.offsetWidth; // reflow so re-adding restarts the animation
+    titleEl.classList.add('fable-title-enter');
+    titleEl.addEventListener('animationend', () => {
+      titleEl.classList.remove('fable-title-enter');
+    }, { once: true });
+  }
+  // Theme music fires HERE — i.e. exactly at FABLE_SPLASH_HOLD_MS (2s after
+  // entry), never during the splash hold.
+  try { startThemeMusic(fableRoot, { fadeIn: true }); } catch (_) {}
+};
 // DEV SHORTCUT (?dev=preview or #dev=preview): pure-frontend layout preview.
 // Skips title + void + ALL backend (no model, no API, no fable_send) and drops
 // straight into the chat stage with placeholder messages (devPreviewEnter).
@@ -1527,76 +1557,68 @@ function openFable() {
     // point real content first appears (title fallback OR the stage entry).
     fableRoot.classList.add('fable-entry-hold');
     const revealHold = () => fableRoot.classList.remove('fable-entry-hold');
+    // Title fallbacks honor the splash hold: reveal via the shared
+    // choreography (revealTitleUnderSplash) DELAYED until the F splash's 2s
+    // window has elapsed (0ms if the async handoff already outlasted it —
+    // e.g. a slow IPC). Revealing bare made the menu spawn beside the F
+    // (the handoff resolves in tens of ms; fixed 2026-08-14).
+    const launchT0 = performance.now();
+    const revealTitleAfterSplash = () => {
+      const wait = Math.max(0, FABLE_SPLASH_HOLD_MS - (performance.now() - launchT0));
+      setTimeout(() => revealTitleUnderSplash(fableRoot), wait);
+    };
     (async () => {
       try {
         const ctx = await invoke('get_launch_context');
-        if (!ctx || !ctx.cardSlug) { revealHold(); showScreen('title'); return; }
+        if (!ctx || !ctx.cardSlug) { revealTitleAfterSplash(); return; }
         // API gate: fable_start refuses without a connected API. Falling back
         // to the title (instead of a dead stage) lets the player connect via
         // the ONLINE button + retry — a persisted API connection carries over.
         const src = await invoke('model_source_get').catch(() => null);
-        if (!src || !src.apiReady) { revealHold(); showScreen('title'); return; }
+        if (!src || !src.apiReady) { revealTitleAfterSplash(); return; }
         revealHold();
         await resumeSave(ctx.cardSlug, ctx.saveId ?? null);
       } catch (e) {
         console.error('[fable] direct launch failed, falling back to title', e);
-        revealHold();
-        showScreen('title');
+        revealTitleAfterSplash();
       }
     })();
     return;
   }
 
   if (FABLE_ENTRY) {
-    // Reveal #fable + chrome + pause the OS aurora IMMEDIATELY so the title
-    // screen composites underneath the floating-F splash (#fable-entry-splash,
-    // driven by script.js + the inline head script in wupi.html). The title
-    // SCREEN itself + the theme music are deliberately held back for the
-    // SPLASH_HOLD_MS window so the user perceives a real 2s splash (the splash
-    // background is transparent, so revealing the title any earlier would let
-    // the menu show through the splash → the "spawns alongside the menu, no
-    // delay" bug). The reveal is then synchronized to the splash's fade-out so
-    // the handoff reads as a smooth dissolve, not a hard cut.
+    // Reveal #fable + chrome + pause the OS aurora IMMEDIATELY, and show the
+    // title screen RIGHT AWAY — held 100% transparent (.fable-title-held,
+    // fable.css) behind the floating-F splash (#fable-entry-splash, driven by
+    // script.js + the inline head script in wupi.html). Loading the menu
+    // during the splash hold means every layer (bg image, dim, grass,
+    // particles, clouds, wordmark) composites + warms BEFORE the player sees
+    // anything, so the 2s reveal is a pure opacity fade with zero pop-in —
+    // and WUPI's purple boot base never shows, because by the time anything
+    // becomes visible the (fading-in) menu owns the pixels.
     fableRoot.classList.add('show');
     fableRoot.setAttribute('aria-hidden', 'false');
     activateChrome();
     if (hooks.pauseAurora) hooks.pauseAurora();
-    // Hide EVERY screen now. initFable() pre-shows the title via its closing
-    // showScreen('title') (see the screen-building tail), so without this the
-    // already-visible title screen would bleed through the splash's transparent
-    // backdrop the instant #fable.show is added → the menu spawns alongside
-    // the F logo with no delay. Mirrors the DIRECT_LAUNCH / DEV_PREVIEW branches.
-    for (const s of Object.values(screens)) s.hidden = true;
     // Suppress #fable's own void backdrop for the hold too (.fable-entry-hold,
-    // styles.css): without it the opaque #05040a void (a blue-violet near-black
-    // that reads as purple behind the warm glow) paints behind the F for the
-    // whole 2s. Held = only the F floats over the desktop; dropped at the
-    // reveal below.
+    // styles.css): while the title is held transparent the opaque #05040a void
+    // (a blue-violet near-black that reads as purple behind the warm glow)
+    // must stay off — only the F floats over the desktop. Dropped at the
+    // reveal below, so the title's fade-in runs over the solid void, never
+    // over the desktop.
     fableRoot.classList.add('fable-entry-hold');
-    // Keep the title screen hidden during the splash hold. showScreen('title')
-    // fires at SPLASH_HOLD_MS (matching script.js's splash fade start) so the
-    // menu fades in underneath as the F logo crossfades out. The
-    // .fable-title-enter class rides a 700ms opacity fade on the title screen
-    // (fable.css) that mirrors the splash's 600ms fade-out → the F logo
-    // dissolves INTO the menu. Self-removes on animationend so later title
-    // re-shows (⌂ back, Load back) are unaffected.
-    setTimeout(() => {
-      // End the transparency hold FIRST: the void backdrop paints instantly
-      // (background isn't transitioned) so the title's fade-in runs over the
-      // solid void, never over the desktop.
-      fableRoot.classList.remove('fable-entry-hold');
-      showScreen('title');
-      const titleEl = screens.title;
-      if (titleEl) {
-        titleEl.classList.remove('fable-title-enter');
-        void titleEl.offsetWidth; // reflow so re-adding restarts the animation
-        titleEl.classList.add('fable-title-enter');
-        titleEl.addEventListener('animationend', () => {
-          titleEl.classList.remove('fable-title-enter');
-        }, { once: true });
-      }
-      try { startThemeMusic(fableRoot, { fadeIn: true }); } catch (_) {}
-    }, FABLE_SPLASH_HOLD_MS);
+    // Show the title NOW (initFable's closing showScreen('title') already
+    // left it visible; this re-show is idempotent + re-fires the ambient
+    // guards) + apply the transparency hold in the same synchronous block —
+    // no paint can land between them. The reveal fires at SPLASH_HOLD_MS
+    // (matching script.js's splash fade start) via the shared
+    // revealTitleUnderSplash choreography: the held class drops, the
+    // .fable-title-enter fade rides 0→1 (700ms) as the F logo crossfades out
+    // (600ms) → the F dissolves INTO the menu, and the theme music starts
+    // its fade-in at that same 2s mark (never during the hold).
+    showScreen('title');
+    if (screens.title) screens.title.classList.add('fable-title-held');
+    setTimeout(() => revealTitleUnderSplash(fableRoot), FABLE_SPLASH_HOLD_MS);
     return;
   }
 

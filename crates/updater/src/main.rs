@@ -106,6 +106,11 @@ fn main() {
     // the launched exe may be inconsistent — the documented residual risk.)
     spawn_wupi(&args.target_dir);
 
+    // Sweep stale %TEMP% residue left by PRIOR updates (a pre-0.19 updater
+    // never self-deleted its temp copy + log). Our own files are excluded —
+    // self_delete_temp_copy removes those at exit.
+    sweep_temp_residue();
+
     // Remove our own %TEMP% copy + log (the no-remnants rule). No-op when not
     // running from %TEMP% (dev builds) or on non-Windows.
     self_delete_temp_copy();
@@ -267,21 +272,74 @@ fn self_delete_temp_copy() {
     use std::os::windows::process::CommandExt;
     const DETACHED_PROCESS: u32 = 0x0000_0008;
     const CREATE_NO_WINDOW: u32 = 0x0200_0000;
-    let _ = std::process::Command::new("cmd.exe")
-        .args(["/C", &script])
-        .creation_flags(DETACHED_PROCESS | CREATE_NO_WINDOW)
-        .spawn();
+    let mut cmd = std::process::Command::new("cmd.exe");
+    // raw_arg, not args: std's default Windows argument quoting wraps the
+    // script in quotes and escapes the inner path quotes as \" — cmd.exe
+    // reads those as literal characters, so both `del`s silently miss their
+    // targets and the temp copy + log survive (observed live on the
+    // 0.19.0→0.19.1 hop). raw_arg passes the script verbatim so the quoted
+    // paths reach cmd intact.
+    cmd.raw_arg(format!("/C {script}"));
+    let _ = cmd.creation_flags(DETACHED_PROCESS | CREATE_NO_WINDOW).spawn();
 }
 
 /// Non-Windows stub: the temp-copy handoff + self-delete are Windows-only.
 #[cfg(not(windows))]
 fn self_delete_temp_copy() {}
 
+/// Delete leftover `%TEMP%` residue from PRIOR updates: any `wupi_updater_*.exe`
+/// / `wupi_updater_*.log` file and any `wupi_stage_*` directory other than OUR
+/// own (our temp copy + log are removed by `self_delete_temp_copy` at exit).
+/// Updates applied by a pre-0.19 updater leave their temp copy + log behind —
+/// this sweep runs on every update so `%TEMP%` converges without any boot-time
+/// wiring. Scoped to WUPI's namespace only; best-effort (locked files are
+/// skipped, never fatal).
+fn sweep_temp_residue() {
+    let temp = std::env::temp_dir();
+    let own_exe = std::env::current_exe().ok();
+    let own_log = temp.join(format!("wupi_updater_{}.log", std::process::id()));
+    let entries = match std::fs::read_dir(&temp) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+    let mut swept = 0usize;
+    for entry in entries.flatten() {
+        let Some(name) = entry.file_name().into_string().ok() else {
+            continue;
+        };
+        let ours = (name.starts_with("wupi_updater_")
+            && (name.ends_with(".exe") || name.ends_with(".log")))
+            || name.starts_with("wupi_stage_");
+        if !ours {
+            continue;
+        }
+        let path = entry.path();
+        if own_exe.as_deref() == Some(path.as_path()) || path == own_log {
+            continue; // ours — self_delete_temp_copy handles these at exit
+        }
+        let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
+        let removed = if is_dir {
+            std::fs::remove_dir_all(&path).is_ok()
+        } else {
+            std::fs::remove_file(&path).is_ok()
+        };
+        if removed {
+            swept += 1;
+        }
+    }
+    if swept > 0 {
+        log(format!("swept {swept} stale %TEMP% residue file(s)"));
+    }
+}
+
 /// Headless debug log: append a line to `%TEMP%/wupi_updater_<pid>.log`. There
 /// is no console (the launcher uses CREATE_NO_WINDOW), so this file is the only
 /// trail when diagnosing a failed update. Best-effort, never panics.
 fn log(msg: impl AsRef<str>) {
     use std::io::Write;
+    if cfg!(test) {
+        return; // in-process tests: don't litter %TEMP% with per-run logs
+    }
     let path = std::env::temp_dir().join(format!("wupi_updater_{}.log", std::process::id()));
     if let Ok(mut f) = std::fs::OpenOptions::new()
         .create(true)

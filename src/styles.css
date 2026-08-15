@@ -2017,7 +2017,11 @@ html.fable-entry body:not(.booting):not(.loading) .dock-trigger-area {
     position: absolute;
     top: 36%;
     left: 50%;
-    transform: translate(-50%, -50%);
+    /* 2026-08-14: the box gained padding-top:110px (see the reflection notes
+       below) — the glyphs would drift down 55px (half the pad). The extra
+       -55px in the Y translate cancels it so the text sits exactly where it
+       always has. */
+    transform: translate(-50%, calc(-50% - 55px));
     /* Fredoka is the bubbly primary; the system fallback chain still reads
        thick at font-weight: 700 even before the webfont caches. */
     font-family: 'Fredoka', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
@@ -2028,6 +2032,21 @@ html.fable-entry body:not(.booting):not(.loading) .dock-trigger-area {
     text-transform: uppercase;
     white-space: nowrap;
     user-select: none;
+    /* 2026-08-14: padding EXTENDS the element box so the reflected image's
+       box covers the FULL mirrored glow field on ALL sides. Without it the
+       box-reflect mask only spans the glyph line-box; the mirrored
+       text-shadow halo (60px blur) overflows PAST the reflection box — below
+       it (the hard horizontal cut at the bottom, fixed pass 1) AND beside the
+       first 'L' / last '.' (vertical hard cuts at the left/right edges, fixed
+       pass 2) — then gets clipped at the paint extent. With the pads the
+       entire mirrored halo lives INSIDE the masked box and the gradient fades
+       it to true zero before the box ends. 110px = the 60px blur halo +
+       margin. The -55px Y translate above compensates the downward drift the
+       top pad would cause; the side pads are symmetric so translate(-50%)
+       centering is untouched. */
+    padding-top: 110px;
+    padding-left: 110px;
+    padding-right: 110px;
     /* Neon reflection pool below the title. box-reflect mirrors the LIVE
        rendered element, so the L→R .lit sweep + its layered glow reflect in
        real time. line-height:1 tightens the element box to the glyph cap-height
@@ -2038,11 +2057,14 @@ html.fable-entry body:not(.booting):not(.loading) .dock-trigger-area {
        the reflection, which immediately attenuated the glyph's text-shadow glow
        halo and produced a visible hard seam/cutoff at the top of the reflected
        words (the glow got clipped where the steep gradient met the outer blur).
-       The mask now holds FULL opacity (1.0) through the top portion so the
-       glow's full field renders unclipped, then eases out later + softer —
-       the reflection's near edge now matches the real text's glow with no
-       border. The watery fade at the far edge is preserved. */
-    -webkit-box-reflect: below -8px linear-gradient(to bottom, rgba(255,255,255,1) 0%, rgba(255,255,255,0.95) 20%, rgba(255,255,255,0.55) 55%, rgba(255,255,255,0.18) 80%, transparent 100%);
+       The mask holds FULL opacity (1.0) through the top portion so the glow's
+       full field renders unclipped.
+       2026-08-14: the far-edge hard cut fix (see padding-top above). The mask
+       now fades over the WHOLE padded box (glyphs + mirrored halo) and reaches
+       true transparent at 94% — comfortably inside the box — so the reflection
+       melts into the void with no edge. Verified in-engine via an A/B
+       screenshot pass (unpadded = hard cut, padded = seamless). */
+    -webkit-box-reflect: below -8px linear-gradient(to bottom, rgba(255,255,255,1) 0%, rgba(255,255,255,0.92) 35%, rgba(255,255,255,0.55) 60%, rgba(255,255,255,0.22) 78%, transparent 94%);
 }
 .boot-loading-text span {
     display: inline-block;

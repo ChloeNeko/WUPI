@@ -32,6 +32,9 @@ use std::path::Path;
 ///   `cards/<card_id>/` now; players live in `apps/fable/players/`). v0.17/
 ///   v0.18 still created them eagerly at boot, so every upgraded install
 ///   has all four.
+/// - `apps/fable/backgrounds` — the pre-Library scene-art dir. v0.18 created
+///   it eagerly at boot; the live path is `apps/fable/images/backgrounds`
+///   (§7 "Stage Background Library"). Nothing ever resolved the old dir.
 /// - `apps/games` — the entire v0.6.x pre-Fable-rename state root (the boot
 ///   migration that drained it is gone; this reaps whatever it left).
 /// - `data/{sessions,schemas}` — the v0.2.4 flat-layout state dirs.
@@ -43,6 +46,7 @@ pub const LEGACY_PATHS: &[&str] = &[
     "apps/fable/schemas",
     "apps/fable/saves",
     "apps/fable/profiles",
+    "apps/fable/backgrounds",
     "apps/games",
     "data/sessions",
     "data/schemas",

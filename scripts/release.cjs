@@ -42,7 +42,7 @@
 // NSIS flow which required keys/wupi.key + keys/wupi.key.pw.
 
 const { readFileSync, existsSync, mkdirSync, rmSync, readdirSync, copyFileSync, cpSync, writeFileSync, statSync } = require('fs');
-const { join } = require('path');
+const { join, basename } = require('path');
 const { spawnSync } = require('child_process');
 
 // Windows-tolerant recursive delete. Node's `fs.rmSync` returns EPERM when
@@ -381,13 +381,26 @@ if (!dryRun) {
 // fable explicitly to GUARANTEE it exists for staging (cheap — the main build
 // already compiled the lib + every heavy dep, so this is just fable.rs +
 // link). Sets the same window attrs as wupi.exe but boots straight to the
-// Fable title via the `wupi.html#fable` entry marker.
+// Fable title via the `wupi.html#fable` entry marker. (The exe name stays
+// `fable.exe` by Chloe's call — Discord's game detection matches it to the
+// 2005 "Fable: The Lost Chapters", accepted as-is 2026-08-14.)
 // ──────────────────────────────────────────────────────────────────────────
 const builtFableExe = join(cargoTargetDir, 'release', 'fable.exe');
 console.log('[release] building fable.exe (src/bin/fable.rs)…');
 if (!dryRun) {
   const fableBuild = spawnSync('cargo', [
     'build', '--release', '--bin', 'fable',
+    // CRITICAL — mirror `npx tauri build`'s feature set EXACTLY. The tauri
+    // CLI compiles with `--features tauri/custom-protocol`; without it,
+    // tauri-macros' context codegen sees dev=true (devUrl is set in
+    // tauri.conf.json) and generate_context! embeds an EMPTY asset set → a
+    // fable.exe with NO frontend inside. This exact bug shipped v0.19.0–
+    // v0.19.2 (2026-08-14): the bare `--bin fable` rebuild clobbered the
+    // good fable.exe Step 3's `npx tauri build` had just emitted with
+    // assets embedded — the launcher then opened to WebView2's "localhost
+    // refused to connect" (no splash, dead window). The Step 3.7 embed
+    // verification below is the backstop if this ever drifts again.
+    '--features', 'tauri/custom-protocol',
   ], { stdio: 'inherit', cwd: join(repoRoot, 'src-tauri'), shell: true });
   if (fableBuild.status !== 0) {
     console.error(`[release] fable build failed (exit ${fableBuild.status}).`);
@@ -400,6 +413,43 @@ if (!dryRun) {
   console.log('[release] fable.exe built.');
 } else {
   console.log('[release] (dry-run) skipping fable.exe build');
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// Step 3.7: verify BOTH launcher exes embed the current frontend.
+//
+// generate_context! bakes dist/ into the binary at COMPILE time. A build
+// missing `--features tauri/custom-protocol` (the v0.19.0–v0.19.2 fable.exe
+// break) — or a cargo build racing a Vite rewrite of dist/ (the 2026-08-04
+// stale-embed incident) — bakes an empty/stale asset map, and the exe opens
+// to WebView2's "localhost refused to connect" page. The embed carries the
+// asset PATH strings raw in the binary, so we can verify it statically:
+// extract the hashed JS bundle name from the freshly-built dist/wupi.html
+// and require it in BOTH exes. ~290 MB read per exe, well under a second —
+// cheap insurance against shipping a frontend-less launcher again.
+// ──────────────────────────────────────────────────────────────────────────
+if (!dryRun) {
+  const distHtml = readFileSync(join(repoRoot, 'dist', 'wupi.html'), 'utf8');
+  const jsAsset = distHtml.match(/assets\/wupi-[A-Za-z0-9_-]+\.js/);
+  if (!jsAsset) {
+    console.error('[release] !! could not find the hashed JS bundle reference in dist/wupi.html.');
+    console.error('[release]    Expected something like assets/wupi-<hash>.js — did the Vite build change shape?');
+    process.exit(1);
+  }
+  const marker = Buffer.from(jsAsset[0]);
+  // (builtExe is declared later, in Step 4 — resolve the same path here.)
+  const wupiExePath = join(cargoTargetDir, 'release', 'wupi.exe');
+  for (const exe of [wupiExePath, builtFableExe]) {
+    const buf = readFileSync(exe);
+    if (buf.indexOf(marker) === -1) {
+      console.error(`[release] !! ${basename(exe)} does NOT embed the current frontend (no "${jsAsset[0]}" in the binary).`);
+      console.error('[release]    A frontend-less exe opens to "localhost refused to connect".');
+      console.error('[release]    Cause is a cargo build missing --features tauri/custom-protocol,');
+      console.error('[release]    or one that raced a Vite rewrite of dist/. REFUSING to ship it.');
+      process.exit(1);
+    }
+    console.log(`[release] ${basename(exe)} embeds the current frontend (${jsAsset[0]} found).`);
+  }
 }
 
 // ──────────────────────────────────────────────────────────────────────────

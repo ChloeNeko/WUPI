@@ -193,6 +193,19 @@ body.fable-active.fable-chrome-peek .top-bar { transform: translateY(0); }
     from { opacity: 0; }
     to   { opacity: 1; }
 }
+/* ── The 2s transparency hold (load-behind-the-F) ──
+   On the fable.exe path the title screen is shown IMMEDIATELY (t=0), held at
+   opacity 0 behind the floating-F splash: every layer — bg image, dim, grass,
+   particles, clouds, wordmark — composites + warms during the 2s hold, so
+   the reveal is a pure opacity ramp with zero pop-in, and WUPI's purple boot
+   base never shows (the splash owns the pixels while the menu warms up).
+   Dropped by revealTitleUnderSplash at FABLE_SPLASH_HOLD_MS, right before
+   .fable-title-enter rides the 0→1 fade. `animation: none` so the pair can
+   never half-animate if both classes ever coexist. */
+.fable-title-screen.fable-title-held {
+    opacity: 0;
+    animation: none;
+}
 
 /* --- Boot transition: the 2s-paused welcome + magical ripple --- */
 /* The cinematic open sequence (see screens/boot.js). The prior fog roll

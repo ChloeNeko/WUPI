@@ -11038,6 +11038,22 @@ fn safe_shortcut_name(name: &str) -> String {
     }
 }
 
+/// The `.lnk` label for a card's shortcut: the card's parsed `<identity>
+/// <name>`, falling back to the folder slug for pre-reorg (2026-08-01) cards
+/// whose legacy top-level `<name>` the parser doesn't read (parse yields
+/// "unknown") — so a shortcut is "Launch One Piece.lnk", never "Launch
+/// unknown.lnk". Shared by `build_card_shortcut` (create) AND
+/// `fable_card_delete` (Desktop reap) so the two always agree on the filename.
+fn card_shortcut_label(sim_path: &std::path::Path, card_slug: &str) -> String {
+    let card_name = sim_card::load_or_fallback(sim_path).name;
+    let display_name = if card_name.trim().is_empty() || card_name == "unknown" {
+        card_slug.to_string()
+    } else {
+        card_name
+    };
+    safe_shortcut_name(&display_name)
+}
+
 /// Build (or refresh) the `Launch <Card Name>.lnk` shortcut(s) for a card.
 /// Always writes the `.lnk` into the card's own folder (so deleting the card
 /// reaps it automatically via `remove_dir_all`); when `export_to_desktop` is
@@ -11071,10 +11087,9 @@ fn build_card_shortcut(
     if !sim_path.exists() {
         return Err(format!("no card with id '{card_slug}'"));
     }
-    // Display name for the .lnk filename — read from <slug>.sim's <identity>
-    // <name>; fall back to the slug if parsing yields nothing useful.
-    let card_name = sim_card::load_or_fallback(&sim_path).name;
-    let label = safe_shortcut_name(&card_name);
+    // Display name for the .lnk filename — see card_shortcut_label (shared
+    // with fable_card_delete's Desktop reap so the two always agree).
+    let label = card_shortcut_label(&sim_path, card_slug);
     let lnk_name = format!("Launch {label}.lnk");
 
     // Target fable.exe (sibling of whichever exe is running) + working dir =
@@ -11087,7 +11102,12 @@ fn build_card_shortcut(
             install_root.display()
         ));
     }
-    let args = format!("--card {card_slug}");
+    // QUOTE the slug: card folder names may contain spaces ("One Piece"), and
+    // the .lnk Arguments string is re-split by CommandLineToArgvW on launch —
+    // unquoted, `--card One Piece` parses as card="One" + a dropped "Piece"
+    // (observed live: get_launch_context returned cardSlug "One"). Quoted,
+    // it round-trips as the single argv token the parser expects.
+    let args = format!("--card \"{card_slug}\"");
 
     // Icon: wrap portrait.png → portrait.ico (only PNG — ICO can't embed a
     // JPEG). Anything else (jpg / no portrait) → None → fable.exe's F icon.
@@ -11202,7 +11222,7 @@ fn fable_card_delete(card_id: String, app: tauri::AppHandle) -> Result<(), Strin
     // .lnk + portrait.ico + saves tree are all caught by remove_dir_all below,
     // but a `Launch <Name>.lnk` exported to the Desktop lives outside the card
     // folder. Best-effort: a NotFound / unresolvable Desktop is not fatal.
-    let lnk_name = format!("Launch {}.lnk", safe_shortcut_name(&sim_card::load_or_fallback(&sim_path).name));
+    let lnk_name = format!("Launch {}.lnk", card_shortcut_label(&sim_path, &card_id));
     if let Some(desk) = shortcut::desktop_dir() {
         let desk_lnk = desk.join(&lnk_name);
         match std::fs::remove_file(&desk_lnk) {

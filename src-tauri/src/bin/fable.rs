@@ -1,5 +1,9 @@
 // fable.exe — the Fable-only launcher binary (a sibling of wupi.exe).
 //
+// (Name note, 2026-08-14: Discord's game detection matches this exe name to
+// the 2005 game "Fable: The Lost Chapters" (that game's exe is literally
+// Fable.exe). Chloe's call: KEEP the name — do not rename to dodge Discord.)
+//
 // This is the SECOND launcher binary of the same `wupi` crate. It runs the
 // IDENTICAL boot code as wupi.exe (wupi_lib::run) — same model load, same
 // memory DB, same tray, same IPCs — with ONE difference: set_fable_entry()
