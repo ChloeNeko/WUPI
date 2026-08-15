@@ -1497,15 +1497,17 @@
     filter: drop-shadow(0 0 12px rgba(230, 213, 138, 0.6));
 }
 
-/* --- ID Card (compact license-card face + bronze-arrow disclosure) ---------
+/* --- ID Card (compact license-card face + card-icon details popup) ---------
    2026-08-13 (Chloe): the review card now leads with a COMPACT core grid —
    Player/NPC show 8 fields (Name, Gender, Race, Age, Hair Color, Eye Color,
    Height, Weight); World/Scenario show a TYPE banner + Name/Setting/Purpose/
    Tone. NO section headers on the core (a flat <dl> — real-life state-license
-   look). Every remaining tag lives behind a small bronze arrow on the card's
-   right edge → expands the .fable-id-card-extra disclosure (the full
-   section/h3/dl grid, reused wholesale for a clean, parseable read). The card
-   markup comes from screens/id-card.js; the model from buildIdCard. */
+   look). Every remaining tag lives behind a small brass CARD-ICON button on
+   the card's top-right edge (2026-08-14, Chloe: replaces the bronze arrow +
+   its inline slide-out disclosure — removed outright) → opens the
+   .fable-id-details-* CENTERED popup (the full section/h3/dl grid, reused
+   wholesale for a clean, parseable read; the card itself never expands).
+   The card markup comes from screens/id-card.js; the model from buildIdCard. */
 .fable-id-card { position: relative; }     /* anchor for the absolute arrow */
 
 /* Compact core grid — no <h3> dividers. Mirrors the .fable-player-review-section
@@ -1559,8 +1561,8 @@
     text-transform: uppercase;
 }
 
-/* The bronze arrow toggle — small circular brass button at the card's top-right
-   edge. Rotates 90° (points down) when expanded. */
+/* The brass card-icon trigger — small circular brass button at the card's
+   top-right edge. Opens the centered details popup (.fable-id-details-*). */
 .fable-id-card-expand {
     position: absolute;
     top: 22px;
@@ -1577,32 +1579,106 @@
     background: rgba(197, 179, 88, 0.12);
     color: var(--fable-brass-bright);
     cursor: pointer;
-    transition: transform 240ms ease, background 160ms ease, box-shadow 160ms ease;
+    transition: background 160ms ease, box-shadow 160ms ease;
 }
-.fable-id-card-expand svg { width: 22px; height: 22px; display: block; }
+.fable-id-card-expand svg { width: 24px; height: 24px; display: block; }
 .fable-id-card-expand:hover {
     background: rgba(197, 179, 88, 0.22);
     box-shadow: 0 0 16px rgba(230, 213, 138, 0.45);
 }
-.fable-id-card.is-expanded .fable-id-card-expand { transform: rotate(90deg); }
 
-/* The disclosure — the full section/h3/dl grid reused from the review card.
-   Hidden via the [hidden] attr until the arrow is pressed; once shown it flexes
-   to fill the card's leftover height + scrolls internally (the review-mode card
-   cap stays, so CREATE never leaves screen; the Load modal scrolls its own
-   panel). A full-width filament divides it from the compact face. */
-.fable-id-card-extra {
-    flex: 1 1 auto;
-    min-height: 0;
-    width: 100%;
-    overflow-y: auto;
-    margin-top: 10px;
-    padding: 18px 6px 4px 0;
-    border-top: 1px solid rgba(140, 120, 50, 0.45);
-    scrollbar-width: none;              /* hidden scrollbar (clean read) */
+/* --- The ID-card details popup (centered modal) ----------------------------
+   Opened by the card-icon trigger. The same modal aesthetic as the
+   player-picker modal: dimmed blur backdrop, warm glass panel, fade + scale.
+   z-index 52 — above the picker modal (46) + its confirm (48), below the
+   save/load modal (60) + toasts (70). The body scrolls internally so long
+   backstories never push the panel off-screen. */
+.fable-id-details-overlay {
+    position: absolute;
+    inset: 0;
+    z-index: 52;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 5vh 24px;
+    opacity: 0;
+    transition: opacity 220ms ease;
+    pointer-events: none;
 }
-.fable-id-card-extra::-webkit-scrollbar { display: none; }
-.fable-id-card-extra .fable-player-review-section { margin-bottom: 16px; }
+.fable-id-details-overlay[hidden] { display: none; }
+.fable-id-details-overlay.is-open { opacity: 1; pointer-events: auto; }
+.fable-id-details-backdrop {
+    position: absolute;
+    inset: 0;
+    background: rgba(2, 4, 10, 0.85);
+    backdrop-filter: blur(8px);
+    -webkit-backdrop-filter: blur(8px);
+}
+.fable-id-details-modal {
+    position: relative;
+    z-index: 2;
+    display: flex;
+    flex-direction: column;
+    width: min(720px, 92vw);
+    max-height: 82vh;
+    overflow: hidden;               /* the body scrolls, not the panel */
+    background: linear-gradient(180deg, rgba(38, 26, 16, 0.98), rgba(20, 14, 9, 0.98));
+    border: 1px solid var(--fable-brass-dim);
+    border-radius: 12px;
+    box-shadow: 0 24px 60px rgba(0, 0, 0, 0.7), var(--fable-emboss);
+    transform: scale(0.92);
+    transition: transform 220ms cubic-bezier(0.2, 0.8, 0.2, 1);
+}
+.fable-id-details-overlay.is-open .fable-id-details-modal { transform: scale(1); }
+.fable-id-details-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 16px;
+    padding: 18px 22px 14px;
+    border-bottom: 1px solid rgba(140, 120, 50, 0.45);
+}
+.fable-id-details-title {
+    font-family: 'Almendra', var(--fable-font-serif);
+    font-weight: 700;
+    font-size: 1.45rem;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--fable-brass-bright);
+    text-shadow: 0 0 12px var(--fable-brass-glow);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;            /* long names clamp to one line */
+}
+.fable-id-details-close {
+    flex: 0 0 auto;
+    width: 36px;
+    height: 36px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 0;
+    border: 1px solid rgba(197, 179, 88, 0.45);
+    border-radius: 50%;
+    background: rgba(197, 179, 88, 0.12);
+    color: var(--fable-brass-bright);
+    font-size: 16px;
+    cursor: pointer;
+    transition: background 160ms ease, border-color 160ms ease, box-shadow 160ms ease;
+}
+.fable-id-details-close:hover {
+    background: rgba(220, 90, 70, 0.18);
+    border-color: rgba(220, 90, 70, 0.55);
+    color: #f4a0a0;
+    box-shadow: 0 0 12px rgba(220, 90, 70, 0.35);
+}
+.fable-id-details-body {
+    min-height: 0;
+    overflow-y: auto;
+    padding: 18px 26px 22px;
+}
+.fable-id-details-body .fable-player-review-section { margin-bottom: 18px; }
+.fable-id-details-body .fable-player-review-section:last-child { margin-bottom: 0; }
 
 /* --- Creator Chat (minimal two-block UI) ----------------------------------
    2026-08-13 Chloe: the GLM-conversational wizards (Player/Sim/Codex) render
@@ -2153,8 +2229,11 @@
     .fable-wizard-stage,
     .fable-player-modal-overlay,
     .fable-player-modal,
-    .fable-player-confirm { transition: none !important; }
-    .fable-player-modal { transform: none !important; }
+    .fable-player-confirm,
+    .fable-id-details-overlay,
+    .fable-id-details-modal { transition: none !important; }
+    .fable-player-modal,
+    .fable-id-details-modal { transform: none !important; }
 }
 
 /* =======================================================================

@@ -158,6 +158,18 @@ export const ARROW_SVG_LEFT = `<svg viewBox="0 0 100 64" aria-hidden="true" focu
         stroke-linejoin="round" stroke-linecap="round"/>
 </svg>`;
 
+// The ID-CARD glyph — the details trigger on the compact license-card face
+// (2026-08-14, Chloe: replaces the bronze arrow). A card outline carrying a
+// portrait bust + text lines; reads as "the full card" at button size.
+export const CARD_SVG = `<svg viewBox="0 0 64 64" aria-hidden="true" focusable="false">
+  <rect x="10" y="6" width="44" height="52" rx="6" fill="none" stroke="currentColor" stroke-width="3.5"/>
+  <circle cx="24" cy="24" r="5" fill="currentColor"/>
+  <path d="M15 42c2-7 16-7 18 0z" fill="currentColor"/>
+  <line x1="38" y1="20" x2="49" y2="20" stroke="currentColor" stroke-width="3.5" stroke-linecap="round"/>
+  <line x1="38" y1="29" x2="49" y2="29" stroke="currentColor" stroke-width="3.5" stroke-linecap="round"/>
+  <line x1="15" y1="49" x2="49" y2="49" stroke="currentColor" stroke-width="3.5" stroke-linecap="round"/>
+</svg>`;
+
 // Mars (♂) + Venus (♀) symbols as inline SVG paths — verbatim from
 // player-creator.js. Sharp brass glyphs, no bubbly text glyphs.
 export const MARS_SVG = `<svg class="fable-wizard-glyph-svg" viewBox="0 0 100 120" aria-hidden="true" focusable="false">

@@ -380,7 +380,7 @@ export function renderCreatorChat(root, config) {
     }
     const createBtn = el.querySelector('[data-review-create]');
     if (createBtn) createBtn.addEventListener('click', () => doCreate(createBtn));
-    // Bronze-arrow expand/collapse on the ID card (no-op for codex/intro).
+    // Card-icon details popup on the ID card (no-op for codex/intro).
     wireIdCard(el);
   }
 

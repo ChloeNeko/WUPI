@@ -239,7 +239,7 @@ async function openModal(root, meta) {
   card.querySelector('[data-modal-delete]').addEventListener('click', () => {
     confirmDelete(root, full);
   });
-  // Bronze-arrow expand/collapse on the ID card.
+  // Card-icon details popup on the ID card.
   wireIdCard(card);
 }
 
@@ -268,8 +268,9 @@ const SILHOUETTE_SVG = `<svg class="fable-portrait-silhouette" viewBox="0 0 120 
 // portrait left) shared with the Creator review — via buildIdCard +
 // renderIdCard. Everything else (hair length/style, build, distinctive
 // features, clothing, accessories, inventory, background, …) lives behind the
-// bronze arrow. The portrait stays clickable (data-modal-portrait) to re-pick;
-// the three action buttons live in a centered wrapper BELOW the card.
+// card-icon details popup. The portrait stays clickable (data-modal-portrait)
+// to re-pick; the three action buttons live in a centered wrapper BELOW the
+// card.
 function renderModalCard(sp) {
   const portraitHTML = sp.portrait
     ? `<img src="${esc(convertFileSrc(sp.portrait))}" alt="" onerror="this.style.display='none'">`
