@@ -7503,7 +7503,6 @@ fn build_creator_assistant_system_prompt(creator_kind: &str) -> String {
         "player" => out.push_str("a player character"),
         "sim" => out.push_str("a roleplay world (a Fable sim card)"),
         "codex" => out.push_str("a lorebook (a codex of world rules and lore)"),
-        "intro" => out.push_str("the opening narrator beat for a roleplay world"),
         _ => out.push_str("a creative element"),
     }
     out.push_str(
@@ -7564,10 +7563,19 @@ fn build_creator_assistant_system_prompt(creator_kind: &str) -> String {
              SHARED (all branches): locations = array of {name, neighbors:[strings]} \
              (the location anchor is the FIRST entry; the graph grows in play). cast = \
              array of {name, identity} (npc: the one NPC; scenario/world: any starting \
-             NPCs, or omit). intro = optional 1-3 sentence opening narrator beat. \
-             custom_tags = optional flat {key:value} string map for anything that \
-             doesn't fit a field above (currency, faction standing, curse, custom \
-             attribute).\n\n",
+             NPCs, or omit). custom_tags = optional flat {key:value} string map for \
+             anything that doesn't fit a field above (currency, faction standing, \
+             curse, custom attribute).\n\
+             THE INTRO QUESTION (mandatory for EVERY card_type — the card cannot be \
+             finalized without it): before emitting ready you MUST ask the player \
+             whether they want an INTRO (the opening narrator beat that starts the \
+             game). If yes, ask what they'd like it to be — or offer to write one \
+             yourself from the card's tone and anchors if they have no preference — \
+             and set draft.intro to the agreed 2-4 sentence opening (second person, \
+             present tense, no dialogue tags or bracket commands). If the player \
+             declines, leave intro empty. An imported card's first_mes / \
+             alternate_greetings (in the <import> block) count as an agreed intro — \
+             confirm + carry them into draft.intro rather than rewriting.\n\n",
         ),
         "codex" => out.push_str(
             "entries (array of objects each {title, tags:[short keywords], body}). One \
@@ -7580,16 +7588,6 @@ fn build_creator_assistant_system_prompt(creator_kind: &str) -> String {
              \"<Concept> — Part 1\", \"<Concept> — Part 2\", … so the full \
              content carries across parts that each embed cleanly. Never \
              truncate or drop lore to meet the ceiling.\n\n",
-        ),
-        "intro" => out.push_str(
-            "intro (a single string: the opening narrator beat, 2-4 sentences, second \
-             person present tense, no dialogue tags or bracket commands — it sets the \
-             scene + situates the player). The imported reference data carries `world` \
-             (with its `tone`), `player`, optional `codex` lore entries, and an optional \
-             `nudge`. If `nudge` is present and non-empty, make the opening beat center \
-             on it while staying true to the world's tone and lore; if `nudge` is empty \
-             or absent, craft an opening that fits the world's tone, draws on the codex \
-             lore, and situates this player. Never contradict the supplied lore.\n\n",
         ),
         _ => {}
     }
@@ -7628,8 +7626,7 @@ fn build_creator_assistant_system_prompt(creator_kind: &str) -> String {
          - When ready to finalize: {\"action\":\"ready\", \"draft\":{<every required field filled>}}\n\
          The draft accumulates across turns — repeat the fields decided so far on every turn (or omit unchanged ones); never blank out a field already set. Ask at most three short questions per turn, one focused thread at a time — never a wall of questions. \
          For the player schema: settle gender and race early, then ask only the contextual fields that actually apply (breast_size if the character is female; ears, tail, horn if the race is non-human). Do not emit ready until every core field, every applicable contextual field, and any optional or custom-tag thread the player raised are resolved. \
-         For the sim schema: do not emit ready until draft.card_type + name are set, every universal anchor (date, time, weather, location) is filled, and the chosen branch's mandatory fields are complete (npc: the identity fields + personality/flaws/job/backstory/dialogue_style/tone; scenario: directive/trigger_condition/primary_objective/participating_actors/tone; world: directive/setting/tone). \
-         For the intro schema, emit ready immediately with the opening beat (no questions). \
+         For the sim schema: do not emit ready until draft.card_type + name are set, every universal anchor (date, time, weather, location) is filled, the chosen branch's mandatory fields are complete (npc: the identity fields + personality/flaws/job/backstory/dialogue_style/tone; scenario: directive/trigger_condition/primary_objective/participating_actors/tone; world: directive/setting/tone), AND the INTRO question has been answered (an agreed draft.intro, or an explicit no — never assume either way). \
          Keep every string value in plain prose (no JSON, no markup) except where the value is itself prose.\n",
     );
 
@@ -9438,8 +9435,11 @@ async fn creator_assistant_turn(
     require_api_for_fable(&state)?;
 
     // Validate the creator kind up front (the prompt builder branches on it).
+    // The "intro" kind was REMOVED 2026-08-15 (Chloe): the SIM Wizard asks the
+    // mandatory intro question itself + serializeSimCard embeds the agreed
+    // `<intro>` sibling — there is no post-card intro generation pass.
     match creator_kind.as_str() {
-        "player" | "sim" | "codex" | "intro" => {}
+        "player" | "sim" | "codex" => {}
         other => return Err(format!("creator_assistant_turn: unknown creator_kind {other:?}")),
     }
 
@@ -13668,6 +13668,13 @@ mod tests {
         assert!(sim.contains("date"));
         assert!(sim.contains("custom_tags"));
         assert!(sim.contains("do not emit ready until draft.card_type"));
+        // The mandatory INTRO question (2026-08-15, Chloe: the SIM Wizard —
+        // not a post-card step — asks it; a card can't finalize without an
+        // answer). Pinned so a lean-prompt pass can't silently demote it back
+        // to an optional field.
+        assert!(sim.contains("THE INTRO QUESTION"));
+        assert!(sim.contains("whether they want an INTRO"));
+        assert!(sim.contains("the INTRO question has been answered"));
 
         let codex = build_creator_assistant_system_prompt("codex");
         assert!(codex.contains("entries"));
@@ -13679,10 +13686,6 @@ mod tests {
         assert!(codex.contains("SPLIT"));
         assert!(codex.contains("Part 1"));
         assert!(codex.contains("Never truncate or drop lore"));
-
-        let intro = build_creator_assistant_system_prompt("intro");
-        assert!(intro.contains("opening narrator beat"));
-        assert!(intro.contains("emit ready immediately"));
 
         // Input curation block (player used as the representative kind — the
         // block is shared across all kinds). Pinned so a "lean prompt" pass

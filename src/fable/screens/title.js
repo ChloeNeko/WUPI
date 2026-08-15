@@ -41,11 +41,12 @@ import fableTitleUrl from '../assets/fable_title.png';
 import BUTTON_SFX_SRC from '../assets/fableButtonSFX.mp3';
 import { invoke } from '@tauri-apps/api/core';
 
-// Play the menu-button SFX on every press. 0.6 volume = 40% lower than the
-// authored full-volume master. One-shot <audio> node that self-removes on
-// ended/error so nothing leaks across presses. Swallows autoplay rejection
-// silently (the button click IS the user gesture, so it will normally play).
-const BUTTON_SFX_VOLUME = 0.6;
+// Play the menu-button SFX on every press. One-shot <audio> node that
+// self-removes on ended/error so nothing leaks across presses. Swallows
+// autoplay rejection silently (the button click IS the user gesture, so it
+// will normally play). 2026-08-15 Chloe: lowered a further 40% (0.6 → 0.36)
+// — the authored master still read too loud against the title theme.
+const BUTTON_SFX_VOLUME = 0.36;
 function playButtonSfx() {
   const audio = document.createElement('audio');
   audio.src = BUTTON_SFX_SRC;

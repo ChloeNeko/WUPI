@@ -197,13 +197,15 @@ fn spawn_wupi(target_dir: &Path) {
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
-        // DETACHED_PROCESS: the new wupi.exe must outlive THIS updater's own
-        //   imminent exit (it is not a tied child).
-        // CREATE_NO_WINDOW: headless launch — no console flash for the user.
-        const DETACHED_PROCESS: u32 = 0x0000_0008;
+        // CREATE_NO_WINDOW alone — headless launch, no console flash. Do NOT
+        // add DETACHED_PROCESS: Windows ignores CREATE_NO_WINDOW when the two
+        // are combined, and a console-less detached process spawning a console
+        // app with default flags gets a NEW VISIBLE console for it. Lifetime
+        // is not a concern either — Windows children always outlive their
+        // parent, so the new wupi.exe survives this updater's exit regardless.
         const CREATE_NO_WINDOW: u32 = 0x0200_0000;
         if let Err(e) = std::process::Command::new(&exe)
-            .creation_flags(DETACHED_PROCESS | CREATE_NO_WINDOW)
+            .creation_flags(CREATE_NO_WINDOW)
             .spawn()
         {
             log(format!("spawn wupi.exe failed: {e}"));
@@ -270,7 +272,14 @@ fn self_delete_temp_copy() {
         log_path.display()
     );
     use std::os::windows::process::CommandExt;
-    const DETACHED_PROCESS: u32 = 0x0000_0008;
+    // CREATE_NO_WINDOW ALONE — this is the load-bearing fix. With
+    // DETACHED_PROCESS also set, Windows ignores CREATE_NO_WINDOW, cmd gets NO
+    // console at all, and its external `ping.exe` child (launched with default
+    // flags) then receives a NEW VISIBLE console window — the ~2s terminal the
+    // user saw flashing in the background during updates. With
+    // CREATE_NO_WINDOW alone, cmd gets a HIDDEN console that ping inherits:
+    // nothing is ever visible. (Grandchildren only flash when the parent is
+    // console-less; a hidden console is inherited silently.)
     const CREATE_NO_WINDOW: u32 = 0x0200_0000;
     let mut cmd = std::process::Command::new("cmd.exe");
     // raw_arg, not args: std's default Windows argument quoting wraps the
@@ -280,7 +289,7 @@ fn self_delete_temp_copy() {
     // 0.19.0→0.19.1 hop). raw_arg passes the script verbatim so the quoted
     // paths reach cmd intact.
     cmd.raw_arg(format!("/C {script}"));
-    let _ = cmd.creation_flags(DETACHED_PROCESS | CREATE_NO_WINDOW).spawn();
+    let _ = cmd.creation_flags(CREATE_NO_WINDOW).spawn();
 }
 
 /// Non-Windows stub: the temp-copy handoff + self-delete are Windows-only.

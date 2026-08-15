@@ -22,16 +22,16 @@
 //
 // MENU STATE: all 3 title flows are wired.
 //   New Game → the cinematic creator flow: Player pair → SIM pair → Codex
-//              pair → Intro pair → launchGame (see revealNewGameShell). Each
-//              picker reuses the newgame-split tile language; any picker whose
-//              content already exists on the card is skipped (advanceFromSim).
+//              pair → launchGame (see revealNewGameShell). Each picker
+//              reuses the newgame-split tile language; the Codex picker is
+//              skipped when the card already has a codex (advanceFromSim).
 //   Continue → resume the freshest save (resumeSave).
 //   Load     → two-level picker: worlds.js → saves.js → resume.
 // The working stage + gameplay engine (stage.js, engine/*, fx/*, panels/*)
 // are the destination of every flow.
 // =============================================================
 
-import { invoke, Channel } from '@tauri-apps/api/core';
+import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import { AppLifecycle } from '../app-lifecycle.js';
 import './fable.css';
@@ -48,7 +48,6 @@ import { playBurnTransition, playReverseSpawn } from './engine/burn-transition.j
 import { tileCaptionHTML } from './engine/tile-caption.js';
 import { buildWorlds, renderWorlds } from './screens/worlds.js';
 import { buildSaves, renderSaves } from './screens/saves.js';
-import { parseEnvelope } from './engine/creator-engine.js';
 import {
   startThemeMusic, stopThemeMusic, fadeOutThemeMusic,
   pauseThemeMusic, resumeThemeMusic,
@@ -78,16 +77,16 @@ let flowAmbiance = null;
 let flowChrome = null;
 // The New Game flow state machine. `step` tracks the current screen so the
 // flow-chrome ‹ can route back correctly; `selectedPlayerId` carries the
-// chosen SavedPlayer forward to the SIM/Codex/Intro steps; `selectedCardId`
-// is the SIM card established by the SIM pair (rides to Codex/Intro/launch).
-// The GLM-driven player/sim/codex/intro wizards all hang off this same state.
+// chosen SavedPlayer forward to the SIM/codex steps; `selectedCardId`
+// is the SIM card established by the SIM pair (rides to codex/launch).
+// The GLM-driven player/sim/codex wizards all hang off this same state.
 let flowState = {
   step: null,
   slideOneHasBack: false, // whether slide 1 (Player pair) shows ‹ (Load-menu entry only)
-  selectedCardId: null,   // the sim card built by the sim wizard (rides to codex/intro)
+  selectedCardId: null,   // the sim card built by the sim wizard (rides to codex/launch)
   selectedPlayerId: null, // the chosen SavedPlayer (rides to fable_start)
-  playerDraft: null,      // the player wizard's draft (context for the intro)
-  simDraft: null,         // the sim wizard's draft (context for the intro)
+  playerDraft: null,      // the player wizard's draft (starting conditions for fable_start)
+  simDraft: null,         // the sim wizard's draft (context for the launch)
   pendingImport: null,    // a SillyTavern import { charData, portraitDataUrl?, portraitExt? } seeded by the IMPORT tile → the Player Wizard
   pendingSimIntro: null,  // imported first_mes + alternate_greetings carried into the SIM card's <intro> (set by the IMPORT tile)
 };
@@ -748,18 +747,21 @@ function exitLoadToTitle() {
 //     → Create/Import Player → burn → GLM Player Wizard → SIM pair
 //     → Load Player          → burn → Player Picker → select → SIM pair
 //   Slide 2: SIM pair (NEW / LOAD / IMPORT SIM CARD) → establish card →
-//            advanceFromSim (skips Codex/Intro pickers whose content exists)
+//            advanceFromSim (skips the Codex picker when a codex exists)
 //   Slide 3: Codex pair (CREATE / CONTINUE-WITHOUT / IMPORT) — skipped if codex
-//   Slide 4: Intro pair (ADD / NO INTRO) — skipped if intro; else launchGame
-// A card that already has BOTH codex + intro launches the instant it's
-// established. Each GLM wizard (player/sim/codex) is driven by creator-chat.js;
-// the intro is a one-shot nudge collector → launchGame generates behind the fade.
+//   → launchGame
+// The INTRO step is GONE (2026-08-15, Chloe): the SIM Wizard itself must ask
+// the mandatory intro question (yes → what should it say / no → confirmed
+// none) before its draft can complete — serializeSimCard writes the agreed
+// `<intro>` sibling in-file, so no post-card step exists. A card that already
+// has a codex launches the instant it's established. Each GLM wizard
+// (player/sim/codex) is driven by creator-chat.js.
 
 // === Flow pair tiles (the shared picker language) ========================
-// Every picker slide (Player / SIM / Codex / Intro) is a pair of caption slabs
+// Every picker slide (Player / SIM / Codex) is a pair of caption slabs
 // (+ an optional IMPORT mini tile) in the newgame-split host, revealed by the
 // reverse-spawn + burned on click. buildFlowPairTiles generalizes the old
-// Player-pair-only builders so all four pickers share one code path.
+// Player-pair-only builders so all pickers share one code path.
 
 // Build an arbitrary pair of flow tiles (+ optional IMPORT mini tile) into the
 // newgame-split host. `pair` is [{caption, act, onClick} x2]; `importTile` is
@@ -844,8 +846,8 @@ function siblingTilesExcept(selectedBtn) {
 // Create Player: clicked pops+fades, the other burns, → GLM Player Wizard.
 // The wizard converses with the API, shows a review card (with a clickable
 // portrait slot → cropper), then writes via fable_player_write. On CREATE it
-// carries the new player id ( + draft, for the intro's context) into the sim
-// step.
+// carries the new player id (+ draft, for the starting conditions) into the
+// sim step.
 function flowCreatePlayer(selectedBtn) {
   if (flowBusy) return;
   setFlowBusy(true);
@@ -859,7 +861,6 @@ function flowCreatePlayer(selectedBtn) {
       setFlowStep('creator-chat');
       renderCreatorChat(screens['creator-chat'], {
         creatorKind: 'player',
-        title: 'Player Wizard',
         onCreated: ({ playerId, draft }) => {
           flowState.selectedPlayerId = playerId;
           flowState.playerDraft = draft;
@@ -907,7 +908,6 @@ async function flowImportPlayer(selectedBtn) {
       setFlowStep('creator-chat');
       renderCreatorChat(screens['creator-chat'], {
         creatorKind: 'player',
-        title: 'Player Wizard',
         presetImportData: importSeed && importSeed.charData,
         presetPortraitDataUrl: importSeed && importSeed.portraitDataUrl,
         presetPortraitExt: importSeed && importSeed.portraitExt,
@@ -956,7 +956,6 @@ function flowEditPlayer(player) {
   setFlowStep('creator-chat');
   renderCreatorChat(screens['creator-chat'], {
     creatorKind: 'player',
-    title: 'Edit Player',
     seedDraft: player,
     onCreated: ({ playerId, draft }) => {
       flowState.selectedPlayerId = playerId;
@@ -968,8 +967,8 @@ function flowEditPlayer(player) {
 }
 
 // Route after a player is chosen (Load). The SIM pair is the next step.
-// (Loaded players have no draft; flowState.playerDraft stays null + the intro
-// step works off the world context alone.)
+// (Loaded players have no draft; flowState.playerDraft stays null → no
+// transient starting conditions are seeded at launch.)
 function advanceAfterPlayer(playerId) {
   flowState.selectedPlayerId = playerId;
   flowSimPair();
@@ -992,7 +991,6 @@ function flowCreateSim(presetImport = null, presetIntro = null) {
   flowState.pendingSimIntro = null;
   renderCreatorChat(screens['creator-chat'], {
     creatorKind: 'sim',
-    title: 'World Wizard',
     presetImportData: presetImport,
     presetIntro: intro,
     onCreated: ({ cardId, draft }) => {
@@ -1004,12 +1002,11 @@ function flowCreateSim(presetImport = null, presetIntro = null) {
   });
 }
 
-// === SIM / Codex / Intro pickers + content-aware skip ====================
+// === SIM / Codex pickers + content-aware skip ============================
 // The New Game flow past the player step is a chain of tile pickers (each
-// reusing the newgame-split tile language) — SIM pair → Codex pair → Intro
-// pair — ending in launchGame. `advanceFromSim` skips any picker whose content
-// already exists on the established card (a loaded world with a codex skips
-// the Codex picker; one with both codex + intro launches immediately).
+// reusing the newgame-split tile language) — SIM pair → Codex pair — ending
+// in launchGame. `advanceFromSim` skips the Codex picker when the established
+// card already has a codex (a loaded world with lore launches immediately).
 
 // Burn the clicked pair tile + its siblings, then run `next` once the burn
 // completes. Centralizes the per-picker burn boilerplate (every picker tile
@@ -1096,52 +1093,39 @@ async function flowImportSim(selectedBtn) {
 }
 
 // --- Content detection + the skip matrix ---------------------------------
-// Best-effort: a card "has" a codex when its .codex sibling is non-empty, and
-// "has" an intro when its .sim carries an <intro> root (the in-file sibling
-// written by fable_card_set_intro / the SIM serializer). Both run before any
-// active game exists, so they use the by-id variants.
+// Best-effort: a card "has" a codex when its .codex sibling is non-empty.
+// Runs before any active game exists, so it uses the by-id variant.
 async function detectHasCodex(cardId) {
   try {
     const r = await invoke('fable_codex_get_by_id', { cardId });
     return !!(r && r.raw && r.raw.trim());
   } catch (_) { return false; }
 }
-async function detectHasIntro(cardId) {
-  try {
-    const raw = await invoke('fable_card_raw_get_by_id', { cardId });
-    return /<intro[\s>]/i.test(raw || '');
-  } catch (_) { return false; }
-}
 
-// Route after a sim card is established (NEW / LOAD / IMPORT). Skips the Codex
-// picker if a codex exists + the Intro picker if an intro exists — so a loaded
-// world that already has both launches immediately.
+// Route after a sim card is established (NEW / LOAD / IMPORT). Skips the
+// Codex picker when a codex already exists — a loaded world with lore
+// launches immediately. The intro question is the SIM Wizard's job now (asked
+// in-chat before its draft can complete), so there is no intro picker to skip.
 async function advanceFromSim(cardId) {
-  const [hasCodex, hasIntro] = await Promise.all([
-    detectHasCodex(cardId),
-    detectHasIntro(cardId),
-  ]);
-  if (hasCodex && hasIntro) {
+  const hasCodex = await detectHasCodex(cardId);
+  if (hasCodex) {
     launchGame(cardId);
-  } else if (hasCodex) {
-    flowIntroPair(cardId);
-  } else if (hasIntro) {
-    // Intro already exists → the Codex picker is the LAST slide (no Intro
-    // picker after it): on any codex choice, launch directly.
-    flowCodexPair(cardId, { afterCodex: () => launchGame(cardId) });
   } else {
-    flowCodexPair(cardId, { afterCodex: () => flowIntroPair(cardId) });
+    flowCodexPair(cardId, { afterCodex: () => launchGame(cardId) });
   }
 }
 
 // --- Codex pair: CREATE SIM CODEX / CONTINUE WITHOUT CODEX / IMPORT ------
+// The LAST picker slide: any codex choice (create / skip / import) ends in
+// `afterCodex` — normally launchGame.
 function flowCodexPair(cardId, { afterCodex } = {}) {
+  const done = afterCodex || (() => launchGame(cardId));
   buildFlowPairTiles({
     pair: [
-      { caption: 'CREATE SIM CODEX', act: 'create-codex', onClick: (b) => burnPairTile(b, () => flowCreateCodex(cardId, null, afterCodex)) },
-      { caption: 'CONTINUE WITHOUT CODEX', act: 'no-codex', onClick: (b) => burnPairTile(b, () => (afterCodex ? afterCodex() : flowIntroPair(cardId))) },
+      { caption: 'CREATE SIM CODEX', act: 'create-codex', onClick: (b) => burnPairTile(b, () => flowCreateCodex(cardId, null, done)) },
+      { caption: 'CONTINUE WITHOUT CODEX', act: 'no-codex', onClick: (b) => burnPairTile(b, done) },
     ],
-    importTile: { caption: 'IMPORT', onClick: (b) => flowImportCodexPair(b, cardId, afterCodex) },
+    importTile: { caption: 'IMPORT', onClick: (b) => flowImportCodexPair(b, cardId, done) },
   });
   showScreen('newgame-split');
   setFlowStep('codex-pair');
@@ -1149,15 +1133,15 @@ function flowCodexPair(cardId, { afterCodex } = {}) {
 }
 
 function flowCreateCodex(cardId, presetImport, afterCodex) {
+  const done = afterCodex || (() => launchGame(cardId));
   showScreen('creator-chat');
   setFlowStep('creator-chat');
   renderCreatorChat(screens['creator-chat'], {
     creatorKind: 'codex',
-    title: 'Codex Wizard',
     cardId,
     presetImportData: presetImport,
-    onCreated: () => (afterCodex ? afterCodex() : flowIntroPair(cardId)),
-    back: () => flowCodexPair(cardId, { afterCodex }),
+    onCreated: () => done(),
+    back: () => flowCodexPair(cardId, { afterCodex: done }),
   });
 }
 
@@ -1183,37 +1167,9 @@ async function flowImportCodexPair(selectedBtn, cardId, afterCodex) {
   });
 }
 
-// --- Intro pair: ADD INTRO / NO INTRO  (no import) -----------------------
-function flowIntroPair(cardId) {
-  buildFlowPairTiles({
-    pair: [
-      { caption: 'ADD INTRO', act: 'add-intro', onClick: (b) => burnPairTile(b, () => flowCreateIntro(cardId)) },
-      { caption: 'NO INTRO', act: 'no-intro', onClick: (b) => burnPairTile(b, () => launchGame(cardId)) },
-    ],
-    importTile: null,
-  });
-  showScreen('newgame-split');
-  setFlowStep('intro-pair');
-  spawnFlowTiles();
-}
-
-// ADD INTRO → the intro-nudge collector. A fixed static prompt asks what the
-// intro should say/include; Enter (empty or a nudge) hands it to launchGame,
-// which generates the opening beat behind the fade (codex + sim + player
-// context, fitting the world <tone>, revolving around the nudge if given).
-function flowCreateIntro(cardId) {
-  showScreen('creator-chat');
-  setFlowStep('creator-chat');
-  renderCreatorChat(screens['creator-chat'], {
-    creatorKind: 'intro',
-    title: 'Opening Beat',
-    cardId,
-    introNudge: true,
-    staticPrompt: "How would you like the narrator to start your story? If you're unsure just add something vague or just tap *ENTER* and I don't mind creating the intro for you.",
-    onEnter: (nudge) => launchGame(cardId, nudge),
-    back: () => flowIntroPair(cardId),
-  });
-}
+// (The intro pair + nudge collector were REMOVED 2026-08-15, Chloe: the SIM
+// Wizard asks the mandatory intro question itself + serializeSimCard embeds
+// the agreed `<intro>` sibling — see creator-chat.js + card-serialize.js.)
 
 // Sync the flow-chrome ‹ button to the current step. Slide 1 (the Player
 // pair, step === 'player') hides ‹ unless the entry had a meaningful back
@@ -1267,9 +1223,6 @@ function flowBack(onBack) {
     case 'codex-pair':          // Codex pair → SIM pair
       flowSimPair();
       break;
-    case 'intro-pair':          // Intro pair → Codex pair (re-offer codex)
-      flowCodexPair(flowState.selectedCardId, { afterCodex: () => flowIntroPair(flowState.selectedCardId) });
-      break;
     case 'player':              // Player pair → prior screen or title
       if (onBack) onBack(); else exitFlowToTitle();
       break;
@@ -1303,10 +1256,11 @@ function buildStartingConditions(draft) {
 }
 
 // === The cinematic launch ===============================================
-// The terminal step for every New Game path (NO INTRO + ADD INTRO alike):
-// fade the flow UI to leave only the background + music, [optionally generate
-// the intro behind the fade], run fable_start (the "schema captured" wait),
-// then stop the music + fade to black + enter the stage.
+// The terminal step for every New Game path: fade the flow UI to leave only
+// the background + music, run fable_start (the "schema captured" wait), then
+// stop the music + fade to black + enter the stage. (The behind-the-fade
+// intro generation is GONE with the intro step — the SIM Wizard's draft
+// already carries the agreed `<intro>` in-file.)
 
 // Fade whatever screen is currently visible (the picker tiles or the chat
 // shell) to opacity 0 + hide the flow chrome, leaving the .fable-flow-ambiance
@@ -1317,69 +1271,14 @@ function fadeFlowToLoading() {
   if (current) current.classList.add('is-launching');
 }
 
-// Generate the opening beat behind the fade: gather codex + world + player +
-// nudge into import_data, one creator_assistant_turn (intro kind, emits `ready`
-// immediately), parse the envelope, write draft.intro via fable_card_set_intro.
-// Empty nudge → the model crafts an intro from the codex + world tone + player;
-// non-empty → revolves around the nudge. Best-effort: a failure logs + the
-// launch continues (fable_start falls back to no intro).
-async function generateIntroOneShot(cardId, nudge) {
-  let codexEntries = [];
-  try {
-    const r = await invoke('fable_codex_get_by_id', { cardId });
-    codexEntries = (r && r.entries) || [];
-  } catch (_) { /* no codex — fine */ }
-  const importData = {
-    world: flowState.simDraft || null,
-    player: flowState.playerDraft || null,
-    codex: codexEntries,
-    nudge: nudge || '',
-  };
-  const text = await new Promise((resolve, reject) => {
-    const channel = new Channel();
-    let settled = false;
-    channel.onmessage = (msg) => {
-      if (msg.type === 'done') {
-        if (settled) return; settled = true; resolve(msg.text || '');
-      } else if (msg.type === 'cancelled' || msg.type === 'api_lost') {
-        if (settled) return; settled = true; reject(new Error(msg.message || msg.type));
-      }
-    };
-    invoke('creator_assistant_turn', {
-      creatorKind: 'intro',
-      history: [{
-        role: 'user',
-        content: nudge ? `Opening beat nudge: ${nudge}` : 'Write the opening narrator beat that launches this world.',
-      }],
-      importData,
-      onEvent: channel,
-    }).catch((e) => { if (!settled) { settled = true; reject(e); } });
-  });
-  const env = parseEnvelope(text);
-  const intro = env && env.draft ? (env.draft.intro || '').trim() : '';
-  if (intro) {
-    await invoke('fable_card_set_intro', { cardId, text: intro });
-  }
-}
-
-// The terminal step: fade UI (background + music hold) → [intro gen if ADD]
-// → fable_start (schema capture) → stop music + fade to black + stage.
-// `nudge === undefined` → NO INTRO (skip generation); a string (possibly '')
-// → ADD INTRO (generate the opening beat from the nudge).
-async function launchGame(cardId, nudge = undefined) {
+// The terminal step: fade UI (background + music hold) → fable_start (schema
+// capture) → stop music + fade to black + stage.
+async function launchGame(cardId) {
   // Guarded: a picker tile's burn-onComplete or the intro Enter could
   // double-fire. enterStageViaTransition clears the flag.
   if (flowBusy) return;
   setFlowBusy(true);
   fadeFlowToLoading();
-  // ADD INTRO: generate the opening beat behind the fade, then persist it.
-  if (nudge !== undefined) {
-    try {
-      await generateIntroOneShot(cardId, nudge);
-    } catch (e) {
-      console.error('[fable] intro generation failed — launching without intro', e);
-    }
-  }
   // fable_start: seat the card, bootstrap the schema anchors (clock/weather/
   // location), seed the tracker. The new-game music keeps playing during this
   // wait (the "background + music" hold); it stops further below.

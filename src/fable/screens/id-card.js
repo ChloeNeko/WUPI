@@ -26,6 +26,14 @@
 import { escapeXml } from './card-serialize.js';
 import { SILHOUETTE_SVG, CARD_SVG } from './wizard-engine.js';
 
+// The corner-pencil icon (the review card's edit affordance, 2026-08-15
+// Chloe — replaces the old "Edit" button in the CREATE row). Stroke-based so
+// it reads cleanly at 22px beside the filled CARD_SVG.
+export const PENCIL_SVG = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false">
+  <path d="M12 20h9"/>
+  <path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z"/>
+</svg>`;
+
 // Render ONLY the ID-card markup (no action buttons).
 //   model: { variant:'player'|'world', banner?, tag?, core:[[l,v]], extra:[[title,[[l,v]]]] }
 //   opts:
@@ -36,6 +44,10 @@ import { SILHOUETTE_SVG, CARD_SVG } from './wizard-engine.js';
 //     portraitHtml:       string   — prebuilt <img>/fallback HTML. The picker
 //                                    builds this from convertFileSrc + its own
 //                                    silhouette, so it wins when supplied.
+//     editable:           bool     — Creator review only: renders the corner
+//                                    PENCIL beside the card-icon details
+//                                    button (data-review-pencil → the creator's
+//                                    edit popup). The pickers never pass it.
 export function renderIdCard(model, opts = {}) {
   const esc = escapeXml;
   const m = model || {};
@@ -84,9 +96,14 @@ export function renderIdCard(model, opts = {}) {
     ? `<template data-id-extra>${extraInner}</template>` : '';
 
   // The brass card-icon trigger (card's top-right edge). Only when there's
-  // extra to show. Opens the centered details popup (wireIdCard).
+  // extra to show. Opens the centered details popup (wireIdCard). When the
+  // card is editable (Creator review), the pencil sits to its RIGHT in the
+  // same top-right corner cluster — with no details button it takes the
+  // corner spot alone.
   const expandHTML = hasExtra
     ? `<button type="button" class="fable-id-card-expand" data-id-expand aria-label="Show all details" aria-haspopup="dialog" aria-expanded="false" title="Show all details">${CARD_SVG}</button>` : '';
+  const editHTML = opts.editable
+    ? `<button type="button" class="fable-id-card-edit${hasExtra ? '' : ' fable-id-card-edit--solo'}" data-review-pencil title="Edit" aria-label="Edit card">${PENCIL_SVG}</button>` : '';
 
   return `
     <div class="${cardClass}">
@@ -99,6 +116,7 @@ export function renderIdCard(model, opts = {}) {
       </div>
       ${extraHTML}
       ${expandHTML}
+      ${editHTML}
     </div>`;
 }
 

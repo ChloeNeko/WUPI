@@ -155,6 +155,10 @@ async function openModal(root, meta) {
   // modal-open isn't one). Prevents a double-fetch + double-mount.
   if (root._modalOpen) return;
   root._modalOpen = true;
+  // Invalidate any in-flight close (see closeModal) — the same stale-timer
+  // fix as player-picker: a re-click inside the 260ms close window must
+  // never be hidden by the previous close's deferred hide.
+  root._modalGen = (root._modalGen || 0) + 1;
   const overlay = root.querySelector('[data-modal]');
   const card = root.querySelector('[data-modal-card]');
   card.innerHTML = `<div class="fable-player-modal-loading">Loading…</div>`;
@@ -208,14 +212,21 @@ async function openModal(root, meta) {
           bytesB64: bytesToBase64(cropped.bytes),
           ext,
         });
-        // Reflect the new portrait immediately (cache-bust via timestamp).
+        // Reflect the new portrait immediately. fable_card_portrait_url
+        // returns a RAW absolute filesystem path — it MUST go through
+        // convertFileSrc before it's a loadable web URL (the old code
+        // assigned it raw → the slot went blank until a re-open; 2026-08-15).
         meta.portrait = `portrait.${ext}`;
         meta.has_portrait = true;
-        const absUrl = await invoke('fable_card_portrait_url', { cardId: meta.id }).catch(() => null);
-        const freshSrc = absUrl ? `${absUrl}?t=${Date.now()}` : null;
-        const img = portraitSlot.querySelector('img');
-        if (freshSrc && img) img.src = freshSrc;
-        else if (freshSrc) portraitSlot.innerHTML = `<img src="${esc(freshSrc)}" alt="" onerror="this.style.display='none'">`;
+        const absPath = await invoke('fable_card_portrait_url', { cardId: meta.id }).catch(() => null);
+        if (absPath) {
+          const freshSrc = `${convertFileSrc(absPath)}?t=${Date.now()}`;
+          const img = portraitSlot.querySelector('img');
+          if (img) { img.style.display = ''; img.src = freshSrc; }
+          else portraitSlot.innerHTML = `<img src="${esc(freshSrc)}" alt="" onerror="this.style.display='none'">`;
+          // Refresh the grid mini-card too (no screen swap needed).
+          refreshMiniPortrait(root, meta.id, freshSrc);
+        }
       } catch (err) {
         console.error('[fable] card portrait change failed', err);
       }
@@ -241,13 +252,44 @@ async function openModal(root, meta) {
 
 function closeModal(root) {
   const overlay = root.querySelector('[data-modal]');
-  if (!overlay || overlay.hidden) return;
+  if (!overlay) return;
+  // ALWAYS release the double-open guard — even on the early return (the
+  // player-picker "popup dead until restart" bug class: a stale close timer
+  // hides a re-opened modal while _modalOpen stays true).
+  const wasOpen = !overlay.hidden;
+  root._modalOpen = false;
+  if (!wasOpen) return;
   if (root._modalCleanup) root._modalCleanup();
   overlay.classList.remove('is-open');
-  const finish = () => { overlay.hidden = true; };
+  // Generation-guarded hide: openModal bumps _modalGen, so a re-open inside
+  // the close window invalidates this close's deferred hide.
+  root._modalGen = (root._modalGen || 0) + 1;
+  const gen = root._modalGen;
+  const finish = () => {
+    if (root._modalGen !== gen) return;
+    overlay.hidden = true;
+  };
   overlay.addEventListener('transitionend', finish, { once: true });
-  setTimeout(() => { overlay.hidden = true; }, 260);
-  root._modalOpen = false;
+  setTimeout(finish, 260);
+}
+
+// Refresh one mini-card's portrait in the grid after an in-modal change
+// (mirrors player-picker.refreshMiniPortrait).
+function refreshMiniPortrait(root, cardId, src) {
+  const tile = root.querySelector(`.fable-player-mini-card[data-card-id="${cardId}"]`);
+  if (!tile) return;
+  const holder = tile.querySelector('.fable-player-mini-portrait');
+  if (!holder) return;
+  holder.classList.remove('fable-player-mini-portrait--placeholder');
+  let img = holder.querySelector('img');
+  if (!img) {
+    img = document.createElement('img');
+    img.className = 'fable-player-mini-portrait-img';
+    img.alt = '';
+    holder.appendChild(img);
+  }
+  img.onerror = () => { holder.classList.add('fable-player-mini-portrait--placeholder'); };
+  img.src = src;
 }
 
 const SILHOUETTE_SVG = `<svg class="fable-portrait-silhouette" viewBox="0 0 120 160" aria-hidden="true" focusable="false">
@@ -303,14 +345,18 @@ function confirmDelete(root, card) {
   const no = root.querySelector('[data-confirm-no]');
   msg.textContent = `Delete ${card.name}? This removes the card and ALL its saves. This cannot be undone.`;
   confirmEl.hidden = false;
+  // Invalidate any in-flight close (the same stale-timer class as closeModal).
+  root._confirmGen = (root._confirmGen || 0) + 1;
   void confirmEl.offsetWidth;
   confirmEl.classList.add('is-open');
 
   const close = () => {
     confirmEl.classList.remove('is-open');
-    const finish = () => { confirmEl.hidden = true; };
+    root._confirmGen = (root._confirmGen || 0) + 1;
+    const gen = root._confirmGen;
+    const finish = () => { if (root._confirmGen === gen) confirmEl.hidden = true; };
     confirmEl.addEventListener('transitionend', finish, { once: true });
-    setTimeout(() => { confirmEl.hidden = true; }, 200);
+    setTimeout(finish, 200);
   };
 
   const onYes = async () => {

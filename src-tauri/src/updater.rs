@@ -17,7 +17,7 @@
 //!    temp COPY is what runs — so the install's own `bin/updater.exe` is just an
 //!    ordinary unlocked file that the next update's payload can overwrite (the
 //!    "who updates the updater" problem solves itself).
-//! 3. Spawn the temp copy detached (`DETACHED_PROCESS | CREATE_NO_WINDOW`) with
+//! 3. Spawn the temp copy detached (`CREATE_NO_WINDOW` — headless) with
 //!    `--pid <self_pid> --target-dir <exe_dir> --zip <zip> --version <v>`.
 //! 4. Emit `update-relaunching` and `std::process::exit(0)`. The exit is the
 //!    whole point — it releases wupi.exe's locks. The apply IPC therefore NEVER
@@ -171,11 +171,16 @@ pub async fn perform_update(
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
-        // DETACHED_PROCESS: the updater must outlive wupi.exe's imminent exit.
-        // CREATE_NO_WINDOW: headless — no console flash for the user.
-        const DETACHED_PROCESS: u32 = 0x0000_0008;
+        // CREATE_NO_WINDOW alone — NEVER combine with DETACHED_PROCESS: the
+        // docs say CREATE_NO_WINDOW is IGNORED when paired with it, and a
+        // console-less detached process that later spawns a console app with
+        // default flags (e.g. cmd running an external exe) gets a NEW VISIBLE
+        // console window for it. CREATE_NO_WINDOW alone gives the child a
+        // hidden console its own grandchildren inherit — fully invisible.
+        // (Lifetime is not a concern: Windows children always outlive their
+        // parent; there is no "tied child" to detach from.)
         const CREATE_NO_WINDOW: u32 = 0x0200_0000;
-        cmd.creation_flags(DETACHED_PROCESS | CREATE_NO_WINDOW);
+        cmd.creation_flags(CREATE_NO_WINDOW);
     }
     cmd.spawn().map_err(|e| format!("spawn updater: {e}"))?;
 

@@ -127,7 +127,9 @@ export function buildReviewSections(kind, d) {
     if (locRows.length) sections.push(['Locations', locRows]);
     if (castRows.length) sections.push(['Cast', castRows]);
     if (customRows.length) sections.push(['Custom tags', customRows]);
-    sections.push(['Intro', [row('Opening beat', d.intro)].filter(Boolean)]);
+    // The intro the SIM Wizard gathered (its mandatory question — 2026-08-15
+    // the intro is the wizard's job, not a post-card step). Absent → dropped.
+    if ((d.intro || '').trim()) sections.push(['Intro', [['Text', String(d.intro).trim()]]]);
     return sections.filter(([, rows]) => rows.length);
   }
   if (kind === 'codex') {
@@ -136,10 +138,6 @@ export function buildReviewSections(kind, d) {
       const bodyRow = row('Body', e.body);
       return [e.title || `Entry ${i + 1}`, [row('Tags', e.tags), bodyRow].filter(Boolean)];
     }).filter(([, rows]) => rows.length);
-  }
-  if (kind === 'intro') {
-    const r = row('Opening Beat', d.intro);
-    return r ? [['Opening Beat', [r]]] : [];
   }
   return [];
 }
@@ -150,8 +148,8 @@ export function buildReviewSections(kind, d) {
 // label/value grid, NO section headers — a real-life state-license look) and an
 // "extra" disclosure of every remaining tag, revealed by the bronze arrow
 // (§6C/§6D, 2026-08-13). Player/NPC share the player layout (8 core fields);
-// world/scenario get a TYPE banner + a 4-field core. codex/intro are NOT ID
-// cards → returns null (those keep the generic review-section rendering, so
+// world/scenario get a TYPE banner + a 4-field core. codex is NOT an ID
+// card → returns null (it keeps the generic review-section rendering, so
 // buildReviewSections + its tests stay intact).
 
 // idRow mirrors buildReviewSections' `row`: arrays join to a comma string;
@@ -188,7 +186,7 @@ export function buildIdCard(kind, d) {
     if (subtype === 'scenario') return worldIdCard(draft, 'SCENARIO CARD');
     return worldIdCard(draft, 'WORLD CARD'); // world, pre-router, or unknown
   }
-  return null; // codex/intro are not ID cards
+  return null; // codex is not an ID card
 }
 
 // Player + NPC share the 8-field core. The only difference is the subtle
@@ -221,13 +219,16 @@ function playerIdCard(d, isNpc) {
     // was captured. Absent on edited/loaded players → section dropped.
     ['Starting conditions', [idRow('Wealth', d.wealth), idRow('Reputation', d.reputation || d.fame)].filter(Boolean)],
     ['Custom tags', customTagRows(d)],
+    // The intro the SIM Wizard gathered for an NPC card (mandatory question —
+    // 2026-08-15). Player cards never carry one → dropped.
+    ...((d.intro || '').trim() ? [['Intro', [['Text', String(d.intro).trim()]]]] : []),
   ].filter(([, rows]) => rows.length);
   return { variant: 'player', banner: null, tag: isNpc ? 'NPC CARD' : null, core, extra };
 }
 
 // World + Scenario share a banner + a 4-field core (Name/Setting/Purpose/Tone).
 // directive is shown as "Purpose". Scenario-specific fields, world anchors,
-// locations, cast, custom tags, and the intro beat all live in the disclosure.
+// locations, cast, custom tags, and the intro all live in the disclosure.
 function worldIdCard(d, banner) {
   const core = [
     idRow('Name', d.name),
@@ -253,7 +254,8 @@ function worldIdCard(d, banner) {
   if (locRows.length) extra.push(['Locations', locRows]);
   if (castRows.length) extra.push(['Cast', castRows]);
   extra.push(['Custom tags', customTagRows(d)]);
-  extra.push(['Intro', [idRow('Opening beat', d.intro)].filter(Boolean)]);
+  // The intro the SIM Wizard gathered (mandatory question). Absent → dropped.
+  if ((d.intro || '').trim()) extra.push(['Intro', [['Text', String(d.intro).trim()]]]);
   return { variant: 'world', banner, tag: null, core, extra: extra.filter(([, rows]) => rows.length) };
 }
 

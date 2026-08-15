@@ -26,11 +26,10 @@
 // The displacement filter is a single inline <svg> defined ONCE and
 // referenced by url(#…) from each burn twin's CSS.
 //
-// AUDIO: playIgnitionWhoosh() plays the authored Incinerate.mp3 asset at
-// volume 0.6 (Chloe 2026-08-03: "Use Incinerate.mp3... volume 0.6 otherwise
-// it'll be too loud"). It fires on BOTH the burn (rejected cards incinerate)
-// AND the reverse-spawn (cards materialize) — "play the incinerator sound
-// when the cards spawn in as well."
+// AUDIO: playIgnitionWhoosh() plays the authored Incinerate.mp3 asset. It
+// fires on BOTH the burn (rejected cards incinerate, volume 0.6) AND the
+// reverse-spawn (cards materialize, quieter — 2026-08-15 Chloe: "lower the
+// fire audio that plays for all buttons when they spawn in New Game").
 //
 // Reduced motion: collapse the burn to a 250ms opacity fade (mirrors
 // transition.js's discipline + fog.js's reduced-motion short-circuit).
@@ -67,7 +66,13 @@ const DISPLACE = 14;
 // the user gesture, so it plays). Same one-shot pattern as title.js
 // playButtonSfx.
 
-const INCINERATE_VOLUME = 0.6;   // Chloe: "otherwise it'll be too loud"
+// Volumes are split by cue (2026-08-15 Chloe: "lower the fire audio that
+// plays for all buttons when they spawn in New Game"). The BURN keeps its
+// authored 0.6; the reverse-SPAWN sits well below it — every step
+// transition plays both back-to-back (burn the pair → spawn the next pair),
+// so the second whoosh at full level stacked into fatigue.
+const BURN_VOLUME = 0.6;      // Chloe 2026-08-03: "otherwise it'll be too loud"
+const SPAWN_VOLUME = 0.3;     // Chloe 2026-08-15: the materialize cue, quieter
 
 function reducedMotion() {
   return !!(window.matchMedia &&
@@ -77,11 +82,14 @@ function reducedMotion() {
 // Play the Incinerate.mp3 cue once. The single source of truth for the
 // burn + the reverse-spawn (card materialization) — both fire the same
 // incineration sound (Chloe 2026-08-03: "play the incinerator sound when
-// the cards spawn in as well").
-export function playIgnitionWhoosh() {
+// the cards spawn in as well"), at their own volumes. One-shot <audio>
+// node that self-removes on ended/error so nothing leaks across plays.
+// Swallows autoplay rejection silently (the click IS the user gesture, so
+// it plays). Same one-shot pattern as title.js playButtonSfx.
+export function playIgnitionWhoosh(volume = BURN_VOLUME) {
   const audio = document.createElement('audio');
   audio.src = INCINERATE_SRC;
-  audio.volume = INCINERATE_VOLUME;
+  audio.volume = volume;
   audio.setAttribute('aria-hidden', 'true');
   const cleanup = () => { if (audio.parentNode) audio.parentNode.removeChild(audio); };
   audio.addEventListener('ended', cleanup, { once: true });
@@ -295,8 +303,8 @@ export function playReverseSpawn(btns = []) {
 
     // Play the incinerator cue as the cards materialize too (Chloe
     // 2026-08-03: "play the incinerator sound when the cards spawn in as
-    // well"). Same asset + volume as the burn.
-    try { playIgnitionWhoosh(); } catch (_) { /* audio is a bonus */ }
+    // well"), at the quieter SPAWN volume (2026-08-15).
+    try { playIgnitionWhoosh(SPAWN_VOLUME); } catch (_) { /* audio is a bonus */ }
 
     let remaining = btns.length;
     btns.forEach((btn) => {

@@ -127,10 +127,11 @@ test('buildIdCard: sim with no card_type defaults to WORLD CARD', () => {
 });
 
 // ── non-ID kinds ───────────────────────────────────────────────────────────
-test('buildIdCard: codex + intro are not ID cards → null', () => {
+test('buildIdCard: codex is not an ID card → null (unknown kinds too)', () => {
   assert.equal(buildIdCard('codex', { entries: [] }), null);
-  assert.equal(buildIdCard('intro', { intro: 'You wake.' }), null);
   assert.equal(buildIdCard('codex', {}), null);
+  // The intro wizard kind was removed 2026-08-15; any stray kind → null.
+  assert.equal(buildIdCard('intro', { intro: 'You wake.' }), null);
 });
 
 test('buildIdCard: empty/unknown draft is safe', () => {

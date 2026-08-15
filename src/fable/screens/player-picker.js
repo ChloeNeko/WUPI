@@ -140,6 +140,12 @@ async function openModal(root, meta) {
   // transition — this local gate prevents the double-fetch + double-mount).
   if (root._modalOpen) return;
   root._modalOpen = true;
+  // Invalidate any in-flight close (see closeModal): a re-click inside the
+  // 260ms close window must never be hidden by the previous close's stale
+  // transitionend/timer — that left the modal invisible with _modalOpen
+  // stuck true, permanently killing every later click ("the popup never
+  // opens again until restart", 2026-08-15).
+  root._modalGen = (root._modalGen || 0) + 1;
   const overlay = root.querySelector('[data-modal]');
   const card = root.querySelector('[data-modal-card]');
   // Loading state while we fetch the full player.
@@ -188,7 +194,11 @@ async function openModal(root, meta) {
   // card and you see the image on the left, allow it to be clickable so when
   // someone clicks on it, the same exact image cropping thing pops." The
   // portrait slot opens a file picker → the 2:3 cropper → upload_bytes. A
-  // successful crop refreshes the modal portrait in place.
+  // successful crop refreshes the modal portrait AND the grid mini-card
+  // immediately (2026-08-15: the old code rebuilt a RELATIVE 'portrait.png'
+  // + handed it to convertFileSrc → a broken asset URL → the slot went blank
+  // until the modal was re-opened. The fresh ABSOLUTE path comes from a
+  // re-fetch of the player — the server is the source of truth).
   const portraitSlot = card.querySelector('[data-modal-portrait]');
   if (portraitSlot) {
     portraitSlot.style.cursor = 'pointer';
@@ -215,12 +225,20 @@ async function openModal(root, meta) {
           id: full.id,
           bytesB64: bytesToBase64(cropped.bytes),
         });
-        // Reflect the new portrait immediately (cache-bust via timestamp).
-        full.portrait = `portrait.${cropped.ext === 'jpeg' ? 'jpg' : cropped.ext}`;
-        const img = portraitSlot.querySelector('img');
-        const freshSrc = `${convertFileSrc(full.portrait)}?t=${Date.now()}`;
-        if (img) img.src = freshSrc;
-        else portraitSlot.innerHTML = `<img src="${esc(freshSrc)}" alt="" onerror="this.style.display='none'">`;
+        // Re-fetch for the fresh ABSOLUTE portrait path (cache-busted).
+        let freshAbs = null;
+        try {
+          const again = await invoke('fable_player_get', { id: full.id });
+          if (again && again.portrait) freshAbs = again.portrait;
+        } catch (_) { /* keep the old path */ }
+        if (freshAbs) full.portrait = freshAbs;
+        if (full.portrait) {
+          const freshSrc = `${convertFileSrc(full.portrait)}?t=${Date.now()}`;
+          const img = portraitSlot.querySelector('img');
+          if (img) { img.style.display = ''; img.src = freshSrc; }
+          else portraitSlot.innerHTML = `<img src="${esc(freshSrc)}" alt="" onerror="this.style.display='none'">`;
+          refreshMiniPortrait(root, full.id, freshSrc);
+        }
       } catch (err) {
         console.error('[fable] player portrait change failed', err);
       }
@@ -245,16 +263,47 @@ async function openModal(root, meta) {
 
 function closeModal(root) {
   const overlay = root.querySelector('[data-modal]');
-  if (!overlay || overlay.hidden) return;
-  // Tear down the backdrop/Esc listeners registered in openModal.
+  if (!overlay) return;
+  // ALWAYS release the double-open guard — even on the early return. A stale
+  // close timer can hide a freshly re-opened modal (overlay.hidden === true)
+  // while _modalOpen stays true; combined with the old early-return this
+  // wedged the popup dead until an app restart.
+  const wasOpen = !overlay.hidden;
+  root._modalOpen = false;
+  if (!wasOpen) return;
   if (root._modalCleanup) root._modalCleanup();
   overlay.classList.remove('is-open');
-  // Hide after the transition completes (or a fallback).
-  const finish = () => { overlay.hidden = true; };
+  // Generation-guard the deferred hide: openModal bumps _modalGen, so a
+  // re-open inside the close window invalidates this close's transitionend/
+  // fallback timer — they can never hide the new open.
+  root._modalGen = (root._modalGen || 0) + 1;
+  const gen = root._modalGen;
+  const finish = () => {
+    if (root._modalGen !== gen) return;
+    overlay.hidden = true;
+  };
   overlay.addEventListener('transitionend', finish, { once: true });
-  setTimeout(() => { overlay.hidden = true; }, 260);
-  // Release the double-open guard.
-  root._modalOpen = false;
+  setTimeout(finish, 260);
+}
+
+// Refresh one mini-card's portrait in the grid (called after an in-modal
+// portrait change so the tile updates without leaving + re-entering the
+// screen — the "stays blank until I change the screen" report).
+function refreshMiniPortrait(root, playerId, src) {
+  const tile = root.querySelector(`.fable-player-mini-card[data-player-id="${playerId}"]`);
+  if (!tile) return;
+  const holder = tile.querySelector('.fable-player-mini-portrait');
+  if (!holder) return;
+  holder.classList.remove('fable-player-mini-portrait--placeholder');
+  let img = holder.querySelector('img');
+  if (!img) {
+    img = document.createElement('img');
+    img.className = 'fable-player-mini-portrait-img';
+    img.alt = '';
+    holder.appendChild(img);
+  }
+  img.onerror = () => { holder.classList.add('fable-player-mini-portrait--placeholder'); };
+  img.src = src;
 }
 
 // The same default silhouette SVG the Player Creator uses for an empty
@@ -293,14 +342,20 @@ function confirmDelete(root, sp) {
   const no = root.querySelector('[data-confirm-no]');
   msg.textContent = `Delete ${sp.name}? This cannot be undone.`;
   confirmEl.hidden = false;
+  // Invalidate any in-flight close (mirrors closeModal's open-side bump).
+  root._confirmGen = (root._confirmGen || 0) + 1;
   void confirmEl.offsetWidth;
   confirmEl.classList.add('is-open');
 
   const close = () => {
     confirmEl.classList.remove('is-open');
-    const finish = () => { confirmEl.hidden = true; };
+    // Generation-guarded hide (same class as closeModal): a re-opened
+    // confirm can never be hidden by a prior close's stale timer.
+    root._confirmGen = (root._confirmGen || 0) + 1;
+    const gen = root._confirmGen;
+    const finish = () => { if (root._confirmGen === gen) confirmEl.hidden = true; };
     confirmEl.addEventListener('transitionend', finish, { once: true });
-    setTimeout(() => { confirmEl.hidden = true; }, 200);
+    setTimeout(finish, 200);
   };
 
   const onYes = async () => {

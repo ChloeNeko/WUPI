@@ -8,17 +8,23 @@
 //   { "action":"ask", "message":..., "questions":[...], "draft":{...} }
 //   { "action":"ready", "draft":{...full...} }
 // On `ready`, the draft loads into an in-screen review card (with a
-// portrait slot → cropper). CREATE serializes via card-serialize.js +
-// writes through the existing IPCs (fable_player_write / fable_write_card
-// / fable_card_sibling_write / fable_card_portrait_write). Mechanical
-// integrity stays in JS/Rust — Prime-Mandate compliant.
+// portrait slot → cropper + a corner pencil → edit popup). CREATE
+// serializes via card-serialize.js + writes through the existing IPCs
+// (fable_player_write / fable_write_card / fable_card_sibling_write /
+// fable_card_portrait_write). Mechanical integrity stays in JS/Rust —
+// Prime-Mandate compliant.
 //
 // This is a CREATION-ONLY API role (AGENTS.md §3A, 2026-08-12 override):
 // outside the runtime game loop. The IPC `creator_assistant_turn` does
 // the one-shot HttpBackend call (no tracker, no schema, no world state).
+//
+// The INTRO wizard was REMOVED 2026-08-15 (Chloe): the SIM Wizard asks
+// the mandatory intro question itself + serializeSimCard embeds the
+// agreed `<intro>` sibling in-file — no post-card intro step exists.
 // =============================================================
 
 import { invoke, Channel } from '@tauri-apps/api/core';
+import { open as openDialog } from '@tauri-apps/plugin-dialog';
 import { openPortraitCropper } from './portrait-cropper.js';
 import { bytesToBase64, ARROW_SVG_LEFT } from './wizard-engine.js';
 import {
@@ -35,7 +41,7 @@ import {
   buildReviewSections,
   buildIdCard,
 } from '../engine/creator-engine.js';
-import { renderIdCard, wireIdCard } from './id-card.js';
+import { renderIdCard, wireIdCard, PENCIL_SVG } from './id-card.js';
 
 const GREETINGS = {
   player: "Describe your character in detail and I'll help you design your PLAYER Card. Be as vague or descriptive as you'd like and I'll help guide you.",
@@ -51,15 +57,13 @@ export function buildCreatorChat() {
   root.hidden = true;
   // 2026-08-13 Chloe: the chat UI was a retired empty shell. 2026-08-13 Chloe
   // pass #2: rebuilt as the minimal two-block layout — a single AI prompt
-  // block + a single textarea (no chat log, no bubbles). The screen reuses
-  // the wizard centering (.fable-player-wizard) + the glowing divider, so it
-  // matches the rest of the creator suite aesthetically. The renderCreatorChat
-  // backend (GLM turn loop, envelope parse → draft → review → CREATE) binds to
-  // the [data-*] hooks below unchanged.
+  // block + a single textarea (no chat log, no bubbles). 2026-08-14 Chloe: the
+  // header/title is GONE (no "Player/World/Codex Wizard" banners). 2026-08-15
+  // Chloe: the gold divider is GONE too — the AI box stands alone (nothing
+  // crowns it). The renderCreatorChat backend (GLM turn loop, envelope parse
+  // → draft → review → CREATE) binds to the [data-*] hooks below unchanged.
   root.innerHTML = `
     <div class="fable-player-wizard fable-creator-chat">
-      <h2 class="fable-creator-chat-title" data-title></h2>
-      <div class="fable-wizard-slide-divider"></div>
       <div class="fable-creator-chat-stage">
         <div class="fable-creator-chat-prompt" data-messages>
           <div class="fable-creator-chat-prompt-body"></div>
@@ -75,18 +79,12 @@ export function buildCreatorChat() {
 }
 
 // Render the screen for a creator run. Config:
-//   creatorKind: 'player' | 'sim' | 'codex' | 'intro'
-//   title:       header text
-//   cardId:      (codex/intro) the sim card the artifact attaches to
+//   creatorKind: 'player' | 'sim' | 'codex'
+//   cardId:      (codex) the sim card the artifact attaches to
 //   onCreated:   (result) => flow advancement; result = { playerId } | { cardId }
 //   back:        () => return to the prior flow step (flow-chrome ‹)
-//   introNudge:  (intro only) collector mode — show `staticPrompt`, NO API call;
-//                Enter (empty or a nudge) calls `onEnter(nudge)` instead of
-//                generating in-chat (launchGame generates behind the fade).
-//   staticPrompt:(intro only) the fixed prompt text for the nudge collector.
-//   onEnter:     (intro only) (nudge) => launchGame(cardId, nudge).
 export function renderCreatorChat(root, config) {
-  const { creatorKind, title, onCreated, back, cardId, introNudge, staticPrompt, onEnter } = config;
+  const { creatorKind, onCreated, back, cardId } = config;
   // The DOM scaffold lives in buildCreatorChat (rebuilt 2026-08-13). The
   // guard below is defensive: if the shell is ever stripped again, bail
   // cleanly with the back hook wired so the flow-chrome ‹ still routes.
@@ -98,7 +96,7 @@ export function renderCreatorChat(root, config) {
   const messagesEl = root.querySelector('[data-messages]');
   const reviewEl = root.querySelector('[data-review]');
   const composerEl = root.querySelector('.fable-creator-chat-composer');
-  // The screen element is reused across wizards (player → sim → codex → intro),
+  // The screen element is reused across wizards (player → sim → codex),
   // so strip any click/keydown listeners from the prior render before re-wiring.
   // cloneNode copies attributes/children but NOT event listeners → a clean slate.
   const inputElFresh = root.querySelector('[data-input]');
@@ -108,7 +106,7 @@ export function renderCreatorChat(root, config) {
   const state = {
     history: [],        // [{role:'user'|'assistant', content}] — assistant = raw envelope text
     draft: {},          // accumulating fields
-    importData: config.presetImportData || null,  // pre-seeded (IMPORT tile / codex Import / intro context)
+    importData: config.presetImportData || null,  // pre-seeded (IMPORT tile / codex Import)
     portraitBytes: config.presetPortraitBytes || null,        // pre-seeded portrait bytes (IMPORT tile — saved even w/o re-crop)
     portraitExt: config.presetPortraitExt || null,        // pre-seeded portrait ext (IMPORT tile)
     portraitPreview: config.presetPortraitDataUrl || null, // pre-seeded portrait preview (IMPORT tile)
@@ -122,20 +120,36 @@ export function renderCreatorChat(root, config) {
   if (config.presetIntro) state.draft.intro = config.presetIntro;
   root._creatorBack = back;
 
+  // Reset residue from a prior wizard run on this SHARED screen. A completed
+  // review (CREATE) never returns to chat, so the container keeps
+  // .is-review-mode (bottom-anchored flex-end) + the prompt/composer stay
+  // [hidden] — the next wizard (sim → codex chain) then rendered with
+  // only its title pinned to the bottom of the screen (the World Wizard
+  // glitch). Also strip launchGame's .is-launching fade if the prior run
+  // launched from this screen (ADD INTRO → launchGame), + any stuck is-typing
+  // veil from a mid-generation ‹ exit (the class sits on [data-messages]
+  // itself, so innerHTML='' doesn't clear it). Every render starts from the
+  // same clean state the first Player Wizard render enjoyed.
+  if (containerEl) containerEl.classList.remove('is-review-mode');
+  root.classList.remove('is-launching');
+  messagesEl.hidden = false;
+  messagesEl.classList.remove('is-typing');
+  if (composerEl) composerEl.hidden = false;
+  // Strip any edit-popup / edit-generation overlays a prior run left on this
+  // shared screen (a ‹ exit mid-edit can leave the ring spinning invisibly).
+  root.querySelectorAll('[data-genring], [data-edit-overlay]').forEach((el) => {
+    if (el._cleanup) el._cleanup();
+    el.remove();
+  });
+
   messagesEl.innerHTML = '';
   reviewEl.hidden = true;
   reviewEl.innerHTML = '';
   inputEl.value = '';
   inputEl.disabled = false;
-  root.querySelector('[data-title]').textContent = title;
-  // The intro-nudge collector mode shows a fixed static prompt (no greeting,
-  // no API call) — the user types a nudge (or empty) + Enter, then launchGame
-  // generates the opening beat behind the fade. Otherwise the greeting opens
-  // the conversation unless an initial message is supplied or a seed draft is
-  // provided (edit mode skips straight to the review card).
-  if (introNudge) {
-    appendBubble(messagesEl, 'assistant', staticPrompt || '');
-  } else if (!config.initialMessage && !config.seedDraft) {
+  // The greeting opens the conversation unless an initial message is supplied
+  // or a seed draft is provided (edit mode skips straight to the review card).
+  if (!config.initialMessage && !config.seedDraft) {
     appendBubble(messagesEl, 'assistant', GREETINGS[creatorKind] || GREETINGS.player);
   }
   // Pre-seeded import (the IMPORT tile on the Player pair screen, or the
@@ -165,9 +179,8 @@ export function renderCreatorChat(root, config) {
     if (composerEl) composerEl.classList.toggle('is-busy', b);
     // Auto-refocus the instant the textarea unlocks (zero manual re-clicking
     // after every AI reply). Skipped when the review card is showing (the
-    // textarea stays disabled there anyway) or in the intro-nudge collector
-    // (launchGame fades the shell on Enter, so a refocus is moot).
-    if (!b && !state.done && !introNudge) inputEl.focus();
+    // textarea stays disabled there anyway).
+    if (!b && !state.done) inputEl.focus();
   };
 
   // Tee a trace line to BOTH the devtools console + the creator playtest log
@@ -181,14 +194,6 @@ export function renderCreatorChat(root, config) {
   async function send() {
     if (state.busy || state.done) return;
     const text = inputEl.value.trim();
-    // The intro-nudge collector: empty Enter is valid (launchGame decides what
-    // to do with an empty nudge). Hand the nudge to the caller + bail — the
-    // opening beat is generated behind the fade in launchGame, NOT in-chat.
-    if (introNudge) {
-      inputEl.value = '';
-      if (onEnter) onEnter(text);
-      return;
-    }
     if (!text) return;
     inputEl.value = '';
     state.history.push({ role: 'user', content: text });
@@ -228,14 +233,22 @@ export function renderCreatorChat(root, config) {
     return body ? body.textContent : '';
   }
 
-  async function callApi() {
+  // The shared turn engine. `opts.editMode` runs the turn FROM the review
+  // card (the corner-pencil popup): instead of the prompt block's typing
+  // indicator, the whole screen blurs + the centered bronze ring spins
+  // (.fable-creator-genring overlay) until the turn settles — then the
+  // review re-renders (`ready`) or the chat resumes with GLM's follow-up
+  // questions (`ask`). Escape mid-generation cancels (creator_assistant_stop).
+  async function callApi(opts = {}) {
+    const editMode = !!opts.editMode;
     setBusy(true);
     // Capture the prior prompt text so a mid-stream cancel can restore it
     // (the single-block model has no partial bubble to drop — the block IS
     // the prompt surface, so we revert to what was there before this turn).
     const priorText = promptText();
-    const bubble = appendBubble(messagesEl, 'assistant', '');
-    bubble.setTyping(true);
+    const bubble = editMode ? null : appendBubble(messagesEl, 'assistant', '');
+    if (bubble) bubble.setTyping(true);
+    if (editMode) beginEditGen();
     let acc = '';
     const channel = new Channel();
     channel.onmessage = (msg) => {
@@ -244,16 +257,16 @@ export function renderCreatorChat(root, config) {
         // typing indicator stays up until `done`, then the new text fades in.
         acc += msg.text;
       } else if (msg.type === 'done') {
-        handleDone(msg.text, bubble);
+        handleDone(msg.text, bubble, editMode);
       } else if (msg.type === 'cancelled') {
-        // Mid-stream abort (Stop): restore the prior prompt + re-enable.
-        bubble.setTyping(false);
-        bubble.restore(priorText);
+        // Mid-stream abort (Escape/Stop): restore the prior prompt + re-enable.
+        if (bubble) { bubble.setTyping(false); bubble.restore(priorText); }
+        if (editMode) endEditGen();   // un-blur — the review card returns untouched
         setBusy(false);
-        trace('cancelled (stop) — prompt restored');
+        trace('cancelled (stop) — turn aborted');
       } else if (msg.type === 'api_lost') {
-        bubble.setTyping(false);
-        bubble.update(`⚠ ${msg.message || 'The API connection was lost.'}`);
+        if (bubble) { bubble.setTyping(false); bubble.update(`⚠ ${msg.message || 'The API connection was lost.'}`); }
+        if (editMode) { endEditGen(); showReviewError(`⚠ ${msg.message || 'The API connection was lost.'}`); }
         setBusy(false);
         trace(`api_lost: ${msg.message || ''}`);
       } else if (msg.type === 'validation_error') {
@@ -269,12 +282,15 @@ export function renderCreatorChat(root, config) {
         const MAX_RETRIES = 2;
         const n = (msg.offenders && msg.offenders.length) || 0;
         trace(`validation_error: ${n} oversize codex entry/entries; retry ${state.codexValidationRetries}/${MAX_RETRIES}`);
-        bubble.setTyping(false);
-        bubble.update('⚠ A codex entry exceeded the 1400-character embedding cap — asking the assistant to split it…');
+        if (bubble) {
+          bubble.setTyping(false);
+          bubble.update('⚠ A codex entry exceeded the 1400-character embedding cap — asking the assistant to split it…');
+        }
         if (state.codexValidationRetries <= MAX_RETRIES) {
           // Brief pause so the notice is readable before the retry overwrites it.
-          setTimeout(() => callApi(), 900);
+          setTimeout(() => callApi(opts), 900);
         } else {
+          if (editMode) { endEditGen(); showReviewError('⚠ The assistant could not fit a codex entry under the 1400-character cap — edit again or describe the split yourself.'); }
           setBusy(false);
           trace('codex validation retries exhausted — user intervention needed');
         }
@@ -288,38 +304,60 @@ export function renderCreatorChat(root, config) {
         onEvent: channel,
       });
     } catch (e) {
-      bubble.setTyping(false);
-      bubble.update(`⚠ ${e.message || e}`);
+      if (bubble) { bubble.setTyping(false); bubble.update(`⚠ ${e.message || e}`); }
+      if (editMode) { endEditGen(); showReviewError(`⚠ ${e.message || e}`); }
       setBusy(false);
     }
   }
 
-  function handleDone(text, bubble) {
+  function handleDone(text, bubble, editMode = false) {
     state.history.push({ role: 'assistant', content: text });
     const env = parseEnvelope(text);
     if (!env) {
       // Could not parse an envelope — surface the raw text, stay in chat.
       trace('envelope UNPARSEABLE — showing raw reply');
-      bubble.setTyping(false);
-      bubble.update(stripToJsonFallback(text));
-      setBusy(false);
+      if (editMode) {
+        endEditGen();
+        exitReviewToChat(stripToJsonFallback(text));
+        setBusy(false);
+      } else {
+        bubble.setTyping(false);
+        bubble.update(stripToJsonFallback(text));
+        setBusy(false);
+      }
       return;
     }
     if (env.draft && typeof env.draft === 'object') mergeDraft(state.draft, env.draft);
     trace(`envelope action=${env.action || '(none)'} draftKeys=[${Object.keys(env.draft || {}).join(',')}]`);
     if (env.action === 'ready') {
-      bubble.setTyping(false);
-      bubble.update(env.message || 'Here is what I have — review it below.');
-      showReview();
+      if (editMode) {
+        endEditGen();
+        showReview();          // fresh review card from the merged draft
+        setBusy(false);
+      } else {
+        bubble.setTyping(false);
+        bubble.update(env.message || 'Here is what I have — review it below.');
+        showReview();
+        setBusy(false);
+      }
     } else {
       // ask (or unknown → treat as ask)
       const qText = Array.isArray(env.questions) && env.questions.length
         ? '\n\n' + env.questions.map((q) => `• ${q}`).join('\n')
         : '';
-      bubble.setTyping(false);
-      bubble.update((env.message || '').trim() + qText);
+      const askText = (env.message || '').trim() + qText;
+      if (editMode) {
+        // GLM needs more info before the card can re-finalize → drop back to
+        // the chat surface with the follow-up questions in the prompt block.
+        endEditGen();
+        exitReviewToChat(askText.trim() || 'Tell me what to change.');
+        setBusy(false);
+      } else {
+        bubble.setTyping(false);
+        bubble.update(askText);
+        setBusy(false);
+      }
     }
-    setBusy(false);
   }
 
   // --- the review card ---------------------------------------------------
@@ -340,7 +378,10 @@ export function renderCreatorChat(root, config) {
     trace(`review shown — ${sections.length} section(s), draftKeys=[${Object.keys(state.draft).join(',')}]`);
   }
 
-  function exitReview() {
+  // Leave the review card + return to the chat surface. `text` (optional)
+  // replaces the prompt block's content — used by the edit path when GLM
+  // answers with follow-up questions instead of a fresh `ready`.
+  function exitReviewToChat(text) {
     reviewEl.hidden = true;
     reviewEl.innerHTML = '';
     state.done = false;
@@ -348,39 +389,167 @@ export function renderCreatorChat(root, config) {
     messagesEl.hidden = false;
     if (composerEl) composerEl.hidden = false;
     inputEl.disabled = false;
+    if (text != null) appendBubble(messagesEl, 'assistant', text);
     inputEl.focus();
   }
 
+  // Surface an error INSIDE the review card (the prompt block is hidden in
+  // review mode — the old appendBubble-to-hidden-messagesEl path made CREATE
+  // failures invisible, the "CREATE does nothing" report's root surface).
+  function showReviewError(msg) {
+    if (!reviewEl || reviewEl.hidden) return;
+    reviewEl.querySelectorAll('.fable-creator-review-error').forEach((n) => n.remove());
+    const note = document.createElement('p');
+    note.className = 'fable-creator-review-error';
+    note.textContent = msg;
+    reviewEl.appendChild(note);
+  }
+
+  // --- the edit popup (corner pencil → centered mini-editor) --------------
+  // NO send button by design (Chloe 2026-08-15): Enter sends, Escape/✕ close.
+  // On Enter the popup disappears + the screen blurs under the same bronze
+  // loading ring the chat uses while GLM reworks the draft; Escape during
+  // that generation cuts it off (creator_assistant_stop → review restored).
+  function openEditPopup() {
+    if (state.busy) return;
+    // One popup at a time (a leftover can only exist if a close animation
+    // was interrupted — a plain replace is enough).
+    root.querySelectorAll('[data-edit-overlay]').forEach((el) => el.remove());
+    const overlay = document.createElement('div');
+    overlay.className = 'fable-creator-edit-overlay';
+    overlay.dataset.editOverlay = '';
+    overlay.hidden = true;
+    overlay.innerHTML = `
+      <div class="fable-creator-edit-backdrop"></div>
+      <div class="fable-creator-edit-modal" role="dialog" aria-modal="true" aria-label="Edit card">
+        <div class="fable-creator-edit-head">
+          <span class="fable-creator-edit-title">Edit</span>
+          <button type="button" class="fable-creator-edit-close" data-edit-close title="Close" aria-label="Close editor">✕</button>
+        </div>
+        <textarea class="fable-creator-edit-input" data-edit-input rows="4"
+          placeholder="Tell me what to change…"></textarea>
+        <p class="fable-creator-edit-hint">ENTER to send · ESC to close</p>
+      </div>`;
+    root.appendChild(overlay);
+    const input = overlay.querySelector('[data-edit-input]');
+    let closed = false;
+    const close = () => {
+      if (closed) return;
+      closed = true;
+      document.removeEventListener('keydown', onKey, { capture: true });
+      overlay.classList.remove('is-open');
+      const finish = () => overlay.remove();
+      overlay.addEventListener('transitionend', finish, { once: true });
+      setTimeout(finish, 240);
+    };
+    overlay.querySelector('[data-edit-close]').addEventListener('click', close);
+    overlay.addEventListener('click', (e) => {
+      if (e.target === overlay || e.target.classList.contains('fable-creator-edit-backdrop')) close();
+    });
+    // Document-level (capture) so the keys fire wherever focus sits — the
+    // textarea may lose focus to a click inside the modal. ENTER sends (no
+    // send button by design); ESC closes; empty ENTER is a no-op.
+    const onKey = (e) => {
+      if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); close(); }
+      else if (e.key === 'Enter' && !e.shiftKey && e.target === input) {
+        e.preventDefault();
+        const text = input.value.trim();
+        if (!text) return;          // empty Enter is a no-op — Esc/✕ to leave
+        close();
+        requestEdit(text);
+      }
+    };
+    document.addEventListener('keydown', onKey, { capture: true });
+    overlay.hidden = false;
+    void overlay.offsetWidth;
+    overlay.classList.add('is-open');
+    input.focus();
+  }
+
+  // Fire an edit turn from the review card: user text into history, then the
+  // shared turn engine in edit mode (blur + bronze ring until it settles).
+  function requestEdit(text) {
+    state.history.push({ role: 'user', content: text });
+    state.codexValidationRetries = 0;
+    trace(`edit (${creatorKind}): ${text.slice(0, 140)}`);
+    callApi({ editMode: true });
+  }
+
+  // --- the edit-generation overlay (full blur + the bronze ring) ---------
+  function beginEditGen() {
+    endEditGen();               // never stack two overlays
+    const overlay = document.createElement('div');
+    overlay.className = 'fable-creator-genring';
+    overlay.dataset.genring = '';
+    overlay.innerHTML = `<div class="fable-creator-genring-ring"></div>`;
+    root.appendChild(overlay);
+    // Escape is the cut-off path while the ring spins (the composer is hidden
+    // in review mode, so its own Escape handler can't fire here).
+    const onEsc = (e) => {
+      if (e.key === 'Escape') { e.preventDefault(); stopTurn(); }
+    };
+    document.addEventListener('keydown', onEsc, { capture: true });
+    overlay._cleanup = () => document.removeEventListener('keydown', onEsc, { capture: true });
+  }
+
+  function endEditGen() {
+    root.querySelectorAll('[data-genring]').forEach((el) => {
+      if (el._cleanup) el._cleanup();
+      el.remove();
+    });
+  }
+
   function wireReview(el) {
-    // Portrait slot → cropper → stash cropped bytes.
+    // Portrait slot → pick → crop → stash cropped bytes.
+    // Pick-first is load-bearing: on a fresh card there is NO preview to crop,
+    // and the old code handed the cropper '' — its load probe errored + the
+    // modal self-closed within the 200ms fade, so clicking the placeholder
+    // looked like a dead no-op. Now: OS file dialog (png/jpg/jpeg) →
+    // server-side read (magic-byte-validated, same-origin data URL so the
+    // cropper's canvas never taints) → crop → stash.
     const slot = el.querySelector('[data-portrait-slot]');
     if (slot) {
       slot.addEventListener('click', async () => {
+        let picked;
         try {
-          const cropped = await openPortraitCropper(root, state.portraitPreview || '');
+          picked = await openDialog({
+            multiple: false,
+            filters: [{ name: 'Image', extensions: ['png', 'jpg', 'jpeg'] }],
+          });
+        } catch (_) {
+          return; // dialog failure — keep current
+        }
+        if (!picked) return; // picker cancelled
+        const srcPath = typeof picked === 'string' ? picked : (picked.path || picked);
+        if (!srcPath) return;
+        let dataUrl;
+        try {
+          dataUrl = await invoke('fable_player_portrait_read_bytes', { srcPath });
+        } catch (e) {
+          console.error('[creator-chat] portrait read failed:', e);
+          return;
+        }
+        try {
+          const cropped = await openPortraitCropper(root, dataUrl);
           if (cropped) {
             state.portraitBytes = cropped.bytes;
             state.portraitExt = cropped.ext;
             state.portraitPreview = cropped.dataUrl;
             slot.innerHTML = `<img src="${cropped.dataUrl}" alt="" onerror="this.style.display='none'">`;
           }
-        } catch (_) { /* cancel — keep current */ }
+        } catch (_) { /* cropper failure — keep current portrait */ }
       });
     }
     // Back → return to chat to request changes.
     const backBtn = el.querySelector('[data-review-back]');
-    if (backBtn) backBtn.addEventListener('click', exitReview);
-    // Edit → jump straight back to chat with a prompt.
-    const editBtn = el.querySelector('[data-review-edit]');
-    if (editBtn) {
-      editBtn.addEventListener('click', () => {
-        exitReview();
-        appendBubble(messagesEl, 'system', 'Tell me what to change.');
-      });
-    }
+    if (backBtn) backBtn.addEventListener('click', () => exitReviewToChat());
+    // The corner pencil → the edit popup (replaces the old review "Edit"
+    // button, 2026-08-15 Chloe — popup + Enter + blur/ring generation).
+    const pencilBtn = el.querySelector('[data-review-pencil]');
+    if (pencilBtn) pencilBtn.addEventListener('click', openEditPopup);
     const createBtn = el.querySelector('[data-review-create]');
     if (createBtn) createBtn.addEventListener('click', () => doCreate(createBtn));
-    // Card-icon details popup on the ID card (no-op for codex/intro).
+    // Card-icon details popup on the ID card (no-op for codex).
     wireIdCard(el);
   }
 
@@ -407,7 +576,7 @@ export function renderCreatorChat(root, config) {
         const { xml, intro } = serializeSimCard(state.draft);
         const stem = slugify(state.draft.name || '') || 'world';
         trace(`serializeSimCard → stem=${stem} xml=${xml.length}b intro=${intro ? intro.length + 'b' : 'none'}`);
-        // `<intro>` is now embedded AFTER </sim_card> in the XML itself
+        // `<intro>` is embedded AFTER </sim_card> in the XML itself
         // (2026-08-13), so fable_write_card carries it — no separate .intro
         // sibling-file write.
         const meta = await invoke('fable_write_card', { stem, xml });
@@ -425,26 +594,20 @@ export function renderCreatorChat(root, config) {
         if (cardId) await invoke('fable_card_sibling_write', { cardId, ext: 'codex', text });
         trace(`saved codex (${text.length}b) on cardId=${cardId}`);
         if (onCreated) onCreated({ cardId, draft: state.draft });
-      } else if (creatorKind === 'intro') {
-        const intro = (state.draft.intro || '').trim();
-        // The intro step runs AFTER the card exists: inject/replace the
-        // in-file `<intro>` sibling via Rust (owns the two-root XML edit).
-        if (cardId && intro) {
-          await invoke('fable_card_set_intro', { cardId, text: intro });
-        }
-        trace(`saved intro (${intro.length}b) on cardId=${cardId}`);
-        if (onCreated) onCreated({ cardId, draft: state.draft });
       }
     } catch (e) {
       btn.disabled = false;
       btn.textContent = 'Create';
       trace(`CREATE FAILED (${creatorKind}): ${e.message || e}`);
-      appendBubble(messagesEl, 'system', `Create failed: ${e.message || e}. Fix the concept and try again.`);
+      // The prompt block is HIDDEN in review mode — surface the failure ON the
+      // review card so a rejected write is never an invisible "does nothing".
+      showReviewError(`Create failed: ${e.message || e}. Fix the concept and try again.`);
       console.error('[creator-chat] create failed', e);
     }
   }
 
-  // Auto-send an initial message (used by the intro step's nudge → one-shot).
+  // Auto-send an initial message (a caller-seeded opening turn, if ever
+  // needed — currently unused by the three wizards).
   if (config.initialMessage) {
     inputEl.value = config.initialMessage;
     send();
@@ -529,24 +692,29 @@ function fadeSwap(el, newText) {
 }
 
 // Render the review card HTML. Player + sim (npc/scenario/world) render as
-// the compact ID card (core face + bronze-arrow extra disclosure) via the
-// shared id-card renderer; codex/intro keep the generic section grid (no
-// portrait). CREATE/Edit/‹ live in the .fable-player-review-create-wrap row
-// appended under whichever card shape was produced.
+// the compact ID card (core face + card-icon extra disclosure) via the
+// shared id-card renderer; codex keeps the generic section grid (no
+// portrait). CREATE/‹ live in the .fable-player-review-create-wrap row
+// appended under whichever card shape was produced. The edit affordance is
+// the CORNER PENCIL (2026-08-15 Chloe): beside the card-icon details button
+// on ID cards, top-right on the codex grid — never a button in the CREATE
+// row (the old "Edit" button is gone).
 function renderReviewCard(kind, d, portraitPreview, sections) {
   const esc = escapeXml;
   const createWrap = `
     <div class="fable-player-review-create-wrap">
       <button type="button" class="fable-player-review-create" data-review-create>CREATE</button>
-      <button type="button" class="fable-player-review-edit" data-review-edit>Edit</button>
       <button type="button" class="fable-player-review-back" data-review-back aria-label="Back">${ARROW_SVG_LEFT}</button>
     </div>`;
-  // ID-card kinds (player + sim). buildIdCard returns null for codex/intro.
+  // ID-card kinds (player + sim). buildIdCard returns null for codex.
   const idModel = buildIdCard(kind, d);
   if (idModel) {
-    return renderIdCard(idModel, { portraitClickable: true, portraitPreview }) + createWrap;
+    return renderIdCard(idModel, { portraitClickable: true, portraitPreview, editable: true }) + createWrap;
   }
-  // codex/intro: generic section grid, no portrait slot.
+  // codex: generic section grid, no portrait slot. The pencil anchors to the
+  // card's top-right corner (same spot as the ID card's cluster).
+  const pencil = `
+    <button type="button" class="fable-id-card-edit fable-id-card-edit--solo" data-review-pencil title="Edit" aria-label="Edit card">${PENCIL_SVG}</button>`;
   const sectionsHtml = sections.map(([title, rows]) => {
     const pairHtml = rows.map(([label, val]) => {
       if (Array.isArray(val)) {
@@ -558,7 +726,8 @@ function renderReviewCard(kind, d, portraitPreview, sections) {
     return `<section class="fable-player-review-section"><h3>${esc(title)}</h3><dl>${pairHtml}</dl></section>`;
   }).join('');
   return `
-    <div class="fable-player-review-card">
+    <div class="fable-player-review-card fable-codex-review-card">
+      ${pencil}
       <div class="fable-player-review-top">
         <div class="fable-player-review-body">${sectionsHtml}</div>
       </div>

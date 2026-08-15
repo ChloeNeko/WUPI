@@ -156,9 +156,20 @@ test('buildReviewSections: codex → one section per entry', () => {
   assert.equal(secs[0][0], 'Magic');
 });
 
-test('buildReviewSections: intro → single Opening Beat row', () => {
-  const secs = buildReviewSections('intro', { intro: 'You wake in fog.' });
-  assert.deepEqual(secs, [['Opening Beat', [['Opening Beat', 'You wake in fog.']]]]);
+test('buildReviewSections: intro kind is gone → [] (removed with the intro wizard)', () => {
+  // 2026-08-15: the intro wizard was deleted — the SIM Wizard gathers the
+  // intro itself (its sections carry it under 'Intro' / 'Text').
+  assert.deepEqual(buildReviewSections('intro', { intro: 'You wake in fog.' }), []);
+});
+
+test('buildReviewSections: sim draft surfaces the intro as Intro/Text', () => {
+  const secs = buildReviewSections('sim', { name: 'Aldermoor', intro: 'You wake in fog.' });
+  const introSec = secs.find(([t]) => t === 'Intro');
+  assert.ok(introSec, 'Intro section present');
+  assert.deepEqual(introSec[1], [['Text', 'You wake in fog.']]);
+  // No intro agreed → section dropped entirely.
+  const none = buildReviewSections('sim', { name: 'Aldermoor' });
+  assert.ok(!none.some(([t]) => t === 'Intro'));
 });
 
 test('buildReviewSections: empty draft → []', () => {
