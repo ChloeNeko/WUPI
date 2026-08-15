@@ -136,32 +136,77 @@ const FABLE_ENTRY = (() => {
 // background is transparent, so an earlier reveal shows the menu THROUGH the
 // splash). Kept as a named constant here so the two sites stay synchronized.
 const FABLE_SPLASH_HOLD_MS = 2000;
+// The entry reveal's top-to-bottom wipe duration (ms) — shared by the
+// fable.exe title reveal AND the .lnk direct-launch stage reveal. MUST match
+// the .fable-entry-wipe animation duration in fable.css (1000ms) — the entry
+// hold (.fable-entry-hold + html.fable-wipe) stays up for exactly this long
+// after the reveal, so no backdrop ever out-paces the wipe's coverage.
+const FABLE_ENTRY_WIPE_MS = 1000;
+// Shared entry-wipe machinery — used by BOTH reveal paths (the fable.exe
+// title reveal AND the .lnk direct-launch stage reveal): stamps
+// html.fable-wipe, runs the 1s top-to-bottom mask sweep (.fable-entry-wipe,
+// fable.css) on `screenEl`, and drops the whole entry hold at wipe end.
+//
+// Backdrop discipline: NOTHING dark paints until the wipe has covered it.
+// The old choreography dropped .fable-entry-hold first so the fade ran over
+// the solid void — fine for a fast uniform fade, but with the slow wipe the
+// instant void read as a blank dark window popping onto the desktop. So:
+//   - #fable's void stays suppressed for the WHOLE wipe (.fable-entry-hold
+//     stays on): the sweep reveals the DESKTOP behind the content, and the
+//     void only paints once the screen fully covers it (an invisible swap).
+//   - html.fable-wipe (styles.css) extends the body-transparent hold past
+//     script.js's html.fable-entry teardown (~2.6s, when the splash node
+//     goes) — otherwise the body's #02040a base would pop in behind the
+//     still-sweeping bottom half of the screen.
+// A stranded hold would leave the app permanently transparent +
+// click-through, so a timer backs up the animationend hook — idempotent,
+// whichever lands first wins.
+const runEntryWipe = (fableRoot, screenEl) => {
+  document.documentElement.classList.add('fable-wipe');
+  const dropEntryHold = () => {
+    fableRoot.classList.remove('fable-entry-hold');
+    document.documentElement.classList.remove('fable-wipe');
+  };
+  if (screenEl) {
+    screenEl.classList.remove('fable-entry-wipe');
+    void screenEl.offsetWidth; // reflow so re-adding restarts the animation
+    screenEl.classList.add('fable-entry-wipe');
+    // animationend BUBBLES — the screen's children (staggered buttons,
+    // particles, feed beats…) fire their own. Only the wipe itself may end
+    // the hold.
+    const onWipeEnd = (ev) => {
+      if (ev.animationName !== 'fableEntryWipe') return;
+      screenEl.removeEventListener('animationend', onWipeEnd);
+      screenEl.classList.remove('fable-entry-wipe');
+      dropEntryHold();
+    };
+    screenEl.addEventListener('animationend', onWipeEnd);
+  }
+  // Fallback: animationend can be missed (element swapped mid-wipe, animations
+  // throttled while backgrounded). +120ms so the timer never beats the
+  // compositor's final animated frame. Also strips the wipe class — a missed
+  // event would otherwise leave the mask layer mounted all session.
+  setTimeout(() => {
+    if (screenEl) screenEl.classList.remove('fable-entry-wipe');
+    dropEntryHold();
+  }, FABLE_ENTRY_WIPE_MS + 120);
+};
 // Title-reveal choreography shared by the FABLE_ENTRY + DIRECT_LAUNCH title
-// paths: drop the transparency hold FIRST (the void backdrop paints
-// instantly, so the title's fade-in runs over the solid void, never over the
-// desktop), then showScreen('title') + the .fable-title-enter dissolve +
-// theme-music fade-in. Defined ONCE so the direct-launch fallbacks can't
-// drift out of sync with the plain-entry reveal again — the 2026-08-14
-// "menu spawns beside the F on .lnk launches" bug was exactly that drift:
-// the fallbacks called revealHold()+showScreen('title') bare, skipping the
-// hold window + dissolve entirely (the async IPC handoff resolves in tens
-// of ms, so the title appeared while the F splash was still in its 2s hold).
+// paths: showScreen('title') + the shared entry wipe + theme-music fade-in.
+// Defined ONCE so the direct-launch fallbacks can't drift out of sync with
+// the plain-entry reveal again — the 2026-08-14 "menu spawns beside the F on
+// .lnk launches" bug was exactly that drift: the fallbacks called
+// revealHold()+showScreen('title') bare, skipping the hold window + dissolve
+// entirely (the async IPC handoff resolves in tens of ms, so the title
+// appeared while the F splash was still in its 2s hold).
 const revealTitleUnderSplash = (fableRoot) => {
-  fableRoot.classList.remove('fable-entry-hold');
   showScreen('title');
   const titleEl = screens.title;
-  if (titleEl) {
-    // Drop the 2s transparency hold FIRST (fable.css): the title was shown at
-    // t=0 behind the F splash, held at opacity 0 while it warmed up — the
-    // enter animation then rides the full 1s top-to-bottom mask sweep.
-    titleEl.classList.remove('fable-title-held');
-    titleEl.classList.remove('fable-title-enter');
-    void titleEl.offsetWidth; // reflow so re-adding restarts the animation
-    titleEl.classList.add('fable-title-enter');
-    titleEl.addEventListener('animationend', () => {
-      titleEl.classList.remove('fable-title-enter');
-    }, { once: true });
-  }
+  // Drop the title's 2s transparency hold FIRST (fable.css): the title was
+  // shown at t=0 behind the F splash, held at opacity 0 while it warmed up —
+  // the wipe then rides the full 1s top-to-bottom sweep from a clean start.
+  if (titleEl) titleEl.classList.remove('fable-title-held');
+  runEntryWipe(fableRoot, titleEl);
   // Theme music fires HERE — i.e. exactly at FABLE_SPLASH_HOLD_MS (2s after
   // entry), never during the splash hold.
   try { startThemeMusic(fableRoot, { fadeIn: true }); } catch (_) {}
@@ -299,10 +344,12 @@ let engineStarted = false;
 // the named slot.
 
 // Resume a named save for a world. `cardId` resolves the .sim card; `saveId`
-// is the slot to resume. Cold-resume from the title (no game running yet),
-// so fable_start is the entry — NOT fable_load_save (that requires an
-// already-running game).
-async function resumeSave(cardId, saveId) {
+// is the slot to resume. `opts.underSplash` (direct launch only) routes the
+// stage entry through the splash-aligned wipe reveal instead of showing the
+// stage the moment the load finishes. Cold-resume from the title (no game
+// running yet), so fable_start is the entry — NOT fable_load_save (that
+// requires an already-running game).
+async function resumeSave(cardId, saveId, opts = {}) {
   // Guarded: a rapid double-click on a save row could fire two fable_start
   // calls. The withFlowBusy wrapper drops the second; the first clears the
   // flag via enterStageViaTransition (the final step below).
@@ -331,7 +378,7 @@ async function resumeSave(cardId, saveId) {
     engineStarted = false;
   }
 
-  enterStageViaTransition(openingScene, loadMessages);
+  enterStageViaTransition(openingScene, loadMessages, opts);
 }
 
 // CONTINUE button handler: resume the stashed continue target. The target is
@@ -1369,7 +1416,7 @@ async function launchGame(cardId, nudge = undefined) {
 
 // The shared "play the magical transition + swap to stage + wire it" tail.
 // Used by every start/resume path.
-function enterStageViaTransition(openingScene, loadMessages) {
+function enterStageViaTransition(openingScene, loadMessages, opts = {}) {
   // Leaving the New Game flow for the stage — hide the flow chrome entirely
   // so ‹ / ⌂ don't linger over the stage (the Wupi top bar owns stage nav).
   if (flowChrome) { flowChrome.hideBack(); flowChrome.hideHome(); }
@@ -1380,23 +1427,39 @@ function enterStageViaTransition(openingScene, loadMessages) {
   // opens immediately with no overlay. Stop the title ambient (grass/particles)
   // + show + wire the stage directly.
   if (screens.title && screens.title._stopAmbient) screens.title._stopAmbient();
-  showScreen('stage');
-  try {
-    if (screens.stage) {
-      wireStage(screens.stage, {
-        cardContext: null,
-        onExit: returnToTitle,
-        openingScene,
-        loadMessages,
-      });
+  const revealStage = () => {
+    showScreen('stage');
+    try {
+      if (screens.stage) {
+        wireStage(screens.stage, {
+          cardContext: null,
+          onExit: returnToTitle,
+          openingScene,
+          loadMessages,
+        });
+      }
+    } catch (e) {
+      console.error('[fable] wireStage threw (stage shown, some features may degrade)', e);
     }
-  } catch (e) {
-    console.error('[fable] wireStage threw (stage shown, some features may degrade)', e);
-  }
-  // Stage entry is the terminal step of every start/resume path — clear the
-  // double-click guard here so the flag set by resumeSave / launchGame is
-  // always released.
-  setFlowBusy(false);
+    // Stage entry is the terminal step of every start/resume path — clear the
+    // double-click guard here so the flag set by resumeSave / launchGame is
+    // always released.
+    setFlowBusy(false);
+    // Direct launch (.lnk): reveal EXACTLY like the fable.exe title — the 1s
+    // top-to-bottom wipe over the desktop, the entry hold dropping only at
+    // wipe end (runEntryWipe owns both). Normal entries (title Continue /
+    // Load / New Game) reveal instantly, as before.
+    if (opts.underSplash) runEntryWipe(fableRoot, screens.stage);
+  };
+  // Direct launch: the stage must not spawn beside the F splash — wait out
+  // the remainder of the 2s splash window (0ms if the save load already
+  // outlasted it, e.g. a slow fable_start). While it waits, everything stays
+  // transparent: only the F floats over the desktop, then the stage wipes in.
+  const wait = opts.underSplash && opts.launchT0
+    ? Math.max(0, FABLE_SPLASH_HOLD_MS - (performance.now() - opts.launchT0))
+    : 0;
+  if (wait > 0) setTimeout(revealStage, wait);
+  else revealStage();
 }
 
 
@@ -1552,17 +1615,24 @@ function openFable() {
     stageActive = false;
     // Transparency hold (see the FABLE_ENTRY branch above): while the
     // floating-F splash owns the screen, #fable's void backdrop stays
-    // suppressed so nothing paints behind the F. Unlike FABLE_ENTRY there is
-    // no fixed 2s reveal — the async handoff below drops the hold at whatever
-    // point real content first appears (title fallback OR the stage entry).
+    // suppressed so nothing paints behind the F. The hold persists through
+    // the WHOLE entry: the save load runs invisibly behind the F, then the
+    // stage reveal (enterStageViaTransition's underSplash path) wipes in over
+    // the desktop at the splash's 2s mark — the void only paints once the
+    // stage has fully covered it, never as a blank pop. Title fallbacks drop
+    // it the same way via revealTitleUnderSplash. html.fable-wipe is stamped
+    // HERE because the stage reveal is LOAD-GATED (a slow fable_start can
+    // outlast script.js's html.fable-entry teardown at ~2.6s) — without it
+    // the body's dark base would pop in mid-load; with it the transparent
+    // hold is continuous from t=0 until runEntryWipe drops it at wipe end.
     fableRoot.classList.add('fable-entry-hold');
-    const revealHold = () => fableRoot.classList.remove('fable-entry-hold');
+    document.documentElement.classList.add('fable-wipe');
+    const launchT0 = performance.now();
     // Title fallbacks honor the splash hold: reveal via the shared
     // choreography (revealTitleUnderSplash) DELAYED until the F splash's 2s
     // window has elapsed (0ms if the async handoff already outlasted it —
     // e.g. a slow IPC). Revealing bare made the menu spawn beside the F
     // (the handoff resolves in tens of ms; fixed 2026-08-14).
-    const launchT0 = performance.now();
     const revealTitleAfterSplash = () => {
       const wait = Math.max(0, FABLE_SPLASH_HOLD_MS - (performance.now() - launchT0));
       setTimeout(() => revealTitleUnderSplash(fableRoot), wait);
@@ -1576,8 +1646,10 @@ function openFable() {
         // the ONLINE button + retry — a persisted API connection carries over.
         const src = await invoke('model_source_get').catch(() => null);
         if (!src || !src.apiReady) { revealTitleAfterSplash(); return; }
-        revealHold();
-        await resumeSave(ctx.cardSlug, ctx.saveId ?? null);
+        // underSplash: resumeSave → enterStageViaTransition delays the stage
+        // to the 2s splash window + runs the shared entry wipe (the reveal is
+        // identical to the fable.exe title path).
+        await resumeSave(ctx.cardSlug, ctx.saveId ?? null, { underSplash: true, launchT0 });
       } catch (e) {
         console.error('[fable] direct launch failed, falling back to title', e);
         revealTitleAfterSplash();
@@ -1603,19 +1675,26 @@ function openFable() {
     // Suppress #fable's own void backdrop for the hold too (.fable-entry-hold,
     // styles.css): while the title is held transparent the opaque #05040a void
     // (a blue-violet near-black that reads as purple behind the warm glow)
-    // must stay off — only the F floats over the desktop. Dropped at the
-    // reveal below, so the title's fade-in runs over the solid void, never
-    // over the desktop.
+    // must stay off — only the F floats over the desktop. It stays on through
+    // the WHOLE reveal wipe (dropped at wipe end by revealTitleUnderSplash) so
+    // the sweep reveals the desktop behind the menu — the void never pops in
+    // as a blank window, it only paints once the title fully covers it.
+    // html.fable-wipe is stamped HERE (not just at reveal) so the body stay
+    // transparent is CONTINUOUS across script.js's html.fable-entry teardown
+    // (~2.6s) — no dark frame can slip in between the two holds.
     fableRoot.classList.add('fable-entry-hold');
+    document.documentElement.classList.add('fable-wipe');
     // Show the title NOW (initFable's closing showScreen('title') already
     // left it visible; this re-show is idempotent + re-fires the ambient
     // guards) + apply the transparency hold in the same synchronous block —
     // no paint can land between them. The reveal fires at SPLASH_HOLD_MS
     // (matching script.js's splash fade start) via the shared
-    // revealTitleUnderSplash choreography: the held class drops, the
-    // .fable-title-enter wipe fades in top-to-bottom (1000ms) as the F logo
-    // crossfades out (600ms) → the F dissolves INTO the menu, and the theme
-    // music starts its fade-in at that same 2s mark (never during the hold).
+    // revealTitleUnderSplash choreography: the .fable-entry-wipe sweep fades
+    // in top-to-bottom (1000ms) as the F logo crossfades out (600ms) → the F
+    // dissolves INTO the menu sweeping in over the desktop (no backdrop pops
+    // in — the entry hold persists until the wipe has covered the screen),
+    // and the theme music starts its fade-in at that same 2s mark (never
+    // during the hold).
     showScreen('title');
     if (screens.title) screens.title.classList.add('fable-title-held');
     setTimeout(() => revealTitleUnderSplash(fableRoot), FABLE_SPLASH_HOLD_MS);

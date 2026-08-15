@@ -176,29 +176,34 @@ body.fable-active.fable-chrome-peek .top-bar { transform: translateY(0); }
     background-color: #05040a;
     text-align: center;
 }
-/* ── fable.exe splash handoff (the floating-F → title dissolve) ──
-   On the fable.exe path the floating-F splash (#fable-entry-splash, owned by
-   script.js) holds ~2s then crossfades out over 600ms. openFable reveals the
-   title screen at the same instant (FABLE_SPLASH_HOLD_MS in fable.js), so
-   adding .fable-title-enter rides a 1000ms TOP-TO-BOTTOM fade on the title:
-   a soft mask edge (~15% of screen height) sweeps down the whole screen over
-   exactly 1s → the menu fills in from top to bottom as the F logo crossfades
-   out instead of a hard cut. The reveal is a MASK sweep, not an opacity fade
-   (every layer is already composited behind the hold — §the 2s hold below —
-   so a uniform 0→1 opacity ramp and the mask sweep cost the same; the sweep
-   just reads as a cinematic wipe). --fable-reveal-edge is registered via
+/* ── The shared entry wipe (fable.exe title + .lnk direct-launch stage) ──
+   The floating-F splash (#fable-entry-splash, owned by script.js) holds ~2s
+   then crossfades out over 600ms. Both reveal paths (revealTitleUnderSplash
+   for the title, enterStageViaTransition's underSplash path for a direct-
+   launched stage) reveal at that same 2s instant (FABLE_SPLASH_HOLD_MS in
+   fable.js) via runEntryWipe, which adds .fable-entry-wipe to the revealing
+   screen: a 1000ms TOP-TO-BOTTOM fade — a soft mask edge (~15% of screen
+   height) sweeps down the whole screen over exactly 1s → the screen fills
+   in from top to bottom as the F logo crossfades out instead of a hard cut.
+   The reveal is a MASK sweep, not an opacity fade (every layer is already
+   composited behind the hold — §the 2s hold below — so a uniform 0→1
+   opacity ramp and the mask sweep cost the same; the sweep just reads as a
+   cinematic wipe). NOTHING dark paints behind the sweep: the entry hold
+   (.fable-entry-hold + html.fable-wipe) persists for the whole 1000ms so
+   the masked-out region shows the DESKTOP through the transparent window —
+   the void/OS base only repaint once the wipe has covered them (runEntryWipe
+   drops the hold at wipe end). --fable-reveal-edge is registered via
    @property so the gradient stop position is animatable (WebView2/Chromium;
-   unregistered custom props don't interpolate). The class is added once by
-   revealTitleUnderSplash right after showScreen('title') and self-removes on
-   animationend so it never interferes with later title re-shows (New Game ⌂
+   unregistered custom props don't interpolate). The class self-removes on
+   animationend so it never interferes with later screen re-shows (New Game ⌂
    back, Load back) — those reveal with no animation, as before. */
 @property --fable-reveal-edge {
     syntax: '<percentage>';
     inherits: false;
     initial-value: 100%; /* fully revealed when not animating */
 }
-.fable-title-screen.fable-title-enter {
-    animation: fableTitleEnter 1000ms ease both;
+.fable-entry-wipe {
+    animation: fableEntryWipe 1000ms ease both;
     -webkit-mask-image: linear-gradient(
         to bottom,
         black var(--fable-reveal-edge),
@@ -210,7 +215,7 @@ body.fable-active.fable-chrome-peek .top-bar { transform: translateY(0); }
         transparent calc(var(--fable-reveal-edge) + 15%)
     );
 }
-@keyframes fableTitleEnter {
+@keyframes fableEntryWipe {
     /* -15% → the whole screen sits below the soft band (fully hidden);
        100% → the soft band has swept past the bottom (fully visible). */
     from { --fable-reveal-edge: -15%; }
@@ -222,9 +227,11 @@ body.fable-active.fable-chrome-peek .top-bar { transform: translateY(0); }
    particles, clouds, wordmark — composites + warms during the 2s hold, so
    the reveal is a pure top-to-bottom sweep with zero pop-in, and WUPI's
    purple boot base never shows (the splash owns the pixels while the menu
-   warms up). Dropped by revealTitleUnderSplash at FABLE_SPLASH_HOLD_MS,
-   right before .fable-title-enter rides the 1s wipe. `animation: none` so
-   the pair can never half-animate if both classes ever coexist. */
+   warms up). Dropped by revealTitleUnderSplash at FABLE_SPLASH_HOLD_MS — the
+   mask sweep then runs over the still-transparent #fable (desktop behind),
+   and the hold only comes off at WIPE end so the void never pops in as a
+   blank window. `animation: none` so the held class can never half-animate
+   against the wipe if both ever coexist. */
 .fable-title-screen.fable-title-held {
     opacity: 0;
     animation: none;

@@ -1835,11 +1835,18 @@ html.fable-entry #fable-entry-splash img {
    - the body rule is scoped to html.fable-entry (stamped by the inline head
      script; script.js's fadeSplash teardown removes it once the splash node
      is gone, restoring the OS base behind the now-visible app);
+   - html.fable-wipe extends that body hold through the title reveal's 1s
+     top-to-bottom wipe: script.js's teardown lands ~2.6s (splash crossfade
+     end) while the wipe runs 2.0→3.0s, so without it the OS base would pop
+     in behind the still-sweeping bottom half. Stamped + dropped by
+     revealTitleUnderSplash (fable.js) at wipe start/end;
    - .fable-entry-hold is added to #fable by the FABLE_ENTRY / DIRECT_LAUNCH
-     branches (fable.js) and dropped the instant real content reveals
-     (showScreen / resumeSave) so the void never bleeds through the title's
-     fade-in. */
-html.fable-entry body:not(.booting) {
+     branches (fable.js); BOTH reveal paths (title + direct-launch stage)
+     keep it on for the WHOLE wipe (runEntryWipe drops it at wipe end) so the
+     sweep reveals the desktop — the void only paints once the fully-opaque
+     screen covers it, never as a blank pop. */
+html.fable-entry body:not(.booting),
+html.fable-wipe body:not(.booting) {
     background-color: transparent;
 }
 .app-window.fable-app.fable-entry-hold {

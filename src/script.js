@@ -1192,20 +1192,28 @@ function spawnLaunchSparkles(parent, count = 18) {
     const pawImg = document.querySelector('#boot-paw .boot-paw-img');
     if (pawImg && typeof pawImg.decode === 'function') pawImg.decode().catch(() => {});
   } catch (e) { /* warm is best-effort */ }
-  const warmStart = performance.now();
-  (function warmHeartbeat(now) {
-    if (now - warmStart < ENTRY_DELAY) requestAnimationFrame(warmHeartbeat);
-  })(performance.now());
 
-  // Timing constants (ms).
-  // ENTRY_DELAY is a blank-screen runway before the paw enters. History:
+  // ENTRY_DELAY (ms) is a blank-screen runway before the paw enters. History:
   // removed 2026-08-04 (Chloe wanted the paw immediately), RESTORED at 1000ms
   // 2026-08-14 — on a cold wupi.exe launch the WebView2's first second lags
   // badly + skips frames (JS parse/JIT, first style/paint/composite passes,
   // GPU surface creation all landing on the animation's opening frames). The
   // runway shifts all of that ahead of the choreography; the visual pre-cache
   // block above warms the specific paw pipeline during it.
+  // ORDER-DEPENDENT: declared here — BEFORE the warmHeartbeat IIFE below —
+  // because that IIFE runs immediately and reads it. A `const` below the call
+  // is a TDZ ReferenceError that aborts the whole boot splash before any
+  // timer is scheduled: body stays .booting → the window stays transparent
+  // forever (the infinite-blank-screen regression it caused, 2026-08-14).
   const ENTRY_DELAY = 1000;
+
+  const warmStart = performance.now();
+  (function warmHeartbeat(now) {
+    if (now - warmStart < ENTRY_DELAY) requestAnimationFrame(warmHeartbeat);
+  })(performance.now());
+
+  // Timing constants (ms). (ENTRY_DELAY lives up with the pre-cache heartbeat
+  // that reads it — its declaration order is load-bearing.)
   // Fairy-tour choreography: RISE STRAIGHT TO TOP-LEFT MIDDLE → dart to
   // TOP-RIGHT MIDDLE → dart to CENTER. Each dart is a hard ZOOM_EASE in/out
   // so the paw reads as a fairy teleporting with momentum. The rise gets the
@@ -1524,8 +1532,8 @@ function spawnLaunchSparkles(parent, count = 18) {
     doHop();
   }
 
-  // Kick off the entry + hops. ENTRY_DELAY is 0 (no intro delay) so the paw
-  // enters on the next tick.
+  // Kick off the entry + hops after the ENTRY_DELAY pre-cache runway (the
+  // blank first second that warms the SFX decode + render pipelines).
   setTimeout(startEntryAndHops, ENTRY_DELAY);
 
   // ── Flight gate. NO model-ready gate: hop 2 chains IMMEDIATELY into the
