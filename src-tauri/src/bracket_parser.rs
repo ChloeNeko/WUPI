@@ -527,7 +527,15 @@ fn tokenize_kv(tail: &str) -> Vec<(String, String)> {
             continue;
         }
         let mut key: String = chars[key_start..i].iter().collect();
-        if key.starts_with('(') {
+        // Track the parenthesized-group form: the trailing ')' is stripped
+        // from the VALUE only when the KEY was parenthesized (`(qty=1)` →
+        // key `qty`, value `1)` → `1`). (2026-08-15 audit fix) The old
+        // unconditional strip ate the closing paren of legitimate VALUES —
+        // `[BELT name=Gold Ring (family heirloom)]` parsed as
+        // "Gold Ring (family heirloom" (the auto-quoter absorbed the paren
+        // group as value continuation, then the strip bit).
+        let key_was_parenthesized = key.starts_with('(');
+        if key_was_parenthesized {
             key = key[1..].to_string();
         }
         i += 1; // consume '='
@@ -589,10 +597,10 @@ fn tokenize_kv(tail: &str) -> Vec<(String, String)> {
                 i = peek;
             }
         }
-        // Strip a trailing ')' from the value (the closing paren of a
-        // parenthesized field group): `1)` → `1`, `["pocketable"])` →
-        // `["pocketable"]`. Only the LAST paren (the group closer).
-        if value.ends_with(')') {
+        // Strip a trailing ')' from the value ONLY for the parenthesized
+        // group form (the closer of `(key=val)`): `1)` → `1`,
+        // `["pocketable"])` → `["pocketable"]`. Only the LAST paren.
+        if key_was_parenthesized && value.ends_with(')') {
             value.pop();
         }
         if !key.is_empty() {
@@ -685,6 +693,34 @@ const APPEARANCE_VALUE_MAX: usize = 200;
 /// while bounding prompt cost. Matches `APPEARANCE_VALUE_MAX`.
 const DATE_VALUE_MAX: usize = 200;
 
+/// (2026-08-15 audit fix) Free-text body caps for the single-phrase brackets
+/// that previously stored verbatim tracker output: WEATHER conditions and
+/// RUMOR labels are short diegetic phrases; PRESENCE stances are one
+/// micro-location clause. Oversize → the bracket is DROPPED (same leniency
+/// as DATE); stance instead truncates (the presence assertion itself is
+/// load-bearing — never drop it over bad prose).
+const WEATHER_CONDITION_MAX: usize = 60;
+const RUMOR_LABEL_MAX: usize = 140;
+const PRESENCE_STANCE_MAX: usize = 120;
+
+/// (2026-08-15 audit fix) The stance-cleanup contract, actually applied:
+/// free-text tracker output carries the §11.41 repetition risk + control-char
+/// contamination — a looping stance ("polishing a tankard polishing a
+/// tankard…") persisted forever into the `present:` line. Strip control
+/// chars, run the repetition firewall, char-cap. Empty stays empty (the
+/// allowed bare-name form).
+fn clean_stance(raw: &str) -> String {
+    let stripped: String = raw
+        .chars()
+        .filter(|c| {
+            let code = *c as u32;
+            !((code <= 0x08) || code == 0x0B || code == 0x0C || (0x0E..=0x1F).contains(&code))
+        })
+        .collect();
+    let deduped = crate::stream_filter::truncate_repetition(stripped.trim());
+    deduped.chars().take(PRESENCE_STANCE_MAX).collect()
+}
+
 /// Parse the `key=value` (or bare `key`) tail of an `[APPEARANCE ...]`
 /// bracket. Returns `None` for unknown keys, empty keys, or contaminated /
 /// oversize values (dropped silently — same leniency as every other parser).
@@ -710,7 +746,7 @@ fn parse_appearance_kv(rest: &str) -> Option<BracketCommand> {
     // Reject control chars + oversize values. Empty value is the clear
     // sentinel — explicitly allowed through.
     if !value.is_empty() {
-        if value.len() > APPEARANCE_VALUE_MAX {
+        if value.chars().count() > APPEARANCE_VALUE_MAX {
             return None;
         }
         if value.chars().any(|c| {
@@ -794,7 +830,7 @@ fn parse_equip(rest: &str) -> Option<BracketCommand> {
         // Name caps + control-char reject (equip is the one inventory bracket
         // that writes a name into the worn-item model, so validate it).
         let n = name.trim();
-        if n.len() > INV_NAME_MAX || has_control_chars(n) {
+        if n.chars().count() > INV_NAME_MAX || has_control_chars(n) {
             return None;
         }
         Some(n.to_string())
@@ -803,7 +839,7 @@ fn parse_equip(rest: &str) -> Option<BracketCommand> {
         None
     } else {
         let s = stats.trim();
-        if s.len() > INV_STATS_MAX || has_control_chars(s) {
+        if s.chars().count() > INV_STATS_MAX || has_control_chars(s) {
             return None;
         }
         Some(s.to_string())
@@ -836,7 +872,7 @@ fn parse_belt(rest: &str) -> Option<BracketCommand> {
     // For the remove form there's no kv tail — the body is the bare name.
     if remove {
         let name = body.trim();
-        if name.is_empty() || name.len() > INV_NAME_MAX || has_control_chars(name) {
+        if name.is_empty() || name.chars().count() > INV_NAME_MAX || has_control_chars(name) {
             return None;
         }
         return Some(BracketCommand::Belt {
@@ -882,14 +918,14 @@ fn parse_belt(rest: &str) -> Option<BracketCommand> {
         }
     }
     let n = name.trim();
-    if n.is_empty() || n.len() > INV_NAME_MAX || has_control_chars(n) {
+    if n.is_empty() || n.chars().count() > INV_NAME_MAX || has_control_chars(n) {
         return None;
     }
     let item_stats = if stats.trim().is_empty() {
         None
     } else {
         let s = stats.trim();
-        if s.len() > INV_STATS_MAX || has_control_chars(s) {
+        if s.chars().count() > INV_STATS_MAX || has_control_chars(s) {
             return None;
         }
         Some(s.to_string())
@@ -918,7 +954,7 @@ fn parse_pack(rest: &str) -> Option<BracketCommand> {
     };
     if remove {
         let name = body.trim();
-        if name.is_empty() || name.len() > INV_NAME_MAX || has_control_chars(name) {
+        if name.is_empty() || name.chars().count() > INV_NAME_MAX || has_control_chars(name) {
             return None;
         }
         return Some(BracketCommand::Pack {
@@ -973,14 +1009,14 @@ fn parse_pack(rest: &str) -> Option<BracketCommand> {
         }
     }
     let n = name.trim();
-    if n.is_empty() || n.len() > INV_NAME_MAX || has_control_chars(n) {
+    if n.is_empty() || n.chars().count() > INV_NAME_MAX || has_control_chars(n) {
         return None;
     }
     let item_stats = if stats.trim().is_empty() {
         None
     } else {
         let s = stats.trim();
-        if s.len() > INV_STATS_MAX || has_control_chars(s) {
+        if s.chars().count() > INV_STATS_MAX || has_control_chars(s) {
             return None;
         }
         Some(s.to_string())
@@ -1112,8 +1148,44 @@ fn scan_text_brackets(body: &str, commands: &mut Vec<BracketCommand>) {
     while i < bytes.len() {
         let Some(rel) = bytes[i..].iter().position(|&b| b == b'[') else { break };
         let start = i + rel;
-        let Some(end_rel) = bytes[start..].iter().position(|&b| b == b']') else { break };
-        let end = start + end_rel;
+        // (2026-08-15 audit fix) Quote-aware close-scan: a `]` inside a
+        // double-quoted value used to end the bracket early
+        // (`[PRESENCE elara "by the hearth] nook"]` truncated at the inner
+        // `]`). Inside a quoted segment a `]` is literal text. If the quote
+        // never closes (malformed output), fall back to the FIRST `]` —
+        // unchanged legacy behavior, so a stray quote can't swallow the
+        // rest of the turn. ASCII byte scan is UTF-8-safe (`"`/`]` never
+        // appear inside a multi-byte sequence).
+        let mut end = None;
+        let mut j = start + 1;
+        let mut in_quote = false;
+        let mut saw_quote = false;
+        while j < bytes.len() {
+            let b = bytes[j];
+            if in_quote {
+                if b == b'"' {
+                    in_quote = false;
+                }
+            } else if b == b'"' {
+                in_quote = true;
+                saw_quote = true;
+            } else if b == b']' {
+                end = Some(j);
+                break;
+            }
+            j += 1;
+        }
+        let end = match end {
+            Some(e) => e,
+            None if saw_quote => {
+                // Unterminated quote: legacy first-`]` fallback.
+                let Some(end_rel) = bytes[start..].iter().position(|&b| b == b']') else {
+                    break;
+                };
+                start + end_rel
+            }
+            None => break,
+        };
         let bracket = &body[start + 1..end];
         let text_after = &body[end + 1..];
         if let Some((cmd, consumed_after_bracket)) = parse_one(bracket, text_after) {
@@ -1368,10 +1440,15 @@ fn json_to_effect(obj: &serde_json::Map<String, serde_json::Value>) -> Option<Br
 
 fn json_to_time(obj: &serde_json::Map<String, serde_json::Value>) -> Option<BracketCommand> {
     // Prefer an explicit numeric minutes field (Rust-authoritative form).
+    // (2026-08-15 audit fix) CLAMP to the same 4e9 ceiling every text path
+    // enforces (parse_in_world_time): this value is model output, and an
+    // unclamped huge `minutes` permanently bricked the clock — every later
+    // [TIME] became a warned+ignored regression, freezing time + the tick.
     if let Some(mins) = obj.get("minutes").and_then(|v| v.as_i64()) {
         if mins >= 0 {
+            const TIME_MINUTES_MAX: i64 = 4_000_000_000;
             return Some(BracketCommand::Time {
-                minutes: mins,
+                minutes: mins.min(TIME_MINUTES_MAX),
                 raw: format!("{}", mins),
             });
         }
@@ -1505,8 +1582,13 @@ fn json_to_weather(obj: &serde_json::Map<String, serde_json::Value>) -> Option<B
         .get("condition")
         .or_else(|| obj.get("weather"))
         .and_then(|v| v.as_str())?
+        .trim()
         .to_string();
-    if condition.trim().is_empty() {
+    // (2026-08-15 audit fix) Same length/control gate as the text form.
+    if condition.is_empty()
+        || condition.chars().count() > WEATHER_CONDITION_MAX
+        || has_control_chars(&condition)
+    {
         return None;
     }
     Some(BracketCommand::Weather { condition })
@@ -1524,7 +1606,7 @@ fn json_to_date(obj: &serde_json::Map<String, serde_json::Value>) -> Option<Brac
         .and_then(|v| v.as_str())?
         .trim()
         .to_string();
-    if value.is_empty() || value.len() > DATE_VALUE_MAX {
+    if value.is_empty() || value.chars().count() > DATE_VALUE_MAX {
         return None;
     }
     if has_control_chars(&value) {
@@ -1561,7 +1643,7 @@ fn json_to_appearance(obj: &serde_json::Map<String, serde_json::Value>) -> Optio
         .trim()
         .to_string();
     if !value.is_empty() {
-        if value.len() > APPEARANCE_VALUE_MAX {
+        if value.chars().count() > APPEARANCE_VALUE_MAX {
             return None;
         }
         if value.chars().any(|c| {
@@ -1612,7 +1694,7 @@ fn json_to_equip(obj: &serde_json::Map<String, serde_json::Value>) -> Option<Bra
     let item_name = if name_raw.is_empty() {
         None
     } else {
-        if name_raw.len() > INV_NAME_MAX || has_control_chars(&name_raw) {
+        if name_raw.chars().count() > INV_NAME_MAX || has_control_chars(&name_raw) {
             return None;
         }
         Some(name_raw)
@@ -1627,7 +1709,7 @@ fn json_to_equip(obj: &serde_json::Map<String, serde_json::Value>) -> Option<Bra
     let item_stats = if stats_raw.is_empty() {
         None
     } else {
-        if stats_raw.len() > INV_STATS_MAX || has_control_chars(&stats_raw) {
+        if stats_raw.chars().count() > INV_STATS_MAX || has_control_chars(&stats_raw) {
             return None;
         }
         Some(stats_raw)
@@ -1665,7 +1747,7 @@ fn json_to_belt(obj: &serde_json::Map<String, serde_json::Value>) -> Option<Brac
         name = name[1..].trim().to_string();
         remove = true;
     }
-    if name.is_empty() || name.len() > INV_NAME_MAX || has_control_chars(&name) {
+    if name.is_empty() || name.chars().count() > INV_NAME_MAX || has_control_chars(&name) {
         return None;
     }
     let qty_raw = obj
@@ -1693,7 +1775,7 @@ fn json_to_belt(obj: &serde_json::Map<String, serde_json::Value>) -> Option<Brac
         .unwrap_or("")
         .trim()
         .to_string();
-    let item_stats = if stats_raw.is_empty() || stats_raw.len() > INV_STATS_MAX || has_control_chars(&stats_raw) {
+    let item_stats = if stats_raw.is_empty() || stats_raw.chars().count() > INV_STATS_MAX || has_control_chars(&stats_raw) {
         None
     } else {
         Some(stats_raw)
@@ -1728,7 +1810,7 @@ fn json_to_pack(obj: &serde_json::Map<String, serde_json::Value>) -> Option<Brac
         name = name[1..].trim().to_string();
         remove = true;
     }
-    if name.is_empty() || name.len() > INV_NAME_MAX || has_control_chars(&name) {
+    if name.is_empty() || name.chars().count() > INV_NAME_MAX || has_control_chars(&name) {
         return None;
     }
     let qty_raw = obj
@@ -1757,7 +1839,7 @@ fn json_to_pack(obj: &serde_json::Map<String, serde_json::Value>) -> Option<Brac
         .unwrap_or("")
         .trim()
         .to_string();
-    let item_stats = if stats_raw.is_empty() || stats_raw.len() > INV_STATS_MAX || has_control_chars(&stats_raw) {
+    let item_stats = if stats_raw.is_empty() || stats_raw.chars().count() > INV_STATS_MAX || has_control_chars(&stats_raw) {
         None
     } else {
         Some(stats_raw)
@@ -1838,7 +1920,8 @@ fn json_to_rumor(obj: &serde_json::Map<String, serde_json::Value>) -> Option<Bra
         .and_then(|v| v.as_str())?
         .trim()
         .to_string();
-    if label.is_empty() {
+    // (2026-08-15 audit fix) Same length/control gate as the text form.
+    if label.is_empty() || label.chars().count() > RUMOR_LABEL_MAX || has_control_chars(&label) {
         return None;
     }
     Some(BracketCommand::Rumor { label })
@@ -1872,6 +1955,10 @@ fn json_to_presence(obj: &serde_json::Map<String, serde_json::Value>) -> Option<
         .unwrap_or("")
         .trim()
         .to_string();
+    // (2026-08-15 audit fix) The stance-cleanup contract (control-strip +
+    // repetition firewall + cap) — same as the text form. Empty stays empty
+    // (the allowed bare-name form).
+    let stance = clean_stance(&stance);
     Some(BracketCommand::Presence { npc_id, stance })
 }
 
@@ -2129,7 +2216,12 @@ fn parse_one(bracket: &str, text_after: &str) -> Option<(BracketCommand, usize)>
     // code here (the `#[serde(tag = "kind")]` discriminator does the work).
     if let Some(rest) = strip_prefix_ci(bracket, "WEATHER") {
         let condition = rest.trim().to_string();
-        if !condition.is_empty() {
+        // (2026-08-15 audit fix) Length + control-char gate (the DATE
+        // discipline) — the body used to store verbatim tracker output.
+        if !condition.is_empty()
+            && condition.chars().count() <= WEATHER_CONDITION_MAX
+            && !has_control_chars(&condition)
+        {
             return Some((BracketCommand::Weather { condition }, 0));
         }
         return None;
@@ -2216,7 +2308,13 @@ fn parse_one(bracket: &str, text_after: &str) -> Option<(BracketCommand, usize)>
     // helper) — zero parse code here beyond the prefix-form.
     if let Some(rest) = strip_prefix_ci(bracket, "RUMOR") {
         let label = rest.trim().to_string();
-        if !label.is_empty() {
+        // (2026-08-15 audit fix) Length + control-char gate (the DATE
+        // discipline) — the body used to store verbatim tracker output and
+        // rode every rumor render + save forever.
+        if !label.is_empty()
+            && label.chars().count() <= RUMOR_LABEL_MAX
+            && !has_control_chars(&label)
+        {
             return Some((BracketCommand::Rumor { label }, 0));
         }
         return None;
@@ -2246,8 +2344,9 @@ fn parse_one(bracket: &str, text_after: &str) -> Option<(BracketCommand, usize)>
         }
         // Strip a single surrounding pair of double quotes if present
         // (`"by the table"` → `by the table`). Only the outermost pair —
-        // internal quotes are preserved.
-        let stance = strip_one_quote_pair(stance_raw).to_string();
+        // internal quotes are preserved. Then the stance-cleanup contract
+        // (2026-08-15 audit fix): control-strip + repetition firewall + cap.
+        let stance = clean_stance(strip_one_quote_pair(stance_raw));
         return Some((BracketCommand::Presence { npc_id, stance }, 0));
     }
 
@@ -4809,6 +4908,35 @@ mod tests {
         }
     }
 
+    /// 2026-08-15 audit fix pin: the trailing-`)` strip applies ONLY to the
+    /// parenthesized-KEY form — `[BELT name=Gold Ring (family heirloom)]` used
+    /// to lose its closing paren (the auto-quoter absorbed the paren group as
+    /// a value continuation, then the unconditional strip bit).
+    #[test]
+    fn value_ending_in_paren_group_keeps_its_closer() {
+        let parsed = parse("[BELT name=Gold Ring (family heirloom)]");
+        match &parsed.commands[0] {
+            BracketCommand::Belt { item_name, .. } => {
+                assert_eq!(item_name, "Gold Ring (family heirloom)");
+            }
+            other => panic!("expected Belt, got {:?}", other),
+        }
+    }
+
+    /// 2026-08-15 audit fix pin: a `]` inside a quoted value does not end the
+    /// bracket early (the quote-aware close-scan).
+    #[test]
+    fn quoted_close_bracket_inside_value_does_not_end_bracket() {
+        let parsed = parse(r#"[PRESENCE elara "by the hearth] nook"] trailing"#);
+        match &parsed.commands[0] {
+            BracketCommand::Presence { npc_id, stance } => {
+                assert_eq!(npc_id, "elara");
+                assert_eq!(stance, "by the hearth] nook");
+            }
+            other => panic!("expected Presence, got {:?}", other),
+        }
+    }
+
     #[test]
     fn auto_quoter_preserves_single_word_values() {
         // Single-word bare values must be unchanged (no trailing space, no over-absorption).
@@ -4820,5 +4948,32 @@ mod tests {
             }
             other => panic!("expected Belt, got {:?}", other),
         }
+    }
+
+    // --- json_to_time clamp (2026-08-15 recovery-seam-era pin) ---
+
+    /// An absurd model-emitted `minutes` value must CLAMP to the 4e9 ceiling,
+    /// never brick the clock (an unclamped huge value makes every later [TIME]
+    /// a warned+ignored regression — frozen time + tick). Negative values are
+    /// rejected (fall through to the raw-string path → None when absent).
+    #[test]
+    fn json_time_minutes_clamps_to_ceiling() {
+        let cmd = parse_json_command(r#"{"kind":"time","minutes":9007199254740993}"#)
+            .expect("oversize minutes must still produce a Time command (clamped)");
+        match cmd {
+            BracketCommand::Time { minutes, raw } => {
+                assert_eq!(minutes, 4_000_000_000, "the ceiling holds");
+                assert_eq!(raw, "9007199254740993", "raw keeps the model's verbatim value");
+            }
+            other => panic!("expected Time, got {:?}", other),
+        }
+        // A sane value passes through untouched.
+        let cmd = parse_json_command(r#"{"kind":"time","minutes":585}"#).unwrap();
+        match cmd {
+            BracketCommand::Time { minutes, .. } => assert_eq!(minutes, 585),
+            other => panic!("expected Time, got {:?}", other),
+        }
+        // Negative minutes → not taken (regression into the past is illegal).
+        assert!(parse_json_command(r#"{"kind":"time","minutes":-30}"#).is_none());
     }
 }

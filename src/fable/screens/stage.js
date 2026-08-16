@@ -106,6 +106,13 @@ let toastTimer = null;
 // turn text is stashed so a successful retry re-sends it.
 let composerLocked = false;
 let pendingTurnText = '';
+// (2026-08-15 audit fix) The text of the turn currently in flight. The
+// composer is CLEARED at submit, so when api_lost fires mid-turn the box is
+// empty — the old lockComposer stash read input.value and got nothing, killing
+// the Enter-retry affordance (the player's typed action was lost to a
+// disconnect). Stash the in-flight text here at submit; a delivered turn
+// clears it.
+let lastSentTurnText = '';
 let cardContext = null;  // { card, saveId } for the active session
 let activeCardName = '';  // display name of the seated card (the typing indicator)
 let activePlayerName = '';  // protagonist name (card.player_name) → user-beat headers
@@ -297,6 +304,9 @@ export function buildStage() {
 // builders have the card/player names in hand before the first beat could
 // render). Callers fire-and-forget; the return value (a Promise) is unused.
 export async function wireStage(root, hooks) {
+  // (2026-08-15 audit fix) Epoch capture: if this wiring is superseded (a
+  // re-entry) or torn down (fast Home) across any await below, stop wiring.
+  const myEpoch = ++wireEpoch;
   stageRoot = root;
   cardContext = hooks.cardContext || null;
 
@@ -513,12 +523,19 @@ export async function wireStage(root, hooks) {
   // Awaited so the names are in hand before initNarrator forwards them (a
   // fetch failure falls back to generic labels).
   await refreshActiveCardName(root);
+  // (2026-08-15 audit fix) The card-name IPC awaited — a fast Home may have
+  // torn the stage down (or a re-entry superseded us) while suspended. Any
+  // listener registered now would be untracked forever. Stop wiring.
+  if (myEpoch !== wireEpoch) return;
   narrator.initNarrator({
     onTurnStart: () => {
       setGenerating(true);
     },
     onTurnEnd: () => {
       setGenerating(false);
+      // (2026-08-15) The turn delivered — its text was consumed; the api_lost
+      // stash must not resurrect a stale action on some FUTURE disconnect.
+      lastSentTurnText = '';
       // §11.30 Left-Drawer HUD: a turn may have mutated player body (Combat
       // Referee), entities (item-grant brackets), clock/weather (TIME/
       // WEATHER commands). Refresh the paperdoll + ambient + inventory so
@@ -631,6 +648,7 @@ export async function wireStage(root, hooks) {
     }
     input.value = '';
     input.style.height = 'auto';
+    lastSentTurnText = text; // (2026-08-15) the api_lost retry affordance's source
     narrator.sendFableTurn(text);
   });
   on(input, 'keydown', (e) => {
@@ -813,7 +831,11 @@ export async function wireStage(root, hooks) {
       wupiDrawer.closeDrawer();
     }
     if (leftDrawer.isOpenState() && !leftDrawer.isLocked()) {
-      leftDrawer.closeDrawer();
+      // (2026-08-15 audit fix) An open inventory action popup (mid-EQUIP
+      // destination sub-menu) survives the alt-tab/blur: force-closing the
+      // drawer here killed the in-progress item action. Mirrors
+      // onDrawerMouseLeave's own actionPopupOpen guard.
+      if (!isActionPopupOpen()) leftDrawer.closeDrawer();
     }
   }
   // mouseout on document with no relatedTarget = pointer left the viewport
@@ -929,7 +951,10 @@ export async function wireStage(root, hooks) {
   });
 
   // Esc: dismiss panel → close wupi.
-  document.addEventListener('keydown', onKeyDown, true);
+  // (2026-08-15 audit fix) Routed through on() (capture preserved) — the raw
+  // document.addEventListener re-ran on every stage entry and NEVER tore
+  // down, so N sessions meant N Esc handlers firing per keypress.
+  on(document, 'keydown', onKeyDown, { capture: true });
 
   // Paint the dialogue feed on entry. Two paths feed it:
   //   - hooks.loadMessages: a resumed/loaded session's full history
@@ -958,6 +983,13 @@ export async function wireStage(root, hooks) {
   // values for a beat even though the persisted schema carried real state.
   // Best-effort + non-blocking: refreshAll swallows IPC failures internally.
   leftDrawer.refreshAll();
+  // (2026-08-15 audit fix) Re-mount the Soul Gems on every stage entry: the
+  // prior exit's resetLeftDrawer → clearSoulGems removed the overlay + panel
+  // slot (the anti-bleed guarantee) and nulled soul-gem.js's refs, so without
+  // a rebuild here toggleSoulGems() no-ops from game session 2 on. Idempotent:
+  // an existing overlay returns early (leftDrawerEl is resolved above, line
+  // ~744, the same element refreshAll/resetLeftDrawer act on).
+  leftDrawer.mountSoulGems(leftDrawerEl);
 
   // Background Library (2026-08-11): paint the saved active background (if any)
   // onto .fable-stage-bg on entry. Best-effort + non-blocking — a fetch failure
@@ -1008,6 +1040,15 @@ function on(el, type, handler, opts) {
   stageListeners.push([el, type, handler, opts && opts.capture]);
 }
 
+// (2026-08-15 audit fix) wireStage epoch: bumped on every wireStage ENTRY and
+// in teardownStage. After each internal await, wireStage checks its captured
+// epoch — a fast Home during the card-name IPC tears the stage down (or a
+// re-entry supersedes this wiring) while the async fn is suspended; without
+// the guard, the suspended run CONTINUES registering listeners (the document
+// keydown among them) onto a torn-down stage — an untracked leak that
+// accumulated one document listener per aborted entry.
+let wireEpoch = 0;
+
 // Generation state reflection (2026-07-27, no send button): the send/stop
 // toggle button + its SVG icons are GONE. The only UI feedback for a turn in
 // flight is now the in-card streaming caret (the .streaming class on the
@@ -1053,13 +1094,13 @@ function lockComposer(message) {
   const inputRow = stageRoot && stageRoot.querySelector('[data-input-form]');
   const input = stageRoot && stageRoot.querySelector('[data-input]');
   if (!inputRow || !input) return;
-  // Stash the text the player was trying to send so a retry re-sends it. The
-  // backend already aborted the turn WITHOUT consuming the user message (the
-  // api_lost path returns before add_message on the assistant side, but the
-  // user turn WAS pushed at the top of fable_send — so on a successful retry
-  // we send a fresh copy; the duplicate user turn is benign because the
-  // retried narration reads the window, not a strict turn-count).
-  pendingTurnText = input.value && input.value.trim();
+  // Stash the text the player was trying to send so a retry re-sends it.
+  // (2026-08-15 audit fix) The composer is CLEARED at submit, so mid-turn
+  // input.value is EMPTY — fall back to the in-flight turn's text stashed at
+  // submit (lastSentTurnText). The backend already aborted the turn WITHOUT
+  // consuming the user message (the api_lost path pops the turn-start user
+  // message), so the retry sends a fresh, unduplicated copy.
+  pendingTurnText = (input.value && input.value.trim()) || lastSentTurnText;
   input.value = '';
   input.style.height = 'auto';
   input.disabled = true;
@@ -1164,17 +1205,22 @@ function onKeyDown(e) {
   // surfaces can Esc them one at a time. The raw editor is highest (it darkens
   // the full stage + its validation lock means Esc refuses on invalid — only
   // ↻ or ✕ escape, so Esc on invalid just flashes the hint, not a close).
-  if (rawEditorOpen() && rawEditorEsc()) { e.preventDefault(); return; }
+  // (2026-08-15 audit fix) Every HANDLED branch also stopPropagation: this is
+  // a capture-phase listener, so without it the same keypress reaches the
+  // inline editor's own Esc handler (beats.js enterEditMode) on the bubble
+  // and discards the typed edit — one Esc closed TWO surfaces. When no
+  // surface was open the event propagates untouched (nothing handled it).
+  if (rawEditorOpen() && rawEditorEsc()) { e.preventDefault(); e.stopPropagation(); return; }
   if (saveModalClose) {
     const overlay = stageRoot && stageRoot.querySelector('[data-save-overlay]');
-    if (overlay && !overlay.hidden) { saveModalClose(); e.preventDefault(); return; }
+    if (overlay && !overlay.hidden) { saveModalClose(); e.preventDefault(); e.stopPropagation(); return; }
   }
   // Backgrounds gallery modal — same z-tier as the save modal, so it dismisses
   // right after it (before the drawer/panel surfaces below).
-  if (backgrounds.isOpen()) { backgrounds.closeBackgroundsPanel(); e.preventDefault(); return; }
-  if (panelActive()) { dismissPanel(); e.preventDefault(); return; }
-  if (wupiDrawer.isOpen()) { wupiDrawer.closeDrawer(); e.preventDefault(); return; }
-  if (leftDrawer.isOpenState()) { leftDrawer.closeDrawer(); e.preventDefault(); return; }
+  if (backgrounds.isOpen()) { backgrounds.closeBackgroundsPanel(); e.preventDefault(); e.stopPropagation(); return; }
+  if (panelActive()) { dismissPanel(); e.preventDefault(); e.stopPropagation(); return; }
+  if (wupiDrawer.isOpen()) { wupiDrawer.closeDrawer(); e.preventDefault(); e.stopPropagation(); return; }
+  if (leftDrawer.isOpenState()) { leftDrawer.closeDrawer(); e.preventDefault(); e.stopPropagation(); return; }
 }
 
 // Hover-corner dwell (decision 1: no visible button). Arm a 300ms timer
@@ -1229,6 +1275,10 @@ async function doSave(saveId, name, msg) {
 }
 
 export function toast(msg) {
+  // (2026-08-15 audit fix) toast can fire before any stage entry (e.g. a New
+  // Game import failure in fable.js calls it while stageRoot is still null —
+  // wireStage hasn't run on a fresh boot). Guard instead of throwing.
+  if (!stageRoot) { console.warn('[stage] toast before wireStage:', msg); return; }
   const t = stageRoot.querySelector('[data-toast]');
   if (!t) return;
   t.textContent = msg;
@@ -1338,6 +1388,10 @@ export function teardownStage() {
     el.removeEventListener(type, handler, capture);
   }
   stageListeners = [];
+  // (2026-08-15 audit fix) Invalidate any wireStage still suspended across its
+  // card-name IPC await — its post-await epoch check stops it from registering
+  // listeners onto this torn-down stage.
+  wireEpoch++;
   cancelCornerDwell();
   cornerTrigger = null;
   // The LEFT edge dwell timer too (2026-08-15 audit fix): a dwell armed
@@ -1349,6 +1403,7 @@ export function teardownStage() {
   // Reset the API-lost composer lock so a re-entry isn't stuck greyed out.
   composerLocked = false;
   pendingTurnText = '';
+  lastSentTurnText = '';
   // Clear the toast timer so it can't fire into a torn-down element after
   // close (was a residual-state gap — harmless but not clean).
   if (toastTimer) { clearTimeout(toastTimer); toastTimer = null; }

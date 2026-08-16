@@ -40,6 +40,9 @@ export function buildSaves(handlers) {
     <header class="fable-screen-header">
       <button class="fable-back-btn" data-act="back">‹ Back</button>
       <h2 class="fable-screen-title" data-title>Saves</h2>
+      <!-- (2026-08-15 audit fix) inline error surface: the saves screen has no
+           toast of its own, and a swallowed delete failure must be visible. -->
+      <p class="fable-saves-status" data-status hidden></p>
     </header>
     <div class="fable-saves-list" data-host></div>
   `;
@@ -96,6 +99,28 @@ export async function renderSaves(root, cardId, onSelect, cardName) {
     return;
   }
 
+  // (2026-08-15 audit fix) delete is destructive + was one unrecoverable click
+  // with errors swallowed. Armed two-click confirm (native confirm() is dead
+  // in wry): first click arms ("Sure?" + danger styling stays), second click
+  // within 5s executes. Only ONE armed button at a time — arming another
+  // disarms the previous. Failures surface on the inline status line.
+  let armedBtn = null;
+  let armTimer = 0;
+  const disarm = () => {
+    clearTimeout(armTimer);
+    if (armedBtn) {
+      armedBtn.dataset.armed = '';
+      armedBtn.textContent = 'Delete';
+      armedBtn = null;
+    }
+  };
+  const showStatus = (text) => {
+    const el = root.querySelector('[data-status]');
+    if (!el) return;
+    el.textContent = text;
+    el.hidden = !text;
+  };
+
   for (const save of manuals) {
     const row = document.createElement('div');
     row.className = 'fable-save-row';
@@ -111,10 +136,24 @@ export async function renderSaves(root, cardId, onSelect, cardName) {
       </div>
     `;
     row.querySelector('[data-act="load"]').addEventListener('click', () => onSelect(save));
-    row.querySelector('[data-act="del"]').addEventListener('click', async () => {
+    row.querySelector('[data-act="del"]').addEventListener('click', async (e) => {
+      const btn = e.currentTarget;
+      if (btn !== armedBtn) disarm();
+      if (btn.dataset.armed !== '1') {
+        btn.dataset.armed = '1';
+        btn.textContent = 'Sure?';
+        armedBtn = btn;
+        clearTimeout(armTimer);
+        armTimer = setTimeout(disarm, 5000);
+        return;
+      }
+      disarm();
       try {
         await deleteSave(cardId, save.save_id);
-      } catch (_) {}
+        showStatus('');
+      } catch (err) {
+        showStatus(`Delete failed: ${esc(err)}`);
+      }
       renderSaves(root, cardId, onSelect, cardName);
     });
     host.appendChild(row);

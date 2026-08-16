@@ -239,7 +239,11 @@ export function buildOnlinePanel({ onChanged } = {}) {
       const config = await invoke('api_profiles_list');
       const extra = await invoke('model_source_get');
       lastConfig = config;
-      runtimeSource = (extra?.source || config.model_source) === 'api' ? 'api' : 'local';
+      // (2026-08-15 audit fix) Match the title gate's source-of-truth exactly:
+      // source==='api' AND apiReady. The old check ignored apiReady, so the
+      // bubble claimed connected while _refreshTitleGate still blocked play.
+      const src = extra?.source || config.model_source;
+      runtimeSource = src === 'api' && !!extra?.apiReady ? 'api' : 'local';
       activeProfileId = config.active_profile_id || null;
       renderProfileSelect(config);
       renderOnlineBubble();
@@ -326,7 +330,9 @@ export function buildOnlinePanel({ onChanged } = {}) {
     const p = findProfile(profileId);
     if (p && p.model !== modelId) {
       try {
-        await invoke('api_profile_save', { profile: { ...p, model: modelId, temperature: 1.0 } });
+        // (2026-08-15 audit fix) no temperature here: the Rust backend's
+        // locked fallback constant (0.85) must govern every API turn.
+        await invoke('api_profile_save', { profile: { ...p, model: modelId } });
       } catch (err) {
         setStatus('Could not save model choice: ' + err, 'err');
         return;
@@ -355,9 +361,8 @@ export function buildOnlinePanel({ onChanged } = {}) {
       name,
       endpoint: endpointEl.value.trim(),
       api_key: keyEl.value,
-      model: existing?.model || '',
-      temperature: 1.0,
-    };
+        model: existing?.model || '',
+      };
     addBtn.disabled = true;
     setStatus(editingId ? 'Saving…' : 'Adding…');
     try {
@@ -386,11 +391,32 @@ export function buildOnlinePanel({ onChanged } = {}) {
     loadEditor(p);
   });
 
+  // (2026-08-15 audit fix) Two-click inline delete confirm. Native confirm()
+  // is dead in the wry WebView (always false → the delete silently no-ops
+  // forever), so the first click ARMS (label swap + status prompt) and the
+  // second click within the 5s window deletes. Any selection change or
+  // further delay disarms via the timeout.
+  let deleteArmTimer = 0;
+  const disarmDeleteBtn = () => {
+    clearTimeout(deleteArmTimer);
+    deleteBtn.dataset.armed = '';
+    deleteBtn.textContent = 'Delete';
+    deleteBtn.title = 'Delete selected profile';
+  };
   deleteBtn.addEventListener('click', async () => {
     const id = profileSelect.value;
     const p = findProfile(id);
-    if (!p) { setStatus('Pick a profile to delete first.', 'err'); return; }
-    if (!confirm(`Delete profile "${p.name || p.id}"?\nThis removes the saved API URL + key.`)) return;
+    if (!p) { disarmDeleteBtn(); setStatus('Pick a profile to delete first.', 'err'); return; }
+    if (deleteBtn.dataset.armed !== '1') {
+      deleteBtn.dataset.armed = '1';
+      deleteBtn.textContent = 'Sure?';
+      deleteBtn.title = `Really delete "${p.name || p.id}"? Click again.`;
+      setStatus(`Click delete again to remove "${p.name || p.id}" (URL + key).`, 'err');
+      clearTimeout(deleteArmTimer);
+      deleteArmTimer = setTimeout(disarmDeleteBtn, 5000);
+      return;
+    }
+    disarmDeleteBtn();
     setStatus('Deleting…');
     try {
       await invoke('api_profile_delete', { profileId: id });

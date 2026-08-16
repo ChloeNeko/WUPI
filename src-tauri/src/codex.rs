@@ -182,6 +182,21 @@ async fn seed_compound_codex<E: Embedder>(
     // undeletable — `wipe_episodic_card` preserves codex rows, so no path
     // could ever remove it).
     let existing = engine.list_codex_entries(card_id).await?;
+    // (2026-08-15 audit fix) Seed-vs-delete race guard: the parse + this list
+    // span awaits during which `fable_card_delete` can purge the partition +
+    // remove the card folder. Writing now would resurrect rows for a dead
+    // partition (unreachable ghosts). The source file's existence is the
+    // liveness signal — a delete removes it with the folder. Re-checked here,
+    // directly before the write loop, the window shrinks from seconds (the
+    // whole seed) to the loop's own duration.
+    if !path.exists() {
+        tracing::info!(
+            card_id,
+            namespace,
+            "compound codex source vanished mid-seed (card deleted?); aborting seed"
+        );
+        return Ok(report);
+    }
     let mut existing_by_title: HashMap<String, Vec<(MemoryId, Option<String>)>> = HashMap::new();
     for (id, metadata_json) in existing {
         let title = extract_metadata_field(metadata_json.as_deref(), "title").unwrap_or_default();
@@ -332,7 +347,7 @@ pub(crate) fn expand_oversize_entries(sources: Vec<ParsedEntry>) -> Vec<ParsedEn
     const CAP: usize = crate::memory::CHUNK_CHAR_BUDGET;
     let mut out = Vec::with_capacity(sources.len());
     for src in sources {
-        if src.body.len() <= CAP {
+        if src.body.chars().count() <= CAP {
             out.push(src);
             continue;
         }
@@ -381,7 +396,7 @@ async fn insert_entry(
     // >1400. If this fires, a future caller bypassed the split — the final
     // backstop in `add_codex_entry` (memory.rs) clamps the embed input regardless.
     const BUDGET_CHARS: usize = 1400;
-    if src.body.len() > BUDGET_CHARS {
+    if src.body.chars().count() > BUDGET_CHARS {
         tracing::error!(
             title = %src.title,
             body_chars = src.body.len(),

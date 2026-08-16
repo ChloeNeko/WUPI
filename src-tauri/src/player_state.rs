@@ -104,6 +104,22 @@ impl BodyPartState {
             BodyPartState::Black => 5,
         }
     }
+
+    /// (2026-08-15 recovery seam) One healing step DOWN the severity
+    /// ladder: Purple→Red→Orange→Yellow→healthy. Returns `None` when the
+    /// part cannot heal — healthy (nothing to heal) or Amputated (a lost
+    /// limb is gone; it never regrows). `rank` is private + load-bearing,
+    /// so this stays inside the impl rather than reconstructing the ladder
+    /// at the call site.
+    pub fn heal_step(&self) -> Option<BodyPartState> {
+        match self {
+            BodyPartState::Transparent | BodyPartState::Black => None,
+            BodyPartState::Yellow => Some(BodyPartState::Transparent),
+            BodyPartState::Orange => Some(BodyPartState::Yellow),
+            BodyPartState::Red => Some(BodyPartState::Orange),
+            BodyPartState::Purple => Some(BodyPartState::Red),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -152,6 +168,20 @@ impl Stamina {
             Stamina::Active => Stamina::Winded,
             Stamina::Winded => Stamina::Exhausted,
             Stamina::Exhausted | Stamina::Depleted => Stamina::Depleted,
+        };
+    }
+
+    /// (2026-08-15 recovery seam) Recover one step toward `Fresh` — the
+    /// inverse of `drain`, fired by the recovery Referee on a
+    /// Downtime-classified rest turn. Without this stamina was strictly
+    /// monotonic downward: every long campaign converged on a permanently
+    /// `Depleted` player.
+    pub fn recover(&mut self) {
+        *self = match self {
+            Stamina::Depleted => Stamina::Exhausted,
+            Stamina::Exhausted => Stamina::Winded,
+            Stamina::Winded => Stamina::Active,
+            Stamina::Active | Stamina::Fresh => Stamina::Fresh,
         };
     }
 }
@@ -760,6 +790,92 @@ const COMBAT_KEYWORDS: &[&str] = &[
     "parry", "shoot", "fire", "cast", "throw", "tackle", "grapple", "charge",
     "run", "sprint", "climb", "jump", "leap", "swim",
 ];
+
+/// (2026-08-15 recovery seam) Rest keywords that trigger the recovery
+/// Referee. Same whole-word, case-insensitive matcher as COMBAT_KEYWORDS.
+/// Deliberately short + rest-specific: "rest", "sleep", "camp" — the verbs
+/// a player types when their character actually rests. "watch" (a common
+/// camp activity) is intentionally ABSENT: it is already a TENSE pillar
+/// keyword in scene_pacing, and a watchkeeping sentry is not resting.
+const REST_KEYWORDS: &[&str] = &[
+    "rest", "rests", "sleep", "sleeps", "nap", "camp", "recuperate", "convalesce",
+    "bandage", "binds", "mend", "recovers",
+];
+
+/// (2026-08-15 recovery seam) The recovery Referee's verdict for one turn.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RecoveryOutcome {
+    /// Stamina moved one tier toward `Fresh`.
+    pub stamina_recovered: bool,
+    /// The worst healable injury improved one grade. `None` = no injury was
+    /// healable this turn (all healthy, or only amputations). The part maps
+    /// to its NEW state; `Transparent` means fully healed (entry removed).
+    pub healed: Option<(BodyPart, BodyPartState)>,
+}
+
+/// (2026-08-15 recovery seam) The recovery Referee — the exit from the
+/// otherwise-monotonic wound/stamina economy. Fires ONLY when the scene is
+/// classified Downtime AND the player's action carries a rest keyword: one
+/// stamina tier up, plus the WORST healable injury down one grade. Worst =
+/// highest severity; ties resolve to the first part in canonical
+/// `BodyPart::all()` order (deterministic, no RNG — healing is not a gamble).
+/// Amputated parts never heal; a fully-healed (`Transparent`) part's entry
+/// + injury history are removed from the maps.
+///
+/// Pure evaluation: reads `state`, returns the outcome; the caller applies
+/// it (same contract as `referee_evaluate` + `apply_outcome`).
+pub fn referee_evaluate_recovery(
+    text: &str,
+    state: &PlayerState,
+    is_downtime: bool,
+) -> Option<RecoveryOutcome> {
+    if !is_downtime {
+        return None;
+    }
+    let lower = text.to_lowercase();
+    if !REST_KEYWORDS.iter().any(|kw| keyword_present(&lower, kw)) {
+        return None;
+    }
+    let stamina_recovered = state.stamina != Stamina::Fresh;
+    // Worst healable injury: max severity rank among non-Black, non-Healthy
+    // entries; canonical-order tie-break (first wins).
+    let mut worst: Option<(BodyPart, BodyPartState)> = None;
+    for part in BodyPart::all() {
+        if let Some(st) = state.body.get(part) {
+            if let Some(healed) = st.heal_step() {
+                let better = match worst {
+                    None => true,
+                    Some((_, ref cur)) => st.rank() > cur.rank(),
+                };
+                if better {
+                    worst = Some((*part, healed));
+                }
+            }
+        }
+    }
+    if !stamina_recovered && worst.is_none() {
+        return None; // resting while fully healthy: nothing to recover
+    }
+    Some(RecoveryOutcome { stamina_recovered, healed: worst })
+}
+
+/// (2026-08-15 recovery seam) Apply a recovery outcome to the canonical
+/// state. A part healed to `Transparent` is REMOVED from `body` (the map
+/// only carries non-healthy zones — same clean-delete the split round-trip
+/// uses) and its `injury_details` history is dropped with it.
+pub fn apply_recovery(state: &mut PlayerState, outcome: &RecoveryOutcome) {
+    if outcome.stamina_recovered {
+        state.stamina.recover();
+    }
+    if let Some((part, new_state)) = outcome.healed {
+        if new_state == BodyPartState::Transparent {
+            state.body.remove(&part);
+            state.injury_details.remove(&part);
+        } else {
+            state.body.insert(part, new_state);
+        }
+    }
+}
 
 /// A tiny xorshift RNG. std-only (no new crate). Seeded from the turn text
 /// so each turn is deterministic for testing; swap for a real RNG later by
@@ -2836,5 +2952,74 @@ mod tests {
         assert!(AttackerTier::Soldier < AttackerTier::Elite);
         assert!(AttackerTier::Elite < AttackerTier::Boss);
         assert!(AttackerTier::Boss < AttackerTier::Legendary);
+    }
+
+    // --- Recovery Referee (2026-08-15 recovery-seam pins) ---
+
+    /// Downtime-gating: no rest keyword or no Downtime classification → the
+    /// referee stays silent (healing is an active choice, not a default).
+    #[test]
+    fn referee_evaluate_recovery_gates_on_downtime_and_keyword() {
+        let mut s = fresh_state();
+        s.stamina = Stamina::Winded;
+        s.body.insert(BodyPart::Head, BodyPartState::Orange);
+        // No Downtime → never fires, even with the keyword.
+        assert!(referee_evaluate_recovery("I rest by the hearth.", &s, false).is_none());
+        // Downtime but no rest keyword → silent.
+        assert!(referee_evaluate_recovery("I stare at the map.", &s, true).is_none());
+        // Both gates open → fires.
+        assert!(referee_evaluate_recovery("I rest by the hearth.", &s, true).is_some());
+        // "watch" is deliberately NOT a rest keyword (a sentry is not resting).
+        assert!(referee_evaluate_recovery("I watch the road.", &s, true).is_none());
+    }
+
+    /// Worst-injury selection: the highest-severity healable part improves one
+    /// grade; amputations never heal; a fully-healthy body recovers stamina only.
+    #[test]
+    fn referee_evaluate_recovery_heals_worst_injury_and_skips_amputations() {
+        let mut s = fresh_state();
+        s.stamina = Stamina::Fresh; // fully rested: stamina won't move
+        s.body.insert(BodyPart::LeftHand, BodyPartState::Yellow);
+        s.body.insert(BodyPart::Head, BodyPartState::Purple);
+        s.body.insert(BodyPart::RightFoot, BodyPartState::Black); // amputated
+        let out = referee_evaluate_recovery("we camp for the night", &s, true)
+            .expect("resting with injuries must fire");
+        assert!(!out.stamina_recovered, "Fresh stamina has nothing to recover");
+        // Purple Head outranks Yellow LeftHand; Black is never healable.
+        assert_eq!(out.healed, Some((BodyPart::Head, BodyPartState::Red)));
+        // Apply: head advances one grade, everything else untouched.
+        apply_recovery(&mut s, &out);
+        assert_eq!(s.body.get(&BodyPart::Head), Some(&BodyPartState::Red));
+        assert_eq!(s.body.get(&BodyPart::LeftHand), Some(&BodyPartState::Yellow));
+        assert_eq!(s.body.get(&BodyPart::RightFoot), Some(&BodyPartState::Black));
+    }
+
+    /// A Yellow (minor) wound heals to healthy in ONE rest: the part's entry
+    /// AND its injury history leave the maps (the clean-delete contract).
+    #[test]
+    fn apply_recovery_removes_fully_healed_part_and_history() {
+        let mut s = fresh_state();
+        s.stamina = Stamina::Fresh;
+        s.body.insert(BodyPart::Neck, BodyPartState::Yellow);
+        s.injury_details.insert(BodyPart::Neck, vec!["bruised in a fall".into()]);
+        let out = referee_evaluate_recovery("I sleep", &s, true)
+            .expect("resting with a minor wound must fire");
+        assert_eq!(out.healed, Some((BodyPart::Neck, BodyPartState::Transparent)));
+        apply_recovery(&mut s, &out);
+        assert!(!s.body.contains_key(&BodyPart::Neck), "a fully healed part leaves the body map");
+        assert!(!s.injury_details.contains_key(&BodyPart::Neck), "its injury history goes with it");
+        // Resting while fully healthy → nothing to recover → silent.
+        assert!(referee_evaluate_recovery("I sleep", &s, true).is_none());
+    }
+
+    /// One rest = ONE stamina tier up (the monotonic economy's single exit).
+    #[test]
+    fn apply_recovery_advances_stamina_exactly_one_tier() {
+        let mut s = fresh_state();
+        s.stamina = Stamina::Depleted;
+        let out = referee_evaluate_recovery("I sleep", &s, true).expect("must fire");
+        assert!(out.stamina_recovered);
+        apply_recovery(&mut s, &out);
+        assert_eq!(s.stamina, Stamina::Exhausted, "Depleted recovers to Exhausted, never further");
     }
 }

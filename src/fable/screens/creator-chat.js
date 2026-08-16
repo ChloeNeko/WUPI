@@ -23,7 +23,7 @@
 // agreed `<intro>` sibling in-file — no post-card intro step exists.
 // =============================================================
 
-import { invoke, Channel } from '@tauri-apps/api/core';
+import { invoke, Channel, convertFileSrc } from '@tauri-apps/api/core';
 import { open as openDialog } from '@tauri-apps/plugin-dialog';
 import { openPortraitCropper } from './portrait-cropper.js';
 import { bytesToBase64, ARROW_SVG_LEFT } from './wizard-engine.js';
@@ -140,7 +140,19 @@ export function renderCreatorChat(root, config) {
   // turn (mergeDraft overwrites with non-empty), but the mechanically-captured
   // greetings are the floor so the authored opening survives into `<intro>`.
   if (config.presetIntro) state.draft.intro = config.presetIntro;
-  root._creatorBack = back;
+  // (2026-08-15 audit fix) ‹ mid-edit leak wrap: the edit popup + the edit
+  // generation ring attach DOCUMENT-level capture keydowns; exiting the
+  // screen with ‹ while either was open left them attached forever
+  // (Enter/Escape firing into dead overlays on other screens). Every ‹ now
+  // closes the open popup + strips the genring before routing back.
+  root._creatorBack = () => {
+    if (root._creatorCloseEditPopup) {
+      try { root._creatorCloseEditPopup(); } catch (_) {}
+      root._creatorCloseEditPopup = null;
+    }
+    endEditGen();
+    if (typeof back === 'function') back();
+  };
 
   // Reset residue from a prior wizard run on this SHARED screen. A completed
   // review (CREATE) never returns to chat, so the container keeps
@@ -159,10 +171,14 @@ export function renderCreatorChat(root, config) {
   if (composerEl) composerEl.hidden = false;
   // Strip any edit-popup / edit-generation overlays a prior run left on this
   // shared screen (a ‹ exit mid-edit can leave the ring spinning invisibly).
+  // (2026-08-15 audit fix) _cleanup now exists on BOTH overlay shapes — the
+  // edit popup's document keydown releases here too (a creator re-render is
+  // the other teardown path besides ‹).
   root.querySelectorAll('[data-genring], [data-edit-overlay]').forEach((el) => {
     if (el._cleanup) el._cleanup();
     el.remove();
   });
+  root._creatorCloseEditPopup = null;
 
   messagesEl.innerHTML = '';
   reviewEl.hidden = true;
@@ -191,6 +207,21 @@ export function renderCreatorChat(root, config) {
   if (config.seedDraft) {
     Object.assign(state.draft, config.seedDraft);
     showReview();
+    // (2026-08-15 audit fix) Edit-run portrait preview: flowEditPlayer passes
+    // no presetPortraitDataUrl, so the review card opened with an empty
+    // portrait slot even when the saved player HAS one. Load it via the same
+    // fable_player_get the picker uses (its `portrait` is a raw absolute path
+    // — must go through convertFileSrc) + re-render the still-open review.
+    // fable.js is deliberately untouched (another agent's file).
+    if (creatorKind === 'player' && !state.portraitPreview && config.seedDraft.id) {
+      invoke('fable_player_get', { id: config.seedDraft.id })
+        .then((full) => {
+          if (root._creatorEpoch !== epoch || !full || !full.portrait) return;
+          state.portraitPreview = convertFileSrc(full.portrait);
+          if (!reviewEl.hidden) showReview();
+        })
+        .catch(() => { /* no portrait / IPC failure — empty slot is fine */ });
+    }
   }
 
   const setBusy = (b) => {
@@ -538,6 +569,7 @@ export function renderCreatorChat(root, config) {
       if (closed) return;
       closed = true;
       document.removeEventListener('keydown', onKey, { capture: true });
+      if (root._creatorCloseEditPopup === close) root._creatorCloseEditPopup = null;
       overlay.classList.remove('is-open');
       const finish = () => overlay.remove();
       overlay.addEventListener('transitionend', finish, { once: true });
@@ -561,6 +593,11 @@ export function renderCreatorChat(root, config) {
       }
     };
     document.addEventListener('keydown', onKey, { capture: true });
+    // (2026-08-15 audit fix) The popup's document keydown releases via ‹
+    // (root._creatorCloseEditPopup) or a creator re-render (overlay._cleanup)
+    // — not only its own close paths.
+    overlay._cleanup = () => document.removeEventListener('keydown', onKey, { capture: true });
+    root._creatorCloseEditPopup = close;
     overlay.hidden = false;
     void overlay.offsetWidth;
     overlay.classList.add('is-open');
@@ -656,6 +693,12 @@ export function renderCreatorChat(root, config) {
   }
 
   // --- CREATE: serialize + write via the existing IPCs -------------------
+  // (2026-08-15 audit fix) Ids THIS screen has already written. A CREATE that
+  // fails AFTER the entity write (e.g. the portrait upload throws) left a
+  // complete entity on disk; the retry then hit the duplicate-name guard on
+  // ITS OWN half-finished id and dead-ended. The guard exempts our own
+  // minted ids — a retry is a resume-overwrite, not a collision.
+  const mintedIds = new Set();
   async function doCreate(btn) {
     if (btn.disabled) return;
     btn.disabled = true;
@@ -695,14 +738,38 @@ export function renderCreatorChat(root, config) {
             : (await invoke('fable_cards_list'));
           existingIds = (existing || []).map((m) => m.id);
         } catch (_) { /* list IPC failure → skip the guard (the write may still fail server-side) */ }
-        if (shouldRejectDuplicateName(target, seededId, existingIds)) {
+        if (shouldRejectDuplicateName(target, seededId, existingIds) && !mintedIds.has(target)) {
           throw new Error(`a ${creatorKind === 'player' ? 'player' : 'world'} named "${state.draft.name || target}" already exists — choose a different name`);
         }
       }
       if (creatorKind === 'player') {
         const { id, player } = serializePlayer(state.draft);
+        // (2026-08-15 audit fix) Edit-run identity preservation:
+        // serializePlayer builds a fresh object modeling only the wizard's
+        // fields — re-saving an EDIT silently dropped identity-file keys it
+        // doesn't model (notably `portrait`, killing load_player_portrait).
+        // Merge forward every key the serializer didn't set from the stored
+        // player JSON (fetch via fable_player_get, same source the picker
+        // lazy-loads portraits from); serializer-set keys always win.
+        if (config.seedDraft && config.seedDraft.id) {
+          try {
+            const existing = await invoke('fable_player_get', { id: config.seedDraft.id });
+            if (existing && typeof existing === 'object') {
+              for (const [k, v] of Object.entries(existing)) {
+                if (!(k in player) && k !== 'id') player[k] = v;
+              }
+            }
+          } catch (_) { /* unreadable prior entity — write the fresh form */ }
+        }
         trace(`serializePlayer → id=${id} fields=[${Object.keys(player).join(',')}]`);
-        const meta = await invoke('fable_player_write', { id, player });
+        // (2026-08-15 audit fix) Rename-on-edit cleanup: pass the SEEDED id
+        // (the entity's old id) as the write's `id` param so the backend's
+        // rename branch fires (old folder → new slug, portrait rides along).
+        // The fresh-derived id made `slug == id` always true, so the old
+        // folder was silently orphaned on every rename edit.
+        const writeId = (config.seedDraft && config.seedDraft.id) ? config.seedDraft.id : id;
+        const meta = await invoke('fable_player_write', { id: writeId, player });
+        mintedIds.add(meta.id);
         if (state.portraitBytes) {
           await invoke('fable_player_portrait_upload_bytes', {
             id: meta.id,
@@ -719,6 +786,20 @@ export function renderCreatorChat(root, config) {
         // (2026-08-13), so fable_write_card carries it — no separate .intro
         // sibling-file write.
         const meta = await invoke('fable_write_card', { stem, xml });
+        mintedIds.add(meta.id);
+        // (2026-08-15 audit fix) Rename-on-edit cleanup: a card edit under a
+        // NEW name writes a NEW folder (cards have no rename path); the OLD
+        // card would linger in the worlds list + hold its saves/memory. The
+        // duplicate guard already proved the new slug is fresh — reap the
+        // seeded card after the successful write.
+        if (config.seedDraft && config.seedDraft.id && config.seedDraft.id !== meta.id) {
+          try {
+            await invoke('fable_card_delete', { cardId: config.seedDraft.id });
+            trace(`reaped pre-rename card id=${config.seedDraft.id}`);
+          } catch (e) {
+            console.warn('[creator-chat] old card reap failed (orphaned):', e);
+          }
+        }
         if (state.portraitBytes) {
           await invoke('fable_card_portrait_write', {
             cardId: meta.id,

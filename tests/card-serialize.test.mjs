@@ -54,6 +54,26 @@ test('slugify: Windows reserved names get a suffix', () => {
   assert.equal(slugify('Null Void'), 'null-void');
 });
 
+test('slugify: caps at 64 chars without a trailing dash (2026-08-15 audit fix)', () => {
+  // Mirrors the upcoming Rust-side cap; keeps <slug>/<slug>.sim well under
+  // MAX_PATH. The truncation must not leave a trailing dash (the trim above
+  // guaranteed a clean end — the cut must restore that invariant).
+  const long = 'a'.repeat(30) + ' ' + 'b'.repeat(50); // → 30a + '-' + 50b = 81 chars
+  const out = slugify(long);
+  assert.equal(out.length, 64);
+  assert.ok(!out.endsWith('-'), `trailing dash after truncation: ${out}`);
+  assert.ok(out.startsWith('a'.repeat(30) + '-'));
+  // An exactly-64 slug passes through untouched.
+  assert.equal(slugify('c'.repeat(64)), 'c'.repeat(64));
+  // A cut landing on a surrogate pair drops the dangling high surrogate
+  // (never emits a lone half of an astral char). Uses astral LETTERS
+  // (U+1D400 𝐀, category Lu) — emoji are symbols and slug to ''.
+  const astral = 'a' + '𝐀'.repeat(40); // pairs start at ODD indices → cut at 64 splits a pair
+  const eout = slugify(astral);
+  assert.ok(eout.length === 63, `expected surrogate-safe 63, got ${eout.length}`);
+  assert.ok(/[\ud800-\udbff]$/.test(eout) === false, 'dangling high surrogate');
+});
+
 // ── escapeXml ──────────────────────────────────────────────────────────────
 test('escapeXml: escapes & < >', () => {
   assert.equal(escapeXml('a & b < c > d'), 'a &amp; b &lt; c &gt; d');

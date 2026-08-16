@@ -637,7 +637,38 @@ impl Tool for FileRead {
     fn execute(&self, args: &serde_json::Value, ctx: &ToolCtx) -> Result<String, ToolError> {
         let rel = req_str(args, "path")?;
         let path = ctx.resolve(&rel)?;
-        // Read is allowed anywhere under the install (no allowlist gate).
+        // Read is allowed anywhere under the install (no allowlist gate),
+        // BUT bounded (2026-08-15 audit fix): an unbounded read_to_string on
+        // models/WUPI.gguf (~9.8 GB) loads the whole file into RAM before
+        // UTF-8 validation fails — OOM/thrash on a process already holding
+        // ~10.9 GB. Binary + credential paths are refused outright: a .gguf
+        // is never useful text, and the API config carries the plaintext key
+        // (readable → quotable into chat → archived into memory.sqlite).
+        const FILE_READ_MAX_BYTES: u64 = 2 * 1024 * 1024;
+        let lower = rel.to_lowercase();
+        if lower.ends_with(".gguf")
+            || lower.ends_with(".png")
+            || lower.ends_with(".jpg")
+            || lower.ends_with(".jpeg")
+            || lower.ends_with(".ico")
+            || lower.ends_with(".exe")
+            || lower.ends_with(".dll")
+            || lower.ends_with(".safetensors")
+            || lower == "data/api_config.json"
+        {
+            return Err(ToolError::new(format!(
+                "refused: {rel:?} is a binary or credential file (text reads only)"
+            )));
+        }
+        if let Ok(meta) = std::fs::metadata(&path) {
+            if meta.len() > FILE_READ_MAX_BYTES {
+                return Err(ToolError::new(format!(
+                    "refused: {rel:?} is {} bytes (cap {}); reads are for small text files",
+                    meta.len(),
+                    FILE_READ_MAX_BYTES
+                )));
+            }
+        }
         std::fs::read_to_string(&path)
             .map_err(|e| ToolError::new(format!("read {}: {e}", rel)))
     }
@@ -703,7 +734,22 @@ impl Tool for FileWrite {
                 let _ = libc::fsync(f.as_raw_fd());
             }
         }
-        let _ = std::fs::rename(&tmp, &path);
+        // (2026-08-15 audit fix) The rename is the commit — a swallowed
+        // failure reported "wrote N bytes" while the file was unchanged
+        // (Windows rename-over-open-file fails under AV scans or when the
+        // app itself holds the destination, e.g. a card session.json racing
+        // the autosave). On failure: remove the destination + retry once
+        // (the standard Windows atomic-replace dance), then surface a real
+        // error + clean the temp sibling so file_list doesn't see it.
+        if let Err(first_err) = std::fs::rename(&tmp, &path) {
+            let _ = std::fs::remove_file(&path);
+            if let Err(e) = std::fs::rename(&tmp, &path) {
+                let _ = std::fs::remove_file(&tmp);
+                return Err(ToolError::new(format!(
+                    "rename onto {rel:?} failed ({first_err}, retry {e})"
+                )));
+            }
+        }
         Ok(format!("wrote {} bytes to {}", content.len(), rel))
     }
 }
@@ -827,7 +873,21 @@ impl Tool for CreateSimCard {
     fn execute(&self, args: &serde_json::Value, ctx: &ToolCtx) -> Result<String, ToolError> {
         let filename = req_str(args, "filename")?;
         let xml = req_str(args, "xml")?;
-        let stem = sanitize_stem(&filename)
+        // (2026-08-15 audit fix) The folder stem is the card's PARSED id,
+        // not the raw filename stem. The parsed <metadata><id> (or the
+        // name-derived slug when omitted) is the memory-partition key; a
+        // filename/id mismatch meant the folder and the partition key
+        // diverged at creation, so BOTH delete paths (IPC + tool purge
+        // hook, which re-derive from their own strings) could hit the
+        // wrong key and leave permanent ghost rows. Creating under the
+        // parsed id makes folder == partition key by construction. The
+        // filename stem remains the fallback when the XML carries no
+        // usable id (parse failure was already rejected in validate_args).
+        let stem = crate::sim_card::parse_from_xml_str(&xml)
+            .ok()
+            .map(|c| c.id)
+            .filter(|id| sanitize_stem(id).is_some())
+            .or_else(|| sanitize_stem(&filename))
             .ok_or_else(|| ToolError::new("filename empty after sanitization"))?;
         let rel = format!("apps/fable/cards/{stem}/{stem}.sim");
         let path = ctx.resolve(&rel)?;
@@ -835,7 +895,9 @@ impl Tool for CreateSimCard {
         std::fs::create_dir_all(parent).map_err(|e| ToolError::new(format!("mkdir: {e}")))?;
         std::fs::write(&path, xml.as_bytes())
             .map_err(|e| ToolError::new(format!("write card: {e}")))?;
-        Ok(format!("created {rel}"))
+        Ok(format!(
+            "created {rel} (the card id '{stem}' is its folder + memory key — reference it in future delete/edit calls)"
+        ))
     }
 }
 

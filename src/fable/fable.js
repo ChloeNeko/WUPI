@@ -900,6 +900,10 @@ async function flowImportPlayer(selectedBtn) {
     return;
   }
   if (!result) return; // picker cancelled
+  // (2026-08-15 audit fix) Re-check flowBusy AFTER the dialog await: two
+  // rapid clicks both pass the pre-await guard, then both resolve past the
+  // picker — the second would burn/render over the first's chain.
+  if (flowBusy) return;
   flowState.pendingImport = result;
   // Carry the imported greetings (first_mes + alternate_greetings) into the
   // SIM card's <intro> so the authored opening survives verbatim (2026-08-13).
@@ -1102,6 +1106,9 @@ async function flowImportSim(selectedBtn) {
     return;
   }
   if (!result) return; // picker cancelled
+  // (2026-08-15 audit fix) Re-check flowBusy AFTER the dialog await (see
+  // flowImportPlayer): two rapid clicks both passed the pre-await guard.
+  if (flowBusy) return;
   flowState.pendingSimIntro = result.introText || null;
   setFlowBusy(true);
   const rejected = siblingTilesExcept(selectedBtn);
@@ -1178,6 +1185,9 @@ async function flowImportCodexPair(selectedBtn, cardId, afterCodex) {
     return;
   }
   if (!result) return; // picker cancelled
+  // (2026-08-15 audit fix) Re-check flowBusy AFTER the dialog await (see
+  // flowImportPlayer): two rapid clicks both passed the pre-await guard.
+  if (flowBusy) return;
   setFlowBusy(true);
   const rejected = siblingTilesExcept(selectedBtn);
   playBurnTransition({
@@ -1325,8 +1335,17 @@ async function launchGame(cardId) {
       loadMessages = result.messages;
     }
   } catch (err) {
-    console.error('[fable] fable_start (new game) failed — entering stage without engine', err);
+    console.error('[fable] fable_start (new game) failed — returning to title', err);
+    // (2026-08-15 audit fix) NEVER enter the stage without a seated engine —
+    // the old path showed a dead stage (no card, first turn guaranteed to
+    // fail). Surface the error + return to the title instead.
     engineStarted = false;
+    fadeOutThemeMusic(fableRoot);
+    stopNewGameMusic(fableRoot);
+    showScreen('title');
+    setFlowBusy(false);
+    toast(`Could not start the game: ${err?.message || err}`);
+    return;
   }
   // Fade-to-black + stage swap. Stop the new-game music + fade the title theme
   // HERE (after the schema-capture wait) so the stage opens in silence.
@@ -1401,6 +1420,12 @@ async function returnToTitle() {
   // the engine never started (engineStarted gate avoids a needless IPC
   // round-trip on the no-engine degrade path).
   if (engineStarted) {
+    // (2026-08-15 audit fix) Stop any in-flight turn BEFORE fable_end: the
+    // flow layer can't see narrator.js's generating flag, so invoke
+    // fable_stop unconditionally (a safe no-op when no turn is in flight) —
+    // ending the session mid-decode races the tracker's turn-lock against
+    // the engine join. Best-effort await, then proceed.
+    try { await invoke('fable_stop'); } catch (_) {}
     try { await invoke('fable_end'); } catch (e) {
       console.error('[fable] fable_end on return-to-title failed', e);
     }
@@ -1863,7 +1888,12 @@ function closeFable() {
     try { deactivateChrome(); } catch (_) {}
     if (hooks.resumeAurora) { try { hooks.resumeAurora(); } catch (_) {} }
   }
-  invoke('fable_end').catch(() => {});
+  // (2026-08-15 audit fix) Stop any in-flight turn BEFORE fable_end (the app
+  // can close mid-generation; fable_stop is a safe no-op otherwise). Chained
+  // so the end IPC always follows the stop.
+  invoke('fable_stop').catch(() => {}).finally(() => {
+    invoke('fable_end').catch(() => {});
+  });
   engineStarted = false;  // mirror the Rust slot clear so returnToTitle's gate stays honest
   stageActive = false;
   fableRoot.classList.remove('show');

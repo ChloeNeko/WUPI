@@ -55,6 +55,14 @@ pub const THINKING_ENABLED: bool = false;
 /// working stream is never killed mid-flight, even if slow.
 pub const API_FIRST_TOKEN_TIMEOUT_MS: u64 = 10_000;
 
+/// (2026-08-15 audit fix) Idle guard BETWEEN chunks once the stream is alive
+/// (post-first-token), in milliseconds. Replaces the old reqwest 300s TOTAL
+/// request timeout — that killed legit 5+ minute narrations mid-flight. With
+/// no total limit, a stream that stalls forever post-first-token needs its
+/// own liveness bound: any working stream beats 120s between chunks by
+/// orders of magnitude, so this only fires on a genuinely dead connection.
+pub const API_CHUNK_IDLE_TIMEOUT_MS: u64 = 120_000;
+
 // ---------------------------------------------------------------------------
 // Context sizes (tokens)
 // ---------------------------------------------------------------------------
@@ -162,3 +170,24 @@ pub const API_TEMP: f32 = 0.85;
 
 /// API top_p.
 pub const API_TOP_P: f32 = 0.95;
+
+// ---------------------------------------------------------------------------
+// World-sim growth caps
+// ---------------------------------------------------------------------------
+
+/// (2026-08-15 audit fix) Hard cap on the player's concurrent status tags
+/// ([EFFECT] upserts). Old behavior pushed unconditionally — a tracker loop
+/// re-emitting the same effect stacked duplicates into `condition_penalty`
+/// (lethality DC) and grew every save. TASK (20) and RUMOR (20) already had
+/// their caps; this closes the third member of the family.
+pub const FABLE_STATUS_TAG_CAP: usize = 16;
+
+/// (2026-08-15 audit fix) Server-side cap on a `fable_send` player action,
+/// in CHARS (not bytes — CJK/accented actions count fairly; anti-pattern #6
+/// discipline). A giant paste front-drained the tracker prompt past its
+/// 3072-token budget — the client composer cap is the first line of defense,
+/// this is the authoritative backstop ("bounded only by client behavior" was
+/// a documented P0 regression risk). 4000 chars ≈ 1000 tokens — generous for
+/// a typed action, well under the tracker budget even before the window
+/// truncation guard runs.
+pub const FABLE_ACTION_CHAR_CAP: usize = 4000;

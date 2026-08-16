@@ -47,7 +47,8 @@ pub struct ApiProfile {
     #[serde(default)]
     pub temperature: Option<f32>,
     /// Optional per-profile max context window (in tokens) for the API model.
-    /// `None` falls back to the v0.7 default of 8192. Consumed by
+    /// `None` falls back to `settings::CTX_API` (16384; raised 2026-07-31 —
+    /// the doc previously said the v0.7 default of 8192). Consumed by
     /// `HttpBackend::stream` as a soft budget: when the assembled message
     /// payload (system + history) exceeds it, oldest non-system messages are
     /// truncated from the front to stay under the wall. Same `Option<T>` +

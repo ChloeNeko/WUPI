@@ -347,31 +347,9 @@ export function buildLeftDrawer() {
     </div>
   `;
   wireInteractions(drawerEl);
-  // Build the soul-gem overlay (the 6 inventory triggers that bloom from the
-  // backpack onto the body regions) once the DOM is wired. The backpack is
-  // the bloom origin + master toggle; the paperdoll <img>'s box drives the
-  // body targets (Head → Foot, per-gender). Done AFTER wireInteractions so
-  // the toggle's click listener is bound first.
-  const backpackEl = drawerEl.querySelector('[data-backpack-btn]');
-  const paperdollImgEl = drawerEl.querySelector('[data-paperdoll-img]');
-  if (backpackEl) {
-    buildSoulGems(drawerEl, backpackEl, paperdollImgEl, normGender(gender));
-    // The paperdoll <img> + the backpack both use fluid sizing, so their
-    // boxes resolve after first paint + shift on resize. Re-measure the body
-    // targets once on window load + on resize so the gems stay glued. The
-    // resize path is rAF-coalesced (a fullscreen-toggle burst fires dozens
-    // of events — one measurement per frame, not dozens) + the reposition
-    // itself suppresses the bloom transition so the gems SNAP, not spring.
-    window.addEventListener('load', repositionToBody, { once: true });
-    window.addEventListener('resize', repositionOnResize);
-    // Heatmap resize follow: the paperdoll is fluid (clamp(510px, 76.85vh,
-    // 1200px)), so a viewport resize moves the img box the bruises are glued
-    // to. Repaint from the cached lastBodyMap (same no-injuries no-op as the
-    // gender-toggle path) — own rAF token so it coalesces with, not inside,
-    // soul-gem's resize path. Skipped while the PNG is mid-swap (an
-    // incomplete img measures a stale box; the next refreshAll corrects).
-    window.addEventListener('resize', repaintHeatmapOnResize);
-  }
+  // Build the soul-gem overlay (see mountSoulGems — the extracted gem-mount
+  // block, called here AND on every stage re-entry from wireStage).
+  mountSoulGems(drawerEl);
   renderGenderGlyph(); // paint the initial glyph + color
   // Paint the fixed Sun/Moon glyphs (these never change), then load the live
   // world state once. The header (player name), the diamond position, + the
@@ -408,6 +386,45 @@ export function buildLeftDrawer() {
     hitboxDebugVisible = false;
   };
   return drawerEl;
+}
+
+// (2026-08-15 audit fix) Mount the Soul Gems overlay + the resize listeners.
+// buildStage() runs once per app boot but teardownStage → resetLeftDrawer →
+// clearSoulGems removes the overlay + #inventory-panel-slot on EVERY stage
+// exit and nulls soul-gem.js's module refs — nothing rebuilt them, so
+// toggleSoulGems() no-opped (`if (!overlayEl) return`) from game session 2
+// on. Called from buildLeftDrawer AND from stage.js wireStage on every
+// stage re-entry. Idempotent-safe: an existing overlay (the DOM soul-gem.js
+// left behind) means the gems are already mounted — return WITHOUT
+// rebuilding (buildSoulGems would re-run, and duplicate window resize
+// listeners would stack).
+export function mountSoulGems(rootDrawerEl) {
+  const target = rootDrawerEl || drawerEl;
+  if (!target) return;
+  if (target.querySelector('.soul-gem-overlay')) return; // already mounted
+  // The backpack is the bloom origin + master toggle; the paperdoll <img>'s
+  // box drives the body targets (Head → Foot, per-gender). Must run AFTER
+  // wireInteractions so the toggle's click listener is bound first (the
+  // buildLeftDrawer call site guarantees this).
+  const backpackBtn = target.querySelector('[data-backpack-btn]');
+  if (!backpackBtn) return;
+  const paperdollImgEl = target.querySelector('[data-paperdoll-img]');
+  buildSoulGems(target, backpackBtn, paperdollImgEl, normGender(gender));
+  // The paperdoll <img> + the backpack both use fluid sizing, so their
+  // boxes resolve after first paint + shift on resize. Re-measure the body
+  // targets once on window load + on resize so the gems stay glued. The
+  // resize path is rAF-coalesced (a fullscreen-toggle burst fires dozens
+  // of events — one measurement per frame, not dozens) + the reposition
+  // itself suppresses the bloom transition so the gems SNAP, not spring.
+  window.addEventListener('load', repositionToBody, { once: true });
+  window.addEventListener('resize', repositionOnResize);
+  // Heatmap resize follow: the paperdoll is fluid (clamp(510px, 76.85vh,
+  // 1200px)), so a viewport resize moves the img box the bruises are glued
+  // to. Repaint from the cached lastBodyMap (same no-injuries no-op as the
+  // gender-toggle path) — own rAF token so it coalesces with, not inside,
+  // soul-gem's resize path. Skipped while the PNG is mid-swap (an
+  // incomplete img measures a stale box; the next refreshAll corrects).
+  window.addEventListener('resize', repaintHeatmapOnResize);
 }
 
 // ===========================================================================

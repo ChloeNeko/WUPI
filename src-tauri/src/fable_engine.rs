@@ -685,13 +685,14 @@ impl FableRuntime {
         // chopped. The log line below surfaces it loudly for exactly that reason.
         //
         // Reserve is MODE-AWARE (2026-08-10 fix): the tracker needs only
-        // TRACKER_MAX_TOKENS (256) of generation reserve, the narrator needs
-        // FABLE_MAX_TOKENS (1024). The prior bug reserved 1024 for BOTH →
-        // max_prompt = 3072-1024 = 2048 → a ~2500-token tracker prompt
-        // front-truncated 454-1022 tokens EVERY turn, chopping the bracket
-        // protocol → tracker narrated instead of tracking → zero brackets.
-        // With the tracker reserve, max_prompt = 3072-150 = 2922 — the prompt
-        // fits, the bracket protocol survives, the tracker sees its syntax.
+        // TRACKER_MAX_TOKENS (256 — raised from 150 post-T52) of generation
+        // reserve, the narrator needs FABLE_MAX_TOKENS (1024). The prior bug
+        // reserved 1024 for BOTH → max_prompt = 3072-1024 = 2048 → a
+        // ~2500-token tracker prompt front-truncated 454-1022 tokens EVERY
+        // turn, chopping the bracket protocol → tracker narrated instead of
+        // tracking → zero brackets. With the tracker reserve, max_prompt =
+        // 3072-256 = 2816 — the prompt fits, the bracket protocol survives,
+        // the tracker sees its syntax.
         let reserve = if req.tracker_mode { TRACKER_MAX_TOKENS } else { FABLE_MAX_TOKENS };
         let max_prompt = (FABLE_CTX as usize).saturating_sub(reserve as usize);
         if tokens.len() > max_prompt {

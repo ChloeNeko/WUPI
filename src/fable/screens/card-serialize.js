@@ -369,11 +369,23 @@ export function slugify(s) {
   // flag covers a-z0-9 plus all Unicode letters/digits.
   const slug = text(s).trim().toLowerCase()
     .replace(/[^\p{L}\p{N}_-]+/gu, '-').replace(/^-+|-+$/g, '');
+  // (2026-08-15 audit fix) 64-char cap — mirrors the upcoming Rust-side cap;
+  // keeps <slug>/<slug>.sim well under MAX_PATH. Truncation must not leave a
+  // trailing dash (the trim above already guaranteed a clean end, so restore
+  // that invariant after the cut). If the cut would split a surrogate pair,
+  // drop the dangling high surrogate too (the one char-boundary care UCS-2
+  // slicing needs).
+  let cut = slug.slice(0, 64);
+  if (cut.length === 64) {
+    const last = cut.charCodeAt(63);
+    if (last >= 0xd800 && last <= 0xdbff) cut = cut.slice(0, 63);
+  }
+  const capped = slug.length > 64 ? cut.replace(/-+$/g, '') : slug;
   // A card named "Nul" or "Com1" must not slug onto a reserved name —
   // append a suffix so the folder create succeeds (the slug stays unique
   // per name; "nul" and "nul-card" can't collide).
-  if (WINDOWS_RESERVED.has(slug)) return `${slug}-card`;
-  return slug;
+  if (WINDOWS_RESERVED.has(capped)) return `${capped}-card`;
+  return capped;
 }
 
 // Convert the codex_entries array (from the Attach Codex slide) into the

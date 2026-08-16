@@ -44,6 +44,19 @@ use std::sync::OnceLock;
 
 pub type StreamFuture = Pin<Box<dyn Future<Output = anyhow::Result<ParsedOutput>> + Send>>;
 pub type ChunkFn = Arc<dyn Fn(&str) + Send + Sync>;
+
+/// (2026-08-15 audit fix) Cooperative cancel watcher raced against the
+/// TTFT wait via `select!`: resolves once the token is signaled (polled at
+/// 100ms — an AtomicBool has no async wakeup). A stop during the
+/// first-token window is honored in ~100ms instead of the full 10s.
+async fn cancel_poll(cancel: &CancelToken) {
+    loop {
+        if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+}
 /// Cancellation flag shared between `chat_send` and `chat_stop`. The engine's
 /// decode loop checks this between tokens.
 pub type CancelToken = Arc<std::sync::atomic::AtomicBool>;
@@ -151,9 +164,15 @@ pub struct HttpBackend {
 }
 
 impl HttpBackend {
-    /// Construct from a saved profile. Builds a reqwest client with a generous
-    /// timeout (generation can take minutes for long replies) + the bearer
-    /// token pre-attached so every request on this client is authenticated.
+    /// Construct from a saved profile. Builds a reqwest client with the
+    /// bearer token pre-attached so every request on this client is
+    /// authenticated. (2026-08-15 audit fix) NO total timeout: the old
+    /// `.timeout(300s)` is a whole-request deadline in reqwest — a legit
+    /// 5+ minute narration died as `api_lost` mid-stream, contradicting "a
+    /// slow stream is never killed mid-flight". Liveness is enforced in the
+    /// read loop instead: the absolute TTFT deadline pre-first-token +
+    /// `settings::API_CHUNK_IDLE_TIMEOUT_MS` between chunks after it. A
+    /// connect timeout still bounds a dead-endpoint attempt.
     pub fn new(profile: crate::api::ApiProfile) -> Self {
         let mut headers = reqwest::header::HeaderMap::new();
         if !profile.api_key.is_empty() {
@@ -166,7 +185,7 @@ impl HttpBackend {
         }
         let client = reqwest::Client::builder()
             .default_headers(headers)
-            .timeout(std::time::Duration::from_secs(300))
+            .connect_timeout(std::time::Duration::from_secs(30))
             .build()
             .unwrap_or_else(|_| reqwest::Client::new());
         Self { profile, client }
@@ -326,8 +345,8 @@ impl GenerationClient for HttpBackend {
                 });
             }
 
-            // v0.7: enforce the profile's max_context (default 8192) as a soft
-            // input-token budget. We don't ship a real tokenizer to the API
+            // v0.7: enforce the profile's max_context (defaults to
+            // settings::CTX_API, 16384) as a soft input-token budget. We don't ship a real tokenizer to the API
             // path (the provider does its own counting server-side), so this
             // is a conservative safety net: estimate at ~4 chars/token and
             // drop the OLDEST non-system messages from the front until under
@@ -416,10 +435,22 @@ impl GenerationClient for HttpBackend {
             // error bubble + fall back to local. Once the first token lands,
             // the deadline is retired: a slow-but-working stream is NEVER
             // killed mid-flight.
+            //
+            // (2026-08-15 audit fix) ABSOLUTE deadline, not per-read: the old
+            // per-read `timeout(10s)` reset on every keep-alive ping <10s
+            // apart, so a provider streaming only keep-alives never tripped
+            // the watchdog. `timeout_at(deadline)` bounds the WHOLE wait.
+            // Cancel is observed DURING the wait (select! against a 100ms
+            // cancel poll) — a stop used to lag up to the full 10s window.
+            // Post-first-token reads carry the `API_CHUNK_IDLE_TIMEOUT_MS`
+            // stall guard (the reqwest 300s total timeout is gone — it killed
+            // legit 5+ minute narrations).
             let mut got_first_token = false;
             let mut stream_done = false;
-            let timeout_dur =
-                std::time::Duration::from_millis(crate::settings::API_FIRST_TOKEN_TIMEOUT_MS);
+            let ttft_deadline = tokio::time::Instant::now()
+                + std::time::Duration::from_millis(crate::settings::API_FIRST_TOKEN_TIMEOUT_MS);
+            let idle_dur =
+                std::time::Duration::from_millis(crate::settings::API_CHUNK_IDLE_TIMEOUT_MS);
 
             loop {
                 // The server signalled end-of-stream ([DONE]) — stop reading.
@@ -431,22 +462,43 @@ impl GenerationClient for HttpBackend {
                     break;
                 }
                 let chunk_res = if got_first_token {
-                    // Past the deadline window — read normally, no timeout.
-                    stream.next().await
-                } else {
-                    // Still waiting for the first token — wrap in the deadline.
-                    match tokio::time::timeout(timeout_dur, stream.next()).await {
+                    // Stream is alive — bound only the idle gap between chunks.
+                    match tokio::time::timeout(idle_dur, stream.next()).await {
                         Ok(opt) => opt,
                         Err(_elapsed) => {
-                            // Deadline elapsed with no first token. Drop the
-                            // stream to sever TCP, return the sentinel error.
-                            // `chat_send` branches on the `API_TIMEOUT` prefix.
                             buffer.clear();
                             drop(stream);
                             return Err(anyhow::anyhow!(
-                                "API_TIMEOUT: no first token within {}ms — provider hung on request",
-                                crate::settings::API_FIRST_TOKEN_TIMEOUT_MS
+                                "API_TIMEOUT: stream stalled for over {}ms after the first token — connection dead",
+                                crate::settings::API_CHUNK_IDLE_TIMEOUT_MS
                             ));
+                        }
+                    }
+                } else {
+                    // Still waiting for the first token — the ABSOLUTE
+                    // deadline bounds the whole window, raced against cancel
+                    // so a stop is honored within ~100ms, not 10s.
+                    let read = tokio::time::timeout_at(ttft_deadline, stream.next());
+                    tokio::select! {
+                        res = read => match res {
+                            Ok(opt) => opt,
+                            Err(_elapsed) => {
+                                // Deadline elapsed with no first token. Drop
+                                // the stream to sever TCP, return the sentinel
+                                // error. `chat_send` branches on the
+                                // `API_TIMEOUT` prefix.
+                                buffer.clear();
+                                drop(stream);
+                                return Err(anyhow::anyhow!(
+                                    "API_TIMEOUT: no first token within {}ms — provider hung on request",
+                                    crate::settings::API_FIRST_TOKEN_TIMEOUT_MS
+                                ));
+                            }
+                        },
+                        _ = cancel_poll(&cancel) => {
+                            // Cancel observed mid-wait — fall through to the
+                            // loop-top cancel check's break with partials.
+                            continue;
                         }
                     }
                 };
@@ -471,6 +523,27 @@ impl GenerationClient for HttpBackend {
                         stream_done = true;
                         buffer.clear();
                         break;
+                    }
+                    // (2026-08-15 audit fix) In-band error events: providers
+                    // like OpenRouter stream failures as `data: {"error":…}`
+                    // with HTTP 200. The chunk won't parse as ChatStreamChunk,
+                    // so the old path silently skipped it and returned Ok("")
+                    // — an empty beat committed as a normal turn. Detect the
+                    // error shape FIRST and fail the stream loudly (the
+                    // caller's api_lost path handles revert + composer lock).
+                    if let Ok(obj) = serde_json::from_str::<serde_json::Value>(data) {
+                        if obj.get("error").is_some() && obj.get("choices").is_none() {
+                            let msg = match obj.get("error") {
+                                Some(serde_json::Value::String(s)) => s.clone(),
+                                Some(other) => other.to_string(),
+                                None => String::new(),
+                            };
+                            buffer.clear();
+                            drop(stream);
+                            return Err(anyhow::anyhow!(
+                                "API provider error (in-band): {msg}"
+                            ));
+                        }
                     }
                     // Parse the JSON chunk; on failure skip (some providers
                     // send keep-alive comments or partial events we don't care
@@ -512,6 +585,14 @@ impl GenerationClient for HttpBackend {
                                     // of `stream`) at function return severs
                                     // the TCP connection.
                                     if rep_guard.push(&piece) {
+                                        // (2026-08-15 audit fix) Forensics
+                                        // contract parity with the local
+                                        // engines: raw_output carries the
+                                        // FULL un-truncated turn (the loop
+                                        // evidence); content carries the
+                                        // truncated clean prose. The caller
+                                        // prefers out.raw when non-empty.
+                                        let raw_forensic = full_content.clone();
                                         full_content =
                                             crate::stream_filter::truncate_repetition(&full_content);
                                         // Exit both loops via early return.
@@ -524,7 +605,7 @@ impl GenerationClient for HttpBackend {
                                         return Ok(ParsedOutput {
                                             content: full_content,
                                             reasoning: String::new(),
-                                            raw: String::new(),
+                                            raw: raw_forensic,
                                         });
                                     }
                                 }
@@ -1277,6 +1358,14 @@ mod tests {
         assert!(
             result.content.starts_with(lead_in),
             "lead-in prose must be preserved in truncated output"
+        );
+        // (2026-08-15 audit fix pin) Forensics parity with the local engines:
+        // raw carries the FULL un-truncated turn (all 5 occurrences — the
+        // loop evidence); content carries the truncated prose.
+        assert!(
+            !result.raw.is_empty()
+                && result.raw.matches("The smuggler turns and runs away").count() == 5,
+            "kill-switch raw_output must keep the full un-truncated turn as forensics"
         );
 
         // ── Assertion 2: the stream broke at the trigger chunk ──

@@ -133,7 +133,14 @@ pub fn write_save(
     };
 
     let final_path = resolve_save_path(fable_root, &card.id, save_id);
-    let json = serde_json::to_vec_pretty(&save)
+    // (2026-08-15 audit fix) Byte-stable saves: `to_value` routing first —
+    // serde_json's Map is BTreeMap-backed (no preserve_order feature), so
+    // HashMap-keyed subtrees (schema entities, custom_tags, …) serialize in
+    // sorted key order instead of per-process hash order. Identical logical
+    // state → identical bytes across boots.
+    let value = serde_json::to_value(&save)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+    let json = serde_json::to_vec_pretty(&value)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
 
     // Atomic write pattern (matches session.rs / schema.rs): write temp +

@@ -62,6 +62,8 @@ let sliceEscapeFn = null;   // transient Escape listener, removed on turn end
 // entry into the Fable stage cleans up the prior listener before registering
 // a new one (otherwise multiple listeners accumulate across stage entries).
 let sessionChangedUnlisten = null;
+// Generation counter for the async unlisten-handle race (see initNarrator).
+let sessionChangedGen = 0;
 // Optional hook fired when a chat-side `fable_schema_patch` tool mutates the
 // live schema (the HUD may refresh its Soul Gem panel immediately). Receives
 // the list of merged top-level field names.
@@ -104,14 +106,30 @@ export function initNarrator(hooks = {}) {
   //   - { kind: 'schema', merged_keys: [...] } → refresh the Soul Gem panel /
   //     HUD (the operator asked WUPI to patch world/player/npc state).
   // Re-entry safe: any prior listener is torn down before the new one is set
-  // up (initNarrator runs on every Fable stage entry).
+  // up (initNarrator runs on every Fable stage entry). (2026-08-15 audit fix)
+  // GENERATION guard: the unlisten handle arrives ASYNC — two wireStages
+  // within IPC latency both saw `sessionChangedUnlisten == null`, and the
+  // FIRST handle to resolve was clobbered by the second (a leaked listener
+  // that no teardown ever removed). A superseded handle now unlistens ITSELF
+  // the moment it resolves.
+  const mySessionGen = ++sessionChangedGen;
   if (sessionChangedUnlisten) {
     try { sessionChangedUnlisten(); } catch (_) { /* already torn down */ }
     sessionChangedUnlisten = null;
   }
-  listen('fable-session-changed', (e) => {
+  listen('fable-session-changed', async (e) => {
     const payload = e?.payload || {};
     if (payload.kind === 'messages' && Array.isArray(payload.messages)) {
+      // (2026-08-15 audit fix) Settle the open inline editor BEFORE the
+      // rebuild — rebuildFromMessages replaces every feed node, so an open
+      // editor's typed text would be silently vaporized. Same
+      // single-editor discipline as the composer submit / delete paths;
+      // commitOpenEditor is a cheap no-op when no editor is open. A failure
+      // in the save is swallowed (the backend-driven rebuild still lands).
+      const pendingSave = beats.commitOpenEditor();
+      if (pendingSave) {
+        try { await pendingSave; } catch (_) { /* rebuild regardless */ }
+      }
       beats.rebuildFromMessages(payload.messages);
     } else if (payload.kind === 'schema') {
       // The HUD (left-drawer) reads schema on its own refresh cadence; the
@@ -121,7 +139,15 @@ export function initNarrator(hooks = {}) {
         try { onSchemaPatch(payload.merged_keys || []); } catch (_) {}
       }
     }
-  }).then((un) => { sessionChangedUnlisten = un; })
+  }).then((un) => {
+    if (mySessionGen !== sessionChangedGen) {
+      // Superseded while the handle was in flight — release it immediately
+      // (it would otherwise leak: nothing references it anymore).
+      try { un(); } catch (_) {}
+      return;
+    }
+    sessionChangedUnlisten = un;
+  })
     .catch((err) => { /* listener setup failed; non-fatal */ });
 }
 
@@ -137,7 +163,9 @@ export function resetNarrator() {
   rerolling = false;
   clearSliceState();
   // Tear down the session-changed listener — the stage is exiting, no more
-  // chat-side mutations should rebuild the (now-hidden) feed.
+  // chat-side mutations should rebuild the (now-hidden) feed. Bump the
+  // generation so an in-flight handle from THIS session self-releases.
+  sessionChangedGen++;
   if (sessionChangedUnlisten) {
     try { sessionChangedUnlisten(); } catch (_) {}
     sessionChangedUnlisten = null;
@@ -190,6 +218,13 @@ export async function sendFableTurn(text, opts = {}) {
 
   try {
     await invoke('fable_send', { text, onEvent: channel, regenerate, reroll });
+    // (.finally backstop, 2026-08-15 audit fix) A backend resolve WITHOUT a
+    // terminal event (done / error / api_lost / cancelled) would leave
+    // `generating` latched → the composer wedges until app restart. Every
+    // terminal path runs finishTurn, so reaching here STILL generating means
+    // no terminal arrived: finish defensively (mirrors the chat window's
+    // .finally backstop).
+    if (generating) finishTurn();
   } catch (err) {
     beats.addErrorBeat(String(err));
     finishTurn();
@@ -261,6 +296,25 @@ function onDone(finalText, reasoning, cancelled) {
   // `reasoning` is unused post-2026-08-07 override (the API narrator never
   // emits a thought channel + the player-facing reasoning UI was removed).
   void reasoning;
+  // (2026-08-15 audit fix) A soft-cancelled turn (fable_stop) is FULLY
+  // reverted by the backend, which emits done with `cancelled: true` and an
+  // EMPTY final_text. The in-flight partial beat must be DISCARDED — never
+  // finalized into the feed (finalizing committed prose the backend never
+  // saved). On a reroll the streaming target is the PRIOR message's beat
+  // node, so clear its aborted partial in place (beginReroll — same restore
+  // the `cancelled`-event path uses) instead of removing history; on a
+  // normal turn the streaming beat node is removed outright. finishTurn
+  // runs the same cleanup path as a normal done (composer re-enable, slice
+  // state, deferred-reroll disarm).
+  if (cancelled) {
+    if (activeBeat) {
+      if (rerolling) beats.beginReroll(activeBeat);
+      else activeBeat.remove();
+    }
+    activeBeat = null;
+    finishTurn();
+    return;
+  }
   if (activeBeat) {
     beats.finalizeBeat(activeBeat, finalText);
     // After a reroll, this beat now has one more variant (the freshly-
@@ -568,6 +622,9 @@ export async function regenerateSlice({ index, pre, selection, post }) {
 
   try {
     await invoke('fable_regenerate_slice', { index, pre, selection, post, onEvent: channel });
+    // (.finally backstop, 2026-08-15 audit fix — same as sendFableTurn) a
+    // backend resolve WITHOUT a terminal event must not latch `generating`.
+    if (generating) finishTurn();
   } catch (err) {
     // Restore the beat to its pre-regen prose + surface the error.
     if (sliceBeat) beats.cancelSliceRegen(sliceBeat);

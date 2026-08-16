@@ -367,6 +367,19 @@ function buildItemButton(item) {
 // per button after layout settles. Idempotent (re-measures cleanly).
 const FIT_MIN_FONT = 9;      // px — never shrink below this
 const FIT_MAX_LINES = 3;     // max stacked lines before we just shrink
+// (2026-08-15 audit fix) Build a multi-line stacked label via DOM
+// construction (text nodes + <br>), never innerHTML — the line fragments are
+// model-emitted item names, and the old `stacked.map(w => w).join('<br>')`
+// injected them as raw HTML (an item name containing markup = XSS in the
+// webview). Identical layout: text lines separated by <br> elements.
+function setStackedLabel(label, lines) {
+  const frag = document.createDocumentFragment();
+  lines.forEach((line, i) => {
+    if (i > 0) frag.appendChild(document.createElement('br'));
+    frag.appendChild(document.createTextNode(line));
+  });
+  label.replaceChildren(frag);
+}
 function fitLabel(btn, label, text) {
   if (!btn || !label) return;
   // Reset to base so measurement starts clean.
@@ -408,14 +421,14 @@ function fitLabel(btn, label, text) {
       p = fontPx;
       while (p >= FIT_MIN_FONT) {
         label.style.fontSize = p + 'px';
-        label.innerHTML = stacked.map((w) => w).join('<br>');
+        setStackedLabel(label, stacked);
         if (label.scrollWidth <= boxW - 16 && label.scrollHeight <= boxH - 12) return;
         p -= 0.5;
       }
     }
     // Last resort: keep the smallest font + the max-line stack.
     label.style.fontSize = FIT_MIN_FONT + 'px';
-    label.innerHTML = stackWords(words, FIT_MAX_LINES).join('<br>');
+    setStackedLabel(label, stackWords(words, FIT_MAX_LINES));
   } else {
     // Single very-long word: just clamp to min font (it may clip slightly,
     // but the button bounds are fixed per spec — title attr carries the full).
@@ -512,12 +525,21 @@ function openActionPopup(anchorBtn, itemId, bodyEl) {
     _forceCloseActionPopup(); // genuine outside click — user intent
   };
   const onKey = (e) => { if (e.key === 'Escape') _forceCloseActionPopup(); };
+  // (2026-08-15 audit fix) Deferred-bind cancel flag: the outside-click/Esc
+  // listeners are added inside setTimeout(...,0), but popup._cleanup can run
+  // BEFORE that timeout fires (e.g. an action click force-closes in the same
+  // tick) — a deferred add then attaches listeners to document forever (the
+  // next _cleanup never runs; _forceCloseActionPopup already nulled popupEl).
+  // The flag makes the deferred add a no-op once cleanup ran.
+  let deferredBindCancelled = false;
   popup._cleanup = () => {
+    deferredBindCancelled = true;
     document.removeEventListener('click', onDocClick, true);
     document.removeEventListener('keydown', onKey);
   };
   // Defer binding the outside-click so the opening click doesn't immediately close.
   setTimeout(() => {
+    if (deferredBindCancelled) return;
     document.addEventListener('click', onDocClick, true);
     document.addEventListener('keydown', onKey);
   }, 0);
@@ -789,6 +811,15 @@ function removeItem(ps, item) {
   if (item.source === 'equipment') {
     const layers = ps.equipment && ps.equipment[item.slot];
     if (layers && layers[item.layer]) {
+      // (2026-08-15 audit fix) Mirror the belt/pack P2 name-recheck: handlers
+      // refetch FRESH schema before mutating, and a narrator turn whose
+      // [EQUIP] bracket lands between render + click can have REPLACED the
+      // worn item in this layer — deleting `layers[item.layer]` unverified
+      // then vaporizes the WRONG (new) item and persists it. Only delete
+      // when the resident item is still the one the player clicked; a
+      // mismatch aborts the whole move (callers gate the persist on the
+      // returned false, same as the belt/pack branch).
+      if (String(layers[item.layer].name) !== item.name) return false;
       delete layers[item.layer];
       // If the slot is now empty, drop the key (mirrors the Rust invariant).
       if ((!layers.outer && !layers.inner) && ps.equipment) {

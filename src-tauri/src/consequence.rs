@@ -745,6 +745,54 @@ pub fn add_tag(tags: &mut Vec<StatusTag>, tag: StatusTag) -> bool {
     true
 }
 
+/// (2026-08-15 audit fix) The [EFFECT] upsert — dedupe on (label, kind) +
+/// hard cap, the same treatment TASK/RUMOR already received. A tracker loop
+/// re-emitting the same effect every turn (repetition is exactly what DRY
+/// partially misses inside brackets) used to stack duplicates: each copy
+/// counted in `count_by_polarity`, multiplying `condition_penalty` into the
+/// lethality DC, and the vec grew unboundedly across saves.
+///
+/// Re-emission of a live (label, kind) EXTENDS the expiry to the new value
+/// instead of pushing — permanent tags stay permanent (the 0 sentinel wins).
+/// When the cap is reached, the SOONEST-EXPIRING timed tag is evicted; if
+/// every slot is permanent the new tag is refused (returns false). Returns
+/// true when the tag list changed.
+pub fn upsert_tag(tags: &mut Vec<StatusTag>, tag: StatusTag, cap: usize) -> bool {
+    if tag.label.trim().is_empty() {
+        return false;
+    }
+    // Dedupe: extend the matching live tag's expiry rather than stack.
+    if let Some(existing) = tags
+        .iter_mut()
+        .find(|t| t.label == tag.label && t.kind == tag.kind)
+    {
+        if existing.expires_at == 0 {
+            return false;
+        }
+        if tag.expires_at == 0 || tag.expires_at > existing.expires_at {
+            existing.expires_at = tag.expires_at;
+            return true;
+        }
+        return false;
+    }
+    if tags.len() >= cap {
+        let Some(evict_idx) = tags
+            .iter()
+            .enumerate()
+            .filter(|(_, t)| t.expires_at != 0)
+            .min_by_key(|(_, t)| t.expires_at)
+            .map(|(i, _)| i)
+        else {
+            // Every slot is a permanent condition — refuse the newcomer
+            // rather than evicting something that only an event can end.
+            return false;
+        };
+        tags.remove(evict_idx);
+    }
+    tags.push(tag);
+    true
+}
+
 /// Count tags by polarity. Used by `derive_condition` (which takes counts,
 /// not the tag list, so it stays decoupled from the storage representation).
 ///
@@ -1729,5 +1777,58 @@ mod tests {
         sorted.sort();
         sorted.dedup();
         assert_eq!(sorted.len(), tiers.len(), "directives must be distinct");
+    }
+
+    // ---- upsert_tag (2026-08-15 recovery-seam pins) ----
+
+    fn tag(label: &str, kind: &str, expires_at: i64) -> StatusTag {
+        StatusTag {
+            label: label.to_string(),
+            polarity: Polarity::Buff,
+            expires_at,
+            source: String::new(),
+            kind: kind.to_string(),
+        }
+    }
+
+    /// Re-emitting the same (label, kind) extends the expiry — it never
+    /// stacks a duplicate into `condition_penalty` (the leak the upsert
+    /// replaced).
+    #[test]
+    fn upsert_tag_dedupes_on_label_and_kind_by_extending() {
+        let mut tags = vec![tag("Rallying Cry", "", 100)];
+        // Same label+kind, later expiry → extended, no new entry.
+        assert!(upsert_tag(&mut tags, tag("Rallying Cry", "", 300), 16));
+        assert_eq!(tags.len(), 1, "a re-emitted effect must not stack");
+        assert_eq!(tags[0].expires_at, 300);
+        // Same label+kind, EARLIER expiry → no change (the stored window wins).
+        assert!(!upsert_tag(&mut tags, tag("Rallying Cry", "", 200), 16));
+        assert_eq!(tags[0].expires_at, 300);
+        // Same label but DIFFERENT kind → a distinct mechanical lane, both live.
+        assert!(upsert_tag(&mut tags, tag("Rallying Cry", "disguise", 100), 16));
+        assert_eq!(tags.len(), 2);
+        // Empty label → rejected outright.
+        assert!(!upsert_tag(&mut tags, tag("   ", "", 100), 16));
+        assert_eq!(tags.len(), 2);
+    }
+
+    /// A permanent tag (expires_at 0) is never duplicated AND never
+    /// overwrites a live timed window — plus the cap: the 17th distinct tag
+    /// evicts the soonest-expiring entry, never a permanent one.
+    #[test]
+    fn upsert_tag_caps_at_16_and_never_touches_permanents() {
+        let mut tags: Vec<StatusTag> = (0..15)
+            .map(|i| tag(&format!("Timed {i}"), "", 1000 + i as i64))
+            .collect();
+        tags.push(tag("Permanent Curse", "", 0)); // 16th slot, permanent
+        // Distinct newcomer at cap → the SOONEST-expiring timed tag evicts.
+        assert!(upsert_tag(&mut tags, tag("Newcomer", "", 5000), 16));
+        assert_eq!(tags.len(), 16, "the cap holds");
+        assert!(!tags.iter().any(|t| t.label == "Timed 0"), "the earliest-expiring timed tag is the evictee");
+        assert!(tags.iter().any(|t| t.label == "Permanent Curse"), "a permanent tag is never evicted");
+        assert!(tags.iter().any(|t| t.label == "Newcomer"));
+        // A permanent re-emission over an existing permanent → no-op, no dup.
+        assert!(!upsert_tag(&mut tags, tag("Permanent Curse", "", 0), 16));
+        assert_eq!(tags.iter().filter(|t| t.label == "Permanent Curse").count(), 1);
     }
 }

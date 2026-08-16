@@ -1063,6 +1063,28 @@ pub struct WorldSchema {
 }
 
 impl WorldSchema {
+    /// (2026-08-15 audit fix) The ONE capped entry point for direct
+    /// `recent_events` pushes (the belt-spill note, the Soul-Gem UI
+    /// `event_note`). The delta path caps via `cap_recent_events`; the
+    /// direct `Vec::push` sites bypassed the 50-entry cap until the next
+    /// delta pass — every push now goes through here so the stored vec
+    /// can never outgrow the cap between passes. Caller pre-trims the text
+    /// (EVENT_NOTE_MAX discipline lives at the call sites).
+    pub fn push_event(&mut self, event: String) {
+        self.recent_events.push(event);
+        self.cap_recent_events();
+    }
+
+    /// (P3 fix) Bound the stored history: the render reads only the last 5,
+    /// but the stored vec grew unbounded over a long campaign (save bloat +
+    /// prompt-path drift). Keep the most recent 50.
+    fn cap_recent_events(&mut self) {
+        let overflow = self.recent_events.len().saturating_sub(50);
+        if overflow > 0 {
+            self.recent_events.drain(..overflow);
+        }
+    }
+
     /// Deep-merge a micro-delta into self. The "native Rust merging"
     /// requirement: the model emits only changed keys, Rust applies them.
     ///
@@ -1084,16 +1106,21 @@ impl WorldSchema {
         }
         if let Some(mut events) = delta.recent_events {
             self.recent_events.append(&mut events);
-            // (P3 fix) Bound the stored history: the render reads only the
-            // last 5, but the stored vec grew unbounded over a long campaign
-            // (save bloat + prompt-path drift). Keep the most recent 50.
-            let overflow = self.recent_events.len().saturating_sub(50);
-            if overflow > 0 {
-                self.recent_events.drain(..overflow);
-            }
+            self.cap_recent_events();
         }
         if let Some(ents) = delta.entities {
             for (key, value) in ents {
+                // (2026-08-15 audit fix) Legacy freeform inventory keys are
+                // refused here, not just swept at load: the load-time
+                // `migrate_legacy_items` converts any `item_*`/`inv_*`
+                // entity into a typed pack item, so a model delta re-creating
+                // one alongside a real [PACK] bracket silently duplicated the
+                // item on the next boot. Strip + warn (same discipline as the
+                // referee-owned field strip in fable_schema_patch).
+                if key.starts_with("item_") || key.starts_with("inv_") {
+                    tracing::warn!(%key, "apply_delta: legacy inventory entity key refused (typed inventory owns items)");
+                    continue;
+                }
                 match value {
                     Some(v) => {
                         self.entities.insert(key, v);
@@ -1199,6 +1226,15 @@ impl WorldSchema {
                         .as_object()
                         .ok_or_else(|| "entities must be an object".to_string())?;
                     for (ek, ev) in map {
+                        // (2026-08-15 audit fix) Same legacy-key refusal as
+                        // apply_delta — the typed inventory owns items; a
+                        // model patch re-creating item_*/inv_* keys would be
+                        // converted into duplicate pack items by the next
+                        // boot's migrate_legacy_items sweep.
+                        if ek.starts_with("item_") || ek.starts_with("inv_") {
+                            tracing::warn!(%ek, "merge_patch: legacy inventory entity key refused (typed inventory owns items)");
+                            continue;
+                        }
                         if ev.is_null() {
                             self.entities.remove(ek);
                         } else {
@@ -1666,9 +1702,35 @@ impl WorldSchema {
             }
         }
 
-        atomic_write_text(world_path, &serde_json::to_string_pretty(&world)?)?;
-        atomic_write_text(player_path, &serde_json::to_string_pretty(&player)?)?;
-        atomic_write_text(npc_path, &serde_json::to_string_pretty(&npc)?)
+        // (2026-08-15 audit fix) STAGED trio write: serialize + write all
+        // three temp files FIRST, then rename them back-to-back. The old
+        // sequential per-file atomic writes left a seconds-wide window where
+        // a crash produced mixed-generation siblings (a new world.json next
+        // to a stale player.json — both individually valid JSON, so the
+        // corrupt-file guard couldn't catch the combination). Staging shrinks
+        // the cross-file window to the rename sequence; a crash mid-write
+        // leaves every original untouched + only stray temps behind (the
+        // next save clears its own temp; temps never load).
+        let world_json = serde_json::to_string_pretty(&world)?;
+        let player_json = serde_json::to_string_pretty(&player)?;
+        let npc_json = serde_json::to_string_pretty(&npc)?;
+        let world_tmp = temp_path_for(world_path);
+        let player_tmp = temp_path_for(player_path);
+        let npc_tmp = temp_path_for(npc_path);
+        for (tmp, body) in [
+            (&world_tmp, &world_json),
+            (&player_tmp, &player_json),
+            (&npc_tmp, &npc_json),
+        ] {
+            let _ = std::fs::remove_file(tmp); // clear stale temp
+            let mut file = std::fs::File::create(tmp)?;
+            std::io::Write::write_all(&mut file, body.as_bytes())?;
+            std::io::Write::flush(&mut file)?;
+            let _ = file.sync_all();
+        }
+        std::fs::rename(&world_tmp, world_path)?;
+        std::fs::rename(&player_tmp, player_path)?;
+        std::fs::rename(&npc_tmp, npc_path)
     }
 
     /// The inverse of [`save_split`]: read the three sibling files, deep-merge

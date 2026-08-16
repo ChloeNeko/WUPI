@@ -86,9 +86,15 @@ export function openBackgroundCropper(parentEl, imageSrc) {
     const cancelBtn = overlay.querySelector('[data-crop-cancel]');
 
     let settled = false;
+    // (2026-08-15 audit fix) document-level (capture) key handler — the old
+    // overlay-bound listener went deaf once focus left the overlay (dragging
+    // the crop rect moves focus to body). Removed on settle; the isConnected
+    // guard keeps a late event from re-firing after close.
+    let onDocKey = null;
     function done(result) {
       if (settled) return;
       settled = true;
+      if (onDocKey) document.removeEventListener('keydown', onDocKey, { capture: true });
       overlay.classList.remove('is-open');
       // Wait for the fade-out transition before removing + resolving so the
       // modal doesn't snap out of existence (mirrors portrait-cropper).
@@ -305,17 +311,19 @@ export function openBackgroundCropper(parentEl, imageSrc) {
     confirmBtn.addEventListener('click', onConfirm);
     cancelBtn.addEventListener('click', () => done(null));
     function onKey(e) {
-      if (e.key === 'Escape' && !settled) {
+      if (!overlay.isConnected) return;
+      if (e.key === 'Escape') {
         e.stopPropagation();
         e.preventDefault();
         done(null);
-      } else if (e.key === 'Enter' && !settled) {
+      } else if (e.key === 'Enter') {
         e.stopPropagation();
         e.preventDefault();
         onConfirm();
       }
     }
-    overlay.addEventListener('keydown', onKey);
+    onDocKey = onKey;
+    document.addEventListener('keydown', onKey, { capture: true });
     // Click on the backdrop (outside the modal) cancels.
     overlay.addEventListener('pointerdown', (e) => {
       if (e.target === overlay) done(null);

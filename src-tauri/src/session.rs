@@ -302,7 +302,16 @@ impl Conversation {
     /// - A stale `.tmp` from a prior crashed save is removed first so we never
     ///   accidentally rename a leftover corrupt temp over the good file.
     pub fn save(&self, path: &Path) -> std::io::Result<()> {
-        let json = serde_json::to_string_pretty(self)
+        // (2026-08-15 audit fix) Byte-stable saves: route through `to_value`
+        // FIRST — serde_json's Map is BTreeMap-backed (the crate has no
+        // `preserve_order` feature), so every HashMap (schema entities,
+        // custom_tags, …) lands in sorted key order instead of per-process
+        // hash order. The same logical state now produces identical bytes
+        // across boots (save diffs stop being hash-order noise). f32 fields
+        // serialize via their exact f64 widening — round-trip identical.
+        let value = serde_json::to_value(self)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        let json = serde_json::to_string_pretty(&value)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
 
         // Temp file: sibling of the destination, same directory/volume.

@@ -176,6 +176,11 @@ async function openModal(root, meta) {
     }
   };
   const onEsc = (e) => {
+    // (2026-08-15 audit fix) Do NOT steal Esc while a higher overlay is open:
+    // this handler runs on CAPTURE, so a stopPropagation here killed the raw
+    // editor's bubble-phase Esc listener (fable.js) — the first Esc closed
+    // the worlds modal UNDER the editor instead of the editor itself.
+    if (document.querySelector('.fable-raw-editor-overlay')) return;
     if (e.key === 'Escape') { e.stopPropagation(); closeModal(root); }
   };
   overlay.addEventListener('click', onBackdropClick);
@@ -260,6 +265,11 @@ async function openModal(root, meta) {
     if (root._handlers.onResume) root._handlers.onResume(meta);
   }));
   card.querySelector('[data-modal-edit]').addEventListener('click', consumeOnce(() => {
+    // (2026-08-15 audit fix) CLOSE the modal before opening the raw editor
+    // (same ordering as player-picker's EDIT): leaving it open latched
+    // _actionConsumed under the editor, so a later NEW/LOAD no-opped until
+    // the modal was reopened.
+    closeModal(root);
     if (root._handlers.onEdit) root._handlers.onEdit(meta);
   }));
   card.querySelector('[data-modal-delete]').addEventListener('click', () => {
@@ -317,6 +327,36 @@ const SILHOUETTE_SVG = `<svg class="fable-portrait-silhouette" viewBox="0 0 120 
 // right (name + tone + setting/intro blurb + player_name + saves state), +
 // four action buttons in a centered row BELOW (NEW / LOAD / EDIT / DELETE).
 // Reuses the player modal's classes so the look matches.
+// CDATA-aware root-close scan (2026-08-15 audit fix): a literal
+// `</sim_card>` inside authored CDATA prose fooled the naive indexOf — the
+// head sliced mid-CDATA, DOMParser threw parsererror, and the modal fell
+// back to meta-only. Mirrors sim_card.rs::find_root_close's discipline:
+// skip `<![CDATA[ … ]]>` spans while hunting the close tag. Returns the index
+// of the `</sim_card` open, or -1.
+function findRootClose(text) {
+  let i = 0;
+  let inCdata = false;
+  while (i < text.length) {
+    if (inCdata) {
+      const close = text.indexOf(']]>', i);
+      if (close === -1) return -1; // unterminated CDATA — malformed card
+      i = close + 3;
+      inCdata = false;
+    } else {
+      const open = text.indexOf('<![CDATA[', i);
+      const closeTag = text.indexOf('</sim_card', i);
+      if (closeTag === -1) return -1;
+      if (open !== -1 && open < closeTag) {
+        i = open + 9;
+        inCdata = true;
+        continue;
+      }
+      return closeTag;
+    }
+  }
+  return -1;
+}
+
 // Parse the card's raw .sim XML into a creator-engine draft so the modal can
 // render through buildIdCard — the SAME license face the Creator review uses
 // (2026-08-15 Chloe: the load menu must match the review exactly). The .sim is
@@ -326,8 +366,12 @@ const SILHOUETTE_SVG = `<svg class="fable-portrait-silhouette" viewBox="0 0 120 
 function parseSimDraft(xmlText, subtype) {
   const out = { card_type: subtype || '' };
   try {
-    const end = xmlText.indexOf('</sim_card>');
-    const head = end === -1 ? xmlText : xmlText.slice(0, end + 11);
+    const end = findRootClose(xmlText);
+    let head = xmlText;
+    if (end !== -1) {
+      const gt = xmlText.indexOf('>', end); // tolerate `</sim_card >`
+      head = gt === -1 ? xmlText : xmlText.slice(0, gt + 1);
+    }
     const doc = new DOMParser().parseFromString(head, 'text/xml');
     if (doc.querySelector('parsererror')) return out;
     const q = (sel) => {

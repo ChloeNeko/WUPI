@@ -119,17 +119,6 @@ function bboxCenterAndRadius(poly) {
   return { cx, cy, r: Math.max(r, 0.5) }; // floor so a degenerate poly still draws
 }
 
-// Escape a string for safe injection into a tooltip's textContent. The
-// tooltip is built with textContent (not innerHTML), so this is belt-and-
-// braces; kept so a future refactor to innerHTML can't introduce an XSS
-// via a part label or severity word.
-function escapeText(s) {
-  return String(s == null ? '' : s)
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;');
-}
-
 // paintInjuryHeatmap(sectionEl, gender, bodyMap)
 //
 //   sectionEl — the `.hud-paperdoll-section` element (the paperdoll <img>'s
@@ -340,11 +329,15 @@ export function paintInjuryHeatmap(sectionEl, gender, bodyMap, detailsMap) {
     // severity wrapped in brackets, no dash. e.g. "NECK" / "[MINOR INJURY]".
     const partEl = document.createElement('span');
     partEl.className = 'injury-tooltip-part';
-    partEl.textContent = escapeText(partLabel).toUpperCase();
+    // (2026-08-15 audit fix) No escapeText here: textContent renders its
+    // input LITERALLY, so the old pre-escape double-escaped — a part label
+    // containing "&" displayed as "&amp;". XSS safety comes from textContent
+    // itself, not from pre-escaping.
+    partEl.textContent = String(partLabel == null ? '' : partLabel).toUpperCase();
     header.appendChild(partEl);
     const sevEl = document.createElement('span');
     sevEl.className = 'injury-tooltip-severity';
-    sevEl.textContent = `[${escapeText(tierLabel).toUpperCase()}]`;
+    sevEl.textContent = `[${String(tierLabel == null ? '' : tierLabel).toUpperCase()}]`;
     header.appendChild(sevEl);
     tooltip.appendChild(header);
 

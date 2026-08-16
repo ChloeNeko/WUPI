@@ -80,9 +80,14 @@ const EMOTIONAL_CALM: &[&str] = &[
 
 const EMOTIONAL_TENSE: &[&str] = &[
     "argue", "argu", "disagree", "negotiate", "bargain hard", "suspect",
-    "suspicious", "wary", "distrust", "tense", "uneasy", "guard", "watch",
+    "suspicious", "wary", "distrust", "tense", "uneasy", "guard",
     "study", "investigate", "search", "examine", "interrogate", "question",
     "plead", "beg", "plea",
+    // (2026-08-15 audit fix) "watch" REMOVED — it also lives in CALM, and the
+    // tier scoring let TENSE win, so "I sit and watch the fire" classified
+    // Exploration instead of Downtime (also suppressing the recovery referee:
+    // its Downtime gate never opened for a restful watching turn). Tense
+    // watching is still covered by "suspicious(ly)" / "wary" / "guard".
 ];
 
 const EMOTIONAL_ALARMED: &[&str] = &[
@@ -302,9 +307,21 @@ mod tests {
     #[test]
     fn tension_without_combat_is_exploration() {
         // Tense but not moving → Exploration (kinetic=0, emotional=1 → not
-        // Downtime because emotional != 0).
+        // Downtime because emotional != 0). NOTE: "watch the stranger
+        // SUSPICIOUSLY" is tense via "suspicious(ly)" — "watch" alone is a
+        // CALM keyword (the 2026-08-15 fix; it used to sit in both lists).
         assert_eq!(mode_of("I argue with the merchant."), SceneMode::Exploration);
         assert_eq!(mode_of("I watch the stranger suspiciously."), SceneMode::Exploration);
+    }
+
+    /// 2026-08-15 fix pin: "watch" is CALM-only. A restful watching turn
+    /// classifies Downtime (the recovery referee's Downtime gate opens).
+    /// ("hearth", not "fire" — a standalone "fire" is a combat keyword by
+    /// the shared referee list; the campfire-compound case is pinned above.)
+    #[test]
+    fn watching_restfully_is_downtime() {
+        assert_eq!(mode_of("I sit and watch the hearth."), SceneMode::Downtime);
+        assert_eq!(mode_of("I watch the dancers while I eat."), SceneMode::Downtime);
     }
 
     #[test]

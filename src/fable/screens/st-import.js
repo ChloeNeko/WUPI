@@ -96,7 +96,15 @@ export async function parseImportFile(screenEl) {
     const u8 = new Uint8Array(await res.arrayBuffer());
     const b64 = await readCharaChunk(u8);
     if (!b64) throw new Error('no SillyTavern character data found in this PNG');
-    const json = JSON.parse(base64ToUtf8(b64));
+    // (2026-08-15 audit fix) Some ST card writers store the chara chunk as
+    // RAW JSON text, not base64 — a strict base64 decode failed the whole
+    // import. Try base64 first (the spec form), fall back to raw JSON.
+    let json;
+    try {
+      json = JSON.parse(base64ToUtf8(b64));
+    } catch (_) {
+      json = JSON.parse(b64);
+    }
     charData = normalizeCharJson(json);
     if (!charData) throw new Error('embedded character JSON is empty');
     portraitDataUrl = dataUrl; // uncropped preview — the review slot crops on click

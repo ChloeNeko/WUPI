@@ -703,9 +703,14 @@ export function beginSliceRegen(beat, { pre, post }) {
 // beat from the final string, so no markdown pass is needed mid-stream.
 export function streamSliceChunk(span, piece) {
   if (!span || piece == null) return;
+  // (2026-08-15 audit fix) Same nearBottom guard as appendChunk: a reader
+  // scrolled up during a golden-pencil regen must not be yanked down per
+  // chunk. Measure BEFORE the append grows scrollHeight.
+  const nearBottom =
+    !feedEl || feedEl.scrollHeight - feedEl.scrollTop - feedEl.clientHeight < 80;
   span.textContent += String(piece);
   span.removeAttribute('data-empty');
-  scrollDown();
+  if (nearBottom) scrollDown();
 }
 
 // Finalize: re-render the whole beat from the authoritative final text

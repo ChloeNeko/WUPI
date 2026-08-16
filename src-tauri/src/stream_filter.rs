@@ -161,7 +161,14 @@ impl StreamFilter {
         // too — a mixed-case bracket used to leak raw into the live stream.
         // The CHARACTER_TURN id class is widened to any non-]/non-ws run so
         // dotted ids (npc.mara) strip like the parser accepts them.
-        let pattern = r"(?i)\[(?:CHARACTER_TURN:(?:end|[^\]\s]+)|OBJECT\s+[^\]]+|FX\s+[^\]]+|TIME\s+[^\]]+|DATE\s+[^\]]+|WEATHER\s+[^\]]+|TRAVEL\s+[^\]]+|EFFECT\s+[^\]]+|MILESTONE\s+[^\]]+|TASK\s+[^\]]+|RUMOR\s+[^\]]+|PRESENCE\s+[^\]]+|DISCOVER\s+[^\]]+|NPC_REGISTER\s+[^\]]+|APPEARANCE\s+[^\]]+|EQUIP\s+[^\]]+|BELT\s+[^\]]+|PACK\s+[^\]]+)\]";
+        // (2026-08-15 audit fix) `\s*` not `\s+`: the parser accepts GLUED
+        // verbs (`[TIME14:00]` — strip_prefix_ci needs no separator), so the
+        // filter must too or the glued form applies server-side but leaks raw
+        // into the live local stream until finalization. Symmetric with the
+        // parser's own glued-form acceptance (a prose word like `[TIMELY]`
+        // already parses as a TIME body + is range-gate-rejected — the filter
+        // matching it too is the same contract, display-side).
+        let pattern = r"(?i)\[(?:CHARACTER_TURN:(?:end|[^\]\s]+)|OBJECT\s*[^\]]+|FX\s*[^\]]+|TIME\s*[^\]]+|DATE\s*[^\]]+|WEATHER\s*[^\]]+|TRAVEL\s*[^\]]+|EFFECT\s*[^\]]+|MILESTONE\s*[^\]]+|TASK\s*[^\]]+|RUMOR\s*[^\]]+|PRESENCE\s*[^\]]+|DISCOVER\s*[^\]]+|NPC_REGISTER\s*[^\]]+|APPEARANCE\s*[^\]]+|EQUIP\s*[^\]]+|BELT\s*[^\]]+|PACK\s*[^\]]+)\]";
         self.bracket_re = Some(Regex::new(pattern).expect("bracket regex always compiles"));
         // Longest realistic bracket: `[TASK npc.marcus scout the bandit camp |
         // challenging adequate 1440]` ≈ 70 chars; an EFFECT with a long label

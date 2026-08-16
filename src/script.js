@@ -3316,7 +3316,9 @@ const dropdownMenu = document.getElementById('dropdownMenu');
       // backend's api_connect validates non-empty model.
       const p = findProfile(profileId);
       if (p && p.model !== modelId) {
-        const updated = { ...p, model: modelId, temperature: 1.0 };
+        // (2026-08-15 audit fix) no temperature here: the Rust backend's
+        // locked fallback constant (0.85) must govern every API turn.
+        const updated = { ...p, model: modelId };
         try {
           await invoke('api_profile_save', { profile: updated });
         } catch (err) {
@@ -3372,7 +3374,6 @@ const dropdownMenu = document.getElementById('dropdownMenu');
         endpoint: endpointEl.value.trim(),
         api_key: keyEl.value,
         model: existing?.model || '',
-        temperature: 1.0,
       };
       addBtn.disabled = true;
       setStatus(editingId ? 'Saving…' : 'Adding…');
