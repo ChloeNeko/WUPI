@@ -129,6 +129,11 @@ pub enum ValidationFailure {
     InvalidEvent { index: usize, reason: String },
     /// The summary exceeded the length cap.
     SummaryTooLong { len: usize },
+    /// (2026-08-16 audit fix) The summary contained control characters — a
+    /// multi-line summary injects fake `present:`/`clock:` lines into the
+    /// `<world_state>` render (it renders verbatim), the same contamination
+    /// class entity values were already gated against.
+    SummaryControlChars,
     /// The delta carried more entity keys than the per-delta cap.
     TooManyEntityKeys { count: usize },
     /// The delta tried to OVERWRITE or DELETE an entity key flagged immutable
@@ -162,6 +167,10 @@ impl std::fmt::Display for ValidationFailure {
                 f,
                 "summary is {len} chars; max {MAX_SUMMARY_LEN} (rewrite concisely)"
             ),
+            Self::SummaryControlChars => write!(
+                f,
+                "summary contains control characters / line breaks (keep it one plain paragraph — rendered verbatim into world state)"
+            ),
             Self::TooManyEntityKeys { count } => write!(
                 f,
                 "delta emitted {count} entity keys; max {MAX_ENTITY_KEYS_PER_DELTA} (emit only changed keys)"
@@ -185,15 +194,23 @@ impl std::fmt::Display for ValidationFailure {
 /// `ctx` is the extension point for future-phase typed validation (spatial
 /// nodes, entity spec ranges). Pass `ValidationContext::default()` today.
 pub fn validate(delta: &SchemaDelta, ctx: &ValidationContext<'_>) -> Result<(), ValidationFailure> {
-    // Summary: cap runaway length.
+    // Summary: cap runaway length. (2026-08-16 audit fix) Control-char gate:
+    // the summary renders VERBATIM inside `<world_state>` — a newline-laden
+    // summary could inject fake `present:`/`clock:` lines the tracker reads
+    // as ground truth. Entity keys/values were already gated; summary wasn't.
     if let Some(summary) = &delta.summary {
         let len = summary.chars().count();
         if len > MAX_SUMMARY_LEN {
             return Err(ValidationFailure::SummaryTooLong { len });
         }
+        if has_control_chars(summary) {
+            return Err(ValidationFailure::SummaryControlChars);
+        }
     }
 
-    // Recent events: per-delta count cap + per-event length + non-empty.
+    // Recent events: per-delta count cap + per-event length + non-empty +
+    // the same control-char gate (each event renders as a `•` line; a
+    // newline inside one splits it into forgeable lines).
     if let Some(events) = &delta.recent_events {
         if events.len() > MAX_EVENTS_PER_DELTA {
             return Err(ValidationFailure::TooManyEvents { count: events.len() });
@@ -210,6 +227,13 @@ pub fn validate(delta: &SchemaDelta, ctx: &ValidationContext<'_>) -> Result<(), 
                 return Err(ValidationFailure::InvalidEvent {
                     index: i,
                     reason: format!("is {len} chars; max {MAX_EVENT_LEN}"),
+                });
+            }
+            if has_control_chars(ev) {
+                return Err(ValidationFailure::InvalidEvent {
+                    index: i,
+                    reason: "contains control characters / line breaks (one event = one line)"
+                        .to_string(),
                 });
             }
         }

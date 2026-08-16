@@ -51,6 +51,11 @@ export function stripToJsonFallback(text) {
 export function mergeDraft(dst, src) {
   for (const [k, v] of Object.entries(src || {})) {
     if (v === null || v === undefined || v === '') continue;
+    // (2026-08-16 audit M7) Prototype-pollution guard: JSON.parse makes
+    // `__proto__` an own enumerable key, and `dst[k]=v` assignment (unlike
+    // defineProperty) routes through the inherited setter — model-controlled
+    // data swapping the draft's prototype. Skip the whole danger trio.
+    if (k === '__proto__' || k === 'constructor' || k === 'prototype') continue;
     dst[k] = v;
   }
   return dst;

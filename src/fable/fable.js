@@ -311,11 +311,19 @@ let hooks = { pauseAurora: null, resumeAurora: null, openHooks: null, closeHooks
 // This is screen-agnostic: a screen opts in by defining the hooks, no
 // special-casing here.
 function showScreen(name) {
+  // (2026-08-16 audit M8a) Ambient systems only run while #fable is actually
+  // shown: initFable's boot-time showScreen('title') used to start the
+  // title's particle/grass/leaf/cloud/sparkle RAFs while the app window was
+  // still hidden — on wupi.exe (OS boot, Fable never opened) they then ran
+  // invisibly for the WHOLE desktop session. Every real open path adds
+  // .show BEFORE its showScreen call (fog onSwap, FABLE_ENTRY, dev preview),
+  // so gating here covers them all; hidden screens still get _stopAmbient.
+  const rootShown = !!(fableRoot && fableRoot.classList.contains('show'));
   for (const key of Object.keys(screens)) {
     const showing = (key === name);
     const scr = screens[key];
     scr.hidden = !showing;
-    if (showing && scr._startAmbient) scr._startAmbient();
+    if (showing && rootShown && scr._startAmbient) scr._startAmbient();
     else if (!showing && scr._stopAmbient) scr._stopAmbient();
   }
   // Track whether the stage owns the screen (pause/resume + onClose branch
@@ -380,14 +388,21 @@ async function resumeSave(cardId, saveId, opts = {}) {
       loadMessages = result.messages;
     }
   } catch (err) {
-    console.error('[fable] fable_start (resume) failed — entering stage without engine', err);
+    console.error('[fable] fable_start (resume) failed — returning to the title', err);
     engineStarted = false;
     // (P2 fix) Direct-launch contract: "any failure falls back to the title
-    // so a broken shortcut never strands the window". Swallowing the error
-    // here booted a dead, engine-less stage (stale .lnk, deleted card) —
-    // rethrow under the splash so the DIRECT_LAUNCH catch routes to
-    // revealTitleAfterSplash instead.
+    // so a broken shortcut never strands the window". Rethrow under the
+    // splash so the DIRECT_LAUNCH catch routes to revealTitleAfterSplash
+    // instead.
     if (opts && opts.underSplash) throw err;
+    // (2026-08-16 audit fix #26) The non-direct path used to fall through
+    // into enterStageViaTransition anyway — a dead, engine-less stage the
+    // player could only stare at. Unwind to the title instead: disarm the
+    // busy latch immediately (not the 12s safety timer) + exit the Load
+    // flow's chrome/ambience the same way its ⌂ does.
+    setFlowBusy(false);
+    exitLoadToTitle();
+    return;
   }
 
   enterStageViaTransition(openingScene, loadMessages, opts);
@@ -696,6 +711,15 @@ function revealNewGameShell({ startMusic = false, onBack, onHome } = {}) {
     if (startMusic) startNewGameMusic(fableRoot, { fadeIn: true });
     buildPlayerPairTiles();
     showScreen('newgame-split');
+    // (2026-08-16 audit M8d) The tiles are BUILT at opacity:0 (they ship for
+    // the reverse-spawn) — without spawning them here the catch fallback
+    // revealed a silent, empty picker. Run the same spawn the success path
+    // runs; its own failure is swallowed (the tiles' CSS default still
+    // allows interaction-less visibility recovery on the next rebuild).
+    const tiles = screens['newgame-split'].querySelectorAll('.fable-flow-spawn');
+    if (tiles.length) {
+      try { playReverseSpawn(Array.from(tiles)).catch(() => {}); } catch (_) {}
+    }
   });
 }
 
@@ -1342,6 +1366,10 @@ async function launchGame(cardId) {
     engineStarted = false;
     fadeOutThemeMusic(fableRoot);
     stopNewGameMusic(fableRoot);
+    // (2026-08-16 audit M8c) Tear the flow ambiance down too — the success
+    // path does it inside enterStageViaTransition; without this the embers
+    // RAF kept running invisibly behind the silent title.
+    stopFlowAmbiance();
     showScreen('title');
     setFlowBusy(false);
     toast(`Could not start the game: ${err?.message || err}`);
@@ -1375,6 +1403,13 @@ function enterStageViaTransition(openingScene, loadMessages, opts = {}) {
         wireStage(screens.stage, {
           cardContext: null,
           onExit: returnToTitle,
+          // (2026-08-16 audit fix #26) The drawer's Load foot button: exit to
+          // the title + open the SAME worlds→saves picker the title's LOAD
+          // opens (mid-session save-swaps go through the standard flow; the
+          // in-flight-turn guards live on the backend).
+          onLoad: () => {
+            void returnToTitle().then(() => onLoadClicked());
+          },
           openingScene,
           loadMessages,
         });
@@ -1614,6 +1649,10 @@ function openFable() {
           await resumeSave(ctx.cardSlug, ctx.saveId ?? null, { underSplash: true, launchT0 });
         } catch (e) {
           console.error('[fable] direct launch failed, falling back to title', e);
+          // (2026-08-16 audit fix #26) resumeSave armed flowBusy before its
+          // fable_start threw — without this the title's buttons stayed dead
+          // for the full 12s safety window after the fallback reveal.
+          setFlowBusy(false);
           revealTitleAfterSplash();
         }
       })();
@@ -1624,6 +1663,10 @@ function openFable() {
       ]);
       if (!settled) {
         console.error('[fable] direct launch timed out (hung IPC); revealing title + dropping entry hold');
+        // (2026-08-16 audit M8c) Same flowBusy release the catch path got
+        // (fix #26) — the timeout branch missed it, leaving the title's
+        // buttons dead for the 12s safety window after the fallback reveal.
+        setFlowBusy(false);
         revealTitleAfterSplash();
       }
     })();

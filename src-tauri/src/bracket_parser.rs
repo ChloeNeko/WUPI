@@ -314,15 +314,14 @@ pub fn parse(raw: &str) -> ParsedNarration {
         // Emit any prose before the bracket.
         prose.push_str(&raw[i..start]);
 
-        // Find the closing `]`.
-        let Some(end_rel) = bytes[start..].iter().position(|&b| b == b']') else {
+        // Find the closing `]` (quote-aware — see `find_bracket_close`).
+        let Some(end) = find_bracket_close(bytes, start) else {
             // Unterminated bracket: emit the `[` literally and advance one
             // byte (so we don't loop forever on a stray `[`).
             prose.push('[');
             i = start + 1;
             continue;
         };
-        let end = start + end_rel;
         let bracket = &raw[start + 1..end]; // contents between [ and ]
 
         // Try to match a command. On match, push it; on miss, the bracket
@@ -398,6 +397,46 @@ pub fn parse(raw: &str) -> ParsedNarration {
     let prose = normalize_whitespace(&prose);
 
     ParsedNarration { commands, prose }
+}
+
+/// Quote-aware close-scan for a bracket whose `[` sits at byte `start`.
+/// A `]` inside a double-quoted value is literal text
+/// (`[EQUIP name="Studded [Fine] Armor" slot=chest]` must not close at the
+/// inner `]`). If the quote never closes (malformed output), fall back to
+/// the FIRST `]` — unchanged legacy behavior, so a stray quote can't
+/// swallow the rest of the turn. ASCII byte scan is UTF-8-safe (`"`/`]`
+/// never appear inside a multi-byte sequence).
+///
+/// (2026-08-15 audit fix, originally landed only in the hybrid-fence
+/// fallback; 2026-08-16 extracted here so `parse()`'s main path — the one
+/// every tracker bracket goes through — gets the same scan.)
+fn find_bracket_close(bytes: &[u8], start: usize) -> Option<usize> {
+    let mut j = start + 1;
+    let mut in_quote = false;
+    let mut saw_quote = false;
+    while j < bytes.len() {
+        let b = bytes[j];
+        if in_quote {
+            if b == b'"' {
+                in_quote = false;
+            }
+        } else if b == b'"' {
+            in_quote = true;
+            saw_quote = true;
+        } else if b == b']' {
+            return Some(j);
+        }
+        j += 1;
+    }
+    if saw_quote {
+        // Unterminated quote: legacy first-`]` fallback.
+        bytes[start..]
+            .iter()
+            .position(|&b| b == b']')
+            .map(|rel| start + rel)
+    } else {
+        None
+    }
 }
 
 /// Collapse runs of 2+ ASCII spaces into one, and trim trailing whitespace
@@ -610,6 +649,45 @@ fn tokenize_kv(tail: &str) -> Vec<(String, String)> {
     out
 }
 
+/// (2026-08-16 audit M2) Shared gate for free-text tracker fields that
+/// persist to saves + render toward prompts (DISCOVER names/settings/
+/// neighbor ids, NPC_REGISTER name/role/tier): flatten newlines/tabs to
+/// spaces (a quoted bracket value may legally span a newline — it must
+/// never persist a forged `location:`/`cast:`/`exits:` render line), strip
+/// the remaining control chars, char-cap. Empty stays empty (all these
+/// fields are optional).
+fn clean_free_text(raw: &str, cap: usize) -> String {
+    let flattened: String = raw
+        .chars()
+        .map(|c| match c {
+            '\n' | '\r' | '\t' => ' ',
+            _ => c,
+        })
+        .collect();
+    let stripped: String = flattened
+        .chars()
+        .filter(|c| {
+            let code = *c as u32;
+            !((code <= 0x08) || code == 0x0B || code == 0x0C || (0x0E..=0x1F).contains(&code))
+        })
+        .collect();
+    stripped.trim().chars().take(cap).collect()
+}
+
+/// Per-field caps for the DISCOVER / NPC_REGISTER free-text fields (audit
+/// M2 — same 2026-08-15 discipline as WEATHER/RUMOR/STANCE: short diegetic
+/// labels, not paragraphs).
+const DISCOVER_NAME_MAX: usize = 80;
+const DISCOVER_SETTING_MAX: usize = 40;
+const NODE_ID_MAX: usize = 64;
+const NPC_NAME_MAX: usize = 80;
+const NPC_ROLE_MAX: usize = 120;
+const NPC_TIER_MAX: usize = 20;
+/// (2026-08-16 audit LOW) Free-text caps for the EFFECT/TASK labels — same
+/// discipline as the stance/name gates.
+const EFFECT_LABEL_MAX: usize = 80;
+const TASK_DESC_MAX: usize = 160;
+
 /// Parse the optional `key=value` tail of a `[DISCOVER node_id ...]` bracket.
 /// Recognized keys: `name` (diegetic label — may contain spaces when quoted),
 /// `setting` (indoor/outdoor hint), `neighbors` (comma-separated node ids).
@@ -622,10 +700,14 @@ fn parse_discover_kv(tail: &str) -> (String, String, Vec<String>) {
     let mut neighbors = Vec::new();
     for (k, v) in tokenize_kv(tail) {
         match k.as_str() {
-            "name" | "label" => name = v,
-            "setting" | "type" => setting = v,
+            "name" | "label" => name = clean_free_text(&v, DISCOVER_NAME_MAX),
+            "setting" | "type" => setting = clean_free_text(&v, DISCOVER_SETTING_MAX),
             "neighbors" | "neighbor" | "exits" => {
-                neighbors = v.split(',').map(|p| p.trim().to_string()).filter(|p| !p.is_empty()).collect();
+                neighbors = v
+                    .split(',')
+                    .map(|p| clean_free_text(p, NODE_ID_MAX))
+                    .filter(|p| !p.is_empty())
+                    .collect();
             }
             _ => {}
         }
@@ -643,11 +725,12 @@ fn parse_npc_register_kv(tail: &str) -> (String, String, Option<String>) {
     let mut tier: Option<String> = None;
     for (k, v) in tokenize_kv(tail) {
         match k.as_str() {
-            "name" | "label" => name = v,
-            "role" | "vocation" => role = v,
+            "name" | "label" => name = clean_free_text(&v, NPC_NAME_MAX),
+            "role" | "vocation" => role = clean_free_text(&v, NPC_ROLE_MAX),
             "tier" => {
-                if !v.is_empty() {
-                    tier = Some(v);
+                let cleaned = clean_free_text(&v, NPC_TIER_MAX);
+                if !cleaned.is_empty() {
+                    tier = Some(cleaned);
                 }
             }
             _ => {}
@@ -710,7 +793,19 @@ const PRESENCE_STANCE_MAX: usize = 120;
 /// chars, run the repetition firewall, char-cap. Empty stays empty (the
 /// allowed bare-name form).
 fn clean_stance(raw: &str) -> String {
-    let stripped: String = raw
+    // (2026-08-16 audit M2) Newlines/tabs flatten to spaces BEFORE the
+    // control-char filter — a bracket body spanning a newline would
+    // otherwise persist a forged line into the `present:` render of every
+    // turn + save (the filter below deliberately spares \n/\r/\t as
+    // whitespace, so the flattening has to happen first).
+    let flattened: String = raw
+        .chars()
+        .map(|c| match c {
+            '\n' | '\r' | '\t' => ' ',
+            _ => c,
+        })
+        .collect();
+    let stripped: String = flattened
         .chars()
         .filter(|c| {
             let code = *c as u32;
@@ -719,6 +814,43 @@ fn clean_stance(raw: &str) -> String {
         .collect();
     let deduped = crate::stream_filter::truncate_repetition(stripped.trim());
     deduped.chars().take(PRESENCE_STANCE_MAX).collect()
+}
+
+/// (2026-08-16 audit LOW) Extract the item NAME from a `[BELT -…]` /
+/// `[PACK -…]` remove body. The model sometimes echoes a kv tail after the
+/// remove marker (`[BELT -health_potion qty=2]`) — the old whole-body read
+/// swallowed the tail into the name ("health_potion qty=2"), so the removal
+/// silently missed the stored stack. Prefer an explicit `name=` key; else a
+/// leading quoted span; else the first bare token.
+fn remove_form_name(body: &str) -> String {
+    let body = body.trim();
+    if body.is_empty() {
+        return String::new();
+    }
+    // No `=` anywhere → the whole body is the name (the DOCUMENTED multi-word
+    // bare form: `[PACK -Old Map]`).
+    if !body.contains('=') {
+        return body.to_string();
+    }
+    // A kv tail is present (`[BELT -health_potion qty=2]`): prefer an
+    // explicit `name=`; else a leading quoted span; else the first bare
+    // token (the tail is dropped either way — swallowing it into the name
+    // made the removal silently miss the stored stack).
+    for (k, v) in tokenize_kv(body) {
+        if (k == "name" || k == "item") && !v.is_empty() {
+            return v;
+        }
+    }
+    if let Some(stripped) = body.strip_prefix('"') {
+        if let Some(close) = stripped.find('"') {
+            return stripped[..close].trim().to_string();
+        }
+    }
+    body.split_whitespace()
+        .next()
+        .unwrap_or("")
+        .trim_matches('"')
+        .to_string()
 }
 
 /// Parse the `key=value` (or bare `key`) tail of an `[APPEARANCE ...]`
@@ -784,7 +916,7 @@ fn parse_appearance_kv(rest: &str) -> Option<BracketCommand> {
 /// Per-field value caps for the inventory brackets. Names cap at the trait cap
 /// (a weapon name is a short label); stats cap at the appearance-value cap (a
 /// flavor line, not a paragraph).
-const INV_NAME_MAX: usize = 80;
+pub(crate) const INV_NAME_MAX: usize = 80;
 const INV_STATS_MAX: usize = APPEARANCE_VALUE_MAX; // 200
 
 /// Reject control chars (defense shared by every value-bearing parser here).
@@ -871,8 +1003,8 @@ fn parse_belt(rest: &str) -> Option<BracketCommand> {
     };
     // For the remove form there's no kv tail — the body is the bare name.
     if remove {
-        let name = body.trim();
-        if name.is_empty() || name.chars().count() > INV_NAME_MAX || has_control_chars(name) {
+        let name = remove_form_name(body);
+        if name.is_empty() || name.chars().count() > INV_NAME_MAX || has_control_chars(&name) {
             return None;
         }
         return Some(BracketCommand::Belt {
@@ -897,7 +1029,13 @@ fn parse_belt(rest: &str) -> Option<BracketCommand> {
             "qty" | "count" | "n" => {
                 // An explicit 0 means REMOVE (the documented contract — the
                 // old .max(1) coerced it to an add-1, a dead applier branch).
-                qty = v.parse::<u32>().unwrap_or(1);
+                // (2026-08-16 audit LOW) Parse u64 + saturate — the JSON
+                // dual's rule: "4294967297" used to fail u32 parsing and
+                // silently land on qty=1.
+                qty = v
+                    .parse::<u64>()
+                    .map(|n| n.min(u32::MAX as u64) as u32)
+                    .unwrap_or(1);
                 if qty == 0 {
                     qty_zero_remove = true;
                     qty = 1;
@@ -953,8 +1091,8 @@ fn parse_pack(rest: &str) -> Option<BracketCommand> {
         (false, rest)
     };
     if remove {
-        let name = body.trim();
-        if name.is_empty() || name.chars().count() > INV_NAME_MAX || has_control_chars(name) {
+        let name = remove_form_name(body);
+        if name.is_empty() || name.chars().count() > INV_NAME_MAX || has_control_chars(&name) {
             return None;
         }
         return Some(BracketCommand::Pack {
@@ -979,7 +1117,12 @@ fn parse_pack(rest: &str) -> Option<BracketCommand> {
             "qty" | "count" | "n" => {
                 // Explicit 0 = remove (documented; the old .max(1) made it a
                 // dead branch that added 1 instead).
-                qty = v.parse::<u32>().unwrap_or(1);
+                // (2026-08-16 audit LOW) u64 parse + saturate, the JSON
+                // dual's rule (an overflowing count used to land on qty=1).
+                qty = v
+                    .parse::<u64>()
+                    .map(|n| n.min(u32::MAX as u64) as u32)
+                    .unwrap_or(1);
                 if qty == 0 {
                     qty_zero_remove = true;
                     qty = 1;
@@ -1148,44 +1291,10 @@ fn scan_text_brackets(body: &str, commands: &mut Vec<BracketCommand>) {
     while i < bytes.len() {
         let Some(rel) = bytes[i..].iter().position(|&b| b == b'[') else { break };
         let start = i + rel;
-        // (2026-08-15 audit fix) Quote-aware close-scan: a `]` inside a
-        // double-quoted value used to end the bracket early
-        // (`[PRESENCE elara "by the hearth] nook"]` truncated at the inner
-        // `]`). Inside a quoted segment a `]` is literal text. If the quote
-        // never closes (malformed output), fall back to the FIRST `]` —
-        // unchanged legacy behavior, so a stray quote can't swallow the
-        // rest of the turn. ASCII byte scan is UTF-8-safe (`"`/`]` never
-        // appear inside a multi-byte sequence).
-        let mut end = None;
-        let mut j = start + 1;
-        let mut in_quote = false;
-        let mut saw_quote = false;
-        while j < bytes.len() {
-            let b = bytes[j];
-            if in_quote {
-                if b == b'"' {
-                    in_quote = false;
-                }
-            } else if b == b'"' {
-                in_quote = true;
-                saw_quote = true;
-            } else if b == b']' {
-                end = Some(j);
-                break;
-            }
-            j += 1;
-        }
-        let end = match end {
-            Some(e) => e,
-            None if saw_quote => {
-                // Unterminated quote: legacy first-`]` fallback.
-                let Some(end_rel) = bytes[start..].iter().position(|&b| b == b']') else {
-                    break;
-                };
-                start + end_rel
-            }
-            None => break,
-        };
+        // Quote-aware close-scan — shared with `parse()`'s main loop (see
+        // `find_bracket_close` for the quoted-`]` + unterminated-quote
+        // fallback semantics).
+        let Some(end) = find_bracket_close(bytes, start) else { break };
         let bracket = &body[start + 1..end];
         let text_after = &body[end + 1..];
         if let Some((cmd, consumed_after_bracket)) = parse_one(bracket, text_after) {
@@ -2237,7 +2346,13 @@ fn parse_one(bracket: &str, text_after: &str) -> Option<(BracketCommand, usize)>
     // `date` arm + `json_to_date` helper.
     if let Some(rest) = strip_prefix_ci(bracket, "DATE") {
         let value = rest.trim().to_string();
-        if !value.is_empty() && value.len() <= DATE_VALUE_MAX && !has_control_chars(&value) {
+        // (2026-08-16 audit LOW) Chars, matching the JSON dual's gate — the
+        // byte count under-admitted non-ASCII calendar labels (a full-width
+        // CJK date string hit the cap at half the visible length).
+        if !value.is_empty()
+            && value.chars().count() <= DATE_VALUE_MAX
+            && !has_control_chars(&value)
+        {
             return Some((BracketCommand::Date { value }, 0));
         }
         return None;
@@ -2450,15 +2565,20 @@ fn parse_one(bracket: &str, text_after: &str) -> Option<(BracketCommand, usize)>
             if let (Some(label), Some(duration)) = (label, duration) {
                 if !label.is_empty() && duration >= 0 {
                     let polarity = polarity.unwrap_or_else(|| infer_polarity(label));
-                    return Some((
-                        BracketCommand::Effect {
-                            label: label.to_string(),
-                            polarity,
-                            duration_minutes: duration,
-                            tag_kind: kind,
-                        },
-                        0,
-                    ));
+                    // (2026-08-16 audit LOW) Label gate — the tag persists to
+                    // saves + renders into every `buffs:`/`debuffs:` line.
+                    let label = clean_free_text(label, EFFECT_LABEL_MAX);
+                    if !label.is_empty() {
+                        return Some((
+                            BracketCommand::Effect {
+                                label,
+                                polarity,
+                                duration_minutes: duration,
+                                tag_kind: kind,
+                            },
+                            0,
+                        ));
+                    }
                 }
             }
         }
@@ -2481,6 +2601,8 @@ fn parse_one(bracket: &str, text_after: &str) -> Option<(BracketCommand, usize)>
                         let label = positional[..duration_idx].join(" ");
                         (label.clone(), infer_polarity(&label))
                     };
+                    // (2026-08-16 audit LOW) Same label gate as the kv branch.
+                    let label = clean_free_text(&label, EFFECT_LABEL_MAX);
                     if !label.is_empty() {
                         return Some((
                             BracketCommand::Effect {
@@ -2614,6 +2736,9 @@ fn parse_one(bracket: &str, text_after: &str) -> Option<(BracketCommand, usize)>
         if let (Some(npc_id), Some(description), Some(difficulty), Some(suitability), Some(eta_minutes)) =
             (npc_id, description, difficulty, suitability, eta_minutes)
         {
+            // (2026-08-16 audit LOW) Description gate — persists to saves +
+            // renders into tick directives.
+            let description = clean_free_text(&description, TASK_DESC_MAX);
             if !npc_id.is_empty() && !description.is_empty() && eta_minutes > 0 {
                 return Some((
                     BracketCommand::Task {
@@ -2724,19 +2849,65 @@ fn strip_one_quote_pair(s: &str) -> &str {
 /// Helper for the bracket parsers' tolerant key=value + positional parse. A
 /// token containing `=` (with a non-empty key) goes into the kv map; any other
 /// token goes into the positional vec. Pure, no allocations beyond the returns.
+///
+/// (2026-08-16 audit LOW) Quote-aware + paren-tolerant: a `"` opened inside a
+/// token (e.g. `label="Berserk Rage"`) extends the token to the closing
+/// quote — the naive whitespace split mangled multi-word quoted labels
+/// (`label="Berserk` + `Rage"`). A leading `(`/trailing `)` on a token is
+/// trimmed before classification so the paren-group form
+/// (`[EFFECT (label=X polarity=buff duration_minutes=60)]`) parses instead
+/// of dropping the whole bracket into prose. An unterminated quote falls
+/// back to the plain whitespace token (a stray quote can't swallow the
+/// rest of the body).
 fn split_kv_positional(s: &str) -> (std::collections::HashMap<&str, &str>, Vec<&str>) {
     let mut kv = std::collections::HashMap::new();
     let mut positional = Vec::new();
-    for tok in s.split_whitespace() {
-        if let Some(eq) = tok.find('=') {
-            let k = tok[..eq].trim();
-            let v = tok[eq + 1..].trim();
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        // Skip whitespace runs.
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if i >= bytes.len() {
+            break;
+        }
+        let start = i;
+        let mut in_quote = false;
+        while i < bytes.len() {
+            let b = bytes[i];
+            if b == b'"' {
+                in_quote = !in_quote;
+                i += 1;
+            } else if b.is_ascii_whitespace() && !in_quote {
+                break;
+            } else {
+                i += 1;
+            }
+        }
+        // Safe slicing: `i` only stops at ASCII whitespace/quote boundaries
+        // (always valid char boundaries in UTF-8).
+        let mut tok = &s[start..i];
+        if in_quote {
+            // Unterminated quote: re-cut at the first whitespace (legacy
+            // behavior for this one token).
+            tok = &s[start..s[start..]
+                .find(char::is_whitespace)
+                .map(|w| start + w)
+                .unwrap_or(s.len())];
+        }
+        // Paren tolerance: trim an outermost group marker.
+        let tok_trimmed = tok.trim_matches(|c| c == '(' || c == ')');
+        let tok_ref: &str = if tok_trimmed.len() >= 1 { tok_trimmed } else { tok };
+        if let Some(eq) = tok_ref.find('=') {
+            let k = tok_ref[..eq].trim();
+            let v = tok_ref[eq + 1..].trim();
             if !k.is_empty() {
-                kv.insert(k, v);
+                kv.insert(k, strip_one_quote_pair(v));
                 continue;
             }
         }
-        positional.push(tok);
+        positional.push(strip_one_quote_pair(tok_ref));
     }
     (kv, positional)
 }
@@ -2760,11 +2931,12 @@ fn parse_task_no_pipe(rest: &str) -> Option<(BracketCommand, usize)> {
     if let (Some(npc_id), Some(description), Some(difficulty), Some(suitability), Some(eta)) =
         (npc_id, description, difficulty, suitability, eta)
     {
+        let description = clean_free_text(description, TASK_DESC_MAX);
         if !npc_id.is_empty() && !description.is_empty() && eta > 0 {
             return Some((
                 BracketCommand::Task {
                     npc_id: npc_id.to_string(),
-                    description: description.to_string(),
+                    description,
                     difficulty: difficulty.to_string(),
                     suitability: suitability.to_string(),
                     eta_minutes: eta,
@@ -2777,7 +2949,7 @@ fn parse_task_no_pipe(rest: &str) -> Option<(BracketCommand, usize)> {
     if pos.len() >= 5 {
         let npc_id = pos[0].to_string();
         let trailing = &pos[pos.len() - 3..];
-        let description = pos[1..pos.len() - 3].join(" ");
+        let description = clean_free_text(&pos[1..pos.len() - 3].join(" "), TASK_DESC_MAX);
         let difficulty = trailing[0].to_string();
         let suitability = trailing[1].to_string();
         let eta_minutes = trailing[2].parse::<i64>().ok();
@@ -2871,8 +3043,14 @@ fn parse_in_world_time_inner(s: &str) -> Option<i64> {
                 continue;
             }
             if let Ok(n) = rest.parse::<i64>() {
-                day_from_word = Some(n);
-                saw_any_signal = true;
+                // (2026-08-16 audit LOW) Same plausibility gate the SPLIT
+                // "day 3" form has below: a glued 16-digit "day" parses as
+                // i64 but overflows `(day-1)*1440` in debug (release wraps
+                // silently) — the #56 clock gate covered h:mm, not the day.
+                if (1..=100_000).contains(&n) {
+                    day_from_word = Some(n);
+                    saw_any_signal = true;
+                }
                 continue;
             }
             continue;

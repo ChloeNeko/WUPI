@@ -1046,6 +1046,22 @@ export async function refreshAll() {
   // paint below runs only while this call is still the newest.
   const seq = ++refreshSeq;
   const superseded = () => seq !== refreshSeq;
+  // (2026-08-16 audit LOW) Re-read the gender key on every refresh — the
+  // Creator's Gender slide writes localStorage directly (setPaperdollGender
+  // has no callers), so the module-load capture showed the boot-time gender
+  // until an app restart. refreshAll fires on drawer open + after every
+  // narrator turn, which covers every path back into the HUD.
+  try {
+    const stored = localStorage.getItem('wupi.paperdoll.gender');
+    const n = normGender(stored);
+    if (n === 'male' || n === 'female') {
+      if (gender !== n) {
+        gender = n;
+        drawerEl.dataset.gender = n;
+        if (drawerEl.querySelector('[data-gender-btn]')) renderGenderGlyph();
+      }
+    }
+  } catch (_) { /* storage unavailable */ }
   // The paperdoll is local-only (gender + PNG) — re-render it always.
   // NOTE: renderPaperdoll assigns a fresh img.src. The paperdoll <img> uses
   // height:clamp() + width:auto, so its rendered width is 0 until the PNG

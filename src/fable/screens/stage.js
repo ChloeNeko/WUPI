@@ -113,6 +113,10 @@ let pendingTurnText = '';
 // disconnect). Stash the in-flight text here at submit; a delivered turn
 // clears it.
 let lastSentTurnText = '';
+// (2026-08-16 audit fix #26) Timestamp of the last composer submit — the
+// double-Enter debounce anchor (a second Enter <350ms after the send is a
+// duplicate keypress, not the stop gesture).
+let lastSendAt = 0;
 let cardContext = null;  // { card, saveId } for the active session
 let activeCardName = '';  // display name of the seated card (the typing indicator)
 let activePlayerName = '';  // protagonist name (card.player_name) → user-beat headers
@@ -531,8 +535,22 @@ export async function wireStage(root, hooks) {
     onTurnStart: () => {
       setGenerating(true);
     },
-    onTurnEnd: () => {
+    onTurnEnd: (info) => {
       setGenerating(false);
+      // (2026-08-16 audit fix #5) A REVERTED turn (soft cancel / api_lost /
+      // dev-narrator error) hands its typed text back — the user bubble was
+      // removed in lockstep with the backend's pop, so this restore is the
+      // only thing keeping the player's action from vanishing. Skipped while
+      // the composer is API-locked (the pendingTurnText stash owns the retry
+      // there; refilling the box would fight the lock's cleared state).
+      if (info && typeof info.revertedText === 'string' && info.revertedText && !composerLocked) {
+        const input = stageRoot && stageRoot.querySelector('[data-input]');
+        if (input && !input.value.trim()) {
+          input.value = info.revertedText;
+          autoGrow(input);
+          input.focus();
+        }
+      }
       // (2026-08-15) The turn delivered — its text was consumed; the api_lost
       // stash must not resurrect a stale action on some FUTURE disconnect.
       lastSentTurnText = '';
@@ -646,8 +664,15 @@ export async function wireStage(root, hooks) {
       await pendingSave;
       if (narrator.isGenerating() || narrator.isRerolling()) return;
     }
-    input.value = '';
-    input.style.height = 'auto';
+    // (2026-08-16 audit LOW) Clear ONLY if the field still holds the
+    // submitted text — the editor save above can take seconds (an assistant
+    // re-track is a local decode), and clearing unconditionally destroyed
+    // whatever the player typed into the composer during that wait.
+    if (input.value.trim() === text) {
+      input.value = '';
+      input.style.height = 'auto';
+    }
+    lastSendAt = Date.now(); // (audit #26) the double-Enter debounce anchor
     lastSentTurnText = text; // (2026-08-15) the api_lost retry affordance's source
     narrator.sendFableTurn(text);
   });
@@ -661,6 +686,12 @@ export async function wireStage(root, hooks) {
         return;
       }
       if (narrator.isGenerating() && !input.value.trim()) {
+        // (2026-08-16 audit fix #26) Double-Enter debounce: the composer is
+        // cleared synchronously at submit, so a second Enter ~100ms after the
+        // first read as "empty Enter mid-generation" and instantly STOPPED
+        // the just-started turn. The stop affordance stays — it just needs
+        // the user to have SEEN the turn start (350ms).
+        if (Date.now() - lastSendAt < 350) return;
         // Empty Enter mid-generation → stop. Route to the slice cancel slot
         // if a golden-pencil regen is in flight (distinct from the full-turn
         // fable_stop slot — Bug #7 cross-wire lesson); otherwise the normal
@@ -957,13 +988,15 @@ export async function wireStage(root, hooks) {
   on(document, 'keydown', onKeyDown, { capture: true });
 
   // Paint the dialogue feed on entry. Two paths feed it:
-  //   - hooks.loadMessages: a resumed/loaded session's full history
-  //     (the backend already holds it; we mirror it into the DOM). This
-  //     is authoritative — when present it IS the feed, including any
-  //     opening beat as its first entry.
-  //   - hooks.openingScene: a fresh game's one-shot narrator beat (the
-  //     card's .intro), rendered as the sole assistant card. Used only
-  //     when there's no history to rebuild from.
+  //   - hooks.loadMessages: the session's full history (the backend already
+  //     holds it; we mirror it into the DOM). This is authoritative — when
+  //     present it IS the feed. (2026-08-16) the opening beat rides here too:
+  //     a fresh game's `<intro>` is seeded as session message 0 backend-side,
+  //     so index 0 in the feed is index 0 in the conversation and the beat
+  //     survives rebuilds/resumes like any other message.
+  //   - hooks.openingScene: legacy fallback for a backend that still surfaces
+  //     `FableLoadResult.intro` (rendered DOM-only). Dead under the current
+  //     backend — kept as a one-shot guard.
   // A cold start has neither — the first fable_send turn
   // streams the opening beat live.
   beats.clearFeed();
@@ -1100,10 +1133,21 @@ function lockComposer(message) {
   // submit (lastSentTurnText). The backend already aborted the turn WITHOUT
   // consuming the user message (the api_lost path pops the turn-start user
   // message), so the retry sends a fresh, unduplicated copy.
-  pendingTurnText = (input.value && input.value.trim()) || lastSentTurnText;
+  // (2026-08-16 audit M4) PREFER the in-flight action over a half-typed
+  // draft: lockComposer fires mid-turn, where input.value is whatever the
+  // player started typing NEXT — the old `input.value ||` order let that
+  // draft beat the lost action, which then existed nowhere. Keep any prior
+  // stash as the last resort (never clobber with empty).
+  pendingTurnText = lastSentTurnText || (input.value && input.value.trim()) || pendingTurnText;
   input.value = '';
   input.style.height = 'auto';
-  input.disabled = true;
+  // (2026-08-16 audit fix #25) readOnly, NOT disabled: a disabled textarea
+  // receives NO keydown in WebView2, so the Enter-to-retry affordance the
+  // toast advertises could never fire (the lock was a dead end until the API
+  // panel reconnect path unlocked it). readOnly blocks typing but keeps the
+  // keydown path alive — the composer's Enter handler routes composerLocked
+  // to retryIfApiReady. The .is-api-lost class carries the visual lock.
+  input.readOnly = true;
   // The red glowing placeholder IS the in-box error message.
   input.placeholder = 'API LOST CONNECTION';
   inputRow.classList.add('is-api-lost');
@@ -1116,7 +1160,7 @@ function unlockComposer() {
   const input = stageRoot && stageRoot.querySelector('[data-input]');
   if (!inputRow || !input) return;
   inputRow.classList.remove('is-api-lost');
-  input.disabled = false;
+  input.readOnly = false;
   // Restore the original idle placeholder (setGenerating stashes it, but the
   // lock overwrote it directly — reset to the default).
   input.placeholder = 'Type a message...';
@@ -1144,6 +1188,11 @@ async function retryIfApiReady() {
   pendingTurnText = '';
   unlockComposer();
   if (text && !narrator.isGenerating()) {
+    // (2026-08-16 audit M4) The retry re-sends through sendFableTurn
+    // DIRECTLY — the submit handler that sets lastSentTurnText is bypassed,
+    // so a SECOND consecutive api_lost would find it cleared and lose the
+    // action for good. Set it here like a normal submit would.
+    lastSentTurnText = text;
     narrator.sendFableTurn(text);
   }
 }
@@ -1219,6 +1268,14 @@ function onKeyDown(e) {
   // right after it (before the drawer/panel surfaces below).
   if (backgrounds.isOpen()) { backgrounds.closeBackgroundsPanel(); e.preventDefault(); e.stopPropagation(); return; }
   if (panelActive()) { dismissPanel(); e.preventDefault(); e.stopPropagation(); return; }
+  // (2026-08-16 audit fix #26) The inline beat editor + an in-flight slice
+  // regen own Esc BEFORE any drawer: this listener runs CAPTURE-phase, so a
+  // drawer branch's stopPropagation used to eat the keypress while the
+  // editor stayed open — the drawer (an outer surface) dismissed first.
+  // Both surfaces handle Esc on their own listeners (the editor's textarea
+  // keydown; slice-regen's transient capture listener) — just don't act.
+  if (beats.openEditingBeat()) return;
+  if (narrator.isSliceRegenerating()) return;
   if (wupiDrawer.isOpen()) { wupiDrawer.closeDrawer(); e.preventDefault(); e.stopPropagation(); return; }
   if (leftDrawer.isOpenState()) { leftDrawer.closeDrawer(); e.preventDefault(); e.stopPropagation(); return; }
 }
@@ -1278,7 +1335,13 @@ export function toast(msg) {
   // (2026-08-15 audit fix) toast can fire before any stage entry (e.g. a New
   // Game import failure in fable.js calls it while stageRoot is still null —
   // wireStage hasn't run on a fresh boot). Guard instead of throwing.
-  if (!stageRoot) { console.warn('[stage] toast before wireStage:', msg); return; }
+  // (2026-08-16 audit fix #26) The stage must also be the VISIBLE screen:
+  // showScreen toggles each screen's `hidden` property, so a stale stageRoot
+  // from a prior entry painted the toast into the hidden stage DOM — the
+  // flow-level failure the caller wanted to surface never showed anywhere.
+  // Non-stage surfaces drop to console so the error at least lands somewhere
+  // observable.
+  if (!stageRoot || stageRoot.hidden) { console.warn('[stage] toast (stage not visible):', msg); return; }
   const t = stageRoot.querySelector('[data-toast]');
   if (!t) return;
   t.textContent = msg;
@@ -1428,6 +1491,14 @@ export function teardownStage() {
   // `generating` (would no-op the next session's first send) or a dangling
   // activeBeat, and so the Wupi drawer starts fresh next entry.
   narrator.resetNarrator();
+  // (2026-08-16 audit M8b) Cut an in-flight DRAWER chat decode too — the
+  // local-model turn lock it holds would stall the next session's first
+  // tracker turn. resetWupiDrawer only clears DOM state; the decode is
+  // backend-side. Fire-and-forget: chat_stop races nothing (fable_end on
+  // the next entry is chained after the stop in the backend's own paths,
+  // and a turn finalizing into the swapped session is blocked by the
+  // session-identity guards).
+  wupiDrawer.stopWupiTurn();
   wupiDrawer.resetWupiDrawer();
   leftDrawer.resetLeftDrawer();
   // Reset the tab rail (clears the active tab so no stale dropdown leaks into

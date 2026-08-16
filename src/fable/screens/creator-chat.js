@@ -607,6 +607,25 @@ export function renderCreatorChat(root, config) {
   // Fire an edit turn from the review card: user text into history, then the
   // shared turn engine in edit mode (blur + bronze ring until it settles).
   function requestEdit(text) {
+    // (2026-08-16 audit M6) Seeded edit runs are blind: the run's history
+    // carries ONLY the user's instruction ("make her hair red") — GLM never
+    // sees the entity being edited, reinvents the whole identity from the
+    // name, and mergeDraft then overwrites every field. Mid-creation edits
+    // don't need this (their history already carries the gathering
+    // conversation). Inject the entity's CURRENT state as context right
+    // before the instruction, size-capped so a codex-laden draft can't
+    // bloat the call. Consecutive user turns are fine for the API path.
+    if (config.seedDraft) {
+      try {
+        let snapshot = JSON.stringify(state.draft, null, 2) || '';
+        if (snapshot.length > 6000) snapshot = snapshot.slice(0, 6000) + '\n…(truncated)';
+        state.history.push({
+          role: 'user',
+          content: `Current state of the ${creatorKind === 'player' ? 'player' : 'card'} being edited ` +
+            `(rework THIS — keep every field the instruction does not mention):\n${snapshot}`,
+        });
+      } catch (_) { /* unserializable draft — the instruction goes alone */ }
+    }
     state.history.push({ role: 'user', content: text });
     state.codexValidationRetries = 0;
     state.mandatoryRetries = 0;
@@ -703,6 +722,11 @@ export function renderCreatorChat(root, config) {
     if (btn.disabled) return;
     btn.disabled = true;
     btn.textContent = 'Creating...';
+    // (2026-08-16 audit LOW) state.busy for the WHOLE create — the pencil +
+    // the ‹ back stay clickable during the multi-IPC write otherwise
+    // (openEditPopup gates on state.busy; the composer half of setBusy is a
+    // no-op in review mode where it's already hidden).
+    setBusy(true);
     trace(`CREATE: kind=${creatorKind} cardId=${cardId || '-'} portrait=${!!state.portraitBytes}`);
     try {
       // Final backstop: the ready gate should make this unreachable, but a
@@ -729,7 +753,11 @@ export function renderCreatorChat(root, config) {
       if (creatorKind === 'player' || creatorKind === 'sim') {
         const target = creatorKind === 'player'
           ? serializePlayer(state.draft).id
-          : (slugify(state.draft.name || '') || 'world');
+          // Symbol-only name → empty slug → Rust derives the id "unknown"
+          // (empty <id> is filtered, name-derivation is sentinel-filtered).
+          // The folder fallback MUST match or state splits into a phantom
+          // folder the id can never load (2026-08-16 audit low).
+          : (slugify(state.draft.name || '') || 'unknown');
         const seededId = config.seedDraft ? config.seedDraft.id : undefined;
         let existingIds = [];
         try {
@@ -780,7 +808,7 @@ export function renderCreatorChat(root, config) {
         if (onCreated) onCreated({ playerId: meta.id, draft: state.draft });
       } else if (creatorKind === 'sim') {
         const { xml, intro } = serializeSimCard(state.draft);
-        const stem = slugify(state.draft.name || '') || 'world';
+        const stem = slugify(state.draft.name || '') || 'unknown';
         trace(`serializeSimCard → stem=${stem} xml=${xml.length}b intro=${intro ? intro.length + 'b' : 'none'}`);
         // `<intro>` is embedded AFTER </sim_card> in the XML itself
         // (2026-08-13), so fable_write_card carries it — no separate .intro
@@ -818,6 +846,7 @@ export function renderCreatorChat(root, config) {
     } catch (e) {
       btn.disabled = false;
       btn.textContent = 'Create';
+      setBusy(false);
       trace(`CREATE FAILED (${creatorKind}): ${e.message || e}`);
       // The prompt block is HIDDEN in review mode — surface the failure ON the
       // review card so a rejected write is never an invisible "does nothing".

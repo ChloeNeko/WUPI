@@ -2685,8 +2685,9 @@ async fn route_to_fable_manager(
 
     // 3b. Fail-proof contract: if the reply carries a retryable failed_attempt
     //     (all 3 passes failed on parse/validation), enqueue it for the next
-    //     translation request. Never silently dropped.
-    if let Some(failed) = reply.failed_attempt.clone() {
+    //     translation request — within the retry budget (the passes_used
+    //     circuit breaker, 2026-08-16 audit LOW).
+    if let Some(failed) = reply.failed_attempt.clone().and_then(bump_retry_budget) {
         enqueue_failed_translation(state, failed).await;
     }
 
@@ -3803,7 +3804,7 @@ async fn chat_send(
                     // silently dropped. Infrastructure failures (panic,
                     // tokenize/prefill error) leave failed_attempt = None and
                     // are simply logged.
-                    if let Some(failed) = reply.failed_attempt.clone() {
+                    if let Some(failed) = reply.failed_attempt.clone().and_then(bump_retry_budget) {
                         let mut q = failed_queue_slot.lock().await;
                         if q.len() >= MAX_FAILED_DELTA_ATTEMPTS {
                             q.remove(0);
@@ -4367,6 +4368,31 @@ async fn enqueue_failed_progression(
     q.push(attempt);
 }
 
+/// (2026-08-16 audit LOW) The `passes_used` circuit breaker
+/// `FailedAttempt` has documented since birth but no caller ever ran: bump
+/// the counter when a DEFERRED RE-ATTEMPT fails again, and DROP the attempt
+/// once its retry budget is spent — a systematically failing exchange used
+/// to re-fire 3 engine passes every turn forever (each round ~seconds of
+/// local decode). The engine constructs attempts at MAX_DELTA_PASSES (3);
+/// the budget allows 2 full re-attempt rounds past that. Returns None when
+/// the attempt is spent (callers skip the enqueue + log loudly — "never
+/// silently dropped" holds WITHIN the budget).
+fn bump_retry_budget(
+    mut attempt: schema_engine::FailedAttempt,
+) -> Option<schema_engine::FailedAttempt> {
+    const MAX_DEFERRED_RETRY_ROUNDS: u8 = 2;
+    const MAX_TOTAL_PASSES: u8 = 3 + MAX_DEFERRED_RETRY_ROUNDS;
+    attempt.passes_used = attempt.passes_used.saturating_add(1);
+    if attempt.passes_used > MAX_TOTAL_PASSES {
+        tracing::warn!(
+            passes = attempt.passes_used,
+            "failed schema attempt exhausted its retry budget; dropping (systematic failure — see the errors above)"
+        );
+        return None;
+    }
+    Some(attempt)
+}
+
 /// (#32 2026-08-15) Re-enqueue drained failed-attempt re-tries after an
 /// INFRA failure (engine acquire / request post / reply channel). The
 /// fail-proof contract's "no world-state evolution is ever silently
@@ -4374,8 +4400,7 @@ async fn enqueue_failed_progression(
 /// `take()` the queue up front and previously returned without restoring
 /// it — silently erasing prior turns' deferred re-attempts on any
 /// infrastructure hiccup. Cap-preserving FIFO, same as the enqueue helpers.
-async fn reenqueue_failed_attempts(
-    queue: &Arc<tokio::sync::Mutex<Vec<schema_engine::FailedAttempt>>>,
+async fn reenqueue_failed_attempts(    queue: &Arc<tokio::sync::Mutex<Vec<schema_engine::FailedAttempt>>>,
     items: Vec<schema_engine::FailedAttempt>,
     label: &str,
 ) {
@@ -4645,6 +4670,12 @@ async fn apply_phase3_bracket_commands(
         && milestones.is_empty()
         && tasks.is_empty()
         && weather_cmds.is_empty()
+        // (2026-08-16 audit fix #6) date_cmds MUST be in this early-out: a
+        // [DATE]-only turn (common on solo scenes with no presences — nothing
+        // else to assert) used to return before the DATE applier below ever
+        // ran, silently discarding the calendar rewrite. Intermittent by
+        // construction — any turn carrying another bracket worked.
+        && date_cmds.is_empty()
         && travel_cmds.is_empty()
         && rumor_cmds.is_empty()
         && presence_cmds.is_empty()
@@ -4749,13 +4780,12 @@ async fn apply_phase3_bracket_commands(
                 // stays in every save forever — pure bloat). Past the cap, a
                 // KNOWN npc still records; an UNKNOWN one is dropped instead
                 // of minting entry #N+1.
-                const MAX_TRACKED_RELATIONSHIPS: usize = 48;
                 if !s.relationships.contains_key(npc_id)
-                    && s.relationships.len() >= MAX_TRACKED_RELATIONSHIPS
+                    && s.relationships.len() >= crate::schema::MAX_TRACKED_RELATIONSHIPS
                 {
                     tracing::warn!(
                         npc_id = %npc_id,
-                        cap = MAX_TRACKED_RELATIONSHIPS,
+                        cap = crate::schema::MAX_TRACKED_RELATIONSHIPS,
                         "[MILESTONE] relationships map at cap — not tracking a new NPC"
                     );
                     continue;
@@ -4853,8 +4883,7 @@ async fn apply_phase3_bracket_commands(
                     resolves_at_minutes: now_minutes.saturating_add(*eta_minutes),
                     resolved: false,
                 });
-                const MAX_STORED_TASKS: usize = 20;
-                let overflow = s.offscreen_tasks.len().saturating_sub(MAX_STORED_TASKS);
+                let overflow = s.offscreen_tasks.len().saturating_sub(crate::schema::MAX_STORED_TASKS);
                 if overflow > 0 {
                     s.offscreen_tasks.drain(..overflow);
                 }
@@ -5122,8 +5151,7 @@ async fn apply_phase3_bracket_commands(
                     known_nodes: vec![cur_id.clone()],
                     born_minutes: now_minutes,
                 });
-                const MAX_STORED_RUMORS: usize = 20;
-                let overflow = s.rumors.len().saturating_sub(MAX_STORED_RUMORS);
+                let overflow = s.rumors.len().saturating_sub(crate::schema::MAX_STORED_RUMORS);
                 if overflow > 0 {
                     s.rumors.drain(..overflow);
                 }
@@ -5950,7 +5978,36 @@ async fn apply_time_command_and_maybe_tick(
 ///
 /// Errors are logged + dropped (see [`apply_time_command_and_maybe_tick`]);
 /// retryable failures land in `failed_progression_queue`.
-async fn fire_world_progression_tick(state: &tauri::State<'_, AppState>) {
+/// True while the session a world-progression tick was armed for is still
+/// the live one (`active_card_id` unchanged). Logs once per miss so the
+/// dropped old-timeline state is visible. See `fire_world_progression_tick`.
+async fn tick_session_live(state: &tauri::State<'_, AppState>, turn_card_id: &str) -> bool {
+    let live = *state.active_card_id.lock().expect("active_card_id mutex") == turn_card_id;
+    if !live {
+        tracing::warn!(
+            turn_card = %turn_card_id,
+            "world progression: session swapped mid-tick; dropping the tick's old-timeline state (no writes to the new session)"
+        );
+    }
+    live
+}
+
+async fn fire_world_progression_tick(state: &tauri::State<'_, AppState>, turn_card_id: &str) {
+    // (2026-08-16 audit fix #4) Session-identity guard. This tick runs for
+    // ~1-3s AFTER the turn's cancel slot was cleared and after `done`
+    // unlocked the frontend — `fable_turn_in_flight` is already false, so a
+    // Load/Continue/End/Start issued right after a beat lands passes its
+    // guard while the tick is still mid-flight. Without these checks the
+    // tick applies the OLD timeline's progression delta onto the newly
+    // loaded schema, pushes old-era entries onto the freshly cleared undo
+    // ring, and re-populates the just-drained directive/failed queues — the
+    // exact leak class the 2026-08-15 session-boundary drains exist to
+    // prevent. Checked before the drain, re-checked after the LLM pass (the
+    // long wait), and on every failure-path re-enqueue; same best-effort
+    // contract as the mid-turn guard in fable_send.
+    if !tick_session_live(state, turn_card_id).await {
+        return;
+    }
     // Re-derive the snapshot POST tick-mutations so the model diffs against
     // the already-resolved state (tag expiry, task resolution, weather,
     // rumors), and recompute the pacing interval for this tick.
@@ -5980,7 +6037,9 @@ async fn fire_world_progression_tick(state: &tauri::State<'_, AppState>) {
         Ok(t) => t,
         Err(e) => {
             tracing::warn!(error = %e, "world progression: could not acquire schema engine; tick skipped");
-            reenqueue_failed_attempts(&state.failed_progression_queue, deferred, "failed_progression_queue").await;
+            if tick_session_live(state, turn_card_id).await {
+                reenqueue_failed_attempts(&state.failed_progression_queue, deferred, "failed_progression_queue").await;
+            }
             return;
         }
     };
@@ -5996,7 +6055,9 @@ async fn fire_world_progression_tick(state: &tauri::State<'_, AppState>) {
         Ok(rx) => rx,
         Err(e) => {
             tracing::warn!(error = %format!("{e:#}"), "world progression request failed; tick skipped");
-            reenqueue_failed_attempts(&state.failed_progression_queue, deferred, "failed_progression_queue").await;
+            if tick_session_live(state, turn_card_id).await {
+                reenqueue_failed_attempts(&state.failed_progression_queue, deferred, "failed_progression_queue").await;
+            }
             return;
         }
     };
@@ -6004,19 +6065,34 @@ async fn fire_world_progression_tick(state: &tauri::State<'_, AppState>) {
         Ok(Ok(r)) => r,
         Ok(Err(e)) => {
             tracing::warn!(error = %format!("{e}"), "world progression reply channel closed");
-            reenqueue_failed_attempts(&state.failed_progression_queue, deferred, "failed_progression_queue").await;
+            if tick_session_live(state, turn_card_id).await {
+                reenqueue_failed_attempts(&state.failed_progression_queue, deferred, "failed_progression_queue").await;
+            }
             return;
         }
         Err(e) => {
             tracing::warn!(error = %format!("{e}"), "world progression reply join failed");
-            reenqueue_failed_attempts(&state.failed_progression_queue, deferred, "failed_progression_queue").await;
+            if tick_session_live(state, turn_card_id).await {
+                reenqueue_failed_attempts(&state.failed_progression_queue, deferred, "failed_progression_queue").await;
+            }
             return;
         }
     };
     drop(deferred);
 
-    // 7. Fail-proof contract: enqueue retryable failures for the next tick.
-    if let Some(failed) = reply.failed_attempt.clone() {
+    // (audit #4) The LLM pass above is the long wait — re-verify the session
+    // identity before ANY mutation: the failed-attempt enqueue, the delta
+    // apply, the ring pushes, and the baseline stamp all belong to the
+    // armed timeline. A mismatch drops the tick's results entirely (they
+    // are one-shot facts of the old timeline; the new session drained its
+    // queues at its boundary for exactly this reason).
+    if !tick_session_live(state, turn_card_id).await {
+        return;
+    }
+
+    // 7. Fail-proof contract: enqueue retryable failures for the next tick
+    // (within the passes_used retry budget — the circuit breaker).
+    if let Some(failed) = reply.failed_attempt.clone().and_then(bump_retry_budget) {
         enqueue_failed_progression(state, failed).await;
     }
     if !reply.error.is_empty() {
@@ -6897,16 +6973,56 @@ fn load_card_intro(cards_root: &std::path::Path, card_id: &str) -> Option<String
 /// but inlined here so the IPC layer doesn't depend on the agent-tool module.
 /// The stem is the `<stem>.sim` filename AND the card's memory/save partition
 /// key, so it must be stable + unique across cards.
+///
+/// MUST stay in exact agreement with the JS `slugify` (card-serialize.js):
+/// (2026-08-16 audit fix #3) a RUN of non-slug chars collapses to ONE dash
+/// (the per-char map left "Kaelen, the Bold" as `kaelen--the-bold` while JS
+/// built the folder `kaelen-the-bold` — the parsed id and the on-disk folder
+/// disagreed: phantom state folders, a delete-by-id that misses the real
+/// folder forever, raw-edit/portrait/.lnk paths resolving nowhere), and a
+/// slug landing on a Windows reserved base name gets the "-card" suffix (the
+/// same suffix JS appends) so folder creation can't fail opaquely.
+const WINDOWS_RESERVED_STEMS: [&str; 24] = [
+    "con", "prn", "aux", "nul", "conin$", "conout$", //
+    "com1", "com2", "com3", "com4", "com5", "com6", "com7", "com8", "com9", //
+    "lpt1", "lpt2", "lpt3", "lpt4", "lpt5", "lpt6", "lpt7", "lpt8", "lpt9",
+];
+
+/// Collapse every run of '-' (2+) into a single '-' — the regex-side
+/// (`[...]+` → '-') behavior the char-map misses. Shared by the card slug
+/// derivation + the sanitizer so both halves agree with the JS slug.
+fn collapse_dash_runs(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut in_dash_run = false;
+    for c in s.chars() {
+        if c == '-' {
+            if !in_dash_run {
+                out.push('-');
+                in_dash_run = true;
+            }
+        } else {
+            out.push(c);
+            in_dash_run = false;
+        }
+    }
+    out
+}
+
 fn slugify_card_stem(name: &str) -> Option<String> {
-    let stem: String = name
+    let mapped: String = name
         .trim()
         .to_lowercase()
         .chars()
         .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '-' })
         .collect();
-    // (2026-08-15 audit fix) Same 64-char cap the JS slugify applies, so the
-    // folder the Creator write derives always matches the client's id math.
-    let stem = cap_slug_chars(stem.trim_matches('-').to_owned());
+    // (2026-08-16 audit fix #3) run-collapse BEFORE the trim/cap, mirroring
+    // the JS replace+trim order.
+    let stem = cap_slug_chars(collapse_dash_runs(&mapped).trim_matches('-').to_owned());
+    let stem = if WINDOWS_RESERVED_STEMS.contains(&stem.as_str()) {
+        format!("{stem}-card")
+    } else {
+        stem
+    };
     if stem.is_empty() { None } else { Some(stem) }
 }
 
@@ -7356,10 +7472,41 @@ async fn enter_fable_session(
         // load_split's NotFound skip.
         let s = load_schema(app, &card.id).await
             .map_err(|e| format!("card state file is corrupt (world.json/player.json/npc.json): {e} — refusing to resume with a reset world; restore from a save slot or fix the file"))?;
+        // (2026-08-16 audit fix) Symmetric refusal for a corrupt session.json:
+        // the old swallow-to-empty reset the campaign PROSE (the schema two
+        // lines up got the hardened refusal, the conversation didn't), and the
+        // next autosave persisted the empty session over the file — silent
+        // history loss.
         let c = load_session(app, &card.id).await
-            .unwrap_or_else(session::Conversation::new);
+            .map_err(|e| format!("card session file is corrupt (session.json): {e} — refusing to resume with an empty conversation; restore from a save slot or fix the file"))?;
         (s, c, None)
     };
+    // (2026-08-16, Chloe ruling + audit #2) Seed the card's `<intro>` as
+    // session message 0 (an assistant beat) whenever we're entering a card
+    // with an EMPTY conversation (fresh New Game, or a first entry with no
+    // session.json yet). The intro used to be a DOM-only render: feed
+    // data-indexes ran +1 vs the backend session for the whole early game
+    // (delete/edit/swipe hit the wrong message), and the beat VANISHED on
+    // the first feed rebuild + every resume because it lived in no session.
+    // As a real session message it survives rebuilds/resumes/saves for free.
+    // It is the BEGINNING message, never a persistent prompt fixture: it
+    // rides the same WINDOW_API_FABLE = 16 slice as every other beat, so
+    // the narrator's context drops it naturally once 16 messages (8 turns)
+    // have gone through — exactly the Fable chat-history limit. A save-slot
+    // resume NEVER seeds (the save's session snapshot is authoritative).
+    {
+        if save_id.is_none() && prior_session.messages.is_empty() {
+            let intro_text = if !card.intro.trim().is_empty() {
+                Some(card.intro.clone())
+            } else {
+                resolve_fable_cards_dir(app).and_then(|root| load_card_intro(&root, &card.id))
+            };
+            if let Some(intro) = intro_text.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+                prior_session
+                    .add_message(session::Role::Assistant, intro.to_owned());
+            }
+        }
+    }
     // (#77) The install paths bypass `Conversation::load`, so run the same
     // defensive normalize it does: clamp active_idx + reconcile variant/raw
     // lengths on every message (a hand-edited or skewed save can't confuse
@@ -7379,8 +7526,14 @@ async fn enter_fable_session(
     // regardless of which state-resolution path fired; a None player_id
     // is a complete no-op (the card's own player_name stands).
     if let Some(pid) = player_id.as_deref() {
+        // (2026-08-16 audit LOW) Sanitize the player id through the same slug
+        // rules every player path uses — the raw join only ever traversed
+        // players/ (read-only), but a hostile id mangles to a nonexistent
+        // path either way; clean it for consistency with the portraiture/
+        // write IPCs' guard.
+        let clean = sanitize_player_slug(pid);
         let players_root = resolve_fable_players_dir(app);
-        let json_path = players_root.join(pid).join(format!("{pid}.json"));
+        let json_path = players_root.join(&clean).join(format!("{clean}.json"));
         if let Some(sp) = load_player_at(&json_path) {
             // Override the card's player_name anchor (the load-bearing
             // identity swap). Only when the saved player has a real name.
@@ -7806,18 +7959,21 @@ async fn enter_fable_session(
         .collect();
     let turn_count = messages.len();
     *state.fable_session.lock().await = prior_session;
+    // (2026-08-16 audit fix #11) Session install = boundary: an armed manual
+    // player_action from the previous game never fires in this one's first
+    // turn. fable_load_save + fable_end run the same clear.
+    *state.pending_player_action.lock().await = None;
     // Read the one-shot opening beat BEFORE the card is moved into
-    // active_fable_card. Surfaced on FableLoadResult.intro so the UI renders the
-    // first narrator beat on a FRESH game without a second IPC round-trip. It is
-    // NEVER injected into the cached system prompt (a one-turn seed; prime
-    // directive). The beat now lives in-file as the `<intro>` sibling after
-    // </sim_card> (2026-08-13); fall back to a legacy `.intro` FILE for old cards.
-    let intro = if !card.intro.trim().is_empty() {
-        Some(card.intro.clone())
-    } else {
-        resolve_fable_cards_dir(app)
-            .and_then(|root| load_card_intro(&root, &card.id))
-    };
+    // active_fable_card. (2026-08-16, Chloe ruling) The intro is NO LONGER
+    // surfaced here: it is seeded into the fresh session as message 0 (see
+    // the seed block above), so it rides `messages` like any other beat —
+    // rendered by the same rebuild path (correct data-index alignment),
+    // persisted in session.json/saves, and dropped from the narrator's
+    // WINDOW_API_FABLE=16 slice once 16 messages have gone through. Returning
+    // it here too would invite a double render (messages + DOM-only path).
+    // The beat lives in-file as the `<intro>` sibling after </sim_card>
+    // (2026-08-13); the legacy `.intro` FILE fallback is handled by the seed
+    // block.
     *state.active_fable_card.lock().expect("active_fable_card mutex") = Some(card);
 
     tracing::info!(?resumed_save_label, "game started: narrator engine live, memory scoped to card, state loaded");
@@ -7832,7 +7988,7 @@ async fn enter_fable_session(
             turn_count,
         },
         messages,
-        intro,
+        intro: None,
     })
 }
 
@@ -8112,7 +8268,12 @@ fn build_narrator_system_prompt(
     out.push_str("- [NPC_REGISTER <npc_id> name=<name> (role=<role>) (tier=minion|soldier|elite|boss|legendary)] — the FIRST time a named NPC who is NOT in the cast line appears. The npc_id is the bare first token (never `id=`). Register them once, then use [PRESENCE]. Omit tier for civilians.\n");
     out.push_str("- [PRESENCE <npc_id> <stance or micro-location>] — when an NPC enters the scene or is already on-camera. Resolves names from the cast line. Example: [PRESENCE mara \"behind the bar, drying a glass\"].\n");
     out.push_str("- [DISCOVER <node_id> name=<name> (setting=indoor|outdoor) (neighbors=<ids>)] — when the player reaches a place that is not yet in the location line's exits. The node_id is the bare first token (never `id=`). Adds it as a travelable node.\n");
-    out.push_str("- [EFFECT <label> buff|debuff <minutes> [kind=disguise]] — when a buff/debuff or disguise takes hold. The number is MINUTES (0 = permanent).\n");
+    // (2026-08-16 audit fix #19) Teach the grammar the parser actually reads:
+    // the old `[kind=disguise]` notation (literal brackets) tokenizes as key
+    // `[kind` → kind stayed empty → the §7.2 disguise gate NEVER engaged. The
+    // parser reads a bare trailing `kind=disguise` token on the positional
+    // form (bracket_parser.rs hoists it before the kv/positional split).
+    out.push_str("- [EFFECT <label> buff|debuff <minutes>] — when a buff/debuff takes hold. The number is MINUTES (0 = permanent). Disguises use the same verb with a trailing kind token: [EFFECT <label> buff <minutes> kind=disguise].\n");
     out.push_str("- [MILESTONE <npc_id> <event_id>] — when a relationship meaningfully shifts (alliance forged, trust broken).\n");
     out.push_str("- [TASK <npc_id> <description> | <difficulty> <suitability> <eta-minutes>] — when an NPC starts an off-screen task you should track. All five fields; the pipe separates the description from the three trailing fields.\n");
     out.push_str("- [APPEARANCE key=value] — when the player's look LASTINGLY changes (a disguise applied, hair cut, a scar earned). Keys: hair_color, outfit, eye_color, scars, wounds, tattoos, disguise, body_type, skin_complexion, hair_length, hair_style, breast_size, ears, tail, horn. Bare [APPEARANCE key] clears.\n");
@@ -8428,9 +8589,19 @@ fn render_fable_world_state(
 ) -> String {
     let mut rendered = s.render_for_prompt();
 
-    // Condition + active status tags (Phase 3 Slice 2 + 4 render).
-    let buffs_count = consequence::count_by_polarity(&s.status_tags, consequence::Polarity::Buff);
-    let debuffs_count = consequence::count_by_polarity(&s.status_tags, consequence::Polarity::Debuff);
+    // Condition + active status tags (Phase 3 Slice 2 + 4 render). Expired
+    // tags don't count (2026-08-16 audit M1) — the tick's sweep is suspended
+    // in Combat, so read-time filtering is the authority.
+    let buffs_count = consequence::count_by_polarity(
+        &s.status_tags,
+        consequence::Polarity::Buff,
+        s.world_clock.current_minutes,
+    );
+    let debuffs_count = consequence::count_by_polarity(
+        &s.status_tags,
+        consequence::Polarity::Debuff,
+        s.world_clock.current_minutes,
+    );
     let condition = consequence::derive_condition(&s.player_state.body, buffs_count, debuffs_count);
     if !rendered.is_empty() {
         rendered.push_str("\n\n");
@@ -8581,25 +8752,31 @@ fn http_backend_cached(
 /// Mid-session API-failure handler (2026-08-07 architectural override).
 ///
 /// Fable narration is API-only; there is no local-narrator fallback. When the
-/// Re-queue tick directives a turn DRAINED but never delivered (2026-08-15
-/// audit fix). `pending_tick_directives` holds one-shot world events
-/// ("marcus returned from scouting — failure") drained into the turn's
-/// `<directives>` block pre-prompt; a turn that then aborts (dev-narrator
-/// failure, api_lost, interrupt-reroll, reply error) must put them BACK —
-/// they are facts about the world that already happened, not prompt
-/// furniture, and losing them made the events vanish with the dead turn.
-/// Restores at the FRONT, preserving order.
-async fn requeue_tick_directives(state: &AppState, directives: &[String]) {
-    if directives.is_empty() {
-        return;
-    }
+/// Restore the turn-start tick-directive queue on a reverted/aborted turn.
+/// (2026-08-15 audit fix) `pending_tick_directives` holds one-shot world
+/// events ("marcus returned from scouting — failure") drained into the
+/// turn's `<directives>` block pre-prompt; a turn that then aborts
+/// (dev-narrator failure, api_lost, interrupt-reroll, reply error) must
+/// put them BACK — they are facts about the world that already happened,
+/// not prompt furniture, and losing them made the events vanish with the
+/// dead turn.
+/// (2026-08-16 audit fix #10) The restore is now the FULL turn-start
+/// snapshot, not just the drained set: directives pushed LATER by this
+/// turn's inline world tick (weather/rumor/task directives from
+/// `apply_time_command_and_maybe_tick`) used to survive the schema revert —
+/// the next turn's narrator was told "marcus returned / weather shifted"
+/// about mutations that had been rolled back, and the re-fired tick
+/// duplicated them. The snapshot includes the drained set in original
+/// order, so the restore reproduces the turn-start queue exactly.
+async fn restore_tick_directives(state: &AppState, snapshot: &[String]) {
     let mut td = state.pending_tick_directives.lock().await;
-    for (i, d) in directives.iter().enumerate() {
-        td.insert(i, d.clone());
+    if td.len() == snapshot.len() && td.iter().zip(snapshot.iter()).all(|(a, b)| a == b) {
+        return; // nothing was drained or pushed — the queue is already the snapshot
     }
+    *td = snapshot.to_vec();
     tracing::info!(
-        count = directives.len(),
-        "re-queued undelivered off-screen task directives (turn aborted after drain)"
+        count = snapshot.len(),
+        "restored turn-start off-screen task directives (turn reverted after drain)"
     );
 }
 
@@ -8901,6 +9078,35 @@ async fn fable_send(
         let guard = state.active_fable_card.lock().expect("active_fable_card mutex");
         guard.clone().ok_or_else(|| "no active game card: call fable_start first".to_string())?
     };
+    let regenerate = regenerate.unwrap_or(false);
+    let reroll = reroll.unwrap_or(false);
+
+    // (2026-08-16 audit LOW) Reroll/regenerate contract checks HOISTED to the
+    // top: they used to run AFTER the referee block — an invalid reroll paid
+    // the whole referee pass (pacing persist, relationship transitions, undo
+    // ring pushes) and returned Err with those schema mutations APPLIED +
+    // unreverted. Rejecting here means zero state is touched.
+    {
+        let gs = state.fable_session.lock().await;
+        if reroll {
+            let last_is_assistant = gs
+                .messages
+                .last()
+                .map(|m| m.role == session::Role::Assistant)
+                .unwrap_or(false);
+            if !last_is_assistant {
+                return Err(
+                    "fable_send: reroll=true but the last message is not an assistant turn".into(),
+                );
+            }
+        } else if regenerate
+            && !gs.last_message_is_user()
+        {
+            return Err(
+                "fable_send: regenerate=true but the last message is not a user turn".into(),
+            );
+        }
+    }
 
     // v0.6.4 VRAM swap-lock: acquire the Fable lease + spawn-or-reuse the
     // engine under it. Extracted into `acquire_fable_engine_leased` (2026-08-
@@ -8987,7 +9193,16 @@ async fn fable_send(
     // world, an even earlier point).
     let pre_referee_schema: schema::WorldSchema = state.fable_schema.lock().await.clone();
 
-    let (world_state, pacing, mut turn_directives, drained_tick_directives) = {
+    // (2026-08-16 audit fix #10) Full directive snapshot at turn start, taken
+    // BEFORE the referee block drains the queue. Every revert path below
+    // restores THIS (not just the drained set): directives pushed later by
+    // this turn's inline world tick used to survive the schema revert — the
+    // next turn's narrator was told about mutations that had been rolled
+    // back, and the re-fired tick duplicated them.
+    let directives_at_turn_start: Vec<String> =
+        state.pending_tick_directives.lock().await.clone();
+
+    let (world_state, pacing, mut turn_directives) = {
         let mut s = state.fable_schema.lock().await;
 
         // (1) Scene pacing FIRST — its DC modifier threads into (3).
@@ -9098,12 +9313,30 @@ async fn fable_send(
         // a tier key — preserves the original severity distribution exactly.
         // Passes the real tier to referee_evaluate_with_tier so the severity
         // weights + lethality DC scale with the threat.
-        let present_npc_ids: Vec<String> =
-            s.presences.iter().map(|p| p.npc_id.clone()).collect();
-        let buffs_count =
-            consequence::count_by_polarity(&s.status_tags, consequence::Polarity::Buff);
-        let debuffs_count =
-            consequence::count_by_polarity(&s.status_tags, consequence::Polarity::Debuff);
+        // (2026-08-16 audit fix #18) Tier selection reads only FRESH
+        // assertions — presences at ttl == PRESENCE_GRACE_RESET were asserted
+        // by the immediately-preceding tracker pass (the scene the player is
+        // acting against). The old whole-whitelist read let a DEPARTED
+        // dragon keep granting Legendary lethality weights for up to 3 grace
+        // turns of unrelated fights. (An NPC mid under-emission streak
+        // simply falls back to the Soldier default — under-tiering beats a
+        // ghost boss.) The render whitelist below still shows everyone.
+        let present_npc_ids: Vec<String> = s
+            .presences
+            .iter()
+            .filter(|p| p.ttl >= schema::PRESENCE_GRACE_RESET)
+            .map(|p| p.npc_id.clone())
+            .collect();
+        let buffs_count = consequence::count_by_polarity(
+            &s.status_tags,
+            consequence::Polarity::Buff,
+            s.world_clock.current_minutes,
+        );
+        let debuffs_count = consequence::count_by_polarity(
+            &s.status_tags,
+            consequence::Polarity::Debuff,
+            s.world_clock.current_minutes,
+        );
         let attacker_tier =
             player_state::select_attacker_tier_from_entities(&s.entities, &present_npc_ids);
         let combat_directive: Option<String> = if let Some(outcome) =
@@ -9174,14 +9407,17 @@ async fn fable_send(
         };
         // (P2 fix) A failed scrutiny mechanically revokes the disguise tag —
         // prose alone let it survive to auto-pass again next turn.
+        // (2026-08-16 audit LOW) Revoke the FIRST disguise tag (the gate's
+        // binary "the disguise" — it evaluated exactly one), not every
+        // kind=disguise tag: a blown hood check shouldn't strip an unrelated
+        // second disguise facet.
         if let Some(dd) = &disguise_directive {
             if dd.should_revoke() {
-                if undo_snapshot.is_none() {
-                    undo_snapshot = Some(s.clone());
-                }
-                let before = s.status_tags.len();
-                s.status_tags.retain(|t| t.kind != "disguise");
-                if s.status_tags.len() != before {
+                if let Some(pos) = s.status_tags.iter().position(|t| t.kind == "disguise") {
+                    if undo_snapshot.is_none() {
+                        undo_snapshot = Some(s.clone());
+                    }
+                    s.status_tags.remove(pos);
                     mutated = true;
                     tracing::info!(
                         "[disguise] scrutiny FAILED — disguise tag revoked mechanically"
@@ -9307,7 +9543,10 @@ async fn fable_send(
         }
 
         let world_state_opt = if rendered.trim().is_empty() { None } else { Some(rendered) };
-        (world_state_opt, pacing, turn_directives, tick_directives)
+        // (2026-08-16 audit fix #10) The drained directive set no longer rides
+        // out of this block — every revert path restores the FULL turn-start
+        // snapshot (`directives_at_turn_start`), which includes it in order.
+        (world_state_opt, pacing, turn_directives)
     };
 
     // Fable codex retrieval (2026-07-29, the core fix): the narrator now
@@ -9398,42 +9637,13 @@ async fn fable_send(
     // (The API-only require_api_for_fable backstop moved to the fn's top
     // preflight — P3 #20 — so a no-API call pays no lease/engine spawn.)
     let fable_visible_window = settings::WINDOW_API_FABLE;
-    let regenerate = regenerate.unwrap_or(false);
-    let reroll = reroll.unwrap_or(false);
+    // (2026-08-16 audit LOW) The reroll/regenerate contract checks moved to
+    // the fn TOP (before the referee block — an invalid reroll used to pay
+    // the referee mutations + return with them applied). This block now only
+    // appends the turn-start user message.
     {
         let mut gs = state.fable_session.lock().await;
-        if reroll {
-            // Reroll path (variant↔schema binding, 2026-08-11): regenerate a
-            // FRESH variant of the trailing assistant turn. The bookkeeping —
-            // stashing the old prose as a swipeable sibling, advancing
-            // active_idx, and appending the new variant's post-tracker schema
-            // — is all handled by `push_variant_with_schema` AFTER generation
-            // (below). We do NOT pop the assistant message; it stays + the
-            // window slice below excludes it (last message dropped) so the
-            // model regenerates from the preceding user turn. The schema revert
-            // (so the re-track doesn't double-mutate on top of the prior roll)
-            // + the variant_schemas seed happen in the pre-Stage-1 block below.
-            let last_is_assistant = gs
-                .messages
-                .last()
-                .map(|m| m.role == session::Role::Assistant)
-                .unwrap_or(false);
-            if !last_is_assistant {
-                return Err(
-                    "fable_send: reroll=true but the last message is not an assistant turn".into(),
-                );
-            }
-        } else if regenerate {
-            // Re-generation path: the user turn to reply to is already the
-            // last message (a mutation command — rewind_and_edit_user — left
-            // it there). Bail if the contract is violated so we don't generate
-            // from a stale or assistant tail silently.
-            if !gs.last_message_is_user() {
-                return Err(
-                    "fable_send: regenerate=true but the last message is not a user turn".into(),
-                );
-            }
-        } else {
+        if !reroll && !regenerate {
             gs.add_message(session::Role::User, text.clone());
         }
     }
@@ -9776,7 +9986,7 @@ async fn fable_send(
                     },
                     Ok(Err(e)) => {
                         tracing::warn!(error = %e, "fable_send: DEV local narrator channel recv failed");
-                        requeue_tick_directives(&state, &drained_tick_directives).await;
+                        restore_tick_directives(&state, &directives_at_turn_start).await;
                         return emit_fable_api_lost(
                             &on_event, &app, &state,
                             "Dev local narrator failed (see logs).",
@@ -9788,7 +9998,7 @@ async fn fable_send(
                     }
                     Err(e) => {
                         tracing::warn!(error = %e, "fable_send: DEV local narrator join failed");
-                        requeue_tick_directives(&state, &drained_tick_directives).await;
+                        restore_tick_directives(&state, &directives_at_turn_start).await;
                         return emit_fable_api_lost(
                             &on_event, &app, &state,
                             "Dev local narrator failed (see logs).",
@@ -9801,7 +10011,7 @@ async fn fable_send(
                 },
                 Err(e) => {
                     tracing::warn!(error = %format!("{e:#}"), "fable_send: DEV local narrator request_turn failed");
-                    requeue_tick_directives(&state, &drained_tick_directives).await;
+                    restore_tick_directives(&state, &directives_at_turn_start).await;
                     return emit_fable_api_lost(
                         &on_event, &app, &state,
                         "Dev local narrator failed (see logs).",
@@ -9818,7 +10028,7 @@ async fn fable_send(
                 // Defensive: no active profile despite the guards (e.g. the
                 // profile was deleted mid-turn). No local fallback — emit
                 // api_lost, autosave, and abort the turn.
-                requeue_tick_directives(&state, &drained_tick_directives).await;
+                restore_tick_directives(&state, &directives_at_turn_start).await;
                 return emit_fable_api_lost(
                     &on_event, &app, &state, "No active API profile.",
                     !regenerate && !reroll,
@@ -9889,7 +10099,7 @@ async fn fable_send(
                 // progress, tell the frontend to lock the composer, and abort
                 // the turn. The player reconnects via Settings and retries.
                 tracing::warn!(error = %e, "fable_send: API narrator failed; emitting api_lost (no local fallback)");
-                requeue_tick_directives(&state, &drained_tick_directives).await;
+                restore_tick_directives(&state, &directives_at_turn_start).await;
                 return emit_fable_api_lost(
                     &on_event,
                     &app,
@@ -9947,7 +10157,7 @@ async fn fable_send(
         // The drained tick directives never reached a delivered beat —
         // restore them for the next turn (2026-08-15 audit fix: a reroll
         // abort used to permanently drop one-shot world events).
-        requeue_tick_directives(&state, &drained_tick_directives).await;
+        restore_tick_directives(&state, &directives_at_turn_start).await;
         // Reroll → the message's stored pre-turn base; normal turn → the
         // pre-REFEREE world (#25: base_schema_snapshot is post-referee there,
         // which would persist this aborted turn's injuries).
@@ -9989,7 +10199,7 @@ async fn fable_send(
         // re-arm the manual player_action, pop the turn-start user message on
         // normal turns (regenerate's user tail is the rewind target — never
         // pop it), autosave, THEN surface the error.
-        requeue_tick_directives(&state, &drained_tick_directives).await;
+        restore_tick_directives(&state, &directives_at_turn_start).await;
         *state.fable_schema.lock().await = if reroll {
             base_schema_snapshot.clone()
         } else {
@@ -10023,7 +10233,7 @@ async fn fable_send(
     // done{cancelled:true} with empty final_text so the frontend discards
     // the partial streamed beat without committing it.
     if reply.cancelled {
-        requeue_tick_directives(&state, &drained_tick_directives).await;
+        restore_tick_directives(&state, &directives_at_turn_start).await;
         *state.fable_schema.lock().await = if reroll {
             base_schema_snapshot.clone()
         } else {
@@ -10134,7 +10344,7 @@ async fn fable_send(
     // pop (same flags as the HTTP-Err path above).
     if parsed.prose.trim().is_empty() {
         tracing::warn!("fable_send: narrator returned empty prose; emitting api_lost (no phantom turn)");
-        requeue_tick_directives(&state, &drained_tick_directives).await;
+        restore_tick_directives(&state, &directives_at_turn_start).await;
         return emit_fable_api_lost(
             &on_event,
             &app,
@@ -10158,7 +10368,12 @@ async fn fable_send(
         let memory_engine = Arc::clone(memory_engine);
         let user_text = text.clone();
         let asst_text = parsed.prose.clone();
-        let skip_asst_archive = codex_was_injected;
+        // (2026-08-16 audit fix #17) Reroll/regenerate turns skip ASSISTANT
+        // archival entirely: each roll of the same moment used to mint another
+        // contradictory "past record" (4 rerolls = 4 mutually-exclusive
+        // histories that retrieval later surfaces as fact). The original
+        // turn's beat is already archived; memory keeps ONE record per turn.
+        let skip_asst_archive = codex_was_injected || reroll || regenerate;
         // One turn id for BOTH rows: the §4 retention key (same as the chat
         // archive spawn — the prune is partition-scoped, not path-scoped).
         let turn_uuid = memory::new_turn_uuid();
@@ -10300,7 +10515,10 @@ async fn fable_send(
     drop(engine_opt);
     drop(lease_opt);
     if tick_armed {
-        fire_world_progression_tick(&state).await;
+        // (audit #4) The tick carries this turn's card identity — it runs
+        // after the cancel slot is cleared, so it must self-guard against a
+        // session swap during its ~1-3s run.
+        fire_world_progression_tick(&state, &card.id).await;
     }
 
     Ok(())
@@ -10581,7 +10799,18 @@ async fn fable_regenerate_slice(
     // Brackets are NEVER applied here — pure prose swap. Trim leading/trailing
     // whitespace so the splice butts cleanly against `pre`/`post`. Returns
     // None on an empty result → soft error (don't delete the highlighted span).
-    let raw_content = if out.raw.is_empty() { out.content } else { out.raw };
+    // (2026-08-16 audit fix #16) `out.raw` is preferred for the same
+    // raw-fidelity reason the narrator path prefers it — but on a repetition
+    // KILL-SWITCH the API stream returns raw = the FULL un-truncated loop
+    // evidence. Splicing that baked the loop into the beat verbatim. Run the
+    // post-gen truncator over whichever copy we take (a no-op on clean prose,
+    // identical to the narrator turn's finalize contract: content is the
+    // truncated clean text).
+    let raw_content = if out.raw.is_empty() {
+        out.content
+    } else {
+        stream_filter::truncate_repetition(&out.raw)
+    };
     let new_content = match clean_and_splice_slice(&pre, &raw_content, &post) {
         Some(s) => s,
         None => {
@@ -10627,6 +10856,11 @@ async fn fable_regenerate_slice(
     if let Err(e) = persist_fable_session(&app, state.inner(), &card_id).await {
         tracing::warn!(error = %e, "fable_regenerate_slice: persist failed (in-memory splice still applied)");
     }
+    // (2026-08-16 audit fix #16) The reserved autosave still predates the
+    // splice — an abrupt exit right here loaded a save with the OLD prose
+    // while session.json carried the new. Refresh it (detached, same as the
+    // other post-mutation refreshes).
+    spawn_reserved_autosave(&app, &state).await;
 
     let _ = on_event.send(serde_json::json!({
         "type": "slice_done",
@@ -11017,7 +11251,18 @@ async fn fable_end(
     *state.active_player_id.lock().expect("active_player_id mutex") = None;
 
     // 4. Clear any leftover game cancel token.
+    // (2026-08-16 audit LOW) BOTH fable-side slots: the in-flight guard at
+    // the top checks narrator + retrack, but the old wipe cleared only the
+    // narrator slot — a leftover retrack token survived fable_end and kept
+    // `fable_turn_in_flight` true for the NEXT session, refusing every
+    // session swap until restart. No turn can be in flight here (the top
+    // guard refused that case), so the unconditional wipe only reaps stale
+    // tokens.
     *state.active_fable_cancel.lock().expect("active_fable_cancel mutex") = None;
+    *state
+        .active_retrack_cancel
+        .lock()
+        .expect("active_retrack_cancel mutex") = None;
 
     // 5. (2026-08-15 audit fix) Drain the game-scoped directive/failed
     // queues. These are ONE-SHOT WORLD FACTS of the card that just closed
@@ -11038,6 +11283,11 @@ async fn fable_end(
     }
     state.failed_progression_queue.lock().await.clear();
     state.failed_translation_queue.lock().await.clear();
+    // (2026-08-16 audit fix #11) An armed manual player_action (Consume/
+    // Equip from the Soul Gem panel) is a tactile intent of THIS game — it
+    // must never fire as a hard fact in a different card's first turn.
+    // Cleared alongside the one-shot queue drains.
+    *state.pending_player_action.lock().await = None;
 
     tracing::info!("game ended: narrator engine down, per-card state persisted, memory scope restored");
     Ok(())
@@ -11068,14 +11318,13 @@ async fn fable_player_action_set(
     }
     // Hard cap so a runaway UI loop can't bloat the prompt (§1C: shrink the
     // payload, never raise the context). 500 chars is generous for any
-    // "Player equipped X to Y" line.
-    let capped = if trimmed.len() > 500 {
-        let mut s = trimmed[..500].to_string();
-        // Avoid splitting a multi-byte char — back up to a char boundary.
-        while !s.is_char_boundary(s.len()) {
-            s.pop();
-        }
-        s
+    // "Player equipped X to Y" line. (2026-08-16 audit fix #9) Chars, never
+    // a byte slice: `trimmed[..500]` panics when byte 500 lands mid-character
+    // (CJK/emoji item names from the Soul Gem panel killed the IPC), and the
+    // old "back up to a boundary" loop after it was dead code — a String's
+    // end is always a boundary. Same pattern as `cap_assistant_prose`.
+    let capped: String = if trimmed.chars().count() > 500 {
+        trimmed.chars().take(500).collect()
     } else {
         trimmed.to_string()
     };
@@ -12059,11 +12308,12 @@ fn fable_card_set_intro(card_id: String, text: String, app: tauri::AppHandle) ->
     // Slice up to + including the closing `</sim_card>` — this drops any prior
     // sibling `<intro>`/`<introduction>` (the only elements that live after the
     // card). The `.codex`/`.world.json` siblings are separate FILES, untouched.
-    let close = "</sim_card>";
-    let end = existing
-        .find(close)
-        .ok_or_else(|| "card XML missing </sim_card>".to_string())?
-        + close.len();
+    // (2026-08-16 audit fix #22) Route through the parser's CDATA/comment-
+    // aware scanner: the naive `find("</sim_card>")` hit the literal string
+    // inside authored CDATA prose — the slice cut mid-CDATA, the rebuild
+    // failed validation, and such a card could never have its intro edited.
+    let end = sim_card::find_root_close(&existing)
+        .ok_or_else(|| "card XML missing </sim_card>".to_string())?;
     let trimmed = text.trim();
     let mut out = String::from(&existing[..end]);
     if !trimmed.is_empty() {
@@ -12917,6 +13167,16 @@ async fn fable_save_now(
     state: tauri::State<'_, AppState>,
     app: tauri::AppHandle,
 ) -> Result<fable_save::SaveMeta, String> {
+    // (2026-08-16 audit fix #15) Refuse while a narrator turn / edit retrack
+    // is in flight: the drawer's Save button is usable mid-turn by design,
+    // and a manual slot taken then permanently pairs an UNANSWERED user
+    // action with a mid-turn world state (the referee mutations of the
+    // live turn are half-applied). The reserved AUTOSAVE path never comes
+    // through this IPC — it fires only at turn boundaries, so this guard
+    // can't deadlock the autosave.
+    if fable_turn_in_flight(&state) {
+        return Err("a narrator turn is still in flight: stop it (or wait) before saving".into());
+    }
     let card = {
         let guard = state.active_fable_card.lock().expect("active_fable_card mutex");
         guard.clone().ok_or_else(|| "no active game: call fable_start first".to_string())?
@@ -13043,6 +13303,9 @@ async fn fable_load_save(
     state.pending_tick_directives.lock().await.clear();
     state.failed_progression_queue.lock().await.clear();
     state.failed_translation_queue.lock().await.clear();
+    // (2026-08-16 audit fix #11) Same session-boundary rule as fable_end: an
+    // armed manual player_action belongs to the PREVIOUS timeline.
+    *state.pending_player_action.lock().await = None;
     tracing::info!(save_id = %meta.save_id, "game state loaded");
     // intro is None on a save-load: resumed games render their feed from
     // `messages`, not from the card's opening beat. Only fresh starts
@@ -13056,15 +13319,12 @@ async fn fable_load_save(
 struct FableLoadResult {
     meta: fable_save::SaveMeta,
     messages: Vec<FableLoadMessage>,
-    /// The card's full intro text (untruncated) from the sibling `.intro`
-    /// file. Surfaced so the UI can render the first narrator beat on a FRESH
-    /// game (no resumed messages yet) without a second IPC round-trip. `None`
-    /// when the card has no `.intro`. The intro is read ONCE here + NEVER
-    /// injected into the cached system prompt — it's a one-turn seed (2026-08-05:
-    /// moved out of the cached `<sim_card>` to keep the per-turn KV cache lean).
-    /// NOTE: this is the FULL text — the per-card `opening_scene_preview` on
-    /// `FableCardMeta` (capped at 240 chars, also read from the `.intro`) is
-    /// only for the launcher card picker, NOT for the first beat.
+    /// (2026-08-16, Chloe ruling) RETIRED — always `None` now. The intro is
+    /// seeded into the fresh session as message 0 (see `enter_fable_session`),
+    /// so it arrives via `messages` like every other beat: correct feed-index
+    /// alignment, persisted in saves, and naturally dropped from the narrator
+    /// window once 16 messages (8 turns) have gone through. The field survives
+    /// on the wire for frontend compat only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     intro: Option<String>,
 }
@@ -13480,6 +13740,12 @@ async fn retrack_edited_assistant_message(
         push_fable_history_snapshot(state, displaced.clone()).await;
         *state.fable_schema.lock().await = base.clone();
     }
+    // (2026-08-16 audit fix #10, retrack sibling) Directive snapshot before
+    // the tracker pass: the retrack's inline world tick can push directives,
+    // and a failed retrack reverts the schema — the pushed directives must
+    // revert with it (else the next narrator is told about mutations that
+    // were rolled back).
+    let directives_at_start: Vec<String> = state.pending_tick_directives.lock().await.clone();
 
     // (3) Stage-1 tracker pass — the same prompt shape fable_send builds:
     // system prompt from the REVERTED world state (no turn directives — the
@@ -13584,6 +13850,7 @@ async fn retrack_edited_assistant_message(
             "edit re-track failed; restoring the pre-edit world schema (the prose edit stands)"
         );
         *state.fable_schema.lock().await = displaced;
+        restore_tick_directives(state, &directives_at_start).await;
         return;
     }
 
@@ -13616,7 +13883,14 @@ async fn retrack_edited_assistant_message(
     // dropped its Fable lease + engine Arc + local-model turn guard, so the
     // schema lease acquire inside evicts/joins the fable engine cleanly.
     if tick_armed {
-        fire_world_progression_tick(state).await;
+        // (audit #4) Same session-identity guard as fable_send's fire: the
+        // retrack's tick runs after its reserved cancel slot cleared.
+        let turn_card_id = state
+            .active_card_id
+            .lock()
+            .expect("active_card_id mutex")
+            .clone();
+        fire_world_progression_tick(state, &turn_card_id).await;
     }
 }
 
@@ -13807,6 +14081,12 @@ async fn rewind_and_edit_user(
         *state.fable_schema.lock().await = snap;
     }
     persist_fable_session(&app, &state, &card_id).await?;
+    // (2026-08-16 audit M9) The rewind installed a restored schema while
+    // persisting only session.json — the same gap swipe/retrack/rollback
+    // closed with the reserved autosave. Without it, a crash before the
+    // regenerated turn's own autosave lands resumes truncated prose paired
+    // with the removed turns' referee injuries/items.
+    spawn_reserved_autosave(&app, &state).await;
     Ok(EditResponse {
         messages,
         schema_pop_count: 0,
@@ -13955,7 +14235,11 @@ fn sanitize_card_slug(card_id: &str) -> String {
         .chars()
         .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '-' })
         .collect();
-    let safe = cap_slug_chars(safe.trim_matches('-').to_string());
+    // (2026-08-16 audit fix #3) Same dash-run collapse as `slugify_card_stem`
+    // — no-op on the already-normalized ids that are the only legitimate
+    // callers, but keeps malformed/hostile ids on the same reduction the
+    // slug derivation applies.
+    let safe = cap_slug_chars(collapse_dash_runs(&safe).trim_matches('-').to_string());
     if safe.is_empty() {
         "__unknown_card__".to_string()
     } else {
@@ -14016,6 +14300,16 @@ fn sanitize_player_slug(id: &str) -> String {
     // (2026-08-15 audit fix) Same 64-char cap as the card sanitizer (the JS
     // slugify's contract).
     let safe = cap_slug_chars(safe.trim_matches('-').to_string());
+    // (2026-08-16 audit LOW) Windows reserved-stem suffix — the JS slugify
+    // already appends `-card` for `nul`/`con`/`com1-9`…, so ids that arrived
+    // THROUGH it are already suffixed (idempotent here); an id that reached
+    // the backend without the JS slug used to derive a reserved folder stem
+    // → a clean-but-confusing "could not create folder" failure.
+    let safe = if WINDOWS_RESERVED_STEMS.contains(&safe.as_str()) {
+        format!("{safe}-card")
+    } else {
+        safe
+    };
     if safe.is_empty() {
         "__unknown_player__".to_string()
     } else {
@@ -14578,17 +14872,23 @@ async fn save_session(
 /// Load a card-scoped session. Returns a fresh empty `Conversation` when no
 /// saved file exists (the `Conversation::load` NotFound path already does
 /// this: we just route through it). Symmetric to `save_session`.
+/// (2026-08-16 audit fix #12) Result-shaped like `load_schema`: a corrupt
+/// session.json is an ERR (the caller refuses the resume — the old Option
+/// shape swallowed it to an empty conversation, and the next autosave
+/// persisted the emptiness over the file). A MISSING file is still fine —
+/// `Conversation::load` maps NotFound to `Ok(Conversation::new())`.
 async fn load_session(
     app: &tauri::AppHandle,
     card_id: &str,
-) -> Option<session::Conversation> {
-    let cards_root = resolve_fable_cards_dir(app)?;
+) -> Result<session::Conversation, String> {
+    let cards_root = resolve_fable_cards_dir(app)
+        .ok_or_else(|| "no apps/fable/cards/ dir resolved".to_string())?;
     let path = resolve_session_path(&cards_root, card_id);
     let path_cloned = path.clone();
     tokio::task::spawn_blocking(move || session::Conversation::load(&path_cloned))
         .await
-        .ok()?
-        .ok()
+        .map_err(|e| format!("load_session join: {e}"))?
+        .map_err(|e| format!("session.json load: {e}"))
 }
 
 /// Persist the world-state schema off the Tokio worker pool. Mirrors
@@ -16157,8 +16457,8 @@ mod phase3_integration_tests {
     fn component1_gate_autopass_renders_into_directives_block() {
         // End-to-end: the gate produces a DisguiseDirective whose render()
         // output is a clean one-liner that slots into the <directives> block.
-        use std::collections::HashMap;
-        let mut entities = HashMap::new();
+        use std::collections::BTreeMap;
+        let mut entities = BTreeMap::new();
         entities.insert(
             "npc.gate_guard.tier".to_string(),
             serde_json::Value::String("soldier".into()),
@@ -16191,8 +16491,8 @@ mod phase3_integration_tests {
         // The wiring must NOT inject a disguise directive when the player
         // has no disguise tag — the gate returning None means the assembly
         // skips it entirely.
-        use std::collections::HashMap;
-        let entities = HashMap::new();
+        use std::collections::BTreeMap;
+        let entities = BTreeMap::new();
         let tags = vec![consequence::StatusTag {
             label: "Blessed".into(),
             polarity: consequence::Polarity::Buff,
@@ -16379,7 +16679,7 @@ mod phase3_integration_tests {
 
         // Before the tick (minute 1000): buff active → Unscathed.
         let _ = consequence::expire_tags(&mut tags, 1000);
-        let buffs_active = consequence::count_by_polarity(&tags, Polarity::Buff);
+        let buffs_active = consequence::count_by_polarity(&tags, Polarity::Buff, 0);
         assert_eq!(buffs_active, 1, "buff still active before minute 2000");
         assert_eq!(
             consequence::derive_condition(&wounds, buffs_active, 0),
@@ -16390,7 +16690,7 @@ mod phase3_integration_tests {
         // Tick past expiry (minute 3000): buff drops → Haggard.
         let dropped = consequence::expire_tags(&mut tags, 3000);
         assert_eq!(dropped, 1, "buff expired");
-        let buffs_after = consequence::count_by_polarity(&tags, Polarity::Buff);
+        let buffs_after = consequence::count_by_polarity(&tags, Polarity::Buff, 0);
         assert_eq!(buffs_after, 0, "no buffs remain after expiry");
         assert_eq!(
             consequence::derive_condition(&wounds, buffs_after, 0),
@@ -17338,7 +17638,7 @@ mod phase3_wiring_tests {
     /// No npc.*.tier keys → defaults to Soldier (preserves the v1 distribution).
     #[test]
     fn wiring_tier_selection_defaults_to_soldier() {
-        let entities = HashMap::new(); // empty
+        let entities = std::collections::BTreeMap::new(); // empty
         assert_eq!(
             player_state::select_attacker_tier_from_entities(&entities, &[]),
             player_state::AttackerTier::Soldier,
@@ -17346,7 +17646,7 @@ mod phase3_wiring_tests {
         );
 
         // Entities present but no tier keys.
-        let mut entities = HashMap::new();
+        let mut entities = std::collections::BTreeMap::new();
         entities.insert("weather".to_string(), serde_json::Value::String("rainy".into()));
         entities.insert("npc.marcus.name".to_string(), serde_json::Value::String("Marcus".into()));
         assert_eq!(
@@ -17360,7 +17660,7 @@ mod phase3_wiring_tests {
     /// enforcement: a dragon's blows weight toward Critical + lethality).
     #[test]
     fn wiring_tier_selection_picks_declared_legendary() {
-        let mut entities = HashMap::new();
+        let mut entities = std::collections::BTreeMap::new();
         entities.insert(
             "npc.dragon.tier".to_string(),
             serde_json::Value::String("legendary".into()),
@@ -17382,7 +17682,7 @@ mod phase3_wiring_tests {
     /// foe dominates the severity distribution in a multi-foe fight).
     #[test]
     fn wiring_tier_selection_picks_highest_threat() {
-        let mut entities = HashMap::new();
+        let mut entities = std::collections::BTreeMap::new();
         entities.insert("npc.thug1.tier".to_string(), serde_json::Value::String("soldier".into()));
         entities.insert("npc.dragon.tier".to_string(), serde_json::Value::String("legendary".into()));
         entities.insert("npc.goblin1.tier".to_string(), serde_json::Value::String("minion".into()));
@@ -17451,8 +17751,8 @@ mod phase3_wiring_tests {
             },
         ];
         // The wiring computes these counts then passes them to derive_condition.
-        let buffs = consequence::count_by_polarity(&tags, Polarity::Buff);
-        let debuffs = consequence::count_by_polarity(&tags, Polarity::Debuff);
+        let buffs = consequence::count_by_polarity(&tags, Polarity::Buff, 0);
+        let debuffs = consequence::count_by_polarity(&tags, Polarity::Debuff, 0);
         assert_eq!(buffs, 1);
         assert_eq!(debuffs, 0);
         // Yellow + 1 buff + 0 debuffs → Unscathed (the buff lifts Haggard→Unscathed).

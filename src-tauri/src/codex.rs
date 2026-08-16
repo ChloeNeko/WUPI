@@ -494,7 +494,44 @@ pub fn parse_compound_text(text: &str, fallback_stem: &str) -> Vec<ParsedEntry> 
 /// <body>` block. The `title:`/`tags:` lines mirror what `parse_front_matter`
 /// reads. An empty `entries` slice serializes to an empty string (a fresh card
 /// with no authored lore). Used by the per-card Codex tab's save path.
+///
+/// (2026-08-16 audit follow-up) ROUND-TRIP GUARD: the compound format is
+/// inherently ambiguous — a body containing a blank-line-preceded `---` line
+/// followed by a `title:` line re-parses as TWO entries, silently splitting
+/// authored lore at the next load. The guard is verify-then-sanitize: build
+/// the text verbatim, re-parse it, and if the entry count matches the intent
+/// the bodies are byte-exact (full fidelity, the overwhelmingly common case).
+/// Only on a mismatch are the COLLIDING body fences neutralized (`---` → `—`,
+/// the same transform the front-matter sanitizer applies) — that is
+/// serialization hygiene on text that would otherwise be silently corrupted
+/// by the round trip, not a rewrite of authored lore.
 pub fn format_compound_text(entries: &[ParsedEntry]) -> String {
+    let verbatim = format_compound_text_verbatim(entries);
+    // The parser drops empty-body chunks; the intent is the count of entries
+    // that will actually materialize.
+    let intended = entries.iter().filter(|e| !e.body.trim().is_empty()).count();
+    let reparsed = parse_compound_text(&verbatim, "").len();
+    if reparsed == intended {
+        return verbatim;
+    }
+    tracing::warn!(
+        intended,
+        reparsed,
+        "codex compound round-trip mismatch — neutralizing body fence collisions"
+    );
+    let sanitized: Vec<ParsedEntry> = entries
+        .iter()
+        .map(|e| {
+            let mut e2 = e.clone();
+            e2.body = neutralize_body_fences(&e.body);
+            e2
+        })
+        .collect();
+    format_compound_text_verbatim(&sanitized)
+}
+
+/// The verbatim serializer (the old `format_compound_text` body, unchanged).
+fn format_compound_text_verbatim(entries: &[ParsedEntry]) -> String {
     let mut out = String::new();
     for entry in entries {
         if !out.is_empty() {
@@ -512,6 +549,39 @@ pub fn format_compound_text(entries: &[ParsedEntry]) -> String {
         out.push_str("---\n\n");
         out.push_str(entry.body.trim());
         out.push('\n');
+    }
+    out
+}
+
+/// Neutralize ONLY the body fences that would forge an entry boundary on the
+/// next parse: a `---` line that is blank-preceded (or opens the body — the
+/// formatter always emits a blank line after its own closer) and whose next
+/// non-empty line starts a `title:` key. Everything else stays verbatim.
+/// Line endings normalize to LF inside a REWRITTEN body only when the guard
+/// fired (the verbatim path never passes through here).
+fn neutralize_body_fences(body: &str) -> String {
+    let lines: Vec<&str> = body.split('\n').collect();
+    let mut out = String::with_capacity(body.len());
+    for (i, line) in lines.iter().enumerate() {
+        if line.trim() == "---" {
+            let prev_blank = i == 0 || lines[i - 1].trim().is_empty();
+            let next_title = lines[i + 1..]
+                .iter()
+                .find(|l| !l.trim().is_empty())
+                .map(|l| l.trim_start().to_lowercase().starts_with("title:"))
+                .unwrap_or(false);
+            if prev_blank && next_title {
+                out.push('—');
+                if i + 1 < lines.len() {
+                    out.push('\n');
+                }
+                continue;
+            }
+        }
+        out.push_str(line);
+        if i + 1 < lines.len() {
+            out.push('\n');
+        }
     }
     out
 }
@@ -683,12 +753,18 @@ fn build_metadata_json(title: &str, tags: &[String], hash: u64, namespace: &str)
     // / render frame). `namespace` is the origin tag: "wupi_system" here,
     // "codex" for the dormant user-codex partition. Both reuse the same
     // retrieval/render pipeline; namespace is for future filtering + audit.
+    // (2026-08-16 audit LOW) LOAD-BEARING ORDER: title + hash keys precede
+    // `tags` — `extract_metadata_field` scans for the FIRST `"key"` literal,
+    // and a tag element named "title"/"hash" would shadow the real key (a
+    // "hash"-tagged entry's hash never matched → delete+reinsert every
+    // seed). All string values are escaped, so a title CONTAINING those
+    // words can't collide — only raw tag elements can.
     format!(
-        "{{\"kind\":\"codex\",\"namespace\":\"{}\",\"title\":\"{}\",\"tags\":[{}],\"hash\":\"{}\"}}",
+        "{{\"kind\":\"codex\",\"namespace\":\"{}\",\"title\":\"{}\",\"hash\":\"{}\",\"tags\":[{}]}}",
         escape_json_string(namespace),
         title_escaped,
-        tags_array,
-        hash
+        hash,
+        tags_array
     )
 }
 
@@ -712,29 +788,45 @@ fn escape_json_string(s: &str) -> String {
 /// Extract a string field from a `metadata_json` value. Hand-rolled scan for
 /// `"key":"value"` (no nested objects in the codex metadata shape). Used by
 /// the reconcile to read the stored `title` + `hash` back out.
+/// (2026-08-16 audit LOW) Assumes `build_metadata_json`'s key order — the
+/// string keys precede `tags`, so a tag element named like a key can't
+/// shadow the real one.
 fn extract_metadata_field(metadata_json: Option<&str>, key: &str) -> Option<String> {
     let s = metadata_json?;
-    let needle = format!("\"{key}\"");
-    let idx = s.find(&needle)?;
-    let after_key = &s[idx + needle.len()..];
-    let after_colon = after_key.trim_start();
-    let after_colon = after_colon.strip_prefix(':')?;
-    let after_colon = after_colon.trim_start();
-    let value = after_colon.strip_prefix('"')?;
-    let mut end = None;
-    let mut chars = value.char_indices();
-    while let Some((i, c)) = chars.next() {
-        if c == '\\' {
-            chars.next();
-            continue;
+    // (2026-08-16 audit LOW) Key-POSITION guard: the needle includes the
+    // colon, and the preceding non-whitespace char must be `{` or `,`. The
+    // old bare-`"key"` search matched the text INSIDE a value — a codex
+    // entry TITLED exactly "hash" serialized as `"title":"hash"` made the
+    // hash lookup miss → the reconcile treated the stored entry as stale
+    // and re-inserted a duplicate EVERY boot.
+    let needle = format!("\"{key}\":");
+    let mut search_from = 0;
+    loop {
+        let rel = s[search_from..].find(&needle)?;
+        let idx = search_from + rel;
+        let before = s[..idx].trim_end();
+        if before.ends_with('{') || before.ends_with(',') {
+            let after_key = &s[idx + needle.len()..];
+            let after_colon = after_key.trim_start();
+            let value = after_colon.strip_prefix('"')?;
+            let mut end = None;
+            let mut chars = value.char_indices();
+            while let Some((i, c)) = chars.next() {
+                if c == '\\' {
+                    chars.next();
+                    continue;
+                }
+                if c == '"' {
+                    end = Some(i);
+                    break;
+                }
+            }
+            let raw = &value[..end?];
+            return Some(raw.replace("\\\"", "\"").replace("\\\\", "\\"));
         }
-        if c == '"' {
-            end = Some(i);
-            break;
-        }
+        // Not a key position — keep searching (a later real key may follow).
+        search_from = idx + needle.len();
     }
-    let raw = &value[..end?];
-    Some(raw.replace("\\\"", "\"").replace("\\\\", "\\"))
 }
 
 // ─── tests ────────────────────────────────────────────────────────────────
@@ -1036,5 +1128,50 @@ mod tests {
             assert_eq!(x.body, y.body);
             assert_eq!(x.hash, y.hash);
         }
+    }
+
+    /// (2026-08-16 audit follow-up pin) A lore body containing a blank-line-
+    /// preceded `---` + `title:` line — the compound format's one ambiguity —
+    /// must round-trip as ONE entry: `format_compound_text` verifies the
+    /// round-trip and neutralizes only the colliding fence.
+    #[test]
+    fn format_round_trips_body_containing_forged_entry_boundary() {
+        let entries = vec![ParsedEntry {
+            title: "The Schism".to_string(),
+            tags: vec!["history".to_string()],
+            body: "Ancient records quote the treaty scroll verbatim:\n\n\
+                   ---\ntitle: Forged Treaty\n---\n\n\
+                   The text of the treaty follows here.".to_string(),
+            hash: 0,
+        }];
+        let text = format_compound_text(&entries);
+        let reparsed = parse_compound_text(&text, "stem");
+        assert_eq!(reparsed.len(), 1, "the forged boundary must not split the entry");
+        assert_eq!(reparsed[0].title, "The Schism");
+        assert!(
+            reparsed[0].body.contains("The text of the treaty follows here."),
+            "the tail prose after the collision survives inside the one entry"
+        );
+        assert!(
+            !reparsed[0].body.contains("---\ntitle: Forged Treaty"),
+            "the colliding fence is neutralized in the written form"
+        );
+    }
+
+    /// The mirror case: bodies with NO collision stay byte-exact (the guard
+    /// must not rewrite ordinary lore — plain `---` horizontal rules and
+    /// fenced code blocks in bodies are untouched).
+    #[test]
+    fn format_keeps_collision_free_bodies_verbatim() {
+        let body = "Section one.\n\n---\n\nSection two after a horizontal rule.".to_string();
+        let entries = vec![ParsedEntry {
+            title: "Rule".to_string(),
+            tags: vec![],
+            body: body.clone(),
+            hash: 0,
+        }];
+        let text = format_compound_text(&entries);
+        assert!(text.contains(&body), "no collision → body verbatim");
+        assert_eq!(parse_compound_text(&text, "stem").len(), 1);
     }
 }

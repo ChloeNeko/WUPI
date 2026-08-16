@@ -762,10 +762,12 @@ pub fn upsert_tag(tags: &mut Vec<StatusTag>, tag: StatusTag, cap: usize) -> bool
         return false;
     }
     // Dedupe: extend the matching live tag's expiry rather than stack.
-    if let Some(existing) = tags
-        .iter_mut()
-        .find(|t| t.label == tag.label && t.kind == tag.kind)
-    {
+    // (2026-08-16 audit LOW) Case-insensitive label match — the byte-exact
+    // compare let "Feverish" + "feverish" stack as two debuffs toward the
+    // 16-tag cap AND the M1 condition count (compounding the same drift).
+    if let Some(existing) = tags.iter_mut().find(|t| {
+        t.kind == tag.kind && t.label.trim().eq_ignore_ascii_case(tag.label.trim())
+    }) {
         if existing.expires_at == 0 {
             return false;
         }
@@ -801,9 +803,19 @@ pub fn upsert_tag(tags: &mut Vec<StatusTag>, tag: StatusTag, cap: usize) -> bool
 /// polarity `disguise` is a mechanical state lane, not a condition modifier:
 /// counting it nudged the lethality condition penalty + could lift
 /// Haggard→Unscathed purely from wearing a disguise.
-pub fn count_by_polarity(tags: &[StatusTag], polarity: Polarity) -> usize {
+///
+/// (2026-08-16 audit M1) EXPIRED tags don't count. The only `expire_tags`
+/// sweep lives in the World Progression tick, which returns early in Combat —
+/// a "Feverish 30m" debuff from before a fight kept counting through every
+/// 20-minute combat turn, permanently dragging the lethality condition
+/// penalty a full tier for the whole battle (stale buffs over-credit
+/// symmetrically). Filtering at the counting sites makes the derived
+/// condition read-time-correct regardless of when the sweep last ran.
+pub fn count_by_polarity(tags: &[StatusTag], polarity: Polarity, now_minutes: i64) -> usize {
     tags.iter()
-        .filter(|t| t.kind.is_empty() && t.polarity == polarity)
+        .filter(|t| {
+            t.kind.is_empty() && t.polarity == polarity && !t.is_expired(now_minutes)
+        })
         .count()
 }
 
@@ -1476,8 +1488,8 @@ mod tests {
             kind: String::new(),
             },
         ];
-        assert_eq!(count_by_polarity(&tags, Polarity::Buff), 2);
-        assert_eq!(count_by_polarity(&tags, Polarity::Debuff), 1);
+        assert_eq!(count_by_polarity(&tags, Polarity::Buff, 0), 2);
+        assert_eq!(count_by_polarity(&tags, Polarity::Debuff, 0), 1);
     }
 
     /// 2026-08-15 audit fix: a kinded tag (e.g. a Buff-polarity disguise) is
@@ -1503,10 +1515,38 @@ mod tests {
             },
         ];
         assert_eq!(
-            count_by_polarity(&tags, Polarity::Buff),
+            count_by_polarity(&tags, Polarity::Buff, 0),
             1,
             "the disguise tag is a mechanical lane, not a condition buff"
         );
+    }
+
+    /// 2026-08-16 audit M1 pin: an expired tag does not count — the tick's
+    /// expiry sweep is suspended in Combat, so a stale pre-fight debuff must
+    /// not drag the lethality condition penalty through the whole battle.
+    /// Permanent tags (expires_at == 0) never expire.
+    #[test]
+    fn count_by_polarity_excludes_expired_tags() {
+        let tags = vec![
+            StatusTag {
+                label: "Feverish".into(),
+                polarity: Polarity::Debuff,
+                expires_at: 30,
+                source: String::new(),
+                kind: String::new(),
+            },
+            StatusTag {
+                label: "Battle Hardened".into(),
+                polarity: Polarity::Buff,
+                expires_at: 0,
+                source: String::new(),
+                kind: String::new(),
+            },
+        ];
+        assert_eq!(count_by_polarity(&tags, Polarity::Debuff, 29), 1, "one minute before expiry it still counts");
+        assert_eq!(count_by_polarity(&tags, Polarity::Debuff, 30), 0, "at the expiry minute it is expired (>= semantics)");
+        assert_eq!(count_by_polarity(&tags, Polarity::Debuff, 31), 0, "past expiry it must not count");
+        assert_eq!(count_by_polarity(&tags, Polarity::Buff, 9_999_999), 1, "permanent tags never expire");
     }
 
     #[test]

@@ -570,7 +570,7 @@ impl SchemaEngine {
         let (reply_tx, reply_rx) = mpsc::channel::<SchemaReply>();
         let req = SchemaRequest {
             last_exchange,
-            current_schema_json: current_schema.to_json_pretty(),
+            current_schema_json: current_schema.to_json_prompt(),
             deferred_attempts,
             immutable_keys: current_schema.immutable_keys.clone(),
             existing_keys: current_schema.entities.keys().cloned().collect(),
@@ -599,7 +599,7 @@ impl SchemaEngine {
         let (reply_tx, reply_rx) = mpsc::channel::<SchemaReply>();
         let req = TranslationRequest {
             player_request,
-            current_schema_json: current_schema.to_json_pretty(),
+            current_schema_json: current_schema.to_json_prompt(),
             deferred_attempts,
             immutable_keys: current_schema.immutable_keys.clone(),
             existing_keys: current_schema.entities.keys().cloned().collect(),
@@ -631,7 +631,7 @@ impl SchemaEngine {
     ) -> anyhow::Result<mpsc::Receiver<SchemaReply>> {
         let (reply_tx, reply_rx) = mpsc::channel::<SchemaReply>();
         let req = WorldProgressionRequest {
-            current_schema_json: current_schema.to_json_pretty(),
+            current_schema_json: current_schema.to_json_prompt(),
             interval_hours,
             deferred_attempts,
             immutable_keys: current_schema.immutable_keys.clone(),
@@ -1321,24 +1321,34 @@ pub fn should_fire_delta(user_text: &str, assistant_text: &str) -> bool {
     let user = user_text.trim();
     // Word count via split_whitespace (handles runs of spaces/tabs/newlines).
     let word_count = user.split_whitespace().count();
-    // Short AND compact → almost certainly filler. The char ceiling catches
-    // 4 "words" that are actually one long token blob; the word ceiling catches
-    // long rambling filler. Both must hold to skip.
-    if word_count <= 4 && user.len() <= 32 {
-        // Final guard: if the short message contains a first/second-person
+    // (2026-08-16 audit LOW) CHARS, never bytes (anti-pattern #6's counting
+    // discipline): byte length undercounts CJK/emoji short actions as
+    // overlong... inverts here — bytes OVERCOUNT non-ASCII, so the 32-unit
+    // ceiling skipped the delta pass for short non-English fillers while
+    // never protecting the pronoun path for non-ASCII leads. Char count
+    // keeps the ceiling's intent language-neutral.
+    if word_count <= 4 && user.chars().count() <= 32 {
+        // Final guard: if the short message LEADS with a first/second-person
         // pronoun, it might be a roleplay action ("I nod", "you see"). Fire
-        // rather than risk skipping world state. Pronoun check is case-
-        // insensitive on a small set; cheaper than a verb lookup.
-        let lower = user.to_lowercase();
+        // rather than risk skipping world state. Word-boundary match on the
+        // first word (more precise than the old prefix list, and it can't
+        // false-positive on "liege"/"lie down" style leads).
+        let first = user.split_whitespace().next().unwrap_or("").to_lowercase();
+        // "i'm"/"you're" → "i"/"you": the comparison word is the leading
+        // alphanumeric run (the apostrophe + suffix drop off).
+        let first_word: String =
+            first.chars().take_while(|c| c.is_alphanumeric()).collect();
         const PRONOUNS: &[&str] = &[
-            "i ", "i'", "i’m", "i'm", "i’ll", "i'll", "i’ve", "i've",
-            "you ", "you'", "u ", "he ", "she ", "they ", "we ",
+            "i", "you", "u", "he", "she", "they", "we",
+            // (2026-08-16 audit LOW) Apostrophe-LESS contractions — the chat
+            // corpus drops them constantly ("Im tired", "Ill go"); without
+            // these the gate misread real actions as filler.
+            "im", "ill", "ive", "id", "ur", "youre", "youve", "youd", "lets",
         ];
-        let looks_like_action = PRONOUNS.iter().any(|p| lower.starts_with(p));
-        if looks_like_action {
+        if PRONOUNS.contains(&first_word.as_str()) {
             return true; // ambiguous: fire to be safe
         }
-        return false; // short, compact, no pronoun → filler, skip
+        return false; // short, compact, no leading pronoun → filler, skip
     }
     // Everything else: fire. Long or substantive exchanges always get a pass.
     true

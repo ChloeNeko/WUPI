@@ -3716,6 +3716,14 @@ body.fable-active.fable-chrome-peek .top-bar { transform: translateY(0); }
     color: #f4b8b8;
     border-color: #b04040;
 }
+/* (2026-08-16 audit LOW) Armed-confirm state — first click turns the ✕ into
+   a red glowing confirmation; the second click executes (5s auto-disarm). */
+.fable-bg-delete.is-armed {
+    opacity: 1;
+    color: #ff8f8f;
+    border-color: #c24040;
+    box-shadow: 0 0 10px rgba(194, 64, 64, 0.55);
+}
 .fable-bg-empty {
     grid-column: 1 / -1;
     padding: 30px 12px;

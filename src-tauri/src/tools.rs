@@ -284,17 +284,16 @@ fn is_user_data(rel_str: &str) -> bool {
     if rel_str == "data/user.xml" {
         return true;
     }
-    // Fable scenario cards + per-card saves/schemas/sessions.
+    // Fable scenario cards (incl. per-card saves/ + .codex + portraits — the
+    // per-card folder layout) + the saved-player identity library.
+    // (2026-08-16 audit LOW) Allow-list drift fix: the deleted legacy flat
+    // roots (profiles/, saves/, schemas/, sessions/ — §7.9) were still
+    // writable while the LIVE players/ tree wasn't. Cards' own saves ride
+    // apps/fable/cards/<id>/saves/ — already covered by the cards prefix.
     if rel_str.starts_with("apps/fable/cards/")
         || rel_str == "apps/fable/cards"
-        || rel_str.starts_with("apps/fable/profiles/")
-        || rel_str == "apps/fable/profiles"
-        || rel_str.starts_with("apps/fable/saves/")
-        || rel_str == "apps/fable/saves"
-        || rel_str.starts_with("apps/fable/schemas/")
-        || rel_str == "apps/fable/schemas"
-        || rel_str.starts_with("apps/fable/sessions/")
-        || rel_str == "apps/fable/sessions"
+        || rel_str.starts_with("apps/fable/players/")
+        || rel_str == "apps/fable/players"
     {
         return true;
     }
@@ -605,13 +604,20 @@ fn req_str_nonempty(args: &serde_json::Value, key: &str) -> Result<String, ToolE
 /// deleted, so both sides must run through this one sanitizer — a second
 /// derivation path could drift and silently miss the partition.
 pub fn sanitize_stem(filename: &str) -> Option<String> {
-    let stem: String = filename
+    let mapped: String = filename
         .trim()
         .to_lowercase()
         .chars()
         .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '-' })
         .collect();
-    let stem = stem.trim_matches('-').to_owned();
+    // (2026-08-16 audit fix #20) The 64-char cap the IPC-side sanitizers
+    // (`sanitize_card_slug`) apply: a >64-char tool delete used to resolve
+    // the UNCAPPED folder — a false "already absent" + the wrong partition
+    // purged, and it BYPASSED lib.rs's active-card delete guard (which
+    // compares against the capped active id). Collapse dash runs first so
+    // both sides agree with `slugify_card_stem` (audit #3).
+    let collapsed = crate::collapse_dash_runs(&mapped);
+    let stem = crate::cap_slug_chars(collapsed.trim_matches('-').to_owned());
     if stem.is_empty() { None } else { Some(stem) }
 }
 
@@ -960,9 +966,16 @@ impl Tool for EditUserProfile {
     }
     fn validate_args(&self, args: &serde_json::Value) -> Result<(), ToolError> {
         // Both fields optional; just type-check if present.
+        // (2026-08-16 audit LOW) `name` is capped (CHARS, matching the player
+        // NAME_MAX discipline): the name renders into the STABLE system-prompt
+        // prefix every turn — an uncapped name let the model bloat every
+        // future prompt (Prime Mandate) byte by byte.
         if let Some(n) = args.get("name") {
-            if n.as_str().is_none() {
-                return Err(ToolError::new("`name` must be a string"));
+            let s = n
+                .as_str()
+                .ok_or_else(|| ToolError::new("`name` must be a string"))?;
+            if s.chars().count() > 64 {
+                return Err(ToolError::new("`name` exceeds 64 chars"));
             }
         }
         if let Some(d) = args.get("description") {
@@ -1146,8 +1159,15 @@ mod tests {
         assert!(is_writable(Path::new("data/docs/notes.md")));
         assert!(is_writable(Path::new("data/user.xml")));
         assert!(is_writable(Path::new("apps/fable/cards/x.sim")));
-        assert!(is_writable(Path::new("apps/fable/profiles/x.json")));
-        assert!(is_writable(Path::new("apps/fable/saves/x/y.json")));
+        assert!(is_writable(Path::new("apps/fable/cards/x/saves/save_1.json")));
+        // (2026-08-16 audit LOW pin, updated with the allow-list drift fix)
+        // The LIVE player identity library is writable; the deleted legacy
+        // flat roots (profiles/ saves/ schemas/ sessions/) are NOT.
+        assert!(is_writable(Path::new("apps/fable/players/x/x.json")));
+        assert!(!is_writable(Path::new("apps/fable/profiles/x.json")));
+        assert!(!is_writable(Path::new("apps/fable/saves/x/y.json")));
+        assert!(!is_writable(Path::new("apps/fable/schemas/x.json")));
+        assert!(!is_writable(Path::new("apps/fable/sessions/x.json")));
     }
 
     #[test]
@@ -1357,10 +1377,14 @@ mod tests {
         });
         let t = CreateSimCard;
         t.execute(&payload, &ctx).unwrap();
-        // File exists at the right path — the per-card folder layout (§6B):
-        // apps/fable/cards/<stem>/<stem>.sim.
+        // File exists at the right path — the per-card folder layout (§6B)
+        // under the card's PARSED id (the 2026-08-15 audit fix: folder stem
+        // == memory-partition key by construction). This XML carries no
+        // <metadata><id>, so the id derives from the name "Test Scenario" →
+        // "test-scenario" — NOT the raw filename stem. The test pinned the
+        // pre-fix filename-derived folder and had been red since.
         let written = ctx
-            .resolve("apps/fable/cards/test_scenario/test_scenario.sim")
+            .resolve("apps/fable/cards/test-scenario/test-scenario.sim")
             .unwrap();
         assert!(written.exists(), "card should be written");
         // Round-trips through the parser.

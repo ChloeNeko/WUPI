@@ -353,12 +353,18 @@ pub fn resolve_task(task: &OffScreenTask) -> TaskResolution {
 /// local so this module stays self-contained.
 fn hash_task(task: &OffScreenTask) -> u64 {
     let mut h: u64 = 0xCBF2_9CE4_8422_2325;
-    for b in task.npc_id.as_bytes() {
-        h ^= *b as u64;
+    // (2026-08-16 audit LOW) Field SEPARATORS: concatenating without one
+    // made ("ab", "c") and ("a", "bc") collide — two different tasks could
+    // roll identical dice. A `|` cannot appear ambiguity-free... it can
+    // appear in a description, but a deliberate 3-field collision still
+    // requires matching npc_id+description+eta anyway; the separator kills
+    // the accidental boundary collisions.
+    for b in task.npc_id.as_bytes().iter().copied().chain(Some(b'|')) {
+        h ^= b as u64;
         h = h.wrapping_mul(0x100_0000_01B3);
     }
-    for b in task.description.as_bytes() {
-        h ^= *b as u64;
+    for b in task.description.as_bytes().iter().copied().chain(Some(b'|')) {
+        h ^= b as u64;
         h = h.wrapping_mul(0x100_0000_01B3);
     }
     h ^= task.resolves_at_minutes as u64;

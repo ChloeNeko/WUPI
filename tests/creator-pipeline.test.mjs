@@ -53,8 +53,13 @@ test('pipeline: sim envelope → valid XML with anchors + graph + cast', () => {
   const { xml, intro } = serializeSimCard(draft);
 
   // 4. Structural validation of the emitted XML.
-  //    a. roleplay metadata (so fable_cards_list surfaces it).
-  assert.ok(xml.includes('<metadata><type>roleplay</type></metadata>'));
+  //    a. roleplay metadata (so fable_cards_list surfaces it). The embedded
+  //       <id> (2026-08-16 audit fix #3: the client slug rides in-metadata so
+  //       the parsed id == the created folder by construction) is asserted
+  //       too — the name "Aldermoor" slugs to "aldermoor". This draft carries
+  //       no card_type, so no <subtype> appears.
+  assert.ok(xml.includes('<metadata><type>roleplay</type>'));
+  assert.ok(/<id>aldermoor<\/id>/.test(xml));
   //    b. anchors block with both children (weather prose is CDATA-wrapped).
   assert.ok(/<start>\s*<time>/.test(xml));
   assert.ok(/<weather>/.test(xml) && xml.includes('low fog rolling off the marsh'));

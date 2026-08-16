@@ -72,6 +72,16 @@ pub struct Message {
     /// turns generated after this feature shipped.
     #[serde(default)]
     pub variant_schemas: Vec<WorldSchema>,
+    /// (2026-08-16 audit H3) WIRE-ONLY pool reference for `base_schema` —
+    /// written by the save path's schema-pool transform, resolved + cleared
+    /// by `hydrate_schema_refs` on load. Never populated in memory outside
+    /// deserialization; never read by any runtime code.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_schema_ref: Option<usize>,
+    /// (2026-08-16 audit H3) WIRE-ONLY pool references for `variant_schemas`
+    /// — same contract as `base_schema_ref`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub variant_schema_refs: Vec<usize>,
 }
 
 impl Message {
@@ -178,10 +188,26 @@ impl Message {
         if self.active_idx >= self.variants.len() {
             self.active_idx = 0;
         }
+        // (2026-08-16 audit LOW) `variant_schemas` may legitimately be
+        // SHORTER than `variants` (lazy seeding — accessors `.get()` and
+        // degrade gracefully), but LONGER is a hand-edit artifact whose tail
+        // entries can install a deleted variant's world state on a swipe.
+        // Truncate to the variant count.
+        if self.variant_schemas.len() > self.variants.len() {
+            self.variant_schemas.truncate(self.variants.len());
+        }
         // Keep the mirror honest (a hand-edit could have changed variants but
         // not content). The active variant is the source of truth here.
         if self.content != self.variants[self.active_idx] {
             self.content = self.variants[self.active_idx].clone();
+        }
+        // (2026-08-16 audit LOW) Same mirror discipline for `raw_output` —
+        // a hand-edited variants list left the stale active raw in place,
+        // desyncing KV-coherent re-render (Bug #3's invariant).
+        if let Some(active_raw) = self.raw_outputs.get(self.active_idx) {
+            if &self.raw_output != active_raw {
+                self.raw_output = active_raw.clone();
+            }
         }
     }
 }
@@ -189,11 +215,22 @@ impl Message {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Conversation {
     pub messages: Vec<Message>,
+    /// (2026-08-16 audit H3) WIRE-ONLY deduplicated schema pool written by
+    /// the save path (`pool_session_schemas`) + resolved into the per-message
+    /// inline fields by `hydrate_schema_refs` immediately after load. Always
+    /// empty in live memory. Not serialized by the derived `Serialize` (the
+    /// pool transform injects it at the `serde_json::Value` level) so the
+    /// in-memory clone path never carries it.
+    #[serde(default, skip_serializing)]
+    pub schema_pool: Vec<WorldSchema>,
 }
 
 impl Conversation {
     pub fn new() -> Self {
-        Self { messages: Vec::new() }
+        Self {
+            messages: Vec::new(),
+            schema_pool: Vec::new(),
+        }
     }
 
     pub fn add_message(&mut self, role: Role, content: String) -> &Message {
@@ -221,6 +258,8 @@ impl Conversation {
             active_idx: 0,
             base_schema: None,
             variant_schemas: Vec::new(),
+            base_schema_ref: None,
+            variant_schema_refs: Vec::new(),
         };
         self.messages.push(msg);
         self.messages.last().expect("just pushed")
@@ -247,6 +286,8 @@ impl Conversation {
             active_idx: 0,
             base_schema: None,
             variant_schemas: Vec::new(),
+            base_schema_ref: None,
+            variant_schema_refs: Vec::new(),
         };
         self.messages.push(msg);
         self.messages.last().expect("just pushed")
@@ -284,6 +325,31 @@ impl Conversation {
         Ok(self.messages.remove(index))
     }
 
+    /// (2026-08-16 audit H3) Resolve the wire-only schema pool into the
+    /// per-message inline fields. Idempotent + a no-op on the legacy inline
+    /// format (empty pool). Out-of-range refs degrade to `None`/skipped —
+    /// the same `.get()` fallback discipline the accessors use for
+    /// hand-edited saves.
+    pub fn hydrate_schema_refs(&mut self) {
+        if self.schema_pool.is_empty() {
+            return;
+        }
+        for m in &mut self.messages {
+            if let Some(idx) = m.base_schema_ref.take() {
+                m.base_schema = self.schema_pool.get(idx).cloned();
+            }
+            if !m.variant_schema_refs.is_empty() {
+                m.variant_schemas = m
+                    .variant_schema_refs
+                    .iter()
+                    .filter_map(|i| self.schema_pool.get(*i).cloned())
+                    .collect();
+                m.variant_schema_refs.clear();
+            }
+        }
+        self.schema_pool.clear();
+    }
+
     /// Persist the conversation **atomically**: serialize, write to a sibling
     /// temp file, then `rename` it over the destination.
     ///
@@ -309,16 +375,17 @@ impl Conversation {
         // hash order. The same logical state now produces identical bytes
         // across boots (save diffs stop being hash-order noise). f32 fields
         // serialize via their exact f64 widening — round-trip identical.
-        let value = serde_json::to_value(self)
+        let mut value = serde_json::to_value(self)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        // (2026-08-16 audit H3) Collapse the per-message inline schemas into
+        // a dedup pool on the wire — see `pool_session_schemas`.
+        pool_session_schemas(&mut value);
         let json = serde_json::to_string_pretty(&value)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
 
-        // Temp file: sibling of the destination, same directory/volume.
+        // Temp file: sibling of the destination, same directory/volume,
+        // UNIQUE per write (2026-08-16 audit fix #13 — see temp_path_for).
         let tmp_path = temp_path_for(path);
-
-        // Clear any stale temp from a crashed prior save (ignore NotFound).
-        let _ = std::fs::remove_file(&tmp_path);
 
         // Write + flush the temp so the bytes are durable before the rename.
         // Without fsync, a crash after rename could expose an empty/journaled
@@ -335,7 +402,13 @@ impl Conversation {
         }
 
         // Atomic replace. On Windows this uses MOVEFILE_REPLACE_EXISTING.
-        std::fs::rename(&tmp_path, path)
+        // (audit #13) A failure past this point must never leave THIS write's
+        // temp behind as grime — remove it before propagating.
+        if let Err(e) = std::fs::rename(&tmp_path, path) {
+            let _ = std::fs::remove_file(&tmp_path);
+            return Err(e);
+        }
+        Ok(())
     }
 
     pub fn load(path: &Path) -> std::io::Result<Self> {
@@ -343,6 +416,9 @@ impl Conversation {
             Ok(text) => {
                 let mut conv: Self = serde_json::from_str(&text)
                     .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+                // Resolve the wire-only schema pool (audit H3) into the
+                // inline fields FIRST, then the defensive normalizations.
+                conv.hydrate_schema_refs();
                 // Defensive: clamp active_idx + reconcile variant/raw lengths
                 // so a hand-edited or skewed save can't panic the accessors.
                 for m in &mut conv.messages {
@@ -497,18 +573,106 @@ pub struct ApiMessage {
     pub raw_output: String,
 }
 
-/// Build a sibling temp-file path for an atomic save: same directory + volume
-/// as `path` (so `rename` is atomic), with a `.tmp` suffix on the file stem.
+/// (2026-08-16 audit H3) Collapse the per-message inline `base_schema` /
+/// `variant_schemas` of a serialized `Conversation` value into ONE
+/// deduplicated `schema_pool` array + per-message integer refs.
 ///
-/// `session.json` → `session.json.tmp`. We keep the full original name as a
-/// prefix so the temp is visually obvious in the dir and `save`'s stale-temp
-/// cleanup (`remove_file`) targets exactly this one file: not a random one.
+/// Why: every assistant `Message` serialized its schemas inline — a mature
+/// schema is tens of KB and a long campaign embeds 2-3 copies per turn
+/// (base + every variant roll), so `session.json` AND every save slot grew
+/// O(messages × full schema clones) into multi-MB files the UI fully
+/// re-parses (`list_saves`, the title Continue walk). Consecutive turns
+/// dedup heavily: turn N+1's `base_schema` IS turn N's active
+/// `variant_schemas` entry, and reroll variants share their base — the
+/// pool stores each unique schema exactly once.
+///
+/// Wire contract (back-compatible BOTH directions):
+/// - A message with a pooled write carries `base_schema_ref: <pool idx>` /
+///   `variant_schema_refs: [<idx>, …]` and NO inline schema keys.
+/// - The conversation object carries `schema_pool: [...]` only when
+///   non-empty.
+/// - The legacy inline shape still deserializes (the ref fields default);
+///   `hydrate_schema_refs` is a no-op without a pool.
+///
+/// Operates at the `serde_json::Value` level on PURPOSE: both save paths
+/// already route through `to_value` for byte-stable key ordering, the
+/// in-memory types stay untouched, and the dedup keys inherit that same
+/// deterministic serialization (logically identical schemas always hash to
+/// the same pool entry).
+pub(crate) fn pool_session_schemas(session: &mut serde_json::Value) {
+    let Some(obj) = session.as_object_mut() else {
+        return;
+    };
+    let Some(messages) = obj
+        .get_mut("messages")
+        .and_then(serde_json::Value::as_array_mut)
+    else {
+        return;
+    };
+    let mut pool: Vec<serde_json::Value> = Vec::new();
+    let mut index: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
+    for msg in messages.iter_mut() {
+        let Some(m) = msg.as_object_mut() else {
+            continue;
+        };
+        if let Some(base) = m.remove("base_schema") {
+            if !base.is_null() {
+                let idx = intern_schema(&mut pool, &mut index, base);
+                m.insert("base_schema_ref".to_string(), serde_json::Value::from(idx));
+            }
+        }
+        if let Some(variants) = m.remove("variant_schemas") {
+            if let Some(arr) = variants.as_array() {
+                if !arr.is_empty() {
+                    let refs: Vec<serde_json::Value> = arr
+                        .iter()
+                        .cloned()
+                        .map(|v| serde_json::Value::from(intern_schema(&mut pool, &mut index, v)))
+                        .collect();
+                    m.insert("variant_schema_refs".to_string(), serde_json::Value::Array(refs));
+                }
+            }
+        }
+    }
+    if !pool.is_empty() {
+        obj.insert("schema_pool".to_string(), serde_json::Value::Array(pool));
+    }
+}
+
+/// Intern one schema value into the dedup pool, returning its stable index.
+fn intern_schema(
+    pool: &mut Vec<serde_json::Value>,
+    index: &mut std::collections::HashMap<String, usize>,
+    value: serde_json::Value,
+) -> usize {
+    let key = serde_json::to_string(&value).unwrap_or_default();
+    if let Some(&existing) = index.get(&key) {
+        return existing;
+    }
+    let idx = pool.len();
+    pool.push(value);
+    index.insert(key, idx);
+    idx
+}
+
+/// Build a sibling temp-file path for an atomic save: same directory + volume
+/// as `path` (so `rename` is atomic), with a UNIQUE per-write
+/// `<pid>.<counter>.tmp` suffix.
+///
+/// (2026-08-16 audit fix #13) `session.json` → `session.json.<pid>.<n>.tmp`
+/// — the same per-write uniqueness the save slots got (#59). The old fixed
+/// `session.json.tmp` let a writer racing another writer on the same file
+/// share one temp (remove-then-create interleave → corrupt/lost history).
+/// A crashed writer's stale temp is inert grime: nothing loads it, and the
+/// next save stages its OWN fresh temp.
 fn temp_path_for(path: &Path) -> std::path::PathBuf {
     let mut name = path
         .file_name()
         .map(std::ffi::OsString::from)
         .unwrap_or_else(|| std::ffi::OsString::from("wupi.tmp"));
-    name.push(".tmp");
+    name.push(".");
+    name.push(crate::fable_save::unique_tmp_suffix());
     path.with_file_name(name)
 }
 
@@ -616,20 +780,44 @@ mod tests {
         assert!(err.contains("out of bounds"), "error: {err}");
     }
 
-    /// Clean up both the main file and its sibling temp so the temp dir
+    /// Every `<name>.*.tmp` sibling (the unique per-write temps, 2026-08-16
+    /// audit fix #13). Empty = no leftover.
+    fn sibling_temps(path: &Path) -> Vec<std::path::PathBuf> {
+        let Some(dir) = path.parent() else { return Vec::new(); };
+        let Some(stem) = path.file_name().and_then(|s| s.to_str()) else { return Vec::new(); };
+        let mut out = Vec::new();
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for e in entries.flatten() {
+                let name = e.file_name();
+                let Some(name) = name.to_str() else { continue };
+                if name.starts_with(stem) && name.ends_with(".tmp") {
+                    out.push(e.path());
+                }
+            }
+        }
+        out
+    }
+
+    /// Clean up the main file and any sibling unique temps so the temp dir
     /// doesn't accumulate test artifacts. NotFound is fine.
     fn cleanup(path: &Path) {
         let _ = std::fs::remove_file(path);
-        let _ = std::fs::remove_file(temp_path_for(path));
+        for t in sibling_temps(path) {
+            let _ = std::fs::remove_file(t);
+        }
     }
 
     #[test]
-    fn temp_path_is_sibling_with_tmp_suffix() {
+    fn temp_path_is_sibling_with_unique_tmp_suffix() {
         let p = std::path::PathBuf::from("dir/session.json");
-        assert_eq!(temp_path_for(&p), std::path::PathBuf::from("dir/session.json.tmp"));
-        // No-extension path still gets .tmp.
-        let p2 = std::path::PathBuf::from("dir/session");
-        assert_eq!(temp_path_for(&p2), std::path::PathBuf::from("dir/session.tmp"));
+        let tmp = temp_path_for(&p);
+        let name = tmp.file_name().and_then(|s| s.to_str()).unwrap();
+        // (2026-08-16 audit fix #13) UNIQUE per call: `<name>.<pid>.<n>.tmp`.
+        assert!(name.starts_with("session.json."), "got {name}");
+        assert!(name.ends_with(".tmp"), "got {name}");
+        assert_eq!(tmp.parent(), p.parent(), "sibling dir so rename is atomic");
+        // Two calls never collide — the interleave race the fix exists for.
+        assert_ne!(temp_path_for(&p), temp_path_for(&p));
     }
 
     #[test]
@@ -640,8 +828,8 @@ mod tests {
 
         conv.save(&path).expect("save should succeed");
 
-        // Temp must be gone after a successful save (renamed away).
-        assert!(!temp_path_for(&path).exists(), "temp file left behind");
+        // No temp left behind after a successful save (renamed away).
+        assert!(sibling_temps(&path).is_empty(), "temp file left behind");
         // Main file exists and round-trips.
         let loaded = Conversation::load(&path).expect("load should succeed");
         assert_eq!(loaded.messages.len(), 1);
@@ -659,7 +847,7 @@ mod tests {
         sample_conv().save(&path).expect("save");
         assert!(path.exists(), "destination must exist");
         assert!(
-            !temp_path_for(&path).exists(),
+            sibling_temps(&path).is_empty(),
             "temp file must be renamed away, not left behind"
         );
         cleanup(&path);
@@ -668,7 +856,7 @@ mod tests {
     #[test]
     fn save_overwrites_existing_file_in_place() {
         // Save once, then save a second time with different content. The
-        // destination must reflect the second save and the temp must be gone.
+        // destination must reflect the second save and no temp may remain.
         let path = unique_test_path("overwrite");
         cleanup(&path);
 
@@ -684,29 +872,34 @@ mod tests {
         let loaded = Conversation::load(&path).expect("load");
         assert_eq!(loaded.messages.len(), 2, "second save should win");
         assert_eq!(loaded.messages[0].content, "second");
-        assert!(!temp_path_for(&path).exists(), "temp leaked after overwrite");
+        assert!(sibling_temps(&path).is_empty(), "temp leaked after overwrite");
 
         cleanup(&path);
     }
 
     #[test]
-    fn stale_temp_from_prior_crash_is_cleared_before_rename() {
-        // Simulate a prior crashed save: drop a stale temp file in place, then
-        // save. The stale temp must not survive (it gets removed + replaced by
-        // the new one, which is then renamed away).
+    fn stale_temp_from_prior_crash_is_inert() {
+        // (2026-08-16 audit fix #13) With UNIQUE per-write temps, a crashed
+        // writer's stale temp is INERT grime: the next save stages its own
+        // fresh temp + renames it over the destination — the stale file is
+        // never opened, never renamed, never loaded. (The old fixed-name
+        // design removed-then-recreated it; that interleave is the race
+        // uniqueness exists to kill.)
         let path = unique_test_path("stale_temp");
         cleanup(&path);
 
-        let tmp = temp_path_for(&path);
-        std::fs::write(&tmp, b"stale garbage from a crashed save").expect("seed stale temp");
-        assert!(tmp.exists(), "precondition: stale temp exists");
+        let mut stale = path.clone().into_os_string();
+        stale.push(".999999.99.tmp");
+        let stale: std::path::PathBuf = stale.into();
+        std::fs::write(&stale, b"stale garbage from a crashed save").expect("seed stale temp");
+        assert!(stale.exists(), "precondition: stale temp exists");
 
-        sample_conv().save(&path).expect("save should clear stale temp");
+        sample_conv().save(&path).expect("save must ignore the stale temp");
         assert!(path.exists(), "destination written");
-        assert!(
-            !tmp.exists(),
-            "stale temp must be cleared (removed then renamed away), not left as garbage"
-        );
+        Conversation::load(&path)
+            .expect("destination is valid (the stale temp never replaced it)");
+        // The stale temp survives as accepted, invisible grime.
+        assert!(stale.exists(), "stale unique temp is left as inert grime");
 
         cleanup(&path);
     }
@@ -879,6 +1072,8 @@ mod tests {
             active_idx: 0,
             base_schema: None,
             variant_schemas: Vec::new(),
+            base_schema_ref: None,
+            variant_schema_refs: Vec::new(),
         }
     }
 
@@ -1042,6 +1237,8 @@ mod tests {
             active_idx: 99,                    // out of range
             base_schema: None,
             variant_schemas: Vec::new(),
+            base_schema_ref: None,
+            variant_schema_refs: Vec::new(),
         };
         m.normalize_variants();
         assert_eq!(m.active_idx, 0, "clamped to 0");

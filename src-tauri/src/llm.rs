@@ -176,11 +176,24 @@ impl HttpBackend {
     pub fn new(profile: crate::api::ApiProfile) -> Self {
         let mut headers = reqwest::header::HeaderMap::new();
         if !profile.api_key.is_empty() {
-            if let Ok(v) = reqwest::header::HeaderValue::from_str(&format!(
+            match reqwest::header::HeaderValue::from_str(&format!(
                 "Bearer {}",
                 profile.api_key
             )) {
-                headers.insert(reqwest::header::AUTHORIZATION, v);
+                Ok(v) => {
+                    headers.insert(reqwest::header::AUTHORIZATION, v);
+                }
+                Err(e) => {
+                    // A key containing control chars / non-visible ASCII
+                    // can't become a header value. The old silent skip sent
+                    // UNAUTHENTICATED requests — the user saw an opaque
+                    // provider 401 (as api_lost) with no hint of the cause.
+                    // Loud error so the paste/typo is diagnosable.
+                    tracing::error!(
+                        error = %e,
+                        "API key is not a valid header value; requests will be sent unauthenticated"
+                    );
+                }
             }
         }
         let client = reqwest::Client::builder()
@@ -312,7 +325,6 @@ impl GenerationClient for HttpBackend {
     ) -> StreamFuture {
         let url = self.completions_url();
         let model = self.profile.model.clone();
-        let temperature = self.profile.temperature;
         let max_context = self.profile.max_context;
         let client = self.client.clone();
         Box::pin(async move {
@@ -373,9 +385,13 @@ impl GenerationClient for HttpBackend {
             // API_TEMP/API_TOP_P are `f32`, + the `json!` macro promotes f32 →
             // f64 for serialization, so `0.95_f32` becomes `0.949999988079071`
             // (16 places) → instant 400. Round to 2 decimals (as f64) BEFORE
-            // serialization so the JSON emits clean `0.95`/`0.85`. The profile's
-            // own temperature (also f32) gets the same treatment.
-            let temp_val = temperature.unwrap_or(crate::settings::API_TEMP) as f64;
+            // serialization so the JSON emits clean `0.95`/`0.85`.
+            // (2026-08-16 audit fix) `API_TEMP` governs every API turn, per the
+            // locked sampler table. A legacy profile that persisted its own
+            // `temperature` (the never-persist rule is enforced in the panels,
+            // not in old saves) is IGNORED at stream time — it used to override
+            // the locked 0.85 backend-side.
+            let temp_val = crate::settings::API_TEMP as f64;
             let temp_r = (temp_val * 100.0).round() / 100.0;
             let topp_r = ((crate::settings::API_TOP_P as f64) * 100.0).round() / 100.0;
             let body = serde_json::json!({
@@ -386,12 +402,43 @@ impl GenerationClient for HttpBackend {
                 "top_p": topp_r,
             });
 
-            let response = client
-                .post(&url)
-                .json(&body)
-                .send()
-                .await
-                .map_err(|e| anyhow::anyhow!("API request to {url} failed: {e}"))?;
+            // (2026-08-16 audit fix) The request phase is part of the
+            // first-token budget: the ABSOLUTE TTFT deadline is armed BEFORE
+            // `send()` and raced against cancel, so a provider that accepts
+            // the connection then stalls before responding (no headers, no
+            // error) can no longer hang the await forever. The old bare
+            // `.send().await` had no deadline and no cancel path — the wedged
+            // turn kept the fable cancel slot occupied, so `fable_turn_in_
+            // flight` stayed true and fable_end/load/start all refused; the
+            // only recovery was killing the process.
+            let ttft_deadline = tokio::time::Instant::now()
+                + std::time::Duration::from_millis(crate::settings::API_FIRST_TOKEN_TIMEOUT_MS);
+            let response = {
+                let send_fut = client.post(&url).json(&body).send();
+                tokio::select! {
+                    res = send_fut => {
+                        res.map_err(|e| anyhow::anyhow!("API request to {url} failed: {e}"))?
+                    }
+                    _ = cancel_poll(&cancel) => {
+                        // Cancel during the request phase: return the EMPTY Ok,
+                        // NOT Err — the narrator's Err arm would surface this
+                        // as api_lost. Callers re-check the token and finalize
+                        // as a soft cancel, the same contract as a read-phase
+                        // stop (the abandoned future severs the connection).
+                        return Ok(ParsedOutput {
+                            content: String::new(),
+                            reasoning: String::new(),
+                            raw: String::new(),
+                        });
+                    }
+                    _ = tokio::time::sleep_until(ttft_deadline) => {
+                        return Err(anyhow::anyhow!(
+                            "API_TIMEOUT: no response headers within {}ms — provider hung on request",
+                            crate::settings::API_FIRST_TOKEN_TIMEOUT_MS
+                        ));
+                    }
+                }
+            };
 
             if !response.status().is_success() {
                 let status = response.status();
@@ -447,10 +494,115 @@ impl GenerationClient for HttpBackend {
             // legit 5+ minute narrations).
             let mut got_first_token = false;
             let mut stream_done = false;
-            let ttft_deadline = tokio::time::Instant::now()
-                + std::time::Duration::from_millis(crate::settings::API_FIRST_TOKEN_TIMEOUT_MS);
             let idle_dur =
                 std::time::Duration::from_millis(crate::settings::API_CHUNK_IDLE_TIMEOUT_MS);
+
+            // Per-line SSE parser, hoisted into a closure so the EOF tail
+            // flush runs the EXACT same parse path as in-stream lines
+            // (2026-08-16 audit fix: a provider ending the body without a
+            // trailing newline on its final `data:` line used to have that
+            // line silently dropped — the split loop only fires on
+            // terminators).
+            enum LineOutcome {
+                Next,
+                Done,
+                Fail(String),
+                RepKill(ParsedOutput),
+            }
+            let mut process_line =
+                |full_content: &mut String, got_first_token: &mut bool, line: &str| -> LineOutcome {
+                    if line.is_empty() || !line.starts_with("data:") {
+                        return LineOutcome::Next;
+                    }
+                    let data = line["data:".len()..].trim();
+                    if data == "[DONE]" {
+                        // (P3 fix) Terminate the OUTER read loop too — the
+                        // old `break` only exited this line-parse while, so
+                        // termination relied on the server closing the
+                        // connection; a provider that keeps it open hung the
+                        // turn until the client timeout.
+                        return LineOutcome::Done;
+                    }
+                    // (2026-08-15 audit fix) In-band error events: providers
+                    // like OpenRouter stream failures as `data: {"error":…}`
+                    // with HTTP 200. The chunk won't parse as ChatStreamChunk,
+                    // so the old path silently skipped it and returned Ok("")
+                    // — an empty beat committed as a normal turn. Detect the
+                    // error shape FIRST and fail the stream loudly (the
+                    // caller's api_lost path handles revert + composer lock).
+                    if let Ok(obj) = serde_json::from_str::<serde_json::Value>(data) {
+                        if obj.get("error").is_some() && obj.get("choices").is_none() {
+                            let msg = match obj.get("error") {
+                                Some(serde_json::Value::String(s)) => s.clone(),
+                                Some(other) => other.to_string(),
+                                None => String::new(),
+                            };
+                            return LineOutcome::Fail(msg);
+                        }
+                    }
+                    // Parse the JSON chunk; on failure skip (some providers
+                    // send keep-alive comments or partial events we don't care
+                    // about). A malformed chunk must never kill the stream.
+                    if let Ok(parsed) = serde_json::from_str::<ChatStreamChunk>(data) {
+                        if let Some(choice) = parsed.choices.into_iter().next() {
+                            // GLM-5.2 (a reasoning model) streams its chain-of-
+                            // thought in `reasoning_content` BEFORE the first
+                            // `content` token. The reasoning body is DISCARDED
+                            // (the API narrator never thinks, §3A) — but the
+                            // arrival of a reasoning token proves the stream is
+                            // alive, so retire the TTFT deadline on it. Without
+                            // this, a long reasoning phase trips the 10s
+                            // first-token timeout → `api_lost` mid-narration.
+                            if let Some(rc) = choice.delta.reasoning_content {
+                                if !rc.is_empty() {
+                                    *got_first_token = true;
+                                }
+                            }
+                            if let Some(piece) = choice.delta.content {
+                                if !piece.is_empty() {
+                                    // First content token landed — retire the
+                                    // TTFT deadline window for all subsequent
+                                    // reads (don't kill a slow-but-working stream).
+                                    *got_first_token = true;
+                                    on_chunk(&piece);
+                                    full_content.push_str(&piece);
+                                    // §11.43 kill switch: scan the rolling
+                                    // tail-buffer for a mechanical loop. On
+                                    // hit, finalize by truncating the FULL
+                                    // turn content at the loop's 2nd
+                                    // occurrence and break BOTH loops (inner
+                                    // line-parse + outer chunk-read). The
+                                    // detector's tail buffer is a DETECTION
+                                    // window only — finalizing from it would
+                                    // silently drop all pre-tail prose
+                                    // (2026-08-15 audit fix).
+                                    // Dropping `response` (the moved owner
+                                    // of `stream`) at function return severs
+                                    // the TCP connection.
+                                    if rep_guard.push(&piece) {
+                                        // (2026-08-15 audit fix) Forensics
+                                        // contract parity with the local
+                                        // engines: raw_output carries the
+                                        // FULL un-truncated turn (the loop
+                                        // evidence); content carries the
+                                        // truncated clean prose. The caller
+                                        // prefers out.raw when non-empty.
+                                        let raw_forensic = full_content.clone();
+                                        let truncated = crate::stream_filter::truncate_repetition(
+                                            full_content,
+                                        );
+                                        return LineOutcome::RepKill(ParsedOutput {
+                                            content: truncated,
+                                            reasoning: String::new(),
+                                            raw: raw_forensic,
+                                        });
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    LineOutcome::Next
+                };
 
             loop {
                 // The server signalled end-of-stream ([DONE]) — stop reading.
@@ -462,21 +614,37 @@ impl GenerationClient for HttpBackend {
                     break;
                 }
                 let chunk_res = if got_first_token {
-                    // Stream is alive — bound only the idle gap between chunks.
-                    match tokio::time::timeout(idle_dur, stream.next()).await {
-                        Ok(opt) => opt,
-                        Err(_elapsed) => {
-                            buffer.clear();
-                            drop(stream);
-                            return Err(anyhow::anyhow!(
-                                "API_TIMEOUT: stream stalled for over {}ms after the first token — connection dead",
-                                crate::settings::API_CHUNK_IDLE_TIMEOUT_MS
-                            ));
+                    // Stream is alive — bound only the idle gap between chunks,
+                    // RACED against cancel (2026-08-16 audit fix: a stop during
+                    // a between-chunks stall used to lag the full 120s window —
+                    // cancel was only checked at loop top between reads, so a
+                    // dead-air stream held the stop hostage until the stall
+                    // guard fired and finalized as api_lost instead of the
+                    // requested soft cancel).
+                    let read = tokio::time::timeout(idle_dur, stream.next());
+                    tokio::select! {
+                        res = read => match res {
+                            Ok(opt) => opt,
+                            Err(_elapsed) => {
+                                buffer.clear();
+                                drop(stream);
+                                return Err(anyhow::anyhow!(
+                                    "API_TIMEOUT: stream stalled for over {}ms after the first token — connection dead",
+                                    crate::settings::API_CHUNK_IDLE_TIMEOUT_MS
+                                ));
+                            }
+                        },
+                        _ = cancel_poll(&cancel) => {
+                            // Cancel observed mid-wait — fall through to the
+                            // loop-top cancel check's break with partials.
+                            continue;
                         }
                     }
                 } else {
                     // Still waiting for the first token — the ABSOLUTE
-                    // deadline bounds the whole window, raced against cancel
+                    // deadline bounds the whole window (armed before `send()`,
+                    // so it also covered the request phase; what remains here
+                    // is the post-headers remainder), raced against cancel
                     // so a stop is honored within ~100ms, not 10s.
                     let read = tokio::time::timeout_at(ttft_deadline, stream.next());
                     tokio::select! {
@@ -506,111 +674,55 @@ impl GenerationClient for HttpBackend {
                 let bytes = chunk_res.map_err(|e| anyhow::anyhow!("SSE read error: {e}"))?;
                 buffer.extend_from_slice(&bytes);
 
-                // Process complete lines. Keep any trailing partial line in buffer.
-                while let Some(newline_pos) = buffer.iter().position(|&b| b == b'\n') {
-                    let line = String::from_utf8_lossy(&buffer[..newline_pos]).trim().to_string();
-                    drop(buffer.drain(..=newline_pos));
-                    if line.is_empty() || !line.starts_with("data:") {
-                        continue;
+                // Process complete lines. Keep any trailing partial line in
+                // buffer. (2026-08-16 audit fix) CR-aware framing: the SSE
+                // spec permits \n, \r\n, AND bare \r as line terminators — the
+                // old splitter only recognized \n (\r\n worked only because
+                // `.trim()` ate the residual \r; a bare-\r stream never
+                // framed a single line).
+                while let Some(sep_pos) = buffer.iter().position(|&b| b == b'\n' || b == b'\r') {
+                    let mut end = sep_pos + 1;
+                    if buffer[sep_pos] == b'\r' && buffer.get(end) == Some(&b'\n') {
+                        end += 1;
                     }
-                    let data = line["data:".len()..].trim();
-                    if data == "[DONE]" {
-                        // (P3 fix) Terminate the OUTER read loop too — the
-                        // old `break` only exited this line-parse while, so
-                        // termination relied on the server closing the
-                        // connection; a provider that keeps it open hung the
-                        // turn until the client timeout.
-                        stream_done = true;
-                        buffer.clear();
-                        break;
-                    }
-                    // (2026-08-15 audit fix) In-band error events: providers
-                    // like OpenRouter stream failures as `data: {"error":…}`
-                    // with HTTP 200. The chunk won't parse as ChatStreamChunk,
-                    // so the old path silently skipped it and returned Ok("")
-                    // — an empty beat committed as a normal turn. Detect the
-                    // error shape FIRST and fail the stream loudly (the
-                    // caller's api_lost path handles revert + composer lock).
-                    if let Ok(obj) = serde_json::from_str::<serde_json::Value>(data) {
-                        if obj.get("error").is_some() && obj.get("choices").is_none() {
-                            let msg = match obj.get("error") {
-                                Some(serde_json::Value::String(s)) => s.clone(),
-                                Some(other) => other.to_string(),
-                                None => String::new(),
-                            };
+                    let line = String::from_utf8_lossy(&buffer[..sep_pos]).trim().to_string();
+                    drop(buffer.drain(..end));
+                    match process_line(&mut full_content, &mut got_first_token, &line) {
+                        LineOutcome::Next => {}
+                        LineOutcome::Done => {
+                            stream_done = true;
+                            buffer.clear();
+                            break;
+                        }
+                        LineOutcome::Fail(msg) => {
                             buffer.clear();
                             drop(stream);
-                            return Err(anyhow::anyhow!(
-                                "API provider error (in-band): {msg}"
-                            ));
+                            return Err(anyhow::anyhow!("API provider error (in-band): {msg}"));
+                        }
+                        LineOutcome::RepKill(out) => {
+                            buffer.clear();
+                            drop(stream);
+                            return Ok(out);
                         }
                     }
-                    // Parse the JSON chunk; on failure skip (some providers
-                    // send keep-alive comments or partial events we don't care
-                    // about). A malformed chunk must never kill the stream.
-                    if let Ok(parsed) = serde_json::from_str::<ChatStreamChunk>(data) {
-                        if let Some(choice) = parsed.choices.into_iter().next() {
-                            // GLM-5.2 (a reasoning model) streams its chain-of-
-                            // thought in `reasoning_content` BEFORE the first
-                            // `content` token. The reasoning body is DISCARDED
-                            // (the API narrator never thinks, §3A) — but the
-                            // arrival of a reasoning token proves the stream is
-                            // alive, so retire the TTFT deadline on it. Without
-                            // this, a long reasoning phase trips the 10s
-                            // first-token timeout → `api_lost` mid-narration.
-                            if let Some(rc) = choice.delta.reasoning_content {
-                                if !rc.is_empty() {
-                                    got_first_token = true;
-                                }
-                            }
-                            if let Some(piece) = choice.delta.content {
-                                if !piece.is_empty() {
-                                    // First content token landed — retire the
-                                    // TTFT deadline window for all subsequent
-                                    // reads (don't kill a slow-but-working stream).
-                                    got_first_token = true;
-                                    on_chunk(&piece);
-                                    full_content.push_str(&piece);
-                                    // §11.43 kill switch: scan the rolling
-                                    // tail-buffer for a mechanical loop. On
-                                    // hit, finalize by truncating the FULL
-                                    // turn content at the loop's 2nd
-                                    // occurrence and break BOTH loops (inner
-                                    // line-parse + outer chunk-read). The
-                                    // detector's tail buffer is a DETECTION
-                                    // window only — finalizing from it would
-                                    // silently drop all pre-tail prose
-                                    // (2026-08-15 audit fix).
-                                    // Dropping `response` (the moved owner
-                                    // of `stream`) at function return severs
-                                    // the TCP connection.
-                                    if rep_guard.push(&piece) {
-                                        // (2026-08-15 audit fix) Forensics
-                                        // contract parity with the local
-                                        // engines: raw_output carries the
-                                        // FULL un-truncated turn (the loop
-                                        // evidence); content carries the
-                                        // truncated clean prose. The caller
-                                        // prefers out.raw when non-empty.
-                                        let raw_forensic = full_content.clone();
-                                        full_content =
-                                            crate::stream_filter::truncate_repetition(&full_content);
-                                        // Exit both loops via early return.
-                                        // `stream` (borrowed from `response`)
-                                        // + `response` drop here, severing
-                                        // the TCP connection + stopping
-                                        // token billing for any unread body.
-                                        buffer.clear();
-                                        drop(stream);
-                                        return Ok(ParsedOutput {
-                                            content: full_content,
-                                            reasoning: String::new(),
-                                            raw: raw_forensic,
-                                        });
-                                    }
-                                }
-                            }
-                        }
+                }
+            }
+
+            // EOF tail flush (2026-08-16 audit fix): the server closed the
+            // body with a final line that never received its terminator.
+            // Parse it through the same path instead of dropping it.
+            if !buffer.is_empty() {
+                let line = String::from_utf8_lossy(&buffer).trim().to_string();
+                buffer.clear();
+                match process_line(&mut full_content, &mut got_first_token, &line) {
+                    LineOutcome::Next | LineOutcome::Done => {}
+                    LineOutcome::Fail(msg) => {
+                        drop(stream);
+                        return Err(anyhow::anyhow!("API provider error (in-band): {msg}"));
+                    }
+                    LineOutcome::RepKill(out) => {
+                        drop(stream);
+                        return Ok(out);
                     }
                 }
             }
@@ -1359,13 +1471,23 @@ mod tests {
             result.content.starts_with(lead_in),
             "lead-in prose must be preserved in truncated output"
         );
-        // (2026-08-15 audit fix pin) Forensics parity with the local engines:
-        // raw carries the FULL un-truncated turn (all 5 occurrences — the
-        // loop evidence); content carries the truncated prose.
+        // (2026-08-15 audit fix pin, corrected 2026-08-16) Forensics parity
+        // with the local engines: raw carries the FULL UN-TRUNCATED content
+        // RECEIVED before the sever — at kill time that is the lead-in +
+        // the 3 occurrences the detector needed to confirm the loop (the
+        // 4th + 5th chunks never arrive — the stream is severed, which is
+        // the entire point). The original pin demanded 5 occurrences, which
+        // contradicts its own Assertion 2 (≤4 chunk callbacks); it was
+        // committed without ever running the test binary.
         assert!(
             !result.raw.is_empty()
-                && result.raw.matches("The smuggler turns and runs away").count() == 5,
-            "kill-switch raw_output must keep the full un-truncated turn as forensics"
+                && result.raw.matches("The smuggler turns and runs away").count() == 3,
+            "kill-switch raw_output must keep the full un-truncated received turn as forensics"
+        );
+        // Raw is strictly MORE than the truncated prose (the loop evidence).
+        assert!(
+            result.raw.len() > result.content.len(),
+            "raw forensics must exceed the truncated content"
         );
 
         // ── Assertion 2: the stream broke at the trigger chunk ──

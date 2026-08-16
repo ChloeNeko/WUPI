@@ -21,10 +21,15 @@
 //! recent user message or schema summary, NOT model-generated).
 //!
 //! ## Efficiency (Prime Directive §1B)
-//! The save payload is small JSON (a few KB per slot). Save writes are
-//! atomic (temp + rename). Listing reads only filenames + opens each file
-//! once for the metadata header (cheap; O(saves)). Loading reads one file.
-//! No re-embedding, no schema rebuild, no token cost.
+//! Save payloads grow with campaign length — the per-message world schemas
+//! are collapsed into a deduplicated pool on the wire (2026-08-16 audit H3,
+//! `session::pool_session_schemas`), so a slot costs roughly one unique
+//! schema per turn instead of 2-3 full clones per turn. Save writes are
+//! atomic (temp + rename). Listing reads a capped header PREFIX of each
+//! file (`read_save_header`) — never the session payload — so the Load
+//! list and the title Continue walk stay O(saves × prefix) regardless of
+//! campaign size. Loading reads one file. No re-embedding, no schema
+//! rebuild, no token cost.
 
 use std::path::{Path, PathBuf};
 
@@ -61,8 +66,28 @@ pub struct SaveFile {
     pub summary: String,
     pub timestamp: i64,
     pub is_autosave: bool,
+    /// (2026-08-16 audit H3) `session.messages.len()`, hoisted so
+    /// `list_saves` can read the header prefix WITHOUT parsing the heavy
+    /// session payload. `#[serde(default)]` keeps pre-field saves loadable
+    /// (the header reader falls back to a full parse for them).
+    #[serde(default)]
+    pub turn_count: usize,
     pub session: Conversation,
     pub schema: WorldSchema,
+}
+
+/// The metadata-only projection `list_saves` extracts from a save's HEADER
+/// PREFIX (everything before the `"session"` key). All fields must precede
+/// `session` in `SaveFile`'s declaration order for the prefix cut to work —
+/// pinned by test.
+#[derive(Debug, serde::Deserialize)]
+struct SaveHeader {
+    name: String,
+    summary: String,
+    timestamp: i64,
+    is_autosave: bool,
+    #[serde(default)]
+    turn_count: usize,
 }
 
 /// Resolve `<cards_root>/<card_id>/saves/` — the per-card saves subdir inside
@@ -128,6 +153,7 @@ pub fn write_save(
         summary,
         timestamp,
         is_autosave,
+        turn_count: session.messages.len(),
         session: session.clone(),
         schema: schema.clone(),
     };
@@ -138,8 +164,16 @@ pub fn write_save(
     // HashMap-keyed subtrees (schema entities, custom_tags, …) serialize in
     // sorted key order instead of per-process hash order. Identical logical
     // state → identical bytes across boots.
-    let value = serde_json::to_value(&save)
+    let mut value = serde_json::to_value(&save)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+    // (2026-08-16 audit H3) Same schema-pool collapse as `Conversation::save`
+    // — the save slot embeds the whole session, so it inherits the
+    // O(messages × schema clones) growth. The header fields (incl.
+    // `turn_count`) all precede `session` in the value, so the prefix cut in
+    // `read_save_header` still lands before any pooled payload.
+    if let Some(session_value) = value.get_mut("session") {
+        crate::session::pool_session_schemas(session_value);
+    }
     let json = serde_json::to_vec_pretty(&value)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
 
@@ -173,8 +207,11 @@ pub fn write_save(
 
 /// Per-write temp suffix: `<pid>.<counter>.tmp`. Uniqueness is what makes
 /// concurrent same-slot writes safe (#59); `Relaxed` is correct (no
-/// dependent data rides on the counter).
-fn unique_tmp_suffix() -> String {
+/// dependent data rides on the counter). (2026-08-16 audit fix #13) Shared
+/// by the save slots AND `session::Conversation::save` +
+/// `schema::WorldSchema::save_split` — the fixed `.tmp` names there had the
+/// same remove-then-create interleave race this suffix was built to kill.
+pub(crate) fn unique_tmp_suffix() -> String {
     static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     format!("{}.{}.tmp", std::process::id(), n)
@@ -184,6 +221,13 @@ fn unique_tmp_suffix() -> String {
 /// List all saves for a card. Sorted: most-recent first (the natural order
 /// for a Load Game list). Returns an empty Vec when no saves dir exists
 /// (the common case until the user saves the first time).
+///
+/// (2026-08-16 audit H3) HEADER-ONLY: reads a capped byte prefix of each
+/// file (everything before the `"session"` key) instead of parsing the
+/// multi-MB session payload. Long campaigns made the old full parse the
+/// dominant cost of the Load list AND the title screen's Continue walk
+/// (every card × every slot). Falls back to a full parse when the prefix
+/// doesn't yield (pre-`turn_count` saves, truncated prefix, odd hand-edits).
 pub fn list_saves(fable_root: &Path, card_id: &str) -> std::io::Result<Vec<SaveMeta>> {
     let dir = resolve_saves_dir(fable_root, card_id);
     if !dir.is_dir() {
@@ -199,28 +243,87 @@ pub fn list_saves(fable_root: &Path, card_id: &str) -> std::io::Result<Vec<SaveM
         // per-write temp suffixes end in `.tmp`, so the extension check
         // above already excludes them — the old file_stem=="*.tmp" guard
         // was dead code that could never match.)
-        // Read just enough to pull the metadata header. serde_json needs the
-        // full file but the payloads are small (a few KB), so we don't
-        // bother with a streaming parser.
-        let Ok(bytes) = std::fs::read(&path) else { continue };
-        let Ok(save) = serde_json::from_slice::<SaveFile>(&bytes) else {
-            // A corrupt save shouldn't hide the others. Skip + log upstream.
-            tracing::warn!(path = %path.display(), "skipping unreadable save file");
-            continue;
+        // (2026-08-16 audit LOW) FILENAME truth: the file stem is the
+        // authoritative save_id (every load path resolves id→filename), and
+        // the walked card folder is the authoritative card_id — internal
+        // values that disagree (hand-edited payload, manual file rename)
+        // used to make Continue target a nonexistent path. Internal values
+        // remain only as non-UTF8-stem fallbacks.
+        let stem_id = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .map(str::to_owned);
+        let (name, summary, timestamp, is_autosave, turn_count) = match read_save_header(&path) {
+            Some(h) => h,
+            None => {
+                // Header prefix failed to yield — full-parse fallback (old
+                // saves without turn_count, or a hand-mangled head).
+                let Ok(bytes) = std::fs::read(&path) else { continue };
+                let Ok(save) = serde_json::from_slice::<SaveFile>(&bytes) else {
+                    // A corrupt save shouldn't hide the others. Skip + log.
+                    tracing::warn!(path = %path.display(), "skipping unreadable save file");
+                    continue;
+                };
+                let mut session = save.session;
+                session.hydrate_schema_refs();
+                (save.name, save.summary, save.timestamp, save.is_autosave, session.messages.len())
+            }
         };
         out.push(SaveMeta {
-            save_id: save.save_id,
-            card_id: save.card_id,
-            name: save.name,
-            summary: save.summary,
-            timestamp: save.timestamp,
-            is_autosave: save.is_autosave,
-            turn_count: save.session.messages.len(),
+            save_id: stem_id.unwrap_or_else(|| card_id.to_owned()),
+            card_id: card_id.to_owned(),
+            name,
+            summary,
+            timestamp,
+            is_autosave,
+            turn_count,
         });
     }
     // Most-recent first.
     out.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
     Ok(out)
+}
+
+/// Read a save's metadata from a capped byte prefix without parsing the
+/// session/schema payloads. Cuts the text at the first unescaped
+/// `"session"` key (a needle that cannot occur inside a JSON string value:
+/// every `"` inside a value is backslash-escaped, breaking the needle at
+/// both ends), trims the trailing comma, closes the object, and
+/// deserializes the flat header. Returns `None` whenever any step doesn't
+/// line up — the caller falls back to a full parse.
+fn read_save_header(path: &Path) -> Option<(String, String, i64, bool, usize)> {
+    use std::io::Read;
+    const PREFIX_CAP: usize = 16 * 1024;
+    let mut file = std::fs::File::open(path).ok()?;
+    let mut buf: Vec<u8> = Vec::with_capacity(4096);
+    let mut chunk = [0u8; 4096];
+    loop {
+        let n = file.read(&mut chunk).ok()?;
+        if n == 0 {
+            break;
+        }
+        buf.extend_from_slice(&chunk[..n]);
+        // Stop as soon as the prefix contains the session marker.
+        if buf.windows(9).any(|w| w == b"\"session\"") || buf.len() >= PREFIX_CAP {
+            break;
+        }
+    }
+    let text = String::from_utf8_lossy(&buf);
+    let cut = text.find("\"session\"")?;
+    let mut prefix = text[..cut].trim_end().to_string();
+    if prefix.ends_with(',') {
+        prefix.pop();
+        prefix = prefix.trim_end().to_string();
+    }
+    prefix.push('}');
+    let header: SaveHeader = serde_json::from_str(&prefix).ok()?;
+    Some((
+        header.name,
+        header.summary,
+        header.timestamp,
+        header.is_autosave,
+        header.turn_count,
+    ))
 }
 
 /// Load a single save file. Returns Err if the file is missing or corrupt.
@@ -231,8 +334,13 @@ pub fn load_save(
 ) -> std::io::Result<SaveFile> {
     let path = resolve_save_path(fable_root, card_id, save_id);
     let bytes = std::fs::read(&path)?;
-    serde_json::from_slice::<SaveFile>(&bytes)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+    let mut save: SaveFile = serde_json::from_slice(&bytes)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    // (2026-08-16 audit H3) Resolve the wire-only schema pool into the
+    // per-message inline fields — the same hydrate `Conversation::load`
+    // runs, for the save-slot path.
+    save.session.hydrate_schema_refs();
+    Ok(save)
 }
 
 /// Delete a save slot. Idempotent (returns Ok if already gone).
@@ -343,7 +451,7 @@ mod tests {
         let schema = WorldSchema {
             summary: "Tester opened the door.".into(),
             recent_events: vec!["door_opened".into()],
-            entities: std::collections::HashMap::new(),
+            entities: std::collections::BTreeMap::new(),
             ..Default::default()
         };
 
@@ -450,7 +558,7 @@ mod tests {
         let schema = WorldSchema {
             summary: "The saga so far.".into(),
             recent_events: Vec::new(),
-            entities: std::collections::HashMap::new(),
+            entities: std::collections::BTreeMap::new(),
             ..Default::default()
         };
         let summary = derive_summary(&c, &schema);
@@ -464,6 +572,147 @@ mod tests {
         let summary = derive_summary(&c, &WorldSchema::default());
         assert!(summary.chars().count() <= 100);
         assert!(summary.ends_with('…'));
+    }
+
+    // ---- (2026-08-16 audit H3) schema pool + header-only listing --------
+
+    fn schema_with(summary: &str) -> WorldSchema {
+        let mut s = WorldSchema::default();
+        s.summary = summary.to_owned();
+        s
+    }
+
+    /// A 4-turn campaign-shaped session: each assistant turn's base equals
+    /// the PREVIOUS turn's active variant schema (the real production
+    /// pattern — turn N+1 acts on the world turn N left behind), so the
+    /// pool must collapse the 6 logical schema slots into 4 unique entries.
+    fn campaign_session() -> Conversation {
+        let mut c = Conversation::new();
+        c.add_message(Role::User, "turn 1".into());
+        c.add_assistant_turn("beat 1".into(), String::new(), "<r1>".into());
+        let s1 = schema_with("after turn 1");
+        {
+            let m = c.messages.last_mut().unwrap();
+            m.base_schema = Some(schema_with("start"));
+            m.variant_schemas = vec![s1.clone()];
+        }
+        c.add_message(Role::User, "turn 2".into());
+        c.add_assistant_turn("beat 2".into(), String::new(), "<r2>".into());
+        {
+            let m = c.messages.last_mut().unwrap();
+            // base of turn 2 == turn 1's variant schema (dedup case).
+            m.base_schema = Some(s1);
+            m.variant_schemas = vec![schema_with("after turn 2"), schema_with("after turn 2 reroll")];
+        }
+        c
+    }
+
+    #[test]
+    fn save_slots_pool_schemas_and_roundtrip() {
+        let tmp = tempdir().unwrap();
+        let card = fake_card();
+        let session = campaign_session();
+        let schema = schema_with("after turn 2"); // the live final state
+        write_save(tmp.path(), &card, "save_1", "Pooled", &session, &schema).unwrap();
+
+        let raw = std::fs::read_to_string(
+            resolve_save_path(tmp.path(), "test_card", "save_1"),
+        )
+        .unwrap();
+        // Wire shape: pooled refs, no inline schemas on messages.
+        assert!(raw.contains("\"schema_pool\""), "pool array present");
+        assert!(raw.contains("\"base_schema_ref\""), "base ref present");
+        assert!(raw.contains("\"variant_schema_refs\""), "variant refs present");
+        assert!(!raw.contains("\"base_schema\":"), "no inline base_schema");
+        assert!(!raw.contains("\"variant_schemas\":"), "no inline variant_schemas");
+        // 4 unique schemas in the pool (start, s1, after2, after2-reroll);
+        // `"summary":` occurrences = 4 pool entries + the save header's own
+        // summary + the live top-level schema's summary = 6.
+        assert_eq!(raw.matches("\"summary\":").count(), 6);
+
+        // Round-trip: full fidelity through the pool.
+        let loaded = load_save(tmp.path(), "test_card", "save_1").unwrap();
+        assert_eq!(loaded.session.messages.len(), 4);
+        assert!(loaded.session.schema_pool.is_empty(), "hydrated away");
+        let a1 = &loaded.session.messages[1];
+        assert_eq!(a1.base_schema.as_ref().unwrap().summary, "start");
+        assert_eq!(a1.variant_schemas.len(), 1);
+        assert_eq!(a1.variant_schemas[0].summary, "after turn 1");
+        let a2 = &loaded.session.messages[3];
+        assert_eq!(a2.base_schema.as_ref().unwrap().summary, "after turn 1");
+        assert_eq!(
+            a2.variant_schemas.iter().map(|s| s.summary.as_str()).collect::<Vec<_>>(),
+            vec!["after turn 2", "after turn 2 reroll"]
+        );
+    }
+
+    #[test]
+    fn list_saves_reads_header_prefix_only() {
+        let tmp = tempdir().unwrap();
+        let card = fake_card();
+        write_save(
+            tmp.path(),
+            &card,
+            "save_big",
+            "Big",
+            &campaign_session(),
+            &schema_with("live"),
+        )
+        .unwrap();
+        let list = list_saves(tmp.path(), "test_card").unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].turn_count, 4, "turn_count from the header prefix");
+        assert_eq!(list[0].summary, "turn 2");
+        assert_eq!(list[0].name, "Big");
+    }
+
+    /// A legacy pre-pool save (inline schemas, no turn_count) must still
+    /// list + load through the fallback path.
+    #[test]
+    fn legacy_inline_save_still_lists_and_loads() {
+        let tmp = tempdir().unwrap();
+        let dir = resolve_saves_dir(tmp.path(), "test_card");
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut session = Conversation::new();
+        session.add_message(Role::User, "legacy action".into());
+        {
+            session.add_assistant_turn("legacy beat".into(), String::new(), "<r>".into());
+            let m = session.messages.last_mut().unwrap();
+            m.base_schema = Some(schema_with("legacy world"));
+            m.variant_schemas = vec![schema_with("legacy world")];
+        }
+        // Serialize WITHOUT the pool transform — the old wire shape (plus no
+        // turn_count, as a pre-field save would have).
+        let value = serde_json::to_value(&session).unwrap();
+        let mut save_value = serde_json::json!({
+            "card_id": "test_card",
+            "save_id": "save_legacy",
+            "name": "Legacy",
+            "summary": "legacy action",
+            "timestamp": 123i64,
+            "is_autosave": false,
+            "session": value,
+            "schema": serde_json::to_value(schema_with("legacy world")).unwrap(),
+        });
+        // Strip turn_count if present (it isn't in this literal — belt+braces).
+        if let Some(o) = save_value.as_object_mut() {
+            o.remove("turn_count");
+        }
+        let path = dir.join("save_legacy.json");
+        std::fs::write(&path, serde_json::to_vec_pretty(&save_value).unwrap()).unwrap();
+
+        // Listing falls back to a full parse + hydrates for the count.
+        let list = list_saves(tmp.path(), "test_card").unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].turn_count, 2);
+        assert_eq!(list[0].summary, "legacy action");
+
+        // Loading hydrates the inline (pool-less) shape unchanged.
+        let loaded = load_save(tmp.path(), "test_card", "save_legacy").unwrap();
+        assert_eq!(
+            loaded.session.messages[1].base_schema.as_ref().unwrap().summary,
+            "legacy world"
+        );
     }
 
 }

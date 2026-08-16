@@ -30,7 +30,7 @@
 //! verified at compile time, and so the LLM delta path can NEVER corrupt
 //! canonical player state (it doesn't flow through `SchemaDelta`).
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use crate::equipment;
 
@@ -839,16 +839,20 @@ pub fn referee_evaluate_recovery(
     let stamina_recovered = state.stamina != Stamina::Fresh;
     // Worst healable injury: max severity rank among non-Black, non-Healthy
     // entries; canonical-order tie-break (first wins).
-    let mut worst: Option<(BodyPart, BodyPartState)> = None;
+    // (2026-08-16 audit LOW) The tracked rank is the CURRENT injury rank —
+    // the old code stored the HEALED (one-grade-down) rank, so ties resolved
+    // to the LAST part (docs promise the first) and a later one-grade-less
+    // injury could steal "worst" from an equal-grade earlier one.
+    let mut worst: Option<(BodyPart, BodyPartState, u8)> = None; // (part, healed, current rank)
     for part in BodyPart::all() {
         if let Some(st) = state.body.get(part) {
             if let Some(healed) = st.heal_step() {
                 let better = match worst {
                     None => true,
-                    Some((_, ref cur)) => st.rank() > cur.rank(),
+                    Some((.., cur_rank)) => st.rank() > cur_rank,
                 };
                 if better {
-                    worst = Some((*part, healed));
+                    worst = Some((*part, healed, st.rank()));
                 }
             }
         }
@@ -856,7 +860,10 @@ pub fn referee_evaluate_recovery(
     if !stamina_recovered && worst.is_none() {
         return None; // resting while fully healthy: nothing to recover
     }
-    Some(RecoveryOutcome { stamina_recovered, healed: worst })
+    Some(RecoveryOutcome {
+        stamina_recovered,
+        healed: worst.map(|(part, healed, _)| (part, healed)),
+    })
 }
 
 /// (2026-08-15 recovery seam) Apply a recovery outcome to the canonical
@@ -1087,7 +1094,7 @@ pub(crate) fn keyword_present(lower: &str, kw: &str) -> bool {
 }
 
 pub fn select_attacker_tier_from_entities(
-    entities: &std::collections::HashMap<String, serde_json::Value>,
+    entities: &std::collections::BTreeMap<String, serde_json::Value>,
     present_npc_ids: &[String],
 ) -> AttackerTier {
     // Single-pass scan: collect every npc.<id>.tier value for an NPC that is
@@ -1389,6 +1396,14 @@ struct SkillSpec {
     /// success; false-positive cost (rolled on "I tell the truth about
     /// persuasion") is a spurious check. Mirror COMBAT_KEYWORDS' bar.
     keywords: &'static [&'static str],
+    /// (2026-08-16 audit LOW) Keywords that must match as a COMPLETE word
+    /// (boundaries on both sides). `keyword_present` deliberately skips the
+    /// trailing boundary so "attacks" inflects "attack" — but "lie" then
+    /// fires on "liege" +, worse, the everyday "lie down" (a rest action,
+    /// not deception — it ALSO misroutes the recovery seam's classification
+    /// energy into a deceive roll). Only set where inflection tolerance
+    /// causes real damage; everything else keeps the lenient default.
+    whole_word: &'static [&'static str],
     /// Base DC before the ScenePacing modifier (Combat +2, Exploration +0,
     /// Downtime −2). Tuned for d20 (1..=20): 12 = coin-flip for an untrained
     /// player, 14 = slight disadvantage.
@@ -1411,6 +1426,7 @@ const SKILL_TABLE: &[SkillSpec] = &[
     SkillSpec {
         name: "lockpick",
         keywords: &["pick the lock", "pick lock", "lockpick", "pick a lock", "pickpocket"],
+        whole_word: &[],
         base_dc: 12,
         success_seed: "the lock clicks open",
         fail_seed: "the lock resists; your picks slip",
@@ -1418,6 +1434,7 @@ const SKILL_TABLE: &[SkillSpec] = &[
     SkillSpec {
         name: "sneak",
         keywords: &["sneak", "sneak past", "stealth", "hide", "slip past", "creep"],
+        whole_word: &[],
         base_dc: 12,
         success_seed: "you move unseen",
         fail_seed: "you are noticed",
@@ -1425,13 +1442,17 @@ const SKILL_TABLE: &[SkillSpec] = &[
     SkillSpec {
         name: "persuade",
         keywords: &["persuade", "convince", "talk into", "talk him into", "talk her into"],
+        whole_word: &[],
         base_dc: 14,
         success_seed: "your words land",
         fail_seed: "your words fall flat",
     },
     SkillSpec {
         name: "deceive",
-        keywords: &["bluff", "lie", "deceive", "fast-talk", "fast talk", "con "],
+        keywords: &["bluff", "deceive", "fast-talk", "fast talk", "con "],
+        // "lie" moved here: "lie down" (rest) + "liege" (a noun) used to roll
+        // a deceive check — a complete-word match only fires on the verb.
+        whole_word: &["lie"],
         base_dc: 14,
         success_seed: "the lie holds",
         fail_seed: "the lie unravels",
@@ -1439,11 +1460,38 @@ const SKILL_TABLE: &[SkillSpec] = &[
     SkillSpec {
         name: "intimidate",
         keywords: &["intimidate", "threaten", "scare", "menace"],
+        whole_word: &[],
         base_dc: 13,
         success_seed: "they flinch",
         fail_seed: "they stand firm",
     },
 ];
+
+/// Whole-word variant of [`keyword_present`]: the keyword must sit at word
+/// boundaries on BOTH sides (used only for keywords whose lenient match
+/// false-positives on everyday prose — see `SkillSpec::whole_word`).
+pub(crate) fn keyword_whole_word(lower: &str, kw: &str) -> bool {
+    let mut from = 0;
+    while let Some(pos) = lower[from..].find(kw) {
+        let at = from + pos;
+        let end = at + kw.len();
+        let leading_ok = lower[..at]
+            .chars()
+            .next_back()
+            .map(|c| !c.is_alphanumeric())
+            .unwrap_or(true);
+        let trailing_ok = lower[end..]
+            .chars()
+            .next()
+            .map(|c| !c.is_alphanumeric())
+            .unwrap_or(true);
+        if leading_ok && trailing_ok {
+            return true;
+        }
+        from = at + kw.len().max(1);
+    }
+    false
+}
 
 /// Roll a single d20 (1..=20) using the provided Roller. Exposed so tests can
 /// construct a Roller with a known seed and assert the roll value directly.
@@ -1479,7 +1527,11 @@ pub fn referee_evaluate_skill_checks(text: &str, pacing_dc_mod: i32) -> Vec<Skil
     let text_hash = hash_text(text);
     let mut out = Vec::new();
     for (idx, spec) in SKILL_TABLE.iter().enumerate() {
-        let triggered = spec.keywords.iter().any(|kw| keyword_present(&lower, kw));
+        let triggered = spec.keywords.iter().any(|kw| keyword_present(&lower, kw))
+            || spec
+                .whole_word
+                .iter()
+                .any(|kw| keyword_whole_word(&lower, kw));
         if !triggered {
             continue;
         }
@@ -1694,7 +1746,7 @@ const SCRUTINIZED_FAIL_SEED: &str = "the act cracks under scrutiny; the disguise
 pub fn evaluate_disguise_gate(
     text: &str,
     tags: &[crate::consequence::StatusTag],
-    entities: &HashMap<String, serde_json::Value>,
+    entities: &BTreeMap<String, serde_json::Value>,
     present_npc_ids: &[String],
     pacing_dc_mod: i32,
 ) -> Option<DisguiseDirective> {
@@ -2697,8 +2749,8 @@ mod tests {
         }
     }
 
-    fn entities_with_tier(tier: &str) -> HashMap<String, serde_json::Value> {
-        let mut m = HashMap::new();
+    fn entities_with_tier(tier: &str) -> BTreeMap<String, serde_json::Value> {
+        let mut m = BTreeMap::new();
         m.insert(
             "npc.guard1.tier".into(),
             serde_json::Value::String(tier.into()),

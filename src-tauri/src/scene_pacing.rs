@@ -76,6 +76,13 @@ const EMOTIONAL_CALM: &[&str] = &[
     "rest", "sleep", "relax", "wait", "sit", "drink", "eat", "dine", "chat",
     "talk", "listen", "watch", "trade", "barter", "buy", "sell", "shop",
     "browse", "hum", "sing softly", "think",
+    // (2026-08-16 audit fix #7) The recovery Referee needs Downtime AND a
+    // REST_KEYWORD; these rest verbs were in REST_KEYWORDS but NOT here, so
+    // "we camp for the night" classified Exploration → zero recovery — the
+    // monotonic-decline economy the recovery seam exists to exit persisted
+    // for exactly the verbs its own doc comment lists. "watch" stays OUT of
+    // the tense pillar (see below) but IN here — a watching sentry camps.
+    "camp", "nap", "recuperate", "convalesce", "bandage", "mend",
 ];
 
 const EMOTIONAL_TENSE: &[&str] = &[

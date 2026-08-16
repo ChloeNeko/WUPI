@@ -521,7 +521,10 @@ pub fn parse_from_xml_str(xml: &str) -> anyhow::Result<SimCard> {
 /// authored CDATA prose (legal XML — the slice cut mid-CDATA, the head became
 /// unparseable, and the card silently degraded to the fallback stub) and
 /// (b) whitespace before `>` (`</sim_card >` — valid XML the find missed).
-fn find_root_close(xml: &str) -> Option<usize> {
+/// (2026-08-16 audit fix #22) Pub(crate): `fable_card_set_intro` slices the
+/// same two-root boundary when rewriting the `<intro>` sibling — its own
+/// naive `find` made any card whose CDATA contains the literal un-editable.
+pub(crate) fn find_root_close(xml: &str) -> Option<usize> {
     let b = xml.as_bytes();
     let starts = |i: usize, pat: &[u8]| b.len() >= i + pat.len() && &b[i..i + pat.len()] == pat;
     let mut i = 0;
@@ -982,8 +985,24 @@ fn extract_sibling_intro(tail: &str) -> String {
 }
 
 /// The concatenated text of a node (CDATA + plain text children merged).
+/// (2026-08-16 audit fix #21) `Node::text()` returns only the FIRST text
+/// child — legal prose split across CDATA/comment/CDATA spans
+/// (`<![CDATA[part one]]> <!-- aside --> <![CDATA[part two]]>`) silently
+/// truncated at the comment. Concatenate EVERY text child in document
+/// order (roxmltree already merges CDATA sections into text nodes).
 fn text_content(node: roxmltree::Node) -> String {
-    node.text().unwrap_or("").to_owned()
+    if !node.has_children() {
+        return node.text().unwrap_or("").to_owned();
+    }
+    let mut out = String::new();
+    for child in node.children() {
+        if child.is_text() {
+            if let Some(t) = child.text() {
+                out.push_str(t);
+            }
+        }
+    }
+    out
 }
 
 /// Find the first direct child element with the given tag name.

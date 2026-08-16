@@ -13,7 +13,7 @@
 //! `fable_json_raw_set(kind="player")` unchanged. All fields are `#[serde
 //! (default)]` so existing saves load without migration.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 // ---------------------------------------------------------------------------
 // The six equipment slots — map 1:1 to body-part anchors on the paperdoll.
@@ -409,7 +409,7 @@ fn contains_any(hay: &str, needles: &[&str]) -> bool {
 /// (the deleted `panels/inventory.js` read-view) — once migrated, the typed
 /// model is the sole source of truth.
 pub fn migrate_legacy_items(
-    entities: &mut HashMap<String, serde_json::Value>,
+    entities: &mut BTreeMap<String, serde_json::Value>,
     equipment: &mut Equipment,
     pack: &mut Vec<StackItem>,
 ) {
@@ -441,7 +441,18 @@ pub fn migrate_legacy_items(
             .strip_prefix("item_")
             .or_else(|| raw_key.strip_prefix("inv_"))
             .unwrap_or(&raw_key);
-        let name = prettify(slug);
+        let mut name = prettify(slug);
+        // (2026-08-16 audit LOW) Name hygiene before it enters the typed
+        // model (it persists to player.json + renders into the carry-back):
+        // drop empties entirely (an `item_` key with a bare slug migrates as
+        // a nameless ghost stack) + clamp oversize slugs to the INV_NAME_MAX
+        // discipline instead of storing a paragraph-long "name".
+        name = name.trim().chars().take(crate::bracket_parser::INV_NAME_MAX).collect();
+        if name.is_empty() {
+            entities.remove(&raw_key);
+            continue;
+        }
+        let name = name;
         let state = state_raw.trim().to_lowercase();
 
         // State hint: "equipped" → slot Outer; "N in pack" / "N" → pack qty N.
@@ -665,7 +676,7 @@ mod tests {
 
     #[test]
     fn migrate_legacy_items_routes_weapon_to_main_hand() {
-        let mut entities: HashMap<String, serde_json::Value> = HashMap::new();
+        let mut entities: BTreeMap<String, serde_json::Value> = BTreeMap::new();
         entities.insert("item_iron_sword".into(), serde_json::Value::String("equipped".into()));
         let mut equipment = Equipment::new();
         let mut pack = Vec::new();
@@ -678,7 +689,7 @@ mod tests {
 
     #[test]
     fn migrate_legacy_items_routes_unknown_to_pack() {
-        let mut entities: HashMap<String, serde_json::Value> = HashMap::new();
+        let mut entities: BTreeMap<String, serde_json::Value> = BTreeMap::new();
         entities.insert(
             "inv_health_potion".into(),
             serde_json::Value::String("3 in pack".into()),
@@ -694,7 +705,7 @@ mod tests {
 
     #[test]
     fn migrate_legacy_items_is_idempotent() {
-        let mut entities: HashMap<String, serde_json::Value> = HashMap::new();
+        let mut entities: BTreeMap<String, serde_json::Value> = BTreeMap::new();
         entities.insert("item_iron_sword".into(), serde_json::Value::String("equipped".into()));
         let mut equipment = Equipment::new();
         let mut pack = Vec::new();
@@ -713,7 +724,7 @@ mod tests {
     #[test]
     fn migrate_legacy_items_slot_contention_is_deterministic() {
         let build = || {
-            let mut entities: HashMap<String, serde_json::Value> = HashMap::new();
+            let mut entities: BTreeMap<String, serde_json::Value> = BTreeMap::new();
             // Both route to chest ("armor"/"vest" keywords): alphabetically
             // "item_iron_vest" < "item_leather_armor", so the vest takes
             // Outer deterministically.
@@ -751,7 +762,7 @@ mod tests {
     fn migrate_legacy_items_skips_structured_values() {
         // Widening guard (2026-08-11): a structured JSON value at an item_* key
         // is unrecognized noise — leave it in the entity map untouched.
-        let mut entities: HashMap<String, serde_json::Value> = HashMap::new();
+        let mut entities: BTreeMap<String, serde_json::Value> = BTreeMap::new();
         entities.insert(
             "item_strange".into(),
             serde_json::json!({ "enchantment": "unknown" }),

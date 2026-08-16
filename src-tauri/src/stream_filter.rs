@@ -344,23 +344,21 @@ impl StreamFilter {
                     effective_end = self.cursor + opener_pos;
                 }
             } else {
-                // Sub-case 2: partial opener. Scan backticks from the right.
-                // A backtick run of length 1-3 at the slice end could be the
-                // start of ```json; longer runs already matched sub-case 1
-                // or are complete openers (handled above). Hold the run.
+                // Sub-case 2: partial opener. The slice's tail may be ANY
+                // proper prefix of ` ```json ` — check all 7 non-complete
+                // positions, longest first. (2026-08-16 audit LOW) The old
+                // trailing-backtick-run check only held positions 1-3
+                // (`/``/```); a tail like ` ```js ` leaked the opener into
+                // the live stream. Latent today (the sole with_brackets
+                // consumer's chunks go to a no-op sink) but the filter is a
+                // shared utility — hold every boundary position.
+                const OPENER: &[u8] = b"```json";
                 let bytes = slice_so_far.as_bytes();
-                let mut bt_end = bytes.len();
-                while bt_end > 0 && bytes[bt_end - 1] == b'`' {
-                    bt_end -= 1;
-                }
-                let bt_run = bytes.len() - bt_end;
-                // Hold only if it's a proper prefix of the 3-backtick opener
-                // (1 or 2 backticks). A run of exactly 3 with no `json`
-                // following is ambiguous — could be the opener's first 3
-                // chars OR a complete (but body-less) fence; hold it too,
-                // the next chunk disambiguates.
-                if matches!(bt_run, 1 | 2 | 3) {
-                    effective_end = self.cursor + bt_end;
+                for k in (1..OPENER.len()).rev() {
+                    if bytes.len() >= k && &bytes[bytes.len() - k..] == &OPENER[..k] {
+                        effective_end = self.cursor + bytes.len() - k;
+                        break;
+                    }
                 }
             }
         }

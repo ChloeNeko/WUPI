@@ -60,6 +60,12 @@ export function initBeats(el) {
 
 export function clearFeed() {
   if (feedEl) feedEl.innerHTML = '';
+  // (2026-08-16 audit fix #26) Drop the open-editor bookkeeping with the
+  // wiped nodes: `editingBeat` holds a strong ref that survived the wipe, so
+  // a stale editor crossed sessions and its next commit path fired a phantom
+  // edit_message at the NEW session. The editor's listeners die with the
+  // node (editClosers is a WeakMap) — only this ref needed clearing.
+  editingBeat = null;
 }
 
 // Auto-scroll the feed to its bottom. Throttled per-call via rAF so a

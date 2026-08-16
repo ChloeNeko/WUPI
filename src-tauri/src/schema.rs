@@ -377,8 +377,20 @@ impl TravelGraph {
                     .unwrap_or_else(|| id.clone())
             })
             .collect();
+        // (2026-08-16 audit LOW) Bounded exits line — the one unbounded
+        // `<world_state>` render: hub nodes accumulate neighbors across a
+        // whole campaign, inflating every turn's tracker prompt. Cap the
+        // listed exits with a `(+N more)` marker (same shape as the
+        // carry-back caps).
+        const EXITS_RENDER_CAP: usize = 8;
         let exits_str = if exits.is_empty() {
             "none".to_string()
+        } else if exits.len() > EXITS_RENDER_CAP {
+            let extra = exits.len() - EXITS_RENDER_CAP;
+            format!(
+                "{} (+{extra} more)",
+                exits[..EXITS_RENDER_CAP].join(", ")
+            )
         } else {
             exits.join(", ")
         };
@@ -400,6 +412,22 @@ impl TravelGraph {
             return false;
         }
         if self.find_node(&node.id).is_some() {
+            return false;
+        }
+        // (2026-08-16 audit fix #14) Stored-node cap: a tracker that mints
+        // [DISCOVER] nodes every turn grew the graph (rendered into the
+        // tracker prompt + folded WHOLE into every schema-engine pass)
+        // unboundedly across a long campaign. Refuse NEW nodes at the cap —
+        // returning false reads as "duplicate" to the applier (no snapshot,
+        // no mutation). Authored cards seed well under it; evicting an
+        // authored hub to make room for one more discovered clearing would
+        // be worse than refusing it.
+        if self.nodes.len() >= MAX_TRAVEL_NODES {
+            tracing::warn!(
+                len = self.nodes.len(),
+                node_id = %node.id,
+                "travel-graph node cap reached; refusing new node"
+            );
             return false;
         }
         let new_id = node.id.clone();
@@ -608,6 +636,19 @@ impl NpcRegistry {
         if self.find(&entry.id).is_some() {
             return false;
         }
+        // (2026-08-16 audit fix #14) Registry cap, same growth guard as the
+        // travel-graph nodes: a registry bloated by [NPC_REGISTER] spam rides
+        // every save + every schema-engine pass. Refuse at the cap (false =
+        // the applier's duplicate semantics).
+        const MAX_NPC_REGISTRY: usize = 96;
+        if self.entries.len() >= MAX_NPC_REGISTRY {
+            tracing::warn!(
+                len = self.entries.len(),
+                npc_id = %entry.id,
+                "npc registry cap reached; refusing new entry"
+            );
+            return false;
+        }
         self.entries.push(entry);
         true
     }
@@ -669,6 +710,14 @@ pub struct Presence {
 /// prompt-side fix (the `<per_turn_presence>` maintainer discipline) is the
 /// real cure; this TTL is the defensive net beneath it.
 pub const PRESENCE_GRACE_RESET: u32 = 4;
+
+/// (2026-08-16 audit LOW) Shared growth caps for the typed referee-owned
+/// collections — the bracket appliers (lib.rs) + `merge_patch`'s
+/// full-replace defense (`enforce_typed_caps`) agree on one set of numbers.
+pub const MAX_TRACKED_RELATIONSHIPS: usize = 48;
+pub const MAX_STORED_TASKS: usize = 20;
+pub const MAX_STORED_RUMORS: usize = 20;
+pub const MAX_TRAVEL_NODES: usize = 96;
 
 /// The scene pacing mode (Fable Seam #4 expansion, 2026-07-27): a
 /// Rust-computed per-turn classification of the scene's rhythm. Drives:
@@ -841,7 +890,19 @@ pub struct WorldSchema {
     /// as a delete by `apply_delta` (matches the `Option<String>` semantics
     /// the delta has always used).
     #[serde(default)]
-    pub entities: HashMap<String, serde_json::Value>,
+    pub entities: BTreeMap<String, serde_json::Value>,
+
+    /// (2026-08-16 audit fix #14) First-insert order of `entities` — the
+    /// FIFO eviction key for [`WorldSchema::enforce_entity_cap`]. Entities
+    /// accumulated unboundedly in long campaigns (deletion is model-
+    /// discretionary), and the whole-schema JSON folded into every delta/
+    /// translation/progression prompt blew the 2048-token budget around
+    /// turn ~100-200 — the middle-drop then permanently spliced the schema
+    /// the model must diff against. Re-upserting an existing key does NOT
+    /// refresh its slot (the original insert order stands). Empty for legacy
+    /// saves → backfilled deterministically (sorted) on first enforcement.
+    #[serde(default, skip_serializing_if = "std::collections::VecDeque::is_empty")]
+    pub entity_order: std::collections::VecDeque<String>,
 
     /// The player's canonical state (Fable Seam #7, Player State).
     /// Rust is the SOLE authority here — the schema-delta LLM pass never
@@ -1109,6 +1170,7 @@ impl WorldSchema {
             self.cap_recent_events();
         }
         if let Some(ents) = delta.entities {
+            let mut grew = false;
             for (key, value) in ents {
                 // (2026-08-15 audit fix) Legacy freeform inventory keys are
                 // refused here, not just swept at load: the load-time
@@ -1123,12 +1185,67 @@ impl WorldSchema {
                 }
                 match value {
                     Some(v) => {
+                        if !self.entities.contains_key(&key) {
+                            self.entity_order.push_back(key.clone());
+                            grew = true;
+                        }
                         self.entities.insert(key, v);
                     }
                     None => {
                         self.entities.remove(&key);
                     }
                 }
+            }
+            if grew {
+                self.enforce_entity_cap();
+            }
+        }
+    }
+
+    /// (2026-08-16 audit fix #14) Total-entity cap with FIFO eviction — see
+    /// `entity_order`. `player.*` keys are NEVER evicted: they are the
+    /// identity ground truth seeded at attach (§6C; the narrator + retrieval
+    /// read them as who the player IS). If protected keys alone exceed the
+    /// cap they all stay — the cap is a growth guard, not a hard wall.
+    pub fn enforce_entity_cap(&mut self) {
+        const ENTITY_TOTAL_CAP: usize = 500;
+        if self.entities.len() <= ENTITY_TOTAL_CAP {
+            return;
+        }
+        // Deterministic backfill for legacy saves (no order list): sorted
+        // keys stand in for insert order — arbitrary but stable.
+        if self.entity_order.is_empty() && !self.entities.is_empty() {
+            let mut keys: Vec<String> = self.entities.keys().cloned().collect();
+            keys.sort();
+            self.entity_order = keys.into();
+        }
+        let mut idx = 0;
+        while self.entities.len() > ENTITY_TOTAL_CAP && idx < self.entity_order.len() {
+            let key = self.entity_order[idx].clone();
+            if !self.entities.contains_key(&key) {
+                // Deleted since ordering — drop the stale slot.
+                self.entity_order.remove(idx);
+                continue;
+            }
+            if key.starts_with("player.") {
+                idx += 1;
+                continue;
+            }
+            self.entities.remove(&key);
+            self.entity_order.remove(idx);
+            tracing::info!(%key, "entity cap (500) reached; oldest entity FIFO-evicted");
+        }
+        // Re-sync: any map keys the order list never knew (seeded outside
+        // the model paths) append at the tail so future sweeps see them.
+        if self.entity_order.len() < self.entities.len() {
+            let missing: Vec<String> = self
+                .entities
+                .keys()
+                .filter(|k| !self.entity_order.iter().any(|o| o.as_str() == k.as_str()))
+                .cloned()
+                .collect();
+            for k in missing {
+                self.entity_order.push_back(k);
             }
         }
     }
@@ -1225,6 +1342,7 @@ impl WorldSchema {
                     let map = value
                         .as_object()
                         .ok_or_else(|| "entities must be an object".to_string())?;
+                    let mut grew = false;
                     for (ek, ev) in map {
                         // (2026-08-15 audit fix) Same legacy-key refusal as
                         // apply_delta — the typed inventory owns items; a
@@ -1238,8 +1356,17 @@ impl WorldSchema {
                         if ev.is_null() {
                             self.entities.remove(ek);
                         } else {
+                            if !self.entities.contains_key(ek) {
+                                self.entity_order.push_back(ek.clone());
+                                grew = true;
+                            }
                             self.entities.insert(ek.clone(), ev.clone());
                         }
+                    }
+                    // (2026-08-16 audit fix #14) Same total-entity cap as
+                    // apply_delta — the patch path grows entities too.
+                    if grew {
+                        self.enforce_entity_cap();
                     }
                     merged.push("entities".into());
                 }
@@ -1259,8 +1386,20 @@ impl WorldSchema {
                     merged.push("weather".into());
                 }
                 "travel_graph" => {
-                    self.travel_graph = serde_json::from_value(value)
+                    let graph: TravelGraph = serde_json::from_value(value)
                         .map_err(|e| format!("travel_graph: {e}"))?;
+                    // (2026-08-16 audit LOW) Refuse-at-cap, the applier's
+                    // discipline — a full-replace graph over the node cap is
+                    // a corrupt/hostile patch, and truncating could drop an
+                    // authored hub mid-list.
+                    if graph.nodes.len() > MAX_TRAVEL_NODES {
+                        return Err(format!(
+                            "travel_graph: {} nodes exceeds the {} cap",
+                            graph.nodes.len(),
+                            MAX_TRAVEL_NODES
+                        ));
+                    }
+                    self.travel_graph = graph;
                     merged.push("travel_graph".into());
                 }
                 "scene_pacing" => {
@@ -1308,6 +1447,13 @@ impl WorldSchema {
                     ));
                 }
             }
+        }
+        // (2026-08-16 audit LOW) Typed full-replace defense-in-depth: clamp
+        // the referee-owned collections to their growth caps (the dispatch
+        // pre-filter is the primary gate; this is the backstop for the raw
+        // JSON tab + any future caller).
+        if !merged.is_empty() {
+            self.enforce_typed_caps();
         }
         Ok(merged)
     }
@@ -1594,10 +1740,101 @@ impl WorldSchema {
         out.trim_end().to_string()
     }
 
-    /// Serialize for the delta pass's "current schema" prompt input. Pretty-
-    /// printed JSON so the model can read it clearly; the schema is small.
+    /// Serialize for the delta pass's "current schema" prompt input —
+    /// PROMPT-SHAPED, not save-shaped (2026-08-16 audit H2). The old
+    /// `to_json_pretty` fold serialized the ENTIRE struct; at the
+    /// long-campaign growth caps (entities ≤ 500 with `entity_order`
+    /// re-serializing every key a second time as pure bookkeeping, all 50
+    /// stored `recent_events` instead of the rendered window, the
+    /// deliberately-unbounded pack riding inside `player_state`) that is
+    /// 5-10× the 1792-token prompt budget — the middle-drop then goes
+    /// permanently active and the delta model diffs against a flickering
+    /// head+tail subset of its own schema, re-minting duplicate entities
+    /// and missing mid-list mutations. This was precisely the failure the
+    /// growth caps were built to kill, one layer down.
+    ///
+    /// Carries ONLY what the schema-engine passes read or write:
+    /// `summary`, the last `EVENTS_PROMPT_CAP` `recent_events` (the same
+    /// window `render_for_prompt` shows the narrator), and `entities`
+    /// (BTreeMap → sorted keys, the diff target — deterministic across
+    /// turns so the middle-drop subset can't flicker). Rust-owned referee
+    /// fields (`player_state`, `world_clock`, `weather`, `travel_graph`,
+    /// `status_tags`, …) are omitted: no schema-engine pass may write
+    /// them, so they are dead prompt weight (Prime Mandate). Compact JSON
+    /// — no pretty-print indentation. A single entity value whose
+    /// serialized form exceeds `ENTITY_VALUE_PROMPT_CHARS` collapses to a
+    /// marker string so one giant blob can't eat the budget (the model may
+    /// still overwrite or null-delete the key).
+    pub fn to_json_prompt(&self) -> String {
+        const EVENTS_PROMPT_CAP: usize = 5;
+        const ENTITY_VALUE_PROMPT_CHARS: usize = 400;
+        let events: Vec<&String> = if self.recent_events.len() > EVENTS_PROMPT_CAP {
+            self.recent_events[self.recent_events.len() - EVENTS_PROMPT_CAP..].iter().collect()
+        } else {
+            self.recent_events.iter().collect()
+        };
+        let entities: serde_json::Map<String, serde_json::Value> = self
+            .entities
+            .iter()
+            .map(|(k, v)| {
+                let compact = serde_json::to_string(v).unwrap_or_default();
+                let value = if compact.chars().count() <= ENTITY_VALUE_PROMPT_CHARS {
+                    v.clone()
+                } else {
+                    serde_json::Value::String("<long value omitted>".to_string())
+                };
+                (k.clone(), value)
+            })
+            .collect();
+        let obj = serde_json::json!({
+            "summary": self.summary,
+            "recent_events": events,
+            "entities": entities,
+        });
+        serde_json::to_string(&obj).unwrap_or_else(|_| "{}".to_string())
+    }
+
+    /// Full-struct pretty serialization. NOT a prompt input — the whole
+    /// struct easily outgrows the schema-engine prompt budget (see
+    /// [`WorldSchema::to_json_prompt`]); use that for any prompt-shaped
+    /// consumer. This is the save/debug/manager-query surface.
     pub fn to_json_pretty(&self) -> String {
         serde_json::to_string_pretty(self).unwrap_or_else(|_| "{}".to_string())
+    }
+
+    /// (2026-08-16 audit LOW) Clamp the typed referee-owned collections to
+    /// their growth caps after a `merge_patch` full-replace. The dispatch
+    /// pre-filter is the primary gate (model patches never reach these
+    /// fields), but the mutation fn itself must not install what the bracket
+    /// appliers would refuse — the raw-editor JSON tab + any future caller
+    /// route through here too. Vec fields truncate FIFO (oldest dropped);
+    /// the relationships map keeps the first 48 keys in sorted order
+    /// (deterministic); a travel graph over the node cap is a hard error
+    /// (refusing an authored hub beats silently dropping it — checked at
+    /// the install arm, not here).
+    pub fn enforce_typed_caps(&mut self) {
+        let tag_cap = crate::settings::FABLE_STATUS_TAG_CAP;
+        if self.status_tags.len() > tag_cap {
+            let overflow = self.status_tags.len() - tag_cap;
+            self.status_tags.drain(..overflow);
+        }
+        if self.offscreen_tasks.len() > MAX_STORED_TASKS {
+            let overflow = self.offscreen_tasks.len() - MAX_STORED_TASKS;
+            self.offscreen_tasks.drain(..overflow);
+        }
+        if self.rumors.len() > MAX_STORED_RUMORS {
+            let overflow = self.rumors.len() - MAX_STORED_RUMORS;
+            self.rumors.drain(..overflow);
+        }
+        if self.relationships.len() > MAX_TRACKED_RELATIONSHIPS {
+            let keep: std::collections::HashSet<String> =
+                std::collections::BTreeSet::from_iter(self.relationships.keys().cloned())
+                    .into_iter()
+                    .take(MAX_TRACKED_RELATIONSHIPS)
+                    .collect();
+            self.relationships.retain(|k, _| keep.contains(k));
+        }
+        self.cap_recent_events();
     }
 
     /// Atomic save to `world_schema.json` (temp + fsync + rename, same pattern
@@ -1709,8 +1946,10 @@ impl WorldSchema {
         // to a stale player.json — both individually valid JSON, so the
         // corrupt-file guard couldn't catch the combination). Staging shrinks
         // the cross-file window to the rename sequence; a crash mid-write
-        // leaves every original untouched + only stray temps behind (the
-        // next save clears its own temp; temps never load).
+        // (2026-08-16 audit fix #13) Each of the three temps is UNIQUE per
+        // write — racing `save_schema` callers each stage their own trio;
+        // a crashed writer's stale temps are inert grime (never loaded, and
+        // nothing renames over them).
         let world_json = serde_json::to_string_pretty(&world)?;
         let player_json = serde_json::to_string_pretty(&player)?;
         let npc_json = serde_json::to_string_pretty(&npc)?;
@@ -1722,7 +1961,6 @@ impl WorldSchema {
             (&player_tmp, &player_json),
             (&npc_tmp, &npc_json),
         ] {
-            let _ = std::fs::remove_file(tmp); // clear stale temp
             let mut file = std::fs::File::create(tmp)?;
             std::io::Write::write_all(&mut file, body.as_bytes())?;
             std::io::Write::flush(&mut file)?;
@@ -1730,10 +1968,29 @@ impl WorldSchema {
         }
         std::fs::rename(&world_tmp, world_path)?;
         std::fs::rename(&player_tmp, player_path)?;
-        std::fs::rename(&npc_tmp, npc_path)
+        let r = std::fs::rename(&npc_tmp, npc_path);
+        if r.is_err() {
+            // Never leave THIS write's temps behind as grime on failure.
+            let _ = std::fs::remove_file(&world_tmp);
+            let _ = std::fs::remove_file(&player_tmp);
+            let _ = std::fs::remove_file(&npc_tmp);
+        }
+        r
     }
 
-    /// The inverse of [`save_split`]: read the three sibling files, deep-merge
+    /// Human-readable JSON type name for error messages ("array", "string", …).
+fn type_name_of_value(v: &serde_json::Value) -> &'static str {
+    match v {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "a boolean",
+        serde_json::Value::Number(_) => "a number",
+        serde_json::Value::String(_) => "a string",
+        serde_json::Value::Array(_) => "an array",
+        serde_json::Value::Object(_) => "an object",
+    }
+}
+
+/// The inverse of [`save_split`]: read the three sibling files, deep-merge
     /// their `entities` maps, and deserialize the merged object into one
     /// `WorldSchema`. Any missing file contributes nothing (its keys fall back
     /// to `#[serde(default)]`), so a pre-split save (only `world.json` exists)
@@ -1762,14 +2019,35 @@ impl WorldSchema {
             for (k, v) in obj {
                 if k == "entities" {
                     // Deep-merge: both sides' entities objects union together.
+                    // (2026-08-16 audit LOW) A non-object `entities` value
+                    // (hand-edit, corrupt write) used to be swallowed
+                    // SILENTLY — the partition reset to empty, violating the
+                    // refuse-don't-reset contract every other corrupt-state
+                    // path here upholds. Fail the load instead.
+                    let Some(src_map) = v.as_object() else {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            format!(
+                                "{}: `entities` is not an object (got {})",
+                                path.display(),
+                                Self::type_name_of_value(v)
+                            ),
+                        ));
+                    };
                     let target = merged
                         .entry("entities".to_string())
                         .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
-                    if let (Some(target_map), Some(src_map)) =
-                        (target.as_object_mut(), v.as_object())
-                    {
-                        for (ek, ev) in src_map {
-                            target_map.insert(ek.clone(), ev.clone());
+                    // Defensive: the accumulated target should always be an
+                    // object (only this branch writes it) — if a prior file
+                    // somehow poisoned it, replace rather than silently drop.
+                    match target.as_object_mut() {
+                        Some(target_map) => {
+                            for (ek, ev) in src_map {
+                                target_map.insert(ek.clone(), ev.clone());
+                            }
+                        }
+                        None => {
+                            *target = v.clone();
                         }
                     }
                 } else {
@@ -1966,6 +2244,36 @@ impl BootstrapAnchors {
             location_name: Option<String>,
         }
         let parsed: Raw = serde_json::from_str(&repaired)?;
+        // (2026-08-16 audit M2) Free-text anchor strings render verbatim into
+        // `<world_state>` (`weather:`/`location:` lines) — the same control-
+        // char/newline gate every other render-facing field got. A
+        // newline-laden model string would forge fake state lines into every
+        // subsequent turn + save.
+        fn clean_anchor(raw: String, cap: usize) -> Option<String> {
+            let flattened: String = raw
+                .chars()
+                .map(|c| match c {
+                    '\n' | '\r' | '\t' => ' ',
+                    _ => c,
+                })
+                .collect();
+            let cleaned: String = flattened
+                .chars()
+                .filter(|c| {
+                    let code = *c as u32;
+                    !((code <= 0x08)
+                        || code == 0x0B
+                        || code == 0x0C
+                        || (0x0E..=0x1F).contains(&code))
+                })
+                .collect();
+            let cleaned = cleaned.trim().chars().take(cap).collect::<String>();
+            if cleaned.is_empty() {
+                None
+            } else {
+                Some(cleaned)
+            }
+        }
         // time → minutes (a parse failure is a soft None, not a hard Err).
         let time_minutes = parsed
             .time
@@ -1973,19 +2281,17 @@ impl BootstrapAnchors {
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .and_then(|s| crate::bracket_parser::parse_in_world_time(s));
-        let weather = parsed
-            .weather
-            .map(|w| w.trim().to_string())
-            .filter(|w| !w.is_empty());
+        const ANCHOR_TEXT_MAX: usize = 80;
+        let weather = parsed.weather.and_then(|w| clean_anchor(w, WEATHER_ANCHOR_MAX));
         // location: require BOTH id + name (a partial pair is useless).
         let location = match (parsed.location_id, parsed.location_name) {
             (Some(id), Some(name)) => {
-                let id = id.trim().to_string();
-                let name = name.trim().to_string();
-                if id.is_empty() || name.is_empty() {
-                    None
-                } else {
-                    Some((id, name))
+                match (
+                    clean_anchor(id, ANCHOR_TEXT_MAX),
+                    clean_anchor(name, ANCHOR_TEXT_MAX),
+                ) {
+                    (Some(id), Some(name)) => Some((id, name)),
+                    _ => None,
                 }
             }
             _ => None,
@@ -1993,6 +2299,11 @@ impl BootstrapAnchors {
         Ok(Self { time_minutes, weather, location })
     }
 }
+
+/// Cap for the bootstrap-derived weather condition (audit M2; the
+/// `[WEATHER]` bracket path uses the tighter `WEATHER_CONDITION_MAX`
+/// discipline — this matches it).
+const WEATHER_ANCHOR_MAX: usize = 60;
 
 /// Extract the reply channel from Gemma4 protocol output. The model emits
 /// `<|channel>thought\n...<channel|>reply`: the thought channel (internal
@@ -2043,13 +2354,17 @@ fn strip_markdown_fences(s: &str) -> &str {
 }
 
 /// Build a sibling temp-file path for an atomic save. Mirrors
-/// `session::temp_path_for`: same directory/volume so `rename` is atomic.
+/// `session::temp_path_for`: same directory/volume so `rename` is atomic,
+/// UNIQUE per write (2026-08-16 audit fix #13 — `save_schema` has 5 call
+/// sites and no serialization lock; the old fixed `.tmp` let racing writers
+/// interleave on one file).
 fn temp_path_for(path: &Path) -> std::path::PathBuf {
     let mut name = path
         .file_name()
         .map(std::ffi::OsString::from)
         .unwrap_or_else(|| std::ffi::OsString::from("wupi.tmp"));
-    name.push(".tmp");
+    name.push(".");
+    name.push(crate::fable_save::unique_tmp_suffix());
     path.with_file_name(name)
 }
 
@@ -2084,7 +2399,7 @@ mod tests {
         let mut schema = WorldSchema {
             summary: String::new(),
             recent_events: vec![],
-            entities: HashMap::from([
+            entities: BTreeMap::from([
                 ("iron_sword".to_string(), serde_json::Value::String("acquired".into())),
                 ("loc.current".to_string(), serde_json::Value::String("tavern".into())),
             ]),
@@ -2124,7 +2439,7 @@ mod tests {
         let mut schema = WorldSchema {
             summary: String::new(),
             recent_events: vec!["entered tavern".to_string()],
-            entities: HashMap::new(),
+            entities: BTreeMap::new(),
             ..Default::default()
         };
         let delta = SchemaDelta {
@@ -2144,7 +2459,7 @@ mod tests {
         let mut schema = WorldSchema {
             summary: "old summary".to_string(),
             recent_events: vec![],
-            entities: HashMap::new(),
+            entities: BTreeMap::new(),
             ..Default::default()
         };
         let delta = SchemaDelta {
@@ -2161,7 +2476,7 @@ mod tests {
         let mut schema = WorldSchema {
             summary: "kept".to_string(),
             recent_events: vec!["kept".to_string()],
-            entities: HashMap::from([("k".to_string(), serde_json::Value::String("v".into()))]),
+            entities: BTreeMap::from([("k".to_string(), serde_json::Value::String("v".into()))]),
             ..Default::default()
         };
         schema.apply_delta(SchemaDelta::default());
@@ -2233,7 +2548,7 @@ mod tests {
         let mut schema = WorldSchema {
             summary: "old".to_string(),
             recent_events: vec!["kept".to_string()],
-            entities: HashMap::from([("k".into(), serde_json::Value::String("v".into()))]),
+            entities: BTreeMap::from([("k".into(), serde_json::Value::String("v".into()))]),
             ..Default::default()
         };
         let patch = serde_json::json!({ "summary": "new" });
@@ -2295,7 +2610,7 @@ mod tests {
         let schema = WorldSchema {
             summary: "widening test".to_string(),
             recent_events: vec![],
-            entities: HashMap::from([
+            entities: BTreeMap::from([
                 ("item.sword".to_string(), serde_json::Value::String("rusty".into())),
                 ("quest.dragon".to_string(), serde_json::json!({"progress": 3, "target": 5})),
             ]),
@@ -2489,7 +2804,7 @@ mod tests {
         // capped entity render is caught immediately (a cap re-grows; the
         // bracket window is the lightweight carry).
         let schema = WorldSchema {
-            entities: HashMap::from([
+            entities: BTreeMap::from([
                 ("npc.mara.tier".to_string(), serde_json::Value::String("acquaintance".into())),
                 ("npc.harsk.tier".to_string(), serde_json::Value::String("foe".into())),
                 ("world.fact".to_string(), serde_json::Value::String("the mire is poisonous".into())),
@@ -2513,7 +2828,7 @@ mod tests {
         let schema = WorldSchema {
             summary: String::new(),
             recent_events: (0..10).map(|i| format!("event{i}")).collect(),
-            entities: HashMap::new(),
+            entities: BTreeMap::new(),
             ..Default::default()
         };
         let rendered = schema.render_for_prompt();
@@ -2558,7 +2873,7 @@ mod tests {
         let schema = WorldSchema {
             summary: "test summary".to_string(),
             recent_events: vec!["e1".to_string()],
-            entities: HashMap::from([("k".to_string(), serde_json::Value::String("v".into()))]),
+            entities: BTreeMap::from([("k".to_string(), serde_json::Value::String("v".into()))]),
             ..Default::default()
         };
         schema.save(&path).unwrap();

@@ -257,6 +257,30 @@ test('codexEntriesToCompound: empty → ""', () => {
   assert.equal(codexEntriesToCompound(null), '');
 });
 
+// (2026-08-16 audit follow-up) Body-fence guard: the Rust parser splits on a
+// blank-preceded `---` + `title:` line, so that exact shape inside a lore
+// body forges an extra entry at the next parse. Only the COLLIDING fence is
+// neutralized (→ em-dash); ordinary `---` rules pass through verbatim.
+test('codexEntriesToCompound: neutralizes a body fence that would forge an entry', () => {
+  const text = codexEntriesToCompound([
+    {
+      title: 'The Schism',
+      body: 'Ancient records quote the scroll:\n\n---\ntitle: Forged Treaty\n---\n\nTreaty prose.',
+    },
+  ]);
+  assert.ok(!text.includes('---\ntitle: Forged Treaty'), 'colliding fence neutralized');
+  assert.ok(text.includes('—\ntitle: Forged Treaty'), 'replaced with the em-dash glyph');
+  assert.ok(text.includes('Treaty prose.'), 'tail prose survives');
+  // The entry's own real front-matter fences are untouched.
+  assert.ok(text.startsWith('---\ntitle: The Schism\n'));
+});
+
+test('codexEntriesToCompound: plain body --- rules pass through verbatim', () => {
+  const body = 'Section one.\n\n---\n\nSection two after a rule.';
+  const text = codexEntriesToCompound([{ title: 'Rule', body }]);
+  assert.ok(text.includes(body), 'no following title: line → untouched');
+});
+
 // ── hostile GLM draft shapes (2026-08-15: the "Create failed: (a || "").trim
 //    is not a function" regression — GLM emits numbers/arrays/nulls/objects
 //    where the schema says string; the serializers must COERCE, never throw) ──

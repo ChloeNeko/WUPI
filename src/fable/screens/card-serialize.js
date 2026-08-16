@@ -61,7 +61,14 @@ export function escapeXml(s) {
   // `"` is escaped too so the fn is safe in ATTRIBUTE contexts (<node id="…">,
   // <entry key="…">) as well as element text — an unescaped quote in an
   // attribute emits broken XML caught server-side as a parse-error toast.
+  // (2026-08-16 audit LOW) XML-invalid control chars are stripped (not
+  // escaped — there is no valid escape for most of them in XML 1.0): a GLM
+  // string carrying a stray vertical tab/backslash-b family byte made the
+  // whole card unloadable at the next parse. \t \n \r are the only legal
+  // controls + are preserved.
   return String(s || '')
+    // eslint-disable-next-line no-control-regex
+    .replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g, '')
     .replace(/&/g, '&amp;')
     .replace(/</g, '&lt;')
     .replace(/>/g, '&gt;')
@@ -191,6 +198,14 @@ export function serializeSimCard(f) {
   let xml = '<sim_card>\n';
   xml += '  <metadata><type>roleplay</type>';
   if (subtype) xml += `<subtype>${escapeXml(subtype)}</subtype>`;
+  // (2026-08-16 audit fix #3) Embed the client slug as <id>: the parsed id
+  // and the on-disk folder must agree BY CONSTRUCTION, not by parallel
+  // derivation on both sides of the IPC. The Rust parser normalizes it
+  // through slugify_card_stem (idempotent with this slug) + filters memory
+  // sentinels. Without it, any name whose JS/Rust slug derivations could
+  // drift (punctuation runs, Windows-reserved stems) splits state into a
+  // phantom folder.
+  xml += `<id>${escapeXml(slugify(name))}</id>`;
   xml += '</metadata>\n';
   xml += '  <identity>\n';
   xml += `    <name>${escapeXml(name)}</name>\n`;
@@ -368,7 +383,16 @@ export function slugify(s) {
   // miss what the server would actually derive. `\p{L}\p{N}` with the /u
   // flag covers a-z0-9 plus all Unicode letters/digits.
   const slug = text(s).trim().toLowerCase()
-    .replace(/[^\p{L}\p{N}_-]+/gu, '-').replace(/^-+|-+$/g, '');
+    .replace(/[^\p{L}\p{N}_-]+/gu, '-')
+    // (2026-08-16 audit H5) Collapse dash RUNS to one — Rust's
+    // `slugify_card_stem` does (`collapse_dash_runs`), and without it
+    // "Star - Falls" slugged `star---falls` client-side but `star-falls`
+    // server-side. The duplicate-name guard compares the JS slug against
+    // Rust-normalized existing ids, so the miss let `fable_write_card`
+    // re-slug onto an existing folder → silent overwrite of an authored
+    // card.
+    .replace(/-{2,}/g, '-')
+    .replace(/^-+|-+$/g, '');
   // (2026-08-15 audit fix) 64-char cap — mirrors the upcoming Rust-side cap;
   // keeps <slug>/<slug>.sim well under MAX_PATH. Truncation must not leave a
   // trailing dash (the trim above already guaranteed a clean end, so restore
@@ -405,6 +429,22 @@ export function codexEntriesToCompound(entries) {
     .replace(/\s+/g, ' ')
     .replace(/-{3,}/g, '—')
     .trim();
+  // (2026-08-16 audit follow-up) Body-fence guard — the Rust parser splits
+  // entries on a blank-line-preceded `---` followed by a `title:` line, so a
+  // lore body containing that exact shape would FORGE an extra entry at the
+  // next parse. Neutralize ONLY the colliding fences (`---` → `—`, the same
+  // glyph the front-matter sanitizer uses): ordinary `---` horizontal rules
+  // and code fences (no following `title:` line) pass through untouched.
+  // Mirrors the Rust round-trip guard in `codex::format_compound_text` —
+  // this path writes text verbatim via `fable_card_sibling_write`, so the
+  // Rust verify-then-sanitize never sees it.
+  const neutralizeBodyFences = (s) => text(s).split('\n').map((line, i, arr) => {
+    if (line.trim() !== '---') return line;
+    const prevBlank = i === 0 || arr[i - 1].trim() === '';
+    const next = arr.slice(i + 1).find((l) => l.trim() !== '');
+    const nextTitle = !!next && next.trim().toLowerCase().startsWith('title:');
+    return (prevBlank && nextTitle) ? '—' : line;
+  }).join('\n');
   // Normalize + drop entries with no body (an empty body would emit a junk
   // front-matter-only block the codex parser reads as an empty entry).
   const clean = entries.map((e) => {
@@ -415,7 +455,7 @@ export function codexEntriesToCompound(entries) {
     return {
       title: fmInline(src.title) || 'untitled',
       tags: rawTags.map((t) => fmInline(t)).filter(Boolean),
-      body: text(src.body).trim(),
+      body: neutralizeBodyFences(text(src.body).trim()),
     };
   }).filter((e) => e.body);
   return clean.map((e) => {

@@ -107,6 +107,19 @@ function ensureOverlay(stageEl) {
     </div>`;
   // Single event delegate over the overlay. Delete is checked BEFORE tile so a
   // click on a tile's ✕ never also selects the tile underneath.
+  // (2026-08-16 audit LOW) Delete is a TWO-CLICK armed confirm (the wry
+  // hygiene rule every other destructive control follows — native confirm()
+  // is dead in the webview): first ✕ arms (turns red, 5s auto-disarm), the
+  // second ✕ executes. Only one armed button at a time.
+  let armedDelete = null;
+  let armTimer = 0;
+  const disarmDelete = () => {
+    clearTimeout(armTimer);
+    if (armedDelete) {
+      armedDelete.classList.remove('is-armed');
+      armedDelete = null;
+    }
+  };
   overlayEl.addEventListener('click', (e) => {
     if (e.target.closest('[data-bg-close]') || e.target.closest('[data-bg-backdrop]')) {
       closeBackgroundsPanel();
@@ -118,9 +131,19 @@ function ensureOverlay(stageEl) {
     }
     const del = e.target.closest('[data-bg-delete]');
     if (del) {
+      if (del !== armedDelete) disarmDelete();
+      if (!del.classList.contains('is-armed')) {
+        del.classList.add('is-armed');
+        armedDelete = del;
+        clearTimeout(armTimer);
+        armTimer = setTimeout(disarmDelete, 5000);
+        return;
+      }
+      disarmDelete();
       void onDelete(del.dataset.filename);
       return;
     }
+    disarmDelete();
     const tile = e.target.closest('[data-bg-tile]');
     if (tile) {
       void onSelect(tile.dataset.filename);

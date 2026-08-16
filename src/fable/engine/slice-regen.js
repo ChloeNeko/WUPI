@@ -229,6 +229,12 @@ function onScrollOrResize() {
 // streaming (gates the pencil off). `onRegenerate({ index, pre, selection,
 // post })` is invoked on pencil click — narrator.regenerateSlice.
 export function initSliceRegen({ isGenerating: genFn, onRegenerate: regenFn }) {
+  // (2026-08-16 audit LOW) Defensive prior-teardown guard — the same
+  // discipline vn-interactions' init has. A prior stage entry's teardown
+  // should always have run (stage.js owns it), but an init racing a deferred
+  // teardown would otherwise leave the OLD module-level listeners + pencil
+  // element alive alongside the new set.
+  teardown();
   isGenerating = genFn || (() => false);
   onRegenerate = regenFn || null;
   teardownDone = false;

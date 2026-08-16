@@ -114,6 +114,16 @@ export async function openRawEditor(kind, onSaved) {
     setTimeout(() => textareaEl.focus(), 30);
   } catch (err) {
     console.warn('[fable] raw editor load failed', err);
+    // (2026-08-16 audit LOW) Close + reset on a failed read. The old path
+    // left an EMPTY open modal carrying the PREVIOUS session's `lastGood`
+    // + validity — a stale-true ✓ enabled a save that would overwrite the
+    // real file with nothing.
+    overlayEl.hidden = true;
+    current = null;
+    onSavedCb = null;
+    isValid = true;
+    lastGood = '';
+    saveBtn.disabled = false;
   }
 }
 

@@ -43,6 +43,24 @@ let rerolling = false;     // true when the current turn is a swipeable-variant
                            // place). Set in sendFableTurn({reroll:true}), read
                            // in onDone to update the beat's variant stamp +
                            // refresh the swipe controls.
+// (2026-08-16 audit fix #8) The claimed beat's pre-reroll prose, captured
+// BEFORE beginReroll wipes the body. A cancelled/aborted roll must restore
+// THIS text — the backend already re-installed the prior variant server-side;
+// the old wipe left the beat blank with a live streaming caret until some
+// later feed rebuild.
+let rerollPrevText = null;
+// (2026-08-16 audit fix #5) The turn-start user bubble. Every backend revert
+// path (soft cancel, api_lost, dev-narrator error) pops the turn-start user
+// message server-side — the DOM must match or the Enter-retry renders the
+// action twice + shifts every feed index vs the session.
+let uncommittedUserBeat = null;
+// The typed action of the in-flight NORMAL turn ('' on reroll/regenerate).
+// Handed back via onTurnEnd({revertedText}) when the turn reverts so the
+// composer restore can resurrect it (removing the bubble alone would lose
+// the player's text entirely).
+let turnInputText = '';
+// Set by revertUncommittedTurn, consumed (and cleared) by finishTurn.
+let revertRestoreText = null;
 // Stage 3 (2026-08-11): armed by interruptAndReroll when the user re-presses ›
 // mid-reroll. The backend's abort path emits a `cancelled` event once the
 // in-flight roll is discarded + the schema reverted to base; onCancelled
@@ -56,6 +74,17 @@ let deferredReroll = false;
 let sliceBeat = null;
 let sliceSpan = null;
 let sliceEscapeFn = null;   // transient Escape listener, removed on turn end
+// (2026-08-16 audit M3) Turn EPOCH — bumped by every entry that starts (or
+// tears down) a streaming lifecycle. Each in-flight turn captures the value
+// at entry; its channel events + the post-invoke backstop self-ignore once
+// the epoch moved on. This kills the three identity races:
+//   (a) an interrupt-reroll's OLD invoke resolving after the replacement
+//       turn started used to run the backstop's finishTurn() on the NEW
+//       turn (composer unlocks mid-stream, armed restart disarmed);
+//   (c) a channel event from a wedged/stale stream (or a pre-teardown turn)
+//       landing after resetNarrator used to stamp ghost beats into the
+//       NEXT session's feed.
+let turnEpoch = 0;
 
 // The unlisten handle for the `fable-session-changed` Tauri event (set up in
 // initNarrator, torn down in resetNarrator). Captured at module scope so re-
@@ -130,7 +159,34 @@ export function initNarrator(hooks = {}) {
       if (pendingSave) {
         try { await pendingSave; } catch (_) { /* rebuild regardless */ }
       }
+      // (2026-08-16 audit M3b) A chat-side edit/delete can land while an API
+      // narrator turn streams (the documented Stage-2 concurrency window —
+      // the local chat's agent tools run beside the turn-lock-free HTTP
+      // stage). Rebuilding under a live activeBeat DETACHES it: every later
+      // chunk would append to an invisible node until the next rebuild.
+      // Capture the streaming context, rebuild, then RE-BIND: a reroll
+      // re-claims the trailing assistant beat (wiped fresh — the partial
+      // was DOM-only); a normal turn re-claims the trailing user bubble
+      // (the backend pushed it at turn start, so it IS in the payload) and
+      // opens a fresh narrator beat. The partial text is lost either way;
+      // done/finalize writes the backend's authoritative full text.
+      const wasGenerating = generating;
+      const wasRerolling = rerolling;
+      const wasSlice = sliceBeat !== null;
       beats.rebuildFromMessages(payload.messages);
+      if (wasGenerating) {
+        if (wasRerolling) {
+          activeBeat = beats.lastNarratorBeat();
+          if (activeBeat) beats.beginReroll(activeBeat);
+        } else if (!wasSlice) {
+          const lastIdx = payload.messages.length - 1;
+          const lastMsg = payload.messages[lastIdx];
+          if (lastMsg && lastMsg.role === 'user') {
+            uncommittedUserBeat = beats.beatByIndex(lastIdx);
+          }
+          activeBeat = beats.startNarratorBeat();
+        }
+      }
     } else if (payload.kind === 'schema') {
       // The HUD (left-drawer) reads schema on its own refresh cadence; the
       // turn-end hook already calls refreshAll. We hook here so a future
@@ -161,7 +217,16 @@ export function resetNarrator() {
   activeBeat = null;
   generating = false;
   rerolling = false;
+  rerollPrevText = null;
+  uncommittedUserBeat = null;
+  turnInputText = '';
+  revertRestoreText = null;
   clearSliceState();
+  // (2026-08-16 audit M3c) Invalidate every in-flight turn/slice: their
+  // channel closures + backstops compare against the epoch and self-ignore
+  // from here on — a late event from the old session can never stamp a
+  // ghost beat into the next one.
+  turnEpoch++;
   // Tear down the session-changed listener — the stage is exiting, no more
   // chat-side mutations should rebuild the (now-hidden) feed. Bump the
   // generation so an in-flight handle from THIS session self-releases.
@@ -198,10 +263,21 @@ function clearSliceState() {
 export async function sendFableTurn(text, opts = {}) {
   if (generating) return;
   generating = true;
+  const myEpoch = ++turnEpoch;
   if (onTurnStart) onTurnStart();
   const regenerate = !!opts.regenerate;
   const reroll = !!opts.reroll;
-  if (!opts.silent && !regenerate && !reroll) beats.addUserBeat(text);
+  // (audit #5) Track the turn-start user bubble so every revert path can
+  // remove it in lockstep with the backend's server-side pop. Regenerate
+  // turns never push one (the rewind mutation owns the user tail); rerolls
+  // reuse the trailing assistant beat.
+  if (!opts.silent && !regenerate && !reroll) {
+    turnInputText = text;
+    uncommittedUserBeat = beats.addUserBeat(text);
+  } else {
+    turnInputText = '';
+    uncommittedUserBeat = null;
+  }
 
   // Reroll: claim the last assistant beat as the streaming target so the new
   // variant renders in place (the user watches the reroll happen over the old
@@ -209,12 +285,28 @@ export async function sendFableTurn(text, opts = {}) {
   if (reroll) {
     rerolling = true;
     activeBeat = beats.lastNarratorBeat();
-    if (activeBeat) beats.beginReroll(activeBeat);
-    else activeBeat = beats.startNarratorBeat();
+    if (activeBeat) {
+      // (audit #8) Capture the pre-reroll prose BEFORE the wipe — the cancel
+      // paths restore it (finalizeBeat), they don't re-wipe.
+      const body = activeBeat.querySelector('.fable-mes-text');
+      rerollPrevText = activeBeat.dataset.raw != null
+        ? activeBeat.dataset.raw
+        : (body ? body.textContent : '');
+      beats.beginReroll(activeBeat);
+    } else {
+      activeBeat = beats.startNarratorBeat();
+      rerollPrevText = null;
+    }
   }
 
   const channel = new Channel();
-  channel.onmessage = (msg) => handleEvent(msg);
+  // (2026-08-16 audit M3c) Events from THIS turn only — once the epoch moves
+  // on (interrupt-reroll replacement, stage teardown), a stale channel event
+  // self-ignores instead of stamping a ghost beat into the new turn/session.
+  channel.onmessage = (msg) => {
+    if (myEpoch !== turnEpoch) return;
+    handleEvent(msg);
+  };
 
   try {
     await invoke('fable_send', { text, onEvent: channel, regenerate, reroll });
@@ -223,9 +315,25 @@ export async function sendFableTurn(text, opts = {}) {
     // `generating` latched → the composer wedges until app restart. Every
     // terminal path runs finishTurn, so reaching here STILL generating means
     // no terminal arrived: finish defensively (mirrors the chat window's
-    // .finally backstop).
-    if (generating) finishTurn();
+    // .finally backstop). (2026-08-16 audit M3a) EPOCH-guarded: after an
+    // interrupt-reroll the OLD invoke resolves while the replacement turn is
+    // mid-stream — an unguarded finishTurn here killed the new turn's
+    // `generating` flag (composer unlocks mid-restart) or disarmed the armed
+    // restart.
+    if (generating && myEpoch === turnEpoch) finishTurn();
   } catch (err) {
+    // (2026-08-16 audit M3c) Epoch-guarded like the backstop: an invoke that
+    // REJECTS after a teardown/replacement must not stamp a ghost error beat
+    // into the new session's feed or kill its turn state.
+    if (myEpoch !== turnEpoch) return;
+    // (2026-08-16 audit H4) A REJECTED invoke — preflight refusal (API
+    // disconnected via the OS panel, session-guard while a turn finalizes)
+    // — means the backend never saw the turn. The optimistic DOM mutations
+    // (the uncommitted user bubble, the wiped reroll beat) must revert
+    // exactly like the channel 'error' path, or the orphan beat shifts
+    // every later data-index by one and index-based mutations (edit/
+    // delete/swipe/slice) target the wrong message until a rebuild.
+    revertUncommittedTurn();
     beats.addErrorBeat(String(err));
     finishTurn();
   }
@@ -241,14 +349,24 @@ function handleEvent(msg) {
       onSceneEvent(msg.command);
       break;
     case 'error':
+      // (audit #5) The dev-narrator error path reverts server-side (schema
+      // restore + user-message pop) — mirror it in the DOM before surfacing
+      // the error beat.
+      revertUncommittedTurn();
       beats.addErrorBeat(msg.message || 'Generation failed.');
       finishTurn();
       break;
     case 'api_lost':
       // 2026-08-07 override: the API narrator died mid-session and there's no
       // local fallback. The backend already autosaved + cleared the cancel
-      // slot; the turn aborts without a narrator beat. Lock the composer via
-      // the onApiLost hook so the player reconnects via Settings + retries.
+      // slot; the turn aborts without a narrator beat. (audit #5) It ALSO
+      // popped the turn-start user message + never committed the narrator
+      // beat — discard both from the DOM (the half-streamed beat kept its
+      // live caret, and the orphan user bubble made the Enter-retry render
+      // the action twice). Lock the composer via the onApiLost hook so the
+      // player reconnects via Settings + retries (the retry stash is taken
+      // from lastSentTurnText, still set at this point).
+      revertUncommittedTurn();
       onApiLost(msg.message || 'The API connection was lost.');
       finishTurn();
       break;
@@ -298,20 +416,17 @@ function onDone(finalText, reasoning, cancelled) {
   void reasoning;
   // (2026-08-15 audit fix) A soft-cancelled turn (fable_stop) is FULLY
   // reverted by the backend, which emits done with `cancelled: true` and an
-  // EMPTY final_text. The in-flight partial beat must be DISCARDED — never
-  // finalized into the feed (finalizing committed prose the backend never
-  // saved). On a reroll the streaming target is the PRIOR message's beat
-  // node, so clear its aborted partial in place (beginReroll — same restore
-  // the `cancelled`-event path uses) instead of removing history; on a
-  // normal turn the streaming beat node is removed outright. finishTurn
-  // runs the same cleanup path as a normal done (composer re-enable, slice
-  // state, deferred-reroll disarm).
+  // EMPTY final_text. (2026-08-16 audit fixes #5/#8) The frontend revert now
+  // mirrors the backend exactly: the partial narrator beat is DISCARDED (on
+  // a reroll the pre-reroll prose is RESTORED — the backend re-installed the
+  // prior variant server-side; the old wipe left a blank beat with a stuck
+  // caret), and the turn-start user bubble is REMOVED (the backend popped
+  // it; keeping it duplicated the action on re-send + shifted feed indexes).
+  // The typed text is handed back to the composer via onTurnEnd so the
+  // player doesn't lose it. finishTurn runs the same cleanup as a normal
+  // done (composer re-enable, slice state, deferred-reroll disarm).
   if (cancelled) {
-    if (activeBeat) {
-      if (rerolling) beats.beginReroll(activeBeat);
-      else activeBeat.remove();
-    }
-    activeBeat = null;
+    revertUncommittedTurn();
     finishTurn();
     return;
   }
@@ -339,6 +454,34 @@ function onDone(finalText, reasoning, cancelled) {
   finishTurn();
 }
 
+// (2026-08-16 audit fixes #5 + #8) Shared DOM revert for every path where the
+// backend REVERTED the turn (soft cancel, api_lost, dev-narrator error): the
+// backend popped the turn-start user message + never committed the narrator
+// beat, so the DOM must match. Discards the partial narrator beat — on a
+// reroll it RESTORES the pre-reroll prose instead (the backend re-installed
+// the prior variant server-side; the beat's variant stamp is unchanged since
+// the aborted roll added no variant) — removes the uncommitted user bubble,
+// and stashes the typed text for the composer restore via finishTurn's
+// onTurnEnd handoff.
+function revertUncommittedTurn() {
+  if (activeBeat) {
+    if (rerolling && rerollPrevText != null) {
+      beats.finalizeBeat(activeBeat, rerollPrevText);
+      beats.refreshDrawer(activeBeat);
+    } else if (rerolling) {
+      beats.beginReroll(activeBeat); // defensive: no prior text was captured
+    } else {
+      activeBeat.remove();
+    }
+  }
+  if (uncommittedUserBeat && uncommittedUserBeat.isConnected) {
+    uncommittedUserBeat.remove();
+  }
+  uncommittedUserBeat = null;
+  revertRestoreText = turnInputText || null;
+  rerollPrevText = null;
+}
+
 function finishTurn() {
   generating = false;
   activeBeat = null;
@@ -348,7 +491,15 @@ function finishTurn() {
   // a LATER `cancelled` event fired a spurious reroll of the wrong beat.
   deferredReroll = false;
   clearSliceState();
-  if (onTurnEnd) onTurnEnd();
+  // (audit #5) Hand the reverted turn's typed text to the stage so it can
+  // restore it into the composer (the bubble is gone; without this the
+  // player's action would be lost entirely). Undefined on non-revert paths.
+  if (onTurnEnd) {
+    onTurnEnd(revertRestoreText != null ? { revertedText: revertRestoreText } : undefined);
+  }
+  revertRestoreText = null;
+  turnInputText = '';
+  uncommittedUserBeat = null;
 }
 
 export function isGenerating() { return generating; }
@@ -390,11 +541,11 @@ function onCancelled() {
   // against late-resolving interrupt invokes) erases the flag, so reading
   // it after would always see false and the armed reroll would never fire.
   const wasDeferred = deferredReroll;
-  if (activeBeat) {
-    // beginReroll clears the aborted partial + preps the beat for the fresh
-    // stream (so nothing lingers during the reroll's IPC round-trip).
-    beats.beginReroll(activeBeat);
-  }
+  // (audit #8) The backend discarded the partial + reverted to the prior
+  // variant server-side — restore the beat's pre-reroll prose (not the old
+  // wipe). If a deferred reroll was armed it immediately re-streams over
+  // the restored text, so nothing lingers during the IPC round-trip.
+  revertUncommittedTurn();
   finishTurn();
   if (wasDeferred) {
     // generating was just cleared by finishTurn, so rerollLastTurn's guard passes.
@@ -594,6 +745,7 @@ export async function rewindAndEditUser(index, newText) {
 export async function regenerateSlice({ index, pre, selection, post }) {
   if (generating) return false;
   generating = true;
+  const myEpoch = ++turnEpoch;
   if (onTurnStart) onTurnStart();
 
   const beat = beats.beatByIndex(index);
@@ -618,13 +770,17 @@ export async function regenerateSlice({ index, pre, selection, post }) {
   document.addEventListener('keydown', sliceEscapeFn, true);
 
   const channel = new Channel();
-  channel.onmessage = (msg) => handleSliceEvent(msg);
+  channel.onmessage = (msg) => {
+    if (myEpoch !== turnEpoch) return;
+    handleSliceEvent(msg);
+  };
 
   try {
     await invoke('fable_regenerate_slice', { index, pre, selection, post, onEvent: channel });
     // (.finally backstop, 2026-08-15 audit fix — same as sendFableTurn) a
     // backend resolve WITHOUT a terminal event must not latch `generating`.
-    if (generating) finishTurn();
+    // (2026-08-16 audit M3a) Epoch-guarded like the full-turn backstop.
+    if (generating && myEpoch === turnEpoch) finishTurn();
   } catch (err) {
     // Restore the beat to its pre-regen prose + surface the error.
     if (sliceBeat) beats.cancelSliceRegen(sliceBeat);

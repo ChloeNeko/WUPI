@@ -57,6 +57,8 @@
 // =============================================================
 
 import { invoke } from '@tauri-apps/api/core';
+// (2026-08-16 audit M5) isGenerating gate — see the handlers below.
+import * as narrator from './narrator.js';
 // DEV PREVIEW mock: serves a frozen test schema (full inventory) so the Soul
 // Gem inspection panel renders in the no-backend preview. The mock is
 // deep-cloned per read so in-memory edits (handleAction mutates the schema
@@ -294,7 +296,7 @@ function paintPage(bodyEl) {
   const WHEEL_STEP_THRESHOLD = 40; // px of accumulated delta → 1 button step
   let smoothScrolling = false;
   const stepScroll = (dir) => {
-    if (smoothScrolling) return;
+    if (smoothScrolling) return false;
     smoothScrolling = true;
     const target = Math.max(0, Math.min(
       track.scrollHeight - viewport.clientHeight,
@@ -305,14 +307,23 @@ function paintPage(bodyEl) {
     // the scroll isn't reliably fired; a timeout matching the smooth duration
     // is the robust gate.
     setTimeout(() => { smoothScrolling = false; }, 250);
+    return true;
   };
   viewport.addEventListener('wheel', (e) => {
     e.preventDefault();
     wheelAccumulator += e.deltaY;
     if (Math.abs(wheelAccumulator) >= WHEEL_STEP_THRESHOLD) {
       const dir = wheelAccumulator > 0 ? 1 : -1;
-      wheelAccumulator = 0;
-      stepScroll(dir);
+      // (2026-08-16 audit LOW) Subtract only the CONSUMED threshold + only
+      // when the step actually fired. The old `= 0` reset ate notches that
+      // arrived during the 250ms smooth-scroll lock (stepScroll no-opped,
+      // the notch vanished), and it also discarded the sub-threshold
+      // remainder a trackpad fling had banked.
+      if (stepScroll(dir)) {
+        wheelAccumulator -= dir * WHEEL_STEP_THRESHOLD;
+        // Cap the residual so a long fling can't bank several queued steps.
+        wheelAccumulator = Math.max(-WHEEL_STEP_THRESHOLD, Math.min(WHEEL_STEP_THRESHOLD, wheelAccumulator));
+      }
     }
   }, { passive: false });
 
@@ -711,6 +722,16 @@ function _forceCloseActionPopup() {
 // handleEquip directly (below).
 async function handleAction(action, item, bodyEl) {
   _forceCloseActionPopup(); // user explicitly chose an action — close decisively
+  // (2026-08-16 audit M5) Refuse while a narrator turn is in flight: the
+  // read-modify-write below refetches then installs WHOLESALE — a Stage-1
+  // tracker bracket landing between the fetch and the install is silently
+  // rolled back (referee injuries, [TIME], [EQUIP]s). The panel is usable
+  // during streaming, so this is a realistic long-session state-regression
+  // path. Retry after the beat lands (refreshAll re-renders the panel).
+  if (!isDevPreview() && narrator.isGenerating()) {
+    console.warn('[inventory-panel] action refused: a narrator turn is in flight — retry after the beat lands');
+    return;
+  }
   let mutated = false;
   let verb = '';   // the past-tense trace for recent_events (empty = no trace)
   try {
@@ -771,6 +792,12 @@ async function handleAction(action, item, bodyEl) {
 // migration's preserve-existing discipline).
 async function handleEquip(item, dest, bodyEl) {
   _forceCloseActionPopup(); // user picked an equip destination — close decisively
+  // (2026-08-16 audit M5) Same in-flight refusal as handleAction — the equip
+  // path runs the same fetch→mutate→wholesale-install cycle.
+  if (!isDevPreview() && narrator.isGenerating()) {
+    console.warn('[inventory-panel] equip refused: a narrator turn is in flight — retry after the beat lands');
+    return;
+  }
   let mutated = false;
   let verb = '';
   try {
@@ -803,6 +830,30 @@ async function handleEquip(item, dest, bodyEl) {
 // potion stays a consumable in the trace; an equipped ring stays equippable).
 function tagsArray(item) {
   return Array.from(item.tags);
+}
+
+// (2026-08-16 audit fix #26) Stack moves MERGE on name — the same identity
+// the backend's stack_upsert uses. An unconditional push minted duplicate
+// same-named stacks, and a later DISCARD-by-name then removed "the wrong
+// stack" (the first match): one entry survived carrying the other's qty. Qty
+// adds; tags union (the Rust restack rule); stats/weight keep the first
+// carrier's when the incoming copy carries none.
+function mergeOrPushStack(list, entry) {
+  const existing = list.find((s) => s && s.name === entry.name);
+  if (existing) {
+    existing.qty = (typeof existing.qty === 'number' ? existing.qty : 1)
+      + (typeof entry.qty === 'number' ? entry.qty : 1);
+    existing.tags = [...new Set([
+      ...(Array.isArray(existing.tags) ? existing.tags : []),
+      ...(Array.isArray(entry.tags) ? entry.tags : []),
+    ])];
+    if (!existing.stats && entry.stats) existing.stats = entry.stats;
+    if (typeof existing.weight !== 'number' && typeof entry.weight === 'number') {
+      existing.weight = entry.weight;
+    }
+    return;
+  }
+  list.push(entry);
 }
 
 // Remove an item from wherever it lives. Mutates `ps` in place; returns true
@@ -907,7 +958,9 @@ function moveToEquipmentSlot(ps, item, dest) {
   const currentOuter = ps.equipment[targetSlot].outer;
   if (currentOuter) {
     if (!Array.isArray(ps.pack)) ps.pack = [];
-    ps.pack.push({
+    // (audit #26) Merge on name — a displaced duplicate used to mint a
+    // second same-named pack stack (see mergeOrPushStack).
+    mergeOrPushStack(ps.pack, {
       name: currentOuter.name,
       qty: 1,
       weight: 1.0,
@@ -936,7 +989,9 @@ function moveToStack(ps, item, target) {
   if (!Array.isArray(ps[target])) ps[target] = [];
   const removed = removeItem(ps, item);
   if (!removed) return false;
-  ps[target].push({
+  // (audit #26) Merge into an existing same-named stack instead of pushing a
+  // duplicate (stack_upsert's name-identity — see mergeOrPushStack).
+  mergeOrPushStack(ps[target], {
     name: item.name,
     qty: item.qty,
     weight: typeof item.weight === 'number' ? item.weight : 1.0,

@@ -146,6 +146,15 @@ function setGenerating(on) {
 
 export function isGenerating() { return generating; }
 
+// (2026-08-16 audit M8b) Stop an in-flight drawer chat turn. Called from
+// teardownStage: a decode surviving the stage exit keeps the process-wide
+// local-model turn lock, stalling the next game's first tracker turn by
+// seconds. Safe no-op when nothing streams (chat_stop's own contract).
+export function stopWupiTurn() {
+  if (!generating) return;
+  invoke('chat_stop').catch((err) => console.warn('[fable] wupi drawer stop failed', err));
+}
+
 export function isOpen() { return open; }
 
 export function isLocked() { return locked; }
@@ -292,6 +301,16 @@ async function sendWupiTurn(text) {
   setGenerating(true);
   try {
     await invoke('chat_send', { text, onEvent: channel });
+    // (.finally backstop, 2026-08-16 audit fix — same contract as the stage
+    // composer + narrator) A backend resolve WITHOUT a terminal event would
+    // leave the drawer's `generating` latched: the input stays disabled
+    // until stage exit. Every terminal path runs setGenerating(false), so
+    // still-generating here means no terminal arrived — settle defensively.
+    if (generating) {
+      finalizeBubble(activeBubble, null);
+      activeBubble = null;
+      setGenerating(false);
+    }
   } catch (err) {
     finalizeBubble(activeBubble, null);
     addWupiError(String(err));
