@@ -138,10 +138,17 @@ function hide() {
   currentBeat = null;
 }
 
-// On pencil click: compute the 3-way split with consistent Range.toString()
-// semantics (so <br>/quote/entity handling is uniform across all three +
-// pre + selection + post is exactly the beat's visible text), collapse the
-// selection, hide the pencil, hand off to the regen wrapper.
+// (2026-08-16 yellow J2) Public hide for the rebuild paths: a feed rebuild
+// dissolves the DOM selection the pencil anchors to, so the pencil must not
+// float at a stale viewport position until the next selection event.
+export function hidePencil() {
+  hide();
+}
+
+// On pencil click: compute the 3-way split with <br>-aware semantics (see
+// rangeToText — pre + selection + post is exactly the beat's visible text,
+// newlines included), collapse the selection, hide the pencil, hand off to
+// the regen wrapper.
 function onPencilClick() {
   const res = resolveSelection();
   if (!res) {
@@ -162,12 +169,12 @@ function onPencilClick() {
     const preRange = document.createRange();
     preRange.selectNodeContents(textEl);
     preRange.setEnd(range.startContainer, range.startOffset);
-    pre = preRange.toString();
+    pre = rangeToText(preRange);
   } catch (_) {
     pre = '';
   }
 
-  const selection = range.toString();
+  const selection = rangeToText(range);
 
   // post = text in this beat after the selection.
   let post = '';
@@ -175,7 +182,7 @@ function onPencilClick() {
     const postRange = document.createRange();
     postRange.selectNodeContents(textEl);
     postRange.setStart(range.endContainer, range.endOffset);
-    post = postRange.toString();
+    post = rangeToText(postRange);
   } catch (_) {
     post = '';
   }
@@ -291,4 +298,38 @@ export function isSliceEligible({ role, editing, streaming, sliceRegenerating, c
   if (collapsed) return false;
   if (emptyText) return false;
   return true;
+}
+
+// (2026-08-16 bug 2) BR-aware fragment serialization. Beats render '\n' as
+// <br> (beats.renderMarkdown), but Range.toString() contributes NOTHING for
+// a <br> — the old pre/selection/post extraction flattened every paragraph
+// break, and the backend splices that text back over msg.content AND the
+// active variant mirror: one pencil click on a multi-paragraph beat
+// collapsed the whole beat into a wall of text, persisted to session +
+// autosave. Walking the fragment + emitting '\n' at <br> boundaries restores
+// the exact visible-text contract. Structured inline markup (strong/em/
+// quote spans) recurses — only their inner text is visible. Testable
+// DOM-free: plain node-shaped objects ({ nodeType, nodeValue, childNodes,
+// tagName }) drive it.
+export function fragmentToText(node) {
+  let out = '';
+  for (const child of node.childNodes || []) {
+    if (child.nodeType === 3) {
+      out += child.nodeValue || '';
+    } else if (child.nodeType === 1) {
+      out += child.tagName === 'BR' ? '\n' : fragmentToText(child);
+    }
+  }
+  return out;
+}
+
+// Extract a Range's visible text with <br> → '\n' semantics (see
+// fragmentToText). cloneContents() splits partial text-node boundaries the
+// same way Range.toString() does — only the <br> handling differs.
+function rangeToText(range) {
+  try {
+    return fragmentToText(range.cloneContents());
+  } catch (_) {
+    return range.toString();
+  }
 }

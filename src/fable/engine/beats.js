@@ -863,15 +863,21 @@ export function commitOpenEditor() {
 // Used for both in-place user edits + assistant rewind-and-edit (the caller
 // picks the commit path). Callers enforce the single-editor rule via
 // commitOpenEditor() before calling this.
+// (D5 2026-08-16) opts.seed — a string overriding the textarea's initial
+// text. The session-changed restore path (narrator.js) re-opens an editor
+// with the player's in-progress edit after a feed rebuild, not the beat's
+// committed prose. Esc still cancels to `original` — cancel always means
+// revert to committed.
 export function enterEditMode(beat, opts = {}) {
   if (!beat) return;
   const body = bodyEl(beat);
   if (!body) return;
   const original = beat.dataset.raw != null ? beat.dataset.raw : body.textContent;
+  const seed = typeof opts.seed === 'string' ? opts.seed : original;
   const ta = document.createElement('textarea');
   ta.className = 'fable-mes-editor';
-  ta.value = original;
-  ta.rows = Math.max(3, Math.min(14, original.split('\n').length + 1));
+  ta.value = seed;
+  ta.rows = Math.max(3, Math.min(14, seed.split('\n').length + 1));
   body.innerHTML = '';
   body.appendChild(ta);
   beat.classList.add('editing');

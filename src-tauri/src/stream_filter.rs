@@ -28,6 +28,32 @@
 
 use regex::Regex;
 
+/// (2026-08-16 yellow B13/B10) The verb-shaped bracket strip pattern — ONE
+/// source shared by the streaming filter (`with_brackets`) and the
+/// whole-text `strip_bracket_shaped` (which removes filter-shaped-but-parser-
+/// rejected brackets from FINALIZED prose, so the live stream and the stored
+/// beat can't diverge). Body alternation is quote-aware, mirroring the
+/// parser's `find_bracket_close` (see `with_brackets` for the full rationale).
+const BRACKET_STRIP_PATTERN: &str = r#"(?i)\[(?:CHARACTER_TURN:(?:end|[^\]\s]+)|OBJECT\s*(?:[^"\]]+|"[^"]*"?)+|FX\s*(?:[^"\]]+|"[^"]*"?)+|TIME\s*(?:[^"\]]+|"[^"]*"?)+|DATE\s*(?:[^"\]]+|"[^"]*"?)+|WEATHER\s*(?:[^"\]]+|"[^"]*"?)+|TRAVEL\s*(?:[^"\]]+|"[^"]*"?)+|EFFECT\s*(?:[^"\]]+|"[^"]*"?)+|MILESTONE\s*(?:[^"\]]+|"[^"]*"?)+|TASK\s*(?:[^"\]]+|"[^"]*"?)+|RUMOR\s*(?:[^"\]]+|"[^"]*"?)+|PRESENCE\s*(?:[^"\]]+|"[^"]*"?)+|DISCOVER\s*(?:[^"\]]+|"[^"]*"?)+|NPC_REGISTER\s*(?:[^"\]]+|"[^"]*"?)+|APPEARANCE\s*(?:[^"\]]+|"[^"]*"?)+|EQUIP\s*(?:[^"\]]+|"[^"]*"?)+|BELT\s*(?:[^"\]]+|"[^"]*"?)+|PACK\s*(?:[^"\]]+|"[^"]*"?)+)\]"#;
+
+/// (2026-08-16 yellow B10) Whole-text strip of verb-shaped brackets. The
+/// streaming filter strips these live, but `bracket_parser::parse` only
+/// removes the brackets it ACCEPTS from finalized prose — a bracket the
+/// parser rejects (bad key, out-of-range `[TIME]`, unknown slot) re-leaked
+/// verbatim into the stored/archived beat the moment `done` replaced the
+/// live stream. Running the SAME shape here closes the loop: what the user
+/// watched disappear never re-appears in the saved text. Valid commands are
+/// already gone from parse's prose output, so this only touches the
+/// rejected residue. Cheap `contains('[')` gate for prose.
+pub fn strip_bracket_shaped(text: &str) -> String {
+    if !text.contains('[') {
+        return text.to_string();
+    }
+    static RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    let re = RE.get_or_init(|| Regex::new(BRACKET_STRIP_PATTERN).expect("bracket regex always compiles"));
+    re.replace_all(text, "").into_owned()
+}
+
 /// Configuration for a `StreamFilter`.
 #[derive(Debug)]
 pub struct StreamFilter {
@@ -168,8 +194,19 @@ impl StreamFilter {
         // parser's own glued-form acceptance (a prose word like `[TIMELY]`
         // already parses as a TIME body + is range-gate-rejected — the filter
         // matching it too is the same contract, display-side).
-        let pattern = r"(?i)\[(?:CHARACTER_TURN:(?:end|[^\]\s]+)|OBJECT\s*[^\]]+|FX\s*[^\]]+|TIME\s*[^\]]+|DATE\s*[^\]]+|WEATHER\s*[^\]]+|TRAVEL\s*[^\]]+|EFFECT\s*[^\]]+|MILESTONE\s*[^\]]+|TASK\s*[^\]]+|RUMOR\s*[^\]]+|PRESENCE\s*[^\]]+|DISCOVER\s*[^\]]+|NPC_REGISTER\s*[^\]]+|APPEARANCE\s*[^\]]+|EQUIP\s*[^\]]+|BELT\s*[^\]]+|PACK\s*[^\]]+)\]";
-        self.bracket_re = Some(Regex::new(pattern).expect("bracket regex always compiles"));
+        //
+        // (2026-08-16 yellow B13) QUOTE-AWARE bodies, like the parser's
+        // `find_bracket_close`: a `]` inside a double-quoted value is literal
+        // (`[EQUIP name="Studded [Fine] Armor" slot=chest]`). The old
+        // `[^\]]+` body closed the match at the inner `]`, leaking
+        // ` Armor" slot=chest]` as residue mid-stream. The body alternation
+        // `[^"\]]+|"[^"]*"?` runs unquoted spans and quoted spans (the
+        // optional trailing quote mirrors the parser's first-`]` fallback for
+        // an unterminated quote). The regex crate is a finite automaton — no
+        // backtracking blowup from the nested quantifiers.
+        self.bracket_re = Some(
+            Regex::new(BRACKET_STRIP_PATTERN).expect("bracket regex always compiles"),
+        );
         // Longest realistic bracket: `[TASK npc.marcus scout the bandit camp |
         // challenging adequate 1440]` ≈ 70 chars; an EFFECT with a long label
         // (`[EFFECT Blessed by the Sun Priest buff 1440]`) ≈ 45 chars. 96 still

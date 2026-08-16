@@ -22,6 +22,10 @@ import { invoke, Channel } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import * as beats from './beats.js';
 import { playFX, clearFX } from '../fx/effects.js';
+// (2026-08-16 yellow J2) hidePencil — every feed rebuild dissolves the
+// DOM selection the pencil anchors to; without this the pencil floats at a
+// stale viewport position until the next selection event.
+import { hidePencil } from './slice-regen.js';
 
 let activeBeat = null;     // the streaming narrator/character beat for the current turn
 let generating = false;
@@ -73,6 +77,14 @@ let deferredReroll = false;
 // cancel slot (fable_slice_stop vs fable_stop).
 let sliceBeat = null;
 let sliceSpan = null;
+// (2026-08-16 yellow J2) The in-flight slice's split context — kept so a
+// chat-side feed rebuild (the M3b `fable-session-changed` path) can RE-BIND
+// the streaming span onto the fresh node instead of streaming into a
+// detached one (the live beat showed stale text + a follow-up pencil spliced
+// from it).
+let sliceIndex = -1;
+let slicePre = '';
+let slicePost = '';
 let sliceEscapeFn = null;   // transient Escape listener, removed on turn end
 // (2026-08-16 audit M3) Turn EPOCH — bumped by every entry that starts (or
 // tears down) a streaming lifecycle. Each in-flight turn captures the value
@@ -97,6 +109,17 @@ let sessionChangedGen = 0;
 // live schema (the HUD may refresh its Soul Gem panel immediately). Receives
 // the list of merged top-level field names.
 let onSchemaPatch = null;
+// (D5 2026-08-16) Hook: ({ index, text, role }) => void — fired after a
+// chat-side `fable-session-changed` messages rebuild that landed while a
+// narrator turn streamed AND an inline beat editor was open. The editor's
+// save would be refused by the wrappers' `if (generating) return false`
+// guard AFTER its close() already swapped the body to the typed text (the
+// rebuild then replaced it with the backend's unedited messages — the edit
+// silently vaporized), so the handler CANCELS the editor, captures the
+// in-progress edit, rebuilds, and hands it here to re-open seeded with the
+// typed text. stage.js owns the role-shaped onSave closure (user →
+// rewindAndEditUser, assistant → editMessage).
+let onRestoreEditor = null;
 
 // Identity for the message headers. cardName → narrator beats; playerName →
 // user beats. Forwarded to beats.setIdentity so the builders pick them up.
@@ -115,6 +138,7 @@ export function initNarrator(hooks = {}) {
   onSchemaPop = hooks.onSchemaPop || null;
   onApiLost = hooks.onApiLost || null;
   onSchemaPatch = hooks.onSchemaPatch || null;
+  onRestoreEditor = hooks.onRestoreEditor || null;
   if (typeof hooks.cardName === 'string') cardName = hooks.cardName;
   if (typeof hooks.playerName === 'string') playerName = hooks.playerName;
   if (typeof hooks.cardPortrait === 'string') cardPortrait = hooks.cardPortrait;
@@ -155,9 +179,34 @@ export function initNarrator(hooks = {}) {
       // single-editor discipline as the composer submit / delete paths;
       // commitOpenEditor is a cheap no-op when no editor is open. A failure
       // in the save is swallowed (the backend-driven rebuild still lands).
-      const pendingSave = beats.commitOpenEditor();
-      if (pendingSave) {
-        try { await pendingSave; } catch (_) { /* rebuild regardless */ }
+      //
+      // (D5 2026-08-16) EXCEPT while a narrator turn streams: the commit's
+      // save is refused by the wrappers' `if (generating) return false`
+      // guard AFTER the editor's close() already swapped the beat body to
+      // the typed text — the rebuild below then replaced it with the
+      // backend's unedited messages, so the commit path itself vaporized
+      // the edit it was supposed to settle. In that state: capture the
+      // in-progress edit (index + typed text + role off the textarea),
+      // CANCEL the editor (no save attempt — restores the committed prose),
+      // and re-open it seeded post-rebuild via the onRestoreEditor hook.
+      let restoreEdit = null;
+      const editingBeat = beats.openEditingBeat();
+      if (editingBeat && generating) {
+        const ta = editingBeat.querySelector('.fable-mes-editor');
+        const editIdx = Number.parseInt(editingBeat.dataset.index || '-1', 10);
+        if (ta && editIdx >= 0) {
+          restoreEdit = {
+            index: editIdx,
+            text: ta.value,
+            role: editingBeat.dataset.role === 'user' ? 'user' : 'assistant',
+          };
+        }
+        beats.exitEditMode(editingBeat, false); // cancel — no save attempt
+      } else {
+        const pendingSave = beats.commitOpenEditor();
+        if (pendingSave) {
+          try { await pendingSave; } catch (_) { /* rebuild regardless */ }
+        }
       }
       // (2026-08-16 audit M3b) A chat-side edit/delete can land while an API
       // narrator turn streams (the documented Stage-2 concurrency window —
@@ -173,12 +222,39 @@ export function initNarrator(hooks = {}) {
       const wasGenerating = generating;
       const wasRerolling = rerolling;
       const wasSlice = sliceBeat !== null;
+      // (yellow J2) The slice's streamed partial, captured BEFORE the rebuild
+      // destroys the old span — re-bound onto the fresh node below.
+      const slicePartial = wasSlice && sliceSpan ? sliceSpan.textContent : '';
+      // (yellow J2) The rebuild dissolves the pencil's selection — hide it.
+      hidePencil();
       beats.rebuildFromMessages(payload.messages);
       if (wasGenerating) {
         if (wasRerolling) {
           activeBeat = beats.lastNarratorBeat();
           if (activeBeat) beats.beginReroll(activeBeat);
-        } else if (!wasSlice) {
+        } else if (wasSlice) {
+          // (2026-08-16 yellow J2) RE-BIND the in-flight slice regen: the old
+          // code deliberately skipped the slice case, so every later chunk
+          // appended to a DETACHED span — the live beat showed stale text,
+          // and a follow-up pencil spliced from that stale text. Re-claim
+          // the beat by index + re-split it with the ORIGINAL pre/post (the
+          // backend's slice_done writes the authoritative full text
+          // regardless). Index shifted or beat gone → the regen is orphaned;
+          // cancel the local state (the backend's own cancel/restore path
+          // still fires its terminal event, which no-ops on a null sliceBeat).
+          const rebound = sliceIndex >= 0 ? beats.beatByIndex(sliceIndex) : null;
+          const stillAssistant = rebound && rebound.classList.contains('assistant');
+          if (rebound && stillAssistant) {
+            sliceBeat = rebound;
+            sliceSpan = beats.beginSliceRegen(rebound, { pre: slicePre, post: slicePost });
+            if (sliceSpan && slicePartial) {
+              sliceSpan.textContent = slicePartial;
+              sliceSpan.removeAttribute('data-empty');
+            }
+          } else {
+            clearSliceState();
+          }
+        } else {
           const lastIdx = payload.messages.length - 1;
           const lastMsg = payload.messages[lastIdx];
           if (lastMsg && lastMsg.role === 'user') {
@@ -186,6 +262,15 @@ export function initNarrator(hooks = {}) {
           }
           activeBeat = beats.startNarratorBeat();
         }
+      }
+      // (D5) Re-open the captured editor onto the rebuilt feed — ONLY if a
+      // beat with that index survived the chat-side mutation (a delete can
+      // have removed it; then there is nothing to re-open onto and the
+      // captured text is regrettably lost with the beat it belonged to).
+      // Fired after the re-bind block so the editor opens on the final DOM.
+      if (restoreEdit && typeof onRestoreEditor === 'function'
+          && beats.beatByIndex(restoreEdit.index)) {
+        try { onRestoreEditor(restoreEdit); } catch (_) { /* best-effort */ }
       }
     } else if (payload.kind === 'schema') {
       // The HUD (left-drawer) reads schema on its own refresh cadence; the
@@ -240,11 +325,19 @@ export function resetNarrator() {
 // Clear all slice-regen state (called from finishTurn / resetNarrator).
 function clearSliceState() {
   if (sliceEscapeFn) {
-    document.removeEventListener('keydown', sliceEscapeFn);
+    // (2026-08-16 bug 3) The listener is ADDED with capture=true — the
+    // removal must pass the SAME flag or it never matches (per spec), which
+    // leaked one document-capture handler per pencil use + per stage reset.
+    // Each leaked handler unconditionally ate every Escape app-wide (see
+    // the early-return guard added alongside this in regenerateSlice).
+    document.removeEventListener('keydown', sliceEscapeFn, true);
     sliceEscapeFn = null;
   }
   sliceBeat = null;
   sliceSpan = null;
+  sliceIndex = -1;
+  slicePre = '';
+  slicePost = '';
 }
 
 // Send a narrator turn. Options:
@@ -472,6 +565,15 @@ function revertUncommittedTurn() {
       beats.beginReroll(activeBeat); // defensive: no prior text was captured
     } else {
       activeBeat.remove();
+      // (2026-08-16 bug 18) The removed streamed beat held the trailing
+      // stamp — the assistant below it becomes the new tail still carrying
+      // its stale DISABLED ›. stage.js's `if (btn.disabled) return` makes
+      // the stamp a hard gate (a disabled button never fires the click-time
+      // re-derive), so after a soft-stop / api_lost the player couldn't
+      // reroll the last AI beat until the next append/rebuild. Re-sync the
+      // new tail's drawer here, mirroring the reroll branch above.
+      const tail = beats.lastNarratorBeat();
+      if (tail) beats.refreshDrawer(tail);
     }
   }
   if (uncommittedUserBeat && uncommittedUserBeat.isConnected) {
@@ -570,6 +672,13 @@ function onCancelled() {
 // All three guard on `isGenerating()` — mutating mid-stream would collide
 // with the live `activeBeat` (the streaming turn appends to it). edit
 // blocks too because the round-trip shouldn't race a concurrent send.
+//
+// (2026-08-16 yellow J1) EPOCH GUARDS — the exact M3c class fixed for turns:
+// a resolve landing after a stage exit/teardown used to rebuild the feed
+// with the OLD session's messages inside the NEXT stage's fresh one (+ fire
+// a spurious finishTurn on it). Every wrapper captures the epoch at entry
+// and self-ignores once it moved; the two delegating wrappers (reroll/
+// rewind) also refuse to hand off to sendFableTurn after a teardown.
 // =============================================================
 
 // In-place edit for either a user or assistant message. The backend
@@ -583,10 +692,13 @@ function onCancelled() {
 export async function editMessage(index, newText) {
   if (generating) return false;
   generating = true;
+  const myEpoch = turnEpoch;
   if (onTurnStart) onTurnStart();
   try {
     const res = await invoke('edit_message', { index, newText });
+    if (myEpoch !== turnEpoch) return false; // stage exited mid-save (J1)
     if (res && Array.isArray(res.messages)) {
+      hidePencil(); // (yellow J2) the rebuild dissolves the pencil's selection
       beats.rebuildFromMessages(res.messages);
     }
     if (onSchemaPop && typeof res.schema_pop_count === 'number') {
@@ -594,10 +706,11 @@ export async function editMessage(index, newText) {
     }
     return true;
   } catch (err) {
+    if (myEpoch !== turnEpoch) return false;
     beats.addErrorBeat(String(err));
     return false;
   } finally {
-    finishTurn();
+    if (myEpoch === turnEpoch) finishTurn();
   }
 }
 
@@ -610,10 +723,13 @@ export async function editMessage(index, newText) {
 export async function deleteMessage(index) {
   if (generating) return false;
   generating = true;
+  const myEpoch = turnEpoch;
   if (onTurnStart) onTurnStart();
   try {
     const res = await invoke('delete_message', { index });
+    if (myEpoch !== turnEpoch) return false; // stage exited mid-delete (J1)
     if (res && Array.isArray(res.messages)) {
+      hidePencil(); // (yellow J2) the rebuild dissolves the pencil's selection
       beats.rebuildFromMessages(res.messages);
     }
     if (onSchemaPop && typeof res.schema_pop_count === 'number') {
@@ -621,10 +737,11 @@ export async function deleteMessage(index) {
     }
     return true;
   } catch (err) {
+    if (myEpoch !== turnEpoch) return false;
     beats.addErrorBeat(String(err));
     return false;
   } finally {
-    finishTurn();
+    if (myEpoch === turnEpoch) finishTurn();
   }
 }
 
@@ -641,6 +758,7 @@ export async function deleteMessage(index) {
 export async function rerollLastTurn() {
   if (generating) return false;
   generating = true;
+  const myEpoch = turnEpoch;
   if (onTurnStart) onTurnStart();
   // Validate via the gate command (checks the last message is an assistant
   // turn). No feed rebuild — the last beat stays on screen + gets streamed
@@ -651,10 +769,15 @@ export async function rerollLastTurn() {
       onSchemaPop(res.schema_pop_count);
     }
   } catch (err) {
+    if (myEpoch !== turnEpoch) return false; // stage exited mid-gate (J1)
     beats.addErrorBeat(String(err));
     finishTurn();
     return false;
   }
+  // (J1) The gate round-trip is an await — a stage exit in that window must
+  // NOT delegate to sendFableTurn (it would mint a ghost user beat + stream
+  // into the torn-down feed of the next entry).
+  if (myEpoch !== turnEpoch) return false;
   // Hand off to the streaming path with reroll=true. Reset generating first
   // so sendFableTurn's `if (generating) return` guard doesn't bail.
   generating = false;
@@ -670,9 +793,11 @@ export async function rerollLastTurn() {
 export async function swipeVariant(index, variantIdx) {
   if (generating) return false;
   generating = true;
+  const myEpoch = turnEpoch;
   if (onTurnStart) onTurnStart();
   try {
     const res = await invoke('swipe_variant', { index, variantIdx });
+    if (myEpoch !== turnEpoch) return false; // stage exited mid-swipe (J1)
     if (res && Array.isArray(res.messages)) {
       // Splice the newly-active content into the target beat in place + update
       // the variant stamp so refreshControls (fired by finishTurn's onTurnEnd)
@@ -692,10 +817,11 @@ export async function swipeVariant(index, variantIdx) {
     }
     return true;
   } catch (err) {
+    if (myEpoch !== turnEpoch) return false;
     beats.addErrorBeat(String(err));
     return false;
   } finally {
-    finishTurn();
+    if (myEpoch === turnEpoch) finishTurn();
   }
 }
 
@@ -706,20 +832,27 @@ export async function swipeVariant(index, variantIdx) {
 export async function rewindAndEditUser(index, newText) {
   if (generating) return false;
   generating = true;
+  const myEpoch = turnEpoch;
   if (onTurnStart) onTurnStart();
   try {
     const res = await invoke('rewind_and_edit_user', { index, newText });
+    if (myEpoch !== turnEpoch) return false; // stage exited mid-rewind (J1)
     if (res && Array.isArray(res.messages)) {
+      hidePencil(); // (yellow J2) the rebuild dissolves the pencil's selection
       beats.rebuildFromMessages(res.messages);
     }
     if (onSchemaPop && typeof res.schema_pop_count === 'number') {
       onSchemaPop(res.schema_pop_count);
     }
   } catch (err) {
+    if (myEpoch !== turnEpoch) return false;
     beats.addErrorBeat(String(err));
     finishTurn();
     return false;
   }
+  // (J1) Same delegation guard as rerollLastTurn: a stage exit during the
+  // rewind round-trip must not stream a turn into the torn-down feed.
+  if (myEpoch !== turnEpoch) return false;
   // Regenerate from the edited user message (now the last message). Same
   // hand-off pattern as rerollLastTurn: reset generating + delegate to the
   // streaming path with regenerate=true.
@@ -758,14 +891,22 @@ export async function regenerateSlice({ index, pre, selection, post }) {
   // Split the beat body into pre + streaming span + post.
   sliceBeat = beat;
   sliceSpan = beats.beginSliceRegen(beat, { pre, post });
+  // (yellow J2) Remember the split context so a chat-side feed rebuild can
+  // re-bind the span (see the session-changed handler).
+  sliceIndex = index;
+  slicePre = pre;
+  slicePost = post;
 
   // Transient Escape → cancel. Removed on finishTurn via clearSliceState.
+  // (2026-08-16 bug 3) Inert when no slice is live: a handler that outlived
+  // its turn (or resolved before removal) must not swallow Escape for every
+  // other consumer (inline beat editors, popups) at document-capture.
   sliceEscapeFn = (e) => {
-    if (e.key === 'Escape') {
-      e.preventDefault();
-      e.stopPropagation();
-      stopSliceRegen();
-    }
+    if (e.key !== 'Escape') return;
+    if (!sliceBeat) return;
+    e.preventDefault();
+    e.stopPropagation();
+    stopSliceRegen();
   };
   document.addEventListener('keydown', sliceEscapeFn, true);
 

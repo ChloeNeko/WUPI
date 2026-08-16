@@ -55,23 +55,27 @@ test('slugify: Windows reserved names get a suffix', () => {
 });
 
 test('slugify: caps at 64 chars without a trailing dash (2026-08-15 audit fix)', () => {
-  // Mirrors the upcoming Rust-side cap; keeps <slug>/<slug>.sim well under
-  // MAX_PATH. The truncation must not leave a trailing dash (the trim above
-  // guaranteed a clean end — the cut must restore that invariant).
+  // Mirrors the Rust-side cap; keeps <slug>/<slug>.sim well under MAX_PATH.
+  // The truncation must not leave a trailing dash (the trim above guaranteed
+  // a clean end — the cut must restore that invariant).
+  // (2026-08-16 yellow J9) The cap counts CODE POINTS (Rust's
+  // cap_slug_chars counts chars) — astral letters pass whole + a cut can
+  // never split a surrogate pair, so the old unit-count assertions are
+  // retired with the unit-based cut they pinned.
   const long = 'a'.repeat(30) + ' ' + 'b'.repeat(50); // → 30a + '-' + 50b = 81 chars
   const out = slugify(long);
-  assert.equal(out.length, 64);
+  assert.equal([...out].length, 64);
   assert.ok(!out.endsWith('-'), `trailing dash after truncation: ${out}`);
   assert.ok(out.startsWith('a'.repeat(30) + '-'));
   // An exactly-64 slug passes through untouched.
   assert.equal(slugify('c'.repeat(64)), 'c'.repeat(64));
-  // A cut landing on a surrogate pair drops the dangling high surrogate
-  // (never emits a lone half of an astral char). Uses astral LETTERS
-  // (U+1D400 𝐀, category Lu) — emoji are symbols and slug to ''.
-  const astral = 'a' + '𝐀'.repeat(40); // pairs start at ODD indices → cut at 64 splits a pair
+  // Astral LETTERS (U+1D400 𝐀, category Lu — emoji are symbols and slug to
+  // '') count ONE each: 41 code points is under the cap + passes through
+  // with pairs intact.
+  const astral = 'a' + '𝐀'.repeat(40);
   const eout = slugify(astral);
-  assert.ok(eout.length === 63, `expected surrogate-safe 63, got ${eout.length}`);
-  assert.ok(/[\ud800-\udbff]$/.test(eout) === false, 'dangling high surrogate');
+  assert.equal([...eout].length, 41, `under the cap passes whole, got ${[...eout].length}`);
+  assert.ok(!/[\ud800-\udbff]$/.test(eout), 'no dangling high surrogate');
 });
 
 // ── escapeXml ──────────────────────────────────────────────────────────────
@@ -168,6 +172,32 @@ test('serializeSimCard: omits <start> when no time/weather', () => {
   assert.ok(!xml.includes('<start>'));
   assert.ok(!xml.includes('<locations>'));
   assert.ok(!xml.includes('<cast>'));
+});
+
+// (2026-08-16 yellow J6) GLM drift: the draft may carry `clothing` as a
+// comma STRING — the NPC appearance path used to drop the field silently
+// (serializePlayer's chipList already handled the same drift).
+test('serializeSimCard: NPC clothing as comma string is split into the appearance', () => {
+  const { xml } = serializeSimCard({
+    name: 'Mara', card_type: 'npc', directive: 'd',
+    clothing: 'leather armor, traveling cloak,boots',
+  });
+  assert.ok(
+    xml.includes('Clothing: leather armor, traveling cloak, boots'),
+    `clothing line present: ${xml}`
+  );
+});
+
+// (2026-08-16 yellow J9) The 64 cap counts CODE POINTS, matching Rust's
+// cap_slug_chars — an astral-letter name must derive the SAME slug the
+// server would (the old UTF-16-unit cut split surrogate pairs).
+test('slugify: astral letters cap at 64 code points, pairs never split', () => {
+  const astral = '𝕏'.repeat(70); // 70 chars, 140 UTF-16 units
+  const slug = slugify(astral);
+  assert.equal([...slug].length, 64, 'exactly 64 code points survive');
+  assert.ok(!slug.includes('\uFFFD'), 'no replacement chars from split pairs');
+  // A mixed name under the cap passes through untouched.
+  assert.equal(slugify('Café Örn'), 'café-örn');
 });
 
 test('serializeSimCard: CDATA-wraps prose (directive with special chars)', () => {

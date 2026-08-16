@@ -420,18 +420,35 @@ fn has_control_chars(s: &str) -> bool {
 }
 
 /// Slugify a player name into a filesystem-safe id (lowercase,
-/// non-alphanumerics → dashes, trimmed). Mirrors `slugify_card_stem`
-/// (lib.rs) so player ids share the card-id discipline. Returns None
-/// when the name reduces to empty (no usable slug) — the validator
+/// non-alphanumerics → dashes, dash RUNS collapsed, trimmed, 64-char cap).
+/// Mirrors `slugify_card_stem` (lib.rs) + the JS `slugify`
+/// (card-serialize.js) on BOTH sides: the JS duplicate-name guard compares
+/// its slug against backend-listed ids and `fable_player_write` re-derives
+/// the id from the name — the old divergence ("Kaelen, the Bold" →
+/// `kaelen--the-bold` here, `kaelen-the-bold` in JS) made the guard miss
+/// and the write silently atomic-overwrite the first player's identity JSON
+/// (the exact H5 card bug, still live for players). A slug landing on a
+/// Windows reserved base name gets the "-card" suffix (the same suffix JS
+/// appends) so `create_dir_all(players/con)` can't fail opaquely. Returns
+/// None when the name reduces to empty (no usable slug) — the validator
 /// rejects empty names first, so this is belt-and-suspenders.
 pub fn slugify_player_id(name: &str) -> Option<String> {
-    let stem: String = name
+    let mapped: String = name
         .trim()
         .to_lowercase()
         .chars()
         .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '-' })
         .collect();
-    let stem = stem.trim_matches('-').to_owned();
+    // (2026-08-16 bugs 4+19) Run-collapse BEFORE the trim/cap + the reserved-
+    // stem suffix — byte-for-byte the card discipline.
+    let stem = crate::cap_slug_chars(
+        crate::collapse_dash_runs(&mapped).trim_matches('-').to_owned(),
+    );
+    let stem = if crate::WINDOWS_RESERVED_STEMS.contains(&stem.as_str()) {
+        format!("{stem}-card")
+    } else {
+        stem
+    };
     if stem.is_empty() { None } else { Some(stem) }
 }
 
@@ -714,6 +731,24 @@ mod tests {
         assert_eq!(slugify_player_id("Kaelen Voss"), Some("kaelen-voss".into()));
         assert_eq!(slugify_player_id("  Alex!  "), Some("alex".into()));
         assert_eq!(slugify_player_id("---"), None);
+    }
+
+    /// (2026-08-16 bugs 4+19) Parity with `slugify_card_stem` + the JS
+    /// `slugify`: dash-run collapse (the duplicate-name guard compares
+    /// against JS-normalized ids) + the Windows reserved-stem suffix (an
+    /// opaque `create_dir_all(players/con)` failure otherwise).
+    #[test]
+    fn slugify_matches_card_discipline() {
+        assert_eq!(slugify_player_id("Kaelen, the Bold"), Some("kaelen-the-bold".into()));
+        assert_eq!(slugify_player_id("Star - Falls"), Some("star-falls".into()));
+        assert_eq!(slugify_player_id("Con"), Some("con-card".into()));
+        assert_eq!(slugify_player_id("Nul"), Some("nul-card".into()));
+        assert_eq!(slugify_player_id("COM3"), Some("com3-card".into()));
+        // The 64-char cap re-trims a trailing dash exposed by the cut.
+        let long = "a".repeat(70) + "-b";
+        let slug = slugify_player_id(&long).unwrap();
+        assert_eq!(slug.chars().count(), 64);
+        assert!(!slug.ends_with('-'));
     }
 
     #[test]

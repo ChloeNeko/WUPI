@@ -130,6 +130,28 @@ pub const WINDOW_TRACKER: usize = 2;
 /// keys off). The narrator window is unaffected (it has the 16k API budget).
 pub const TRACKER_ASSISTANT_CHAR_CAP: usize = 600;
 
+/// (2026-08-16 bug 12) Per-side char cap for the exchange/request folded
+/// into the 2048-token schema prompts (delta + translation). The deferred
+/// re-attempt entries were already capped at 200 chars while the LIVE
+/// exchange rode in verbatim — a long chat reply or player paste pushed the
+/// prompt over budget and the middle-drop deleted a contiguous band of the
+/// sorted entity JSON the model must diff against (re-minted keys → growth
+/// spiral). 1500 chars/side (~375 tokens) keeps the anchor signal generously
+/// intact while bounding the blowup; the truncation marker makes the cut
+/// visible to the model.
+pub const SCHEMA_EXCHANGE_CHAR_CAP: usize = 1500;
+
+/// (2026-08-16 yellow S4) TOTAL char budget for the schema JSON rendered into
+/// the 2048-token schema-engine prompts (`WorldSchema::to_json_prompt`). The
+/// per-field legal maxima (500 entities × 400-char values + summary + events)
+/// compose to ~25× the context; when the whole document would overflow, the
+/// renderer now trims entities (oldest first, `player.*` identity keys always
+/// kept) instead of letting the prompt path's middle-drop splice a contiguous
+/// band out of the sorted JSON the model must diff against. 4000 chars
+/// (~1000 tokens) leaves the fixed instruction + capped exchange their share
+/// of CTX_SCHEMA with headroom.
+pub const SCHEMA_JSON_PROMPT_BUDGET_CHARS: usize = 4000;
+
 // ---------------------------------------------------------------------------
 // Sampler profiles — dist(0) terminal, greedy() BANNED
 // ---------------------------------------------------------------------------

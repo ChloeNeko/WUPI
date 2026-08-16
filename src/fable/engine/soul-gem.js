@@ -35,9 +35,12 @@
 //   .is-active on a single gem → that gem is selected (gold pulse)
 //
 // Clicking the backpack toggles .is-open ↔ .is-closed. A 350ms cooldown
-// (animating) guards against rapid multi-clicks thrashing the transitions.
-// Closing the overlay clears all .is-active gems. Clicking a gem sets
-// .is-active on it + deselects the others; the #inventory-panel-slot
+// (animating) guards against rapid multi-clicks thrashing the transitions —
+// it debounces the backpack's own click rhythm ONLY; explicit close commands
+// (closeSoulGems: Esc via the drawer's close, the stale-lock sweep) bypass
+// it (D6a 2026-08-16, Chloe ruling: a debounce is for hover events, not
+// commands). Closing the overlay clears all .is-active gems. Clicking a gem
+// sets .is-active on it + deselects the others; the #inventory-panel-slot
 // container (owned by left-drawer.js) is filled by inventory-panel.js, which
 // renders the per-slot item-button list + the contextual action popup.
 //
@@ -504,22 +507,34 @@ export function toggleSoulGems() {
     overlayEl.classList.add(SOUL_GEM_OPEN_CLASS);
     overlayEl.setAttribute('aria-hidden', 'false');
   } else {
-    overlayEl.classList.remove(SOUL_GEM_OPEN_CLASS);
-    overlayEl.classList.add(SOUL_GEM_CLOSED_CLASS);
-    overlayEl.setAttribute('aria-hidden', 'true');
-    clearActiveGem();                    // closing clears selection (spec §3)
+    applyClosed();
   }
 }
 
-// Open + close entrypoints (for teardown / external control). Each respects
-// the cooldown + mirrors the toggle's state writes.
+// The close state writes, shared by the toggle's retract branch + the
+// explicit closeSoulGems entrypoint. Caller guarantees overlayEl exists.
+function applyClosed() {
+  overlayEl.classList.remove(SOUL_GEM_OPEN_CLASS);
+  overlayEl.classList.add(SOUL_GEM_CLOSED_CLASS);
+  overlayEl.setAttribute('aria-hidden', 'true');
+  clearActiveGem();                      // closing clears selection (spec §3)
+}
+
+// Open + close entrypoints (for teardown / external control). openSoulGems
+// rides the cooldown-guarded toggle; closeSoulGems is an EXPLICIT COMMAND
+// (Esc via closeDrawer, the stale-edge-lock sweep, the drawer's mouseleave
+// auto-close) and BYPASSES the cooldown (D6a 2026-08-16, Chloe ruling: a
+// debounce is for hover events, not explicit commands) — a close landing
+// inside the 350ms window used to no-op and leave the gems bloomed behind a
+// just-closed drawer. The `animating` flag stays armed for its full window
+// so a mid-retract backpack re-click is still debounced.
 export function openSoulGems() {
   if (!overlayEl || isOpen) return;
   toggleSoulGems();
 }
 export function closeSoulGems() {
   if (!overlayEl || !isOpen) return;
-  toggleSoulGems();
+  applyClosed();
 }
 export function soulGemsOpen() { return isOpen; }
 

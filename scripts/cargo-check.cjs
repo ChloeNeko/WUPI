@@ -1,7 +1,7 @@
 // Quick compile-verification for the Rust core: runs `cargo check --release
 // --lib` against the warm RELEASE profile (minutes, NOT the 30+ min dev-
 // profile CUDA recompile that bare `cargo check`/`build`/`test` triggers —
-// see AGENTS.md §13 + the red STOP box at the top of that file).
+// see AGENTS.md §12 + the ZCode build-safety memory).
 //
 // AUTO-CLOSES potentially-locking processes first, mirroring what
 // `npm run release` does via `clear-webview2-cache.cjs`:

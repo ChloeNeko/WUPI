@@ -387,6 +387,48 @@ pub fn resolve_expired_tasks(tasks: &[OffScreenTask], now_minutes: i64) -> Vec<T
         .collect()
 }
 
+/// Remove the tasks a tick's resolutions consumed, in place (the tick's
+/// queue-drain step). One removal slot per resolution, keyed on the
+/// (npc_id, description, DC) tuple.
+///
+/// (2026-08-16 yellow W2) Only DUE tasks consume a slot: duplicate tuples
+/// (a `merge_patch` full-replace or a pre-P3 save can carry two tasks with
+/// identical npc/description/DC but different `resolves_at_minutes`) used to
+/// let the FIRST positional match consume the slot — possibly the not-yet-due
+/// sibling — leaving the due one in the queue to re-resolve (and re-emit its
+/// directive) on the next tick. Matching `is_due(now_minutes)` mirrors
+/// `resolve_expired_tasks`'s own filter exactly, so the tasks removed are
+/// precisely the tasks that produced the resolutions. Pure fn, unit-tested.
+pub fn remove_resolved_tasks(
+    tasks: &mut Vec<OffScreenTask>,
+    resolutions: &[TaskResolution],
+    now_minutes: i64,
+) {
+    let mut to_remove: Vec<(String, String, i64)> = resolutions
+        .iter()
+        .map(|r| (r.npc_id.clone(), r.description.clone(), r.dc as i64))
+        .collect();
+    tasks.retain(|t| {
+        // A not-yet-due (or already-resolved) duplicate never consumes a
+        // slot — its resolution hasn't happened.
+        if !t.is_due(now_minutes) {
+            return true;
+        }
+        let key = (
+            t.npc_id.clone(),
+            t.description.clone(),
+            t.difficulty.dc() as i64,
+        );
+        match to_remove.iter().position(|k| *k == key) {
+            Some(idx) => {
+                to_remove.remove(idx);
+                false
+            }
+            None => true,
+        }
+    });
+}
+
 // ===========================================================================
 // Focus Randomization (the world-is-alive mechanic)
 // ===========================================================================
@@ -703,6 +745,67 @@ mod tests {
         }];
         let resolutions = resolve_expired_tasks(&tasks, 5000);
         assert!(resolutions.is_empty(), "resolved tasks must not re-roll");
+    }
+
+    // ---- remove_resolved_tasks (the tick's queue drain, yellow W2) ----
+
+    fn task(npc: &str, desc: &str, resolves_at: i64) -> OffScreenTask {
+        OffScreenTask {
+            npc_id: npc.into(),
+            description: desc.into(),
+            difficulty: TaskDifficulty::Routine,
+            suitability: Suitability::Adequate,
+            resolves_at_minutes: resolves_at,
+            resolved: false,
+        }
+    }
+
+    /// One resolution + two same-TUPLE tasks (different resolves_at): the DUE
+    /// one is removed, the not-yet-due sibling survives — regardless of the
+    /// queue's ordering. The old positional first-match could delete the
+    /// future sibling and leave the due one to re-resolve next tick.
+    #[test]
+    fn remove_resolved_tasks_spares_not_yet_due_duplicate_tuples() {
+        let resolutions = vec![TaskResolution {
+            npc_id: "marcus".into(),
+            description: "scout the pass".into(),
+            roll: 15,
+            dc: TaskDifficulty::Routine.dc(),
+            severity: OutcomeSeverity::Success,
+            directive: "marcus returned".into(),
+        }];
+
+        // Future sibling FIRST in the queue — the adversarial ordering.
+        let mut tasks = vec![
+            task("marcus", "scout the pass", 5000),
+            task("marcus", "scout the pass", 1000),
+        ];
+        remove_resolved_tasks(&mut tasks, &resolutions, 2000);
+        assert_eq!(tasks.len(), 1, "exactly the due copy is removed");
+        assert_eq!(tasks[0].resolves_at_minutes, 5000, "the future sibling survives");
+
+        // And the mirrored ordering.
+        let mut tasks = vec![
+            task("marcus", "scout the pass", 1000),
+            task("marcus", "scout the pass", 5000),
+        ];
+        remove_resolved_tasks(&mut tasks, &resolutions, 2000);
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].resolves_at_minutes, 5000);
+    }
+
+    /// Two due duplicates → two resolutions from resolve_expired_tasks → both
+    /// removed (the count semantics the P3 fix established stay intact).
+    #[test]
+    fn remove_resolved_tasks_removes_as_many_as_resolved() {
+        let mut tasks = vec![
+            task("marcus", "scout the pass", 1000),
+            task("marcus", "scout the pass", 1200),
+        ];
+        let resolutions = resolve_expired_tasks(&tasks, 2000);
+        assert_eq!(resolutions.len(), 2);
+        remove_resolved_tasks(&mut tasks, &resolutions, 2000);
+        assert!(tasks.is_empty());
     }
 
     // ---- Focus randomization ----

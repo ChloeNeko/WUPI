@@ -2369,6 +2369,30 @@ body.fable-active.fable-chrome-peek .top-bar { transform: translateY(0); }
     color: var(--fable-brass-bright, #E6D58A);
 }
 
+/* ── Refused-action feedback (D6b 2026-08-16) ──────────────────────────
+   A CONSUME/EQUIP/... refused because a narrator turn is in flight keeps
+   the popup OPEN: it shakes (the raw editor's save-refusal gesture — same
+   320ms translateX ±4px) + shows this one-line reason under the buttons, so
+   a refusal never reads as success. The .shake rule sits AFTER .is-swapping
+   so it wins the equal-specificity source-order contest if both land. */
+.inv-action-popup.shake { animation: inv-popup-shake 320ms ease; }
+@keyframes inv-popup-shake {
+    0%, 100% { transform: translateX(0); }
+    25% { transform: translateX(-4px); }
+    75% { transform: translateX(4px); }
+}
+.inv-action-hint {
+    padding: 6px 10px 4px;
+    margin-top: 4px;
+    border-top: 1px solid rgba(224, 80, 90, 0.25);
+    color: #E0505A;
+    font-family: var(--fable-font-serif, 'Cinzel', serif);
+    font-size: 0.62rem;
+    letter-spacing: 0.05em;
+    text-align: center;
+    text-transform: uppercase;
+}
+
 /* =============================================================
    INVENTORY HUD OVERLAY (REMOVED 2026-08-07; REPLACED 2026-08-08/09)
    The equipment-node paperdoll overlay (equipment-overlay.js), the belt

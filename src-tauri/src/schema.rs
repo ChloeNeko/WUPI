@@ -640,7 +640,8 @@ impl NpcRegistry {
         // travel-graph nodes: a registry bloated by [NPC_REGISTER] spam rides
         // every save + every schema-engine pass. Refuse at the cap (false =
         // the applier's duplicate semantics).
-        const MAX_NPC_REGISTRY: usize = 96;
+        // (2026-08-16 yellow W3) The const moved to module scope — merge_patch's
+        // full-replace arm shares it.
         if self.entries.len() >= MAX_NPC_REGISTRY {
             tracing::warn!(
                 len = self.entries.len(),
@@ -718,6 +719,11 @@ pub const MAX_TRACKED_RELATIONSHIPS: usize = 48;
 pub const MAX_STORED_TASKS: usize = 20;
 pub const MAX_STORED_RUMORS: usize = 20;
 pub const MAX_TRAVEL_NODES: usize = 96;
+/// (2026-08-16 yellow W3) The dynamic-cast registry cap — module scope so
+/// `NpcRegistry::upsert_entry` AND `merge_patch`'s full-replace arm share one
+/// number (the raw-editor JSON tab installs whole registries; the applier's
+/// refuse-at-cap discipline now backstops it).
+pub const MAX_NPC_REGISTRY: usize = 96;
 
 /// The scene pacing mode (Fable Seam #4 expansion, 2026-07-27): a
 /// Rust-computed per-turn classification of the scene's rhythm. Drives:
@@ -903,6 +909,18 @@ pub struct WorldSchema {
     /// saves → backfilled deterministically (sorted) on first enforcement.
     #[serde(default, skip_serializing_if = "std::collections::VecDeque::is_empty")]
     pub entity_order: std::collections::VecDeque<String>,
+
+    /// (2026-08-16 deferred-3, Chloe-approved) The 3-file split's GENERATION
+    /// stamp — a cross-file commit hash. `save_split` stamps the same
+    /// `split_gen` (old + 1) into all three sibling files; `load_split`
+    /// refuses a trio whose stamps disagree (a crash between the back-to-back
+    /// renames used to leave a mixed-generation trio where every file
+    /// INDIVIDUALLY parsed, so the corrupt-file guard couldn't catch the
+    /// Frankenstein combination). Referee-owned bookkeeping: `merge_patch`
+    /// refuses it like every other typed field, prompts never render it.
+    /// 0 for legacy saves (unstamped files load as-is — can't retrofit).
+    #[serde(default)]
+    pub split_gen: u64,
 
     /// The player's canonical state (Fable Seam #7, Player State).
     /// Rust is the SOLE authority here — the schema-delta LLM pass never
@@ -1227,7 +1245,13 @@ impl WorldSchema {
                 self.entity_order.remove(idx);
                 continue;
             }
-            if key.starts_with("player.") {
+            // (2026-08-16 yellow S5) Immutable keys are EXEMPT from FIFO
+            // eviction: they occupy the oldest order slots by construction
+            // (canon keys seed first), so the sweep used to evict them before
+            // the immutability lock's overwrite check could ever matter —
+            // a first-set retcon path would then re-mint the "locked" key.
+            // The set ships empty today (latent); this makes the lock real.
+            if key.starts_with("player.") || self.immutable_keys.contains(&key) {
                 idx += 1;
                 continue;
             }
@@ -1428,8 +1452,21 @@ impl WorldSchema {
                     merged.push("rumors".into());
                 }
                 "npc_registry" => {
-                    self.npc_registry = serde_json::from_value(value)
-                        .map_err(|e| format!("npc_registry: {e}"))?;
+                    let registry: NpcRegistry =
+                        serde_json::from_value(value).map_err(|e| format!("npc_registry: {e}"))?;
+                    // (2026-08-16 yellow W3) Refuse-at-cap, the applier's +
+                    // travel-graph's discipline — a full-replace registry over
+                    // the cap is a corrupt/hand-edited patch (the bracket
+                    // applier refuses one-by-one at the same ceiling), and
+                    // truncating could drop an authored cast entry mid-list.
+                    if registry.entries.len() > MAX_NPC_REGISTRY {
+                        return Err(format!(
+                            "npc_registry: {} entries exceeds the {} cap",
+                            registry.entries.len(),
+                            MAX_NPC_REGISTRY
+                        ));
+                    }
+                    self.npc_registry = registry;
                     merged.push("npc_registry".into());
                 }
                 "presences" => {
@@ -1475,6 +1512,21 @@ impl WorldSchema {
     /// Returns an empty string for an empty schema so the caller can skip
     /// emitting the `<world_state>` block entirely (matches the memory block's
     /// empty-skip behavior in `chat_format.rs`).
+    /// (2026-08-16 yellow S7) Render-time inline flattening for prose fields
+    /// that ride `<world_state>` / the schema-engine prompt as single lines.
+    /// The write-time gate stops new mutations, but a pre-fix or hand-edited
+    /// SAVE can still carry an embedded newline that would forge a fake
+    /// `present:`/`clock:`/`exits:` render line into every later prompt. Chars,
+    /// not bytes (anti-pattern #6).
+    fn flatten_inline(s: &str) -> String {
+        s.chars()
+            .map(|c| match c {
+                '\n' | '\r' | '\t' => ' ',
+                _ => c,
+            })
+            .collect()
+    }
+
     pub fn render_for_prompt(&self) -> String {
         let empty = self.summary.trim().is_empty()
             && self.recent_events.is_empty()
@@ -1617,7 +1669,8 @@ impl WorldSchema {
         }
         if !self.summary.trim().is_empty() {
             out.push_str("summary: ");
-            out.push_str(self.summary.trim());
+            // (yellow S7) flattened — see flatten_inline.
+            out.push_str(&Self::flatten_inline(self.summary.trim()));
             out.push('\n');
         }
         // Cap recent events shown in chat at the last 5: older events live
@@ -1627,7 +1680,9 @@ impl WorldSchema {
             out.push_str("recent_events:\n");
             for ev in &self.recent_events[show_events..] {
                 out.push_str("  - ");
-                out.push_str(ev);
+                // (yellow S7) flattened — an event ending in a forged
+                // `present:`-style continuation must not become a line.
+                out.push_str(&Self::flatten_inline(ev));
                 out.push('\n');
             }
         }
@@ -1768,29 +1823,85 @@ impl WorldSchema {
     pub fn to_json_prompt(&self) -> String {
         const EVENTS_PROMPT_CAP: usize = 5;
         const ENTITY_VALUE_PROMPT_CHARS: usize = 400;
-        let events: Vec<&String> = if self.recent_events.len() > EVENTS_PROMPT_CAP {
-            self.recent_events[self.recent_events.len() - EVENTS_PROMPT_CAP..].iter().collect()
+        // (2026-08-16 yellow S4) The per-field legal maxima (500 entities ×
+        // 400-char values + summary + events) compose to ~25× CTX_SCHEMA —
+        // an at-the-caps schema overflowed the 2048-token prompt and the
+        // middle-drop spliced a contiguous band out of the sorted JSON the
+        // model must diff against (re-minted keys → growth spiral). The
+        // renderer now enforces a TOTAL char budget: entities are included
+        // in priority order until the budget is spent, the rest counted in a
+        // visible `(+N trimmed)` marker. Priority = `player.*` identity keys
+        // first (the diff anchor, never many), then `entity_order` (FIFO =
+        // oldest first, the same recency assumption eviction uses), then any
+        // keys the order list never knew (sorted — deterministic fallback).
+        let budget = crate::settings::SCHEMA_JSON_PROMPT_BUDGET_CHARS;
+        let events: Vec<String> = if self.recent_events.len() > EVENTS_PROMPT_CAP {
+            self.recent_events[self.recent_events.len() - EVENTS_PROMPT_CAP..]
+                .iter()
+                .map(|e| Self::flatten_inline(e))
+                .collect()
         } else {
-            self.recent_events.iter().collect()
+            self.recent_events
+                .iter()
+                .map(|e| Self::flatten_inline(e))
+                .collect()
         };
-        let entities: serde_json::Map<String, serde_json::Value> = self
-            .entities
-            .iter()
-            .map(|(k, v)| {
-                let compact = serde_json::to_string(v).unwrap_or_default();
-                let value = if compact.chars().count() <= ENTITY_VALUE_PROMPT_CHARS {
-                    v.clone()
-                } else {
-                    serde_json::Value::String("<long value omitted>".to_string())
-                };
-                (k.clone(), value)
-            })
-            .collect();
-        let obj = serde_json::json!({
-            "summary": self.summary,
+        // Deterministic inclusion order (see the budget note above).
+        let mut order: Vec<&String> = Vec::with_capacity(self.entities.len());
+        let mut seen: std::collections::HashSet<&String> = std::collections::HashSet::new();
+        for k in self.entities.keys() {
+            if k.starts_with("player.") {
+                order.push(k);
+                seen.insert(k);
+            }
+        }
+        for k in &self.entity_order {
+            if self.entities.contains_key(k) && seen.insert(k) {
+                order.push(k);
+            }
+        }
+        for k in self.entities.keys() {
+            if seen.insert(k) {
+                order.push(k);
+            }
+        }
+        let mut entities: serde_json::Map<String, serde_json::Value> = serde_json::Map::new();
+        let mut used = 0usize;
+        let mut trimmed = 0usize;
+        for k in order {
+            let v = &self.entities[k];
+            let compact = serde_json::to_string(v).unwrap_or_default();
+            let value = if compact.chars().count() <= ENTITY_VALUE_PROMPT_CHARS {
+                v.clone()
+            } else {
+                serde_json::Value::String("<long value omitted>".to_string())
+            };
+            let rendered = serde_json::to_string(&value).unwrap_or_default();
+            // +2 covers the `"key":` + `,` framing serde adds per entry.
+            let entry_cost = k.len() + rendered.chars().count() + 8;
+            if used + entry_cost > budget {
+                trimmed = self.entities.len() - entities.len();
+                break;
+            }
+            used += entry_cost;
+            entities.insert(k.clone(), value);
+        }
+        let mut obj = serde_json::json!({
+            "summary": Self::flatten_inline(&self.summary),
             "recent_events": events,
             "entities": entities,
         });
+        if trimmed > 0 {
+            tracing::warn!(
+                total = self.entities.len(),
+                shown = self.entities.len() - trimmed,
+                budget_chars = budget,
+                "schema prompt JSON over budget; oldest entities trimmed (player.* identity keys kept)"
+            );
+            obj.as_object_mut()
+                .expect("json! object")
+                .insert("entities_trimmed".into(), serde_json::json!(trimmed));
+        }
         serde_json::to_string(&obj).unwrap_or_else(|_| "{}".to_string())
     }
 
@@ -1939,6 +2050,19 @@ impl WorldSchema {
             }
         }
 
+        // (2026-08-16 deferred-3) Stamp the SAME generation into all three
+        // files — `self.split_gen + 1` (the struct field round-trips through
+        // world.json, so the counter is monotonic across saves without
+        // needing &mut self here). Overwrites the stale struct-field copy in
+        // `world` so the next load picks up the advanced value.
+        let split_gen = self.split_gen + 1;
+        for map in [&mut world, &mut player, &mut npc] {
+            map.insert(
+                "split_gen".to_string(),
+                serde_json::Value::Number(split_gen.into()),
+            );
+        }
+
         // (2026-08-15 audit fix) STAGED trio write: serialize + write all
         // three temp files FIRST, then rename them back-to-back. The old
         // sequential per-file atomic writes left a seconds-wide window where
@@ -2001,6 +2125,13 @@ fn type_name_of_value(v: &serde_json::Value) -> &'static str {
         npc_path: &Path,
     ) -> std::io::Result<Self> {
         let mut merged: serde_json::Map<String, serde_json::Value> = serde_json::Map::new();
+        // (2026-08-16 deferred-3) Generation stamps seen across the trio:
+        // None = legacy file (unstamped). A trio whose PRESENT stamps disagree
+        // is a mixed-generation Frankenstein (crash between save_split's
+        // back-to-back renames) — every file parses individually, so this
+        // cross-check is the only detector. Refuse loudly, same doctrine as
+        // the other corrupt-state guards here.
+        let mut seen_gens: Vec<(std::path::PathBuf, u64)> = Vec::new();
 
         // Read each file + shallow-merge its keys. `entities` is special-cased:
         // world.json + npc.json each may carry an `entities` object, and the two
@@ -2016,6 +2147,10 @@ fn type_name_of_value(v: &serde_json::Value) -> &'static str {
             let Some(obj) = val.as_object() else {
                 continue; // a non-object file is ignored (defensive; shouldn't happen)
             };
+            let mut obj = obj.clone();
+            if let Some(gen) = obj.remove("split_gen").and_then(|v| v.as_u64()) {
+                seen_gens.push((path.to_path_buf(), gen));
+            }
             for (k, v) in obj {
                 if k == "entities" {
                     // Deep-merge: both sides' entities objects union together.
@@ -2030,7 +2165,7 @@ fn type_name_of_value(v: &serde_json::Value) -> &'static str {
                             format!(
                                 "{}: `entities` is not an object (got {})",
                                 path.display(),
-                                Self::type_name_of_value(v)
+                                Self::type_name_of_value(&v)
                             ),
                         ));
                     };
@@ -2073,8 +2208,32 @@ fn type_name_of_value(v: &serde_json::Value) -> &'static str {
             }
         }
 
+        // (deferred-3) Cross-file generation check. All PRESENT stamps must
+        // agree (absent = legacy, accepted — a mix of stamped + legacy files
+        // can only mean the very first stamped write crashed mid-rename,
+        // which the disagreement check below still catches when two stamps
+        // exist; a single stamped file among two legacy ones is the benign
+        // post-upgrade first write).
+        if let Some((_, first)) = seen_gens.first() {
+            if let Some((bad_path, _)) = seen_gens.iter().find(|(_, g)| g != first) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "mixed-generation card state: {} disagrees with its siblings \
+                         (a write was interrupted — restore from a save)",
+                        bad_path.display()
+                    ),
+                ));
+            }
+        }
+
         let mut schema: WorldSchema = serde_json::from_value(serde_json::Value::Object(merged))
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        // Carry the agreed stamp into the struct so the NEXT save stamps
+        // strictly higher (monotonic even across loads).
+        if let Some((_, gen)) = seen_gens.first() {
+            schema.split_gen = *gen;
+        }
 
         // Legacy item migration (2026-08-07): absorb freeform `item_*`/`inv_*`
         // entity keys (the deleted `panels/inventory.js` convention) into the
@@ -2599,6 +2758,117 @@ mod tests {
         assert!(err.contains("must be a JSON object"), "error: {err}");
     }
 
+    /// (2026-08-16 yellow W3) A full-replace registry over the cap is refused
+    /// (the raw-editor JSON tab is the reachable caller) — same discipline as
+    /// the travel-graph arm.
+    #[test]
+    fn merge_patch_refuses_over_cap_npc_registry() {
+        let mut schema = WorldSchema::default();
+        let entries: Vec<serde_json::Value> = (0..MAX_NPC_REGISTRY + 1)
+            .map(|i| serde_json::json!({ "id": format!("npc{i}"), "name": format!("Npc {i}") }))
+            .collect();
+        let patch = serde_json::json!({ "npc_registry": { "entries": entries } });
+        let err = schema.merge_patch(patch).expect_err("over-cap registry");
+        assert!(err.contains("npc_registry"), "error names the field: {err}");
+        assert!(err.contains("exceeds"), "error states the cap: {err}");
+        // At exactly the cap it installs.
+        let entries: Vec<serde_json::Value> = (0..MAX_NPC_REGISTRY)
+            .map(|i| serde_json::json!({ "id": format!("npc{i}"), "name": format!("Npc {i}") }))
+            .collect();
+        let mut schema = WorldSchema::default();
+        schema
+            .merge_patch(serde_json::json!({ "npc_registry": { "entries": entries } }))
+            .expect("at-cap registry installs");
+    }
+
+    /// (2026-08-16 yellow S5) Immutable keys are exempt from FIFO entity
+    /// eviction — they seed oldest, so the sweep used to eat them before the
+    /// lock could ever matter.
+    #[test]
+    fn enforce_entity_cap_spares_immutable_keys() {
+        let mut schema = WorldSchema::default();
+        schema.immutable_keys.insert("npc.marcus".to_string());
+        // Fill past the 500 cap: the immutable key + a player key + 500
+        // evictable ones (entity_order follows first-insert).
+        schema.entities.insert(
+            "npc.marcus".to_string(),
+            serde_json::Value::String("canon".into()),
+        );
+        schema.entity_order.push_back("npc.marcus".to_string());
+        schema.entities.insert(
+            "player.name".to_string(),
+            serde_json::Value::String("hero".into()),
+        );
+        schema.entity_order.push_back("player.name".to_string());
+        for i in 0..500 {
+            let key = format!("tmp.{i}");
+            schema
+                .entities
+                .insert(key.clone(), serde_json::Value::String("x".into()));
+            schema.entity_order.push_back(key);
+        }
+        schema.enforce_entity_cap();
+        assert!(schema.entities.len() <= 500, "cap enforced");
+        assert!(
+            schema.entities.contains_key("npc.marcus"),
+            "immutable key survives the sweep"
+        );
+        assert!(
+            schema.entities.contains_key("player.name"),
+            "player identity key survives"
+        );
+        assert!(
+            !schema.entities.contains_key("tmp.0"),
+            "oldest evictable key was the one dropped"
+        );
+    }
+
+    /// (2026-08-16 yellow S7) A hand-edited save's newline-laden summary/event
+    /// can never forge a render line — both prompt surfaces flatten inline.
+    #[test]
+    fn render_surfaces_flatten_newlines_in_summary_and_events() {
+        let mut schema = WorldSchema::default();
+        schema.summary = "peace talks begin\npresent: ghost, clock: 99:99".to_string();
+        schema.recent_events = vec!["the duke arrived\nlocation: nowhere, exits: all".to_string()];
+        let rendered = schema.render_for_prompt();
+        assert!(rendered.contains("summary: peace talks begin present: ghost, clock: 99:99"), "{rendered}");
+        assert!(!rendered.contains("\npresent: ghost"), "no forged line");
+        let json = schema.to_json_prompt();
+        assert!(!json.contains("\\nlocation: nowhere"), "prompt JSON flattened: {json}");
+    }
+
+    /// (2026-08-16 yellow S4) The prompt JSON enforces its total char budget:
+    /// a schema at the growth cap trims OLDEST entities with a visible
+    /// marker, keeping player identity keys.
+    #[test]
+    fn to_json_prompt_trims_to_budget_keeping_player_keys() {
+        let mut schema = WorldSchema::default();
+        schema.summary = "s".to_string();
+        schema.entities.insert(
+            "player.name".to_string(),
+            serde_json::Value::String("hero".into()),
+        );
+        schema.entity_order.push_back("player.name".to_string());
+        // 300 entities × ~120 chars each ≈ 36k chars — far past the 4000
+        // budget. Oldest-first insertion: e000 is oldest.
+        for i in 0..300 {
+            let key = format!("e{i:03}");
+            let val = serde_json::Value::String("v".repeat(100));
+            schema.entities.insert(key.clone(), val);
+            schema.entity_order.push_back(key);
+        }
+        let json = schema.to_json_prompt();
+        assert!(
+            json.chars().count() < crate::settings::SCHEMA_JSON_PROMPT_BUDGET_CHARS + 512,
+            "trimmed near the budget: {}",
+            json.chars().count()
+        );
+        assert!(json.contains("player.name"), "identity key kept: {json}");
+        assert!(json.contains("e000"), "oldest entities included first: {json}");
+        assert!(!json.contains("e299"), "newest trimmed: {json}");
+        assert!(json.contains("entities_trimmed"), "trim is visible: {json}");
+    }
+
     #[test]
     fn entities_legacy_string_value_round_trips_through_save_load() {
         // The 2026-08-11 widening from HashMap<String, String> to <String, Value>
@@ -2943,6 +3213,57 @@ mod tests {
         // The body map has EXACTLY one entry — the four dead keys were
         // dropped, not remapped onto new parts.
         assert_eq!(schema.player_state.body.len(), 1);
+        for p in [&world, &player, &npc] {
+            let _ = std::fs::remove_file(p);
+        }
+    }
+
+    /// (2026-08-16 deferred-3) The split trio's generation stamps: all three
+    /// files carry the SAME stamp, the counter advances monotonically across
+    /// saves, a mixed-generation trio is REFUSED (the crash-between-renames
+    /// Frankenstein every file individually survives), and a legacy unstamped
+    /// trio still loads.
+    #[test]
+    fn split_gen_stamps_roundtrip_and_refuse_mixed_trios() {
+        let dir = std::env::temp_dir();
+        let world = dir.join("wupi_splitgen_world.json");
+        let player = dir.join("wupi_splitgen_player.json");
+        let npc = dir.join("wupi_splitgen_npc.json");
+        for p in [&world, &player, &npc] {
+            let _ = std::fs::remove_file(p);
+        }
+
+        // Save twice — stamps advance 1, then 2, and agree across the trio.
+        let mut schema = WorldSchema::default();
+        schema.summary = "gen test".into();
+        schema.save_split(&world, &player, &npc).unwrap();
+        for p in [&world, &player, &npc] {
+            let v: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(p).unwrap()).unwrap();
+            assert_eq!(v["split_gen"].as_u64(), Some(1), "{} stamped", p.display());
+        }
+        let loaded = WorldSchema::load_split(&world, &player, &npc).unwrap();
+        assert_eq!(loaded.split_gen, 1);
+        loaded.save_split(&world, &player, &npc).unwrap();
+        let loaded = WorldSchema::load_split(&world, &player, &npc).unwrap();
+        assert_eq!(loaded.split_gen, 2, "the counter is monotonic across loads");
+
+        // Mixed generation: rewind ONE file's stamp → refuse loudly.
+        let text = std::fs::read_to_string(&player).unwrap();
+        std::fs::write(&player, text.replace("\"split_gen\": 2", "\"split_gen\": 1")).unwrap();
+        let err = WorldSchema::load_split(&world, &player, &npc).unwrap_err();
+        assert!(
+            err.to_string().contains("mixed-generation"),
+            "error explains the refusal: {err}"
+        );
+
+        // Legacy unstamped trio loads (split_gen defaults 0, no refusal).
+        std::fs::write(&world, "{}").unwrap();
+        std::fs::write(&player, "{}").unwrap();
+        std::fs::write(&npc, "{}").unwrap();
+        let legacy = WorldSchema::load_split(&world, &player, &npc).unwrap();
+        assert_eq!(legacy.split_gen, 0);
+
         for p in [&world, &player, &npc] {
             let _ = std::fs::remove_file(p);
         }

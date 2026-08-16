@@ -31,9 +31,11 @@ const MIN_CROP_W = 40;       // stage-px floor on crop width
 const OUTPUT_W = 480;        // output canvas width (natural-scale target)
 const OUTPUT_H = Math.round(OUTPUT_W / CROP_ASPECT); // 720
 
-// Cache the loaded image element between the cover-render + the confirm draw
-// so we don't reload it. One in-flight modal at a time (the creator is modal).
-let _loadedImg = null;
+// (2026-08-16 yellow J7) The loaded image is PER-MODAL state (a local in
+// openPortraitCropper), not a module global: the decode is async, and a
+// module-global meant a Confirm that raced the new image's onload drew the
+// PREVIOUS modal's image (cropping stale bytes). One in-flight modal at a
+// time regardless (the creator is modal).
 
 /**
  * Open the cropper modal against `parentEl` with `imageSrc` (a URL the
@@ -77,6 +79,10 @@ export function openPortraitCropper(parentEl, imageSrc) {
     const cancelBtn = overlay.querySelector('[data-crop-cancel]');
 
     let settled = false;
+    // (yellow J7) Per-modal decoded image — null until the probe's onload.
+    // Confirm before the decode lands is a no-op (below), never a draw of a
+    // previous modal's image.
+    let loadedImg = null;
     // (2026-08-15 audit fix) document-level (capture) key handler — the old
     // overlay-bound listener went deaf once focus left the overlay (dragging
     // the crop rect moves focus to body). Removed on settle; the settled +
@@ -98,7 +104,7 @@ export function openPortraitCropper(parentEl, imageSrc) {
     // Load the image. On error, surface + cancel (no portrait).
     const probe = new Image();
     probe.onload = () => {
-      _loadedImg = probe;
+      loadedImg = probe;
       img.src = imageSrc;
       // After the <img> paints (cover), size the crop rect to a centered
       // default that fits inside the stage. Defer one frame so layout settled.
@@ -253,9 +259,13 @@ export function openPortraitCropper(parentEl, imageSrc) {
     // cleanly instead of freezing.
     function onConfirm() {
       try {
-        if (!_loadedImg) { done(null); return; }
-        const natural = _loadedImg.naturalWidth || _loadedImg.width;
-        const naturalH = _loadedImg.naturalHeight || _loadedImg.height;
+        // (yellow J7) No decoded image YET (the async decode hasn't landed) —
+        // a plain no-op return would hang the modal; settling with null
+        // cancels cleanly + keeps the prior portrait. A previous modal's
+        // image can never be drawn (per-modal state).
+        if (!loadedImg) { done(null); return; }
+        const natural = loadedImg.naturalWidth || loadedImg.width;
+        const naturalH = loadedImg.naturalHeight || loadedImg.height;
         if (!natural || !naturalH) { done(null); return; }
         // Map stage-px crop rect → natural-px source rect. The stage paints the
         // image via object-fit: cover, so the painted region is the largest
@@ -284,7 +294,7 @@ export function openPortraitCropper(parentEl, imageSrc) {
         canvas.height = OUTPUT_H;
         const ctx = canvas.getContext('2d');
         ctx.imageSmoothingQuality = 'high';
-        ctx.drawImage(_loadedImg, sx, sy, sw2, sh2, 0, 0, OUTPUT_W, OUTPUT_H);
+        ctx.drawImage(loadedImg, sx, sy, sw2, sh2, 0, 0, OUTPUT_W, OUTPUT_H);
         const dataUrl = canvas.toDataURL('image/jpeg', 0.92);
         // bytes for the caller — shipped over IPC as base64-over-JSON
         // (bytesB64), never as a bare byte-array arg (anti-pattern #5).

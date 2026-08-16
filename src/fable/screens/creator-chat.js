@@ -700,7 +700,14 @@ export function renderCreatorChat(root, config) {
     }
     // Back → return to chat to request changes.
     const backBtn = el.querySelector('[data-review-back]');
-    if (backBtn) backBtn.addEventListener('click', () => exitReviewToChat());
+    if (backBtn) backBtn.addEventListener('click', () => {
+      // (2026-08-16 yellow J5) Never exit mid-CREATE: the write is a
+      // multi-IPC sequence whose late failure surfaces ON the review card
+      // (showReviewError no-ops once the card is hidden) — a ‹ click during
+      // the write made that failure invisible.
+      if (state.busy) return;
+      exitReviewToChat();
+    });
     // The corner pencil → the edit popup (replaces the old review "Edit"
     // button, 2026-08-15 Chloe — popup + Enter + blur/ring generation).
     const pencilBtn = el.querySelector('[data-review-pencil]');

@@ -152,7 +152,10 @@ export async function renderSaves(root, cardId, onSelect, cardName) {
         await deleteSave(cardId, save.save_id);
         showStatus('');
       } catch (err) {
-        showStatus(`Delete failed: ${esc(err)}`);
+        // (2026-08-16 yellow J8) showStatus renders via textContent — the
+        // caller-side esc() double-escaped (a `&` in the backend error showed
+        // as literal `&amp;`).
+        showStatus(`Delete failed: ${err}`);
       }
       renderSaves(root, cardId, onSelect, cardName);
     });

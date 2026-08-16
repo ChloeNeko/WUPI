@@ -30,6 +30,8 @@
 // =============================================================
 
 import { invoke } from '@tauri-apps/api/core';
+// (2026-08-16 bug 5) In-flight narrator guard — see onSave.
+import * as narrator from './narrator.js';
 
 // kind → { title, isXml, read(), save(text) }. The read/save pair selects the
 // matching backend IPC. `isXml` chooses the client-side pre-check (XML sniff
@@ -155,6 +157,20 @@ let saveEpoch = 0;
 
 async function onSave() {
   if (!current || !isValid) return;
+  // (2026-08-16 bug 5) Refuse while a narrator turn is in flight — the same
+  // M5 discipline the inventory panel got. The editor's text is an OPEN-TIME
+  // snapshot: a tracker turn landing behind the modal mutates the live
+  // schema, and fable_json_raw_set recomposes from LIVE state while
+  // overwriting every key this JSON carries — the turn's mutations
+  // (world_clock/weather/injuries/[EQUIP]s) silently roll back and the undo
+  // ring records the stale state as "prior". Shake (the validation-lock
+  // feedback gesture) + keep the modal open; retry after the beat lands.
+  if (narrator.isGenerating()) {
+    console.warn('[fable] raw editor save refused: a narrator turn is in flight — wait for the beat to land');
+    textareaEl.classList.add('shake');
+    setTimeout(() => textareaEl.classList.remove('shake'), 320);
+    return;
+  }
   const text = textareaEl.value;
   const epoch = ++saveEpoch;
   saveBtn.disabled = true;

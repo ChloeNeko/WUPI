@@ -339,10 +339,16 @@ function buildNpcAppearance(d) {
   push('Body', d.body_type);
   push('Skin', d.skin_complexion);
   push('Eyes', d.eye_color);
-  if (Array.isArray(d.clothing) && d.clothing.length) {
-    const clothes = d.clothing.map((s) => text(s).trim()).filter(Boolean);
-    if (clothes.length) parts.push(`Clothing: ${clothes.join(', ')}`);
-  }
+  // (2026-08-16 yellow J6) GLM drift tolerance: the draft may carry clothing
+  // as a comma STRING — serializePlayer's chipList handles exactly this on
+  // the player side; the NPC path used to drop the mandatory-gated field
+  // silently.
+  const clothingList = Array.isArray(d.clothing)
+    ? d.clothing.map((s) => text(s).trim()).filter(Boolean)
+    : (typeof d.clothing === 'string'
+      ? d.clothing.split(',').map((s) => text(s).trim()).filter(Boolean)
+      : []);
+  if (clothingList.length) parts.push(`Clothing: ${clothingList.join(', ')}`);
   push('Breast', d.breast_size);
   push('Ears', d.ears);
   push('Tail', d.tail);
@@ -396,15 +402,17 @@ export function slugify(s) {
   // (2026-08-15 audit fix) 64-char cap — mirrors the upcoming Rust-side cap;
   // keeps <slug>/<slug>.sim well under MAX_PATH. Truncation must not leave a
   // trailing dash (the trim above already guaranteed a clean end, so restore
-  // that invariant after the cut). If the cut would split a surrogate pair,
-  // drop the dangling high surrogate too (the one char-boundary care UCS-2
-  // slicing needs).
-  let cut = slug.slice(0, 64);
-  if (cut.length === 64) {
-    const last = cut.charCodeAt(63);
-    if (last >= 0xd800 && last <= 0xdbff) cut = cut.slice(0, 63);
-  }
-  const capped = slug.length > 64 ? cut.replace(/-+$/g, '') : slug;
+  // that invariant after the cut).
+  // (2026-08-16 yellow J9) The cap counts CODE POINTS ([...slug] iterates
+  // astral letters whole), not UTF-16 units — Rust's cap_slug_chars counts
+  // chars, and the old unit-based slice derived a DIFFERENT slug for
+  // astral-letter names (a 64-unit cut splits surrogate pairs), so they could
+  // never pass their own duplicate-name guard or re-save under the id the
+  // server had derived.
+  const slugChars = [...slug];
+  const capped = slugChars.length > 64
+    ? slugChars.slice(0, 64).join('').replace(/-+$/g, '')
+    : slug;
   // A card named "Nul" or "Com1" must not slug onto a reserved name —
   // append a suffix so the folder create succeeds (the slug stays unique
   // per name; "nul" and "nul-card" can't collide).

@@ -899,8 +899,32 @@ impl Tool for CreateSimCard {
         let path = ctx.resolve(&rel)?;
         let parent = path.parent().ok_or_else(|| ToolError::new("no parent"))?;
         std::fs::create_dir_all(parent).map_err(|e| ToolError::new(format!("mkdir: {e}")))?;
-        std::fs::write(&path, xml.as_bytes())
-            .map_err(|e| ToolError::new(format!("write card: {e}")))?;
+        // (2026-08-16 yellow C19) ATOMIC write, not a bare fs::write: a crash
+        // mid-write used to truncate an EXISTING card under the same path
+        // (the tool overwrites on re-create). Same temp+fsync+rename
+        // discipline as the file_write tool + lib.rs's write_atomic, with the
+        // shared unique-temp suffix + the Windows rename-retry dance.
+        let file_name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("card.sim")
+            .to_owned();
+        let tmp = parent.join(format!(
+            ".{}.{}",
+            file_name,
+            crate::fable_save::unique_tmp_suffix()
+        ));
+        std::fs::write(&tmp, xml.as_bytes())
+            .map_err(|e| ToolError::new(format!("write temp: {e}")))?;
+        if let Err(first_err) = std::fs::rename(&tmp, &path) {
+            let _ = std::fs::remove_file(&path);
+            if let Err(e) = std::fs::rename(&tmp, &path) {
+                let _ = std::fs::remove_file(&tmp);
+                return Err(ToolError::new(format!(
+                    "rename onto {rel:?} failed ({first_err}, retry {e})"
+                )));
+            }
+        }
         Ok(format!(
             "created {rel} (the card id '{stem}' is its folder + memory key — reference it in future delete/edit calls)"
         ))

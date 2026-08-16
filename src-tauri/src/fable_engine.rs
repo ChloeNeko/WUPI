@@ -191,6 +191,17 @@ struct TrackerSniper {
     /// window (`[TIME Day 2, 14:00]` is 8+ non-space chars) and must not
     /// trip the sniper mid-body (the 2026-08-15 C1 fix).
     inside_bracket: bool,
+    /// (2026-08-16 yellow B12) True inside a ```-fence. A fenced-JSON command
+    /// emitted AFTER the brackets used to count its opener + body as
+    /// post-bracket prose (the grace window trips at the `{` of
+    /// `{"kind":...`) — the sniper decapitated the fence mid-body and the
+    /// command was silently dropped via the repair path. Fence interiors
+    /// never count, and `[`/`]` inside a JSON body don't touch the bracket
+    /// state machine.
+    inside_fence: bool,
+    /// Length of the current backtick run (a complete run of 3 toggles
+    /// `inside_fence`; 1-2 stray backticks were prose).
+    backtick_run: usize,
     /// The number of non-whitespace chars accumulated since the last `]`
     /// (or `[`) while OUTSIDE brackets.
     prose_since_close: usize,
@@ -201,6 +212,8 @@ impl TrackerSniper {
         Self {
             seen_closed_bracket: false,
             inside_bracket: false,
+            inside_fence: false,
+            backtick_run: 0,
             prose_since_close: 0,
         }
     }
@@ -212,6 +225,29 @@ impl TrackerSniper {
         // lumped a whole piece together; per-char keeps bracket-open state
         // correct when a `[` and its text share a piece with the close).
         for ch in piece.chars() {
+            if ch == '`' {
+                self.backtick_run += 1;
+                if self.backtick_run >= 3 {
+                    // A complete fence delimiter toggles fence state
+                    // (well-formed output pairs them: ```json … ```).
+                    self.inside_fence = !self.inside_fence;
+                    self.backtick_run = 0;
+                    self.prose_since_close = 0;
+                }
+                continue;
+            }
+            if self.backtick_run > 0 {
+                // A short run (1-2 backticks) wasn't a delimiter — those
+                // chars were prose after all.
+                let stray_run = self.backtick_run;
+                self.backtick_run = 0;
+                if self.seen_closed_bracket && !self.inside_fence {
+                    self.prose_since_close += stray_run;
+                }
+            }
+            if self.inside_fence {
+                continue;
+            }
             match ch {
                 '[' => {
                     self.inside_bracket = true;
@@ -1166,6 +1202,43 @@ mod tests {
         let mut s = TrackerSniper::new();
         assert!(!s.feed("[EFFECT Rage buff 60] "));
         assert!(!s.feed("[BELT name=Very Long Knife Name Indeed"));
+    }
+
+    /// (2026-08-16 yellow B12) A fenced-JSON command emitted AFTER the
+    /// brackets must complete without a snipe — the old counter read the
+    /// fence opener + body as post-bracket prose and decapitated the command
+    /// mid-body (silently dropped via the repair path).
+    #[test]
+    fn sniper_permits_fenced_json_after_brackets() {
+        let mut s = TrackerSniper::new();
+        assert!(!s.feed("[TIME 09:00] "));
+        assert!(
+            !s.feed("```json\n{\"kind\":\"pack\",\"name\":\"Gold\",\"qty\":5}\n```"),
+            "a complete fenced command after brackets must not snipe"
+        );
+        // Chunks split at arbitrary boundaries (the stream arrives in token
+        // pieces — the backtick run can straddle pieces).
+        let mut s = TrackerSniper::new();
+        assert!(!s.feed("[BELT name=Knife] "));
+        for piece in ["`", "``json\n{", "\"kind\":\"task\",\"npc_id\":\"mara\"", ",\"description\":\"scout\",\"eta_minutes\":90}\n", "`", "``"] {
+            assert!(!s.feed(piece), "split fence pieces must not snipe: {piece}");
+        }
+        // Sustained PROSE after the fence closes still fires (the fence is a
+        // command, not a prose amnesty).
+        let mut s = TrackerSniper::new();
+        assert!(!s.feed("[TIME 09:00] "));
+        assert!(!s.feed("```json\n{\"kind\":\"fx\",\"effect\":\"rain\"}\n```"));
+        assert!(s.feed(" then the fog settles"), "post-fence prose still snipes");
+    }
+
+    /// (yellow B12 corollary) A short backtick run (1-2) is prose, not a
+    /// fence delimiter — it counts toward the grace window like any char.
+    #[test]
+    fn sniper_counts_stray_backticks_as_prose() {
+        let mut s = TrackerSniper::new();
+        assert!(!s.feed("[TIME 09:00] `a` `b` "));
+        // ``a`` ``b`` = 2+1+2 + 2+1+2 = 10 prose chars past the close.
+        assert!(s.feed(" tail"), "stray backticks count as prose");
     }
 
     /// Constants are sane (compile-time sanity check).

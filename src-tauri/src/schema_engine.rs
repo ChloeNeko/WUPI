@@ -1125,6 +1125,22 @@ impl SchemaRuntime {
 // Prompt rendering (Component C)
 // ---------------------------------------------------------------------------
 
+/// (2026-08-16 bug 12) Cap one side of the exchange folded into a schema
+/// prompt, char-boundary-safe with a visible truncation marker. The deferred
+/// re-attempt entries render with a plain `.take(200)`; the LIVE exchange
+/// used to ride in verbatim + unbounded — this is the same discipline for
+/// the primary anchor. `pub(crate)` so the translation prompt
+/// (fable_command) shares it.
+pub(crate) fn cap_exchange_chars(s: &str) -> String {
+    const CAP: usize = crate::settings::SCHEMA_EXCHANGE_CHAR_CAP;
+    if s.chars().count() <= CAP {
+        return s.to_string();
+    }
+    let mut out: String = s.chars().take(CAP).collect();
+    out.push_str("[…]");
+    out
+}
+
 /// Render the schema-delta generation prompt. Uses the Gemma4 turn markers so
 /// the model sees familiar structure, but the content is schema-specific.
 /// NOT routed through `ChatFormat::render_prompt`: this is a dedicated
@@ -1153,10 +1169,13 @@ fn render_delta_prompt(
     out.push_str("<|turn>user\n");
     out.push_str("Current schema:\n");
     out.push_str(current_schema_json);
+    // (2026-08-16 bug 12) Both exchange sides run through the cap — an
+    // unbounded reply here blew the 2048-token budget + the middle-drop
+    // spliced the entity JSON the model must diff against.
     out.push_str("\n\nLast exchange:\n[user]: ");
-    out.push_str(&last_exchange.0);
+    out.push_str(&cap_exchange_chars(&last_exchange.0));
     out.push_str("\n[model]: ");
-    out.push_str(&last_exchange.1);
+    out.push_str(&cap_exchange_chars(&last_exchange.1));
     // Deferred re-attempt context. When the previous turn's delta failed all
     // 3 passes, fold its triggering exchange + accumulated errors in here so
     // the model gets another shot with the new exchange as anchor.

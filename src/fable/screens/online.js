@@ -185,23 +185,33 @@ export function buildOnlinePanel({ onChanged } = {}) {
     ).join('');
     modelSelect.disabled = false;
   }
+  // (2026-08-16 yellow J4) Fetch-sequencing token: rapid profile switches
+  // start overlapping /models fetches, and a slower EARLIER response used to
+  // render provider-A's model list into profile-B's dropdown (and visa-versa
+  // on the way back). Each populate bumps the token; a superseded response
+  // renders nothing.
+  let modelFetchSeq = 0;
   async function populateModelDropdown(profile) {
     if (!profile) {
+      modelFetchSeq++;
       modelSelect.innerHTML = '<option value="">Pick a profile to load models…</option>';
       modelSelect.disabled = true;
       return;
     }
     const cached = modelCache.get(profile.id);
     if (cached) {
+      modelFetchSeq++;
       const currentPick = modelSelect.value;
       const honored = (currentPick && cached.ids.includes(currentPick)) ? currentPick : cached.selected;
       renderModelOptions(cached.ids, honored);
       return;
     }
+    const seq = ++modelFetchSeq;
     modelSelect.disabled = true;
     modelSelect.innerHTML = '<option value="">Loading models…</option>';
     try {
       const v = await invoke('api_profile_test', { profile });
+      if (seq !== modelFetchSeq) return; // superseded by a newer selection
       const rawIds = (v && Array.isArray(v.data))
         ? v.data.map((m) => (typeof m === 'string' ? m : m?.id)).filter(Boolean)
         : [];
@@ -215,6 +225,7 @@ export function buildOnlinePanel({ onChanged } = {}) {
       modelCache.set(profile.id, { ids, selected: preferred });
       renderModelOptions(ids, preferred);
     } catch (err) {
+      if (seq !== modelFetchSeq) return;
       modelSelect.innerHTML = '<option value="">Failed to load models</option>';
       setStatus('Model list fetch failed: ' + err, 'err');
     }
@@ -368,6 +379,11 @@ export function buildOnlinePanel({ onChanged } = {}) {
     try {
       const saved = await invoke('api_profile_save', { profile });
       const savedId = saved?.id || editingId || name;
+      // (2026-08-16 yellow J4) The cached /models list belongs to the OLD
+      // endpoint/key — an edit (or an add that reuses an id) must re-fetch,
+      // never serve the previous provider's models.
+      modelCache.delete(savedId);
+      if (editingId && editingId !== savedId) modelCache.delete(editingId);
       clearEditor();
       await refresh();
       profileSelect.value = savedId;
@@ -420,6 +436,7 @@ export function buildOnlinePanel({ onChanged } = {}) {
     setStatus('Deleting…');
     try {
       await invoke('api_profile_delete', { profileId: id });
+      modelCache.delete(id); // (yellow J4) drop the dead profile's cache entry
       if (editingId === id) clearEditor();
       setStatus('Deleted.', 'ok');
       await refresh();

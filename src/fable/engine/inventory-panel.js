@@ -703,6 +703,28 @@ function _forceCloseActionPopup() {
   popupOpenedAt = 0;
 }
 
+// (D6b 2026-08-16) Refused-action feedback: KEEP the popup open, shake it,
+// and show a one-line hint under the buttons — the same gesture as the raw
+// editor's save-refusal shake. The refusal used to fire after
+// _forceCloseActionPopup, so a refused CONSUME/EQUIP looked exactly like a
+// successful one (console.warn only). Re-arms the shake so a second refusal
+// re-animates, and re-positions (the hint line changes the popup height).
+function refuseActionPopup(msg) {
+  if (!popupEl) return;
+  let hint = popupEl.querySelector('.inv-action-hint');
+  if (!hint) {
+    hint = document.createElement('div');
+    hint.className = 'inv-action-hint';
+    popupEl.appendChild(hint);
+  }
+  hint.textContent = msg;
+  popupEl.classList.remove('shake');
+  void popupEl.offsetWidth;   // force reflow so the class re-add restarts the anim
+  popupEl.classList.add('shake');
+  setTimeout(() => { if (popupEl) popupEl.classList.remove('shake'); }, 320);
+  if (activePopupAnchor) positionPopup(popupEl, activePopupAnchor);
+}
+
 // ── Action handlers ────────────────────────────────────────────────────────
 // Each mutates the live WorldSchema via fable_schema_set (the user-edit trust
 // path: bypasses the immutability lock, pushes the prior schema to the undo
@@ -720,18 +742,42 @@ function _forceCloseActionPopup() {
 // NOTE: EQUIP does NOT come through here — the main-view EQUIP button opens the
 // destination sub-menu (renderEquipDestinations); picking a zone calls
 // handleEquip directly (below).
+// (2026-08-16 bug 7) ONE mutation at a time. Two quick actions each fetch a
+// fresh schema, mutate their own copy, then install WHOLESALE via
+// fable_schema_set — resolving out of order, the later install silently
+// clobbers the earlier one's fields (CONSUME a potion then immediately
+// DISCARD a ration could resurrect the ration or un-consume the potion,
+// depending on resolve order). Every fetch→mutate→install cycle is
+// serialized behind a module-level promise chain; a prior link's failure
+// must not poison the chain (each link runs regardless of the last outcome).
+let mutationChain = Promise.resolve();
+function enqueueMutation(fn) {
+  const run = mutationChain.then(fn, fn);
+  // Keep the chain alive regardless of this link's outcome.
+  mutationChain = run.then(() => {}, () => {});
+  return run;
+}
+
 async function handleAction(action, item, bodyEl) {
-  _forceCloseActionPopup(); // user explicitly chose an action — close decisively
   // (2026-08-16 audit M5) Refuse while a narrator turn is in flight: the
   // read-modify-write below refetches then installs WHOLESALE — a Stage-1
   // tracker bracket landing between the fetch and the install is silently
   // rolled back (referee injuries, [TIME], [EQUIP]s). The panel is usable
   // during streaming, so this is a realistic long-session state-regression
   // path. Retry after the beat lands (refreshAll re-renders the panel).
+  // (D6b) The refusal comes BEFORE the close now: keep the popup open,
+  // shake it, + show the one-line hint so a refused action doesn't read as
+  // success.
   if (!isDevPreview() && narrator.isGenerating()) {
     console.warn('[inventory-panel] action refused: a narrator turn is in flight — retry after the beat lands');
+    refuseActionPopup('A narrator turn is in flight — retry after the beat lands.');
     return;
   }
+  _forceCloseActionPopup(); // user explicitly chose an action — close decisively
+  await enqueueMutation(() => performAction(action, item, bodyEl));
+}
+
+async function performAction(action, item, bodyEl) {
   let mutated = false;
   let verb = '';   // the past-tense trace for recent_events (empty = no trace)
   try {
@@ -748,9 +794,9 @@ async function handleAction(action, item, bodyEl) {
       mutated = removeItem(ps, item);
       verb = 'discarded ' + item.name;
     } else if (action === 'consume') {
-      // Consume = remove the item (a qty-1 stack or a single worn item). A
-      // future stamina/buff effect can hook here; today it just removes + the
-      // narrator learns the item was consumed.
+      // Consume = remove ONE copy of the item (see removeItem's qty
+      // semantics). A future stamina/buff effect can hook here; today it
+      // just removes + the narrator learns the item was consumed.
       mutated = removeItem(ps, item);
       verb = 'consumed ' + item.name;
     } else if (action === 'pocket') {
@@ -791,17 +837,23 @@ async function handleAction(action, item, bodyEl) {
 // occupant is pushed to the pack so nothing is lost — mirrors the legacy
 // migration's preserve-existing discipline).
 async function handleEquip(item, dest, bodyEl) {
-  _forceCloseActionPopup(); // user picked an equip destination — close decisively
   // (2026-08-16 audit M5) Same in-flight refusal as handleAction — the equip
-  // path runs the same fetch→mutate→wholesale-install cycle.
+  // path runs the same fetch→mutate→wholesale-install cycle. (D6b) Refusal
+  // BEFORE the close: keep the popup open + shake it with the hint.
   if (!isDevPreview() && narrator.isGenerating()) {
     console.warn('[inventory-panel] equip refused: a narrator turn is in flight — retry after the beat lands');
+    refuseActionPopup('A narrator turn is in flight — retry after the beat lands.');
     return;
   }
+  _forceCloseActionPopup(); // user picked an equip destination — close decisively
+  await enqueueMutation(() => performEquip(item, dest, bodyEl));
+}
+
+async function performEquip(item, dest, bodyEl) {
   let mutated = false;
   let verb = '';
   try {
-    // (P1 fix) Same discipline as handleAction: refetch, never act on the
+    // (P1 fix) Same discipline as performAction: refetch, never act on the
     // possibly-stale cache.
     const schema = isDevPreview() ? getDevSchema() : await invoke('fable_schema_get');
     cachedSchema = schema;
@@ -811,7 +863,7 @@ async function handleEquip(item, dest, bodyEl) {
     verb = 'equipped ' + item.name + ' to ' + dest.label;
 
     if (mutated) {
-      // DEV PREVIEW has no backend — skip the persist (see handleAction).
+      // DEV PREVIEW has no backend — skip the persist (see performAction).
       if (!isDevPreview()) {
         await invoke('fable_schema_set', {
           schemaJson: schema,
@@ -856,9 +908,27 @@ function mergeOrPushStack(list, entry) {
   list.push(entry);
 }
 
-// Remove an item from wherever it lives. Mutates `ps` in place; returns true
-// if something was removed.
-function removeItem(ps, item) {
+// The live stack entry for a stack-origin item, read from the FRESH schema
+// the handler just fetched (null for equipment origins / missing stacks).
+// (2026-08-16 bug 7) The render-time `item` can be stale — the panel doesn't
+// re-render while open, so a tracker turn that consumed copies mid-panel
+// used to be reverted on the next POCKET/STORE/EQUIP (the render-time
+// qty/stats/tags rode back in).
+function findFreshStack(ps, item) {
+  if (item.source !== 'belt' && item.source !== 'pack') return null;
+  const arr = ps[item.source];
+  if (!Array.isArray(arr)) return null;
+  return arr.find((s) => s && s.name === item.name) || null;
+}
+
+// Remove `count` copies of an item from wherever it lives. Mutates `ps` in
+// place; returns true if something was removed.
+// (2026-08-16 bug 6) Stack sources hold MULTI-COPY entries (Iron Arrow ×40)
+// — CONSUME/DISCARD/EQUIP act on ONE copy, so the entry's qty decrements and
+// only drops out of the list at 0. The old whole-entry splice destroyed all
+// remaining copies in the same persisted fable_schema_set. Equipment sources
+// are single worn copies and ignore `count`.
+function removeItem(ps, item, count = 1) {
   if (item.source === 'equipment') {
     const layers = ps.equipment && ps.equipment[item.slot];
     if (layers && layers[item.layer]) {
@@ -890,7 +960,12 @@ function removeItem(ps, item) {
       // renamed by a turn) → no-op, never a wrong-item delete.
       const idx = arr.findIndex((s) => s && s.name === item.name);
       if (idx !== -1) {
-        arr.splice(idx, 1);
+        const liveQty = Number.isFinite(arr[idx].qty) ? arr[idx].qty : 1;
+        if (liveQty > count) {
+          arr[idx].qty = liveQty - count; // (#6) remaining copies survive
+        } else {
+          arr.splice(idx, 1);
+        }
         return true;
       }
     }
@@ -939,9 +1014,15 @@ function moveToEquipmentSlot(ps, item, dest) {
     item.source === 'equipment' && item.slot === targetSlot && item.layer === 'outer';
   if (isAlreadyThere) return false;
 
+  // (2026-08-16 bug 7) Resolve the LIVE stack shape BEFORE removal — the
+  // render-time item's stats/tags can be stale (the panel stays open across
+  // narrator turns; see findFreshStack).
+  const freshStack = findFreshStack(ps, item);
   // Remove from origin first. The origin may have been the target slot's Outer
   // (a re-equip), in which case this clears it before we re-place.
-  const removed = removeItem(ps, item);
+  // (#6) ONE copy leaves a stack — equipping one of 40 arrows must not
+  // delete the other 39.
+  const removed = removeItem(ps, item, 1);
   if (!removed) return false;
 
   // Re-read the target slot AFTER origin removal. Ensure the slot object exists.
@@ -971,10 +1052,16 @@ function moveToEquipmentSlot(ps, item, dest) {
 
   // Place the new item in the Outer layer. (#68-adjacent) `stats` ride
   // forward — a pack/belt copy with stats used to lose them on equip.
+  // (bug 7) Prefer the FRESH stack's stats/tags over the render-time item's
+  // when the origin was a stack (see findFreshStack).
   ps.equipment[targetSlot].outer = {
     name: item.name,
-    stats: item.stats || undefined,
-    tags: tagsArray(item),
+    stats: (freshStack && typeof freshStack.stats === 'string' && freshStack.stats.trim())
+      ? freshStack.stats
+      : (item.stats || undefined),
+    tags: (freshStack && Array.isArray(freshStack.tags) && freshStack.tags.length)
+      ? freshStack.tags
+      : tagsArray(item),
   };
   // Drop the slot if both layers ended up empty (defensive — shouldn't happen
   // here since we just set Outer, but mirrors the Rust invariant).
@@ -985,18 +1072,40 @@ function moveToEquipmentSlot(ps, item, dest) {
 // forward so the item keeps its classification at the new location. (#68)
 // `stats` + the real `weight` ride forward too — the old rebuild dropped
 // both, so an equipped item STOREd/POCKETed lost its stats until re-authored.
+// (2026-08-16 bug 7) The re-inserted entry's shape resolves from the FRESH
+// source stack, never the render-time item — the panel doesn't re-render
+// while open, so a tracker turn that consumed copies mid-panel used to be
+// reverted on POCKET/STORE (the stale render-time qty rode back in).
 function moveToStack(ps, item, target) {
   if (!Array.isArray(ps[target])) ps[target] = [];
-  const removed = removeItem(ps, item);
-  if (!removed) return false;
+  let qty = 1;
+  let weight = typeof item.weight === 'number' ? item.weight : 1.0;
+  let stats = item.stats || undefined;
+  let tags = tagsArray(item);
+  if (item.source === 'belt' || item.source === 'pack') {
+    // Stack origin: move the WHOLE live stack (all copies) — resolve its
+    // current shape from the fresh schema, then remove the entry outright.
+    const arr = ps[item.source];
+    const src = Array.isArray(arr) ? arr.find((s) => s && s.name === item.name) : null;
+    if (!src) return false; // consumed/renamed by a turn mid-panel — no-op
+    qty = Number.isFinite(src.qty) ? src.qty : 1;
+    if (typeof src.weight === 'number') weight = src.weight;
+    if (typeof src.stats === 'string' && src.stats.trim()) stats = src.stats;
+    if (Array.isArray(src.tags) && src.tags.length) tags = src.tags;
+    arr.splice(arr.indexOf(src), 1);
+  } else {
+    // Equipment origin: a single worn copy.
+    const removed = removeItem(ps, item, 1);
+    if (!removed) return false;
+  }
   // (audit #26) Merge into an existing same-named stack instead of pushing a
   // duplicate (stack_upsert's name-identity — see mergeOrPushStack).
   mergeOrPushStack(ps[target], {
     name: item.name,
-    qty: item.qty,
-    weight: typeof item.weight === 'number' ? item.weight : 1.0,
-    stats: item.stats || undefined,
-    tags: tagsArray(item),
+    qty,
+    weight,
+    stats,
+    tags,
   });
   return true;
 }

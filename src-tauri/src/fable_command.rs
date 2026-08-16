@@ -164,8 +164,11 @@ pub fn render_translation_prompt(
     out.push_str("<|turn>user\n");
     out.push_str("Current world state:\n");
     out.push_str(current_state_json);
+    // (2026-08-16 bug 12) The player request runs through the same cap as
+    // the delta exchange — a pasted block rode in unbounded and could push
+    // the 2048-token translation prompt into the middle-drop.
     out.push_str("\n\nPlayer's request to Wupi:\n");
-    out.push_str(player_request);
+    out.push_str(&crate::schema_engine::cap_exchange_chars(player_request));
     // Deferred re-attempt context (fail-proof contract §5 layer 3). When the
     // player's previous request failed all 3 passes, fold its trigger + errors
     // in here so the model has a fresh shot with the new request as anchor.

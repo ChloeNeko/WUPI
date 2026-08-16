@@ -571,8 +571,6 @@ pub fn derive_condition(
     // - Amputated alone is Critical (shock); Amputated + another severe wound
     //   is Downed (rank 0).
     let has_amputated = wounds.values().any(|s| *s == BodyPartState::Black);
-    let has_critical = wounds.values().any(|s| *s == BodyPartState::Purple);
-    let has_heavy = wounds.values().any(|s| *s == BodyPartState::Red);
     // `has_medium` and `has_minor` are computed for documentation + future
     // tuning (per-part severity interactions); the v1 mapping uses only the
     // worst-wound rank below. Kept so a later pass can read them without
@@ -593,7 +591,12 @@ pub fn derive_condition(
         _ => Condition::Critical,          // Amputated alone → Critical (shock)
     };
     // Multiple severe wounds escalate to Downed — the body can't sustain them.
-    if severe_count >= 3 || (has_amputated && (has_critical || has_heavy)) {
+    // (2026-08-16 yellow W1) `has_amputated && severe_count >= 2` — the old
+    // `has_amputated && (has_critical || has_heavy)` missed DOUBLE amputation
+    // (Black+Black): the second Black IS a severe wound, but the body stayed
+    // Critical — a *smaller* lethality penalty than Black+Red, contradicting
+    // the mapping's own doc above.
+    if severe_count >= 3 || (has_amputated && severe_count >= 2) {
         condition = Condition::Downed;
     }
 
@@ -832,21 +835,33 @@ pub fn count_by_polarity(tags: &[StatusTag], polarity: Polarity, now_minutes: i6
 /// out of the buff/debuff lanes into a dedicated lane. Currently the only
 /// recognized kind is `"disguise"`. Tags with an unrecognized or empty
 /// `kind` route by `polarity` exactly as before (backwards-compatible).
-pub fn render_tags_for_prompt(tags: &[StatusTag]) -> Option<String> {
+///
+/// (2026-08-16 bug 11 — audit M1's unfinished half) EXPIRED tags never
+/// render. The only `expire_tags` sweep lives in the World Progression tick,
+/// which suspends in Combat — an expired debuff used to render as a live
+/// hard fact in `<world_state>`, and the tracker, believing it, re-emitted
+/// `[EFFECT …]` which `upsert_tag` EXTENDS: expired effects resurrected
+/// themselves from their own stale prompt image. Same read-time filter the
+/// polarity-count sites already run.
+pub fn render_tags_for_prompt(tags: &[StatusTag], now_minutes: i64) -> Option<String> {
     if tags.is_empty() {
         return None;
     }
-    let buffs: Vec<&str> = tags
+    let live: Vec<&StatusTag> = tags
+        .iter()
+        .filter(|t| !t.is_expired(now_minutes))
+        .collect();
+    let buffs: Vec<&str> = live
         .iter()
         .filter(|t| t.kind.is_empty() && t.polarity == Polarity::Buff)
         .map(|t| t.label.as_str())
         .collect();
-    let debuffs: Vec<&str> = tags
+    let debuffs: Vec<&str> = live
         .iter()
         .filter(|t| t.kind.is_empty() && t.polarity == Polarity::Debuff)
         .map(|t| t.label.as_str())
         .collect();
-    let disguises: Vec<&str> = tags
+    let disguises: Vec<&str> = live
         .iter()
         .filter(|t| t.kind == "disguise")
         .map(|t| t.label.as_str())
@@ -1267,6 +1282,22 @@ mod tests {
         assert_eq!(derive_condition(&wounds, 0, 0), Condition::Downed);
     }
 
+    /// (2026-08-16 yellow W1) DOUBLE amputation: the second Black is a severe
+    /// wound too — the old arm (`has_amputated && (has_critical || has_heavy)`)
+    /// left Black+Black at Critical, a SMALLER penalty than Black+Red.
+    #[test]
+    fn derive_condition_double_amputation_is_downed() {
+        let mut wounds = HashMap::new();
+        wounds.insert(BodyPart::LeftHand, BodyPartState::Black);
+        wounds.insert(BodyPart::RightHand, BodyPartState::Black);
+        assert_eq!(derive_condition(&wounds, 0, 0), Condition::Downed);
+        // Amputation + Critical (Purple) stays Downed as before.
+        let mut wounds = HashMap::new();
+        wounds.insert(BodyPart::LeftHand, BodyPartState::Black);
+        wounds.insert(BodyPart::Head, BodyPartState::Purple);
+        assert_eq!(derive_condition(&wounds, 0, 0), Condition::Downed);
+    }
+
     #[test]
     fn derive_condition_three_severe_wounds_is_downed() {
         // System shock: three Red-or-worse wounds = Downed regardless of amputation.
@@ -1567,7 +1598,7 @@ mod tests {
             kind: String::new(),
             },
         ];
-        let rendered = render_tags_for_prompt(&tags).expect("non-empty must render");
+        let rendered = render_tags_for_prompt(&tags, 0).expect("non-empty must render");
         assert!(rendered.contains("buffs: Blessed"));
         assert!(rendered.contains("debuffs: Poisoned"));
     }
@@ -1618,7 +1649,7 @@ mod tests {
                 kind: "disguise".into(),
             },
         ];
-        let rendered = render_tags_for_prompt(&tags).expect("must render");
+        let rendered = render_tags_for_prompt(&tags, 0).expect("must render");
         assert!(
             rendered.contains("buffs: Blessed"),
             "generic buff stays in buffs lane: {rendered}"
@@ -1651,7 +1682,7 @@ mod tests {
                 kind: "disguise".into(),
             },
         ];
-        let rendered = render_tags_for_prompt(&tags).expect("must render");
+        let rendered = render_tags_for_prompt(&tags, 0).expect("must render");
         assert!(rendered.contains("disguises: city guard uniform, merchant robes"));
         assert!(!rendered.contains("buffs:"), "no buffs lane when only disguises");
         assert!(!rendered.contains("debuffs:"), "no debuffs lane when only disguises");
@@ -1668,7 +1699,7 @@ mod tests {
             source: String::new(),
             kind: String::new(),
         }];
-        let rendered = render_tags_for_prompt(&tags).expect("must render");
+        let rendered = render_tags_for_prompt(&tags, 0).expect("must render");
         assert!(rendered.contains("debuffs: Poisoned"));
         assert!(!rendered.contains("disguises:"));
     }
@@ -1683,14 +1714,14 @@ mod tests {
             source: String::new(),
             kind: "disguise".into(),
         }];
-        let rendered = render_tags_for_prompt(&tags).expect("must render");
+        let rendered = render_tags_for_prompt(&tags, 0).expect("must render");
         assert_eq!(rendered.trim(), "disguises: novice robe");
     }
 
     #[test]
     fn render_tags_none_when_empty() {
         let tags: Vec<StatusTag> = Vec::new();
-        assert_eq!(render_tags_for_prompt(&tags), None);
+        assert_eq!(render_tags_for_prompt(&tags, 0), None);
     }
 
     #[test]
@@ -1702,9 +1733,64 @@ mod tests {
             source: String::new(),
         kind: String::new(),
         }];
-        let rendered = render_tags_for_prompt(&tags).expect("non-empty must render");
+        let rendered = render_tags_for_prompt(&tags, 0).expect("non-empty must render");
         assert!(rendered.contains("buffs: Blessed"));
         assert!(!rendered.contains("debuffs:"), "debuffs line must be omitted when empty");
+    }
+
+    /// (2026-08-16 bug 11 — M1's unfinished half) Expired tags never render:
+    /// during Combat the tick's expiry sweep is suspended, so the render is
+    /// the authority — an expired debuff rendered as a live fact taught the
+    /// tracker to re-emit `[EFFECT …]`, which `upsert_tag` extends.
+    #[test]
+    fn render_tags_excludes_expired_tags() {
+        let tags = vec![
+            StatusTag {
+                label: "Blessed".into(),
+                polarity: Polarity::Buff,
+                expires_at: 1000,
+                source: String::new(),
+                kind: String::new(),
+            },
+            StatusTag {
+                label: "Feverish".into(),
+                polarity: Polarity::Debuff,
+                expires_at: 500,
+                source: String::new(),
+                kind: String::new(),
+            },
+            StatusTag {
+                label: "stale disguise".into(),
+                polarity: Polarity::Buff,
+                expires_at: 500,
+                source: String::new(),
+                kind: "disguise".into(),
+            },
+            StatusTag {
+                label: "permanent disguise".into(),
+                polarity: Polarity::Buff,
+                expires_at: 0,
+                source: String::new(),
+                kind: "disguise".into(),
+            },
+        ];
+        // now = 999: Feverish + the stale disguise (expires_at 500) are past
+        // expiry; Blessed (expires_at 1000) is still live — expiry is
+        // inclusive (`now >= expires_at`), so exactly-at-expiry is gone.
+        let rendered = render_tags_for_prompt(&tags, 999).expect("live tags must render");
+        assert!(rendered.contains("buffs: Blessed"), "unexpired buff renders: {rendered}");
+        assert!(!rendered.contains("Feverish"), "expired debuff must not render: {rendered}");
+        assert!(!rendered.contains("stale disguise"), "expired disguise must not render: {rendered}");
+        assert!(rendered.contains("disguises: permanent disguise"), "permanent disguise renders: {rendered}");
+        // All expired → None (no empty lanes).
+        let all_expired = vec![StatusTag {
+            label: "Feverish".into(),
+            polarity: Polarity::Debuff,
+            expires_at: 500,
+            source: String::new(),
+            kind: String::new(),
+        }];
+        assert_eq!(render_tags_for_prompt(&all_expired, 1000), None);
     }
 
     // ---- Slice 4: Quest Frustration Curve ----

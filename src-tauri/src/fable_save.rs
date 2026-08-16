@@ -77,9 +77,11 @@ pub struct SaveFile {
 }
 
 /// The metadata-only projection `list_saves` extracts from a save's HEADER
-/// PREFIX (everything before the `"session"` key). All fields must precede
-/// `session` in `SaveFile`'s declaration order for the prefix cut to work —
-/// pinned by test.
+/// PREFIX (everything before the `"session"` key). The wire order that makes
+/// the prefix cut work is pinned BY CONSTRUCTION in `write_save` (every
+/// header field is emitted before `"session"` — serde_json's BTreeMap-backed
+/// Map would otherwise sort `summary`/`timestamp` AFTER `session`, and the
+/// prefix would never parse) — pinned by test.
 #[derive(Debug, serde::Deserialize)]
 struct SaveHeader {
     name: String,
@@ -168,14 +170,44 @@ pub fn write_save(
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
     // (2026-08-16 audit H3) Same schema-pool collapse as `Conversation::save`
     // — the save slot embeds the whole session, so it inherits the
-    // O(messages × schema clones) growth. The header fields (incl.
-    // `turn_count`) all precede `session` in the value, so the prefix cut in
-    // `read_save_header` still lands before any pooled payload.
+    // O(messages × schema clones) growth.
     if let Some(session_value) = value.get_mut("session") {
         crate::session::pool_session_schemas(session_value);
     }
-    let json = serde_json::to_vec_pretty(&value)
+    // (2026-08-16 bug 1) Compose the document with EVERY header field before
+    // `"session"` BY CONSTRUCTION. `to_vec_pretty(&value)` emits BTreeMap-
+    // SORTED keys, which put `summary` + `timestamp` AFTER `"session"` — the
+    // prefix cut in `read_save_header` then yielded a header missing them on
+    // EVERY current-format save (SaveHeader has no defaults for those), so
+    // the header path always fell back to the full multi-MB parse + hydrate:
+    // strictly MORE work than pre-H3, silently (the list results were still
+    // correct via the fallback — which is why the existing tests passed).
+    // Hand-assembling the outer object pins the wire order: header fields
+    // first, then the (already sorted + pooled) session/schema payloads.
+    // Key order is irrelevant to deserialization — load_save + legacy
+    // readers are unaffected. Determinism is preserved (every input to this
+    // composition is itself deterministic).
+    let session_json = serde_json::to_string_pretty(&value.get("session").cloned().unwrap_or(serde_json::Value::Null))
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+    let schema_json = serde_json::to_string_pretty(&value.get("schema").cloned().unwrap_or(serde_json::Value::Null))
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+    let quoted = |s: &str| serde_json::to_string(s);
+    let json = format!(
+        "{{\n  \"card_id\": {},\n  \"save_id\": {},\n  \"name\": {},\n  \"summary\": {},\n  \"timestamp\": {},\n  \"is_autosave\": {},\n  \"turn_count\": {},\n  \"session\": {},\n  \"schema\": {}\n}}",
+        quoted(&save.card_id)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?,
+        quoted(&save.save_id)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?,
+        quoted(&save.name)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?,
+        quoted(&save.summary)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?,
+        save.timestamp,
+        save.is_autosave,
+        save.turn_count,
+        session_json,
+        schema_json,
+    );
 
     // Atomic write pattern (matches session.rs / schema.rs): write temp +
     // fsync + rename. The temp lives in the same dir/volume so the rename
@@ -192,7 +224,7 @@ pub fn write_save(
     let write_result: std::io::Result<()> = (|| {
         use std::io::Write;
         let mut f = std::fs::File::create(&tmp_path)?;
-        f.write_all(&json)?;
+        f.write_all(json.as_bytes())?;
         f.sync_all()?;
         atomic_rename(&tmp_path, &final_path)
     })();
@@ -664,6 +696,54 @@ mod tests {
         assert_eq!(list[0].turn_count, 4, "turn_count from the header prefix");
         assert_eq!(list[0].summary, "turn 2");
         assert_eq!(list[0].name, "Big");
+    }
+
+    /// (2026-08-16 bug 1) The header path must SUCCEED on the current wire
+    /// format — `list_saves_reads_header_prefix_only` above passes even when
+    /// every read falls back to the full parse (the fallback yields the same
+    /// values), so the optimization's "is it actually used" contract needs a
+    /// direct pin on `read_save_header`.
+    #[test]
+    fn read_save_header_parses_current_wire_format_directly() {
+        let tmp = tempdir().unwrap();
+        let card = fake_card();
+        // A schema payload far larger than the 16 KiB prefix read cap — pins
+        // that the cut lands BEFORE any session/schema bytes, not just that
+        // the fields happen to parse.
+        let mut big = WorldSchema::default();
+        big.summary = "x".repeat(60_000);
+        write_save(
+            tmp.path(),
+            &card,
+            "save_hdr",
+            "Header",
+            &session_with("header action"),
+            &big,
+        )
+        .unwrap();
+        let path = resolve_save_path(tmp.path(), "test_card", "save_hdr");
+        let (name, summary, timestamp, is_autosave, turn_count) =
+            read_save_header(&path).expect("header prefix parse must succeed on the current format");
+        assert_eq!(name, "Header");
+        assert_eq!(summary, "header action");
+        assert!(timestamp > 0);
+        assert!(!is_autosave);
+        assert_eq!(turn_count, 2);
+
+        // Wire-order pin: the `"session"` key must appear before the schema
+        // payload in the raw bytes (the composed header-first order), and
+        // everything before it must be small (the capped read stops there).
+        let raw = std::fs::read_to_string(&path).unwrap();
+        let cut = raw.find("\"session\"").expect("session key present");
+        assert!(cut < 16 * 1024, "header prefix stays under the read cap");
+        assert!(
+            raw.find("\"schema\"").map_or(false, |s| s > cut),
+            "schema payload follows session"
+        );
+        // `summary` + `timestamp` must appear BEFORE the cut — the sorted-key
+        // order that broke the prefix cut put them after.
+        assert!(raw.find("\"summary\"").unwrap() < cut);
+        assert!(raw.find("\"timestamp\"").unwrap() < cut);
     }
 
     /// A legacy pre-pool save (inline schemas, no turn_count) must still

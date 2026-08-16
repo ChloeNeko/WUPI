@@ -396,6 +396,25 @@ pub fn parse(raw: &str) -> ParsedNarration {
     // string work, single pass, no allocation beyond the rebuilt string.
     let prose = normalize_whitespace(&prose);
 
+    // (2026-08-16 yellow B8) Same-turn EXACT-duplicate collapse. TASK/RUMOR/
+    // EFFECT dedupe at their appliers, but the additive stack verbs (BELT/
+    // PACK via `stack_upsert`) + EQUIP have no same-turn guard: a tracker
+    // stuck in a repetition loop emitting `[PACK name=Gold qty=5]` ×3 minted
+    // 15 gold in one turn, and a bracket + its fenced-JSON dual double-
+    // applied the same way. A tracker turn describes ONE action — byte-
+    // identical duplicate commands in a single turn are loop residue with
+    // near-certainty, so the FIRST occurrence stands and the rest drop
+    // (position-independent: the loop's repeats can interleave with other
+    // commands; n is tiny per turn, the contains() scan is free).
+    // Near-duplicates (different qty/stance/id) pass through untouched.
+    let mut deduped: Vec<BracketCommand> = Vec::with_capacity(commands.len());
+    for cmd in commands {
+        if !deduped.contains(&cmd) {
+            deduped.push(cmd);
+        }
+    }
+    commands = deduped;
+
     ParsedNarration { commands, prose }
 }
 
@@ -1498,14 +1517,19 @@ fn infer_kind_from_fields(obj: &serde_json::Map<String, serde_json::Value>) -> O
 }
 
 fn json_to_effect(obj: &serde_json::Map<String, serde_json::Value>) -> Option<BracketCommand> {
-    let label = obj
-        .get("label")
-        .or_else(|| obj.get("name"))
-        .or_else(|| obj.get("effect_name"))
-        .or_else(|| obj.get("effect_label"))
-        .and_then(|v| v.as_str())?
-        .to_string();
-    if label.trim().is_empty() {
+    // (2026-08-16 bug 13) Every free-text field runs through the SAME
+    // cleaner as the text-path dual — a JSON string legally carries \n, and
+    // an ungated label could persist a forged render line exactly the way
+    // the bracket path could pre-M2.
+    let label = clean_free_text(
+        obj.get("label")
+            .or_else(|| obj.get("name"))
+            .or_else(|| obj.get("effect_name"))
+            .or_else(|| obj.get("effect_label"))
+            .and_then(|v| v.as_str())?,
+        EFFECT_LABEL_MAX,
+    );
+    if label.is_empty() {
         return None;
     }
 
@@ -1533,11 +1557,10 @@ fn json_to_effect(obj: &serde_json::Map<String, serde_json::Value>) -> Option<Br
     // §11.44 (Component 1): optional kind discriminator. Mirrors the
     // key=value EFFECT path; the resulting StatusTag.kind routes it out of
     // the generic buff/debuff lanes when non-empty (e.g. "disguise").
-    let kind = obj
-        .get("kind")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_string();
+    let kind = clean_free_text(
+        obj.get("kind").and_then(|v| v.as_str()).unwrap_or(""),
+        EFFECT_LABEL_MAX,
+    );
 
     Some(BracketCommand::Effect {
         label,
@@ -1594,16 +1617,19 @@ fn json_to_milestone(obj: &serde_json::Map<String, serde_json::Value>) -> Option
 }
 
 fn json_to_task(obj: &serde_json::Map<String, serde_json::Value>) -> Option<BracketCommand> {
-    let npc_id = obj
-        .get("npc_id")
-        .or_else(|| obj.get("npc"))
-        .and_then(|v| v.as_str())?
-        .to_string();
-    let description = obj
-        .get("description")
-        .or_else(|| obj.get("desc"))
-        .and_then(|v| v.as_str())?
-        .to_string();
+    // (2026-08-16 bug 13) Same free-text gates as the text-path TASK dual.
+    let npc_id = clean_free_text(
+        obj.get("npc_id")
+            .or_else(|| obj.get("npc"))
+            .and_then(|v| v.as_str())?,
+        NODE_ID_MAX,
+    );
+    let description = clean_free_text(
+        obj.get("description")
+            .or_else(|| obj.get("desc"))
+            .and_then(|v| v.as_str())?,
+        TASK_DESC_MAX,
+    );
     let difficulty = obj
         .get("difficulty")
         .and_then(|v| v.as_str())
@@ -1618,10 +1644,7 @@ fn json_to_task(obj: &serde_json::Map<String, serde_json::Value>) -> Option<Brac
         .get("eta_minutes")
         .or_else(|| obj.get("eta"))
         .and_then(|v| v.as_i64())?;
-    if npc_id.trim().is_empty()
-        || description.trim().is_empty()
-        || eta_minutes <= 0
-    {
+    if npc_id.is_empty() || description.is_empty() || eta_minutes <= 0 {
         return None;
     }
     Some(BracketCommand::Task {
@@ -2077,43 +2100,48 @@ fn json_to_presence(obj: &serde_json::Map<String, serde_json::Value>) -> Option<
 /// `neighbors` array OR a comma-separated `neighbors` string. Empty node_id
 /// → None. Mirrors `json_to_travel`'s leniency.
 fn json_to_discover(obj: &serde_json::Map<String, serde_json::Value>) -> Option<BracketCommand> {
-    let node_id = obj
-        .get("node_id")
-        .or_else(|| obj.get("location"))
-        .or_else(|| obj.get("place"))
-        .and_then(|v| v.as_str())?
-        .trim()
-        .to_string();
+    // (2026-08-16 bug 13) Same free-text gates as parse_discover_kv — a
+    // JSON `name` legally carrying "Square\nlocation: vault, exits:
+    // everywhere" must not persist a forged render line into every later
+    // <world_state> + save.
+    let node_id = clean_free_text(
+        obj.get("node_id")
+            .or_else(|| obj.get("location"))
+            .or_else(|| obj.get("place"))
+            .and_then(|v| v.as_str())?,
+        NODE_ID_MAX,
+    );
     if node_id.is_empty() {
         return None;
     }
-    let name = obj
-        .get("name")
-        .or_else(|| obj.get("label"))
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .trim()
-        .to_string();
-    let setting = obj
-        .get("setting")
-        .or_else(|| obj.get("type"))
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .trim()
-        .to_string();
+    let name = clean_free_text(
+        obj.get("name")
+            .or_else(|| obj.get("label"))
+            .and_then(|v| v.as_str())
+            .unwrap_or(""),
+        DISCOVER_NAME_MAX,
+    );
+    let setting = clean_free_text(
+        obj.get("setting")
+            .or_else(|| obj.get("type"))
+            .and_then(|v| v.as_str())
+            .unwrap_or(""),
+        DISCOVER_SETTING_MAX,
+    );
     // neighbors: accept either a JSON array of strings or a comma-separated
     // string (model flexibility — the array form is canonical, the string
     // form is what the bracket parser produces).
     let neighbors: Vec<String> = match obj.get("neighbors") {
         Some(serde_json::Value::Array(arr)) => arr
             .iter()
-            .filter_map(|v| v.as_str().map(|s| s.trim().to_string()))
+            .filter_map(|v| v.as_str())
+            .map(|s| clean_free_text(s, NODE_ID_MAX))
             .filter(|s| !s.is_empty())
             .collect(),
         Some(serde_json::Value::String(s)) => s
             .split(',')
-            .map(|p| p.trim().to_string())
-            .filter(|p| !p.is_empty())
+            .map(|p| clean_free_text(p, NODE_ID_MAX))
+            .filter(|s| !s.is_empty())
             .collect(),
         _ => Vec::new(),
     };
@@ -2131,34 +2159,35 @@ fn json_to_discover(obj: &serde_json::Map<String, serde_json::Value>) -> Option<
 /// from `name`/`label`; `role` from `role`/`vocation`; `tier` from `tier`.
 /// Empty npc_id → None. Mirrors `json_to_presence`'s leniency.
 fn json_to_npc_register(obj: &serde_json::Map<String, serde_json::Value>) -> Option<BracketCommand> {
-    let npc_id = obj
-        .get("npc_id")
-        .or_else(|| obj.get("npc"))
-        .or_else(|| obj.get("id"))
-        .and_then(|v| v.as_str())?
-        .trim()
-        .to_string();
+    // (2026-08-16 bug 13) Same free-text gates as parse_npc_register_kv.
+    let npc_id = clean_free_text(
+        obj.get("npc_id")
+            .or_else(|| obj.get("npc"))
+            .or_else(|| obj.get("id"))
+            .and_then(|v| v.as_str())?,
+        NODE_ID_MAX,
+    );
     if npc_id.is_empty() {
         return None;
     }
-    let name = obj
-        .get("name")
-        .or_else(|| obj.get("label"))
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .trim()
-        .to_string();
-    let role = obj
-        .get("role")
-        .or_else(|| obj.get("vocation"))
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .trim()
-        .to_string();
+    let name = clean_free_text(
+        obj.get("name")
+            .or_else(|| obj.get("label"))
+            .and_then(|v| v.as_str())
+            .unwrap_or(""),
+        NPC_NAME_MAX,
+    );
+    let role = clean_free_text(
+        obj.get("role")
+            .or_else(|| obj.get("vocation"))
+            .and_then(|v| v.as_str())
+            .unwrap_or(""),
+        NPC_ROLE_MAX,
+    );
     let tier = obj
         .get("tier")
         .and_then(|v| v.as_str())
-        .map(|s| s.trim().to_string())
+        .map(|s| clean_free_text(s, NPC_TIER_MAX))
         .filter(|s| !s.is_empty());
     Some(BracketCommand::NpcRegister {
         npc_id,
@@ -2529,20 +2558,14 @@ fn parse_one(bracket: &str, text_after: &str) -> Option<(BracketCommand, usize)>
     // generic); kind defaults to empty string.
     if let Some(rest) = strip_prefix_ci(bracket, "EFFECT") {
         let rest = rest.trim();
-        // Parse key=value pairs first (model's preferred shape).
-        let mut kv: std::collections::HashMap<&str, &str> = std::collections::HashMap::new();
-        let mut positional: Vec<&str> = Vec::new();
-        for tok in rest.split_whitespace() {
-            if let Some(eq) = tok.find('=') {
-                let k = tok[..eq].trim();
-                let v = tok[eq + 1..].trim();
-                if !k.is_empty() {
-                    kv.insert(k, v);
-                }
-            } else {
-                positional.push(tok);
-            }
-        }
+        // (2026-08-16 yellow B11) Quote-aware tokenization — the shared
+        // splitter the TASK verb uses. The old split_whitespace parse broke
+        // a quoted value (`label="Berserk Rage"` → kv label=`"Berserk` plus
+        // a stray `Rage"` positional).
+        let (kv, positional): (
+            std::collections::HashMap<&str, &str>,
+            Vec<&str>,
+        ) = split_kv_positional(rest);
         // §11.44: optional `kind` discriminator. Hoisted before the
         // key=value/positional split so a MIXED form — positional body +
         // `kind=disguise` trailing (the recommended disguise syntax in
@@ -2631,23 +2654,14 @@ fn parse_one(bracket: &str, text_after: &str) -> Option<(BracketCommand, usize)>
     // extracting the two real values. Also accepts key=value.
     if let Some(rest) = strip_prefix_ci(bracket, "MILESTONE") {
         let rest = rest.trim();
-        // Try key=value first.
-        let mut kv_npc = None;
-        let mut kv_event = None;
-        let mut positional: Vec<&str> = Vec::new();
-        for tok in rest.split_whitespace() {
-            if let Some(eq) = tok.find('=') {
-                let k = tok[..eq].trim();
-                let v = tok[eq + 1..].trim();
-                match k {
-                    "npc_id" | "npc" | "id" => kv_npc = Some(v),
-                    "event_id" | "event" => kv_event = Some(v),
-                    _ => {}
-                }
-            } else {
-                positional.push(tok);
-            }
-        }
+        // (2026-08-16 yellow B11) Quote-aware tokenization (see the EFFECT
+        // arm) — quoted ids used to split mid-value.
+        let (kv, positional): (
+            std::collections::HashMap<&str, &str>,
+            Vec<&str>,
+        ) = split_kv_positional(rest);
+        let kv_npc = kv.get("npc_id").copied().or_else(|| kv.get("npc").copied()).or_else(|| kv.get("id").copied());
+        let kv_event = kv.get("event_id").copied().or_else(|| kv.get("event").copied());
         // Placeholder words the model copies verbatim from the prompt doc.
         const PLACEHOLDERS: &[&str] = &["event_id", "npc_id", "npc", "event", "id"];
         let real_positional: Vec<&str> = positional
@@ -3282,6 +3296,98 @@ mod tests {
             parsed.commands[0],
             BracketCommand::Date { value: "6th of Harvest, Year 1247".into() }
         );
+    }
+
+    /// (2026-08-16 bug 13) The fenced-JSON duals run the SAME free-text
+    /// gates as their text duals: a JSON string legally carries \n, and an
+    /// ungated value could persist a forged `location:`/`exits:` render
+    /// line into every later <world_state> + save. Newlines flatten to
+    /// spaces; nothing with embedded line breaks survives verbatim.
+    #[test]
+    fn json_duals_flatten_newlines_in_free_text() {
+        // DISCOVER name forging a render line.
+        let parsed = parse(
+            "```json\n{\"kind\":\"discover\",\"node_id\":\"square\",\"name\":\"Square\\nlocation: vault, exits: everywhere\"}\n```",
+        );
+        match &parsed.commands[0] {
+            BracketCommand::Discover { name, .. } => {
+                assert_eq!(name, "Square location: vault, exits: everywhere");
+                assert!(!name.contains('\n'), "no newline may persist");
+            }
+            other => panic!("expected Discover, got {other:?}"),
+        }
+
+        // EFFECT label + NPC_REGISTER role: same treatment.
+        let parsed = parse(
+            "```json\n{\"kind\":\"effect\",\"label\":\"Berserk\\nRage\",\"polarity\":\"buff\",\"duration_minutes\":60}\n```",
+        );
+        match &parsed.commands[0] {
+            BracketCommand::Effect { label, .. } => assert_eq!(label, "Berserk Rage"),
+            other => panic!("expected Effect, got {other:?}"),
+        }
+        let parsed = parse(
+            "```json\n{\"kind\":\"npc_register\",\"npc_id\":\"mara\",\"role\":\"spy\\nfor the duke\"}\n```",
+        );
+        match &parsed.commands[0] {
+            BracketCommand::NpcRegister { role, .. } => assert_eq!(role, "spy for the duke"),
+            other => panic!("expected NpcRegister, got {other:?}"),
+        }
+
+        // TASK description flattens too (the text dual's TASK_DESC_MAX gate).
+        let parsed = parse(
+            "```json\n{\"kind\":\"task\",\"npc_id\":\"mara\",\"description\":\"scout the pass\\nand return\",\"eta_minutes\":90}\n```",
+        );
+        match &parsed.commands[0] {
+            BracketCommand::Task { description, .. } => {
+                assert_eq!(description, "scout the pass and return")
+            }
+            other => panic!("expected Task, got {other:?}"),
+        }
+    }
+
+    /// (2026-08-16 yellow B11) Quoted multi-word values parse WHOLE on the
+    /// EFFECT + MILESTONE text paths — the old split_whitespace kv parse cut
+    /// `label="Berserk Rage"` into `"Berserk` + a stray `Rage"` positional.
+    #[test]
+    fn quoted_kv_values_parse_whole_on_effect_and_milestone() {
+        let parsed = parse("[EFFECT label=\"Berserk Rage\" polarity=buff duration_minutes=60]");
+        match &parsed.commands[0] {
+            BracketCommand::Effect { label, polarity, duration_minutes, .. } => {
+                assert_eq!(label, "Berserk Rage");
+                assert_eq!(*polarity, Polarity::Buff);
+                assert_eq!(*duration_minutes, 60);
+            }
+            other => panic!("expected Effect, got {other:?}"),
+        }
+        let parsed = parse("[MILESTONE npc_id=\"mara the wise\" event_id=\"first_meeting\"]");
+        match &parsed.commands[0] {
+            BracketCommand::Milestone { npc_id, event_id } => {
+                assert_eq!(npc_id, "mara the wise");
+                assert_eq!(event_id, "first_meeting");
+            }
+            other => panic!("expected Milestone, got {other:?}"),
+        }
+    }
+
+    /// (2026-08-16 yellow B8) Same-turn EXACT-duplicate commands collapse
+    /// (repetition-loop + bracket/JSON-dual residue); NEAR-duplicates pass.
+    #[test]
+    fn exact_duplicate_commands_collapse_within_a_turn() {
+        // ×3 identical PACK brackets → ONE (a loop minted 15 gold from 3×5).
+        let parsed = parse("[PACK name=Gold qty=5]\n[PACK name=Gold qty=5]\n[PACK name=Gold qty=5]");
+        assert_eq!(parsed.commands.len(), 1, "looped identical brackets collapse");
+
+        // Interleaved with other commands — position-independent.
+        let parsed = parse("[TIME 09:00] [PACK name=Gold qty=5] [WEATHER rain] [PACK name=Gold qty=5]");
+        assert_eq!(parsed.commands.len(), 3, "the duplicate PACK collapses, the rest stay");
+
+        // Near-duplicates (different qty) are DISTINCT commands.
+        let parsed = parse("[PACK name=Gold qty=5] [PACK name=Gold qty=3]");
+        assert_eq!(parsed.commands.len(), 2, "different qty = different commands");
+
+        // A bracket + its fenced-JSON dual (semantically equal) also collapse.
+        let parsed = parse("[PACK name=Gold qty=5]\n```json\n{\"kind\":\"pack\",\"name\":\"Gold\",\"qty\":5}\n```");
+        assert_eq!(parsed.commands.len(), 1, "bracket + JSON dual collapse to one");
     }
 
     #[test]

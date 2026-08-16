@@ -188,11 +188,19 @@ export function buildTitle(handlers) {
   // back here to re-enable the buttons + hide the warning. Called on every
   // title show via _startAmbient + best-effort (an IPC error leaves the game
   // buttons disabled — the safe default).
+  // (2026-08-16 yellow J10) Refresh-sequencing token: concurrent gate
+  // refreshes (an ONLINE close callback racing a title re-show) could resolve
+  // out of order, leaving a STALE `_continueTarget` + button states from the
+  // earlier snapshot. Each refresh bumps the token; a superseded one stops
+  // touching the DOM/stash at its first await.
+  let gateSeq = 0;
   root._refreshTitleGate = async () => {
+    const seq = ++gateSeq;
     // API state from the backend — the same check launchFable used to make.
     let apiReady = false;
     try {
       const extra = await invoke('model_source_get');
+      if (seq !== gateSeq) return; // superseded by a newer refresh
       apiReady = !!(extra && extra.source === 'api' && extra.apiReady);
     } catch (err) {
       // IPC failure: treat as not-ready (the safe default — game buttons stay
@@ -216,6 +224,7 @@ export function buildTitle(handlers) {
     }
     try {
       const target = await invoke('fable_continue_target');
+      if (seq !== gateSeq) return; // superseded — don't stash a stale target
       // target is null when no manual/quick save exists → dim CONTINUE.
       // A returned SaveMeta → enable it.
       continueBtn.disabled = !target;

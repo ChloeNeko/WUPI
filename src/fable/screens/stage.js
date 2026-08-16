@@ -576,6 +576,34 @@ export async function wireStage(root, hooks) {
     // `fable-session-changed` kind=schema; narrator forwards the merged_keys
     // here. Same refresh as onTurnEnd — the paperdoll/inventory may have moved.
     onSchemaPatch: (_mergedKeys) => { leftDrawer.refreshAll(); },
+    // (D5 2026-08-16) Editor-restore hook: a chat-side messages rebuild that
+    // lands while a narrator turn streams cancels the open inline editor
+    // (its save would be dropped by the generating guard after the body
+    // swap); narrator captures the in-progress edit + fires this after the
+    // rebuild. Re-open the editor SEEDED with the typed text, wiring the
+    // SAME role-shaped onSave the ✎/dblclick paths use (mirror the
+    // delegated [data-drawer-act="edit"] handler). Single-editor discipline:
+    // never open over an existing editor; a vanished beat no-ops (narrator
+    // pre-checks the index, this re-resolves defensively).
+    onRestoreEditor: ({ index, text, role }) => {
+      if (beats.openEditingBeat()) return;
+      if (typeof text !== 'string') return;
+      const beat = beats.beatByIndex(index);
+      if (!beat) return;
+      // Never restore onto a beat the rebind just claimed as the streaming
+      // target (a reroll/slice re-bind): appendChunk/beginSliceRegen write
+      // the body wholesale — the textarea (and the typed text with it) would
+      // be clobbered by the very next chunk.
+      if (beat.classList.contains('streaming')
+          || beat.classList.contains('slice-regenerating')) return;
+      beats.enterEditMode(beat, {
+        seed: text,
+        onSave: (newText) => {
+          if (role === 'user') return narrator.rewindAndEditUser(index, newText);
+          return narrator.editMessage(index, newText);
+        },
+      });
+    },
     // Schema-ring-buffer handoff: when a mutation command (reroll / rewind)
     // returns `schema_pop_count`, invoke `fable_rollback` that many times to
     // restore the matching world-state snapshots. `fable_rollback` is the
