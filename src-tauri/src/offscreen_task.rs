@@ -27,12 +27,12 @@
 //! # v1 boundary
 //!
 //! This module ships the Rust-authoritative mechanics: the task queue, the
-//! Risk Referee, the directive emission. The deep integration into the
-//! World Progression tick prompt (so the schema engine knows about off-screen
-//! outcomes) is Phase 4 work — it requires modifying the schema-engine's
-//! progression prompt, which is out of scope for Phase 3. The seam (the
-//! `resolve_expired_tasks` fn + the directive emission) is ready to wire
-//! in.
+//! Risk Referee, the directive emission. The World Progression tick
+//! integration (Phase 4 §11.44 Component 3) IS wired: `resolve_expired_
+//! tasks` runs inside the tick, and its `[DIRECTIVE: ...]` lines land in
+//! `pending_tick_directives`, which the next narrator turn drains into its
+//! `<directives>` block — a directive only reaches the player one turn
+//! after the ETA crosses (the tick is turn-gated by design).
 
 use crate::player_state::{roll_d20, Roller};
 use std::collections::HashMap;

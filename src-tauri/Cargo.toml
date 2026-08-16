@@ -202,3 +202,29 @@ tempfile = "3"
 # ~20-40 min CUDA recompile on first build (Chloe runs it).
 [patch.crates-io]
 diffusion-rs-sys = { path = "vendor/diffusion-rs-sys" }
+
+# ===========================================================================
+# §11.59 dual-CRT fix (2026-08-15): keep the DEBUG CRT out of dev builds.
+# ===========================================================================
+# Cargo compiles build scripts with debug-assertions ON in dev, and
+# llama-cpp-sys-2's build.rs emits `cargo:rustc-link-lib=dylib=msvcrtd`
+# under cfg!(debug_assertions) — linking a SECOND (debug) C runtime into
+# every dev exe. The /MD-compiled native code then splits its stdio across
+# ucrtbase.dll and ucrtbased.dll, and FILE*/fd crossings between the two
+# killed SD generation with UCRT debug asserts (`_osfile(fh) & FOPEN` in
+# _read; the fprintf stream-validation assert) — both exit 0x80000003.
+#
+# **DISABLED 2026-08-15 — this override breaks ALL dev builds (found while
+# running cargo check on the FOLLOWUPS fixes):** tauri-build is ALSO a build
+# script, and its ACL manifest serialization of `ResolvedCommand`'s
+# `referenced_by` is #[cfg(debug_assertions)]-gated (tauri-utils
+# acl/resolved.rs). With build scripts at debug-assertions=OFF, the manifest
+# is written WITHOUT that field, but `tauri::generate_context!` (compiled
+# into the lib, debug-assertions ON) must initialize the struct that HAS it
+# → E0063 "missing field `referenced_by`" at the generate_context! call —
+# `cargo check`, `cargo tauri dev`, and `npm run sd:dev` all fail. The
+# msvcrtd goal needs a narrower mechanism (e.g. a vendored llama-cpp-sys-2
+# patch that drops the msvcrtd link line, or /NODEFAULTLIB:msvcrtd scoped
+# to the sd feature). Do NOT re-enable as-is.
+# [profile.dev.build-override]
+# debug-assertions = false

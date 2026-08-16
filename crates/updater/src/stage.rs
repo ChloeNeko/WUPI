@@ -62,6 +62,14 @@ pub fn extract_to_staging(zip_path: &Path, staging: &Path) -> Result<usize, Stri
 /// user-data paths. All locks are released (wupi.exe has exited), so plain
 /// `std::fs::copy` succeeds; a failure here is a real I/O issue (disk full,
 /// antivirus) and is recorded as a partial-apply error.
+///
+/// (#40 2026-08-15) Each file lands via copy-to-temp + RENAME: `fs::copy`
+/// TRUNCATES the destination first, so a disk-full mid-copy used to leave
+/// `wupi.exe` itself corrupt (half-written + unbootable). With the temp
+/// staging name, a failed copy never touches the live file — the rename
+/// (which REPLACES the destination atomically on Windows) only runs after
+/// the temp file is complete. A mid-sequence failure now leaves every file
+/// EITHER fully-old OR fully-new, never truncated.
 pub fn copy_into_target(staging: &Path, target: &Path) -> Result<(), String> {
     let files = walk_files(staging)?;
     let mut errors: Vec<String> = Vec::new();
@@ -80,7 +88,7 @@ pub fn copy_into_target(staging: &Path, target: &Path) -> Result<(), String> {
                 continue;
             }
         }
-        if let Err(e) = std::fs::copy(src, &dst) {
+        if let Err(e) = copy_atomic(src, &dst) {
             errors.push(format!("copy {}: {e}", rel.display()));
         }
     }
@@ -93,6 +101,27 @@ pub fn copy_into_target(staging: &Path, target: &Path) -> Result<(), String> {
             errors[0]
         ))
     }
+}
+
+/// Copy `src` to a sibling temp name of `dst`, then rename over `dst`.
+/// `std::fs::rename` on Windows replaces an existing destination, so the
+/// live file is only ever swapped for a COMPLETE copy — a failure at either
+/// step leaves the destination exactly as it was (and no temp residue).
+fn copy_atomic(src: &Path, dst: &Path) -> Result<(), String> {
+    let base = dst
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("payload");
+    let tmp = dst.with_file_name(format!("{base}.wupi_new"));
+    let res = (|| -> Result<(), String> {
+        std::fs::copy(src, &tmp).map_err(|e| format!("stage {}: {e}", tmp.display()))?;
+        std::fs::rename(&tmp, dst).map_err(|e| format!("replace {}: {e}", dst.display()))
+    })();
+    if res.is_err() {
+        // Never leave a temp residue next to the live file.
+        let _ = std::fs::remove_file(&tmp);
+    }
+    res
 }
 
 /// Recursively collect all files under `root` (depth-first).

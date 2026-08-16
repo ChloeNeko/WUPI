@@ -58,23 +58,53 @@ pub fn repair(raw: &str) -> String {
     let s = raw.to_string();
     let s = normalize_quotes(&s);
     let s = strip_trailing_commas(&s);
-    let s = quote_unquoted_keys(&s);
+    // (#49) wrap_bare_object runs BEFORE quote_unquoted_keys: a brace-less
+    // body's LEADING key (`summary: "ok"`) is never preceded by `{`/`,`, so
+    // the quote pass can't fix it until the braces exist.
     let s = wrap_bare_object(&s);
+    let s = quote_unquoted_keys(&s);
     let s = escape_bare_newlines_in_strings(&s);
     let s = strip_stray_code_fences(&s);
-    balance_brackets(&s)
+    let s = balance_brackets(&s);
+    // Re-run the comma strip AFTER balance: truncation-at-comma — the most
+    // common truncation shape (`{"summary":"ok",`) — only gains its closer
+    // from balance_brackets, which doesn't check for a dangling comma. The
+    // pre-balance strip can't see it, and without this pass the input
+    // burned the full 3-pass LLM repair loop instead of the microsecond
+    // fix. Idempotent + string-aware, so a second pass on already-clean
+    // JSON is a no-op.
+    strip_trailing_commas(&s)
 }
 
 /// Wrap a top-level brace-less object body in `{…}`. A truncated/mangled LLM
 /// emit can drop the outer braces entirely (`"summary": "ok"` — smart quotes
-/// normalized, keys quoted, but no `{`/`}` in sight). Unambiguous shape: the
-/// trimmed input STARTS with a string opener AND contains a top-level `:`
-/// (outside any string). A bare top-level JSON string (`"hello"` — no
-/// top-level colon), number, bool, or already-braced/bracketed value is left
-/// alone (they're valid JSON as-is; wrapping would corrupt them).
+/// normalized, keys quoted, but no `{`/`}` in sight). Unambiguous shapes:
+/// the trimmed input (A) STARTS with a string opener OR (#49) starts with a
+/// BARE key run (`summary: "ok"` — quote_unquoted_keys only fires after
+/// `{`/`,`, so the leading key can't be quoted before the braces exist), AND
+/// in both cases contains a top-level `:` (outside any string). A bare
+/// top-level JSON string (`"hello"` — no top-level colon), number, bool, or
+/// already-braced/bracketed value is left alone (they're valid JSON as-is;
+/// wrapping would corrupt them).
 fn wrap_bare_object(s: &str) -> String {
     let t = s.trim();
-    if !t.starts_with('"') {
+    let shape_quoted = t.starts_with('"');
+    // Shape B: a leading bare-key run followed by `:`. (2026-08-15 audit H1)
+    // The run is matched over BYTES with ASCII-only membership (mirroring
+    // `is_key_char` below) — `key_len` is then a genuine BYTE offset for the
+    // `t[key_len..]` slice. The prior char-count over Unicode-aware
+    // `is_alphanumeric` made any non-ASCII bare key (`é: 1`, `名: "x"`) slice
+    // mid-char → panic (the anti-pattern #6 shape); a non-ASCII key now
+    // simply stops the run → no wrap → serde reports the original error to
+    // the 3-pass loop (the conservative contract, unchanged).
+    let shape_bare_key = !shape_quoted && {
+        let key_len = t
+            .bytes()
+            .take_while(|b| b.is_ascii_alphanumeric() || *b == b'_' || *b == b'-' || *b == b'.')
+            .count();
+        key_len > 0 && t[key_len..].trim_start().starts_with(':')
+    };
+    if !(shape_quoted || shape_bare_key) {
         return s.to_string();
     }
     // Scan for a top-level colon (outside strings) — same string-state
@@ -110,18 +140,82 @@ fn wrap_bare_object(s: &str) -> String {
 }
 
 /// Normalize smart quotes to ASCII. LLMs trained on prose corpora emit `" "`
-/// (U+201C/U+201D) and `' '` (U+2018/U+2019) even inside JSON they intend to
-/// be valid. serde_json rejects these as invalid string delimiters.
+/// (U+201C/U+201D) and `' '` (U+2018/U+2019) even inside JSON they intend
+/// to be valid. serde_json rejects these as invalid string delimiters.
 ///
-/// We swap ALL of them (not just the ones adjacent to a colon/comma): an LLM
-/// rarely mixes smart and dumb quotes intentionally, and a value containing a
-/// literal smart quote (e.g. a character note) is unaffected by becoming ASCII
-/// (the semantic content is identical).
+/// String-state aware (#31 2026-08-15): a smart DOUBLE quote is rewritten to
+/// ASCII only in DELIMITER position — outside any string, or as the
+/// opener/closer of a smart-delimited string. Inside an ASCII-delimited
+/// string value it is CONTENT (narrator prose quoting dialogue with “ ”) and
+/// is left untouched; the old blind replace turned such legally-valid JSON
+/// INVALID (`"she said “hi”"` → `"she said "hi""`), converting pass-1
+/// successes into 3-pass repair failures. Single smart quotes (`' '`) are
+/// rewritten everywhere — they carry no JSON meaning, so the swap can never
+/// change validity (only glyph shape).
 fn normalize_quotes(s: &str) -> String {
-    s.replace('\u{201C}', "\"") // "
-        .replace('\u{201D}', "\"") // "
-        .replace('\u{2018}', "'") // '
-        .replace('\u{2019}', "'") // '
+    #[derive(Clone, Copy, PartialEq)]
+    enum StrState {
+        /// Outside any string — any double quote (smart or ASCII) is a
+        /// delimiter.
+        Out,
+        /// Inside an ASCII `"`-delimited string — smart doubles are content.
+        Ascii,
+        /// Inside a `“`-delimited string (the model delimited with smart
+        /// quotes) — the closer is `”` or a stray ASCII `"` (mixed form).
+        Smart,
+    }
+    let mut out = String::with_capacity(s.len());
+    let mut st = StrState::Out;
+    let mut escape_next = false;
+    for ch in s.chars() {
+        let single = match ch {
+            '\u{2018}' | '\u{2019}' => Some('\''),
+            _ => None,
+        };
+        match st {
+            StrState::Out => match ch {
+                '"' => {
+                    out.push('"');
+                    st = StrState::Ascii;
+                }
+                '\u{201C}' | '\u{201D}' => {
+                    out.push('"');
+                    st = StrState::Smart;
+                }
+                _ => out.push(single.unwrap_or(ch)),
+            },
+            StrState::Ascii => {
+                if escape_next {
+                    out.push(single.unwrap_or(ch));
+                    escape_next = false;
+                } else if ch == '\\' {
+                    out.push('\\');
+                    escape_next = true;
+                } else if ch == '"' {
+                    out.push('"');
+                    st = StrState::Out;
+                } else {
+                    // Smart double quotes here are prose content — preserved.
+                    out.push(single.unwrap_or(ch));
+                }
+            }
+            StrState::Smart => {
+                if escape_next {
+                    out.push(single.unwrap_or(ch));
+                    escape_next = false;
+                } else if ch == '\\' {
+                    out.push('\\');
+                    escape_next = true;
+                } else if ch == '"' || ch == '\u{201D}' {
+                    out.push('"');
+                    st = StrState::Out;
+                } else {
+                    out.push(single.unwrap_or(ch));
+                }
+            }
+        }
+    }
+    out
 }
 
 /// Strip trailing commas before `}` or `]`. The classic LLM JSON mistake:
@@ -391,6 +485,34 @@ fn last_non_ws(s: &str) -> Option<char> {
 mod tests {
     use super::*;
 
+    // ---------- wrap_bare_object (2026-08-15 audit H1 regression) ----------
+
+    /// Non-ASCII bare keys must NOT panic. The old run counted CHARS over
+    /// Unicode-aware `is_alphanumeric` and sliced at that offset as BYTES —
+    /// `é: 1` panicked (`byte index 1 is not a char boundary`). The ASCII-only
+    /// byte run now stops at `é` → no wrap → the input passes through for
+    /// serde to reject (the 3-pass loop's job, the conservative contract).
+    /// Reachable from model output via `SchemaDelta::from_model_output` (the
+    /// §5 fail-proof delta path) AND `bootstrap_anchors_from_intro` (which
+    /// has no catch_unwind — a panic there killed game entry outright).
+    #[test]
+    fn repair_non_ascii_bare_key_does_not_panic() {
+        assert_eq!(repair("é: 1"), "é: 1");
+        assert_eq!(repair("名: \"x\""), "名: \"x\"");
+        // Mixed: a valid ASCII key followed by non-ASCII prose VALUE is not a
+        // bare-key shape at all — the wrap path must not touch it either.
+        assert!(!repair("résumé").starts_with('{'));
+    }
+
+    /// The legit ASCII bare-key wrap still fires (the #49 behavior this
+    /// shape exists for — unchanged by the fix).
+    #[test]
+    fn repair_ascii_bare_key_still_wraps() {
+        let out = repair("summary: \"ok\"");
+        assert!(out.starts_with('{') && out.ends_with('}'), "wrapped: {out}");
+        assert!(serde_json::from_str::<serde_json::Value>(&out).is_ok());
+    }
+
     // ---------- normalize_quotes ----------
 
     #[test]
@@ -404,6 +526,41 @@ mod tests {
     fn repairs_smart_single_quotes() {
         let repaired = repair("'\u{2018}a\u{2019}'");
         assert!(repaired.contains("'a'"));
+    }
+
+    /// #31: legally-valid JSON with typographic quotes inside a string VALUE
+    /// must survive repair unchanged. The old blind replace rewrote the inner
+    /// “ ” to ASCII " — turning a pass-1 success into an INVALID document
+    /// (`"she said "hello""`) that then burned all 3 LLM repair passes.
+    #[test]
+    fn preserves_smart_quotes_inside_string_values() {
+        let valid = "{\"summary\": \"she said \u{201C}hello\u{201D} and left\"}";
+        assert_eq!(repair(valid), valid);
+        let parsed: serde_json::Value =
+            serde_json::from_str(&repair(valid)).expect("must still parse");
+        assert_eq!(parsed["summary"], "she said \u{201C}hello\u{201D} and left");
+    }
+
+    /// The repair side of #31 still works: a string DELIMITED by smart quotes
+    /// (the model's substitute for ASCII ") is rewritten, mixed forms included.
+    #[test]
+    fn rewrites_smart_delimiters_in_mixed_form() {
+        // Smart opener + smart closer → both become ASCII.
+        assert_eq!(repair("{\u{201C}a\u{201D}: 1}"), "{\"a\": 1}");
+        // Smart opener + ASCII closer (mixed) → both become ASCII.
+        assert_eq!(repair("{\u{201C}a\": 1}"), "{\"a\": 1}");
+    }
+
+    /// #49: a brace-less body with an UNQUOTED leading key (`summary: "ok"`)
+    /// must repair to a valid object. quote_unquoted_keys only fires after
+    /// `{`/`,`, so the wrap pass (now first) must accept the bare-key shape
+    /// and put the key into quotable position.
+    #[test]
+    fn repairs_bare_key_without_braces() {
+        assert_eq!(repair("summary: \"ok\""), "{\"summary\": \"ok\"}");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&repair("summary: \"ok\"")).expect("must parse");
+        assert_eq!(parsed["summary"], "ok");
     }
 
     // ---------- strip_trailing_commas ----------
@@ -561,6 +718,30 @@ mod tests {
         let repaired = repair(broken);
         let v: serde_json::Value = serde_json::from_str(&repaired).expect("repaired parses");
         assert_eq!(v["entities"]["char.mira.trust"], "0.8");
+    }
+
+    /// Truncation-at-comma (the most common truncation shape per the module
+    /// doc): the input ends on a dangling comma, so the closer only appears
+    /// via balance_brackets — the post-balance comma strip is what keeps
+    /// this a microsecond fix instead of a 3-pass LLM repair loop.
+    #[test]
+    fn end_to_end_truncation_at_comma_then_serde() {
+        let broken = "{\"summary\":\"ok\",";
+        let repaired = repair(broken);
+        let v: serde_json::Value = serde_json::from_str(&repaired).expect("repaired parses");
+        assert_eq!(v["summary"], "ok");
+
+        // Nested shape: comma dangling inside an array.
+        let broken = "{\"summary\":\"ok\",\"events\":[\"a\",\"b\",";
+        let repaired = repair(broken);
+        let v: serde_json::Value = serde_json::from_str(&repaired).expect("repaired parses");
+        assert_eq!(v["events"][1], "b");
+
+        // Wrap path: a brace-less body truncated at the comma.
+        let broken = "summary: \"ok\",";
+        let repaired = repair(broken);
+        let v: serde_json::Value = serde_json::from_str(&repaired).expect("repaired parses");
+        assert_eq!(v["summary"], "ok");
     }
 
     #[test]

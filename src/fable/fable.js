@@ -1560,24 +1560,45 @@ function openFable() {
       setTimeout(() => revealTitleUnderSplash(fableRoot), wait);
     };
     (async () => {
-      try {
-        const ctx = await invoke('get_launch_context');
-        if (!ctx || !ctx.cardSlug) { revealTitleAfterSplash(); return; }
-        // API gate: fable_start refuses without a connected API. Falling back
-        // to the title (instead of a dead stage) lets the player connect via
-        // the ONLINE button + retry — a persisted API connection carries over.
-        // (P2 fix) Check BOTH flags: apiReady alone stays true after an
-        // api_disconnect (the profile persists), which booted a dead stage
-        // on a stale .lnk. Every other gate (title, stage, Rust's
-        // require_api_for_fable) requires source === 'api'.
-        const src = await invoke('model_source_get').catch(() => null);
-        if (!src || src.source !== 'api' || !src.apiReady) { revealTitleAfterSplash(); return; }
-        // underSplash: resumeSave → enterStageViaTransition delays the stage
-        // to the 2s splash window + runs the shared entry wipe (the reveal is
-        // identical to the fable.exe title path).
-        await resumeSave(ctx.cardSlug, ctx.saveId ?? null, { underSplash: true, launchT0 });
-      } catch (e) {
-        console.error('[fable] direct launch failed, falling back to title', e);
+      // (#74) A HUNG — not rejected — IPC (get_launch_context, or the
+      // fable_start inside resumeSave) used to strand the window transparent
+      // + pointer-events:none forever: the Rust 5s reveal fallback only
+      // calls win.show(), it cannot drop frontend classes. Race the chain
+      // against a 6s frontend deadline; on timeout reveal the title via the
+      // shared choreography (it owns the hold classes end-to-end — no
+      // manual stripping). A late chain resolution is harmless: the
+      // underSplash stage entry simply replaces the title afterward.
+      const DIRECT_LAUNCH_DEADLINE_MS = 6000;
+      let settled = false;
+      const chain = (async () => {
+        try {
+          const ctx = await invoke('get_launch_context');
+          if (!ctx || !ctx.cardSlug) { revealTitleAfterSplash(); return; }
+          // API gate: fable_start refuses without a connected API. Falling back
+          // to the title (instead of a dead stage) lets the player connect via
+          // the ONLINE button + retry — a persisted API connection carries over.
+          // (P2 fix) Check BOTH flags: apiReady alone stays true after an
+          // api_disconnect (the profile persists), which booted a dead stage
+          // on a stale .lnk. Every other gate (title, stage, Rust's
+          // require_api_for_fable) requires source === 'api'.
+          const src = await invoke('model_source_get').catch(() => null);
+          if (!src || src.source !== 'api' || !src.apiReady) { revealTitleAfterSplash(); return; }
+          // underSplash: resumeSave → enterStageViaTransition delays the stage
+          // to the 2s splash window + runs the shared entry wipe (the reveal is
+          // identical to the fable.exe title path).
+          await resumeSave(ctx.cardSlug, ctx.saveId ?? null, { underSplash: true, launchT0 });
+        } catch (e) {
+          console.error('[fable] direct launch failed, falling back to title', e);
+          revealTitleAfterSplash();
+        }
+      })();
+      chain.then(() => { settled = true; }, () => { settled = true; });
+      await Promise.race([
+        chain,
+        new Promise((resolve) => setTimeout(resolve, DIRECT_LAUNCH_DEADLINE_MS)),
+      ]);
+      if (!settled) {
+        console.error('[fable] direct launch timed out (hung IPC); revealing title + dropping entry hold');
         revealTitleAfterSplash();
       }
     })();

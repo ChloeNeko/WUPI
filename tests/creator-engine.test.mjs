@@ -10,6 +10,9 @@ import {
   buildReviewSections,
   buildIdCard,
   missingMandatoryFields,
+  shouldRejectDuplicateName,
+  creatorRetryAllowed,
+  MAX_CREATOR_RETRIES,
   MANDATORY_LABELS,
   findCharaChunk,
   readCharaChunk,
@@ -433,6 +436,40 @@ test('missingMandatoryFields: every missing key has a friendly label', () => {
   for (const k of missing) {
     assert.ok(MANDATORY_LABELS[k], `no label for ${k}`);
   }
+});
+
+// ── shouldRejectDuplicateName (2026-08-15: the rename hole M3 hid) ────────
+
+test('shouldRejectDuplicateName: fresh CREATE colliding with an existing id rejects', () => {
+  assert.equal(shouldRejectDuplicateName('nyx', undefined, ['kael', 'nyx']), true);
+  assert.equal(shouldRejectDuplicateName('kael', null, ['kael', 'nyx']), true);
+});
+
+test('shouldRejectDuplicateName: a genuinely new name passes', () => {
+  assert.equal(shouldRejectDuplicateName('mira', undefined, ['kael', 'nyx']), false);
+  assert.equal(shouldRejectDuplicateName('mira', undefined, []), false);
+});
+
+test('shouldRejectDuplicateName: edit run re-saving its own id is exempt', () => {
+  // Editing "Kael" without renaming: the write target IS the seeded id.
+  assert.equal(shouldRejectDuplicateName('kael', 'kael', ['kael', 'nyx']), false);
+});
+
+test('shouldRejectDuplicateName: an edit run RENAMING onto another player rejects', () => {
+  // THE rename hole: editing "Kael", GLM renames her to "Nyx", a different
+  // saved player "Nyx" exists — fable_player_write is a silent atomic
+  // overwrite, so the guard must fire despite seedDraft being present.
+  assert.equal(shouldRejectDuplicateName('nyx', 'kael', ['kael', 'nyx']), true);
+});
+
+// ── creatorRetryAllowed (2026-08-15: the retry caps were DOM-coupled) ─────
+
+test('creatorRetryAllowed: attempts 1..MAX retry, beyond exhausts', () => {
+  assert.equal(MAX_CREATOR_RETRIES, 2);
+  assert.equal(creatorRetryAllowed(1), true);
+  assert.equal(creatorRetryAllowed(2), true);
+  assert.equal(creatorRetryAllowed(3), false, 'the third attempt surfaces the gap to the user');
+  assert.equal(creatorRetryAllowed(99), false);
 });
 
 // ── summary ────────────────────────────────────────────────────────────────

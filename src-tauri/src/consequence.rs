@@ -747,8 +747,16 @@ pub fn add_tag(tags: &mut Vec<StatusTag>, tag: StatusTag) -> bool {
 
 /// Count tags by polarity. Used by `derive_condition` (which takes counts,
 /// not the tag list, so it stays decoupled from the storage representation).
+///
+/// (2026-08-15 audit fix) Only PURE buff/debuff tags count — `kind.is_empty()`
+/// — matching `render_tags_for_prompt`'s lanes. A kinded tag like a Buff-
+/// polarity `disguise` is a mechanical state lane, not a condition modifier:
+/// counting it nudged the lethality condition penalty + could lift
+/// Haggard→Unscathed purely from wearing a disguise.
 pub fn count_by_polarity(tags: &[StatusTag], polarity: Polarity) -> usize {
-    tags.iter().filter(|t| t.polarity == polarity).count()
+    tags.iter()
+        .filter(|t| t.kind.is_empty() && t.polarity == polarity)
+        .count()
 }
 
 /// Render the active tags as a compact prompt fragment. Returns `None` when
@@ -1422,6 +1430,35 @@ mod tests {
         ];
         assert_eq!(count_by_polarity(&tags, Polarity::Buff), 2);
         assert_eq!(count_by_polarity(&tags, Polarity::Debuff), 1);
+    }
+
+    /// 2026-08-15 audit fix: a kinded tag (e.g. a Buff-polarity disguise) is
+    /// a mechanical lane, NOT a condition buff — it must not count toward
+    /// the buff total that feeds `derive_condition` + the lethality
+    /// condition penalty.
+    #[test]
+    fn count_by_polarity_excludes_kinded_tags() {
+        let tags = vec![
+            StatusTag {
+                label: "city guard uniform".into(),
+                polarity: Polarity::Buff,
+                expires_at: 0,
+                source: String::new(),
+                kind: "disguise".into(),
+            },
+            StatusTag {
+                label: "Blessed".into(),
+                polarity: Polarity::Buff,
+                expires_at: 1000,
+                source: String::new(),
+                kind: String::new(),
+            },
+        ];
+        assert_eq!(
+            count_by_polarity(&tags, Polarity::Buff),
+            1,
+            "the disguise tag is a mechanical lane, not a condition buff"
+        );
     }
 
     #[test]

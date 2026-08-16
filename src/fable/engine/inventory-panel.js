@@ -128,6 +128,13 @@ function normalizeItems(gemId, schema) {
           slot: slotId,
           layer,
           tags: readTags(item.tags),
+          // (#85 2026-08-15) stats ride on the normalized record: the
+          // moveToEquipmentSlot / moveToStack mutators read `item.stats`,
+          // but normalizeItems never carried it — every UI move of an item
+          // with tracker-assigned stats silently stripped them (the #67/#68
+          // preserve fixes read a field that was never populated here).
+          // Equipped items carry no weight (the Rust EquippedItem has none).
+          stats: typeof item.stats === 'string' && item.stats.trim() ? item.stats : undefined,
         });
       }
     }
@@ -146,6 +153,11 @@ function normalizeItems(gemId, schema) {
         slot: null,
         layer: null,
         tags: readTags(item.tags),
+        // (#85) stats + the real weight ride forward (see the equipment
+        // branch note) — moveToStack's 1.0 fallback fires only for items
+        // that genuinely carry no weight.
+        stats: typeof item.stats === 'string' && item.stats.trim() ? item.stats : undefined,
+        weight: Number.isFinite(item.weight) ? item.weight : undefined,
       });
     }
   }
@@ -787,8 +799,15 @@ function removeItem(ps, item) {
   } else if (item.source === 'belt' || item.source === 'pack') {
     const arr = ps[item.source];
     if (Array.isArray(arr)) {
-      const idx = Number(item.id.split(':')[1]);
-      if (Number.isInteger(idx) && idx >= 0 && idx < arr.length) {
+      // (P2 fix) NEVER splice by the render-time index (`pack:2`): handlers
+      // refetch FRESH schema before mutating (the P1 fix), and a narrator
+      // turn whose bracket lands between render + click shifts the indexes
+      // — the splice then consumes/discards the WRONG item and persists it.
+      // Re-resolve by NAME on the fresh array (names are stack identities —
+      // same-name items merge into one stack); absent (already consumed or
+      // renamed by a turn) → no-op, never a wrong-item delete.
+      const idx = arr.findIndex((s) => s && s.name === item.name);
+      if (idx !== -1) {
         arr.splice(idx, 1);
         return true;
       }
@@ -848,10 +867,14 @@ function moveToEquipmentSlot(ps, item, dest) {
     ps.equipment[targetSlot] = { outer: null, inner: null };
   }
 
-  // If the target Outer is occupied (and it's not the item we just removed),
-  // displace the prior occupant to the pack so nothing is lost.
+  // If the target Outer is occupied, displace the prior occupant to the pack
+  // so nothing is lost. (#67) The old `currentOuter.name !== item.name` skip
+  // silently MERGED same-named copies: equipping a pack copy over an
+  // identically-named worn item vaporized the worn copy's stats/identity.
+  // They are two physical items — the worn one always rides to the pack.
+  // (`isAlreadyThere` above already no-ops an exact same-slot re-equip.)
   const currentOuter = ps.equipment[targetSlot].outer;
-  if (currentOuter && currentOuter.name !== item.name) {
+  if (currentOuter) {
     if (!Array.isArray(ps.pack)) ps.pack = [];
     ps.pack.push({
       name: currentOuter.name,
@@ -862,10 +885,11 @@ function moveToEquipmentSlot(ps, item, dest) {
     });
   }
 
-  // Place the new item in the Outer layer.
+  // Place the new item in the Outer layer. (#68-adjacent) `stats` ride
+  // forward — a pack/belt copy with stats used to lose them on equip.
   ps.equipment[targetSlot].outer = {
     name: item.name,
-    stats: undefined,
+    stats: item.stats || undefined,
     tags: tagsArray(item),
   };
   // Drop the slot if both layers ended up empty (defensive — shouldn't happen
@@ -874,11 +898,19 @@ function moveToEquipmentSlot(ps, item, dest) {
 }
 
 // Move an item to belt or pack. Mutates `ps`; returns true if moved. Tags ride
-// forward so the item keeps its classification at the new location.
+// forward so the item keeps its classification at the new location. (#68)
+// `stats` + the real `weight` ride forward too — the old rebuild dropped
+// both, so an equipped item STOREd/POCKETed lost its stats until re-authored.
 function moveToStack(ps, item, target) {
   if (!Array.isArray(ps[target])) ps[target] = [];
   const removed = removeItem(ps, item);
   if (!removed) return false;
-  ps[target].push({ name: item.name, qty: item.qty, weight: 1.0, tags: tagsArray(item) });
+  ps[target].push({
+    name: item.name,
+    qty: item.qty,
+    weight: typeof item.weight === 'number' ? item.weight : 1.0,
+    stats: item.stats || undefined,
+    tags: tagsArray(item),
+  });
   return true;
 }

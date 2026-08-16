@@ -292,45 +292,44 @@ impl ChatFormat for Gemma4Format {
 
     fn parse_output(&self, raw: &str) -> ParsedOutput {
         // The model emits zero or more `<|channel>thought\n ... <channel|>`
-        // blocks, optionally followed by a reply channel. We split on the
-        // closing marker `<channel|>`: anything before it that contains the
-        // opening `<|channel>` (possibly with `thought`) is reasoning; the
-        // remainder is the reply.
+        // blocks, optionally followed by a reply (either as trailing text
+        // after the last closer, or an explicit `<|channel>reply` opener).
+        // Classification is by the exact CHANNEL WORD after the opener (#43
+        // 2026-08-15): the old "segment contains `<|channel>` → thought"
+        // rule classified an explicit `<|channel>reply` emission as
+        // reasoning, leaving `content` empty.
         //
         // The template's own strip_thinking macro uses this same split logic.
         let mut content = String::new();
         let mut reasoning = String::new();
 
         for part in raw.split("<channel|>") {
-            if let Some(before) = part.split("<|channel>").next() {
-                // `before` is everything prior to the opening `<|channel>` on
-                // this segment. If the segment started with `<|channel>thought`,
-                // `before` is "" and what follows (in `part` after the marker)
-                // is the thinking text: but we already consumed it via split.
-                // The text after `<channel|>` (next iteration) is the reply.
-                if part.contains("<|channel>") {
-                    // This was a thought block: capture as reasoning.
-                    let thought = part
-                        .split("<|channel>")
-                        .last()
-                        .unwrap_or("")
-                        .trim_start_matches("thought")
-                        .trim();
-                    if !thought.is_empty() {
-                        if !reasoning.is_empty() {
-                            reasoning.push('\n');
-                        }
-                        reasoning.push_str(thought);
-                    }
-                    // Also preserve any text that came before the `<|channel>`
-                    // in this segment (rare; usually empty).
+            match part.split_once("<|channel>") {
+                None => {
+                    // No opening marker: this is reply text (or trailing junk).
+                    content.push_str(part);
+                }
+                Some((before, after)) => {
+                    // Preserve any text that came before the opener in this
+                    // segment (rare; usually empty).
                     if !before.trim().is_empty() {
                         content.push_str(before.trim());
                         content.push('\n');
                     }
-                } else {
-                    // No opening marker: this is reply text (or trailing junk).
-                    content.push_str(part);
+                    let (name, body) = split_channel_word(after);
+                    if name == "thought" {
+                        let thought = body.trim();
+                        if !thought.is_empty() {
+                            if !reasoning.is_empty() {
+                                reasoning.push('\n');
+                            }
+                            reasoning.push_str(thought);
+                        }
+                    } else {
+                        // A non-thought channel (e.g. an explicit `reply`)
+                        // carries CONTENT — keep its body, drop the marker.
+                        content.push_str(body);
+                    }
                 }
             }
         }
@@ -343,18 +342,47 @@ impl ChatFormat for Gemma4Format {
     }
 }
 
+/// Split the text after a `<|channel>` opener into `(channel_word, body)`:
+/// the word is the leading alphanumeric run; the body is the remainder
+/// (leading whitespace still attached). `<|channel>thought\nsecret` →
+/// `("thought", "\nsecret")`. A run with NO boundary ("thoughtful") yields
+/// the whole run as the word + an empty body — so "thoughtful notes" is NOT
+/// misparsed as channel "thought" + body "ful notes" (#43: the old
+/// `trim_start_matches("thought")` stripped repeated leading "thought" from
+/// genuine thought text).
+fn split_channel_word(after: &str) -> (&str, &str) {
+    let trimmed = after.trim_start_matches(['\n', '\r', ' ', '\t']);
+    match trimmed.find(|c: char| !c.is_alphanumeric()) {
+        Some(i) => (&trimmed[..i], &trimmed[i..]),
+        None => (trimmed, ""),
+    }
+}
+
 /// The Gemma 4 template's strip_thinking logic, in Rust. Removes
 /// `<|channel>thought\n...<channel|>` blocks entirely and keeps the rest.
 /// Used when re-rendering prior assistant turns so we don't re-feed the
 /// raw thinking markers back to the model as literal text.
+///
+/// (#43) Only THOUGHT blocks are removed. The old "any segment containing
+/// `<|channel>`" rule also stripped an explicit `<|channel>reply` block —
+/// body included — so such a turn re-rendered EMPTY into history (a
+/// content-identical prompt divergence + a lost turn). A non-thought
+/// channel's BODY is preserved; only the marker is dropped.
 fn strip_thinking(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     for part in text.split("<channel|>") {
-        if part.contains("<|channel>") {
-            // Keep only what came before the opening marker (usually nothing).
-            out.push_str(part.split("<|channel>").next().unwrap_or(""));
-        } else {
-            out.push_str(part);
+        match part.split_once("<|channel>") {
+            None => out.push_str(part),
+            Some((before, after)) => {
+                // Keep only what came before the opening marker (usually
+                // nothing)...
+                out.push_str(before);
+                // ...and the body when the channel is NOT thought.
+                let (name, body) = split_channel_word(after);
+                if name != "thought" {
+                    out.push_str(body);
+                }
+            }
         }
     }
     out.trim().to_string()
@@ -375,18 +403,18 @@ fn strip_thinking(text: &str) -> String {
 pub fn extract_reasoning_channel(raw: &str) -> String {
     let mut reasoning = String::new();
     for part in raw.split("<channel|>") {
-        if part.contains("<|channel>") {
-            let thought = part
-                .split("<|channel>")
-                .last()
-                .unwrap_or("")
-                .trim_start_matches("thought")
-                .trim();
-            if !thought.is_empty() {
-                if !reasoning.is_empty() {
-                    reasoning.push('\n');
+        if let Some((_before, after)) = part.split_once("<|channel>") {
+            // Only the exact `thought` channel contributes (#43 — see
+            // split_channel_word).
+            let (name, body) = split_channel_word(after);
+            if name == "thought" {
+                let thought = body.trim();
+                if !thought.is_empty() {
+                    if !reasoning.is_empty() {
+                        reasoning.push('\n');
+                    }
+                    reasoning.push_str(thought);
                 }
-                reasoning.push_str(thought);
             }
         }
     }
@@ -908,6 +936,30 @@ mod tests {
     fn gemma4_strip_thinking_removes_thought_blocks() {
         let cleaned = strip_thinking("<|channel>thought\nsecret\n<channel|>visible");
         assert_eq!(cleaned, "visible");
+    }
+
+    /// #43: an explicit `<|channel>reply` emission is CONTENT, not thought —
+    /// the old substring rule routed it to `reasoning` (empty content) and
+    /// strip_thinking deleted the body (turn re-rendered empty into history).
+    #[test]
+    fn gemma4_explicit_reply_channel_is_content() {
+        let f = Gemma4Format;
+        let parsed = f.parse_output("<|channel>reply\nHello there!<channel|>");
+        assert_eq!(parsed.content, "Hello there!");
+        assert_eq!(parsed.reasoning, "");
+        // strip_thinking keeps the reply body (marker dropped only).
+        assert_eq!(strip_thinking("<|channel>reply\nHello!<channel|>"), "Hello!");
+    }
+
+    /// #43: "thought" as a PREFIX of genuine thought text is not stripped
+    /// repeatedly (`trim_start_matches` used to eat "thoughtthought…" and
+    /// turn "thoughtful notes" into "ful notes").
+    #[test]
+    fn gemma4_thought_word_boundary_in_body() {
+        let f = Gemma4Format;
+        let parsed = f.parse_output("<|channel>thought\nthoughtful notes\n<channel|>ok");
+        assert_eq!(parsed.reasoning, "thoughtful notes");
+        assert_eq!(parsed.content, "ok");
     }
 
     #[test]

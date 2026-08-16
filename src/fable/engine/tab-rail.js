@@ -115,8 +115,9 @@ function setActiveTab(key) {
 }
 
 // Render the active tab's dropdown. Called on tab-select AND on drawer
-// reopen (so the dropdown reappears after a mouseleave auto-close — the
-// hover-reopen-keeps-active mechanic). Async (fetches the tab's data).
+// reopen (the rail resets on close — resetTabRail nulls activeTab — so the
+// reopen path re-selects a tab before this runs). Async (fetches the tab's
+// data).
 export function renderActive() {
   if (!activeTab || !dropdownEl) return;
   renderTab(activeTab, dropdownEl);

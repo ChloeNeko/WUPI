@@ -1005,14 +1005,23 @@ impl SchemaRuntime {
         if tokens.is_empty() {
             anyhow::bail!("schema tokenized prompt is empty");
         }
-        // Guard: if the prompt alone exceeds the context, truncate from the
-        // FRONT (keep the generation prompt + last exchange). Losing the
-        // oldest schema detail beats failing entirely.
+        // Guard: if the prompt alone exceeds the context, truncate the
+        // MIDDLE (#30 2026-08-15) — keep the BOS token + the head slice (the
+        // system instruction lives at the front) + the tail slice (the
+        // exchange + generation prompt live at the end), dropping the schema
+        // body's least-recent detail in between. The old front-drain deleted
+        // the BOS token AND the system instruction, so the delta pass
+        // degraded toward garbage exactly when long-campaign state (and thus
+        // the prompt) was richest.
         let max_prompt = (SCHEMA_CTX as usize).saturating_sub(SCHEMA_MAX_TOKENS as usize);
         if tokens.len() > max_prompt {
-            let drop = tokens.len() - max_prompt;
-            tokens.drain(0..drop);
-            tracing::warn!(dropped = drop, "schema prompt exceeded context; truncated from front");
+            let head = std::cmp::min(std::cmp::max(max_prompt / 4, 64), tokens.len());
+            let tail = max_prompt.saturating_sub(head).min(tokens.len() - head);
+            let dropped = tokens.len() - head - tail;
+            let mut kept: Vec<LlamaToken> = tokens[..head].to_vec();
+            kept.extend_from_slice(&tokens[tokens.len() - tail..]);
+            tokens = kept;
+            tracing::warn!(dropped, head, tail, "schema prompt exceeded context; truncated the middle (kept BOS + system head + exchange tail)");
         }
 
         // Fresh cache each call: the schema context is one-shot, no reuse.

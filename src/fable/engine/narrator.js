@@ -332,14 +332,17 @@ export async function interruptAndReroll() {
 // aborted partial). If no reroll was armed (defensive — shouldn't happen since
 // `cancelled` is only emitted by the abort path), just finalize the turn.
 function onCancelled() {
+  // Capture BEFORE finishTurn() — its unconditional disarm (the P3 guard
+  // against late-resolving interrupt invokes) erases the flag, so reading
+  // it after would always see false and the armed reroll would never fire.
+  const wasDeferred = deferredReroll;
   if (activeBeat) {
     // beginReroll clears the aborted partial + preps the beat for the fresh
     // stream (so nothing lingers during the reroll's IPC round-trip).
     beats.beginReroll(activeBeat);
   }
   finishTurn();
-  if (deferredReroll) {
-    deferredReroll = false;
+  if (wasDeferred) {
     // generating was just cleared by finishTurn, so rerollLastTurn's guard passes.
     rerollLastTurn();
   }

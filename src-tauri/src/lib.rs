@@ -369,7 +369,7 @@ pub struct AppState {
     /// keys on the profile identity (endpoint, model, key); a profile switch
     /// misses the cache and re-stores. `HttpBackend` clones cheaply (the
     /// Client is an Arc pool). Single-slot: only one profile is ever active.
-    pub http_backend_cache: Arc<std::sync::Mutex<Option<((String, String, String), llm::HttpBackend)>>>,
+    pub http_backend_cache: Arc<std::sync::Mutex<Option<((String, String, String, Option<f32>, Option<u32>), llm::HttpBackend)>>>,
     /// Phase 5B (2026-07-29): per-SD-generation cancel token, parallel to the
     /// others. Distinct slot so an image-gen in flight can be cancelled
     /// (user navigates away, ends the game, etc.) without cross-wiring with
@@ -390,7 +390,16 @@ pub struct AppState {
     /// Mirrors `fable_load_save`'s precedent of bypassing the immutability
     /// lock on user-initiated restore (the §5 contract applies to LLM deltas,
     /// not user undo). See `push_fable_history` / `clear_fable_history`.
-    pub fable_schema_history: Arc<tokio::sync::Mutex<std::collections::VecDeque<schema::WorldSchema>>>,
+    ///
+    /// (#36 2026-08-15) Each entry is TAGGED with the fable session's message
+    /// count at push time. A turn can push 0..3+ entries (referee snapshot /
+    /// bracket batch / TIME-tick — see `apply_phase3_bracket_commands` +
+    /// `apply_time_command_and_maybe_tick`), so the old untagged ring +
+    /// "pop N where N = assistant turns removed" under/over-rolled world
+    /// state after a rewind. `rewind_and_edit_user` now pops to a target
+    /// message count server-side ("drop entries pushed while the removed
+    /// tail existed": tag > surviving length).
+    pub fable_schema_history: Arc<tokio::sync::Mutex<std::collections::VecDeque<(usize, schema::WorldSchema)>>>,
     /// The game's scoped conversation (sibling to `session`, which is
     /// Wupi-assistant's). Per-card: loaded on `fable_start` from
     /// `sessions/<card_id>.json`, saved on `fable_end`. Held under tokio Mutex
@@ -2365,6 +2374,7 @@ async fn run_sd_swap_core(
     sd_autogen_disabled: Arc<std::sync::atomic::AtomicBool>,
     active_sd_cancel: Arc<std::sync::Mutex<Option<llm::CancelToken>>>,
     llm_model_path: Arc<std::sync::Mutex<Option<std::path::PathBuf>>>,
+    local_model_lock: Arc<tokio::sync::Mutex<()>>,
     request: scene_art::SceneImageRequest,
     on_result: Box<dyn FnOnce(scene_art::SwapOutcome) + Send>,
 ) {
@@ -2384,6 +2394,18 @@ async fn run_sd_swap_core(
             return;
         }
     };
+
+    // 1b. Serialize the WHOLE cycle under the process-wide local-model turn
+    //     lock (P0 #23). The swap-lock alone does not serialize: its
+    //     `acquire` never blocks a taker — two overlapping prism_generate
+    //     calls hit the same-role fast path → parallel SD backends (2× SD
+    //     VRAM) and the second reload_shared_model raced the first. It also
+    //     fences LLM turns issued mid-render: chat / schema / fable Stage 1
+    //     all hold this lock across their local decode, so none of them can
+    //     evict the SD lease and then find shared_model()==None (weights
+    //     unloaded mid-cycle). Lock BEFORE the lease acquire — the uniform
+    //     order every local-model consumer now takes (no lock-order cycles).
+    let _sd_turn_guard = local_model_lock.lock_owned().await;
 
     // 2. Acquire the Sd lease. The swap-lock evicts the resident LLM context
     //    (joining its thread). The teardown here is a no-op for the SD side —
@@ -2433,6 +2455,9 @@ async fn run_sd_swap_core(
     // Clone the latch Arc for the closure (it's also used after the closure
     // returns, in the post-swap error paths — Arc isn't Copy, so clone first).
     let latch_in_closure = Arc::clone(&sd_autogen_disabled);
+    // Clone for the post-generate explicit unload below (the closure below
+    // moves the original).
+    let sd_cleanup_slot = Arc::clone(&sd_engine_slot);
     let outcome = tokio::task::spawn_blocking(move || {
         // 3. Unload the LLM weights. The lease's teardown already joined every
         //    LLM context, so the precondition (no LlamaContext alive) holds.
@@ -2446,6 +2471,20 @@ async fn run_sd_swap_core(
             Arc::new(scene_art::default_sd_backend());
         {
             let mut g = sd_engine_slot.lock().expect("sd_engine slot mutex");
+            // (#42) Unload any PRIOR cycle's backend before the overwrite
+            // drops its Arc — LeaseGuard drop does NOT fire teardown
+            // (eviction is lazy: it fires on the NEXT cross-role acquire),
+            // so without this, a VRAM-holding backend from cycle N leaks
+            // when cycle N+1 overwrites the slot. No-op for the current
+            // VRAM-less backends.
+            if let Some(prior) = g.take() {
+                match Arc::try_unwrap(prior) {
+                    Ok(p) => p.unload(),
+                    Err(_) => tracing::warn!(
+                        "sd-swap: prior SD backend still referenced elsewhere; skipping its unload"
+                    ),
+                }
+            }
             *g = Some(Arc::clone(&backend));
         }
         if let Err(e) = backend.load(&sd_model_path) {
@@ -2470,20 +2509,38 @@ async fn run_sd_swap_core(
             }
         }
         // The `backend` Arc drops here, but the slot still holds a clone —
-        // the lease's teardown (registered above) unloads + clears it when the
-        // lease drops. The SD VRAM is freed by that teardown, not here.
+        // the post-generate block below takes it out + unloads it explicitly
+        // (the lease's lazy teardown is NOT relied upon; see #42).
     })
     .await;
 
-    // The spawn_blocking returned (either the outcome or a JoinError). The
-    // lease drops here → the SD teardown fires (unloading SD), but the LLM
-    // weights are STILL unloaded (step 3 freed them). We must reload the LLM
-    // BEFORE the lease drops so the next fable_send/chat_send finds a live
-    // model — otherwise the game is stranded with no narrator.
+    // The spawn_blocking returned (either the outcome or a JoinError). The LLM
+    // weights are STILL unloaded (step 3 freed them) and must reload so the
+    // next fable_send/chat_send finds a live model — otherwise the game is
+    // stranded with no narrator.
     //
-    // Order: reload the LLM weights FIRST (so shared_model() is live again),
-    // THEN drop the lease (the SD teardown frees SD VRAM, which the LLM
-    // reload didn't need — they're sequential, not concurrent).
+    // (#42) Free the SD VRAM BEFORE the reload. The lease's teardown is LAZY
+    // (LeaseGuard drop only marks the slot free; the teardown closure fires
+    // on the NEXT cross-role acquire), so "drop(lease) frees SD VRAM" was
+    // never true — reloading the ~9.8GB LLM while the SD model still held
+    // VRAM could OOM on tight cards (the stranded-chat reload failure).
+    // Unload + clear the slot explicitly here; each cycle loads a fresh SD
+    // backend anyway (step 4), so nothing warm is lost.
+    {
+        let mut g = sd_cleanup_slot.lock().expect("sd_engine slot mutex");
+        if let Some(gen) = g.take() {
+            match Arc::try_unwrap(gen) {
+                Ok(p) => {
+                    p.unload();
+                    tracing::info!("sd-swap: SD backend unloaded (VRAM freed for the LLM reload)");
+                }
+                Err(_) => tracing::warn!(
+                    "sd-swap: SD backend still referenced after generate; deferring its unload to eviction"
+                ),
+            }
+        }
+    }
+
     let llm_path = llm_model_path_clone
         .lock()
         .ok()
@@ -2499,7 +2556,7 @@ async fn run_sd_swap_core(
         tracing::error!("sd-swap: no LLM model path to reload — the game has no narrator until reboot. Tripping one-strike latch.");
         sd_autogen_disabled.store(true, Ordering::Relaxed);
     }
-    drop(lease); // SD teardown fires here (frees SD VRAM).
+    drop(lease); // Slot bookkeeping only — SD VRAM was already freed above.
 
     match outcome {
         Ok(inner) => on_result(inner),
@@ -2590,13 +2647,31 @@ async fn route_to_fable_manager(
 
     // 3. Post the translation request + await the reply off the tokio worker
     //    (the schema thread is a bare std::thread; its mpsc::Receiver blocks).
-    let reply_rx = schema_engine
-        .request_translation(text.clone(), &current_schema, deferred)
-        .map_err(|e| format!("{e:#}"))?;
-    let reply = tokio::task::spawn_blocking(move || reply_rx.recv())
-        .await
-        .map_err(|e| format!("translation reply join: {e}"))?
-        .map_err(|e| format!("translation reply channel: {e}"))?;
+    //    (#32) A shadow copy of the drained re-attempts rides along: any infra
+    //    failure below restores them to the queue instead of dropping them.
+    let reply_rx = match schema_engine
+        .request_translation(text.clone(), &current_schema, deferred.clone())
+    {
+        Ok(rx) => rx,
+        Err(e) => {
+            reenqueue_failed_attempts(&state.failed_translation_queue, deferred, "failed_translation_queue").await;
+            return Err(format!("{e:#}"));
+        }
+    };
+    let reply = match tokio::task::spawn_blocking(move || reply_rx.recv()).await {
+        Ok(Ok(r)) => r,
+        Ok(Err(e)) => {
+            let msg = format!("translation reply channel: {e}");
+            reenqueue_failed_attempts(&state.failed_translation_queue, deferred, "failed_translation_queue").await;
+            return Err(msg);
+        }
+        Err(e) => {
+            let msg = format!("translation reply join: {e}");
+            reenqueue_failed_attempts(&state.failed_translation_queue, deferred, "failed_translation_queue").await;
+            return Err(msg);
+        }
+    };
+    drop(deferred);
 
     // 3b. Fail-proof contract: if the reply carries a retryable failed_attempt
     //     (all 3 passes failed on parse/validation), enqueue it for the next
@@ -3072,7 +3147,7 @@ async fn chat_send(
     if fable_is_active(&state) {
         match fable_command::classify(&text) {
             fable_command::FableCommand::MutateWorldState(_) => {
-                clear_active_cancel(&state);
+                clear_active_cancel(&state, &cancel);
                 let mutated =
                     route_to_fable_manager(text.clone(), on_event.clone(), &app, &state).await?;
                 if mutated {
@@ -3085,7 +3160,7 @@ async fn chat_send(
                 *slot = Some(Arc::clone(&cancel));
             }
             fable_command::FableCommand::QueryWorldState(focus) => {
-                clear_active_cancel(&state);
+                clear_active_cancel(&state, &cancel);
                 return route_to_fable_query(focus, on_event, &state).await;
             }
             fable_command::FableCommand::NotACommand => {
@@ -3526,14 +3601,14 @@ async fn chat_send(
         // 0 (whole-message; no chunking yet).
         //
         // `codex_was_injected` was captured before `memory_block` was moved
-        // into `.stream()`. If true, skip archiving the assistant's reply -
-        // it's a paraphrase of authored Codex lore, and saving it would
-        // pollute retrieval with echoes of the Codex itself (the self-
-        // contamination loop, §2N landmine #5).
-        if codex_was_injected {
-            tracing::debug!("codex echo-skip: archiving suppressed (codex reference was injected this turn)");
-        }
-        if !codex_was_injected {
+        // into `.stream()`. If true, skip archiving the ASSISTANT'S REPLY
+        // only — it's a paraphrase of authored Codex lore, and saving it
+        // would pollute retrieval with echoes of the Codex itself (the
+        // self-contamination loop, §2N landmine #5). The USER turn is still
+        // archived unconditionally (#28 2026-08-15: the old whole-block gate
+        // meant codex-flavored questions were systematically never archived,
+        // so later recall of what the user asked about was lost — the Fable
+        // path already archives user + skips assistant only).
         if let Some(engine) = state.memory.get() {
             // The user message is the second-to-last (last is the assistant
             // turn we just appended). checked_sub(2) guards the cold-start
@@ -3546,18 +3621,32 @@ async fn chat_send(
                 .expect("active_card_id mutex")
                 .clone();
             let engine = Arc::clone(engine);
+            // One turn id for BOTH rows (user + assistant, all their chunks):
+            // the §4 retention key the prune evicts whole turns by.
+            let turn_uuid = memory::new_turn_uuid();
             tokio::spawn(async move {
                 if let Some(text) = user_text {
-                    if let Err(e) = engine.add_memory(text, &card_id, memory::Role::User, 1.0).await {
+                    if let Err(e) = engine.add_memory(text, &card_id, memory::Role::User, 1.0, Some(&turn_uuid)).await {
                         tracing::warn!(error = %format!("{e:#}"), "archive user turn failed");
                     }
                 }
-                if let Err(e) = engine.add_memory(asst_text, &card_id, memory::Role::Assistant, 1.0).await {
+                if codex_was_injected {
+                    tracing::debug!("codex echo-skip: assistant reply not archived (codex reference was injected this turn)");
+                } else if let Err(e) = engine.add_memory(asst_text, &card_id, memory::Role::Assistant, 1.0, Some(&turn_uuid)).await {
                     tracing::warn!(error = %format!("{e:#}"), "archive assistant turn failed");
                 }
+                // Retention prune (§4): hysteresis-capped whole-turn eviction,
+                // off the hot path (this spawn is already detached post-turn).
+                // Runs even on echo-skip turns — the cap doesn't care which
+                // rows crossed it. Codex lore + sentinel partitions are locked
+                // out inside the engine.
+                match engine.prune_episodic_card(&card_id).await {
+                    Ok(0) => {}
+                    Ok(n) => tracing::info!(card_id = %card_id, pruned = n, "episodic memory pruned to watermark"),
+                    Err(e) => tracing::warn!(error = %format!("{e:#}"), "episodic prune failed (non-fatal)"),
+                }
             });
-        }
-        } // end echo-skip gate (if !codex_was_injected)
+        } // end echo-skip (assistant-only)
     }
 
     // Fire the background schema delta pass for the turn that just completed.
@@ -3647,22 +3736,27 @@ async fn chat_send(
                 Ok(t) => t,
                 Err(e) => {
                     tracing::warn!(error = %e, "schema delta: could not acquire schema engine; schema unchanged");
+                    reenqueue_failed_attempts(&failed_queue_slot, deferred, "failed_delta_queue").await;
                     return;
                 }
             };
             // Post the delta request. The reply comes back on a std::mpsc
             // channel (the schema thread is a bare std::thread), so we await
             // it via spawn_blocking: same pattern as the chat engine reply.
+            // (#32) A shadow copy stays with us: on any infra failure below,
+            // the drained re-attempts go back into the queue instead of
+            // vanishing with the failed task.
             let reply_rx = match schema_engine
                 .request_delta(
                     (user_text.unwrap_or_default(), asst_text),
                     &current_schema,
-                    deferred,
+                    deferred.clone(),
                 )
             {
                 Ok(rx) => rx,
                 Err(e) => {
                     tracing::warn!(error = %format!("{e:#}"), "schema delta request failed; schema unchanged");
+                    reenqueue_failed_attempts(&failed_queue_slot, deferred, "failed_delta_queue").await;
                     return;
                     }
                 };
@@ -3670,13 +3764,19 @@ async fn chat_send(
                     Ok(Ok(r)) => r,
                     Ok(Err(e)) => {
                         tracing::warn!(error = %format!("{e}"), "schema delta reply channel closed");
+                        reenqueue_failed_attempts(&failed_queue_slot, deferred, "failed_delta_queue").await;
                         return;
                     }
                     Err(e) => {
                         tracing::warn!(error = %format!("{e}"), "schema delta reply join failed");
+                        reenqueue_failed_attempts(&failed_queue_slot, deferred, "failed_delta_queue").await;
                         return;
                     }
                 };
+                // The engine consumed the re-attempts (its own failure
+                // handling re-enqueues THIS turn's attempt below) — the
+                // shadow copy's job is done.
+                drop(deferred);
                 if let Some(delta) = reply.delta {
                     let mut s = schema_slot.lock().await;
                     s.apply_delta(delta);
@@ -3712,7 +3812,7 @@ async fn chat_send(
             *state.pending_delta.lock().await = Some(handle);
         }
 
-    clear_active_cancel(&state);
+    clear_active_cancel(&state, &cancel);
 
     on_event
         .send(serde_json::json!({
@@ -3728,9 +3828,12 @@ async fn chat_send(
 
 /// Clear the active cancel slot. Called at every exit path of `chat_send`
 /// (success + both error branches) so a stale token is never left behind.
-fn clear_active_cancel(state: &tauri::State<'_, AppState>) {
-    let mut slot = state.active_cancel.lock().expect("active_cancel mutex");
-    *slot = None;
+/// Identity-checked (#46): an overlapping `chat_send` that already minted a
+/// newer token owns the slot — this turn's cleanup must not wipe the live
+/// token (the old unconditional clear stranded `chat_stop` for the newer
+/// turn).
+fn clear_active_cancel(state: &tauri::State<'_, AppState>, token: &llm::CancelToken) {
+    clear_cancel_slot_if_owner(&state.active_cancel, token);
 }
 
 /// Run a chat turn on the local backend (or the EchoBackend last-resort when
@@ -3774,13 +3877,15 @@ async fn run_local_or_echo(
         s.assemble_api_messages_windowed(system_prompt, window)
     };
     if let Some(backend) = backend {
+        // clone: stream takes the token by value, but the error arms below
+        // still need it for the identity-checked slot clear (#46).
         match backend
-            .stream(messages, memory_block, world_state, tools, context_size, on_chunk, cancel)
+            .stream(messages, memory_block, world_state, tools, context_size, on_chunk, cancel.clone())
             .await
         {
             Ok(text) => Ok(text),
             Err(e) => {
-                clear_active_cancel(state);
+                clear_active_cancel(state, &cancel);
                 let _ = on_event.send(serde_json::json!({
                     "type": "error",
                     "message": format!("{e}")
@@ -3790,10 +3895,10 @@ async fn run_local_or_echo(
         }
     } else {
         let echo = llm::EchoBackend;
-        match echo.stream(messages, None, None, Vec::new(), context_size, on_chunk, cancel).await {
+        match echo.stream(messages, None, None, Vec::new(), context_size, on_chunk, cancel.clone()).await {
             Ok(t) => Ok(t),
             Err(e) => {
-                clear_active_cancel(state);
+                clear_active_cancel(state, &cancel);
                 let _ = on_event.send(serde_json::json!({
                     "type": "error",
                     "message": format!("{e}")
@@ -3873,16 +3978,38 @@ async fn dispatch_fable_state_tool(
         "fable_message_edit" => {
             let index = call.args["index"].as_u64().unwrap_or(0) as usize;
             let content = call.args["content"].as_str().unwrap_or("").to_string();
-            let messages = {
+            // Edit re-track parity fix (2026-08-15 audit): the IPC path
+            // (`edit_message`) reverts + re-runs the local tracker over the
+            // edited AI beat — an edit is new information. The tool path
+            // used to skip it, diverging schema from prose. The retrack
+            // takes the process-wide local-model turn lock, which the
+            // agent loop ALREADY holds across this dispatch — running it
+            // inline would self-deadlock the non-reentrant tokio Mutex, so
+            // the tracker pass is DEFERRED (the world-progression-tick
+            // discipline): a detached task parks on the lock + fires the
+            // moment chat_send's agent loop releases it.
+            let (messages, is_assistant) = {
                 let mut gs = state.fable_session.lock().await;
                 apply_edit(&mut gs, index, content)?;
-                project_messages(&gs)
+                let is_assistant = gs
+                    .messages
+                    .get(index)
+                    .map(|m| m.role == session::Role::Assistant)
+                    .unwrap_or(false);
+                (project_messages(&gs), is_assistant)
             };
             persist_fable_session(app, state, &card_id).await?;
             let _ = app.emit(
                 "fable-session-changed",
                 serde_json::json!({ "kind": "messages", "messages": messages }),
             );
+            if is_assistant {
+                let app_handle = app.clone();
+                tokio::spawn(async move {
+                    let state = app_handle.state::<AppState>();
+                    retrack_edited_assistant_message(index, &state, &app_handle).await;
+                });
+            }
             format!("edited message at index {index}")
         }
         "fable_message_delete" => {
@@ -4081,6 +4208,42 @@ async fn run_agent_loop(
                     },
                 };
 
+            // delete_sim_card removed the card FOLDER; its memory partition
+            // lives in memory.sqlite outside that tree. Same contract as
+            // `fable_card_delete`: a delete must leave no ghost rows (a
+            // same-slug re-create would inherit them). The tools stay pure
+            // (no AppState), so the stateful side-effect hooks HERE — the
+            // same inline-dispatch pattern as the Fable-state tools. The slug
+            // is re-derived through the tool's own `sanitize_stem` so the
+            // partition key always matches the folder that was deleted.
+            // Detached spawn: the agent loop never blocks on disk I/O.
+            if outcome.0 && call.name == "delete_sim_card" {
+                if let Some(engine) = state.memory.get() {
+                    let engine = Arc::clone(engine);
+                    let filename = call
+                        .args
+                        .get("filename")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_owned);
+                    tokio::spawn(async move {
+                        let Some(filename) = filename else { return };
+                        let Some(slug) = tools::sanitize_stem(&filename) else {
+                            tracing::warn!(%filename, "delete_sim_card purge skipped: unsanitizable filename");
+                            return;
+                        };
+                        match engine.purge_card_partition(&slug).await {
+                            Ok(0) => {}
+                            Ok(n) => tracing::info!(card_id = %slug, purged = n, "tool-deleted card's memory partition purged"),
+                            Err(e) => tracing::error!(
+                                error = %format!("{e:#}"),
+                                card_id = %slug,
+                                "tool deleted card folder but memory purge FAILED (ghost rows may linger)"
+                            ),
+                        }
+                    });
+                }
+            }
+
             let _ = on_event.send(serde_json::json!({
                 "type": "tool_result",
                 "iteration": iteration,
@@ -4172,6 +4335,36 @@ async fn enqueue_failed_progression(
     q.push(attempt);
 }
 
+/// (#32 2026-08-15) Re-enqueue drained failed-attempt re-tries after an
+/// INFRA failure (engine acquire / request post / reply channel). The
+/// fail-proof contract's "no world-state evolution is ever silently
+/// dropped" invariant covers these exits too, but the drain sites
+/// `take()` the queue up front and previously returned without restoring
+/// it — silently erasing prior turns' deferred re-attempts on any
+/// infrastructure hiccup. Cap-preserving FIFO, same as the enqueue helpers.
+async fn reenqueue_failed_attempts(
+    queue: &Arc<tokio::sync::Mutex<Vec<schema_engine::FailedAttempt>>>,
+    items: Vec<schema_engine::FailedAttempt>,
+    label: &str,
+) {
+    if items.is_empty() {
+        return;
+    }
+    let count = items.len();
+    let mut q = queue.lock().await;
+    for item in items {
+        if q.len() >= MAX_FAILED_DELTA_ATTEMPTS {
+            q.remove(0);
+        }
+        q.push(item);
+    }
+    tracing::warn!(
+        queue = label,
+        count,
+        "infra failure before the deferred re-attempts ran — restored to the queue"
+    );
+}
+
 /// World Progression tick interval (Fable Seam #4, 2026-07-27). How much
 /// in-world time must elapse before an off-screen simulation pass fires.
 /// Default 24h matches Multihog's default + the natural "daily report"
@@ -4218,12 +4411,19 @@ async fn push_fable_history(state: &AppState) {
 /// without re-acquiring it (avoids the drop-and-relock race). Use this inside
 /// any `fable_schema.lock().await` critical section where the pre-mutation
 /// state is already in hand.
+///
+/// (#36) The entry is tagged with the fable session's current message count
+/// (read in its own short scope — the session lock is never held alongside
+/// the history lock here). The tag lets `rewind_and_edit_user` pop exactly
+/// the entries pushed while a removed message tail existed, regardless of
+/// how many pushes a turn produced.
 async fn push_fable_history_snapshot(state: &AppState, snapshot: schema::WorldSchema) {
+    let tag = state.fable_session.lock().await.messages.len();
     let mut hist = state.fable_schema_history.lock().await;
     if hist.len() >= FABLE_HISTORY_CAP {
         hist.pop_front();
     }
-    hist.push_back(snapshot);
+    hist.push_back((tag, snapshot));
 }
 
 /// Clear the history ring buffer. Called at every session boundary
@@ -4564,6 +4764,23 @@ async fn apply_phase3_bracket_commands(
                     );
                     continue;
                 };
+                // (P3 fix) Dedup + cap — mirrors the [RUMOR] treatment: a
+                // tracker loop re-emitting the same task each turn (repetition
+                // is exactly what DRY partially misses inside brackets) grew
+                // the queue one-per-turn into every save. Same (npc,
+                // description) still unresolved = the same task; cap the
+                // stored queue at 20 (oldest dropped).
+                let dupe = s.offscreen_tasks.iter().any(|t| {
+                    !t.resolved && t.npc_id == *npc_id && t.description == *description
+                });
+                if dupe {
+                    tracing::debug!(
+                        npc_id = %npc_id,
+                        description = %description,
+                        "[TASK] duplicate suppressed"
+                    );
+                    continue;
+                }
                 if undo_snapshot.is_none() {
                     undo_snapshot = Some(s.clone());
                 }
@@ -4575,6 +4792,11 @@ async fn apply_phase3_bracket_commands(
                     resolves_at_minutes: now_minutes.saturating_add(*eta_minutes),
                     resolved: false,
                 });
+                const MAX_STORED_TASKS: usize = 20;
+                let overflow = s.offscreen_tasks.len().saturating_sub(MAX_STORED_TASKS);
+                if overflow > 0 {
+                    s.offscreen_tasks.drain(..overflow);
+                }
                 mutated = true;
                 tracing::info!(
                     npc_id = %npc_id,
@@ -5060,16 +5282,29 @@ async fn apply_phase3_bracket_commands(
         // applier's single-snapshot-per-turn discipline).
         for cmd in &appearance_cmds {
             if let bracket_parser::BracketCommand::Appearance { key, value } = cmd {
-                if undo_snapshot.is_none() {
-                    undo_snapshot = Some(s.clone());
-                }
+                // (P3 fix) Snapshot ONLY on a real change: a clear of an
+                // absent key, or a set of the value already stored, is a
+                // no-op — the old unconditional snapshot minted ring entries
+                // (undo noise) for turns that changed nothing.
                 if value.trim().is_empty() {
-                    let existed = s.player_state.current_appearance_deltas.remove(key).is_some();
-                    if existed {
+                    if s.player_state.current_appearance_deltas.contains_key(key) {
+                        if undo_snapshot.is_none() {
+                            undo_snapshot = Some(s.clone());
+                        }
+                        s.player_state.current_appearance_deltas.remove(key);
                         mutated = true;
                         tracing::info!(key = %key, "[APPEARANCE] delta cleared");
                     }
-                } else {
+                } else if s
+                    .player_state
+                    .current_appearance_deltas
+                    .get(key)
+                    .map(|v| v != value)
+                    .unwrap_or(true)
+                {
+                    if undo_snapshot.is_none() {
+                        undo_snapshot = Some(s.clone());
+                    }
                     s.player_state
                         .current_appearance_deltas
                         .insert(key.clone(), value.clone());
@@ -5094,6 +5329,36 @@ async fn apply_phase3_bracket_commands(
                 item_tags,
             } = cmd
             {
+                // (P3 fix) Skip true no-ops BEFORE snapshotting: an unequip
+                // of an empty slot changes nothing, and an equip of the
+                // identical item already in the layer re-writes the same
+                // value — neither may mint an undo-ring entry (the old
+                // unconditional snapshot was ring noise per tracker echo).
+                let current = s.player_state.equipment.get(slot);
+                let is_noop = match item_name {
+                    None => current
+                        .map(|layers| match layer {
+                            equipment::ItemLayer::Outer => layers.outer.is_none(),
+                            equipment::ItemLayer::Inner => layers.inner.is_none(),
+                        })
+                        .unwrap_or(true),
+                    Some(name) => current
+                        .map(|layers| {
+                            match layer {
+                                equipment::ItemLayer::Outer => &layers.outer,
+                                equipment::ItemLayer::Inner => &layers.inner,
+                            }
+                            .as_ref()
+                            .map(|it| {
+                                it.name == *name && it.stats == *item_stats && it.tags == *item_tags
+                            })
+                            .unwrap_or(false)
+                        })
+                        .unwrap_or(false),
+                };
+                if is_noop {
+                    continue;
+                }
                 if undo_snapshot.is_none() {
                     undo_snapshot = Some(s.clone());
                 }
@@ -5218,9 +5483,22 @@ async fn apply_phase3_bracket_commands(
                     );
                     // FIFO eviction: if this added a new entry past the cap,
                     // drop the oldest (index 0) so the rack stays at BELT_MAX.
+                    // (#27 2026-08-15) Overflow = SPILL, not destruction: the
+                    // evictee routes to the unbounded pack (the same
+                    // "nothing silently vaporized" contract as unequip → pack
+                    // and displaced-occupant → pack) + leaves a recent_events
+                    // trace so the narrator sees the item move next turn.
                     while s.player_state.belt.len() > equipment::BELT_MAX {
                         let evicted = s.player_state.belt.remove(0);
-                        tracing::info!(name = %evicted.name, "[BELT] FIFO-evicted (rack full)");
+                        tracing::info!(name = %evicted.name, "[BELT] rack full — spilling oldest to the pack");
+                        let note = format!("stashed {} in the pack (belt full)", evicted.name);
+                        let capped: String = if note.chars().count() > EVENT_NOTE_MAX {
+                            note.chars().take(EVENT_NOTE_MAX).collect()
+                        } else {
+                            note
+                        };
+                        s.recent_events.push(capped);
+                        equipment::stack_upsert(&mut s.player_state.pack, evicted);
                     }
                     if added || *qty > 0 {
                         mutated = true;
@@ -5433,9 +5711,13 @@ async fn apply_time_command_and_maybe_tick(
 
         // Slice 4: expire status tags whose WorldClock expiry has passed.
         // Permanent tags (expires_at == 0) survive. Returns the dropped count.
+        // (#34 2026-08-15) The undo snapshot is captured BEFORE the mutation —
+        // a post-expiry clone (the old behavior) could never restore the
+        // expired tags via fable_rollback, despite the pre-mutation comment.
+        let pre_expire_snapshot = s.clone();
         let dropped_tags = consequence::expire_tags(&mut s.status_tags, now_minutes);
         if dropped_tags > 0 {
-            tick_snapshot = Some(s.clone());
+            tick_snapshot = Some(pre_expire_snapshot);
             tick_mutated = true;
             tracing::info!(
                 dropped = dropped_tags,
@@ -5615,20 +5897,23 @@ async fn fire_world_progression_tick(state: &tauri::State<'_, AppState>) {
         Ok(t) => t,
         Err(e) => {
             tracing::warn!(error = %e, "world progression: could not acquire schema engine; tick skipped");
+            reenqueue_failed_attempts(&state.failed_progression_queue, deferred, "failed_progression_queue").await;
             return;
         }
     };
 
     // 6. Post the progression request + await the reply off the tokio worker
     //    (the schema thread is a bare std::thread; its mpsc::Receiver blocks).
+    //    (#32) Shadow copy: infra failures restore the drained re-attempts.
     let reply_rx = match schema_engine.request_world_progression(
         &schema_snapshot,
         interval_hours,
-        deferred,
+        deferred.clone(),
     ) {
         Ok(rx) => rx,
         Err(e) => {
             tracing::warn!(error = %format!("{e:#}"), "world progression request failed; tick skipped");
+            reenqueue_failed_attempts(&state.failed_progression_queue, deferred, "failed_progression_queue").await;
             return;
         }
     };
@@ -5636,13 +5921,16 @@ async fn fire_world_progression_tick(state: &tauri::State<'_, AppState>) {
         Ok(Ok(r)) => r,
         Ok(Err(e)) => {
             tracing::warn!(error = %format!("{e}"), "world progression reply channel closed");
+            reenqueue_failed_attempts(&state.failed_progression_queue, deferred, "failed_progression_queue").await;
             return;
         }
         Err(e) => {
             tracing::warn!(error = %format!("{e}"), "world progression reply join failed");
+            reenqueue_failed_attempts(&state.failed_progression_queue, deferred, "failed_progression_queue").await;
             return;
         }
     };
+    drop(deferred);
 
     // 7. Fail-proof contract: enqueue retryable failures for the next tick.
     if let Some(failed) = reply.failed_attempt.clone() {
@@ -6900,7 +7188,7 @@ async fn enter_fable_session(
 
     // Resolve initial state. Priority: explicit save_id → fresh → fallback.
     let fable_root = resolve_apps_dir(app).join("fable");
-    let (mut prior_schema, prior_session, resumed_save_label) = if let Some(sid) = save_id.as_deref() {
+    let (mut prior_schema, mut prior_session, resumed_save_label) = if let Some(sid) = save_id.as_deref() {
         let fable_root_clone = fable_root.clone();
         let cid = card.id.clone();
         let sid_owned = sid.to_owned();
@@ -6920,6 +7208,13 @@ async fn enter_fable_session(
             .unwrap_or_else(session::Conversation::new);
         (s, c, None)
     };
+    // (#77) The install paths bypass `Conversation::load`, so run the same
+    // defensive normalize it does: clamp active_idx + reconcile variant/raw
+    // lengths on every message (a hand-edited or skewed save can't confuse
+    // the accessors). No-op on already-clean sessions.
+    for m in &mut prior_session.messages {
+        m.normalize_variants();
+    }
     // Saved Player attachment (2026-08-02): when a saved player id was
     // passed (the New Game flow's Pair 2), load it + override the card's
     // `player_name` anchor with the saved player's name. The narrator
@@ -7494,7 +7789,12 @@ pub(crate) fn cap_assistant_prose(
     cap: usize,
 ) -> Vec<session::Message> {
     for m in window.iter_mut() {
-        if m.role == session::Role::Assistant && m.content.len() > cap {
+        // Char-count gate (2026-08-15 audit fix): the old byte-length check
+        // made multibyte prose over the byte threshold take the branch with
+        // FEWER than `cap` chars — the char-boundary cut then truncated
+        // nothing while still appending the `[…]` marker (a spurious
+        // ellipsis on every CJK/accented beat past the byte cap).
+        if m.role == session::Role::Assistant && m.content.chars().count() > cap {
             let cut = m
                 .content
                 .char_indices()
@@ -7625,28 +7925,37 @@ fn build_narrator_system_prompt(
     // (c) Bracket-command protocol reference. The tracker emits these
     // alongside its prose so Rust can apply the mechanical truth. One TIGHT
     // line each — the syntax only; the WHEN/WHY guidance lives in the AGENT
-    // prose above (the <item_tags> block covers tag classification, the
-    // <restraint> block covers emit-only-on-change). KEPT LEAN per the Prime
+    // prose above (the <item_rules> block covers tag classification, the
+    // <emit_order> block covers emit-only-on-change). KEPT LEAN per the Prime
     // Directive: this list is in the always-on system prompt, so every byte
     // costs context budget on every tracker turn. Detailed bracket semantics
     // are in the card's codex (retrieved on-demand), NOT here.
-    out.push_str("Track changes with these brackets (emit one per genuine change this turn — see <triggers> for exactly when each fires):\n");
+    // (#26 2026-08-15: every line below is pinned to the PARSER's actual
+    // grammar — the applier is the authority, drift here produces slugs like
+    // `id_mara` / silently mis-parsed tasks.)
+    out.push_str("Track changes with these brackets (emit one per genuine change this turn — see <emit_order> for exactly when each fires):\n");
     out.push_str("- [TIME Day N, HH:MM] — advance the clock when the turn spans hours (travel, sleep, a long task). Use the real time, never a placeholder.\n");
     out.push_str("- [DATE <new calendar label>] — when a day or more passes or a calendar boundary is crossed (a new day dawns, a month turns, a festival begins). Emit the NEW full date label verbatim (e.g. \"4th of Harvest, Year 1247, Market Day\") — the whole label is rewritten, no arithmetic. Only fires when a `date:` anchor is in use; otherwise omit.\n");
     out.push_str("- [WEATHER <condition>] — when the narrated weather shifts (fog lifts, rain starts, night falls). One word: fog, rain, snow, clear, overcast, storm, etc.\n");
     out.push_str("- [TRAVEL <node_id>] — when the player arrives at a different location. Use a node_id from the location line's exits (or one you seed via [DISCOVER]).\n");
     out.push_str("- [RUMOR <rumor_text>] — when a rumor is actually heard or spread in the scene. The whole phrase is the rumor.\n");
-    out.push_str("- [NPC_REGISTER id=<npc_id> name=<name> (role=<role>) (tier=minion|soldier|elite|boss|legendary)] — the FIRST time a named NPC who is NOT in the cast line appears. Register them once, then use [PRESENCE]. Omit tier for civilians.\n");
+    out.push_str("- [NPC_REGISTER <npc_id> name=<name> (role=<role>) (tier=minion|soldier|elite|boss|legendary)] — the FIRST time a named NPC who is NOT in the cast line appears. The npc_id is the bare first token (never `id=`). Register them once, then use [PRESENCE]. Omit tier for civilians.\n");
     out.push_str("- [PRESENCE <npc_id> <stance or micro-location>] — when an NPC enters the scene or is already on-camera. Resolves names from the cast line. Example: [PRESENCE mara \"behind the bar, drying a glass\"].\n");
-    out.push_str("- [DISCOVER id=<node_id> name=<name> (setting=indoor|outdoor) (neighbors=<ids>)] — when the player reaches a place that is not yet in the location line's exits. Adds it as a travelable node.\n");
-    out.push_str("- [EFFECT <label> buff|debuff <secs> [kind=disguise]] — when a buff/debuff or disguise takes hold.\n");
+    out.push_str("- [DISCOVER <node_id> name=<name> (setting=indoor|outdoor) (neighbors=<ids>)] — when the player reaches a place that is not yet in the location line's exits. The node_id is the bare first token (never `id=`). Adds it as a travelable node.\n");
+    out.push_str("- [EFFECT <label> buff|debuff <minutes> [kind=disguise]] — when a buff/debuff or disguise takes hold. The number is MINUTES (0 = permanent).\n");
     out.push_str("- [MILESTONE <npc_id> <event_id>] — when a relationship meaningfully shifts (alliance forged, trust broken).\n");
-    out.push_str("- [TASK <npc> <description> <difficulty> <eta-minutes>] — when an NPC starts an off-screen task you should track.\n");
+    out.push_str("- [TASK <npc_id> <description> | <difficulty> <suitability> <eta-minutes>] — when an NPC starts an off-screen task you should track. All five fields; the pipe separates the description from the three trailing fields.\n");
     out.push_str("- [APPEARANCE key=value] — when the player's look LASTINGLY changes (a disguise applied, hair cut, a scar earned). Keys: hair_color, outfit, eye_color, scars, wounds, tattoos, disguise, body_type, skin_complexion, hair_length, hair_style, breast_size, ears, tail. Bare [APPEARANCE key] clears.\n");
     out.push_str("- [EQUIP slot=<slot> name=<item> (layer=outer|inner) (stats=<note>) (tags=<tags>)] — when a garment or READY weapon is put ON. Slots: head, chest, main_hand, off_hand, legs, feet. main_hand/off_hand are for readied weapons/tools ONLY — a sheathed or belt-hung blade goes in [BELT], not a hand slot. Bare [EQUIP slot=<slot>] unequips. Quote multi-word names.\n");
     out.push_str("- [BELT name=<item> (qty=N) (tags=<tags>)] / [BELT -<name>] — when a quick-access item (a belt knife, a potion, a pouch) is gained or stowed. This is where belt-hung knives belong.\n");
     out.push_str("- [PACK name=<item> (qty=N) (tags=<tags>)] / [PACK -<name>] — when an item is acquired into deep storage or removed. Check the pack line first so you don't re-add what's already there.\n");
-    out.push_str("Tags (EQUIP/BELT/PACK): consumable, equippable, pocketable — see <item_tags> above.\n");
+    out.push_str("Tags (EQUIP/BELT/PACK): consumable, equippable, pocketable — see <item_rules> above.\n");
+    // NOTE (#26c, 2026-08-15): `CharacterTurn` / `Object` / `Fx` are
+    // LEGACY-RECOGNIZED only — the parser + streaming filter still accept +
+    // strip them (a safety net for model-training residue), but they are
+    // deliberately NOT taught here: their emissions are notification-only and
+    // the API-mode scene-event filter drops them (the narrator's prose covers
+    // them). Do NOT re-add them to the taught list.
 
     out
 }
@@ -8027,26 +8336,56 @@ fn require_api_for_fable(state: &tauri::State<'_, AppState>) -> Result<(), Strin
 /// on Drop — every exit, including unwinds. The eager post-stream clear in
 /// `fable_send` stays (the frontend-visible latency matters); this is the
 /// correctness backstop.
+///
+/// **Identity-checked clear (#46):** on Drop the slot is emptied ONLY if it
+/// still holds THIS guard's token (`Arc::ptr_eq`). Two overlapping
+/// `fable_send`s used to overwrite the slot; the first finisher's
+/// unconditional clear then wiped the LIVE turn's token and `fable_stop`
+/// no-oped for the rest of that turn. With the check, the first guard's
+/// drop is a no-op and the second (owning) guard clears normally.
 struct FableCancelSlotGuard {
     slot: Arc<std::sync::Mutex<Option<llm::CancelToken>>>,
+    token: llm::CancelToken,
 }
 impl FableCancelSlotGuard {
-    fn new(state: &tauri::State<'_, AppState>) -> Self {
+    fn new(state: &tauri::State<'_, AppState>, token: &llm::CancelToken) -> Self {
         Self {
             slot: Arc::clone(&state.active_fable_cancel),
+            token: Arc::clone(token),
         }
     }
 }
 impl Drop for FableCancelSlotGuard {
     fn drop(&mut self) {
-        *self.slot.lock().expect("active_fable_cancel mutex") = None;
+        clear_cancel_slot_if_owner(&self.slot, &self.token);
+    }
+}
+
+/// Empty a cancel slot only when it still points at `token` — the #46
+/// concurrent-turn race fix. A newer turn that overwrote the slot owns it;
+/// the older turn's cleanup must not strand the live token.
+fn clear_cancel_slot_if_owner(
+    slot: &std::sync::Mutex<Option<llm::CancelToken>>,
+    token: &llm::CancelToken,
+) {
+    let mut slot = slot.lock().expect("cancel slot mutex");
+    if slot
+        .as_ref()
+        .map(|live| Arc::ptr_eq(live, token))
+        .unwrap_or(false)
+    {
+        *slot = None;
     }
 }
 
 /// Cached `HttpBackend` accessor (P3 #16): a hit clones the warm client
 /// (shared connection pool + TLS session — the per-turn handshake was pure
 /// latency); a miss builds + stores. Keyed by (endpoint, model, api_key) so
-/// a profile switch or key rotation can never reuse a stale bearer token.
+/// a profile switch or key rotation can never reuse a stale bearer token,
+/// PLUS the request tunables temperature/max_context (#33 2026-08-15): the
+/// backend captures the whole profile by value, so a settings edit to those
+/// must also invalidate — the old triple-only key silently served the old
+/// values until the endpoint/model/key changed.
 fn http_backend_cached(
     state: &tauri::State<'_, AppState>,
     profile: &api::ApiProfile,
@@ -8055,6 +8394,8 @@ fn http_backend_cached(
         profile.endpoint.clone(),
         profile.model.clone(),
         profile.api_key.clone(),
+        profile.temperature,
+        profile.max_context,
     );
     let mut cache = state.http_backend_cache.lock().expect("http_backend_cache mutex");
     if let Some((k, backend)) = cache.as_ref() {
@@ -8070,6 +8411,28 @@ fn http_backend_cached(
 /// Mid-session API-failure handler (2026-08-07 architectural override).
 ///
 /// Fable narration is API-only; there is no local-narrator fallback. When the
+/// Re-queue tick directives a turn DRAINED but never delivered (2026-08-15
+/// audit fix). `pending_tick_directives` holds one-shot world events
+/// ("marcus returned from scouting — failure") drained into the turn's
+/// `<directives>` block pre-prompt; a turn that then aborts (dev-narrator
+/// failure, api_lost, interrupt-reroll, reply error) must put them BACK —
+/// they are facts about the world that already happened, not prompt
+/// furniture, and losing them made the events vanish with the dead turn.
+/// Restores at the FRONT, preserving order.
+async fn requeue_tick_directives(state: &AppState, directives: &[String]) {
+    if directives.is_empty() {
+        return;
+    }
+    let mut td = state.pending_tick_directives.lock().await;
+    for (i, d) in directives.iter().enumerate() {
+        td.insert(i, d.clone());
+    }
+    tracing::info!(
+        count = directives.len(),
+        "re-queued undelivered off-screen task directives (turn aborted after drain)"
+    );
+}
+
 /// API stream fails (or no active profile is present despite the guards), this:
 ///   1. clears the in-flight cancel slot,
 ///   2. writes the reserved `autosave` slot so the player never loses progress
@@ -8088,11 +8451,10 @@ async fn emit_fable_api_lost(
     pop_trailing_user_turn: bool,
     restore_schema: Option<schema::WorldSchema>,
 ) -> Result<(), String> {
-    // Clear the cancel slot (mirror the normal turn-finalize cleanup).
-    {
-        let mut slot = state.active_fable_cancel.lock().expect("active_fable_cancel mutex");
-        *slot = None;
-    }
+    // Cancel-slot hygiene lives in the caller's FableCancelSlotGuard (#46):
+    // every `emit_fable_api_lost` call site is a `return` from `fable_send`,
+    // so the identity-checked guard Drop fires immediately after this fn —
+    // clearing here would need the token anyway to stay race-safe.
     // (P2 fix) Pop the dangling user turn the turn-start push added (normal
     // turns only — regenerate/reroll didn't push one). Without this the
     // autosave below persists an unanswered action into session.json and the
@@ -8328,8 +8690,10 @@ async fn fable_send(
     // failure), the api_lost early return, the happy path — must leave
     // `active_fable_cancel` empty once the turn is over. The guard clears
     // the slot on Drop (unwind-safe); the explicit post-stream clear further
-    // down is kept as the eager path, this is the backstop.
-    let _cancel_guard = FableCancelSlotGuard::new(&state);
+    // down is kept as the eager path, this is the backstop. Both clears are
+    // identity-checked (#46): an overlapping `fable_send` that overwrote the
+    // slot owns it, and this turn's cleanup must not wipe the live token.
+    let _cancel_guard = FableCancelSlotGuard::new(&state, &cancel);
     // (P2 fix) Clear any stale reroll-interrupt flag at turn START. The flag
     // was previously consumed only at the post-reply check — a › click in the
     // post-done tail window (after the check already ran) armed it, and the
@@ -8352,17 +8716,35 @@ async fn fable_send(
     // 14) so the edit-retrack path (edit_message) reaches the local tracker
     // through the SAME lease — every local-model Fable consumer routes
     // through the lease (the §2C boot-bypass lesson).
+    //
+    // **Local-model turn lock BEFORE the lease (2026-08-15, #29/#23):** the
+    // lock is taken FIRST and held across Stage 1 (tracker decode + bracket
+    // application), dropped before Stage 2 — the uniform lock→lease order
+    // chat/schema/SD already use. The old lease→lock order left a window
+    // where a chat turn or an SD swap cycle could acquire the lease and evict
+    // the fable role while this frame still held an engine clone (its
+    // teardown's Arc::try_unwrap then failed → the ~510MB fable context
+    // orphaned in VRAM alongside the new role's context; for the SD path,
+    // unload_shared_model could free the weights under the still-live
+    // LlamaContext — memory-unsafe). Holding the turn lock from before the
+    // lease acquire closes the window: every lease taker is also a turn-lock
+    // holder, so eviction can only happen between turns.
+    let _tracker_model_guard = state.local_model_lock.lock().await;
     let (lease, engine) = acquire_fable_engine_leased(&state, &app).await?;
-    // The lease is now held for the duration of this turn. It will be
-    // released when `lease` drops at end of scope.
-    let _ = &lease;
+    // Stage-2 droppables: the API narrator needs NEITHER the engine NOR the
+    // lease, so both become Options the API arm drops before its HTTP wait
+    // (see the Stage-2 block). The dev-only local-narrator arm keeps them.
+    let mut lease_opt = Some(lease);
+    let mut engine_opt = Some(engine);
     // Armed by apply_time_command_and_maybe_tick when the [TIME] gate
     // crosses the progression interval; fired ONLY at the very end of this
     // fn, after `engine` + `lease` are dropped (see fire_world_progression_tick).
     let mut tick_armed = false;
     // Context size for the API narrator path (the local FableEngine ignores it:
-    // it clears KV per turn on its own fixed context).
-    let context_size = state.settings.lock().expect("settings mutex").context_size;
+    // it clears KV per turn on its own fixed context). CTX_API directly — the
+    // old `WupiSettings::context_size` read here was a dead field (always 0,
+    // documented "read by nothing") feeding an ignored HTTP param.
+    let context_size = settings::CTX_API;
 
     // Build the narrator system prompt from the card + current game schema.
     //
@@ -8405,11 +8787,30 @@ async fn fable_send(
         g.take()
     };
 
-    let (world_state, pacing, mut turn_directives) = {
+    // (#25) Pre-referee snapshot: the world BEFORE this turn's Referee
+    // mutations. The api_lost path restores THIS (not the post-referee
+    // `base_schema_snapshot`) so the autosave never persists injuries the
+    // failed turn applied — otherwise the frontend's Enter-retry re-runs the
+    // referees on the same text and double-applies them. The reroll path
+    // keeps restoring `base_schema_snapshot` (the message's stored pre-turn
+    // world, an even earlier point).
+    let pre_referee_schema: schema::WorldSchema = state.fable_schema.lock().await.clone();
+
+    let (world_state, pacing, mut turn_directives, drained_tick_directives) = {
         let mut s = state.fable_schema.lock().await;
 
         // (1) Scene pacing FIRST — its DC modifier threads into (3).
-        let pacing = scene_pacing::evaluate(&text);
+        // Reroll/regenerate guard (2026-08-15 audit fix): those turns carry
+        // an EMPTY player action, and evaluate("") is the neutral default —
+        // re-classifying would mutate live pacing + mint a spurious undo
+        // ring push that the base-schema revert below discards anyway
+        // (ring + log noise on every reroll). Keep the stored classification
+        // (the world state the original roll ran under) for this pass.
+        let pacing = if text.trim().is_empty() {
+            s.scene_pacing
+        } else {
+            scene_pacing::evaluate(&text)
+        };
 
         // Track whether anything mutated so we snapshot once for undo. All
         // three engines share a single history push (the snapshot captures
@@ -8509,6 +8910,11 @@ async fn fable_send(
                 attacker_tier,
                 buffs_count,
                 debuffs_count,
+                // Lethality uses the MIRRORED pacing mod (combat = killing
+                // blows land easier), NOT the skill-check DC mod — threading
+                // dc_modifier() here made Combat the safest place to take a
+                // hit (2026-08-15 inversion fix).
+                pacing.mode.lethality_dc_mod(),
             )
         {
             tracing::info!(
@@ -8643,7 +9049,7 @@ async fn fable_send(
         }
 
         let world_state_opt = if rendered.trim().is_empty() { None } else { Some(rendered) };
-        (world_state_opt, pacing, turn_directives)
+        (world_state_opt, pacing, turn_directives, tick_directives)
     };
 
     // Fable codex retrieval (2026-07-29, the core fix): the narrator now
@@ -8726,11 +9132,11 @@ async fn fable_send(
     // produces punchy 2-4 paragraph beats naturally; the §11.41 DRY sampler
     // + post-gen truncator are the mechanical loop backstop.
     //
-    // v0.7: the API window was cut 16 → 12 (6 beats). 12 narrator messages
-    // + the ~2050-tok narrator prompt + generation fits comfortably inside
-    // the API profile's max_context (default 8192), and 12 matches the chat
-    // API window for a consistent "6 beats of recent history" feel across
-    // both surfaces.
+    // v0.7: the API window was briefly cut 16 → 12, then restored to 16
+    // (WINDOW_API_FABLE): the 16k CTX_API budget comfortably carries 16
+    // narrator messages + the distilled prompt + generation, and 16 matches
+    // chat's API window for a consistent "8 beats of recent history" feel
+    // across both surfaces.
     // (The API-only require_api_for_fable backstop moved to the fn's top
     // preflight — P3 #20 — so a no-API call pays no lease/engine spawn.)
     let fable_visible_window = settings::WINDOW_API_FABLE;
@@ -8789,10 +9195,12 @@ async fn fable_send(
     let (window, tracker_window): (Vec<session::Message>, Vec<session::Message>) = {
         let gs = state.fable_session.lock().await;
         let msgs = &gs.messages;
-        // Reroll: the trailing assistant message has empty content (stashed into
-        // variants above). Exclude it from the prompt window so the model
-        // regenerates from the preceding user turn, not from an empty assistant
-        // turn. We slice to `len - 1` in that case.
+        // Reroll: the trailing assistant message's prose is superseded by the
+        // fresh roll (the OLD variant gets stashed by push_variant_with_schema
+        // AFTER generation, below — nothing is stashed yet at this point).
+        // Exclude it from the prompt window so the model regenerates from the
+        // preceding user turn, not from the prior assistant turn. We slice to
+        // `len - 1` in that case.
         let end = if reroll && msgs.last().map(|m| m.role == session::Role::Assistant).unwrap_or(false) {
             msgs.len().saturating_sub(1)
         } else {
@@ -8825,12 +9233,19 @@ async fn fable_send(
             //     this is the first reroll of the turn (empty for a turn made
             //     before this feature, OR a fresh turn whose post-tracker
             //     snapshot is pushed after generation below).
+            //
+            //     (#57) Seeded from `pre_referee_schema`, NOT the live schema:
+            //     by the time this block runs, this call's referee/pacing/
+            //     relationship mutations have already landed on live — a
+            //     legacy first-reroll used to bake those duplicate injuries
+            //     into the seed. The pre-referee snapshot IS the active
+            //     variant's schema at reroll start. Legacy messages only
+            //     (modern turns push their post-tracker snapshot post-gen).
             {
-                let live = state.fable_schema.lock().await.clone();
                 let mut gs = state.fable_session.lock().await;
                 if let Some(m) = gs.messages.last_mut() {
                     if m.role == session::Role::Assistant && m.variant_schemas.is_empty() {
-                        m.variant_schemas.push(live);
+                        m.variant_schemas.push(pre_referee_schema.clone());
                     }
                 }
             }
@@ -8902,10 +9317,12 @@ async fn fable_send(
         // applied. The no-op on_chunk ensures the tracker's prose/bracket
         // output never reaches the frontend.
         //
-        // **Local-model turn lock (2026-08-08):** the tracker decode + bracket
-        // application run under the process-wide `local_model_lock` so they
-        // never overlap a concurrent `chat_send` or schema-delta decode on the
-        // local 12B. Whichever local consumer acquires first runs to
+        // **Local-model turn lock (2026-08-08; hoisted above the lease
+        // acquire 2026-08-15):** the tracker decode + bracket application run
+        // under the process-wide `local_model_lock` (`_tracker_model_guard`,
+        // taken before acquire_fable_engine_leased) so they never overlap a
+        // concurrent `chat_send`, schema-delta, or SD-swap decode on the local
+        // 12B / shared VRAM. Whichever consumer acquires first runs to
         // completion; the others queue. The guard drops at the end of this
         // block — BEFORE Stage 2 (the API narrator never takes it).
         let noop_chunk: llm::ChunkFn = Arc::new(|_: &str| {});
@@ -8914,7 +9331,9 @@ async fn fable_send(
         // Rust state, not re-read history (2026-08-10).
         let tracker_prompt = build_narrator_prompt(&system_prompt, &tracker_window);
         tracing::info!("fable_send: API mode — tracker stage (local) starting");
-        let _tracker_model_guard = state.local_model_lock.lock().await;
+        let engine = engine_opt
+            .as_ref()
+            .expect("tracker engine alive (dropped only in the API Stage-2 arm)");
         let tracker_reply_opt: Option<fable_engine::FableReply> = match engine
             .request_turn(tracker_prompt, noop_chunk.clone(), cancel.clone(), true)
         {
@@ -9068,15 +9487,23 @@ async fn fable_send(
         // save-state dev work. The engine is already spawned above (Stage 1)
         // and clears KV every turn, so a second request_turn is a fresh
         // prefill with no cache concern. The tracker already applied its
-        // brackets; any brackets this pass emits are harmless duplicates
-        // (same contract as the API path: narrator brackets are a no-op for
-        // state, the tracker owns mechanics). tracker_mode=false → creative
-        // sampler for more natural prose to look at while styling.
+        // brackets; brackets this pass emits are STRIPPED-AND-DROPPED at the
+        // post-reply parse (2026-08-15: the old defensive apply re-applied
+        // them — a duplicate [TIME] double-advanced the clock in dev).
+        // tracker_mode=false → creative sampler for more natural prose to
+        // look at while styling.
         if cfg!(debug_assertions) && profile.is_none() {
             tracing::info!(
                 "fable_send: DEV MODE — no API profile; narrating via local FableEngine (stat-spammy)"
             );
             let narrator_prompt = build_narrator_prompt(&narrator_system_prompt, &window);
+            // Re-take the turn lock for this decode (2026-08-15, #44): the
+            // Stage-1 guard was dropped above, and a local decode outside the
+            // lock could overlap a concurrent chat/schema decode in dev.
+            let _dev_model_guard = state.local_model_lock.lock().await;
+            let engine = engine_opt
+                .as_ref()
+                .expect("dev narrator engine alive (dropped only in the API arm)");
             let dev_reply: fable_engine::FableReply = match engine.request_turn(
                 narrator_prompt,
                 on_chunk.clone(),
@@ -9091,32 +9518,35 @@ async fn fable_send(
                     },
                     Ok(Err(e)) => {
                         tracing::warn!(error = %e, "fable_send: DEV local narrator channel recv failed");
+                        requeue_tick_directives(&state, &drained_tick_directives).await;
                         return emit_fable_api_lost(
                             &on_event, &app, &state,
                             "Dev local narrator failed (see logs).",
                             !regenerate && !reroll,
-                        if reroll { Some(base_schema_snapshot.clone()) } else { None },
+                        if reroll { Some(base_schema_snapshot.clone()) } else { Some(pre_referee_schema.clone()) },
                         )
                         .await;
                     }
                     Err(e) => {
                         tracing::warn!(error = %e, "fable_send: DEV local narrator join failed");
+                        requeue_tick_directives(&state, &drained_tick_directives).await;
                         return emit_fable_api_lost(
                             &on_event, &app, &state,
                             "Dev local narrator failed (see logs).",
                             !regenerate && !reroll,
-                        if reroll { Some(base_schema_snapshot.clone()) } else { None },
+                        if reroll { Some(base_schema_snapshot.clone()) } else { Some(pre_referee_schema.clone()) },
                         )
                         .await;
                     }
                 },
                 Err(e) => {
                     tracing::warn!(error = %format!("{e:#}"), "fable_send: DEV local narrator request_turn failed");
+                    requeue_tick_directives(&state, &drained_tick_directives).await;
                     return emit_fable_api_lost(
                         &on_event, &app, &state,
                         "Dev local narrator failed (see logs).",
                         !regenerate && !reroll,
-                    if reroll { Some(base_schema_snapshot.clone()) } else { None },
+                    if reroll { Some(base_schema_snapshot.clone()) } else { Some(pre_referee_schema.clone()) },
                     )
                     .await;
                 }
@@ -9127,12 +9557,24 @@ async fn fable_send(
                 // Defensive: no active profile despite the guards (e.g. the
                 // profile was deleted mid-turn). No local fallback — emit
                 // api_lost, autosave, and abort the turn.
+                requeue_tick_directives(&state, &drained_tick_directives).await;
                 return emit_fable_api_lost(
                     &on_event, &app, &state, "No active API profile.",
                     !regenerate && !reroll,
-                if reroll { Some(base_schema_snapshot.clone()) } else { None },
+                if reroll { Some(base_schema_snapshot.clone()) } else { Some(pre_referee_schema.clone()) },
                 ).await;
             };
+            // Release the fable engine + lease for the WHOLE Stage-2 HTTP wait
+            // (2026-08-15, #29): the API narrator needs neither. Keeping the
+            // engine clone pinned the FableEngine's Arc through the wait, so
+            // any cross-role acquire's teardown Arc::try_unwrap failed → the
+            // ~510MB fable context orphaned in VRAM next to the new role's
+            // context (and for an SD cycle, unload_shared_model would free the
+            // weights under the still-live LlamaContext — memory-unsafe).
+            // Dropped here, the resident engine stays ONLY in its slot: the
+            // next cross-role teardown unwraps + joins it cleanly.
+            drop(engine_opt.take());
+            drop(lease_opt.take());
             // Re-render the windowed history as flat ApiMessages for the HTTP path
             // (system + windowed turns; the API folds memory + world_state into
             // the system message itself).
@@ -9173,7 +9615,11 @@ async fn fable_send(
                 // "<channel|>", returns the input unchanged).
                 raw_output: if out.raw.is_empty() { out.content } else { out.raw },
                 error: String::new(),
-                cancelled: false,
+                // (#45) HttpBackend::stream breaks + returns Ok(partial) on
+                // cancel — surface the cancel token so the turn finalizes as
+                // cancelled (the same contract as the local engine) instead
+                // of being saved as a normal turn.
+                cancelled: cancel.load(std::sync::atomic::Ordering::Relaxed),
             },
             Err(e) => {
                 // Architectural override (2026-08-07): NO local narration
@@ -9181,13 +9627,14 @@ async fn fable_send(
                 // progress, tell the frontend to lock the composer, and abort
                 // the turn. The player reconnects via Settings and retries.
                 tracing::warn!(error = %e, "fable_send: API narrator failed; emitting api_lost (no local fallback)");
+                requeue_tick_directives(&state, &drained_tick_directives).await;
                 return emit_fable_api_lost(
                     &on_event,
                     &app,
                     &state,
                     "The API connection was lost.",
                     !regenerate && !reroll,
-                if reroll { Some(base_schema_snapshot.clone()) } else { None },
+                if reroll { Some(base_schema_snapshot.clone()) } else { Some(pre_referee_schema.clone()) },
                 )
                 .await;
             }
@@ -9195,11 +9642,9 @@ async fn fable_send(
         }  // close else (API path)
     };
 
-    // Clear the cancel slot now that the turn is done.
-    {
-        let mut slot = state.active_fable_cancel.lock().expect("active_fable_cancel mutex");
-        *slot = None;
-    }
+    // Clear the cancel slot now that the turn is done — identity-checked
+    // (#46): only our own token, never a newer overlapping turn's.
+    clear_cancel_slot_if_owner(&state.active_fable_cancel, &cancel);
 
     // Abort check (Stage 3, 2026-08-11): if `fable_interrupt_reroll` requested
     // an abort (the user re-pressed › mid-reroll to abandon this roll), discard
@@ -9211,7 +9656,18 @@ async fn fable_send(
     // consumed once. This is distinct from a soft `fable_stop` cancel
     // (reply.cancelled without the abort flag), which keeps its partial prose.
     if state.fable_abort_requested.swap(false, std::sync::atomic::Ordering::Relaxed) {
-        *state.fable_schema.lock().await = base_schema_snapshot.clone();
+        // The drained tick directives never reached a delivered beat —
+        // restore them for the next turn (2026-08-15 audit fix: a reroll
+        // abort used to permanently drop one-shot world events).
+        requeue_tick_directives(&state, &drained_tick_directives).await;
+        // Reroll → the message's stored pre-turn base; normal turn → the
+        // pre-REFEREE world (#25: base_schema_snapshot is post-referee there,
+        // which would persist this aborted turn's injuries).
+        *state.fable_schema.lock().await = if reroll {
+            base_schema_snapshot.clone()
+        } else {
+            pre_referee_schema.clone()
+        };
         // Defensive: for a normal turn (not reroll) the user message was added
         // at turn start — pop it so the conversation reverts to its pre-turn
         // tail. The frontend only triggers abort for the reroll case, so this
@@ -9228,6 +9684,7 @@ async fn fable_send(
     }
 
     if !reply.error.is_empty() {
+        requeue_tick_directives(&state, &drained_tick_directives).await;
         on_event
             .send(serde_json::json!({ "type": "error", "message": reply.error }))
             .map_err(|e| e.to_string())?;
@@ -9274,11 +9731,16 @@ async fn fable_send(
     // untruncated as a forensic record (FableEngine clears KV every turn,
     // so it's never re-tokenized — no cache-coherence concern).
     parsed.prose = stream_filter::truncate_repetition(&parsed.prose);
-    for cmd in &parsed.commands {
-        on_event
-            .send(serde_json::json!({ "type": "scene_event", "command": cmd }))
-            .map_err(|e| e.to_string())?;
-    }
+    // (2026-08-15 audit fix) Narrator-stage brackets are STRIPPED-AND-
+    // DROPPED, never applied — the slice-regen precedent. The tracker
+    // (Stage 1) owns ALL mechanics; this parse exists purely to clean
+    // brackets out of the stored prose. The old defensive apply site re-
+    // applied whatever the narrator emitted: a no-op for the API narrator
+    // (prose-only prompt, no commands) but in the DEV local-narrator arm
+    // the 12B stat-spams brackets, so a duplicate [TIME] double-advanced
+    // the clock. No scene_events are emitted for narrator-stage commands
+    // either (the tracker's Stage-1 loop above owns emission; dev-mode
+    // duplicates would double-fire UI notifications).
 
     // Apply any [TIME ...] bracket command + check the World Progression tick
     // gate (Fable Seam #4, 2026-07-27). If the narrator advanced the in-world
@@ -9295,29 +9757,11 @@ async fn fable_send(
     // + visible on the NEXT narrator turn (off-screen sim is decoupled from
     // the just-completed narrator turn by design).
     //
-    // Phase 3 bracket commands ([EFFECT], [MILESTONE], [TASK]) are applied
-    // FIRST so the tick sees any freshly-queued tasks / freshly-recorded
-    // milestones when it fires (parallel ordering to the [TIME] consume).
-    //
-    // Component 3 (2026-07-28): the return tuple's reject directives (e.g.
-    // "[TRAVEL] rejected — non-adjacent") are DROPPED here. The tracker-stage
-    // caller above already merged its rejects into turn_directives, so `parsed`
-    // here is the API narrator's bracket-free output → empty commands. This
-    // shared site is thus a no-op for rejects; it remains the defensive apply
-    // site for any bracket the narrator might have slipped through despite the
-    // prose-only prompt. The `tracing::warn!` inside the apply helper captures
-    // rejections for forensics.
-    // The defensive apply site — decay=false: the tracker stage above already
-    // ran this turn's presence grace-decay; a second pass would halve the
-    // grace window (P2 fix).
-    let _ = apply_phase3_bracket_commands(&parsed, &state, false).await;
-    tick_armed |= apply_time_command_and_maybe_tick(&parsed, &state).await;
-    // §11.41: the reply parsed here is the prose-only API NARRATOR's output
-    // (the build_api_narrator_system_prompt contract). The narrator emits NO
-    // brackets — the tracker (Stage 1 above) already applied them + emitted
-    // its scene_events with source:"tracker". So `parsed.commands` is empty
-    // here and both apply_* calls are harmless no-ops. The scene_event loop
-    // above also emits nothing.
+    // Phase 3 bracket commands ([EFFECT], [MILESTONE], [TASK]) would have
+    // been applied here pre-2026-08-15; the tracker stage above already ran
+    // them. `parsed.commands` here is empty for the API narrator (prose-only
+    // prompt) and deliberately dropped in dev mode (see the strip-and-drop
+    // note above).
 
     // Archive both turns to the card-scoped memory. Best-effort, detached,
     // same pattern as chat_send's pillar-2 archive.
@@ -9327,13 +9771,16 @@ async fn fable_send(
         let user_text = text.clone();
         let asst_text = parsed.prose.clone();
         let skip_asst_archive = codex_was_injected;
+        // One turn id for BOTH rows: the §4 retention key (same as the chat
+        // archive spawn — the prune is partition-scoped, not path-scoped).
+        let turn_uuid = memory::new_turn_uuid();
         tokio::spawn(async move {
             // (P3) A reroll/regenerate turn carries an EMPTY user text —
             // don't archive it (add_memory would warn "chunked to nothing"
             // on every reroll).
             if !user_text.trim().is_empty() {
                 if let Err(e) = memory_engine
-                    .add_memory(user_text, &card_id, memory::Role::User, 1.0)
+                    .add_memory(user_text, &card_id, memory::Role::User, 1.0, Some(&turn_uuid))
                     .await
                 {
                     tracing::warn!(error = %format!("{e:#}"), "archive game user turn failed");
@@ -9341,13 +9788,20 @@ async fn fable_send(
             }
             if skip_asst_archive {
                 tracing::debug!("[fable-archive] codex lore was injected - assistant prose not archived (echo-skip)");
-                return;
-            }
-            if let Err(e) = memory_engine
-                .add_memory(asst_text, &card_id, memory::Role::Assistant, 1.0)
+            } else if let Err(e) = memory_engine
+                .add_memory(asst_text, &card_id, memory::Role::Assistant, 1.0, Some(&turn_uuid))
                 .await
             {
                 tracing::warn!(error = %format!("{e:#}"), "archive game assistant turn failed");
+            }
+            // Retention prune (§4): the 1k+-message deep-play guardrail. A
+            // Fable campaign is the partition most likely to cross the
+            // watermark, so this spawn — already detached + off the turn
+            // lock — is where the hysteresis eviction lives.
+            match memory_engine.prune_episodic_card(&card_id).await {
+                Ok(0) => {}
+                Ok(n) => tracing::info!(card_id = %card_id, pruned = n, "episodic memory pruned to watermark"),
+                Err(e) => tracing::warn!(error = %format!("{e:#}"), "episodic prune failed (non-fatal)"),
             }
         });
     }
@@ -9450,8 +9904,8 @@ async fn fable_send(
     // teardown joins the engine thread via Arc::try_unwrap, which requires
     // our clone gone (otherwise the context orphans in VRAM). Firing any
     // earlier self-deadlocks the non-reentrant local-model turn lock.
-    drop(engine);
-    drop(lease);
+    drop(engine_opt);
+    drop(lease_opt);
     if tick_armed {
         fire_world_progression_tick(&state).await;
     }
@@ -9984,15 +10438,13 @@ async fn creator_assistant_turn(
         .stream(api_msgs, None, None, Vec::new(), settings::CTX_API, on_chunk, cancel.clone())
         .await;
 
-    // Clear the slot now that the stream is done (mirrors the slice path's
-    // post-turn cleanup).
-    {
-        let mut slot = state
-            .active_creator_cancel
-            .lock()
-            .expect("active_creator_cancel mutex");
-        *slot = None;
-    }
+    // Clear the slot now that the stream is done — identity-checked (#46
+    // discipline, same as the fable slot's FableCancelSlotGuard): a stale
+    // turn's cleanup must never orphan a NEWER live turn's cancel token
+    // (Escape would then fire at a dead token + the live stream becomes
+    // uncancellable). The frontend's stale-turn firewall prevents the
+    // overlap in the first place; this is the backend belt-and-suspenders.
+    clear_cancel_slot_if_owner(&state.active_creator_cancel, &cancel);
 
     let out = match reply {
         Ok(out) => out,
@@ -10314,6 +10766,8 @@ async fn prism_generate(
     let sd_engine_slot = state.sd_engine.clone();
     let sd_autogen_disabled = state.sd_autogen_disabled.clone();
     let active_sd_cancel = state.active_sd_cancel.clone();
+    // The turn lock the swap core holds across the whole cycle (P0 #23).
+    let local_model_lock = state.local_model_lock.clone();
     // Resolve the LLM model path. pending_model_path is CONSUMED by
     // boot_load_model's `.take()` (§21) at boot, so by the time Prism runs
     // it's almost always None — reloading from it would have no path + trip
@@ -10355,6 +10809,7 @@ async fn prism_generate(
             sd_autogen_disabled.clone(),
             active_sd_cancel,
             llm_model_path,
+            local_model_lock,
             request,
             Box::new(move |outcome| {
                 use tauri::Emitter;
@@ -11197,8 +11652,11 @@ fn fable_card_portrait_write(
     // (P3) Magic-byte validation — mirrors fable_player_portrait_upload_bytes
     // + the background import: a non-image payload must never land on disk
     // as portrait.png (the ext allowlist alone doesn't check content).
-    let looks_png = bytes.len() > 8 && bytes[..4] == [0x89, b'P', b'N', b'G'];
-    let looks_jpg = bytes.len() > 3 && bytes[..3] == [0xFF, 0xD8, 0xFF];
+    // (#82) Full signatures, not prefixes: PNG is 8 bytes (89 50 4E 47 0D 0A
+    // 1A 0A), JPEG is FF D8 FF — the old 4-byte PNG prefix also matched
+    // payloads that merely start with the marker.
+    let looks_png = bytes.starts_with(&[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]);
+    let looks_jpg = bytes.starts_with(&[0xFF, 0xD8, 0xFF]);
     let is_image = if ext_lower == "png" { looks_png } else { looks_jpg };
     if !is_image {
         return Err("portrait bytes failed image magic-byte check".into());
@@ -11211,8 +11669,29 @@ fn fable_card_portrait_write(
     let file_ext = if ext_lower == "jpeg" { "jpg" } else { &ext_lower };
     let path = card_dir.join(format!("portrait.{file_ext}"));
     write_atomic(&path, &bytes).map_err(|e| format!("write portrait: {e}"))?;
+    // (#61) Reap other-ext siblings: discovery prefers png > jpg > jpeg, so
+    // uploading a new JPEG over an old PNG left the stale PNG winning
+    // forever. The just-written file is the only truth.
+    reap_other_portrait_exts(&card_dir, file_ext);
     tracing::info!(card_id = %card_id, bytes = bytes.len(), "fable_card_portrait_write: portrait written");
     Ok(())
+}
+
+/// Remove `portrait.<ext>` siblings of every ext EXCEPT `keep_ext` in `dir`
+/// (#61). Best-effort: a failed removal is logged, never fatal — worst case
+/// the stale file lingers until the next portrait write.
+fn reap_other_portrait_exts(dir: &std::path::Path, keep_ext: &str) {
+    for ext in ["png", "jpg", "jpeg"] {
+        if ext == keep_ext {
+            continue;
+        }
+        let stale = dir.join(format!("portrait.{ext}"));
+        match std::fs::remove_file(&stale) {
+            Ok(()) => tracing::debug!(ext, "reaped stale portrait sibling"),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => tracing::warn!(ext, error = %e, "failed to reap stale portrait sibling"),
+        }
+    }
 }
 
 /// Resolve the absolute filesystem path to a card's portrait sibling (if one
@@ -11663,6 +12142,30 @@ fn create_card_shortcut(
     build_card_shortcut(&app, &card_slug, export_to_desktop.unwrap_or(false))
 }
 
+/// Best-effort memory-partition purge after a card delete (§4 retention,
+/// 2026-08-15). The card folder lives under `apps/fable/cards/` but its memory
+/// rows live in `memory.sqlite` OUTSIDE that tree — a delete that only removes
+/// the folder leaves ghost rows that nothing will ever clean (the partition
+/// stops receiving writes, so the retention cap can never fire on it), and a
+/// same-slug re-create would inherit the dead run's memories. Episodic AND
+/// codex rows both go: the `.codex` source file died with the folder.
+///
+/// Logs loudly on failure — every call site has already removed the folder at
+/// that point, so a failed purge means ghost rows (visible in the 🧠 panel's
+/// row counts, fixable by re-deleting the card id).
+async fn purge_deleted_card_memory(state: &AppState, card_id: &str) {
+    let Some(engine) = state.memory.get() else { return };
+    match engine.purge_card_partition(card_id).await {
+        Ok(0) => {}
+        Ok(n) => tracing::info!(card_id = %card_id, purged = n, "deleted card's memory partition purged"),
+        Err(e) => tracing::error!(
+            error = %format!("{e:#}"),
+            card_id = %card_id,
+            "card deleted but memory partition purge FAILED (ghost rows may linger)"
+        ),
+    }
+}
+
 /// Delete a card's entire per-card folder (`cards/<id>/` — the `.sim` + every
 /// sibling: `.intro`, `.codex`, `world.json`, `player.json`, `npc.json`,
 /// `portrait.*`, `portrait.ico`, the `saves/` tree, AND the in-folder `Launch
@@ -11671,9 +12174,16 @@ fn create_card_shortcut(
 /// Mirrors `fable_player_delete`'s discipline: path-traversal guard on the id
 /// + a confirm-the-folder-is-a-real-card check (the namesake `<id>.sim` must
 /// exist) before `remove_dir_all`, so a stray id can't nuke an unrelated
-/// sibling directory. Idempotent: a missing folder is Ok.
+/// sibling directory. Idempotent: a missing folder is Ok (and the early
+/// return also purges the memory partition — the legacy-ghost cleanup).
+/// The §4 retention follow-up (2026-08-15) purges the card's memory
+/// partition after the folder falls: see [`purge_deleted_card_memory`].
 #[tauri::command]
-fn fable_card_delete(card_id: String, app: tauri::AppHandle) -> Result<(), String> {
+async fn fable_card_delete(
+    card_id: String,
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+) -> Result<(), String> {
     // Path-traversal guard: the card id is a slug (lowercase + dashes), so any
     // separator / dot-segment is malformed or malicious. Reject before join.
     if card_id.is_empty()
@@ -11688,7 +12198,12 @@ fn fable_card_delete(card_id: String, app: tauri::AppHandle) -> Result<(), Strin
         .ok_or_else(|| "no apps/fable/cards/ dir resolved".to_string())?;
     let card_dir = resolve_card_dir(&cards_root, &card_id);
     if !card_dir.exists() {
-        return Ok(()); // idempotent
+        // Idempotent — but ALSO the ghost-data exorcism path: a card deleted
+        // before the §4 retention fix left its memory partition behind (the
+        // folder went, the rows stayed). Purge so a re-delete of the same id
+        // cleans those legacy ghosts even though the folder is already gone.
+        purge_deleted_card_memory(&state, &card_id).await;
+        return Ok(());
     }
     // Confirm the folder actually contains its namesake `<id>.sim` so a stray
     // id can't nuke an unrelated sibling directory. A missing .sim means the
@@ -11712,6 +12227,10 @@ fn fable_card_delete(card_id: String, app: tauri::AppHandle) -> Result<(), Strin
     }
     std::fs::remove_dir_all(&card_dir)
         .map_err(|e| format!("could not delete card: {e}"))?;
+    // Nuke the memory partition too: folder, .lnk, episodic rows, codex rows,
+    // FTS/vec mirrors — all of it (§4: deleting ANYTHING leaves nothing in
+    // memory.sqlite).
+    purge_deleted_card_memory(&state, &card_id).await;
     tracing::info!(card_id = %card_id, "card deleted");
     Ok(())
 }
@@ -11806,7 +12325,7 @@ async fn fable_rollback(
     }
     let prior = {
         let mut hist = state.fable_schema_history.lock().await;
-        hist.pop_back()
+        hist.pop_back().map(|(_tag, snap)| snap)
     };
     let prior = prior.ok_or_else(|| "nothing to roll back: history is empty".to_string())?;
     let diff = {
@@ -11826,6 +12345,41 @@ async fn fable_rollback(
         summary_changed = diff.summary_changed,
         "fable_rollback: restored prior world state"
     );
+    // (#58) Persist the restored schema to the autosave immediately — an
+    // abrupt exit after a rollback used to leave autosave/session.json at
+    // the pre-rollback state (the restore lived only in memory until the
+    // next turn's autosave). Same detached best-effort shape as the api_lost
+    // path; `fable_end` still writes its own save on close.
+    {
+        let state_active_card = state.active_fable_card.clone();
+        let state_session = state.fable_session.clone();
+        let state_schema = state.fable_schema.clone();
+        let fable_root = resolve_apps_dir(&app).join("fable");
+        tokio::spawn(async move {
+            let card_opt = state_active_card.lock().expect("active_fable_card mutex").clone();
+            let Some(card) = card_opt else { return };
+            let session = state_session.lock().await.clone();
+            let schema = state_schema.lock().await.clone();
+            let fable_root_clone = fable_root.clone();
+            let card_clone = card.clone();
+            let result = tokio::task::spawn_blocking(move || {
+                fable_save::write_save(
+                    &fable_root_clone,
+                    &card_clone,
+                    fable_save::AUTOSAVE_ID,
+                    "Autosave",
+                    &session,
+                    &schema,
+                )
+            })
+            .await;
+            match result {
+                Ok(Ok(_)) => tracing::debug!("autosave (rollback): ok"),
+                Ok(Err(e)) => tracing::warn!(error = %format!("{e}"), "autosave (rollback) write failed"),
+                Err(e) => tracing::warn!(error = %format!("{e}"), "autosave (rollback) join failed"),
+            }
+        });
+    }
     let _ = app.emit("fable_rollback", &diff);
     Ok(diff)
 }
@@ -11921,6 +12475,14 @@ async fn fable_load_save(
     .await
     .map_err(|e| format!("load join: {e}"))?
     .map_err(|e| format!("load read: {e}"))?;
+    // (#77) Same defensive normalize `Conversation::load` runs: clamp
+    // active_idx + reconcile variant/raw lengths so a hand-edited or skewed
+    // save can't confuse the accessors. Runs BEFORE the UI snapshot so the
+    // feed renders the clamped indices too.
+    let mut loaded_session = save.session;
+    for m in &mut loaded_session.messages {
+        m.normalize_variants();
+    }
     let meta = fable_save::SaveMeta {
         save_id: save.save_id,
         card_id: save.card_id,
@@ -11928,11 +12490,10 @@ async fn fable_load_save(
         summary: save.summary,
         timestamp: save.timestamp,
         is_autosave: save.is_autosave,
-        turn_count: save.session.messages.len(),
+        turn_count: loaded_session.messages.len(),
     };
     // Snapshot the messages for the UI BEFORE we move the session into state.
-    let messages: Vec<FableLoadMessage> = save
-        .session
+    let messages: Vec<FableLoadMessage> = loaded_session
         .messages
         .iter()
         .map(|m| FableLoadMessage {
@@ -11948,7 +12509,7 @@ async fn fable_load_save(
             reasoning: m.reasoning.clone(),
         })
         .collect();
-    *state.fable_session.lock().await = save.session;
+    *state.fable_session.lock().await = loaded_session;
     *state.fable_schema.lock().await = save.schema;
     clear_fable_history(&state).await;
     tracing::info!(save_id = %meta.save_id, "game state loaded");
@@ -12401,10 +12962,12 @@ async fn retrack_edited_assistant_message(
 
     tracing::info!("edit re-track: tracker pass starting (index {index})");
     let tracker_result: Result<(), String> = async {
-        // Fable lease (engine spawn-or-reuse) + the local-model turn lock —
-        // the identical serialization fable_send's Stage 1 runs under.
-        let (_lease, engine) = acquire_fable_engine_leased(state, app).await?;
+        // The local-model turn lock FIRST, then the Fable lease — the
+        // identical lock→lease serialization fable_send's Stage 1 runs under
+        // (2026-08-15 reorder; taking the lease first left the same eviction
+        // window #29 describes for fable_send).
         let _model_guard = state.local_model_lock.lock().await;
+        let (_lease, engine) = acquire_fable_engine_leased(state, app).await?;
         let noop_chunk: llm::ChunkFn = Arc::new(|_: &str| {});
         let reply_rx = engine
             .request_turn(tracker_prompt, noop_chunk, cancel.clone(), true)
@@ -12589,13 +13152,59 @@ async fn rewind_and_edit_user(
     app: tauri::AppHandle,
 ) -> Result<EditResponse, String> {
     let card_id = active_fable_card_id(&state)?;
-    let (messages, schema_pop_count) = {
+    let (messages, surviving) = {
         let mut gs = state.fable_session.lock().await;
-        let pop = apply_rewind_and_edit(&mut gs, index, new_text)?;
-        (project_messages(&gs), pop)
+        apply_rewind_and_edit(&mut gs, index, new_text)?;
+        // (#36) The rewind's ring work happens AFTER this scope (schema +
+        // session locks are never nested — see the variant-binding block in
+        // fable_send for the same discipline).
+        let surviving = gs.messages.len();
+        (project_messages(&gs), surviving)
     };
+    // (#36) Pop the ring to the surviving length, SERVER-SIDE. The old
+    // contract returned `deleted assistant turns` and let the frontend call
+    // `fable_rollback` N times — but a turn pushes 0..3+ entries (referee /
+    // bracket batch / TIME-tick), so N pops under/over-rolled world state.
+    // Tagged entries make this exact: drop everything pushed while the
+    // removed tail existed (tag > surviving len). `schema_pop_count` now
+    // returns 0 so the frontend's legacy pop loop no-ops.
+    let restore: Option<schema::WorldSchema> = {
+        let mut hist = state.fable_schema_history.lock().await;
+        let mut popped = 0usize;
+        while hist
+            .back()
+            .map(|(tag, _)| *tag > surviving)
+            .unwrap_or(false)
+        {
+            hist.pop_back();
+            popped += 1;
+        }
+        // If (and only if) tail-owned entries existed, the live schema still
+        // carries the removed turns' mutations. The entry now on top is the
+        // last pre-mutation snapshot from the surviving era — consume it and
+        // install below (the same pop-and-restore semantics as
+        // `fable_rollback`). popped == 0 means the removed turns never
+        // pushed — touching the ring would over-roll.
+        if popped > 0 {
+            let snap = hist.pop_back().map(|(_, s)| s);
+            if snap.is_none() {
+                tracing::warn!(popped, "rewind: popped the tail's entries but no older snapshot remains to restore");
+            } else {
+                tracing::info!(popped, surviving, "rewind: popped ring entries owned by the removed tail + restoring the era's snapshot");
+            }
+            snap
+        } else {
+            None
+        }
+    };
+    if let Some(snap) = restore {
+        *state.fable_schema.lock().await = snap;
+    }
     persist_fable_session(&app, &state, &card_id).await?;
-    Ok(EditResponse { messages, schema_pop_count })
+    Ok(EditResponse {
+        messages,
+        schema_pop_count: 0,
+    })
 }
 
 /// Resolve the roleplay scenario-card registry root, where per-card folders
@@ -12700,32 +13309,51 @@ fn iter_card_sim_paths(cards_root: &std::path::Path) -> Vec<std::path::PathBuf> 
     out
 }
 
-/// Resolve a card's per-card folder: `cards_root/<card_id>/`. Created on
-/// demand by the writers; readers treat NotFound as "no folder yet".
-fn resolve_card_dir(cards_root: &std::path::Path, card_id: &str) -> std::path::PathBuf {
-    // (P2 hardening) Sanitize the id to a bare slug segment: with parse-time
-    // slug normalization every legitimate id is [alnum_-]+, so separators,
-    // parent refs, and drive prefixes are malformed or hostile - they can
-    // never escape the cards root from here on.
+/// Sanitize a card id to a bare slug segment (`[alnum_-]+`, dashes trimmed;
+/// Unicode alphanumerics kept — the card-side convention). Shared by the
+/// directory join AND the filename join so both halves of every card path
+/// derive from the SAME cleaned stem.
+///
+/// (2026-08-15 audit H2) `resolve_card_file` used to sanitize the DIRECTORY
+/// half but embed the RAW id in the `<card_id>.<ext>` filename — a caller-
+/// supplied `../../x` id resolved to `cards/x/../../x.sim`, escaping the
+/// cards tree (the by-id reader/writer/intro/sibling IPCs feed card_id
+/// straight through). One cleaned stem for both segments closes every
+/// card-side instance at once.
+fn sanitize_card_slug(card_id: &str) -> String {
+    // (P2 hardening) with parse-time slug normalization every legitimate id
+    // is [alnum_-]+, so separators, parent refs, and drive prefixes are
+    // malformed or hostile - they can never escape the cards root from here
+    // on.
     let safe: String = card_id
         .chars()
         .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '-' })
         .collect();
     let safe = safe.trim_matches('-').to_string();
     if safe.is_empty() {
-        return cards_root.join("__unknown_card__");
+        "__unknown_card__".to_string()
+    } else {
+        safe
     }
-    cards_root.join(safe)
+}
+
+/// Resolve a card's per-card folder: `cards_root/<card_id>/`. Created on
+/// demand by the writers; readers treat NotFound as "no folder yet".
+fn resolve_card_dir(cards_root: &std::path::Path, card_id: &str) -> std::path::PathBuf {
+    cards_root.join(sanitize_card_slug(card_id))
 }
 
 /// Resolve a sibling file inside a card's per-card folder:
 /// `cards_root/<card_id>/<card_id>.<ext>` (e.g. `<id>.sim`, `<id>.codex`).
+/// BOTH segments are built from the same sanitized stem (see
+/// `sanitize_card_slug` — the filename half used to carry the raw id).
 fn resolve_card_file(
     cards_root: &std::path::Path,
     card_id: &str,
     ext: &str,
 ) -> std::path::PathBuf {
-    resolve_card_dir(cards_root, card_id).join(format!("{card_id}.{ext}"))
+    let safe = sanitize_card_slug(card_id);
+    cards_root.join(&safe).join(format!("{safe}.{ext}"))
 }
 
 // === SAVED PLAYERS (2026-08-02) ===========================================
@@ -12742,6 +13370,31 @@ fn resolve_fable_players_dir(app: &tauri::AppHandle) -> std::path::PathBuf {
     resolve_apps_dir(app).join("fable").join("players")
 }
 
+/// Sanitize a player id to a bare slug segment (`[alnum_-]+`, dashes trimmed;
+/// Unicode alphanumerics kept) — the player-side sibling of
+/// `sanitize_card_slug`.
+///
+/// (2026-08-15 audit H3) the read / rename / portrait IPCs used to join the
+/// RAW caller-supplied `id` into both the folder and the `<id>.json`
+/// filename — `../..` traversed out of the players root (the write path's
+/// rename branch could MOVE an arbitrary directory; the portrait uploads
+/// wrote `portrait.png` into any traversed existing dir).
+/// `fable_player_delete` already had the reject-style guard; these paths now
+/// share the same one-cleaned-stem discipline. A hostile id mangles to a
+/// nonexistent path → the callers' existing "not found" errors.
+fn sanitize_player_slug(id: &str) -> String {
+    let safe: String = id
+        .chars()
+        .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '-' })
+        .collect();
+    let safe = safe.trim_matches('-').to_string();
+    if safe.is_empty() {
+        "__unknown_player__".to_string()
+    } else {
+        safe
+    }
+}
+
 /// Resolve a saved player's portrait to an absolute filesystem path (ready
 /// for the frontend's `convertFileSrc`), or `None` when the player has no
 /// portrait or the portrait file is missing/stale. Loads the player JSON,
@@ -12751,10 +13404,17 @@ fn resolve_fable_players_dir(app: &tauri::AppHandle) -> std::path::PathBuf {
 /// Best-effort: a missing player JSON or a stat error degrades to `None`.
 fn load_player_portrait(app: &tauri::AppHandle, id: &str) -> Option<String> {
     let dir = resolve_fable_players_dir(app);
-    let json_path = dir.join(id).join(format!("{id}.json"));
+    let safe = sanitize_player_slug(id);
+    let json_path = dir.join(&safe).join(format!("{safe}.json"));
     let player = load_player_at(&json_path)?;
     let fname = player.portrait?;
-    let abs = dir.join(id).join(&fname);
+    // The stored portrait filename is ours by construction (`portrait.png`/
+    // `portrait.jpg`), but a hand-edited JSON could carry a traversal path —
+    // refuse anything with separators or parent refs before joining.
+    if fname.contains('/') || fname.contains('\\') || fname.contains("..") {
+        return None;
+    }
+    let abs = dir.join(&safe).join(&fname);
     if abs.is_file() {
         Some(abs.to_string_lossy().into_owned())
     } else {
@@ -12851,12 +13511,15 @@ fn fable_players_list(app: tauri::AppHandle) -> Result<Vec<player::PlayerMeta>, 
 #[tauri::command]
 fn fable_player_get(id: String, app: tauri::AppHandle) -> Result<player::SavedPlayer, String> {
     let dir = resolve_fable_players_dir(&app);
-    let json_path = dir.join(&id).join(format!("{id}.json"));
+    // (2026-08-15 H3) both joins from the sanitized stem — the raw IPC id
+    // used to reach `dir.join(&id)` + `format!("{id}.json")` unsanitized.
+    let safe = sanitize_player_slug(&id);
+    let json_path = dir.join(&safe).join(format!("{safe}.json"));
     let mut player = load_player_at(&json_path)
         .ok_or_else(|| format!("no saved player with id '{id}'"))?;
     // Resolve the portrait filename to an absolute path via the shared
     // helper (same logic the chat portrait bridge uses).
-    player.portrait = load_player_portrait(&app, &id);
+    player.portrait = load_player_portrait(&app, &safe);
     Ok(player)
 }
 
@@ -12882,10 +13545,13 @@ fn fable_active_player_get(
         Some(id) => id,
     };
     let dir = resolve_fable_players_dir(&app);
-    let json_path = dir.join(&id).join(format!("{id}.json"));
+    // (2026-08-15 H3) sanitized joins — the id is server-fed here, but the
+    // discipline is shared with every other player IPC.
+    let safe = sanitize_player_slug(&id);
+    let json_path = dir.join(&safe).join(format!("{safe}.json"));
     let mut player = load_player_at(&json_path)
         .ok_or_else(|| format!("attached player '{id}' not found on disk"))?;
-    player.portrait = load_player_portrait(&app, &id);
+    player.portrait = load_player_portrait(&app, &safe);
     Ok(Some(player))
 }
 
@@ -12919,8 +13585,12 @@ fn fable_player_write(
     let json_path = player_dir.join(format!("{slug}.json"));
     // 3. If the slug changed (rename), move the existing folder so the
     //    portrait + JSON stay together. No-op when the slug is unchanged.
+    //    (2026-08-15 H3) the OLD dir comes from the sanitized stem — the
+    //    raw `id` used to reach `dir.join(&id)`, so a hostile id could
+    //    `fs::rename` an arbitrary directory INTO the players tree. A
+    //    hostile id now mangles to a nonexistent path → rename skipped.
     if slug != id {
-        let old_dir = dir.join(&id);
+        let old_dir = dir.join(sanitize_player_slug(&id));
         if old_dir.is_dir() && !player_dir.exists() {
             let _ = std::fs::rename(&old_dir, &player_dir);
         }
@@ -12969,7 +13639,10 @@ fn fable_player_portrait_upload(
     app: tauri::AppHandle,
 ) -> Result<String, String> {
     let dir = resolve_fable_players_dir(&app);
-    let player_dir = dir.join(&id);
+    // (2026-08-15 H3) sanitized stem for both the folder and the JSON name —
+    // the raw id used to write `portrait.png` into any traversed directory.
+    let safe = sanitize_player_slug(&id);
+    let player_dir = dir.join(&safe);
     if !player_dir.is_dir() {
         return Err(format!("no player folder for id '{id}'"));
     }
@@ -12983,7 +13656,7 @@ fn fable_player_portrait_upload(
     write_atomic(&dest, &bytes)
         .map_err(|e| format!("could not write portrait: {e}"))?;
     // 3. Update the JSON's portrait field so get/list reflect the truth.
-    let json_path = player_dir.join(format!("{id}.json"));
+    let json_path = player_dir.join(format!("{safe}.json"));
     if let Some(mut p) = load_player_at(&json_path) {
         p.portrait = Some(fname.clone());
         if let Ok(b) = serde_json::to_vec_pretty(&p) {
@@ -13016,7 +13689,10 @@ fn fable_player_portrait_upload_bytes(
     app: tauri::AppHandle,
 ) -> Result<String, String> {
     let dir = resolve_fable_players_dir(&app);
-    let player_dir = dir.join(&id);
+    // (2026-08-15 H3) sanitized stem for both the folder and the JSON name —
+    // mirrors the path-based upload's hardening.
+    let safe = sanitize_player_slug(&id);
+    let player_dir = dir.join(&safe);
     if !player_dir.is_dir() {
         return Err(format!("no player folder for id '{id}'"));
     }
@@ -13037,8 +13713,12 @@ fn fable_player_portrait_upload_bytes(
     let dest = player_dir.join(&fname);
     write_atomic(&dest, &bytes)
         .map_err(|e| format!("could not write portrait: {e}"))?;
+    // (#61 hygiene) Reap other-ext siblings here too: `p.portrait` below
+    // points at the new file, but a lingering other-ext copy is dead weight
+    // (and any ext-order scan would still see it).
+    reap_other_portrait_exts(&player_dir, &detected);
     // 2. Update the JSON's portrait field so get/list reflect the truth.
-    let json_path = player_dir.join(format!("{id}.json"));
+    let json_path = player_dir.join(format!("{safe}.json"));
     if let Some(mut p) = load_player_at(&json_path) {
         p.portrait = Some(fname.clone());
         if let Ok(b) = serde_json::to_vec_pretty(&p) {
@@ -13345,6 +14025,56 @@ fn resolve_session_path(cards_root: &std::path::Path, card_id: &str) -> std::pat
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Path-traversal regression tests (2026-08-15 audit H2/H3). The card
+    // filename half + every raw-id player join must stay under their roots.
+    // ─────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn resolve_card_file_sanitizes_both_segments() {
+        let root = std::path::Path::new("/wupi/apps/fable/cards");
+        // Hostile id: the DIRECTORY half was already cleaned, but the old
+        // filename half carried the raw id → `cards/x/../../x.sim` escaped
+        // the tree. Both segments now share one sanitized stem.
+        let p = resolve_card_file(root, "../../x", "sim");
+        assert!(p.starts_with(root), "card path must stay under the cards root: {p:?}");
+        assert_eq!(p, root.join("x").join("x.sim"));
+        // Drive prefixes + separators collapse the same way.
+        let p2 = resolve_card_file(root, "..\\..\\C:", "codex");
+        assert!(p2.starts_with(root), "card path must stay under the cards root: {p2:?}");
+        // Legit slugs (incl. Unicode) pass through untouched.
+        assert_eq!(
+            resolve_card_file(root, "my-card_2", "sim"),
+            root.join("my-card_2").join("my-card_2.sim")
+        );
+        assert_eq!(
+            resolve_card_file(root, "甲乙", "sim"),
+            root.join("甲乙").join("甲乙.sim")
+        );
+        // Fully-hostile id degrades to the unknown-card sentinel, still inside.
+        let p3 = resolve_card_file(root, "../../..", "sim");
+        assert!(p3.starts_with(root), "card path must stay under the cards root: {p3:?}");
+    }
+
+    #[test]
+    fn player_paths_stay_under_players_root() {
+        let dir = std::path::Path::new("/wupi/apps/fable/players");
+        // The read/rename/portrait IPCs join BOTH segments from the sanitized
+        // stem — `../..` used to reach `players/../../<id>.json` (arbitrary
+        // read) and the write path's rename branch could MOVE an arbitrary
+        // directory into the tree.
+        let safe = sanitize_player_slug("../..");
+        let json = dir.join(&safe).join(format!("{safe}.json"));
+        assert!(json.starts_with(dir), "player path must stay under the players root: {json:?}");
+        let old_dir = dir.join(sanitize_player_slug("../.."));
+        assert!(old_dir.starts_with(dir), "rename source must stay under the players root: {old_dir:?}");
+        // Legit slugs pass through; empty/hostile-only ids hit the sentinel.
+        assert_eq!(sanitize_player_slug("nyx"), "nyx");
+        assert_eq!(sanitize_player_slug("kael-the-bold"), "kael-the-bold");
+        assert_eq!(sanitize_player_slug(""), "__unknown_player__");
+        assert_eq!(sanitize_player_slug("---"), "__unknown_player__");
+    }
 
     #[test]
     fn effective_local_ctx_always_returns_with_api_constant() {
@@ -14422,6 +15152,29 @@ mod tests {
         assert_eq!(capped[0].content, long_user, "user messages are never capped");
     }
 
+    /// 2026-08-15 audit fix: a multibyte beat whose CHAR count is under the
+    /// cap but whose BYTE length exceeds it must NOT take the truncation
+    /// branch — the old byte gate appended the `[…]` marker without
+    /// truncating anything (a spurious ellipsis on CJK/accented prose).
+    #[test]
+    fn cap_assistant_prose_char_gate_not_byte_gate() {
+        // 100 CJK chars = 300 bytes: over a 100-BYTE threshold, under/at a
+        // 100-CHAR cap. Exactly at the cap boundary — use 90 chars (270
+        // bytes) to be strictly under the char cap.
+        let cjk: String = "刀".repeat(90);
+        let window = make_cap_window("act", &cjk);
+        let capped = cap_assistant_prose(window, 100);
+        assert_eq!(
+            capped[1].content, cjk,
+            "under the CHAR cap despite exceeding the byte length — no marker, no truncation"
+        );
+        // And just past the char cap it truncates cleanly at a char boundary.
+        let cjk2: String = "刀".repeat(120);
+        let capped2 = cap_assistant_prose(make_cap_window("act", &cjk2), 100);
+        assert!(capped2[1].content.ends_with(" […]\n"));
+        assert_eq!(capped2[1].content, format!("{} […]\n", "刀".repeat(100)));
+    }
+
 }
 
 // ===========================================================================
@@ -14502,6 +15255,7 @@ mod phase3_integration_tests {
                 AttackerTier::Minion,
                 0,
                 0,
+                0,
             ) {
                 if outcome.new_state == BodyPartState::Purple {
                     minion_purple += 1;
@@ -14517,6 +15271,7 @@ mod phase3_integration_tests {
                 &perturbed,
                 &state,
                 AttackerTier::Legendary,
+                0,
                 0,
                 0,
             ) {
@@ -14571,6 +15326,7 @@ mod phase3_integration_tests {
                 &text,
                 &state,
                 AttackerTier::Legendary,
+                0,
                 0,
                 0,
             ) else {
@@ -15465,6 +16221,7 @@ mod phase3_integration_tests {
                 &text,
                 &PlayerState::default(),
                 AttackerTier::Legendary,
+                0,
                 0,
                 0,
             ) {

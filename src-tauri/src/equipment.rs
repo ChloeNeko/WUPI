@@ -417,7 +417,11 @@ pub fn migrate_legacy_items(
     // bare-string values are legacy-convention states ("equipped", "3 in
     // pack"); a widened structured value at an `item_*`/`inv_*` key is
     // unrecognized noise — skip it (leave it in the entity map untouched).
-    let legacy: Vec<(String, String)> = entities
+    // Sorted by key (2026-08-15 audit fix): HashMap iteration order is
+    // random per process, and when two legacy items route to the same slot
+    // the winner (outer vs inner vs pack fallback) was decided by hash
+    // order — the same save could migrate differently every boot.
+    let mut legacy: Vec<(String, String)> = entities
         .keys()
         .filter(|k| k.starts_with("item_") || k.starts_with("inv_"))
         .cloned()
@@ -429,6 +433,7 @@ pub fn migrate_legacy_items(
                 .and_then(|v| v.as_str().map(|s| (k, s.to_string())))
         })
         .collect();
+    legacy.sort_by(|a, b| a.0.cmp(&b.0));
 
     for (raw_key, state_raw) in legacy {
         // Strip the prefix → the item slug. Title-case it into a display name.
@@ -700,6 +705,46 @@ mod tests {
         migrate_legacy_items(&mut entities, &mut equipment, &mut pack);
         assert_eq!(equipment, equipment_before, "idempotent — no change on second run");
         assert_eq!(pack, pack_before);
+    }
+
+    /// 2026-08-15 audit fix: two legacy items contending for the SAME slot
+    /// migrate deterministically (sorted by key) — HashMap iteration order
+    /// used to decide outer-vs-inner-vs-pack at random per boot.
+    #[test]
+    fn migrate_legacy_items_slot_contention_is_deterministic() {
+        let build = || {
+            let mut entities: HashMap<String, serde_json::Value> = HashMap::new();
+            // Both route to chest ("armor"/"vest" keywords): alphabetically
+            // "item_iron_vest" < "item_leather_armor", so the vest takes
+            // Outer deterministically.
+            entities.insert(
+                "item_iron_vest".into(),
+                serde_json::Value::String("equipped".into()),
+            );
+            entities.insert(
+                "item_leather_armor".into(),
+                serde_json::Value::String("equipped".into()),
+            );
+            let mut equipment = Equipment::new();
+            let mut pack = Vec::new();
+            migrate_legacy_items(&mut entities, &mut equipment, &mut pack);
+            (equipment, pack)
+        };
+        // The SAME outcome on every run (the old HashMap order flipped it).
+        for _ in 0..8 {
+            let (equipment, pack) = build();
+            let chest = equipment.get(&EquipSlot::Chest).expect("chest populated");
+            assert_eq!(
+                chest.outer.as_ref().expect("outer filled").name,
+                "Iron Vest",
+                "alphabetically-first key wins the Outer layer deterministically"
+            );
+            assert_eq!(
+                chest.inner.as_ref().expect("inner filled").name,
+                "Leather Armor"
+            );
+            assert!(pack.is_empty(), "both layers absorbed the contention");
+        }
     }
 
     #[test]

@@ -152,8 +152,10 @@ impl Default for FusionWeights {
 ///
 /// - `sparse`: `(id, bm25_raw)` best-first. Lower (more-negative) BM25 is a
 ///   better match. UNFLOORED: see module docs for why.
-/// - `dense`: `(id, distance)` best-first. Lower distance is better;
-///   cosine = `1 - distance`. Floored on `dense_cosine_floor`.
+/// - `dense`: `(id, distance)` best-first. Lower distance is better. The
+///   vec0 metric is L2 on unit-normalized vectors; cosine is recovered at
+///   this single conversion point as `cos = 1 − d²/2` (exact for unit
+///   vectors). Floored on `dense_cosine_floor`.
 /// - `dense_cosine_floor`: drop dense candidates whose cosine < floor.
 /// - `weights`: per-list RRF weights ([`FusionWeights::default`] = equal).
 /// - `limit`: truncate the fused output to this many entries.
@@ -186,7 +188,9 @@ pub fn fuse_scored_rrf(
     weights: FusionWeights,
     limit: usize,
 ) -> Vec<RankedMemory> {
-    // distance = 1 - cosine  →  cosine = 1 - distance. Keep cosine >= floor.
+    // vec0 distance is L2 on unit vectors → cosine = 1 − d²/2 (the single
+    // conversion point; L2 is monotone in cosine for unit vectors, so the
+    // pre-conversion RANK order was always correct). Keep cosine >= floor.
     // The rejected candidates never enter the fusion map, so they contribute
     // nothing to any id's score. This is the cross-topic rejection gate.
     //
@@ -278,6 +282,7 @@ pub fn fuse_scored_rrf(
                 card_id: String::new(),
                 session_id: None,
                 parent_uuid: None,
+                turn_uuid: None,
             },
             score: a.score,
             debug: DebugScores {

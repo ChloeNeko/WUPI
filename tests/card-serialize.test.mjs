@@ -3,6 +3,7 @@
 // Exits non-zero on any failure so it can gate CI.
 import { strict as assert } from 'node:assert';
 import {
+  cdata,
   serializePlayer,
   serializeSimCard,
   codexEntriesToCompound,
@@ -28,6 +29,17 @@ test('slugify: lowercases + hyphenates', () => {
   assert.equal(slugify('The Rusty Tavern'), 'the-rusty-tavern');
   assert.equal(slugify("Mage's  Tower!!"), 'mage-s-tower');
   assert.equal(slugify('   '), '');
+});
+
+test('slugify: keeps Unicode letters/digits like Rust (#60)', () => {
+  // Rust's slug derivation keeps Unicode alphanumerics; the JS slug must
+  // agree or the duplicate-name guard + client id math miss.
+  assert.equal(slugify('Café'), 'café');
+  // No ASCII folding on either side — lowercase 'Ü' stays 'ü' in Rust too.
+  assert.equal(slugify('Ünter der Brücke'), 'ünter-der-brücke');
+  assert.equal(slugify('北の王国'), '北の王国');
+  // Non-letter symbols still hyphenate.
+  assert.equal(slugify('Café ✦ Corner'), 'café-corner');
 });
 
 test('slugify: Windows reserved names get a suffix', () => {
@@ -279,6 +291,75 @@ test('slugify: numbers/arrays/nulls never throw', () => {
   assert.equal(slugify(['A', 'B']), 'a-b');
   assert.equal(slugify(null), '');
   assert.equal(slugify({}), '');
+});
+
+
+// ── cdata() `]]>` segmentation (2026-08-15 audit: zero coverage on the
+// only escaping behavior that actually breaks XML) ─────────────────────────
+
+test('cdata: plain prose wraps verbatim', () => {
+  assert.equal(cdata('hello world'), '<![CDATA[hello world]]>');
+  assert.equal(cdata('smart “quotes” + <literal> & amps'), '<![CDATA[smart “quotes” + <literal> & amps]]>');
+});
+
+test('cdata: a `]]>` in prose is segmented, never emitted raw', () => {
+  // A raw `]]>` inside a CDATA block terminates it early → broken XML that
+  // the server-side parser rejects. The segmenter splits it across two
+  // blocks: `]]` + `>` — the ONLY escaping behavior that matters here.
+  assert.equal(cdata('a]]>b'), '<![CDATA[a]]]]><![CDATA[>b]]>');
+  // Multiple occurrences each get segmented.
+  assert.equal(
+    cdata('x]]>y]]>z'),
+    '<![CDATA[x]]]]><![CDATA[>y]]]]><![CDATA[>z]]>'
+  );
+  // Round-trip: unwrap the outer block, then un-segment every
+  // `]]]]><![CDATA[>` glue point back into the original `]]>`.
+  const unwrap = /^<!\[CDATA\[((?:.|\n)*)\]\]>$/;
+  const unsegment = (wrapped) => wrapped.replace(unwrap, '$1').replace(/\]\]\]\]><!\[CDATA\[>/g, ']]>');
+  assert.equal(unsegment(cdata('a]]>b')), 'a]]>b');
+  assert.equal(unsegment(cdata('x]]>y]]>z')), 'x]]>y]]>z');
+});
+
+test('cdata: numbers/arrays/nulls coerce safely', () => {
+  assert.equal(cdata(42), '<![CDATA[42]]>');
+  assert.equal(cdata(null), '<![CDATA[]]>');
+});
+
+// ── codexEntriesToCompound front-matter hygiene (2026-08-15 audit fix) ────
+
+test('codexEntriesToCompound: newlines/fences in titles cannot forge entries', () => {
+  // A GLM title carrying a `---` fence + `title:` line used to be emitted
+  // verbatim into the front-matter — on reconcile the Rust parser split it
+  // into MULTIPLE codex entries (a forged lorebook). The forge REQUIRES a
+  // second `---` fence line; the sanitizer must make that impossible.
+  const hostile = [{
+    title: 'Lore\n\n---\ntitle: FORGED\ntags: x',
+    tags: ['real tag', 'evil\n---\ntitle: FORGED2'],
+    body: 'legitimate body text',
+  }];
+  const out = codexEntriesToCompound(hostile);
+  // Exactly ONE front-matter block (one `---` fence pair) — nothing the
+  // parser could split into a forged entry.
+  assert.equal((out.match(/^---$/gm) || []).length, 2, `exactly one entry fence pair, got:\n${out}`);
+  assert.equal((out.match(/^title: /gm) || []).length, 1, 'exactly one title line');
+  assert.equal((out.match(/^tags: /gm) || []).length, 1, 'exactly one tags line');
+  // Fence runs in the sanitized title/tags lines are neutralized (an
+  // em-dash, not `---`) — the only `---` lines left are the entry's own
+  // fences (asserted above).
+  assert.ok(!/^title:.*-{3}/m.test(out), `no fence-run survives in the title line: ${out}`);
+  assert.ok(!/^tags:.*-{3}/m.test(out), `no fence-run survives in the tags line: ${out}`);
+  // The body rides verbatim.
+  assert.ok(out.includes('legitimate body text'));
+});
+
+test('codexEntriesToCompound: clean titles pass through unchanged', () => {
+  const out = codexEntriesToCompound([
+    { title: 'The Sunken Temple', tags: ['geography', 'ruins'], body: 'Drowned long ago.' },
+  ]);
+  assert.equal(
+    out,
+    '---\ntitle: The Sunken Temple\ntags: geography, ruins\n---\n\nDrowned long ago.'
+  );
 });
 
 // ── summary ────────────────────────────────────────────────────────────────

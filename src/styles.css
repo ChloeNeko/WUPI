@@ -607,6 +607,53 @@ body:not(.booting) .top-bar {
     animation: update-spin 1s linear infinite;
 }
 
+/* Wi-Fi inline password row: appended to the dropdown when joining a secure
+   network (native prompt() is disabled in the Tauri WebView — it returned
+   null + the connect silently sent no password). Enter joins, Esc/✕ dismisses. */
+.wifi-pass-row {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 6px 10px;
+}
+.wifi-pass-row input {
+    flex: 1;
+    min-width: 0;
+    background: rgba(0, 0, 0, 0.35);
+    border: 1px solid rgba(255, 255, 255, 0.18);
+    border-radius: 6px;
+    color: #ffffff;
+    font-family: inherit;
+    font-size: 12.5px;
+    padding: 5px 8px;
+    outline: none;
+}
+.wifi-pass-row input:focus {
+    border-color: color-mix(in srgb, var(--ui-accent-bright) 70%, transparent);
+    box-shadow: 0 0 8px color-mix(in srgb, var(--ui-accent) 30%, transparent);
+}
+.wifi-pass-go {
+    background: linear-gradient(135deg, var(--ui-accent-bright) 0%, var(--ui-accent) 100%);
+    color: #ffffff;
+    border: none;
+    border-radius: 6px;
+    font-family: inherit;
+    font-size: 12px;
+    font-weight: 600;
+    padding: 5px 10px;
+    cursor: pointer;
+    white-space: nowrap;
+}
+.wifi-pass-x {
+    background: none;
+    border: none;
+    color: rgba(255, 255, 255, 0.55);
+    cursor: pointer;
+    font-size: 12px;
+    padding: 4px;
+}
+.wifi-pass-x:hover { color: #ffffff; }
+
 .digital-time {
     font-variant-numeric: tabular-nums;
     font-size: 16px;
@@ -1223,6 +1270,14 @@ input[type="password"]::-webkit-credentials-auto-fill-button {
 .ai-tool-btn.del { color: #ff6b6b; }
 .ai-tool-btn.del:hover:not(:disabled) {
     background: rgba(255, 77, 77, 0.2);
+    transform: scale(1.18);
+}
+/* Armed state for the two-click inline delete confirm (native confirm() is
+   disabled in the Tauri WebView). Red glow until the second click or the
+   5s disarm timeout. */
+.ai-tool-btn.del[data-armed="1"] {
+    background: rgba(255, 77, 77, 0.3);
+    box-shadow: 0 0 10px rgba(255, 77, 77, 0.55);
     transform: scale(1.18);
 }
 

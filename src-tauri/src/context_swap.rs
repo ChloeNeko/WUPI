@@ -300,24 +300,15 @@ impl ContextSwap {
     /// load-bearing optimization: back-to-back same-role turns reuse the
     /// resident engine without re-spawn churn.
     fn release(&self) {
-        // We deliberately do NOT clear `teardown` here: a subsequent
-        // cross-role acquire still needs to evict the (now-orphaned)
-        // resident context. We only flip the "actively held" bit, which
-        // we represent by setting role to a sentinel that no real acquire
-        // matches... but actually: we WANT the next same-role acquire to
-        // REUSE the still-resident engine. So we leave `role` AND
-        // `teardown` intact. The guard's only job is to allow a different
-        // role's acquire to proceed (it would have blocked on the mutex
-        // anyway — tokio::sync::Mutex is fair + exclusive, so the guard's
-        // drop just releases the mutex lock the caller... wait, no: the
-        // mutex is only held briefly inside acquire, not across the turn).
+        // Semantics (condensed from the original design deliberation):
         //
-        // CORRECTION: the mutex is NOT held across the turn (we release it
-        // before returning the guard). So `release` currently does nothing
-        // observable. The lease is "released" simply by the next acquire
-        // being able to run. We keep the method + the `released` flag purely
-        // as defensive bookkeeping (double-drop protection) + a hook for
-        // future telemetry (e.g. log turn duration when the guard drops).
+        // The internal mutex is held only briefly inside `acquire`, never
+        // across a turn — so the lease ends simply because the next acquire
+        // can run. `release` does nothing observable: it deliberately leaves
+        // `role` AND `teardown` intact so (a) a same-role back-to-back
+        // acquire REUSES the still-resident engine (the load-bearing
+        // optimization above) and (b) a cross-role acquire still finds the
+        // resident context to evict via teardown.
         //
         // This is correct because the SERIALIZATION that matters happens
         // at the engine level (each engine's Mutex<Option<Arc<Engine>>>

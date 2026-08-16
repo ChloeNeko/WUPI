@@ -611,11 +611,22 @@ fn parse(xml: &str) -> anyhow::Result<SimCard> {
                 | crate::memory::CODEX_CARD_ID
         )
     };
+    // A metadata id that normalizes onto a memory sentinel is ignored: a card
+    // must never share a partition key with __wupi__/__codex__ etc. The
+    // filter applies to the FINAL resolved value (2026-08-15 audit fix): the
+    // name-derived fallback branch previously bypassed it, so a card whose
+    // <name> is literally "__wupi__" parsed to the sentinel id and seeded
+    // its episodic memories + codex into the chat partition — the exact
+    // cross-partition contamination the sentinel check exists to prevent.
+    // A sentinel result there falls to the "unknown" placeholder (the write
+    // path's duplicate guard surfaces the collision long before a folder is
+    // ever derived from it).
     let id = nested_text(root, "metadata", "id")
         .as_deref()
         .and_then(crate::slugify_card_stem)
         .filter(|v| !is_sentinel(v))
         .or_else(|| crate::slugify_card_stem(&name))
+        .filter(|v| !is_sentinel(v))
         .unwrap_or_else(|| "unknown".to_owned());
     let card_type = nested_text(root, "metadata", "type").unwrap_or_else(|| "system".to_owned());
     let subtype = nested_text(root, "metadata", "subtype").filter(|s| !s.is_empty());
@@ -1262,6 +1273,46 @@ Booted up, nya~!
         assert_eq!(card.name, "Wupi");
         assert_eq!(card.id, "wupi");
         assert_eq!(card.card_type, "system");
+    }
+
+    /// 2026-08-15 audit fix: a card whose NAME slugifies onto a memory
+    /// sentinel must NOT parse to that sentinel id — its episodic memories +
+    /// codex seed would land in the `__wupi__` chat partition (the
+    /// cross-partition firewall, violated). slugify_card_stem preserves `_`,
+    /// so the name-derived fallback branch was the unguarded hole; it now
+    /// falls to the "unknown" placeholder instead.
+    #[test]
+    fn parse_rejects_sentinel_id_from_name_branch() {
+        let sentinel_named = r#"<sim_card>
+  <metadata><type>roleplay</type></metadata>
+  <identity>
+    <name>__wupi__</name>
+    <persona>An impostor card.</persona>
+  </identity>
+</sim_card>"#;
+        let card = parse(sentinel_named).expect("sentinel-named card still parses");
+        assert_eq!(card.name, "__wupi__");
+        assert_ne!(
+            card.id,
+            crate::memory::WUPI_CARD_ID,
+            "a card must never share a partition key with the chat sentinel"
+        );
+        assert_eq!(card.id, "unknown");
+
+        // Same hole for the OTHER sentinels via the metadata branch
+        // (already guarded) AND the name branch (the fix):
+        for sentinel in [
+            crate::memory::WUPI_CARD_ID,
+            crate::memory::WUPI_SYSTEM_CARD_ID,
+            crate::memory::FABLE_SYSTEM_CARD_ID,
+            crate::memory::CODEX_CARD_ID,
+        ] {
+            let xml = format!(
+                "<sim_card><identity><name>{sentinel}</name><persona>x</persona></identity></sim_card>"
+            );
+            let card = parse(&xml).expect("parses");
+            assert_ne!(card.id, sentinel, "name branch must not mint a sentinel id");
+        }
     }
 
     /// A roleplay scenario card (Games app Seam 1). Same strict-XML + CDATA

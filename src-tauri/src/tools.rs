@@ -598,7 +598,13 @@ fn req_str_nonempty(args: &serde_json::Value, key: &str) -> Result<String, ToolE
 /// + `-`/`_`, leading/trailing dashes trimmed). Returns None if the result is
 /// empty. Inlined from the removed `codex` module so the card/asset tools that
 /// depend on it keep working without the codex (lore RAG) feature.
-fn sanitize_stem(filename: &str) -> Option<String> {
+///
+/// Pub because lib.rs's agent-loop dispatch re-derives the SAME stem after a
+/// successful `delete_sim_card` call to purge the card's memory partition
+/// (§4 retention): the partition key must equal the folder stem the tool just
+/// deleted, so both sides must run through this one sanitizer — a second
+/// derivation path could drift and silently miss the partition.
+pub fn sanitize_stem(filename: &str) -> Option<String> {
     let stem: String = filename
         .trim()
         .to_lowercase()

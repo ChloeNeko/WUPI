@@ -280,12 +280,17 @@ const CUSTOM_TAG_VALUE_MAX: usize = 500;
 ///     sniff does not do. Newlines (\x0A) + tabs (\x09) are allowed
 ///     (legitimate prose formatting); the C1 range (\x80-\x9F) is left
 ///     to the serializer (rare in practice, not a structuring risk).
+///
+/// All length caps count CHARS, not bytes (2026-08-15 audit fix): the byte
+/// checks capped CJK/accented names at ~⅓ the advertised count while the
+/// error strings said "characters". `chars().count()` makes the errors
+/// honest and the caps script-neutral.
 pub fn validate_player(p: &SavedPlayer) -> Result<(), String> {
     let name = p.name.trim();
     if name.is_empty() {
         return Err("Name is required.".into());
     }
-    if name.len() > NAME_MAX {
+    if name.chars().count() > NAME_MAX {
         return Err(format!("Name must be {} characters or fewer.", NAME_MAX));
     }
     if has_control_chars(&p.name) {
@@ -300,7 +305,7 @@ pub fn validate_player(p: &SavedPlayer) -> Result<(), String> {
     ] {
         if let Some(s) = val {
             let s = s.trim();
-            if s.len() > PROSE_MAX {
+            if s.chars().count() > PROSE_MAX {
                 return Err(format!("{} must be {} characters or fewer.", label, PROSE_MAX));
             }
             if has_control_chars(s) {
@@ -317,7 +322,7 @@ pub fn validate_player(p: &SavedPlayer) -> Result<(), String> {
             if s.is_empty() {
                 return Err(format!("{} cannot be empty.", label));
             }
-            if s.len() > TRAIT_MAX {
+            if s.chars().count() > TRAIT_MAX {
                 return Err(format!("{} must be {} characters or fewer.", label, TRAIT_MAX));
             }
             if has_control_chars(s) {
@@ -339,14 +344,14 @@ pub fn validate_player(p: &SavedPlayer) -> Result<(), String> {
             if kt.is_empty() {
                 return Err("Custom tag keys cannot be empty.".into());
             }
-            if kt.len() > CUSTOM_TAG_KEY_MAX {
+            if kt.chars().count() > CUSTOM_TAG_KEY_MAX {
                 return Err(format!("Custom tag keys must be {} characters or fewer.", CUSTOM_TAG_KEY_MAX));
             }
             if has_control_chars(kt) {
                 return Err("A custom tag key contains invalid control characters.".into());
             }
             let vt = v.trim();
-            if vt.len() > CUSTOM_TAG_VALUE_MAX {
+            if vt.chars().count() > CUSTOM_TAG_VALUE_MAX {
                 return Err(format!("Custom tag values must be {} characters or fewer.", CUSTOM_TAG_VALUE_MAX));
             }
             if has_control_chars(vt) {
@@ -367,7 +372,7 @@ fn validate_chip_list(label: &str, items: &Option<Vec<String>>) -> Result<(), St
             if c.is_empty() {
                 return Err(format!("{} entries cannot be empty.", label));
             }
-            if c.len() > TRAIT_MAX {
+            if c.chars().count() > TRAIT_MAX {
                 return Err(format!("Each {} entry must be {} characters or fewer.", label, TRAIT_MAX));
             }
             if has_control_chars(c) {
@@ -602,6 +607,24 @@ mod tests {
         tags.insert("   ".into(), "200 gold".into());
         bad.custom_tags = Some(tags);
         assert!(validate_player(&bad).is_err());
+    }
+
+    /// 2026-08-15 audit fix: the caps count CHARS — a 64-char CJK name is
+    /// 192 bytes and the old byte gate rejected it at ~⅓ the advertised
+    /// count while the error said "characters".
+    #[test]
+    fn validate_caps_count_chars_not_bytes() {
+        // 60 CJK chars = 180 bytes: over any byte-style NAME_MAX read,
+        // comfortably under the 64-char cap.
+        let cjk_name: String = "刀".repeat(60);
+        let ok = p(&cjk_name);
+        assert!(validate_player(&ok).is_ok(), "60 chars / 180 bytes must pass the 64-char cap");
+
+        // 65 CJK chars = 195 bytes: over the CHAR cap by 5.
+        let long_name: String = "刀".repeat(65);
+        let bad = p(&long_name);
+        let err = validate_player(&bad).unwrap_err();
+        assert!(err.contains("64 characters"), "error names the char cap: {err}");
     }
 
     #[test]

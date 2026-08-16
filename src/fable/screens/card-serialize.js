@@ -362,8 +362,13 @@ const WINDOWS_RESERVED = new Set([
 ]);
 
 export function slugify(s) {
+  // Unicode-aware (#60): Rust's slug derivation keeps Unicode alphanumerics,
+  // so the JS slug must too — "Café" → "café" on BOTH sides. An ASCII-only
+  // JS slug ("caf") made the client-side duplicate-name guard + id math
+  // miss what the server would actually derive. `\p{L}\p{N}` with the /u
+  // flag covers a-z0-9 plus all Unicode letters/digits.
   const slug = text(s).trim().toLowerCase()
-    .replace(/[^a-z0-9_-]+/g, '-').replace(/^-+|-+$/g, '');
+    .replace(/[^\p{L}\p{N}_-]+/gu, '-').replace(/^-+|-+$/g, '');
   // A card named "Nul" or "Com1" must not slug onto a reserved name —
   // append a suffix so the folder create succeeds (the slug stays unique
   // per name; "nul" and "nul-card" can't collide).
@@ -377,6 +382,17 @@ export function slugify(s) {
 // on CREATE (written via fable_codex_raw_set after the card folder exists).
 export function codexEntriesToCompound(entries) {
   if (!Array.isArray(entries) || !entries.length) return '';
+  // Front-matter hygiene (2026-08-15 audit fix): titles + tags are emitted
+  // into `title:`/`tags:` lines, and the Rust parser splits entries on a
+  // blank-line-preceded `---` fence — a GLM title containing newlines +
+  // `---\ntitle:` would FORGE extra codex entries on reconcile. Collapse
+  // titles/tags to single-line text + neutralize `---`-fence runs (bodies
+  // stay verbatim — the parser owns body splitting).
+  const fmInline = (s) => text(s)
+    .replace(/[\r\n]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .replace(/-{3,}/g, '—')
+    .trim();
   // Normalize + drop entries with no body (an empty body would emit a junk
   // front-matter-only block the codex parser reads as an empty entry).
   const clean = entries.map((e) => {
@@ -385,8 +401,8 @@ export function codexEntriesToCompound(entries) {
       ? src.tags
       : (typeof src.tags === 'string' && src.tags.trim() ? [src.tags] : []);
     return {
-      title: text(src.title).trim() || 'untitled',
-      tags: rawTags.map((t) => text(t).trim()).filter(Boolean),
+      title: fmInline(src.title) || 'untitled',
+      tags: rawTags.map((t) => fmInline(t)).filter(Boolean),
       body: text(src.body).trim(),
     };
   }).filter((e) => e.body);

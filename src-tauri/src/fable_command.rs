@@ -71,7 +71,7 @@ pub fn classify(text: &str) -> FableCommand {
     let mutation_starters = [
         "make it ", "make the ", "make ",
         "set ", "change ", "turn ", "switch ",
-        "give me ", "give alex ", "add ",
+        "give me ", "add ",
         "remove ", "delete ", "drop ",
         "teleport ", "travel to ", "fast-travel to ", "fast travel to ",
         "spawn ",

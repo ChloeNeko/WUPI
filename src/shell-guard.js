@@ -92,15 +92,21 @@ export function withShellBusy(task) {
   return ret;
 }
 
-// ── The global capture-phase click/pointerdown guard ────────────────
+// ── The global capture-phase click/pointerdown/keydown guard ─────────
 // One listener at document, capture phase, swallows click + pointerdown
 // while a shell transition is in flight (shellBusy). Self-registers on
 // module load — `script.js` is loaded as type="module", so the DOM is
 // already parsed by the time this runs and the listener is armed before
 // any per-button handler can fire. Calling `initShellGuard()` is also
 // exported for explicitness, but importing the module is sufficient.
+//
+// (#63) keydown is covered too: Esc (close topmost window) + Enter (send
+// chat) fired while `shellBusy` — the click/pointerdown arms couldn't see
+// keyboard activation, so Esc could dismiss the home grid mid-Fable-fog
+// and Enter could double-send. Same capture + swallow discipline; the
+// 12s safety timeout bounds any swallowed-key window.
 export function initShellGuard() {
-  ['click', 'pointerdown'].forEach((evt) => {
+  ['click', 'pointerdown', 'keydown'].forEach((evt) => {
     document.addEventListener(evt, (e) => {
       if (!shellBusy) return;
       e.stopImmediatePropagation();

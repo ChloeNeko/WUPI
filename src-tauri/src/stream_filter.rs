@@ -710,15 +710,20 @@ const STREAM_TAIL_MAX_WORDS: usize = 200;
 /// Stateful tail-buffer that detects mechanical repetition mid-stream.
 ///
 /// Construct one per API turn; call `push(chunk)` for each text delta the
-/// SSE loop forwards; on `Some(truncated)`, the caller MUST abort the HTTP
-/// connection and treat `truncated` as the finalized prose for the turn.
+/// SSE loop forwards; on `true`, the caller MUST abort the HTTP connection
+/// and finalize the turn by running [`truncate_repetition`] on the FULL
+/// accumulated turn content — NOT on anything the detector exposes. The
+/// rolling buffer only holds the trailing [`STREAM_TAIL_MAX_WORDS`] words
+/// (the 2026-08-15 audit fix: finalizing from the tail buffer silently
+/// dropped pre-tail prose — a 350-word beat that looped at the end
+/// finalized as its last 200 words).
 ///
 /// Internal invariant: after each `push`, `buffer_words` holds ≤
 /// STREAM_TAIL_MAX_WORDS trailing words of the stream so far, and
 /// `buffer_text` is the whitespace-joined reconstruction of those words
 /// (we don't preserve original whitespace because the post-kill output is
-/// re-rendered anyway — the post-gen truncator handles the
-/// whitespace-preserving slice for finalized prose).
+/// re-derived from the full content by the caller — the post-gen
+/// truncator's slice is the single source of truth for finalized prose).
 pub(crate) struct StreamRepetitionDetector {
     buffer_text: String,
     // Number of whole words currently held. Maintained alongside buffer_text
@@ -735,19 +740,20 @@ impl StreamRepetitionDetector {
     }
 
     /// Append a streamed chunk and run the shared detector. Returns:
-    ///   * `Some(clean)` — a mechanical loop was confirmed. The caller breaks
-    ///     the HTTP stream, drops the response (severing TCP), and finalizes
-    ///     the turn with `clean` as the prose. `clean` contains the first
-    ///     occurrence of the looped phrase + all preceding prose, trimmed.
-    ///   * `None` — no loop yet; keep streaming.
+    ///   * `true` — a mechanical loop was confirmed. The caller breaks the
+    ///     HTTP stream, drops the response (severing TCP), and finalizes
+    ///     the turn's prose by running `truncate_repetition` on the full
+    ///     accumulated content (see the struct doc for why the detector's
+    ///     own buffer must never be the finalized prose).
+    ///   * `false` — no loop yet; keep streaming.
     ///
     /// After a hit, the internal buffer is reset to the truncated text, so
     /// any chunks that arrive between the hit and the loop break (a race
     /// that shouldn't happen given the immediate break, but defended) won't
-    /// double-fire or extend the truncated prose.
-    pub(crate) fn push(&mut self, chunk: &str) -> Option<String> {
+    /// double-fire.
+    pub(crate) fn push(&mut self, chunk: &str) -> bool {
         if chunk.is_empty() {
-            return None;
+            return false;
         }
         self.buffer_text.push_str(chunk);
         // Tokenize once — this is the only O(n) pass on the buffer per
@@ -769,26 +775,27 @@ impl StreamRepetitionDetector {
         }
 
         if self.word_count < MIN_WINDOW_WORDS * MIN_REPEATS {
-            return None;
+            return false;
         }
         let words: Vec<&str> = spans
             .iter()
             .map(|(st, en)| &self.buffer_text[*st..*en])
             .collect();
         if detect_repetition_offset(&self.buffer_text, &spans, &words).is_some() {
-            // Hit. Use `truncate_repetition` so the post-kill prose is
-            // byte-identical to what the post-gen firewall would have
-            // produced (single visible contract, single slice path).
+            // Hit. Run `truncate_repetition` over the tail buffer purely as
+            // the no-false-positive gate + the post-hit buffer reset — the
+            // finalized prose is re-derived from the FULL content by the
+            // caller (single visible contract, single slice path).
             let clean = truncate_repetition(&self.buffer_text);
             // Defensive: if (impossibly) the primitive fired but the wrapper
             // returned the input unchanged, treat as no-hit so we never
-            // finalize a turn with a loop still in the prose.
+            // abort a stream without a real truncation behind it.
             if clean.len() < self.buffer_text.len() {
-                self.buffer_text = clean.clone();
-                return Some(clean);
+                self.buffer_text = clean;
+                return true;
             }
         }
-        None
+        false
     }
 }
 
@@ -1671,22 +1678,17 @@ mod tests {
     #[test]
     fn stream_detector_fires_on_complete_loop_in_one_chunk() {
         // Baseline: the whole loop arrives in one chunk. Same input as the
-        // post-gen truncator's canonical case. Must fire + return the same
-        // truncated prose as truncate_repetition would.
+        // post-gen truncator's canonical case. Must fire; the finalized
+        // prose is the CALLER's job (truncate_repetition on full content —
+        // the llm.rs integration test pins that end-to-end), so here we pin
+        // the fire + the shared primitive's output on the same input.
         let loop_text = "The smuggler turns and runs away. The smuggler turns and runs away. The smuggler turns and runs away.";
         let mut d = StreamRepetitionDetector::new();
-        let hit = d.push(loop_text);
-        assert!(hit.is_some(), "detector must fire on a 3-repeat loop");
-        let clean = hit.unwrap();
+        assert!(d.push(loop_text), "detector must fire on a 3-repeat loop");
         assert_eq!(
-            clean, "The smuggler turns and runs away.",
-            "stream detector must produce byte-identical output to post-gen truncator, got: {:?}",
-            clean
-        );
-        assert_eq!(
-            clean,
             truncate_repetition(loop_text),
-            "stream + post-gen paths must agree (single source of truth)"
+            "The smuggler turns and runs away.",
+            "the shared primitive the caller finalizes with must cut to one instance"
         );
     }
 
@@ -1695,8 +1697,8 @@ mod tests {
         // THE core test. A 3-repeat smuggler loop is split into many tiny
         // chunks (1-3 chars), some of which cut mid-word ("smu" + "ggler").
         // The detector MUST fire on exactly the tick where the 3rd
-        // occurrence completes — and the truncated prose must match the
-        // post-gen truncator's output on the same full text.
+        // occurrence completes — the finalized prose parity is the caller's
+        // truncate_repetition on the same full text.
         let full = "The smuggler turns and runs. The smuggler turns and runs. The smuggler turns and runs.";
         let chars: Vec<&str> = full.split_inclusive(|c: char| matches!(c, ' ' | '.')).collect();
         // split_inclusive keeps the delimiter; assert we actually have
@@ -1708,32 +1710,26 @@ mod tests {
         );
 
         let mut d = StreamRepetitionDetector::new();
-        let mut last_hit: Option<String> = None;
-        let mut ticks_before_hit = 0;
+        let mut fired_at: Option<usize> = None;
         for (i, chunk) in chars.iter().enumerate() {
-            if let Some(clean) = d.push(chunk) {
-                last_hit = Some(clean);
-                ticks_before_hit = i + 1;
+            if d.push(chunk) {
+                fired_at = Some(i + 1);
                 break;
             }
         }
-        let clean = last_hit.expect("detector must eventually fire on the chunked loop");
         // Fired on the LAST chunk (when the 3rd occurrence completes), not
-        // earlier. Indexing from 1 because ticks_before_hit = i+1.
+        // earlier. Indexing from 1 because fired_at = i+1.
         assert_eq!(
-            ticks_before_hit, chars.len(),
+            fired_at.expect("detector must eventually fire on the chunked loop"),
+            chars.len(),
             "must fire on the last chunk (3rd occurrence completion), not earlier"
         );
-        // Byte-identical to the post-gen path on the same input.
+        // Byte-identical to the post-gen path on the same input (what the
+        // caller produces from the full content).
         assert_eq!(
-            clean,
             truncate_repetition(full),
-            "chunked detection must produce the same truncated prose as post-gen"
-        );
-        assert_eq!(
-            clean, "The smuggler turns and runs.",
-            "truncated prose is one clean instance of the phrase, got: {:?}",
-            clean
+            "The smuggler turns and runs.",
+            "chunked detection must agree with post-gen truncation on the same input"
         );
     }
 
@@ -1753,20 +1749,24 @@ mod tests {
         // every push, so it should fire ON p3b (the moment the 3rd
         // occurrence's last word completes the window).
         let mut d = StreamRepetitionDetector::new();
-        assert!(d.push(p1).is_none(), "no fire after 1 occurrence");
-        assert!(d.push(p2).is_none(), "no fire after 2 occurrences (anaphora)");
-        assert!(d.push(p3a).is_none(), "no fire mid-word on the 3rd occurrence");
-        let hit = d.push(p3b).expect("must fire the instant the 3rd occurrence completes");
-        // The rolling buffer joined the chunks with no extra whitespace
-        // (we pushed whitespace-bearing chunks), so the result matches the
-        // post-gen path on the equivalent contiguous string.
-        let equiv = "The smuggler turns and The smuggler turns and The smuggler turns and ";
-        assert_eq!(hit, truncate_repetition(equiv));
-        // And that result is exactly one instance of the phrase.
+        assert!(!d.push(p1), "no fire after 1 occurrence");
+        assert!(!d.push(p2), "no fire after 2 occurrences (anaphora)");
+        assert!(!d.push(p3a), "no fire mid-word on the 3rd occurrence");
         assert!(
-            hit.matches("The smuggler turns and").count() == 1,
-            "truncated prose should contain exactly one instance of the phrase, got: {:?}",
-            hit
+            d.push(p3b),
+            "must fire the instant the 3rd occurrence completes"
+        );
+        // The rolling buffer joined the chunks with no extra whitespace
+        // (we pushed whitespace-bearing chunks), so the caller's
+        // finalization on the equivalent contiguous string cuts to one
+        // instance of the phrase.
+        let equiv = "The smuggler turns and The smuggler turns and The smuggler turns and ";
+        assert!(
+            truncate_repetition(equiv)
+                .matches("The smuggler turns and")
+                .count()
+                == 1,
+            "post-gen truncation of the equivalent text keeps exactly one instance"
         );
     }
 
@@ -1779,14 +1779,14 @@ mod tests {
         let mut d = StreamRepetitionDetector::new();
         // Two occurrences of a 5-word phrase (above the 4-word floor so
         // we're testing the repeat-count gate, not the window-size gate).
-        assert!(d.push("The wind howls across the moor. ").is_none());
+        assert!(!d.push("The wind howls across the moor. "));
         assert!(
-            d.push("The wind howls across the moor. ").is_none(),
+            !d.push("The wind howls across the moor. "),
             "2 repeats is rhetorical anaphora, not a loop — must NOT fire"
         );
         // ...and the buffer should retain the prose so a subsequent real
         // loop later in the same turn still gets caught.
-        assert!(d.push("Then silence falls. ").is_none());
+        assert!(!d.push("Then silence falls. "));
     }
 
     #[test]
@@ -1798,7 +1798,7 @@ mod tests {
         let mut d = StreamRepetitionDetector::new();
         for _ in 0..5 {
             assert!(
-                d.push("I know. ").is_none(),
+                !d.push("I know. "),
                 "short-word repeats below the 4-word floor must never fire"
             );
         }
@@ -1813,26 +1813,27 @@ mod tests {
         // 250 unique-ish words of lead-in. Use enumerated tokens so they
         // don't themselves form a loop.
         for i in 0..250 {
-            let _ = d.push(&format!("word{} ", i));
+            assert!(!d.push(&format!("word{} ", i)), "lead-in must not fire");
         }
-        // Sanity: no fire during the lead-in.
         // Now push a loop in the tail.
         let phrase = "the dragon swoops down from the sky ";  // 8 words
-        let hit = d
-            .push(&phrase.repeat(3))
-            .expect("loop in the live tail must fire despite head trim");
         assert!(
-            hit.matches("the dragon swoops down from the sky").count() == 1,
-            "loop in the tail should truncate to one instance, got: {:?}",
-            hit
+            d.push(&phrase.repeat(3)),
+            "loop in the live tail must fire despite head trim"
         );
-        // And the head-trimmed lead-in words are NOT in the output (they
-        // were outside the rolling window) — only the live tail is.
-        // The most recent few wordN tokens may be in the buffer's prefix,
-        // but the very first ones definitely aren't.
+        // The post-hit internal buffer holds ONE instance of the phrase —
+        // the finalized turn prose is the caller's truncate_repetition over
+        // the FULL content (which, unlike this tail buffer, still contains
+        // the entire pre-tail lead-in — the 2026-08-15 audit fix).
+        assert_eq!(
+            d.buffer_text.matches("the dragon swoops down from the sky").count(),
+            1,
+            "post-hit tail buffer should hold one instance, got: {:?}",
+            d.buffer_text
+        );
         assert!(
-            !hit.contains("word0 "),
-            "head-trimmed lead-in must not appear in the truncated output"
+            !d.buffer_text.contains("word0 "),
+            "head-trimmed lead-in must not appear in the tail buffer"
         );
     }
 
@@ -1849,7 +1850,7 @@ mod tests {
         // Stream it word-by-word (aggressive chunking).
         for chunk in prose.split_inclusive(' ') {
             assert!(
-                d.push(chunk).is_none(),
+                !d.push(chunk),
                 "clean varied prose must never trigger the kill switch — chunk: {:?}",
                 chunk
             );
@@ -1860,52 +1861,47 @@ mod tests {
     fn stream_detector_fires_only_once_then_stays_quiet() {
         // After a hit, the buffer is reset to the truncated prose. Further
         // pushes (raced chunks arriving before the loop break propagates)
-        // must NOT re-fire or extend the truncated prose with new loop
-        // content — they re-scan against the clean text.
+        // must NOT re-fire or extend the buffer with new loop content —
+        // they re-scan against the clean text.
         let mut d = StreamRepetitionDetector::new();
-        let hit = d
-            .push("Alpha beta gamma delta. Alpha beta gamma delta. Alpha beta gamma delta.")
-            .expect("must fire on the 3-repeat loop");
-        assert_eq!(hit, "Alpha beta gamma delta.");
-        // Post-hit push of MORE loop content (the race window).
-        let second = d.push(" Alpha beta gamma delta.");
-        // Either None (clean buffer doesn't have 3 repeats yet) or Some
-        // equal-to-or-shorter-than the current clean state. The contract:
-        // it must NOT produce a longer string with a loop in it.
-        if let Some(ref s) = second {
-            assert!(
-                s.matches("Alpha beta gamma delta").count() <= 1,
-                "post-hit pushes must never re-introduce a loop, got: {:?}",
-                s
-            );
-            assert!(
-                s.len() <= hit.len() + " Alpha beta gamma delta.".len(),
-                "post-hit output must not balloon unboundedly"
-            );
-        }
+        assert!(
+            d.push("Alpha beta gamma delta. Alpha beta gamma delta. Alpha beta gamma delta."),
+            "must fire on the 3-repeat loop"
+        );
+        assert_eq!(d.buffer_text, "Alpha beta gamma delta.");
+        // Post-hit push of MORE loop content (the race window). Two
+        // instances in the buffer (the clean text + the raced chunk) is
+        // 2-repeat anaphora, NOT a loop — no re-fire. The stream break
+        // kills this window immediately; this is the defended race.
+        assert!(
+            !d.push(" Alpha beta gamma delta."),
+            "two instances is anaphora-adjacent, not a loop — no re-fire"
+        );
+        assert_eq!(
+            d.buffer_text.matches("Alpha beta gamma delta").count(),
+            2,
+            "exactly the clean instance + the raced chunk, nothing more"
+        );
     }
 
     #[test]
     fn stream_detector_byte_offsets_are_valid_utf8_after_truncation() {
-        // Defensive: the truncated prose returned to the HTTP loop will be
-        // serialized + sent over IPC + rendered in the DOM. It must be
-        // valid UTF-8 with no mid-codepoint cut. The truncator slices on
-        // whitespace boundaries (which are always ASCII = 1-byte), so this
-        // should hold trivially — but we pin it because a regression here
-        // would be a silent corruption.
+        // Defensive: the finalized prose the caller produces will be
+        // serialized + sent over IPC + rendered in the DOM. The truncator
+        // slices on whitespace boundaries (which are always ASCII =
+        // 1-byte), so multi-byte prose must survive intact — but we pin it
+        // because a regression here would be a silent corruption.
         let loop_text = "café naïve résumé déjÀ vu. café naïve résumé déjÀ vu. café naïve résumé déjÀ vu.";
         let mut d = StreamRepetitionDetector::new();
-        let hit = d.push(loop_text).expect("must fire on Unicode loop");
-        // Result must be valid UTF-8 (String invariant — always true, but
-        // the assertion documents intent).
-        assert!(std::str::from_utf8(hit.as_bytes()).is_ok());
-        // And it should contain exactly one instance of the multi-byte
-        // phrase (the slice happened on whitespace, not mid-codepoint).
+        assert!(d.push(loop_text), "must fire on Unicode loop");
+        // The internal buffer (same slice path the caller finalizes with)
+        // must be valid UTF-8 with exactly one instance of the phrase.
+        assert!(std::str::from_utf8(d.buffer_text.as_bytes()).is_ok());
         assert_eq!(
-            hit.matches("café naïve résumé déjÀ vu").count(),
+            d.buffer_text.matches("café naïve résumé déjÀ vu").count(),
             1,
             "Unicode phrase must be preserved exactly once, got: {:?}",
-            hit
+            d.buffer_text
         );
     }
 
@@ -1913,43 +1909,47 @@ mod tests {
     fn stream_detector_handles_empty_and_single_word_chunks() {
         // Edge cases that could panic a naive impl.
         let mut d = StreamRepetitionDetector::new();
-        assert!(d.push("").is_none(), "empty chunk must not fire or panic");
-        assert!(d.push(" ").is_none(), "whitespace-only chunk must not fire");
-        assert!(d.push("word").is_none(), "single word must not fire");
+        assert!(!d.push(""), "empty chunk must not fire or panic");
+        assert!(!d.push(" "), "whitespace-only chunk must not fire");
+        assert!(!d.push("word"), "single word must not fire");
         // After many single-word pushes that don't form a loop, still no fire.
         for w in &["alpha", "beta", "gamma", "delta", "epsilon", "zeta"] {
-            assert!(d.push(w).is_none());
+            assert!(!d.push(w));
         }
     }
 
     #[test]
     fn stream_detector_idempotent_on_full_text_vs_chunked() {
         // The canonical parity assertion: streaming the same text in one
-        // chunk vs many chunks must produce identical truncated prose.
-        // This is the strongest form of "chunk boundaries don't matter".
+        // chunk vs many chunks must fire identically. The finalized prose
+        // (the caller's truncate_repetition on full content) is therefore
+        // chunk-boundary-independent — the strongest form of "chunk
+        // boundaries don't matter".
         let text = "The smuggler laughs and draws his blade. The smuggler laughs and draws his blade. The smuggler laughs and draws his blade.";
         // One-shot:
-        let oneshot = {
+        let oneshot_fired = {
             let mut d = StreamRepetitionDetector::new();
-            d.push(text).expect("must fire")
+            d.push(text)
         };
         // Chunked char-by-char:
-        let chunked = {
+        let chunked_fired = {
             let mut d = StreamRepetitionDetector::new();
-            let mut result = None;
+            let mut fired = false;
             // One character per push — maximally aggressive chunking.
             for c in text.chars() {
-                if let Some(clean) = d.push(c.to_string().as_str()) {
-                    result = Some(clean);
+                if d.push(c.to_string().as_str()) {
+                    fired = true;
                     break;
                 }
             }
-            result.expect("char-by-char streaming must also fire")
+            fired
         };
+        assert!(oneshot_fired, "one-shot must fire");
+        assert!(chunked_fired, "char-by-char streaming must also fire");
         assert_eq!(
-            oneshot, chunked,
-            "one-shot and char-by-char streaming must produce identical truncated prose"
+            truncate_repetition(text),
+            "The smuggler laughs and draws his blade.",
+            "the finalization primitive keeps exactly one instance"
         );
-        assert_eq!(oneshot, truncate_repetition(text));
     }
 }

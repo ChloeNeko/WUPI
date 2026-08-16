@@ -54,8 +54,10 @@
 //! install is pristine — we spawn the still-intact old `wupi.exe`, write a
 //! failure result marker, and exit. The user boots back into the old version
 //! and sees the error. A failure DURING the copy phase (disk full, hardware)
-//! can leave a partially-updated install — the residual bricking surface,
-//! documented in AGENTS.md; it requires a disk-space fix + a clean redownload.
+//! leaves a version-MIXED install — but with per-file copy-to-temp + rename
+//! (#40) every file is complete (never truncated), and the updater does NOT
+//! relaunch a mixed install: the user re-launches via the shortcut once the
+//! disk issue is resolved; the failure marker + log explain what happened.
 
 // Headless binary: no console is ever allocated for it, even if a future
 // spawn site drops the creation flag (belt-and-braces alongside the
@@ -94,25 +96,39 @@ fn main() {
     ));
 
     let result = run(&args);
-    let (ok, error) = match &result {
+    let (ok, error, install_touched) = match &result {
         Ok(()) => {
             log("update applied successfully");
-            (true, None)
+            (true, None, false)
         }
         Err(e) => {
             log(format!("update FAILED: {e}"));
-            (false, Some(e.clone()))
+            // `run` marks copy-phase failures: the install may be a mix of
+            // old + new files. See the relaunch decision below.
+            (false, Some(e.clone()), e.install_touched)
         }
     };
 
     // Record the outcome for the relaunched wupi.exe to surface on its boot.
-    write_result(&args.target_dir, ok, Some(&args.version), error.as_deref());
+    write_result(
+        &args.target_dir,
+        ok,
+        Some(&args.version),
+        error.as_ref().map(|e| e.message.as_str()),
+    );
 
-    // ALWAYS relaunch wupi.exe. On success the freshly-overwritten exe boots
-    // into the new version; on a pre-copy failure the untouched old exe boots
-    // back into the prior version. (A mid-copy failure is the one case where
-    // the launched exe may be inconsistent — the documented residual risk.)
-    spawn_wupi(&args.target_dir);
+    // Relaunch on SUCCESS + on PRE-COPY failures (the untouched old exe boots
+    // back into the prior version). (#40 2026-08-15) SKIP the relaunch when
+    // the copy phase itself errored: with per-file atomic replace every file
+    // is complete, but a version-mixed install can fail to start (missing
+    // exports etc.) — auto-booting it hid the failure behind a crash loop.
+    // The user relaunches via the shortcut once the disk issue is resolved;
+    // the failure marker + log explain what happened.
+    if !install_touched {
+        spawn_wupi(&args.target_dir);
+    } else {
+        log("skipping relaunch: the copy phase failed (install possibly version-mixed)");
+    }
 
     // Sweep stale %TEMP% residue left by PRIOR updates (a pre-0.19 updater
     // never self-deleted its temp copy + log). Our own files are excluded —
@@ -126,10 +142,36 @@ fn main() {
     std::process::exit(if ok { 0 } else { 1 });
 }
 
+/// A pipeline failure that knows WHETHER the live install was already being
+/// modified when the error struck (#40): `install_touched` is true only for
+/// copy-phase failures — those leave a version-mixed install, and main must
+/// NOT auto-relaunch it.
+#[derive(Debug, Clone)]
+struct RunError {
+    message: String,
+    install_touched: bool,
+}
+
+impl std::fmt::Display for RunError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl From<String> for RunError {
+    fn from(message: String) -> Self {
+        Self {
+            message,
+            install_touched: false,
+        }
+    }
+}
+
 /// The ordered apply pipeline. See the module doc. Returns `Err` WITHOUT
 /// touching the live install when staging fails (the bricking-safety gate);
-/// returns `Err` AFTER a partial copy only on a mid-copy I/O failure.
-fn run(args: &Args) -> Result<(), String> {
+/// returns `Err` AFTER a partial copy only on a mid-copy I/O failure
+/// (flagged `install_touched`).
+fn run(args: &Args) -> Result<(), RunError> {
     // 1. Wait for the spawning wupi.exe to exit + release its locks. The parent
     //    exit(0)s immediately after spawning us, so the normal wait is sub-
     //    second; the 30s timeout is a generous pathological-case ceiling.
@@ -145,7 +187,14 @@ fn run(args: &Args) -> Result<(), String> {
     log(format!("staged {n} entries to {}", staging.display()));
 
     // 3. Copy into the live install (preserve rule applied). All locks released.
-    stage::copy_into_target(&staging, &args.target_dir)?;
+    //    A failure here has already replaced SOME files — flag it so main
+    //    skips the relaunch of a version-mixed install.
+    if let Err(e) = stage::copy_into_target(&staging, &args.target_dir) {
+        return Err(RunError {
+            message: e,
+            install_touched: true,
+        });
+    }
 
     // 3.5. Purge legacy dead paths (§8C purge.rs). Runs AFTER the copy so a
     //     failed copy never leaves the install half-cleaned, and BEFORE the
@@ -317,7 +366,17 @@ fn self_delete_temp_copy() {}
 /// this sweep runs on every update so `%TEMP%` converges without any boot-time
 /// wiring. Scoped to WUPI's namespace only; best-effort (locked files are
 /// skipped, never fatal).
+///
+/// **Age floor (#70):** only entries older than 10 minutes (by mtime) are
+/// swept. During the exit→relaunch window a manual relaunch can re-detect
+/// the update and spawn updater B while updater A is still mid-copy — B's
+/// sweep used to `remove_dir_all` A's LIVE staging dir. A live update never
+/// takes 10 minutes (the PID wait + copy are minutes at worst); genuine
+/// residue from prior boots is always older than the floor.
 fn sweep_temp_residue() {
+    /// Minimum age (secs) before a namespace entry is considered residue.
+    const RESIDUE_AGE_SECS: u64 = 10 * 60;
+
     let temp = std::env::temp_dir();
     let own_exe = std::env::current_exe().ok();
     let own_log = temp.join(format!("wupi_updater_{}.log", std::process::id()));
@@ -325,7 +384,9 @@ fn sweep_temp_residue() {
         Ok(e) => e,
         Err(_) => return,
     };
+    let now = std::time::SystemTime::now();
     let mut swept = 0usize;
+    let mut skipped_fresh = 0usize;
     for entry in entries.flatten() {
         let Some(name) = entry.file_name().into_string().ok() else {
             continue;
@@ -340,6 +401,19 @@ fn sweep_temp_residue() {
         if own_exe.as_deref() == Some(path.as_path()) || path == own_log {
             continue; // ours — self_delete_temp_copy handles these at exit
         }
+        // (#70) Young entries may belong to a CONCURRENT updater mid-run —
+        // leave them for a later sweep rather than kill a live staging dir.
+        let is_stale = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|mtime| now.duration_since(mtime).ok())
+            .map(|age| age.as_secs() >= RESIDUE_AGE_SECS)
+            .unwrap_or(false);
+        if !is_stale {
+            skipped_fresh += 1;
+            continue;
+        }
         let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
         let removed = if is_dir {
             std::fs::remove_dir_all(&path).is_ok()
@@ -352,6 +426,11 @@ fn sweep_temp_residue() {
     }
     if swept > 0 {
         log(format!("swept {swept} stale %TEMP% residue file(s)"));
+    }
+    if skipped_fresh > 0 {
+        log(format!(
+            "skipped {skipped_fresh} fresh %TEMP% entr(y/ies) (<{RESIDUE_AGE_SECS}s old — possibly a concurrent updater)"
+        ));
     }
 }
 

@@ -92,8 +92,10 @@ export function renderMarkdown(text) {
   // **bold** before *italics* so the greedy double-asterisk eats first.
   s = s.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
   s = s.replace(/\*([^*]+)\*/g, '<em>$1</em>');
-  // "dialogue" → ivory quoted run (curly or straight quotes).
-  s = s.replace(/([“"][^"”]*["”])/g, '<span class="quote">$1</span>');
+  // “dialogue” → ivory quoted run (CURLY quotes only — esc() already
+  // rewrote every straight `"` to &quot; upstream, so a straight-quote arm
+  // here could never match; it was dead pattern weight).
+  s = s.replace(/(“[^”]*”)/g, '<span class="quote">$1</span>');
   s = s.replace(/\n/g, '<br>');
   return s;
 }
@@ -406,6 +408,20 @@ function buildDrawerHTML(role) {
 //   • stepper visibility (.multi — hidden unless >1 variant)
 // Pure DOM read/write off dataset.variantCount / variantActive. Cheap;
 // called at build + on every stampVariants (reroll / swipe / load).
+// (#84 2026-08-15) True iff `beat` is the TRAILING assistant message in the
+// feed. Extracted from refreshDrawer so stage.js's delegated click handler
+// can re-derive it AT CLICK TIME: the stamped disabled-state goes stale in
+// both directions — a live-streamed beat's › is born disabled (refreshDrawer
+// ran while the beat was still detached, pre-append), and a rebuilt feed's
+// transiently-last beats keep an enabled › (they were stamped before the
+// later beats appended). A stale-enabled › on a mid-history beat used to
+// reroll the WRONG (trailing) turn.
+export function isTrailingAssistant(beat) {
+  if (!beat || !feedEl) return false;
+  const asst = feedEl.querySelectorAll('.fable-mes.assistant');
+  return asst.length > 0 && asst[asst.length - 1] === beat;
+}
+
 export function refreshDrawer(beat) {
   if (!beat) return;
   const drawer = beat.querySelector('.fable-mes-drawer');
@@ -417,9 +433,11 @@ export function refreshDrawer(beat) {
   // gates the ▼ fold — at the last variant, ▼ on the TRAILING assistant
   // regenerates (cutting the local tracker + rolling a fresh variant)
   // instead of disabling. Computed from the DOM so a load or a delete
-  // that changes the tail is reflected without extra plumbing.
-  const asst = feedEl ? Array.from(feedEl.querySelectorAll('.fable-mes.assistant')) : [];
-  const isLastAssistant = role === 'assistant' && asst.length > 0 && asst[asst.length - 1] === beat;
+  // that changes the tail is reflected without extra plumbing (plus the
+  // post-append + post-rebuild passes below, and the click-time re-check
+  // in stage.js — the stamped state is advisory, the click gate is the
+  // authority).
+  const isLastAssistant = role === 'assistant' && isTrailingAssistant(beat);
   const { canPrev, canNext } = computeDrawerState({ role, count, active, isLastAssistant });
 
   drawer.classList.toggle('multi', count > 1);
@@ -445,9 +463,10 @@ export function refreshDrawer(beat) {
   }
 }
 
-// Re-export the pure swipe-next decision so stage.js's delegated handler
-// routes › through the same logic the unit tests pin (one import path).
-export { swipeNextAction };
+// Re-export the pure swipe-next decision + the pure disabled-state helper so
+// stage.js's delegated handler routes › through the same logic the unit
+// tests pin (one import path).
+export { swipeNextAction, computeDrawerState };
 
 function appendMes(root) {
   if (!feedEl) return null;
@@ -468,6 +487,18 @@ function appendMes(root) {
     }
   }
   feedEl.appendChild(root);
+  // (#84) Post-append drawer sync: buildMes ran refreshDrawer while the beat
+  // was DETACHED, so a fresh assistant beat's › was born disabled (it wasn't
+  // the tail yet — the live-turn reroll affordance was dead until the next
+  // rebuild). Re-sync the new beat now that it IS the tail, + the assistant
+  // that previously held the trailing › (its fold-into-reroll must retire
+  // to this beat). Non-assistant appends don't change which assistant is
+  // trailing — no sync needed.
+  if (root.classList.contains('assistant')) {
+    refreshDrawer(root);
+    const asst = feedEl.querySelectorAll('.fable-mes.assistant');
+    if (asst.length >= 2) refreshDrawer(asst[asst.length - 2]);
+  }
   scrollDown();
   return root;
 }
@@ -739,6 +770,11 @@ export function rebuildFromMessages(messages) {
       stampVariants(root, [], 0);
     }
   });
+  // (#84) Final drawer sync pass: the loop stamps each beat while the LATER
+  // beats aren't appended yet, so every transiently-last assistant kept an
+  // enabled › (› folds into reroll ONLY on the true trailing beat). One
+  // cheap pass re-derives the tail state from the now-complete DOM.
+  feedEl.querySelectorAll('.fable-mes.assistant').forEach(refreshDrawer);
   scrollDown();
 }
 

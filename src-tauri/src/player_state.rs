@@ -50,9 +50,11 @@ use crate::equipment;
 /// | `Purple`     | purple       | Critical Condition              |
 /// | `Black`      | black        | Amputated / gone / decapitated  |
 ///
-/// Serialization is lowercased kebab (serde default for `Transparent`).
-/// The frontend's mannequin renderer reads these strings directly as the
-/// CSS color class.
+/// Serialization is PascalCase variant names verbatim (`"Transparent"`,
+/// `"Yellow"`, … — serde's default unit-variant form; no rename_all). The
+/// wire is consumed by the frontend's injury heatmap, which owns the only
+/// PascalCase→snake_case seam (injury-heatmap.js) to map them onto the CSS
+/// color classes.
 #[derive(Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, Debug)]
 pub enum BodyPartState {
     Transparent,
@@ -643,13 +645,11 @@ pub struct RefereeOutcome {
     /// (unconscious, dying). The narrator must obey: the player character
     /// cannot continue to fight, run, or act this turn. False for ordinary
     /// injuries that merely hurt.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub lethal: bool,
     /// Hard narrator directive, populated only when `lethal == true`. The
     /// caller wraps this as `[DIRECTIVE: {directive}]` inside `<world_state>`
     /// (same injection path as the skill-check Referee). Empty string
     /// otherwise. Reads as a single imperative sentence.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub directive: String,
 }
 
@@ -745,7 +745,9 @@ impl AttackerTier {
 /// The base DC for the lethality SAVE. A roll >= this (modified) means the
 /// blow is lethal. Tuned so a Legendary's full hit on a Battered defender
 /// is almost always lethal, and a Minion's is almost never.
-const BASE_LETHAL_DC: i32 = 18;
+/// `pub(crate)` so the scene-pacing tests can pin the Soldier one-shot
+/// guard against the real value.
+pub(crate) const BASE_LETHAL_DC: i32 = 18;
 
 
 /// Combat / exertion keywords that trigger a Referee roll. Matched as
@@ -789,20 +791,40 @@ impl Roller {
     }
 
     /// Uniform index in `0..n`. Returns 0 when n == 0 (defensive).
+    ///
+    /// Rejection sampling (#82): plain `% n` weights the first
+    /// `2^32 mod n` values one count heavier (for a d20 that's 16 values in
+    /// ~4.3e9 — negligible, but the unbiased draw costs one comparison and
+    /// the dice are the system's contract with the player). Draws landing in
+    /// the incomplete tail zone are redrawn.
     pub fn range(&mut self, n: usize) -> usize {
         if n == 0 {
             return 0;
         }
-        (self.next_u32() as usize) % n
+        let n64 = n as u64;
+        let zone = (1u64 << 32) / n64 * n64;
+        loop {
+            let x = u64::from(self.next_u32());
+            if x < zone {
+                return (x % n64) as usize;
+            }
+        }
     }
 
     /// Roll against a weighted table. `weights[i]` is the relative weight
     /// of outcome `i`. Returns the index of the chosen outcome. Sums the
-    /// weights internally; panics on empty weights (caller bug).
+    /// weights internally; panics on empty weights (caller bug). Same
+    /// rejection-sampling discipline as [`Self::range`].
     pub fn weighted(&mut self, weights: &[u32]) -> usize {
         let total: u64 = weights.iter().map(|&w| w as u64).sum();
         assert!(total > 0, "weighted(): empty weights");
-        let mut roll = (self.next_u32() as u64) % total;
+        let zone = (1u64 << 32) / total * total;
+        let mut roll = loop {
+            let x = u64::from(self.next_u32());
+            if x < zone {
+                break x % total;
+            }
+        };
         for (i, &w) in weights.iter().enumerate() {
             if roll < w as u64 {
                 return i;
@@ -891,8 +913,11 @@ fn roll_injury_descriptor(roller: &mut Roller, tier: AttackerTier, state: BodyPa
 /// v1 severity distribution exactly. Callers that know the attacker's tier
 /// (Wupi-as-game-manager resolution, NPC stat declaration, the [COMBAT]
 /// block's tier field) should call [`referee_evaluate_with_tier`] instead.
-pub fn referee_evaluate(text: &str, state: &PlayerState) -> Option<RefereeOutcome> {
-    referee_evaluate_with_tier(text, state, AttackerTier::Soldier, 0, 0)
+pub fn referee_evaluate(
+    text: &str,
+    state: &PlayerState,
+) -> Option<RefereeOutcome> {
+    referee_evaluate_with_tier(text, state, AttackerTier::Soldier, 0, 0, 0)
 }
 
 /// Select the attacker tier for a combat turn from the schema's entity map
@@ -916,11 +941,18 @@ pub fn referee_evaluate(text: &str, state: &PlayerState) -> Option<RefereeOutcom
 /// Pure fn — no I/O. The entity map is `&HashMap<String, String>` (the
 /// WorldSchema's `entities` field shape).
 /// Substring keyword match with a LEADING word boundary: the character
-/// before the hit (if any) must be non-alphanumeric. Kills the worst false
-/// positives ("I light the camp**fire**", "**run** a bath" style compounds)
-/// while preserving inflections — there is deliberately NO trailing
-/// boundary, so "attacks"/"swings" still match "attack"/"swing".
-fn keyword_present(lower: &str, kw: &str) -> bool {
+/// before the hit (if any) must be non-alphanumeric. This kills MID-WORD
+/// compounds only ("I light the camp**fire**" does not match "fire");
+/// word-initial compounds still fire ("**fire**place", "**run**es" → "run",
+/// "a **block**ade") and standalone uses always match — there is
+/// deliberately NO trailing boundary, so "attacks"/"swings" still match
+/// "attack"/"swing". A trailing boundary would also kill those legit
+/// inflections; killing word-initial compounds needs a morphology list,
+/// which is out of scope for a dice trigger.
+/// `pub(crate)`: also the matcher for `scene_pacing::score_pillar` (#35 —
+/// the pacing scorer used raw `contains`, so "campfire" classified Combat
+/// via "fire" while this referee correctly stayed silent).
+pub(crate) fn keyword_present(lower: &str, kw: &str) -> bool {
     let mut from = 0;
     while let Some(pos) = lower[from..].find(kw) {
         let at = from + pos;
@@ -1004,19 +1036,26 @@ pub fn parse_attacker_tier(s: &str) -> Option<AttackerTier> {
 /// is a thin wrapper that passes `AttackerTier::Soldier` here.
 ///
 /// Lethality judgment: after the severity roll resolves, the Referee rolls
-/// a second d20 against `BASE_LETHAL_DC + tier_mod + condition_penalty`.
-/// `condition_penalty` is derived from the player's existing wound load (a
-/// Battered defender is easier to drop than an Unscathed one). On a failed
-/// save, the outcome is flagged `lethal: true` + a hard directive is emitted
-/// the narrator MUST obey ("the player is Downed — they cannot act this
-/// turn"). This is the mechanical enforcement of the Slice 1 anti-Oblivion
-/// clause: a Legendary's full hit on a wounded body is lethal, period.
+/// a second d20 against `BASE_LETHAL_DC + tier_mod + condition_penalty +
+/// pacing_dc_mod`. `condition_penalty` is derived from the player's existing
+/// wound load (a Battered defender is easier to drop than an Unscathed one).
+/// `pacing_dc_mod` is ScenePacing's LETHALITY modifier
+/// ([`crate::schema::SceneMode::lethality_dc_mod`]: Combat −1, Exploration 0,
+/// Downtime +2 — the mirrored sign of the skill-check `dc_modifier`, so
+/// combat raises the stakes instead of being the safest place to take a
+/// hit; see that method's doc for the tuning rationale). On a failed save,
+/// the outcome is flagged `lethal: true` + a hard directive is
+/// emitted the narrator MUST obey ("the player is Downed — they cannot act
+/// this turn"). This is the mechanical enforcement of the Slice 1
+/// anti-Oblivion clause: a Legendary's full hit on a wounded body is lethal,
+/// period.
 pub fn referee_evaluate_with_tier(
     text: &str,
     state: &PlayerState,
     attacker_tier: AttackerTier,
     buff_tag_count: usize,
     debuff_tag_count: usize,
+    pacing_dc_mod: i32,
 ) -> Option<RefereeOutcome> {
     let lower = text.to_lowercase();
     let triggered = COMBAT_KEYWORDS.iter().any(|kw| keyword_present(&lower, kw));
@@ -1098,13 +1137,16 @@ pub fn referee_evaluate_with_tier(
         crate::consequence::Condition::Haggard => -1,
         crate::consequence::Condition::Unscathed => 0,
     };
-    let lethality_dc = BASE_LETHAL_DC + attacker_tier.lethality_dc_mod() + condition_penalty;
+    let lethality_dc =
+        BASE_LETHAL_DC + attacker_tier.lethality_dc_mod() + condition_penalty + pacing_dc_mod;
     let lethality_roll = roll_d20(&mut roller);
-    // `>=` (P0 fix): the roll is a SAVE — meeting or beating the (modified)
-    // DC means the player shrugs the blow off; only a roll that FAILS the
-    // save (`>=` the DC) drops them. The prior `<` inverted every tier
-    // (default Soldier DC 22 > max d20 → EVERY hit was lethal; Minions
-    // always lethal, Legendary 45%, a Downed player unfinishable).
+    // `>=` (P0 fix): the roll meeting or beating the (modified) DC is a
+    // LETHAL blow; a roll below it is survivable. The modifiers make sense
+    // on that axis — dangerous attackers + wounded bodies LOWER the DC
+    // (easier to clear), scrub attackers + fresh bodies raise it. The prior
+    // `<` inverted every tier (default Soldier DC 22 > max d20 → EVERY hit
+    // was lethal; Minions always lethal, Legendary 45%, a Downed player
+    // unfinishable).
     let lethal = (lethality_roll as i32) >= lethality_dc;
 
     // Narrative hint: a short second-person prose seed. The narrator reads the
@@ -1514,6 +1556,9 @@ const SCRUTINIZED_FAIL_SEED: &str = "the act cracks under scrutiny; the disguise
 ///
 /// Returns:
 ///   - `None` when there's no active disguise tag (nothing to gate).
+///   - `None` when NOBODY is on camera: no observers means no scrutiny — the
+///     tag simply persists unchallenged (an AutoPass here would narrate
+///     invisible soldiers waving the player through; #55).
 ///   - `Some(Scrutinized)` when an Elite+ NPC is present: they scrutinize by
 ///     default, so a Deception check is rolled HERE (P2 fix — the old
 ///     `return None` assumed the §11.21 skill referee would roll it, but
@@ -1538,6 +1583,12 @@ pub fn evaluate_disguise_gate(
     pacing_dc_mod: i32,
 ) -> Option<DisguiseDirective> {
     let disguise = find_disguise_tag(tags)?;
+    // Empty scene: no gate outcome at all. Falling through would compare
+    // against the Soldier default and emit an AutoPass crediting soldiers
+    // who are not there (and could even roll scrutiny with no observer).
+    if present_npc_ids.is_empty() {
+        return None;
+    }
     let label = disguise.label.clone();
     let tier = select_attacker_tier_from_entities(entities, present_npc_ids);
     // Elite+ (captains, bosses, legendary creatures) scrutinize by default —
@@ -2359,6 +2410,7 @@ mod tests {
             AttackerTier::Soldier,
             0,
             0,
+            0,
         );
         assert_eq!(a, b, "default and explicit-Soldier paths must agree");
     }
@@ -2399,7 +2451,7 @@ mod tests {
         let mut lethal_count = 0;
         for i in 0..64 {
             let text = format!("I attack the dragon again, turn {i}");
-            if let Some(o) = referee_evaluate_with_tier(&text, &s, AttackerTier::Legendary, 0, 0) {
+            if let Some(o) = referee_evaluate_with_tier(&text, &s, AttackerTier::Legendary, 0, 0, 0) {
                 if o.lethal {
                     lethal_count += 1;
                     // Lethal outcomes MUST carry a non-empty directive.
@@ -2438,7 +2490,7 @@ mod tests {
         let mut fired = 0;
         for i in 0..100 {
             let text = format!("the rat attacks me, turn {i}");
-            if let Some(o) = referee_evaluate_with_tier(&text, &s, AttackerTier::Minion, 0, 0) {
+            if let Some(o) = referee_evaluate_with_tier(&text, &s, AttackerTier::Minion, 0, 0, 0) {
                 fired += 1;
                 if o.lethal {
                     lethal_count += 1;
@@ -2467,7 +2519,7 @@ mod tests {
         for i in 0..200 {
             // Vary the text to spread the RNG across parts.
             let text = format!("I strike the bandit, exchange {i}");
-            if let Some(o) = referee_evaluate_with_tier(&text, &s, AttackerTier::Elite, 0, 0) {
+            if let Some(o) = referee_evaluate_with_tier(&text, &s, AttackerTier::Elite, 0, 0, 0) {
                 if o.part == BodyPart::UpperTorso {
                     torso_hits += 1;
                     assert!(
@@ -2544,6 +2596,22 @@ mod tests {
         let entities = entities_with_tier("soldier");
         let present = vec!["guard1".to_string()];
         assert!(evaluate_disguise_gate("I walk past the guard", &[generic_tag("Blessed")], &entities, &present, 0).is_none());
+    }
+
+    #[test]
+    fn disguise_gate_none_on_empty_scene() {
+        // (#55) Nobody on camera → no gate outcome at all: the old path fell
+        // through to the Soldier default and AutoPassed with invisible
+        // soldiers vouching the player through — even on suspicious text.
+        let entities = entities_with_tier("soldier");
+        assert!(evaluate_disguise_gate(
+            "I sneak along the corridor and pick the lock",
+            &[disguise_tag("city guard uniform")],
+            &entities,
+            &[],
+            0
+        )
+        .is_none());
     }
 
     #[test]

@@ -399,8 +399,23 @@ fn init_schema(conn: &Connection) -> anyhow::Result<()> {
 /// Build a unique destination PNG path for a generation. Timestamp-prefixed
 /// (chronological dir listing) + seed-suffixed (seed-locked forks of the same
 /// base don't collide). Lives under `apps/prism/gallery/`.
+///
+/// (#72) Same-ms double-fire with a locked seed used to produce ONE PNG +
+/// TWO gallery rows (the second render overwrote the first). When the exact
+/// path already exists, a `-r2`, `-r3`, ... suffix is appended until a free
+/// name is found — each row keeps its own file.
 pub fn dest_path(gallery_dir: &Path, seed: i64, created_at_ms: i64) -> PathBuf {
-    gallery_dir.join(format!("{created_at_ms}-{seed}.png"))
+    let base = gallery_dir.join(format!("{created_at_ms}-{seed}.png"));
+    if !base.exists() {
+        return base;
+    }
+    for retry in 2.. {
+        let candidate = gallery_dir.join(format!("{created_at_ms}-{seed}-r{retry}.png"));
+        if !candidate.exists() {
+            return candidate;
+        }
+    }
+    unreachable!("u64 retry counter cannot exhaust the filesystem namespace")
 }
 
 /// Convert user-supplied [`GenerateParams`] into the internal
@@ -704,6 +719,37 @@ mod tests {
         // do NOT collide because the timestamp differs.
         let d = dest_path(dir, 42, 2000);
         assert_ne!(a, d, "forks of same seed don't collide (timestamp differs)");
+    }
+
+    /// (#72) Same-ms double-fire with a locked seed: the second render must
+    /// get a suffixed path instead of overwriting the first PNG.
+    #[test]
+    fn dest_path_bumps_suffix_on_collision() {
+        let dir = std::env::temp_dir().join(format!(
+            "wupi_prism_dest_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let first = dest_path(&dir, 42, 1000);
+        std::fs::write(&first, b"png").unwrap();
+        let second = dest_path(&dir, 42, 1000);
+        assert_ne!(first, second, "collision must bump the suffix");
+        assert!(
+            second.to_string_lossy().ends_with("1000-42-r2.png"),
+            "got {}",
+            second.display()
+        );
+        std::fs::write(&second, b"png").unwrap();
+        let third = dest_path(&dir, 42, 1000);
+        assert!(
+            third.to_string_lossy().ends_with("1000-42-r3.png"),
+            "got {}",
+            third.display()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

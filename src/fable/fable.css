@@ -5336,6 +5336,29 @@ body.fable-active.fable-chrome-peek .top-bar { transform: translateY(0); }
         0 3px 10px rgba(0, 0, 0, 0.50),
         0 0 14px rgba(220, 90, 70, 0.40);
 }
+/* (#78) ARMED state for the two-click inline delete confirm — native
+   confirm() is dead in the webview (wry maps it to false), so the delete
+   button arms on first click + deletes on the second. A full red heat
+   bloom that outranks the hover wash (!important — the armed read must
+   survive hovering) until the second click or the 5s disarm timeout.
+   Covers BOTH delete surfaces: the rail's gold corner 🗑 and the history
+   column's iron tool. */
+.fable-mes-gold-btn--delete[data-armed="1"],
+.fable-mes-histool-btn[data-armed="1"] {
+    background: linear-gradient(160deg,
+        #8A2A1C 0%,
+        #B0432A 30%,
+        #C9563B 50%,
+        #93321D 75%,
+        #6B2413 100%) !important;
+    box-shadow:
+        inset 0 1px 1px rgba(255, 200, 180, 0.45),
+        inset 0 -3px 5px rgba(30, 8, 1, 0.60),
+        0 3px 10px rgba(0, 0, 0, 0.50),
+        0 0 16px rgba(255, 90, 70, 0.65) !important;
+    color: #FFD9CC;
+    transform: scale(1.06);
+}
 .fable-mes-gold-btn:disabled {
     opacity: 0.45;
     cursor: default;

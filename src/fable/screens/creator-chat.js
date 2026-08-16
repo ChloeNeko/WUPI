@@ -41,6 +41,9 @@ import {
   buildReviewSections,
   buildIdCard,
   missingMandatoryFields,
+  shouldRejectDuplicateName,
+  creatorRetryAllowed,
+  MAX_CREATOR_RETRIES,
   MANDATORY_LABELS,
 } from '../engine/creator-engine.js';
 import { renderIdCard, wireIdCard, PENCIL_SVG } from './id-card.js';
@@ -124,6 +127,14 @@ export function renderCreatorChat(root, config) {
   root._creatorEpoch = (root._creatorEpoch || 0) + 1;
   const epoch = root._creatorEpoch;
   invoke('creator_assistant_stop').catch(() => {});
+  // (P1 fix) Kill any retry PAUSE a prior run left armed: the setTimeout
+  // callbacks below bail on the epoch, but a dangling timer holds no turn
+  // — clearing it here keeps the slot semantics simple (a new render owns
+  // the screen outright).
+  if (root._creatorRetryTimer) {
+    clearTimeout(root._creatorRetryTimer);
+    root._creatorRetryTimer = null;
+  }
   // Pre-seed the draft's `intro` from an import's captured greetings
   // (first_mes + alternate_greetings). GLM may still override it on a later
   // turn (mergeDraft overwrites with non-empty), but the mechanically-captured
@@ -220,8 +231,19 @@ export function renderCreatorChat(root, config) {
 
   // Abort the in-flight turn (Escape). Signals the reserved creator cancel
   // token; the backend emits `cancelled` + the partial bubble is dropped.
+  // A pending VALIDATION/MANDATORY RETRY is "in flight" too (busy stays
+  // held across the 900ms pause) — Escape during the pause previously fired
+  // at no active stream while the timer went on to start a fresh turn
+  // anyway. Cancel the timer + unlock instead.
   async function stopTurn() {
     if (!state.busy) return;
+    if (root._creatorRetryTimer) {
+      clearTimeout(root._creatorRetryTimer);
+      root._creatorRetryTimer = null;
+      setBusy(false);
+      trace('retry pause cancelled (stop) — turn aborted');
+      return;
+    }
     try { await invoke('creator_assistant_stop'); } catch (_) {}
   }
 
@@ -253,6 +275,10 @@ export function renderCreatorChat(root, config) {
   // review re-renders (`ready`) or the chat resumes with GLM's follow-up
   // questions (`ask`). Escape mid-generation cancels (creator_assistant_stop).
   async function callApi(opts = {}) {
+    // Stale-turn firewall (defensive entry check): the scheduled-retry
+    // callbacks below bail at schedule time, but any future caller that
+    // races a render must never start a GLM turn on a replaced screen.
+    if (epoch !== root._creatorEpoch) return;
     const editMode = !!opts.editMode;
     setBusy(true);
     // Capture the prior prompt text so a mid-stream cancel can restore it
@@ -294,18 +320,27 @@ export function renderCreatorChat(root, config) {
         state.history.push({ role: 'assistant', content: msg.text });
         state.history.push({ role: 'user', content: msg.alert });
         state.codexValidationRetries = (state.codexValidationRetries || 0) + 1;
-        const MAX_RETRIES = 2;
         const n = (msg.offenders && msg.offenders.length) || 0;
-        trace(`validation_error: ${n} oversize codex entry/entries; retry ${state.codexValidationRetries}/${MAX_RETRIES}`);
+        trace(`validation_error: ${n} oversize codex entry/entries; retry ${state.codexValidationRetries}/${MAX_CREATOR_RETRIES}`);
         if (bubble) {
           bubble.setTyping(false);
           bubble.update('⚠ A codex entry exceeded the 1400-character embedding cap — asking the assistant to split it…');
         }
-        if (state.codexValidationRetries <= MAX_RETRIES) {
-          // Brief pause so the notice is readable before the retry overwrites it.
-          setTimeout(() => callApi(opts), 900);
+        if (creatorRetryAllowed(state.codexValidationRetries)) {
+          // Brief pause so the notice is readable before the retry overwrites
+          // it. The scheduled callback re-checks the epoch (the guard inside
+          // channel.onmessage can't stop the CALL — a ‹/⌂ exit during the
+          // pause must never start a new GLM turn on the next wizard run),
+          // + the timer is cancellable via stopTurn.
+          root._creatorRetryTimer = setTimeout(() => {
+            root._creatorRetryTimer = null;
+            if (epoch !== root._creatorEpoch) return;
+            callApi(opts);
+          }, 900);
         } else {
-          if (editMode) { endEditGen(); showReviewError('⚠ The assistant could not fit a codex entry under the 1400-character cap — edit again or describe the split yourself.'); }
+          const failMsg = '⚠ The assistant could not fit a codex entry under the 1400-character cap — edit again or describe the split yourself.';
+          if (editMode) { endEditGen(); showReviewError(failMsg); }
+          else if (bubble) { bubble.setTyping(false); bubble.update(failMsg); }
           setBusy(false);
           trace('codex validation retries exhausted — user intervention needed');
         }
@@ -333,23 +368,27 @@ export function renderCreatorChat(root, config) {
   // as the codex validation_error path. Capped so a stuck model surfaces the
   // gap to the user instead of looping.
   function rejectReady(missing, bubble, editMode) {
-    const MAX_RETRIES = 2;
     const alert = `SYSTEM ALERT: your ready draft is missing mandatory fields: ${missing.join(', ')}. ` +
       'Do not emit ready until every mandatory field is filled. Fill the missing fields now ' +
       'from the conversation — ask the user only for what you cannot infer.';
     state.history.push({ role: 'user', content: alert });
     state.mandatoryRetries = (state.mandatoryRetries || 0) + 1;
     const labels = missing.map((k) => MANDATORY_LABELS[k] || k).join(', ');
-    trace(`ready REJECTED — missing mandatory [${missing.join(', ')}]; retry ${state.mandatoryRetries}/${MAX_RETRIES}`);
-    if (state.mandatoryRetries <= MAX_RETRIES) {
+    trace(`ready REJECTED — missing mandatory [${missing.join(', ')}]; retry ${state.mandatoryRetries}/${MAX_CREATOR_RETRIES}`);
+    if (creatorRetryAllowed(state.mandatoryRetries)) {
       if (bubble) {
         bubble.setTyping(false);
         bubble.update('⚠ The draft was missing mandatory fields — asking the assistant to fill them…');
       }
       // Brief pause so the notice is readable before the retry overwrites it
       // (the ring persists across the pause in edit mode — beginEditGen
-      // dedupes on the retried callApi).
-      setTimeout(() => callApi({ editMode }), 900);
+      // dedupes on the retried callApi). Epoch re-check + stopTurn-
+      // cancellable, same as the codex validation retry above.
+      root._creatorRetryTimer = setTimeout(() => {
+        root._creatorRetryTimer = null;
+        if (epoch !== root._creatorEpoch) return;
+        callApi({ editMode });
+      }, 900);
     } else {
       const msg = `⚠ The assistant could not fill the mandatory fields: ${labels}. Tell it the missing details and it will finalize.`;
       if (editMode) { endEditGen(); showReviewError(msg); }
@@ -382,7 +421,12 @@ export function renderCreatorChat(root, config) {
     if (env.action === 'ready') {
       // The gate: no incomplete draft ever shows the review card. Runs on the
       // merged draft (accumulated across turns + seed/import presets).
-      const missing = missingMandatoryFields(creatorKind, state.draft);
+      // (P2 parity fix) Edit runs (seedDraft) are EXEMPT — a legacy player
+      // saved before `body_type` was promoted could never re-save: every
+      // pencil-edit `ready` was rejected → two corrective retries
+      // re-interviewing for fields the user never touched. doCreate's
+      // backstop carries the same exemption.
+      const missing = config.seedDraft ? [] : missingMandatoryFields(creatorKind, state.draft);
       if (missing.length) {
         rejectReady(missing, bubble, editMode);
         return;
@@ -632,15 +676,26 @@ export function renderCreatorChat(root, config) {
       // (P1 fix) Duplicate-name guard: both write IPCs are silent atomic
       // OVERWRITES — a CREATE reusing an existing slug replaced the prior
       // card/player (authored content lost, its saves orphaned). Edit runs
-      // (seedDraft present) re-save the same entity and are exempt.
-      if (!config.seedDraft && (creatorKind === 'player' || creatorKind === 'sim')) {
+      // (seedDraft present) re-save the same entity and are exempt — but
+      // ONLY while the write target is still the seeded entity's own id:
+      // the target is re-derived from the possibly-RENAMED draft, and a
+      // pencil-edit that renames "Kael" onto an existing "Nyx" would
+      // silently destroy that player (the exact loss this guard prevents).
+      // The decision lives in creator-engine (shouldRejectDuplicateName)
+      // so it's unit-testable.
+      if (creatorKind === 'player' || creatorKind === 'sim') {
         const target = creatorKind === 'player'
           ? serializePlayer(state.draft).id
           : (slugify(state.draft.name || '') || 'world');
-        const existing = creatorKind === 'player'
-          ? (await invoke('fable_players_list').catch(() => []))
-          : (await invoke('fable_cards_list').catch(() => []));
-        if (existing.some((m) => m.id === target)) {
+        const seededId = config.seedDraft ? config.seedDraft.id : undefined;
+        let existingIds = [];
+        try {
+          const existing = creatorKind === 'player'
+            ? (await invoke('fable_players_list'))
+            : (await invoke('fable_cards_list'));
+          existingIds = (existing || []).map((m) => m.id);
+        } catch (_) { /* list IPC failure → skip the guard (the write may still fail server-side) */ }
+        if (shouldRejectDuplicateName(target, seededId, existingIds)) {
           throw new Error(`a ${creatorKind === 'player' ? 'player' : 'world'} named "${state.draft.name || target}" already exists — choose a different name`);
         }
       }

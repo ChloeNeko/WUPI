@@ -500,14 +500,20 @@ impl GenerationClient for HttpBackend {
                                     full_content.push_str(&piece);
                                     // §11.43 kill switch: scan the rolling
                                     // tail-buffer for a mechanical loop. On
-                                    // hit, finalize `full_content` to the
-                                    // truncated clean prose and break BOTH
-                                    // loops (inner line-parse + outer chunk-
-                                    // read). Dropping `response` (the moved
-                                    // owner of `stream`) at function return
-                                    // severs the TCP connection.
-                                    if let Some(clean) = rep_guard.push(&piece) {
-                                        full_content = clean;
+                                    // hit, finalize by truncating the FULL
+                                    // turn content at the loop's 2nd
+                                    // occurrence and break BOTH loops (inner
+                                    // line-parse + outer chunk-read). The
+                                    // detector's tail buffer is a DETECTION
+                                    // window only — finalizing from it would
+                                    // silently drop all pre-tail prose
+                                    // (2026-08-15 audit fix).
+                                    // Dropping `response` (the moved owner
+                                    // of `stream`) at function return severs
+                                    // the TCP connection.
+                                    if rep_guard.push(&piece) {
+                                        full_content =
+                                            crate::stream_filter::truncate_repetition(&full_content);
                                         // Exit both loops via early return.
                                         // `stream` (borrowed from `response`)
                                         // + `response` drop here, severing
@@ -704,7 +710,19 @@ pub fn reload_shared_model(path: &std::path::Path, n_gpu_layers: u32) -> anyhow:
     let ptr = std::ptr::NonNull::new(leaked as *const LlamaModel as *mut LlamaModel)
         .expect("Box::leak returns a non-null pointer");
     let mut g = SHARED_MODEL.write().map_err(|e| anyhow::anyhow!("SHARED_MODEL lock poisoned: {e}"))?;
-    *g = Some(SharedModelPtr(ptr));
+    // Expect-empty overwrite: a still-resident prior model must be RECLAIMED,
+    // not silently replaced — the old behavior orphaned the prior leaked Box
+    // (~9.8GB leak until process exit) if two reload paths ever raced. The
+    // SD cycle is serialized under the local-model turn lock so this branch
+    // is a should-never-happen backstop; reclaiming with a loud log is the
+    // lesser evil vs leaking (mirrors unload_shared_model's SAFETY).
+    if let Some(prior) = g.replace(SharedModelPtr(ptr)) {
+        tracing::error!("reload_shared_model: prior model was still resident — reclaiming it (leak prevented; investigate the caller's unload ordering)");
+        // SAFETY: the pointer came from the same Box::leak path in
+        // set_shared_model/reload_shared_model; reclaiming frees the VRAM.
+        let boxed: Box<LlamaModel> = unsafe { Box::from_raw(prior.0.as_ptr()) };
+        drop(boxed);
+    }
     tracing::info!(path = %path.display(), "shared model reloaded after SD swap");
     Ok(family)
 }
@@ -1282,6 +1300,66 @@ mod tests {
         );
 
         // Suppress unused warning on the mock server field.
+        let _ = server.bytes_written();
+    }
+
+    #[tokio::test]
+    async fn stream_abort_preserves_pre_tail_prose_on_long_lead_in() {
+        // 2026-08-15 audit regression: a beat LONGER than the detector's
+        // 200-word tail buffer that loops at the end must finalize with the
+        // FULL lead-in intact. The old path replaced full_content with the
+        // detector's tail-window truncation — the first ~150 words of good
+        // narration silently vanished from the stored turn.
+        let lead_in: String = (0..250)
+            .map(|i| format!("lead{i} "))
+            .collect::<Vec<_>>()
+            .join("");
+        let loop_phrase = "The smuggler turns and runs away. ";
+        let mut lines = vec![sse_chunk(&lead_in)];
+        for _ in 0..4 {
+            lines.push(sse_chunk(loop_phrase));
+        }
+
+        let server = MockSseServer::spawn(lines);
+        let backend = backend_for(&server.url);
+
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let on_chunk: ChunkFn = std::sync::Arc::new(|_: &str| {});
+        let messages = vec![crate::session::ApiMessage {
+            role: "system".into(),
+            content: "test".into(),
+            raw_output: String::new(),
+        }];
+
+        let result = backend
+            .stream(messages, None, None, Vec::new(), 1024, on_chunk, cancel)
+            .await
+            .expect("stream should complete (not error)");
+
+        // The pre-tail lead-in survived — the very first words of the beat
+        // are still in the stored prose (the tail-buffer path dropped them).
+        assert!(
+            result.content.starts_with("lead0 lead1 lead2"),
+            "pre-tail prose must survive the kill-switch finalization, got: {}…",
+            result.content.chars().take(80).collect::<String>()
+        );
+        assert!(
+            result.content.contains("lead249 "),
+            "the tail-adjacent lead-in must also survive, got tail: {}…",
+            result.content.chars().rev().take(80).collect::<String>()
+        );
+        // The loop is still cut to one instance.
+        assert_eq!(
+            result.content.matches("The smuggler turns and runs away").count(),
+            1,
+            "the looped phrase must appear exactly once"
+        );
+        // And the result matches running the post-gen truncator over the
+        // full text directly (the single-source-of-truth contract).
+        let expected = crate::stream_filter::truncate_repetition(&format!(
+            "{lead_in}{loop_phrase}{loop_phrase}{loop_phrase}{loop_phrase}"
+        ));
+        assert_eq!(result.content, expected);
         let _ = server.bytes_written();
     }
 

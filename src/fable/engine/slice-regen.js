@@ -74,14 +74,20 @@ function resolveSelection() {
   const startText = closestTextEl(range.startContainer);
   const endText = closestTextEl(range.endContainer);
   if (!startText || startText !== endText) return null;
-  const beat = startText.closest('.fable-mes.assistant');
+  const beat = startText.closest('.fable-mes');
   if (!beat) return null;
-  if (beat.classList.contains('editing')) return null;
-  if (beat.classList.contains('streaming')) return null;
-  if (beat.classList.contains('slice-regenerating')) return null;
-  // Empty-string selection guard (a click can leave a non-collapsed range
-  // whose toString is whitespace-only).
-  if (!range.toString().trim()) return null;
+  // (#62) The base gate runs through the exported, unit-tested predicate —
+  // the single source of truth. resolveSelection adds only what the
+  // DOM-free predicate can't model: same-beat anchors (above) + the
+  // detached-DOM guard (below).
+  if (!isSliceEligible({
+    role: beat.classList.contains('assistant') ? 'assistant' : 'user',
+    editing: beat.classList.contains('editing'),
+    streaming: beat.classList.contains('streaming'),
+    sliceRegenerating: beat.classList.contains('slice-regenerating'),
+    collapsed: sel.isCollapsed,
+    emptyText: !range.toString().trim(),
+  })) return null;
   // Detached-DOM guard (P2 fix): after a feed rebuild (chat-side messages
   // event, an edit/rewind elsewhere) the Range still resolves on the
   // DETACHED tree — closest() works on detached nodes. Clicking the pencil

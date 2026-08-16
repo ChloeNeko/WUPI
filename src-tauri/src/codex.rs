@@ -156,97 +156,165 @@ async fn seed_compound_codex<E: Embedder>(
         return Ok(report);
     }
 
-    // Embed-cap gate: split any entry whose body exceeds the 1400-char bge-small
-    // window into paginated "Title - Part N" children BEFORE the reconcile loop.
-    // Post-parse/pre-reconcile placement keeps the parts the canonical title-
-    // keyed set (idempotent re-seeds) and guarantees every body reaching
-    // `add_codex_entry` is ≤1400 (see memory.rs's clamp for the final backstop).
-    let sources = expand_oversize_entries(sources);
+    // Chunk-budget gate: split any entry whose body exceeds the 1300-char
+    // CHUNK_CHAR_BUDGET into paginated "Title - Part N" children BEFORE the
+    // reconcile loop. Post-parse/pre-reconcile placement keeps the parts the
+    // canonical title-keyed set (idempotent re-seeds) and guarantees every
+    // body reaching `add_codex_entry` is ≤1300 — under the ~1400-char bge
+    // truncate (see memory.rs's clamp for the final backstop).
+    //
+    // Duplicate-title disambiguation runs FIRST (before the part split, so
+    // an oversize duplicate's parts derive from its disambiguated title):
+    // two source entries sharing a title (reachable with zero authoring
+    // mistakes — front-matter that omits `title:` falls back to the same
+    // stem) previously collapsed in the title-keyed reconcile map,
+    // last-wins, and the loser's row became an unreachable zombie the purge
+    // loop could never see. Later dupes are deterministically renamed
+    // "Title (N)" (file order, N from 2) so every boot maps the same source
+    // entry to the same title → re-seeds stay idempotent.
+    let sources = expand_oversize_entries(dedupe_duplicate_titles(sources));
 
-    // Reconcile diff: title-keyed, hash-detected.
+    // Reconcile diff: title-keyed, hash-detected. Rows are grouped per title
+    // in Vecs — a title may LEGITIMATELY have multiple stored rows (legacy
+    // duplicate-title damage, or pre-disambiguation seeds); grouping keeps
+    // every row reachable by the purge loop instead of collapsing the map
+    // last-wins (the 2026-08-15 audit: the loser's id became permanently
+    // undeletable — `wipe_episodic_card` preserves codex rows, so no path
+    // could ever remove it).
     let existing = engine.list_codex_entries(card_id).await?;
-    let mut existing_by_title: HashMap<String, (MemoryId, Option<String>)> = HashMap::new();
+    let mut existing_by_title: HashMap<String, Vec<(MemoryId, Option<String>)>> = HashMap::new();
     for (id, metadata_json) in existing {
         let title = extract_metadata_field(metadata_json.as_deref(), "title").unwrap_or_default();
-        existing_by_title.insert(
-            title,
-            (id, extract_metadata_field(metadata_json.as_deref(), "hash")),
-        );
+        existing_by_title
+            .entry(title)
+            .or_default()
+            .push((id, extract_metadata_field(metadata_json.as_deref(), "hash")));
     }
     let mut consumed: HashSet<String> = HashSet::new();
 
     for src in &sources {
-        let stored_hash = existing_by_title
-            .get(&src.title)
-            .and_then(|(_, h)| h.clone());
-        let stored_hash_u64 = stored_hash.as_deref().and_then(|s| s.parse::<u64>().ok());
-        match stored_hash_u64 {
-            Some(h) if h == src.hash => {
-                report.unchanged += 1;
+        // Take ALL stored rows for this title — matched keepers, stale-hash
+        // rows, and same-title duplicates are handled in one pass.
+        let had_rows;
+        let mut kept_one = false;
+        let mut delete_failed = false;
+        match existing_by_title.remove(&src.title) {
+            Some(rows) => {
+                had_rows = true;
+                for (id, hash) in rows {
+                    let hash_matches = hash
+                        .as_deref()
+                        .and_then(|s| s.parse::<u64>().ok())
+                        .map(|h| h == src.hash)
+                        .unwrap_or(false);
+                    if hash_matches && !kept_one {
+                        // Keep exactly one row with the current hash.
+                        kept_one = true;
+                    } else {
+                        // Stale hash (an update) or a duplicate row of the
+                        // same title (the zombie heal) → delete.
+                        if let Err(e) = engine.delete_memory(id).await {
+                            tracing::warn!(
+                                title = %src.title,
+                                error = %format!("{e}"),
+                                namespace,
+                                "compound codex update: failed to delete old entry; skipping"
+                            );
+                            delete_failed = true;
+                        }
+                    }
+                }
+            }
+            None => {
+                had_rows = false;
+            }
+        }
+        if kept_one {
+            report.unchanged += 1;
+            consumed.insert(src.title.clone());
+            continue;
+        }
+        // No stored row matched the current hash: insert the source entry
+        // (a brand-new seed, or an update after the deletes above). A failed
+        // delete skips the insert so we never mint a second row for a title
+        // whose stale row still lives.
+        if delete_failed {
+            continue;
+        }
+        match insert_entry(engine, src, card_id, namespace).await {
+            Ok(()) => {
+                if had_rows {
+                    report.updated += 1;
+                } else {
+                    report.seeded += 1;
+                }
                 consumed.insert(src.title.clone());
             }
-            Some(_) => {
-                // Hash differs → delete old, insert new.
-                if let Some(&(old_id, _)) = existing_by_title.get(&src.title) {
-                    if let Err(e) = engine.delete_memory(old_id).await {
-                        tracing::warn!(
-                            title = %src.title,
-                            error = %format!("{e}"),
-                            namespace,
-                            "compound codex update: failed to delete old entry; skipping"
-                        );
-                        continue;
-                    }
-                }
-                match insert_entry(engine, src, card_id, namespace).await {
-                    Ok(()) => {
-                        report.updated += 1;
-                        consumed.insert(src.title.clone());
-                    }
-                    Err(e) => tracing::warn!(
-                        title = %src.title,
-                        error = %format!("{e}"),
-                        namespace,
-                        "compound codex update insert failed"
-                    ),
-                }
-            }
-            None => match insert_entry(engine, src, card_id, namespace).await {
-                Ok(()) => {
-                    report.seeded += 1;
-                    consumed.insert(src.title.clone());
-                }
-                Err(e) => tracing::warn!(
-                    title = %src.title,
-                    error = %format!("{e}"),
-                    namespace,
-                    "compound codex seed insert failed"
-                ),
-            },
+            Err(e) => tracing::warn!(
+                title = %src.title,
+                error = %format!("{e}"),
+                namespace,
+                "compound codex insert failed"
+            ),
         }
     }
-    // Purge stored entries whose source no longer exists.
-    for (title, (id, _)) in &existing_by_title {
+    // Purge stored entries whose source no longer exists. `existing_by_title`
+    // now holds ONLY unconsumed titles (consumed ones were `remove`d above),
+    // and every row under them is deletable — the grouped-Vec fix means a
+    // legacy duplicate row can no longer hide from this loop.
+    for (title, rows) in &existing_by_title {
         if !consumed.contains(title) {
-            match engine.delete_memory(*id).await {
-                Ok(()) => report.purged += 1,
-                Err(e) => tracing::warn!(
-                    title = %title,
-                    error = %format!("{e}"),
-                    namespace,
-                    "compound codex orphan purge failed"
-                ),
+            for (id, _) in rows {
+                match engine.delete_memory(*id).await {
+                    Ok(()) => report.purged += 1,
+                    Err(e) => tracing::warn!(
+                        title = %title,
+                        error = %format!("{e}"),
+                        namespace,
+                        "compound codex orphan purge failed"
+                    ),
+                }
             }
         }
     }
     Ok(report)
 }
 
-/// Expand any entry whose body exceeds the 1400-character embedding cap into
-/// paginated `"{title} - Part N"` children. Each part is ≤1300 chars, split on
-/// sentence/paragraph boundaries via [`crate::memory::chunk_text`] (reused from
-/// the episodic chunker — its 1300 budget sits safely under the 1400 cap; bge-
-/// small silently truncates anything longer, corrupting the vector).
+/// Deterministically disambiguate duplicate titles in parsed sources: the
+/// first occurrence keeps the title; later duplicates become `"{title} ({n})"`
+/// (n from 2, skipping collisions). Warns per rename. Pure — same input,
+/// same output, so re-seeds reconcile cleanly on the renamed key.
+fn dedupe_duplicate_titles(sources: Vec<ParsedEntry>) -> Vec<ParsedEntry> {
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut out = Vec::with_capacity(sources.len());
+    for mut src in sources {
+        if seen.insert(src.title.clone()) {
+            out.push(src);
+            continue;
+        }
+        let mut n = 2;
+        while !seen.insert(format!("{} ({})", src.title, n)) {
+            n += 1;
+        }
+        let renamed = format!("{} ({})", src.title, n);
+        tracing::warn!(
+            original = %src.title,
+            renamed = %renamed,
+            "compound codex: duplicate entry title — later entry disambiguated"
+        );
+        src.title = renamed;
+        out.push(src);
+    }
+    out
+}
+
+/// Expand any entry whose body exceeds the episodic chunker's
+/// [`CHUNK_CHAR_BUDGET`] (1300) into paginated `"{title} - Part N"` children,
+/// each within that budget, split on sentence/paragraph boundaries via
+/// [`crate::memory::chunk_text`] (reused from the episodic chunker). Gating at
+/// the SAME budget the episodic path uses keeps codex rows consistent with
+/// chat rows; bge-small silently truncates bodies >~1400 chars, so 1300 also
+/// sits safely under that cap.
 ///
 /// **Placement matters:** called post-parse + pre-reconcile in
 /// [`seed_compound_codex`], so the parts become the canonical title-keyed set.
@@ -256,11 +324,12 @@ async fn seed_compound_codex<E: Embedder>(
 ///
 /// Each part's hash is `DefaultHasher` over its part body (deterministic), so a
 /// body edit changes the parts' hashes + triggers an `updated` reconcile.
-/// Entries already ≤1400 pass through unchanged. A single-chunk split (the body
-/// fit one chunk, e.g. a 1401-char body) collapses back to the original title
-/// (no spurious "Part 1").
+/// Entries already ≤1300 pass through unchanged. (A single-chunk split is
+/// unreachable in practice — every chunk is ≤1300, so any body >1300 must
+/// yield ≥2 — but the n==1 branch stays as a defensive collapse-to-original
+/// in case `chunk_text`'s budget ever drifts above the gate.)
 pub(crate) fn expand_oversize_entries(sources: Vec<ParsedEntry>) -> Vec<ParsedEntry> {
-    const CAP: usize = 1400;
+    const CAP: usize = crate::memory::CHUNK_CHAR_BUDGET;
     let mut out = Vec::with_capacity(sources.len());
     for src in sources {
         if src.body.len() <= CAP {
@@ -273,7 +342,7 @@ pub(crate) fn expand_oversize_entries(sources: Vec<ParsedEntry>) -> Vec<ParsedEn
             title = %src.title,
             body_chars = src.body.len(),
             parts = n,
-            "codex entry exceeds the 1400-char embedding cap; auto-splitting into paginated parts"
+            "codex entry exceeds the 1300-char chunk budget; auto-splitting into paginated parts"
         );
         for (i, body) in chunks.into_iter().enumerate() {
             let title = if n > 1 {
@@ -445,7 +514,28 @@ pub fn split_compound(text: &str) -> Vec<&str> {
     // matter key — the shape `format_compound_text` always emits after an
     // opener. A bare blank-preceded `---` (a body horizontal rule or a
     // fenced-code delimiter) stays inside the current entry.
-    let lines: Vec<&str> = text.lines().collect();
+    //
+    // Each line's byte span in `text` is recorded alongside it so the final
+    // slices are exact views of the ORIGINAL text. A find()-based re-slice of
+    // LF-joined lines never matches inside a CRLF file (`lines()` strips the
+    // `\r`, so the joined chunk is not a substring) and silently dropped
+    // every entry — a `.codex` saved by Windows Notepad seeded nothing.
+    let mut lines: Vec<&str> = Vec::new();
+    let mut spans: Vec<(usize, usize)> = Vec::new();
+    let mut pos = 0usize;
+    for line in text.split('\n') {
+        // Mirror `str::lines()`: strip one trailing '\r' from the content.
+        let content_end = pos + line.strip_suffix('\r').map_or(line.len(), str::len);
+        lines.push(&text[pos..content_end]);
+        spans.push((pos, content_end));
+        pos += line.len() + 1;
+    }
+    // `str::lines()` yields no trailing empty line — drop the phantom entry
+    // `split('\n')` produces for a newline-terminated text.
+    if text.ends_with('\n') {
+        lines.pop();
+        spans.pop();
+    }
     let mut starts: Vec<usize> = Vec::new();
     for (i, line) in lines.iter().enumerate() {
         if line.trim() == "---" {
@@ -463,7 +553,7 @@ pub fn split_compound(text: &str) -> Vec<&str> {
             vec![text]
         };
     }
-    let mut chunks = Vec::new();
+    let mut out = Vec::new();
     for (idx, &start) in starts.iter().enumerate() {
         let end = if idx + 1 < starts.len() {
             // Up to the blank line preceding the next fence.
@@ -471,20 +561,14 @@ pub fn split_compound(text: &str) -> Vec<&str> {
         } else {
             lines.len()
         };
-        let chunk: String = lines[start..end].join("\n");
-        if !chunk.trim().is_empty() {
-            chunks.push(chunk);
+        if end <= start {
+            continue;
         }
-    }
-    // Re-slice from `text` by computing byte offsets from the joined lines so
-    // we return `&str` slices into the original (cheapest path: no clone).
-    let mut out = Vec::new();
-    let mut cursor = 0usize;
-    for chunk_str in &chunks {
-        if let Some(pos) = text[cursor..].find(chunk_str.as_str()) {
-            let abs = cursor + pos;
-            out.push(&text[abs..abs + chunk_str.len()]);
-            cursor = abs + chunk_str.len();
+        // The chunk spans the first line's start byte to the last line's
+        // content end (interior line terminators, LF or CRLF, ride along).
+        let chunk = &text[spans[start].0..spans[end - 1].1];
+        if !chunk.trim().is_empty() {
+            out.push(chunk);
         }
     }
     out
@@ -644,6 +728,36 @@ fn extract_metadata_field(metadata_json: Option<&str>, key: &str) -> Option<Stri
 mod tests {
     use super::*;
 
+    /// 2026-08-15 audit fix: duplicate source titles are deterministically
+    /// disambiguated — same input, same output (idempotent re-seeds), and
+    /// the fallback-stem collision (two front-matter blocks omitting
+    /// `title:`) is covered too.
+    #[test]
+    fn dedupe_duplicate_titles_renames_deterministically() {
+        let mk = |title: &str, body: &str| ParsedEntry {
+            title: title.into(),
+            tags: vec![],
+            body: body.into(),
+            hash: 0,
+        };
+        let sources = vec![mk("Lore", "a"), mk("Other", "b"), mk("Lore", "c"), mk("Lore", "d")];
+        let out = dedupe_duplicate_titles(sources);
+        let titles: Vec<&str> = out.iter().map(|s| s.title.as_str()).collect();
+        assert_eq!(titles, vec!["Lore", "Other", "Lore (2)", "Lore (3)"]);
+        // Deterministic: a second run over the same shape produces the same
+        // titles (re-seed idempotence rides on this).
+        let again = dedupe_duplicate_titles(vec![mk("Lore", "a"), mk("Lore", "c"), mk("Lore", "d")]);
+        let titles2: Vec<&str> = again.iter().map(|s| s.title.as_str()).collect();
+        assert_eq!(titles2, vec!["Lore", "Lore (2)", "Lore (3)"]);
+        // A source title colliding with an auto-renamed form disambiguates
+        // off ITS OWN text (nested suffix — deterministic + unique, which
+        // is the contract; pretty-printing collided collisions isn't worth
+        // parsing the suffix back off).
+        let tricky = dedupe_duplicate_titles(vec![mk("Lore", "a"), mk("Lore", "b"), mk("Lore (2)", "c")]);
+        let titles3: Vec<&str> = tricky.iter().map(|s| s.title.as_str()).collect();
+        assert_eq!(titles3, vec!["Lore", "Lore (2)", "Lore (2) (2)"]);
+    }
+
     #[test]
     fn split_compound_one_entry() {
         let text = "---\ntitle: One\ntags: a, b\n---\n\nbody one.\n";
@@ -701,6 +815,27 @@ mod tests {
         let text = "---\ntitle: One\n---\n\nbody one.\n\n---\ntitle: Two\n---\n\nbody two.\n";
         let parts = split_compound(text);
         assert_eq!(parts.len(), 2);
+    }
+
+    /// CRLF files (Windows Notepad saves) must split + parse identically to
+    /// LF files. The old find()-based re-slice of LF-joined chunks never
+    /// matched inside CRLF text and silently dropped EVERY entry.
+    #[test]
+    fn split_compound_crlf_roundtrip() {
+        let text = "---\r\ntitle: One\r\ntags: a\r\n---\r\n\r\nbody one.\r\n\r\n---\r\ntitle: Two\r\n---\r\n\r\nbody two.\r\n";
+        let parts = split_compound(text);
+        assert_eq!(parts.len(), 2, "CRLF entries must not be silently dropped");
+        let (t1, _) = parse_front_matter(split_front_matter(parts[0]).0, "x");
+        let (t2, _) = parse_front_matter(split_front_matter(parts[1]).0, "x");
+        assert_eq!(t1, "One");
+        assert_eq!(t2, "Two");
+        let (_, b1) = split_front_matter(parts[0]);
+        assert_eq!(b1.trim(), "body one.");
+        // The full parse path (what the seeder runs) must yield both entries.
+        let entries = parse_compound_text(text, "stem");
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].title, "One");
+        assert_eq!(entries[1].title, "Two");
     }
 
     #[test]
@@ -800,9 +935,15 @@ mod tests {
         };
         let out = expand_oversize_entries(vec![src]);
         assert!(out.len() >= 2, "should split into >=2 parts, got {}", out.len());
-        // Every part body fits the embed cap.
+        // Every part body fits the chunk budget.
         for p in &out {
-            assert!(p.body.len() <= 1400, "part '{}' is {} chars (>1400)", p.title, p.body.len());
+            assert!(
+                p.body.len() <= crate::memory::CHUNK_CHAR_BUDGET,
+                "part '{}' is {} chars (> budget {})",
+                p.title,
+                p.body.len(),
+                crate::memory::CHUNK_CHAR_BUDGET
+            );
         }
         // Paginated titles.
         let titles: Vec<&str> = out.iter().map(|p| p.title.as_str()).collect();
@@ -836,6 +977,27 @@ mod tests {
         assert_eq!(out[0].title, "Short");
         assert_eq!(out[0].body, "tiny body.");
         assert_eq!(out[0].hash, 42); // pass-through keeps the original hash
+    }
+
+    /// The 1301–1400 band: over the 1300 chunk budget but under the ~1400 bge
+    /// truncate. It used to bypass the split entirely (only the embedder clamp
+    /// guarded it); the gate now sits at the chunk budget, so it splits.
+    #[test]
+    fn expand_oversize_entries_splits_the_1301_to_1400_band() {
+        let body = "x".repeat(crate::memory::CHUNK_CHAR_BUDGET + 50);
+        assert!(body.len() > crate::memory::CHUNK_CHAR_BUDGET);
+        assert!(body.len() <= 1400, "test body must stay in the band");
+        let src = ParsedEntry {
+            title: "Band".to_string(),
+            tags: vec![],
+            body,
+            hash: 7,
+        };
+        let out = expand_oversize_entries(vec![src]);
+        assert!(out.len() >= 2, "band body must split, got {}", out.len());
+        for p in &out {
+            assert!(p.body.len() <= crate::memory::CHUNK_CHAR_BUDGET);
+        }
     }
 
     /// Same source ⇒ same parts + same per-part hashes ⇒ the reconcile reports

@@ -153,10 +153,21 @@ const TRACKER_MAX_TOKENS: i32 = 256;
 // accumulated since, the model has transitioned from tracking to narrating →
 // snipe.
 //
-// This correctly permits multi-bracket turns ([PACK …] [TIME …] — the tail
-// re-opens `[`, no snipe) and only fires on the genuine failure (a bracket set
-// followed by newline + prose). Cheap: one byte scan per token over the tail
-// since the last `]` (the typical tail is < 30 chars).
+// This correctly permits multi-bracket turns ([PACK …] [TIME …] — while
+// inside a bracket body, chars never count as prose) and only fires on the
+// genuine failure (a bracket set followed by newline + prose). Cheap: one
+// byte scan per token over the tail since the last `]` (the typical tail is
+// < 30 chars).
+//
+// (2026-08-15 audit C1 fix) The original counter reset on `[`/`]` but still
+// ACCUMULATED inside bracket bodies — any bracket after the first whose
+// body reached 8 cumulative non-whitespace chars (`[TIME Day 2, 14:00]`,
+// `[PRESENCE mara …]` — i.e. nearly all of them) tripped the sniper
+// mid-body, decapitating the bracket before its `]` arrived. The parser
+// then silently dropped the unterminated remnant: multi-bracket turns lost
+// their 2nd+ state mutations with zero errors (the T52 "mid-bracket
+// decapitation" previously blamed on the 150-token wall was this). The fix
+// is an `inside_bracket` toggle: prose counts ONLY outside brackets.
 //
 // The sniper is the PRIMARY stop. TRACKER_MAX_TOKENS (256) is the wall behind
 // it. Together they guarantee a tracker turn ends in seconds, not minutes.
@@ -171,44 +182,60 @@ struct TrackerSniper {
     /// True once at least one `]` (a closed bracket) has been seen in the
     /// reply text. The sniper only fires AFTER a bracket has closed — turns
     /// that emit no brackets are left to run to EOG/max_tokens (a bracket-less
-    /// tracker turn is a valid "nothing changed" outcome, not rambling).
+    /// tracker turn is a valid "nothing changed" outcome, not rambling), and
+    /// prose BEFORE the first close is tolerated (a tracker may emit a short
+    /// preamble before its first bracket — rare, but tolerated).
     seen_closed_bracket: bool,
-    /// The number of non-whitespace, non-`[`/`]` chars accumulated since the
-    /// last `]`. Reset to 0 whenever a `[` opens (the model started a new
-    /// bracket) or a `]` closes.
+    /// True between a `[` and its closing `]`. While inside, chars never
+    /// count as prose — later bracket bodies routinely exceed the grace
+    /// window (`[TIME Day 2, 14:00]` is 8+ non-space chars) and must not
+    /// trip the sniper mid-body (the 2026-08-15 C1 fix).
+    inside_bracket: bool,
+    /// The number of non-whitespace chars accumulated since the last `]`
+    /// (or `[`) while OUTSIDE brackets.
     prose_since_close: usize,
 }
 
 impl TrackerSniper {
     fn new() -> Self {
-        Self { seen_closed_bracket: false, prose_since_close: 0 }
+        Self {
+            seen_closed_bracket: false,
+            inside_bracket: false,
+            prose_since_close: 0,
+        }
     }
 
     /// Feed one decoded piece (already appended to the reply stream). Returns
     /// true if the sniper should fire (early-stop the decode).
     fn feed(&mut self, piece: &str) -> bool {
-        if !self.seen_closed_bracket {
-            // Pre-first-close: scan for the FIRST `]` so we know tracking has
-            // begun. We don't count prose here (a tracker may emit a short
-            // preamble before its first bracket — rare, but tolerated).
-            if piece.contains(']') {
-                self.seen_closed_bracket = true;
-                // Reset the prose counter; start counting AFTER this close.
-                self.prose_since_close = 0;
-            }
-            return false;
-        }
-        // Post-first-close: classify each char. `[` resets (new bracket
-        // opening — not prose). `]` resets (a bracket closed — still
-        // tracking). Anything non-whitespace increments the prose counter.
+        // Per-char state machine (the old per-piece pre-close free-pass
+        // lumped a whole piece together; per-char keeps bracket-open state
+        // correct when a `[` and its text share a piece with the close).
         for ch in piece.chars() {
             match ch {
-                '[' => self.prose_since_close = 0,
-                ']' => self.prose_since_close = 0,
-                c if c.is_whitespace() => { /* whitespace doesn't count */ }
-                _ => self.prose_since_close += 1,
+                '[' => {
+                    self.inside_bracket = true;
+                    self.prose_since_close = 0;
+                }
+                ']' => {
+                    self.inside_bracket = false;
+                    self.seen_closed_bracket = true;
+                    self.prose_since_close = 0;
+                }
+                c if c.is_whitespace() => { /* whitespace never counts */ }
+                _ => {
+                    // Prose: counted ONLY after the first close AND outside
+                    // any bracket. Pre-first-close prose (a preamble) and
+                    // bracket-body chars are tolerated by design.
+                    if self.seen_closed_bracket && !self.inside_bracket {
+                        self.prose_since_close += 1;
+                    }
+                }
             }
-            if self.prose_since_close >= SNIPER_PROSE_GRACE_CHARS {
+            if self.seen_closed_bracket
+                && !self.inside_bracket
+                && self.prose_since_close >= SNIPER_PROSE_GRACE_CHARS
+            {
                 return true;
             }
         }
@@ -1071,6 +1098,73 @@ mod tests {
         let json = serde_json::to_string(&reply).expect("serializes");
         assert!(json.contains("scene text"));
         assert!(json.contains("\"cancelled\":false"));
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // TrackerSniper (2026-08-15 audit C1 regression tests). The old counter
+    // accumulated whitespace-free prose INSIDE bracket bodies, so every
+    // bracket after the first got decapitated mid-body. These pin the fixed
+    // contract: prose counts ONLY outside brackets, after the first close.
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// THE C1 invariant: a multi-bracket turn (the T52 shape — inventory +
+    /// time + presence in one turn) must complete WITHOUT a snipe, even
+    /// though the 2nd+ bracket bodies each exceed the grace window in
+    /// non-whitespace chars.
+    #[test]
+    fn sniper_permits_multi_bracket_turns() {
+        let mut s = TrackerSniper::new();
+        for piece in [
+            "[PACK name=\"Iron Ingot\" qty=2]",
+            "\n",
+            "[TIME Day 2, 14:00]",
+            " ",
+            "[PRESENCE mara \"behind the bar\"]",
+        ] {
+            assert!(!s.feed(piece), "sniper must not fire on bracket body: {piece}");
+        }
+    }
+
+    /// A bracket arriving complete in ONE token piece must also survive (the
+    /// per-char loop must reach the `]` before the 8th body char counts —
+    /// inside-bracket chars never count).
+    #[test]
+    fn sniper_permits_single_piece_second_bracket() {
+        let mut s = TrackerSniper::new();
+        assert!(!s.feed("[BELT name=Knife]"));
+        assert!(!s.feed(" "));
+        assert!(!s.feed("[TIME 09:00]"), "8 body chars inside the bracket must not snipe");
+    }
+
+    /// The genuine failure mode still fires: sustained prose AFTER a closed
+    /// bracket (the bracket→prose transition the sniper exists to kill).
+    #[test]
+    fn sniper_fires_on_sustained_prose_after_brackets() {
+        let mut s = TrackerSniper::new();
+        assert!(!s.feed("[TIME 09:00]"));
+        assert!(!s.feed("\nThe "));
+        assert!(s.feed("fog settles"), "8+ outside-bracket prose chars must snipe");
+    }
+
+    /// Prose BEFORE the first close is tolerated (the documented preamble
+    /// allowance — pre-first-close prose never counts).
+    #[test]
+    fn sniper_tolerates_preamble_before_first_bracket() {
+        let mut s = TrackerSniper::new();
+        assert!(!s.feed("Tracking this turn now: "));
+        assert!(!s.feed("[EFFECT Berserk buff 60]"));
+        assert!(!s.feed(" short"));
+        assert!(s.feed(" tail prose"));
+    }
+
+    /// An UNTERMINATED bracket never counts its body as prose — the decode
+    /// runs to the TRACKER_MAX_TOKENS wall instead (the wall is the correct
+    /// stop for that shape; sniping mid-bracket would decapitate it).
+    #[test]
+    fn sniper_waits_on_unterminated_bracket() {
+        let mut s = TrackerSniper::new();
+        assert!(!s.feed("[EFFECT Rage buff 60] "));
+        assert!(!s.feed("[BELT name=Very Long Knife Name Indeed"));
     }
 
     /// Constants are sane (compile-time sanity check).

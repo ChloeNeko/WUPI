@@ -24,18 +24,13 @@
 //! `'static` and `&mut self` isn't `'static`. (The original spec had
 //! `&mut self`; verdict E on spawn_blocking supersedes it.)
 //!
-//! # What's NOT here yet
+//! # Historical notes
 //!
-//! - Wiring into `AppState` / `chat_send`. Blocked on the §2F cache-invalidation
-//!   decision (tail-injection vs accept-cold-reset).
-//! - The real `LlamaCppEmbedder` (`Embed.gguf` is BERT, not Gemma: a new load
-//!   path, not a chat-engine reuse).
-//! - `debug_memory_query` IPC.
-//! - Chunking (the 512-token BERT context limit is documented but unenforced).
-//!
-//! This module compiles as dead code in v1: it is the foundation Phase 2.5
-//! builds on. Items are `pub` for the future wiring; unused warnings are
-//! suppressed via the `#![allow(dead_code)]` at the bottom of the module.
+//! (This block once listed AppState/chat_send wiring, the real llama
+//! embedder, `debug_memory_query`, + chunking as "not here yet" — all four
+//! shipped long ago. The module is fully live: wired into every chat +
+//! Fable turn, embedded via the dedicated BERT thread, debuggable via the
+//! 🧠 panel IPC, and chunking lives in [`chunk_text`].)
 
 use std::path::Path;
 use std::sync::{Arc, Mutex, Once};
@@ -133,6 +128,18 @@ pub struct MemoryEntry {
     /// needs >1 chunk). Set on every chunk of a multi-chunk turn so a future
     /// "coalesce siblings" hydration can reconstruct the original message.
     pub parent_uuid: Option<String>,
+    /// Turn grouping key (§4 retention, 2026-08-15): minted ONCE per archived
+    /// turn by the call site (`new_turn_uuid`) and threaded through BOTH
+    /// `add_memory` calls of the turn (user + assistant), so every row of the
+    /// turn — across both messages and all their chunks — shares one id.
+    /// This is what lets the prune evict WHOLE turns atomically instead of
+    /// punching half-turn holes (deleting the assistant's chunks while the
+    /// paired user message survives). `None` on codex rows and on legacy rows
+    /// written before the column existed (those evict as ungrouped singles:
+    /// they are the oldest by id anyway). Distinct from [`Self::parent_uuid`],
+    /// which groups chunks of ONE message only and is NULL on single-chunk
+    /// rows — neither key subsumes the other.
+    pub turn_uuid: Option<String>,
 }
 
 /// The default `card_id` for memory that belongs to no specific simulation -
@@ -210,13 +217,29 @@ pub const CODEX_CARD_ID: &str = "__codex__";
 // it (shouldn't, but defense-in-depth), the embedder still truncates cleanly
 // rather than producing a garbage full-length embedding.
 
-/// Target maximum character length of a chunk. Chunks may be slightly shorter
-/// (when a paragraph/sentence boundary lands before the budget) but never
-/// longer unless a single paragraph + sentence has no internal break at all
-/// (the hard-cut fallback). 1,300 chars ≈ ~300-500 BERT tokens for typical
-/// English, leaving ~100-200 tokens of headroom below the 512 ceiling even on
-/// sub-token-heavy roleplay text.
+/// Target maximum length of a chunk, enforced on UTF-8 BYTES (2026-08-15
+/// doc fix: the constant's CHAR name predates the byte comparisons — bytes
+/// are the conservative bound, ≤ the char count, and every slice is
+/// char-boundary safe). Chunks may be slightly shorter (when a
+/// paragraph/sentence boundary lands before the budget) but never longer
+/// unless a single paragraph + sentence has no internal break at all (the
+/// hard-cut fallback). 1,300 bytes ≈ ~300-500 BERT tokens for typical
+/// English, leaving ~100-200 tokens of headroom below the 512 ceiling even
+/// on sub-token-heavy roleplay text.
 pub const CHUNK_CHAR_BUDGET: usize = 1300;
+
+/// Retention watermark: the maximum number of EPISODIC rows a card partition
+/// may hold before the next archival fires the prune (§4 retention policy,
+/// 2026-08-15). Per-partition (per `card_id`, including [`WUPI_CARD_ID`] —
+/// Wupi's own chat memory is capped by the same mechanism). Codex rows and
+/// the sentinel partitions are NEVER counted or evicted (the Codex Lock).
+pub const MAX_EPISODIC_CHUNKS: usize = 2000;
+
+/// Hysteresis floor for the prune: when a partition crosses
+/// [`MAX_EPISODIC_CHUNKS`], eviction runs until the episodic row count drops
+/// to THIS value, so the prune fires once per ~200 rows of growth instead of
+/// on every single turn at the boundary. Must stay < [`MAX_EPISODIC_CHUNKS`].
+pub const EPISODIC_PRUNE_TARGET: usize = 1800;
 
 /// A search result carrying its fused RRF score.
 ///
@@ -244,8 +267,12 @@ pub struct RankedMemory {
 /// decide whether the floor should move.
 #[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct DebugScores {
-    /// Raw cosine similarity of the query to this memory (`1 - vec0 distance`).
-    /// Present only when the memory surfaced via the dense path.
+    /// TRUE cosine similarity of the query to this memory — the L2→cosine
+    /// conversion (`cos = 1 − d²/2`) applied at the single consumption
+    /// point, comparable 1:1 with the startup self-test and
+    /// [`crate::memory_rrf::DENSE_COSINE_FLOOR`] (the 2026-08-15 scale fix
+    /// retired the old mislabeled `1 − distance` axis). Present only when
+    /// the memory surfaced via the dense path.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub dense_cosine: Option<f32>,
     /// 1-based rank within the dense list (post-floor). `None` if the memory
@@ -534,12 +561,19 @@ impl<E: Embedder> MemoryEngine<E> {
     /// ignore the return value. `metadata_json` is hardcoded `None` (use
     /// [`Self::add_codex_entry`] for authored reference lore with metadata).
     /// `card_id` is the partition key: see [`WUPI_CARD_ID`].
+    ///
+    /// **Turn grouping (§4 retention):** `turn_uuid` is minted ONCE per turn
+    /// by the archival call site ([`new_turn_uuid`]) and passed to BOTH the
+    /// user + assistant calls of that turn, so all rows of the turn share it
+    /// and the prune can evict whole turns. `None` leaves the column NULL
+    /// (codex paths, tests).
     pub async fn add_memory(
         &self,
         text: String,
         card_id: &str,
         role: Role,
         salience: f32,
+        turn_uuid: Option<&str>,
     ) -> anyhow::Result<MemoryId> {
         // Chunk first (cheap: pure string work, no embedding). Filtering
         // empty chunks here means the embedder never sees empty input (which
@@ -559,9 +593,12 @@ impl<E: Embedder> MemoryEngine<E> {
             let embedding = self.embedder.embed(text.clone()).await?;
             let conn = self.conn.clone();
             let card_id = card_id.to_owned();
+            // Owned: the spawn_blocking closure must be 'static, and the
+            // caller's &str borrow isn't (same reason card_id is cloned).
+            let turn_uuid = turn_uuid.map(str::to_owned);
             let id = tokio::task::spawn_blocking(move || -> anyhow::Result<MemoryId> {
-                let c = conn.lock().expect("memory conn mutex");
-                insert_in_transaction(&c, &text, &card_id, None, role, salience, 0, None, None, &embedding)
+                let c = lock_conn(&conn);
+                insert_in_transaction(&c, &text, &card_id, None, role, salience, 0, None, None, turn_uuid.as_deref(), &embedding)
             })
             .await
             .map_err(|e| anyhow::anyhow!("add_memory join: {e}"))??;
@@ -572,7 +609,10 @@ impl<E: Embedder> MemoryEngine<E> {
         // the embedder is single-threaded by design: a dedicated wupi-embedder
         // thread owns the !Send LlamaContext; parallel embeds would just queue
         // at the channel anyway). Collect (text, vector) pairs, then one
-        // spawn_blocking inserts them all in a sequence of transactions.
+        // spawn_blocking inserts them ALL inside a SINGLE transaction: a
+        // mid-sequence failure persists NOTHING (no partial message on disk —
+        // each row was already 3-table atomic, but the message itself used to
+        // land row-by-row).
         //
         // The shared parent_uuid: we use the FIRST chunk's autoincrement id
         // (minted inside the insert) cast to a string as the grouping key. So
@@ -590,25 +630,32 @@ impl<E: Embedder> MemoryEngine<E> {
 
         let conn = self.conn.clone();
         let card_id = card_id.to_owned();
+        // Owned for the 'static closure (see the single-chunk path).
+        let turn_uuid = turn_uuid.map(str::to_owned);
         let first_id = tokio::task::spawn_blocking(move || -> anyhow::Result<MemoryId> {
-            let c = conn.lock().expect("memory conn mutex");
+            let c = lock_conn(&conn);
+            let tx = c
+                .unchecked_transaction()
+                .map_err(|e| anyhow::anyhow!("begin chunk txn: {e:?}"))?;
             // Chunk 0: parent_uuid filled in after we know the id.
-            let first_id = insert_in_transaction(
-                &c, &embedded[0].0, &card_id, None, role, salience, 0, None, None, &embedded[0].1,
+            let first_id = insert_row(
+                &tx, &embedded[0].0, &card_id, None, role, salience, 0, None, None, turn_uuid.as_deref(), &embedded[0].1,
             )?;
             let parent = first_id.to_string();
             // Chunks 1..N: parent_uuid = the first chunk's id, chunk_index increments.
             for (idx, (text, vec)) in embedded.iter().enumerate().skip(1) {
-                insert_in_transaction(
-                    &c, text, &card_id, None, role, salience, idx as i32, None, Some(&parent), vec,
+                insert_row(
+                    &tx, text, &card_id, None, role, salience, idx as i32, None, Some(&parent), turn_uuid.as_deref(), vec,
                 )?;
             }
             // Close the loop: chunk 0 joins its siblings under the same key.
-            c.execute(
+            tx.execute(
                 "UPDATE memories SET parent_uuid = ?1 WHERE id = ?2",
                 params![&parent, first_id],
             )
             .map_err(|e| anyhow::anyhow!("update chunk 0 parent_uuid: {e:?}"))?;
+            tx.commit()
+                .map_err(|e| anyhow::anyhow!("commit chunk txn: {e:?}"))?;
             Ok(first_id)
         })
         .await
@@ -657,7 +704,7 @@ impl<E: Embedder> MemoryEngine<E> {
         // passes through as the Ok value) but this keeps the two methods
         // structurally parallel.
         Ok(tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<RankedMemory>> {
-            let c = conn.lock().expect("memory conn mutex");
+            let c = lock_conn(&conn);
             // Degrade to dense-only if FTS5 fails. The sparse and dense paths
             // are independent backends: a syntax error in one (e.g. an FTS5
             // operator char that slipped past sanitization) must not kill the
@@ -740,7 +787,7 @@ impl<E: Embedder> MemoryEngine<E> {
         let active_card_owned = active_card_id.to_owned();
         let conn = self.conn.clone();
         Ok(tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<RankedMemory>> {
-            let c = conn.lock().expect("memory conn mutex");
+            let c = lock_conn(&conn);
 
             // Query each partition independently. FTS5 degrades to dense-only
             // on syntax error (same resilience as `search`).
@@ -839,7 +886,7 @@ impl<E: Embedder> MemoryEngine<E> {
         let active_card_owned = active_card_id.to_owned();
         let conn = self.conn.clone();
         Ok(tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<RankedMemory>> {
-            let c = conn.lock().expect("memory conn mutex");
+            let c = lock_conn(&conn);
 
             // Query each partition independently. FTS5 degrades to dense-only
             // on syntax error (same resilience as `search` / `search_wupi_visible`).
@@ -965,7 +1012,7 @@ impl<E: Embedder> MemoryEngine<E> {
         let card_id = card_id.to_owned();
         let metadata = metadata_json; // already owned
         let id = tokio::task::spawn_blocking(move || -> anyhow::Result<MemoryId> {
-            let c = conn.lock().expect("memory conn mutex");
+            let c = lock_conn(&conn);
             insert_in_transaction(
                 &c,
                 &text,
@@ -979,6 +1026,8 @@ impl<E: Embedder> MemoryEngine<E> {
                       // splits oversize bodies into "Part N" entries pre-embed
                       // (codex::expand_oversize_entries), + add_codex_entry
                       // clamps the embed input as a final backstop.
+                None, // turn_uuid: codex rows are never turn-grouped (the
+                      // prune's Codex Lock excludes them anyway).
                 &embedding,
             )
         })
@@ -994,7 +1043,7 @@ impl<E: Embedder> MemoryEngine<E> {
     pub async fn delete_memory(&self, id: MemoryId) -> anyhow::Result<()> {
         let conn = self.conn.clone();
         tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
-            let c = conn.lock().expect("memory conn mutex");
+            let c = lock_conn(&conn);
             let tx = c
                 .unchecked_transaction()
                 .map_err(|e| anyhow::anyhow!("begin delete txn: {e:?}"))?;
@@ -1030,11 +1079,11 @@ impl<E: Embedder> MemoryEngine<E> {
         let conn = self.conn.clone();
         let card_id = card_id.to_owned();
         Ok(tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<MemoryEntry>> {
-            let c = conn.lock().expect("memory conn mutex");
+            let c = lock_conn(&conn);
             let mut stmt = c
                 .prepare(
                     "SELECT id, text_content, timestamp, role, chunk_index, salience,
-                            metadata_json, card_id, session_id, parent_uuid
+                            metadata_json, card_id, session_id, parent_uuid, turn_uuid
                      FROM memories
                      WHERE card_id = ?1
                      ORDER BY id DESC
@@ -1086,7 +1135,7 @@ impl<E: Embedder> MemoryEngine<E> {
         let embedding = self.embedder.embed(embed_input).await?;
         let conn = self.conn.clone();
         tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
-            let c = conn.lock().expect("memory conn mutex");
+            let c = lock_conn(&conn);
             let emb_bytes = embed_to_bytes(&embedding);
             let tx = c
                 .unchecked_transaction()
@@ -1145,7 +1194,7 @@ impl<E: Embedder> MemoryEngine<E> {
         let conn = self.conn.clone();
         let card_id = card_id.to_owned();
         Ok(tokio::task::spawn_blocking(move || -> anyhow::Result<usize> {
-            let c = conn.lock().expect("memory conn mutex");
+            let c = lock_conn(&conn);
             // 1. Collect codex ids to preserve. The LIKE pre-filter keeps this
             //    cheap; is_codex is the authoritative check on the candidates.
             let mut stmt = c
@@ -1230,6 +1279,241 @@ impl<E: Embedder> MemoryEngine<E> {
         .map_err(|e| anyhow::anyhow!("wipe_episodic_card join: {e}"))??)
     }
 
+    /// Prune a card's EPISODIC memory to the retention watermark (§4,
+    /// 2026-08-15). When the partition holds more than [`MAX_EPISODIC_CHUNKS`]
+    /// episodic rows, evict WHOLE TURNS — oldest first, by the `turn_uuid`
+    /// grouping key — until the count drops to [`EPISODIC_PRUNE_TARGET`]: the
+    /// hysteresis that keeps the prune from firing on every turn once the
+    /// partition sits at the boundary.
+    ///
+    /// **The Codex Lock, two guards:**
+    /// 1. Sentinel partitions (`__wupi_system__`, `__fable_system__`,
+    ///    `__codex__`) are refused outright. [`WUPI_CARD_ID`] is deliberately
+    ///    NOT refused — Wupi's episodic chat memory is capped by the same
+    ///    mechanism as every card.
+    /// 2. Inside a normal card partition, codex rows (metadata-tagged lore)
+    ///    are never counted and never evicted: the per-card `.codex` seeds
+    ///    survive every prune.
+    ///
+    /// **Turn-atomicity:** the walk collects rows in `id` (insertion) order;
+    /// when the cut lands mid-turn, the expansion pass pulls in EVERY row
+    /// sharing a touched `turn_uuid`, so a turn is either fully present or
+    /// fully gone — never the assistant's chunks surviving while the paired
+    /// user message evaporates. Legacy NULL-turn rows (written before the
+    /// column existed) evict as ungrouped singles: they are the oldest by id,
+    /// so FIFO sweeps them first anyway.
+    ///
+    /// Off the hot path by contract: called from the detached archival spawn
+    /// after the turn's inserts commit. Pure SQL — no embedder, no engine
+    /// locks. Returns the number of core rows deleted (0 = under cap).
+    pub async fn prune_episodic_card(&self, card_id: &str) -> anyhow::Result<usize> {
+        self.prune_episodic_card_with(card_id, MAX_EPISODIC_CHUNKS, EPISODIC_PRUNE_TARGET)
+            .await
+    }
+
+    /// The testable core of [`Self::prune_episodic_card`]: identical logic
+    /// with caller-supplied watermark/target so tests exercise eviction
+    /// without inserting production-scale row counts.
+    pub async fn prune_episodic_card_with(
+        &self,
+        card_id: &str,
+        cap: usize,
+        target: usize,
+    ) -> anyhow::Result<usize> {
+        anyhow::ensure!(
+            card_id != WUPI_SYSTEM_CARD_ID
+                && card_id != FABLE_SYSTEM_CARD_ID
+                && card_id != CODEX_CARD_ID,
+            "prune refused: {card_id:?} is a sentinel partition (Codex Lock)"
+        );
+        let conn = self.conn.clone();
+        let card_id = card_id.to_owned();
+        Ok(tokio::task::spawn_blocking(move || -> anyhow::Result<usize> {
+            let c = lock_conn(&conn);
+            // Episodic = rows without codex metadata (Codex Lock guard 2:
+            // `add_memory` hardcodes metadata_json = None; only
+            // `add_codex_entry` writes it). Codex rows are neither counted
+            // nor evicted.
+            let count: i64 = c
+                .query_row(
+                    "SELECT COUNT(*) FROM memories WHERE card_id = ?1 AND metadata_json IS NULL",
+                    params![&card_id],
+                    |r| r.get(0),
+                )
+                .map_err(|e| anyhow::anyhow!("prune count: {e:?}"))?;
+            if (count as usize) <= cap {
+                return Ok(0);
+            }
+            let excess = (count as usize).saturating_sub(target);
+
+            // Walk oldest-first, collecting row ids until `excess` is covered,
+            // and note which turn groups the cut touched. Set membership (not a
+            // Vec): the expansion below unions ids in, and a contains() scan
+            // over thousands of legacy-drain ids would be quadratic.
+            let mut stmt = c
+                .prepare(
+                    "SELECT id, turn_uuid FROM memories
+                     WHERE card_id = ?1 AND metadata_json IS NULL
+                     ORDER BY id ASC",
+                )
+                .map_err(|e| anyhow::anyhow!("prepare prune walk: {e:?}"))?;
+            let rows = stmt
+                .query_map(params![&card_id], |r| {
+                    Ok((r.get::<_, MemoryId>(0)?, r.get::<_, Option<String>>(1)?))
+                })
+                .map_err(|e| anyhow::anyhow!("query prune walk: {e:?}"))?;
+            let mut delete_set: std::collections::HashSet<MemoryId> =
+                std::collections::HashSet::with_capacity(excess);
+            let mut touched: std::collections::HashSet<String> =
+                std::collections::HashSet::new();
+            for row in rows {
+                let (id, turn) = row.map_err(|e| anyhow::anyhow!("prune walk row: {e:?}"))?;
+                if delete_set.len() >= excess {
+                    break;
+                }
+                delete_set.insert(id);
+                if let Some(t) = turn {
+                    touched.insert(t);
+                }
+            }
+            drop(stmt); // release the borrowed statement before the expansion.
+            let touched_turns: Vec<String> = touched.into_iter().collect();
+
+            // Expansion: the cut may have landed mid-turn. Pull in every row
+            // sharing a touched turn key so eviction is turn-atomic.
+            // (turn_uuid is only ever written on episodic rows, but the
+            // metadata predicate stays — the Codex Lock is belt-and-braces at
+            // every delete site. Chunked for the same bound-variable reason
+            // as the delete below.)
+            for turn_chunk in touched_turns.chunks(500) {
+                let placeholders: String = (0..turn_chunk.len())
+                    .map(|i| format!("?{}", i + 2))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let sql = format!(
+                    "SELECT id FROM memories
+                     WHERE card_id = ?1 AND metadata_json IS NULL
+                       AND turn_uuid IN ({placeholders})"
+                );
+                let mut params_vec: Vec<&dyn rusqlite::ToSql> =
+                    Vec::with_capacity(1 + turn_chunk.len());
+                params_vec.push(&card_id);
+                for t in turn_chunk {
+                    params_vec.push(t);
+                }
+                let mut stmt = c
+                    .prepare(&sql)
+                    .map_err(|e| anyhow::anyhow!("prepare prune expand: {e:?}"))?;
+                let rows = stmt
+                    .query_map(params_vec.as_slice(), |r| r.get::<_, MemoryId>(0))
+                    .map_err(|e| anyhow::anyhow!("query prune expand: {e:?}"))?;
+                for row in rows {
+                    let id = row.map_err(|e| anyhow::anyhow!("prune expand row: {e:?}"))?;
+                    delete_set.insert(id);
+                }
+                drop(stmt);
+            }
+
+            if delete_set.is_empty() {
+                return Ok(0);
+            }
+            let delete_ids: Vec<MemoryId> = delete_set.into_iter().collect();
+
+            // One transaction: delete the core rows, then orphan-sweep the
+            // FTS5 + vec0 mirrors (same discipline as wipe_episodic_card —
+            // this txn's core delete is the only one, so the orphan set is
+            // exactly our id set). The id list is chunked at 500: a legacy
+            // partition that drifted far over the watermark (nothing pruned
+            // it before this shipped) can hand us thousands of ids, and an
+            // IN-list with one placeholder per id would brush SQLite's
+            // bound-variable ceiling.
+            let tx = c
+                .unchecked_transaction()
+                .map_err(|e| anyhow::anyhow!("begin prune txn: {e:?}"))?;
+            let mut deleted = 0usize;
+            for chunk in delete_ids.chunks(500) {
+                let placeholders: String = (0..chunk.len())
+                    .map(|i| format!("?{}", i + 1))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let sql = format!("DELETE FROM memories WHERE id IN ({placeholders})");
+                deleted += tx
+                    .execute(&sql, rusqlite::params_from_iter(chunk.iter().copied()))
+                    .map_err(|e| anyhow::anyhow!("prune delete memories: {e:?}"))?;
+            }
+            tx.execute(
+                "DELETE FROM memories_fts WHERE rowid NOT IN (SELECT id FROM memories)",
+                [],
+            )
+            .map_err(|e| anyhow::anyhow!("prune sweep memories_fts: {e:?}"))?;
+            tx.execute(
+                "DELETE FROM memories_vec WHERE rowid NOT IN (SELECT id FROM memories)",
+                [],
+            )
+            .map_err(|e| anyhow::anyhow!("prune sweep memories_vec: {e:?}"))?;
+            tx.commit()
+                .map_err(|e| anyhow::anyhow!("commit prune txn: {e:?}"))?;
+            Ok(deleted)
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("prune join: {e}"))??)
+    }
+
+    /// Nuke an ENTIRE card partition — episodic AND codex rows — across all
+    /// three tables in one transaction. Used by card deletion
+    /// (`fable_card_delete` + the `delete_sim_card` tool): when a card dies
+    /// its folder (saves, session, `.codex` source) goes with it, and the
+    /// memory partition must not survive as ghost rows — a same-slug
+    /// re-create would otherwise inherit the dead run's memories.
+    ///
+    /// Refuses ALL sentinel partitions, including [`WUPI_CARD_ID`]. The
+    /// asymmetry vs [`Self::prune_episodic_card`] (which caps `__wupi__` but
+    /// refuses the system namespaces) is deliberate: prune is routine
+    /// maintenance, purge is destruction, and nothing legitimate ever
+    /// purge-deletes a sentinel through a card-delete path.
+    ///
+    /// Distinct from [`Self::wipe_episodic_card`] — the user-facing Hard
+    /// Reset, which PRESERVES the card's codex lore because the `.codex`
+    /// source file still exists to re-seed from.
+    pub async fn purge_card_partition(&self, card_id: &str) -> anyhow::Result<usize> {
+        anyhow::ensure!(
+            card_id != WUPI_CARD_ID
+                && card_id != WUPI_SYSTEM_CARD_ID
+                && card_id != FABLE_SYSTEM_CARD_ID
+                && card_id != CODEX_CARD_ID,
+            "purge refused: {card_id:?} is a sentinel partition"
+        );
+        let conn = self.conn.clone();
+        let card_id = card_id.to_owned();
+        Ok(tokio::task::spawn_blocking(move || -> anyhow::Result<usize> {
+            let c = lock_conn(&conn);
+            let tx = c
+                .unchecked_transaction()
+                .map_err(|e| anyhow::anyhow!("begin purge txn: {e:?}"))?;
+            let deleted = tx
+                .execute("DELETE FROM memories WHERE card_id = ?1", params![&card_id])
+                .map_err(|e| anyhow::anyhow!("purge memories: {e:?}"))?;
+            // Orphan-sweep the mirrors (same discipline as wipe_episodic_card
+            // + the prune: this txn's core delete is the only one, so the
+            // orphan set is exactly the purged partition's rows).
+            tx.execute(
+                "DELETE FROM memories_fts WHERE rowid NOT IN (SELECT id FROM memories)",
+                [],
+            )
+            .map_err(|e| anyhow::anyhow!("purge sweep memories_fts: {e:?}"))?;
+            tx.execute(
+                "DELETE FROM memories_vec WHERE rowid NOT IN (SELECT id FROM memories)",
+                [],
+            )
+            .map_err(|e| anyhow::anyhow!("purge sweep memories_vec: {e:?}"))?;
+            tx.commit()
+                .map_err(|e| anyhow::anyhow!("commit purge txn: {e:?}"))?;
+            Ok(deleted)
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("purge join: {e}"))??)
+    }
+
     /// List every Codex-tagged entry in a card partition. Returns
     /// `(id, metadata_json)` pairs so the seed reconciler can diff source
     /// files against stored entries (matching on `title`, comparing `hash`).
@@ -1248,7 +1532,7 @@ impl<E: Embedder> MemoryEngine<E> {
         let conn = self.conn.clone();
         let card_id = card_id.to_owned();
         Ok(tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<(MemoryId, Option<String>)>> {
-            let c = conn.lock().expect("memory conn mutex");
+            let c = lock_conn(&conn);
             // Cheap pre-filter: any metadata_json at all (codex rows always
             // have one; episodic turns are NULL). The authoritative kind check
             // happens in Rust on the fetched rows.
@@ -1324,7 +1608,12 @@ fn init_schema(conn: &Connection) -> anyhow::Result<()> {
             -- whole-message rows AND on single-chunk messages (the common
             -- case stays zero-overhead). Set only when add_memory fans one long
             -- turn into >1 chunk; all chunks of a message share this UUID.
-            parent_uuid    TEXT
+            parent_uuid    TEXT,
+            -- Turn grouping key (§4 retention): one id per archived TURN,
+            -- shared by the user + assistant add_memory calls and all their
+            -- chunks. The prune evicts whole turns via this key. NULL on
+            -- codex rows + legacy pre-column rows.
+            turn_uuid      TEXT
         );
 
         -- Index card_id so the retrieval subquery `WHERE card_id = ?` is a
@@ -1350,6 +1639,10 @@ fn init_schema(conn: &Connection) -> anyhow::Result<()> {
     // when the column is absent. Idempotent + safe on fresh DBs (the CREATE
     // TABLE above already added it; the probe finds it and skips the ALTER).
     migrate_add_column(conn, "memories", "parent_uuid", "TEXT")?;
+    // Same additive pattern for the turn key (§4 retention). Legacy rows keep
+    // NULL and evict as ungrouped singles — they are the oldest by id, so FIFO
+    // sweeps them first anyway.
+    migrate_add_column(conn, "memories", "turn_uuid", "TEXT")?;
 
     // §8C data migration: the Wupi-assistant card_id sentinel was renamed
     // from `__wupi_os__` to `__wupi__` (constant WUPI_OS_CARD_ID → WUPI_CARD_ID).
@@ -1585,6 +1878,24 @@ fn split_long_paragraph(para: &str) -> Vec<String> {
     out
 }
 
+/// Lock the shared SQLite connection, RECOVERING from mutex poisoning.
+///
+/// A panic while holding the conn mutex would otherwise poison it and fail
+/// EVERY later memory op for the rest of the process lifetime (search,
+/// archival, the codex seed — the whole engine). The guarded state (the
+/// SQLite connection) lives outside the lock's own bookkeeping, and every
+/// mutation here runs inside its own transaction, so proceeding with the
+/// recovered guard is safe: the panicked op either rolled back or committed
+/// atomically — the connection is never observed half-mutated.
+fn lock_conn(conn: &Mutex<Connection>) -> std::sync::MutexGuard<'_, Connection> {
+    conn.lock().unwrap_or_else(|poisoned| {
+        tracing::error!(
+            "memory conn mutex poisoned by a prior panic; recovering the guard"
+        );
+        poisoned.into_inner()
+    })
+}
+
 /// Insert one memory into all three tables inside a single transaction.
 ///
 /// `memories` is written first to mint the id via `last_insert_rowid()`; that
@@ -1604,6 +1915,34 @@ fn insert_in_transaction(
     chunk_index: i32,
     metadata_json: Option<&str>,
     parent_uuid: Option<&str>,
+    turn_uuid: Option<&str>,
+    embedding: &[f32],
+) -> anyhow::Result<MemoryId> {
+    let tx = conn
+        .unchecked_transaction()
+        .map_err(|e| anyhow::anyhow!("begin txn: {e:?}"))?;
+    let id = insert_row(&tx, text, card_id, session_id, role, salience, chunk_index, metadata_json, parent_uuid, turn_uuid, embedding)?;
+    tx.commit()
+        .map_err(|e| anyhow::anyhow!("commit txn: {e:?}"))?;
+    Ok(id)
+}
+
+/// The three-table insert WITHOUT its own transaction: the caller owns the
+/// transaction (single-row callers go through [`insert_in_transaction`]; the
+/// multi-chunk archival path wraps ALL sibling chunks in ONE transaction so a
+/// mid-sequence failure persists nothing — no partial message on disk).
+#[allow(clippy::too_many_arguments)]
+fn insert_row(
+    tx: &rusqlite::Transaction<'_>,
+    text: &str,
+    card_id: &str,
+    session_id: Option<&str>,
+    role: Role,
+    salience: f32,
+    chunk_index: i32,
+    metadata_json: Option<&str>,
+    parent_uuid: Option<&str>,
+    turn_uuid: Option<&str>,
     embedding: &[f32],
 ) -> anyhow::Result<MemoryId> {
     // Defensive: vec0 will reject a wrong-length blob with an opaque error;
@@ -1617,17 +1956,13 @@ fn insert_in_transaction(
 
     let ts = unix_now();
 
-    let tx = conn
-        .unchecked_transaction()
-        .map_err(|e| anyhow::anyhow!("begin txn: {e:?}"))?;
-
     // 1. Mint the id from the core table. `Option<&str>` implements ToSql
     // directly (None → SQL NULL, Some → TEXT): no intermediate dyn indirection
     // needed (which would borrow a local pattern binding and fail E0597).
     tx.execute(
-        "INSERT INTO memories (text_content, timestamp, role, chunk_index, salience, metadata_json, card_id, session_id, parent_uuid)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-        params![text, ts, role.as_str(), chunk_index, salience, metadata_json, card_id, session_id, parent_uuid],
+        "INSERT INTO memories (text_content, timestamp, role, chunk_index, salience, metadata_json, card_id, session_id, parent_uuid, turn_uuid)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+        params![text, ts, role.as_str(), chunk_index, salience, metadata_json, card_id, session_id, parent_uuid, turn_uuid],
     )
     .map_err(|e| anyhow::anyhow!("insert memories: {e:?}"))?;
 
@@ -1647,9 +1982,6 @@ fn insert_in_transaction(
         params![id, emb_bytes],
     )
     .map_err(|e| anyhow::anyhow!("insert memories_vec: {e:?}"))?;
-
-    tx.commit()
-        .map_err(|e| anyhow::anyhow!("commit txn: {e:?}"))?;
 
     Ok(id)
 }
@@ -1797,7 +2129,7 @@ fn vec0_top_k(
 ///
 /// Column order (must match every SELECT in this module):
 /// `id, text_content, timestamp, role, chunk_index, salience,
-///  metadata_json, card_id, session_id, parent_uuid`.
+///  metadata_json, card_id, session_id, parent_uuid, turn_uuid`.
 fn row_to_entry(r: &rusqlite::Row<'_>) -> rusqlite::Result<MemoryEntry> {
     let role_str: String = r.get(3)?;
     Ok(MemoryEntry {
@@ -1812,6 +2144,7 @@ fn row_to_entry(r: &rusqlite::Row<'_>) -> rusqlite::Result<MemoryEntry> {
         card_id: r.get(7)?,
         session_id: r.get(8)?,
         parent_uuid: r.get(9)?,
+        turn_uuid: r.get(10)?,
     })
 }
 
@@ -1831,7 +2164,7 @@ fn fetch_entries(conn: &Connection, fused: &[RankedMemory]) -> anyhow::Result<Ve
         .collect::<Vec<_>>()
         .join(", ");
     let sql = format!(
-        "SELECT id, text_content, timestamp, role, chunk_index, salience, metadata_json, card_id, session_id, parent_uuid
+        "SELECT id, text_content, timestamp, role, chunk_index, salience, metadata_json, card_id, session_id, parent_uuid, turn_uuid
          FROM memories
          WHERE id IN ({placeholders})"
     );
@@ -1854,6 +2187,7 @@ fn fetch_entries(conn: &Connection, fused: &[RankedMemory]) -> anyhow::Result<Ve
             let card_id: String = r.get(7)?;
             let session_id: Option<String> = r.get(8)?;
             let parent_uuid: Option<String> = r.get(9)?;
+            let turn_uuid: Option<String> = r.get(10)?;
             Ok(MemoryEntry {
                 id: r.get(0)?,
                 text_content: r.get(1)?,
@@ -1866,6 +2200,7 @@ fn fetch_entries(conn: &Connection, fused: &[RankedMemory]) -> anyhow::Result<Ve
                 card_id,
                 session_id,
                 parent_uuid,
+                turn_uuid,
             })
         })
         .map_err(|e| anyhow::anyhow!("query fetch_entries: {e:?}"))?;
@@ -1961,6 +2296,24 @@ fn unix_now() -> i64 {
         .unwrap_or(0)
 }
 
+/// Mint a turn grouping key for episodic archival (§4 retention): ONE id per
+/// archived TURN, threaded through both the user + assistant `add_memory`
+/// calls so the prune can evict whole turns. Nanosecond timestamp + a
+/// process-wide sequence counter — unique even under clock weirdness (the
+/// counter alone would suffice; the timestamp keeps ids glanceable in dumps).
+/// Cross-process collision is irrelevant: the prune scopes by `card_id` AND
+/// `turn_uuid` together.
+pub fn new_turn_uuid() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let n = SEQ.fetch_add(1, Ordering::Relaxed);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    format!("turn-{nanos}-{n}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1981,6 +2334,7 @@ mod tests {
                 card_id: "__wupi__".to_owned(),
                 session_id: None,
                 parent_uuid: None,
+                turn_uuid: None,
             },
             score: 0.0,
             debug: DebugScores::default(),
@@ -2286,5 +2640,232 @@ mod tests {
         assert!(WUPI_SYSTEM_CARD_ID.ends_with("__"));
         assert!(FABLE_SYSTEM_CARD_ID.starts_with("__"));
         assert!(FABLE_SYSTEM_CARD_ID.ends_with("__"));
+    }
+
+    // === Engine-backed retention tests (§4, 2026-08-15) =====================
+    //
+    // The first SQLite+vec0+FTS5 integration harness in this suite: a real
+    // `MemoryEngine` over a tempfile DB with the CUDA-free `StubEmbedder`
+    // (dim = EMBED_DIM), exercising the real schema/migration, insert, prune,
+    // and purge paths end-to-end — including the three-table delete
+    // discipline (core + FTS5 + vec0 must agree after every eviction).
+    mod retention {
+        use crate::memory::{
+            new_turn_uuid, MemoryEngine, MemoryEntry, RankedMemory, Role, CODEX_CARD_ID,
+            FABLE_SYSTEM_CARD_ID, WUPI_CARD_ID, WUPI_SYSTEM_CARD_ID,
+        };
+        use crate::memory_embedder::{StubEmbedder, EMBED_DIM};
+
+        type Engine = MemoryEngine<StubEmbedder>;
+
+        fn open_engine() -> (Engine, tempfile::TempDir) {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let engine = MemoryEngine::open(
+                &dir.path().join("memory.sqlite"),
+                StubEmbedder { dim: EMBED_DIM },
+            )
+            .expect("open engine");
+            (engine, dir)
+        }
+
+        /// Archive one turn the way lib.rs does: both messages under ONE
+        /// turn_uuid. `asst` long enough to exceed CHUNK_CHAR_BUDGET forces
+        /// multi-chunk when requested.
+        async fn archive_turn(
+            engine: &Engine,
+            card: &str,
+            turn: &str,
+            user: &str,
+            asst: &str,
+        ) {
+            engine
+                .add_memory(user.to_owned(), card, Role::User, 1.0, Some(turn))
+                .await
+                .expect("archive user");
+            engine
+                .add_memory(asst.to_owned(), card, Role::Assistant, 1.0, Some(turn))
+                .await
+                .expect("archive assistant");
+        }
+
+        async fn turn_ids(engine: &Engine, card: &str) -> Vec<Option<String>> {
+            engine
+                .list_memories(card, 10_000, 0)
+                .await
+                .expect("list")
+                .into_iter()
+                .map(|e| e.turn_uuid)
+                .collect()
+        }
+
+        /// Both messages of a turn — and every chunk of a multi-chunk
+        /// message — carry the SAME turn_uuid; codex entries stay NULL.
+        #[tokio::test]
+        async fn turn_uuid_threads_across_messages_and_chunks() {
+            let (engine, _dir) = open_engine();
+            let long_asst = "sentence. ".repeat(300); // > CHUNK_CHAR_BUDGET → chunks
+            archive_turn(&engine, "card-a", "t1", "hello", &long_asst).await;
+            engine
+                .add_codex_entry(
+                    "authored lore".to_owned(),
+                    "card-a",
+                    1.0,
+                    r#"{"kind":"codex","title":"lore"}"#.to_owned(),
+                )
+                .await
+                .expect("codex");
+
+            let rows = engine.list_memories("card-a", 100, 0).await.expect("list");
+            let grouped: Vec<&MemoryEntry> =
+                rows.iter().filter(|e| e.metadata_json.is_none()).collect();
+            assert!(grouped.len() > 2, "long assistant should chunk: got {} rows", grouped.len());
+            for e in &grouped {
+                assert_eq!(e.turn_uuid.as_deref(), Some("t1"), "every turn row shares the key");
+            }
+            let codex: Vec<&MemoryEntry> =
+                rows.iter().filter(|e| e.metadata_json.is_some()).collect();
+            assert_eq!(codex.len(), 1);
+            assert_eq!(codex[0].turn_uuid, None, "codex rows are never turn-grouped");
+        }
+
+        /// Crossing the cap evicts WHOLE oldest turns (the cut expands to
+        /// complete turn groups), keeps recent turns, keeps codex lore, and
+        /// leaves the three tables consistent (search still works).
+        #[tokio::test]
+        async fn prune_evicts_oldest_turns_atomically_keeping_recent_and_codex() {
+            let (engine, _dir) = open_engine();
+            let card = "card-b";
+            for t in ["t-a", "t-b", "t-c"] {
+                archive_turn(&engine, card, t, "question", "answer").await;
+            }
+            engine
+                .add_codex_entry(
+                    "sacred lore".to_owned(),
+                    card,
+                    1.0,
+                    r#"{"kind":"codex","title":"sacred"}"#.to_owned(),
+                )
+                .await
+                .expect("codex");
+
+            // 6 episodic rows = cap → no-op at exactly the watermark.
+            let n = engine.prune_episodic_card_with(card, 6, 3).await.expect("prune at cap");
+            assert_eq!(n, 0, "count == cap must not prune");
+
+            archive_turn(&engine, card, "t-d", "question", "answer").await;
+
+            // 8 rows > cap 6, target 3 → excess 5 → walk hits t-a, t-b, and
+            // HALF of t-c → expansion must finish t-c. Deleted = 6, not 5.
+            let n = engine.prune_episodic_card_with(card, 6, 3).await.expect("prune");
+            assert_eq!(n, 6, "mid-turn cut must expand to whole turns");
+
+            let ids = turn_ids(&engine, card).await;
+            assert_eq!(ids.len(), 3, "t-d (2 rows) + codex (1 row) survive");
+            assert!(ids.iter().all(|t| t.as_deref() == Some("t-d") || t.is_none()),
+                "only t-d + the codex row remain: {ids:?}");
+
+            // Three-table consistency: the surviving rows still search clean.
+            let hits = engine.search("question", card, 5, None).await.expect("search");
+            let episodic_hits: Vec<&RankedMemory> =
+                hits.iter().filter(|h| h.entry.metadata_json.is_none()).collect();
+            assert!(!episodic_hits.is_empty(), "surviving turn still retrievable");
+            for h in &episodic_hits {
+                assert_eq!(h.entry.turn_uuid.as_deref(), Some("t-d"));
+            }
+        }
+
+        /// Legacy rows written before the turn_uuid column existed (NULL key)
+        /// evict as ungrouped singles — FIFO sweeps them first.
+        #[tokio::test]
+        async fn prune_sweeps_legacy_null_turn_rows_as_singles() {
+            let (engine, _dir) = open_engine();
+            let card = "card-c";
+            for i in 0..2 {
+                engine
+                    .add_memory(format!("legacy {i}"), card, Role::User, 1.0, None)
+                    .await
+                    .expect("legacy insert");
+            }
+            archive_turn(&engine, card, "t-x", "q", "a").await;
+            archive_turn(&engine, card, "t-y", "q", "a").await;
+
+            // 6 rows > cap 4, target 2 → excess 4: both legacy singles + all
+            // of t-x. t-y survives.
+            let n = engine.prune_episodic_card_with(card, 4, 2).await.expect("prune");
+            assert_eq!(n, 4);
+            let ids = turn_ids(&engine, card).await;
+            assert_eq!(ids.len(), 2);
+            assert!(ids.iter().all(|t| t.as_deref() == Some("t-y")));
+        }
+
+        /// The Codex Lock guard 1: sentinel partitions are refused outright.
+        #[tokio::test]
+        async fn prune_refuses_sentinel_partitions() {
+            let (engine, _dir) = open_engine();
+            for sentinel in [WUPI_SYSTEM_CARD_ID, FABLE_SYSTEM_CARD_ID, CODEX_CARD_ID] {
+                assert!(
+                    engine.prune_episodic_card_with(sentinel, 0, 0).await.is_err(),
+                    "{sentinel} must be refused"
+                );
+            }
+            // `__wupi__` is NOT refused: Wupi's episodic chat is capped like
+            // any card (it must merely be under the watermark to no-op).
+            assert_eq!(
+                engine.prune_episodic_card_with(WUPI_CARD_ID, 10, 5).await.expect("prune wupi"),
+                0
+            );
+        }
+
+        /// Card deletion nukes the ENTIRE partition — episodic AND codex —
+        /// across all three tables, without touching sibling partitions.
+        #[tokio::test]
+        async fn purge_card_partition_removes_episodic_and_codex_only() {
+            let (engine, _dir) = open_engine();
+            archive_turn(&engine, "ghost-card", "t1", "q", "a").await;
+            engine
+                .add_codex_entry(
+                    "dead lore".to_owned(),
+                    "ghost-card",
+                    1.0,
+                    r#"{"kind":"codex","title":"dead"}"#.to_owned(),
+                )
+                .await
+                .expect("codex");
+            archive_turn(&engine, "live-card", "t2", "q", "a").await;
+
+            let n = engine.purge_card_partition("ghost-card").await.expect("purge");
+            assert_eq!(n, 3, "2 episodic + 1 codex row");
+
+            assert!(engine.list_memories("ghost-card", 100, 0).await.expect("list").is_empty());
+            let hits = engine.search("q", "ghost-card", 5, None).await.expect("search");
+            assert!(hits.is_empty(), "no ghost rows in any table");
+
+            let live = engine.list_memories("live-card", 100, 0).await.expect("list");
+            assert_eq!(live.len(), 2, "sibling partition untouched");
+        }
+
+        /// Purge refuses ALL sentinels — including `__wupi__` (the asymmetry
+        /// vs the prune, which caps it: purge is destruction, and nothing
+        /// legitimate purge-deletes a sentinel through a card-delete path).
+        #[tokio::test]
+        async fn purge_refuses_all_sentinels_including_wupi() {
+            let (engine, _dir) = open_engine();
+            for sentinel in [WUPI_CARD_ID, WUPI_SYSTEM_CARD_ID, FABLE_SYSTEM_CARD_ID, CODEX_CARD_ID] {
+                assert!(
+                    engine.purge_card_partition(sentinel).await.is_err(),
+                    "{sentinel} must be refused"
+                );
+            }
+        }
+
+        /// Turn ids from `new_turn_uuid` are unique across rapid mints (the
+        /// sequence counter is the guarantee; the timestamp is decoration).
+        #[test]
+        fn new_turn_uuid_mints_unique_ids() {
+            let a = new_turn_uuid();
+            let b = new_turn_uuid();
+            assert_ne!(a, b);
+            assert!(a.starts_with("turn-"));
+        }
     }
 }

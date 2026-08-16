@@ -297,6 +297,13 @@ fn compare_dotted(a: &str, b: &str) -> std::cmp::Ordering {
 /// Stream-download `url` into `dest`, emitting `update-progress` events with
 /// the percentage complete. The total size is taken from the Content-Length
 /// header; if absent, no progress events fire (the download just completes).
+///
+/// **Size-bounded (#69):** the zip is a known artifact we build — a sane
+/// hard cap + a Content-Length cross-check keep a wrong/hijacked URL from
+/// filling the disk via `data/_update/portable.zip.part`. Content-Length
+/// over the cap aborts immediately; a stream that outgrows the cap without
+/// one (or lying below it) aborts mid-flight. HTTPS-beta mitigates the
+/// threat, this is the mechanical backstop.
 async fn download_with_progress(
     url: &str,
     dest: &Path,
@@ -305,6 +312,10 @@ async fn download_with_progress(
     use futures_util::StreamExt;
     use tauri::Emitter;
     use tokio::io::AsyncWriteExt;
+
+    /// The WUPI zip ships ~2–4 GB of CUDA DLLs today; 16 GB leaves generous
+    /// growth room while staying under any plausible system disk.
+    const MAX_ZIP_BYTES: u64 = 16 * 1024 * 1024 * 1024;
 
     let client = reqwest::Client::builder()
         .user_agent("wupi-updater")
@@ -319,6 +330,13 @@ async fn download_with_progress(
         return Err(format!("zip status: {}", resp.status()));
     }
     let total = resp.content_length();
+    if let Some(len) = total {
+        if len > MAX_ZIP_BYTES {
+            return Err(format!(
+                "zip Content-Length {len} exceeds the {MAX_ZIP_BYTES}-byte download cap (wrong URL?)"
+            ));
+        }
+    }
     let mut file = tokio::fs::File::create(dest)
         .await
         .map_err(|e| format!("create dest: {e}"))?;
@@ -335,6 +353,11 @@ async fn download_with_progress(
             .await
             .map_err(|e| format!("write chunk: {e}"))?;
         written += chunk.len() as u64;
+        if written > MAX_ZIP_BYTES {
+            return Err(format!(
+                "zip stream outgrew the {MAX_ZIP_BYTES}-byte download cap at {written} bytes (wrong URL?)"
+            ));
+        }
         if let Some(total) = total {
             let pct = (written * 100) / total.max(1);
             // Throttle: only emit on whole-percent change (2/sec cap at full

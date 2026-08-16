@@ -2828,10 +2828,19 @@ fn parse_in_world_time_inner(s: &str) -> Option<i64> {
             if parts.len() == 2 {
                 if let (Ok(h), Ok(m)) = (parts[0].parse::<i64>(), parts[1].parse::<i64>()) {
                     let h = apply_meridian(h, meridian);
-                    hours = h;
-                    minutes = m;
-                    saw_clock = true;
-                    saw_any_signal = true;
+                    // (#56) Range-gate the clock BEFORE it reaches the minute
+                    // arithmetic below: hours/minutes parse as unbounded i64,
+                    // so a degenerate "9000000000000000000:00" overflowed
+                    // `(day-1)*1440 + h*60 + m` in debug (the result clamp in
+                    // `parse_in_world_time` fires too late). An out-of-range
+                    // clock is model garbage — drop the token (no signal), so
+                    // a body of nothing else rejects the whole Time bracket.
+                    if (0..=23).contains(&h) && (0..=59).contains(&m) {
+                        hours = h;
+                        minutes = m;
+                        saw_clock = true;
+                        saw_any_signal = true;
+                    }
                     continue;
                 }
             }
@@ -3535,6 +3544,19 @@ mod tests {
         assert_eq!(parse_in_world_time("   "), None);
         assert_eq!(parse_in_world_time("lunchtime"), None);
         assert_eq!(parse_in_world_time("garbage"), None);
+    }
+
+    #[test]
+    fn parse_in_world_time_out_of_range_clock_is_rejected() {
+        // (#56) A degenerate in-i64-range clock used to reach the minute
+        // arithmetic and overflow `h * 60` (debug panic / release wrap). The
+        // result clamp fired too late; the range gate now rejects the token.
+        assert_eq!(parse_in_world_time("9000000000000000000:00"), None);
+        assert_eq!(parse_in_world_time("25:00"), None);
+        assert_eq!(parse_in_world_time("10:99"), None);
+        // Valid boundary clocks still parse.
+        assert_eq!(parse_in_world_time("00:00"), Some(0));
+        assert_eq!(parse_in_world_time("23:59"), Some(1439));
     }
 
     #[test]

@@ -208,8 +208,8 @@ export function buildStage() {
       <!-- The tracked-stat tab rail (Player / Sim Card / Codex / World / NPC).
            Built by engine/tab-rail.js + injected here in buildStage. Sits
            between the brand + the chat messages. A toggled tab drops down its
-           read-only prose panel; the dropdown collapses on drawer close +
-           re-renders on reopen (the hover-reopen-keeps-active mechanic). -->
+           read-only prose panel; the rail RESETS on drawer close
+           (resetTabRail) + re-selects per open. -->
       <div class="fable-tab-rail-mount" data-tab-rail-mount></div>
       <div class="fable-wupi-messages" data-wupi-messages></div>
       <form class="fable-wupi-input-row" data-wupi-form>
@@ -339,6 +339,30 @@ export async function wireStage(root, hooks) {
   // a raw addEventListener double-binds, making every ✎/🗑/‹› click fire N
   // times (a doubled ✎ opened-then-saved instantly, breaking inline editing
   // from session 2 onward; on a user beat that fired rewind+regen).
+  // (#78) Two-click inline delete confirm — helpers. Native window.confirm
+  // is DEAD in the webview (wry disables default script dialogs: confirm()
+  // always returns false → the delete button was a silent NO-OP). First
+  // click ARMS the button (red heat + 5s auto-disarm); the second click
+  // deletes. The armed state lives on the button node itself, so any feed
+  // rebuild (which replaces the node) disarms for free. One armed button at
+  // a time.
+  const DELETE_ARM_TIMEOUT_MS = 5000;
+  function armDeleteButton(btn) {
+    disarmDeleteButton(btn);
+    btn.dataset.armed = '1';
+    btn.dataset.origTitle = btn.title || '';
+    btn.title = 'Click again to delete';
+    btn._disarmTimer = setTimeout(() => disarmDeleteButton(btn), DELETE_ARM_TIMEOUT_MS);
+  }
+  function disarmDeleteButton(btn) {
+    if (btn._disarmTimer) { clearTimeout(btn._disarmTimer); btn._disarmTimer = null; }
+    if (btn.dataset.armed === '1') {
+      btn.dataset.armed = '';
+      if (btn.dataset.origTitle !== undefined) btn.title = btn.dataset.origTitle;
+      delete btn.dataset.origTitle;
+    }
+  }
+
   on(feedEl, 'click', async (e) => {
     // Both control surfaces route here: the .vn-recent hover toolrail AND
     // the .vn-history iron tools column (same data-drawer-act hooks).
@@ -401,7 +425,15 @@ export async function wireStage(root, hooks) {
         },
       });
     } else if (act === 'delete') {
-      if (!window.confirm('Delete this message?')) return;
+      // (#78) Two-click inline confirm (the #24 API-profile-delete pattern —
+      // see the helpers above): first click arms, second click deletes.
+      if (btn.dataset.armed !== '1') {
+        feedEl.querySelectorAll('[data-drawer-act="delete"][data-armed="1"]')
+          .forEach(disarmDeleteButton);
+        armDeleteButton(btn);
+        return;
+      }
+      disarmDeleteButton(btn);
       narrator.deleteMessage(index);
     } else if (act === 'prev') {
       const active = Number.parseInt(beat.dataset.variantActive || '0', 10);
@@ -409,6 +441,18 @@ export async function wireStage(root, hooks) {
     } else if (act === 'next') {
       const count = Number.parseInt(beat.dataset.variantCount || '1', 10);
       const active = Number.parseInt(beat.dataset.variantActive || '0', 10);
+      // (#84 2026-08-15) Click-time authority: the stamped disabled-state is
+      // advisory and can be stale (a live beat's › is refreshed post-append
+      // now, but a rebuild/append race can still leave it a beat behind).
+      // Re-derive canNext HERE — a non-trailing single-variant beat must
+      // no-op instead of rerolling the trailing turn.
+      const { canNext } = beats.computeDrawerState({
+        role,
+        count,
+        active,
+        isLastAssistant: beats.isTrailingAssistant(beat),
+      });
+      if (!canNext) return;
       const action = beats.swipeNextAction({ count, active });
       if (action.kind === 'swipe') narrator.swipeVariant(index, action.variantIdx);
       else narrator.rerollLastTurn();
@@ -613,12 +657,13 @@ export async function wireStage(root, hooks) {
   on(input, 'input', () => autoGrow(input));
   setGenerating(false);
 
-  // Per-beat UX controls (edit / delete / ‹ › variant nav) are RETIRED
-  // (2026-08-11): the hover side-drawer UI was removed pending a redesign.
-  // The backend mutation API is untouched in narrator.js (editMessage /
-  // deleteMessage / swipeVariant / rerollLastTurn / rewindAndEditUser) +
-  // the pure decision logic survives in engine/drawer-logic.js, ready to
-  // wire to whatever per-beat surface replaces the drawer.
+  // Per-beat UX controls (edit / delete / ‹ › variant nav) live in the
+  // HOVER TOOLRAIL (`.fable-mes-drawer` v2, engine/beats.js) — the gold
+  // corner pair + the role-shaped variant capsule on the 2 latest beats.
+  // This module routes the rail's `[data-drawer-act]` clicks to the
+  // narrator.js mutation API (editMessage / deleteMessage / swipeVariant /
+  // rerollLastTurn / rewindAndEditUser); the pure decision logic lives in
+  // engine/drawer-logic.js.
 
   // Wupi trigger: invisible right-edge strip with a 300ms dwell.
   // No visible button (decision 1). The strip element is sized/positioned
@@ -1141,9 +1186,10 @@ function armCornerDwell() {
   cornerDwellTimer = setTimeout(() => {
     cornerDwellTimer = null;
     wupiDrawer.openDrawer();
-    // Hover-reopen-keeps-active: if a tab was active before the drawer
-    // auto-closed on mouseleave, re-render its dropdown now so it reappears
-    // with the tab still glowing. No-op when no tab is active.
+    // The rail RESETS on drawer close (resetTabRail nulls the active tab),
+    // so there is no "keep the prior tab" on reopen — the open path
+    // re-selects a tab itself. renderActive is the backstop for a tab that
+    // re-selection leaves rendered-but-stale (e.g. data changed mid-close).
     renderActive();
   }, CORNER_DWELL_MS);
 }
@@ -1294,6 +1340,11 @@ export function teardownStage() {
   stageListeners = [];
   cancelCornerDwell();
   cornerTrigger = null;
+  // The LEFT edge dwell timer too (2026-08-15 audit fix): a dwell armed
+  // <300ms before exit fired into the torn-down stage, and the next entry
+  // could start with the left drawer stuck open.
+  cancelLeftCornerDwell();
+  leftCornerTrigger = null;
   saveModalClose = null;
   // Reset the API-lost composer lock so a re-entry isn't stuck greyed out.
   composerLocked = false;

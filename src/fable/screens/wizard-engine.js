@@ -102,11 +102,9 @@ export function conditionalValidate(label, val, enabled) {
 
 export function opt(v) { const s = (v || '').trim(); return s ? s : null; }
 
-export function slugify(name) {
-  const s = (name || '').trim().toLowerCase()
-    .replace(/[^a-z0-9_-]+/g, '-').replace(/^-+|-+$/g, '');
-  return s || 'card';
-}
+// (The unsuffixed `slugify` export was removed 2026-08-15: dead — every
+// importer uses card-serialize.js's slugify, the single CREATE-path slug
+// source that also appends Windows reserved-name suffixes.)
 
 export function esc(s) {
   return String(s || '')

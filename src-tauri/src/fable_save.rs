@@ -77,20 +77,28 @@ pub fn resolve_saves_dir(fable_root: &Path, card_id: &str) -> PathBuf {
     fable_root.join("cards").join(card_id).join("saves")
 }
 
+/// Bare slug-segment sanitizer (separators / parent refs / drive prefixes
+/// → `-`, trimmed, empty → `__unknown__`). Shared by `resolve_save_path`
+/// AND the `create_dir_all` in `write_save` — the mkdir must target the
+/// SAME directory the write does (2026-08-15 audit fix: the mkdir used the
+/// raw id, so an id needing cleaning created a junk directory while the
+/// cleaned write path had no parent).
+fn clean_save_segment(id: &str) -> String {
+    let s: String = id
+        .chars()
+        .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '-' })
+        .collect();
+    let s = s.trim_matches('-').to_string();
+    if s.is_empty() { "__unknown__".to_string() } else { s }
+}
+
 /// Resolve a single save file's path.
 pub fn resolve_save_path(fable_root: &Path, card_id: &str, save_id: &str) -> PathBuf {
     // (P2 hardening) Sanitize BOTH ids to bare slug segments: separators,
     // parent refs, or drive prefixes in a caller-supplied id can never
     // escape the saves tree (fable_delete_save is a destructive consumer).
-    let clean = |id: &str| -> String {
-        let s: String = id
-            .chars()
-            .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '-' })
-            .collect();
-        let s = s.trim_matches('-').to_string();
-        if s.is_empty() { "__unknown__".to_string() } else { s }
-    };
-    resolve_saves_dir(fable_root, &clean(card_id)).join(format!("{}.json", clean(save_id)))
+    resolve_saves_dir(fable_root, &clean_save_segment(card_id))
+        .join(format!("{}.json", clean_save_segment(save_id)))
 }
 
 /// Write a save atomically (temp + rename) so a crashed write never leaves
@@ -103,7 +111,11 @@ pub fn write_save(
     session: &Conversation,
     schema: &WorldSchema,
 ) -> std::io::Result<SaveFile> {
-    let dir = resolve_saves_dir(fable_root, &card.id);
+    // (2026-08-15 audit fix) mkdir from the SANITIZED card id — the write
+    // below goes through `resolve_save_path` (which cleans), so an unclean
+    // mkdir created a junk directory AND missed the real one (File::create
+    // then failed on a missing parent).
+    let dir = resolve_saves_dir(fable_root, &clean_save_segment(&card.id));
     std::fs::create_dir_all(&dir)?;
 
     let is_autosave = save_id == AUTOSAVE_ID;
@@ -127,8 +139,15 @@ pub fn write_save(
     // Atomic write pattern (matches session.rs / schema.rs): write temp +
     // fsync + rename. The temp lives in the same dir/volume so the rename
     // is atomic on Windows (MOVEFILE_REPLACE_EXISTING).
-    let tmp_path = final_path.with_extension("json.tmp");
-    let _ = std::fs::remove_file(&tmp_path); // clear a stale temp from a prior crash
+    //
+    // (#59) The temp name is UNIQUE per write (pid + process-local counter):
+    // a manual save racing the detached per-turn autosave on the SAME slot
+    // used to share one fixed `<slot>.json.tmp` — two open handles on one
+    // file interleaved writes and could corrupt the slot. Unique names mean
+    // each racing writer stages its own file; the rename keeps last-writer-
+    // wins semantics. Stale temps from crashed writes can never collide
+    // (different counter/pid) and are invisible to list_saves (.tmp ext).
+    let tmp_path = final_path.with_extension(format!("json.{}", unique_tmp_suffix()));
     let write_result: std::io::Result<()> = (|| {
         use std::io::Write;
         let mut f = std::fs::File::create(&tmp_path)?;
@@ -137,12 +156,21 @@ pub fn write_save(
         atomic_rename(&tmp_path, &final_path)
     })();
     if let Err(e) = write_result {
-        // Never leave the temp behind on a failed write (list_saves ignores
-        // it, but a stale *.json.tmp in the slot dir is grime).
+        // Never leave THIS write's temp behind on failure (list_saves
+        // ignores .tmp files, but stale temps in the slot dir are grime).
         let _ = std::fs::remove_file(&tmp_path);
         return Err(e);
     }
     Ok(save)
+}
+
+/// Per-write temp suffix: `<pid>.<counter>.tmp`. Uniqueness is what makes
+/// concurrent same-slot writes safe (#59); `Relaxed` is correct (no
+/// dependent data rides on the counter).
+fn unique_tmp_suffix() -> String {
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    format!("{}.{}.tmp", std::process::id(), n)
 }
 
 
@@ -160,10 +188,10 @@ pub fn list_saves(fable_root: &Path, card_id: &str) -> std::io::Result<Vec<SaveM
         if path.extension().and_then(|x| x.to_str()) != Some("json") {
             continue;
         }
-        // Skip the temp files written mid-atomic-rename.
-        if path.file_stem().and_then(|s| s.to_str()) == Some("*.tmp") {
-            continue;
-        }
+        // (The pre-#59 fixed-name `<slot>.json.tmp` skip is gone: unique
+        // per-write temp suffixes end in `.tmp`, so the extension check
+        // above already excludes them — the old file_stem=="*.tmp" guard
+        // was dead code that could never match.)
         // Read just enough to pull the metadata header. serde_json needs the
         // full file but the payloads are small (a few KB), so we don't
         // bother with a streaming parser.

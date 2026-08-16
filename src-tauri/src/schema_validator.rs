@@ -276,6 +276,20 @@ pub fn validate(delta: &SchemaDelta, ctx: &ValidationContext<'_>) -> Result<(), 
                                 reason: format!("serializes to {val_len} chars; max {MAX_VALUE_LEN}"),
                             });
                         }
+                        // (2026-08-15 audit fix) The serialized form escapes
+                        // control chars per spec, but the STORED Value keeps
+                        // raw NULs etc. inside nested strings — the same
+                        // bytes a top-level string value is rejected for.
+                        // Storage hygiene (entities never render into
+                        // prompts): recurse into the Value::String leaves.
+                        if nested_string_has_control_chars(other) {
+                            return Err(ValidationFailure::InvalidValue {
+                                key: key.clone(),
+                                reason:
+                                    "contains control characters inside a nested string (newlines allowed; strip other control chars)"
+                                        .to_string(),
+                            });
+                        }
                     }
                 }
             }
@@ -323,6 +337,20 @@ fn has_disallowed_control_chars(s: &str) -> bool {
     })
 }
 
+/// Same control-char rule as [`has_disallowed_control_chars`], applied to
+/// every `Value::String` LEAF inside a structured entity value (objects +
+/// arrays recurse). The serialized form escapes control chars per spec, but
+/// the stored `Value` keeps the raw bytes — this keeps nested strings to the
+/// same hygiene bar as top-level string values.
+fn nested_string_has_control_chars(v: &serde_json::Value) -> bool {
+    match v {
+        serde_json::Value::String(s) => has_disallowed_control_chars(s),
+        serde_json::Value::Array(a) => a.iter().any(nested_string_has_control_chars),
+        serde_json::Value::Object(o) => o.values().any(nested_string_has_control_chars),
+        _ => false,
+    }
+}
+
 /// Stricter variant for KEYS: keys should never contain control chars at all
 /// (including newlines — a key with a newline is always model noise).
 fn has_control_chars(s: &str) -> bool {
@@ -368,10 +396,46 @@ mod tests {
 
     #[test]
     fn accepts_delete_signal() {
-        // None = delete key. Always valid regardless of key shape (it's
-        // removing, not setting).
+        // None = delete key. Valid regardless of key shape (there's no value
+        // to check) — but NOT unconditionally: the immutability lock rejects
+        // a delete when the ctx carries immutable + existing keys containing
+        // it (see `immutability_rejects_delete_of_existing_key`). This test
+        // runs with a bare ctx, so the delete passes.
         let mut ents = HashMap::new();
         ents.insert("item.iron_sword".to_string(), None);
+        let delta = SchemaDelta {
+            summary: None,
+            recent_events: None,
+            entities: Some(ents),
+        };
+        assert!(validate(&delta, &ctx()).is_ok());
+    }
+
+    /// 2026-08-15 audit fix: control chars inside NESTED strings of a
+    /// structured entity value are rejected, same as top-level string
+    /// values (the serialized form escapes them, but the stored Value keeps
+    /// the raw bytes).
+    #[test]
+    fn rejects_control_chars_in_nested_strings() {
+        let nested = serde_json::json!({
+            "note": "clean prose",
+            "list": ["ok", "has\u{0000} a NUL"],
+            "inner": { "deeper": "also \u{0007}belled" }
+        });
+        let mut ents = HashMap::new();
+        ents.insert("npc.mira.misc".to_string(), Some(nested));
+        let delta = SchemaDelta {
+            summary: None,
+            recent_events: None,
+            entities: Some(ents),
+        };
+        let err = validate(&delta, &ctx()).unwrap_err();
+        assert!(matches!(err, ValidationFailure::InvalidValue { key, .. } if key == "npc.mira.misc"));
+
+        // Newlines inside nested strings stay allowed (multi-line prose).
+        let ok = serde_json::json!({ "note": "line one\nline two" });
+        let mut ents = HashMap::new();
+        ents.insert("npc.mira.misc".to_string(), Some(ok));
         let delta = SchemaDelta {
             summary: None,
             recent_events: None,

@@ -201,6 +201,14 @@ function normGender(g) {
 let activeCardDock = null;            // null | 'calendar' | 'weather' | 'location'
 let lastSnap = null;                  // { playerName, cardName, clock, weather, node }
 
+// ─── refreshAll render-ownership token (#37) ──────────────────────────────
+// Two concurrent refreshAll() calls (turn-end at stage.js + drawer-open)
+// each fetch; the older fetch resolving LAST would paint stale state over
+// the fresh one with no correction until the next turn. Same fix as
+// inventory-panel.js's renderSeq: each call stamps a seq; any paint after
+// a superseding call started bails.
+let refreshSeq = 0;
+
 // ─── Injury heatmap state ────────────────────────────────────────────────
 // The last body map refreshAll() fetched. Cached so the gender toggle can
 // RE-PAINT the heatmap against the new silhouette's hitboxes WITHOUT a fresh
@@ -1017,6 +1025,10 @@ function closeInfoCard() {
 // ===========================================================================
 export async function refreshAll() {
   if (!drawerEl) return;
+  // Render-ownership token (#37): see the refreshSeq declaration. Every
+  // paint below runs only while this call is still the newest.
+  const seq = ++refreshSeq;
+  const superseded = () => seq !== refreshSeq;
   // The paperdoll is local-only (gender + PNG) — re-render it always.
   // NOTE: renderPaperdoll assigns a fresh img.src. The paperdoll <img> uses
   // height:clamp() + width:auto, so its rendered width is 0 until the PNG
@@ -1080,6 +1092,9 @@ export async function refreshAll() {
   } catch (_) {
     // swallow — dormant fallbacks below stand.
   }
+  // A newer refreshAll started while our fetches were in flight — its data
+  // is fresher; painting ours would regress the HUD (the #37 race).
+  if (superseded()) return;
 
   // Header: player name → card name → 'WANDERER'. The CSS uppercases it.
   const header = (playerName || cardName || 'WANDERER').trim() || 'WANDERER';
@@ -1109,6 +1124,7 @@ export async function refreshAll() {
   lastBodyMap = bodyMap;
   lastDetailsMap = detailsMap;
   const paintHeatmap = () => {
+    if (superseded()) return; // a newer refresh owns the HUD now
     try {
       const section = drawerEl.querySelector('.hud-paperdoll-section');
       if (section) paintInjuryHeatmap(section, normGender(gender), bodyMap, detailsMap);

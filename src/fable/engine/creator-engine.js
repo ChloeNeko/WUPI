@@ -358,6 +358,29 @@ function mandatoryFilled(v) {
   return String(v).trim() !== '';
 }
 
+// ── Pure CREATE/retry decisions (extracted 2026-08-15) ─────────────────────
+// The DOM-coupled creator-chat screen kept these inline + untestable; the
+// drawer-logic.js precedent: the DECISION is pure, the screen only wires it.
+
+// Retry cap shared by the codex-embed validation loop + the mandatory-field
+// gate. Attempts are counted AFTER increment (1st retry = 1): 1..2 retry,
+// 3+ exhausts + surfaces the gap to the user.
+export const MAX_CREATOR_RETRIES = 2;
+export function creatorRetryAllowed(attempts) {
+  return attempts <= MAX_CREATOR_RETRIES;
+}
+
+// Duplicate-name guard (both write IPCs are silent atomic overwrites — a
+// CREATE reusing an existing slug replaces authored content). REJECT when
+// the write target collides with an existing id, EXCEPT when the target IS
+// the seeded edit-run entity's own id (re-saving itself). A pencil-edit that
+// RENAMES onto a different existing slug must still be caught (M3's rename
+// hole: the write target is re-derived from the possibly-renamed draft).
+export function shouldRejectDuplicateName(target, seededId, existingIds) {
+  if (target === seededId) return false;
+  return existingIds.includes(target);
+}
+
 // Returns the list of MISSING mandatory field keys for kind/draft ([] = the
 // draft may finalize). The sim intro is special: an ABSENCE is incomplete —
 // the wizard must have an explicit answer (agreed text or a confirmed "no",

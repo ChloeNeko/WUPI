@@ -37,11 +37,12 @@
 use crate::schema::{SceneMode, ScenePacing};
 
 // ---------------------------------------------------------------------------
-// Pillar keyword tables. Matched as whole-word, case-insensitive substrings
-// of the player's turn text (same convention as `player_state::COMBAT_KEYWORDS`).
-// Conservative: false-negative cost is a "neutral" classification (default
-// Exploration); false-positive cost is a mis-paced scene. Both are recoverable
-// on the next turn, so the bar is "good default + obvious matches."
+// Pillar keyword tables. Matched case-insensitively through
+// `player_state::keyword_present` (leading word boundary — the SAME matcher
+// convention as `player_state::COMBAT_KEYWORDS`, #35). Conservative:
+// false-negative cost is a "neutral" classification (default Exploration);
+// false-positive cost is a mis-paced scene. Both are recoverable on the next
+// turn, so the bar is "good default + obvious matches."
 // ---------------------------------------------------------------------------
 
 /// Spatial scale: how enclosed is the immediate environment?
@@ -123,9 +124,15 @@ const KINETIC_MOBILE: &[&str] = &[
 /// mentions both "street" and "ocean" classifies as wilderness (Spatial=2),
 /// not civil. This is the load-bearing call: pillar scoring is "did this
 /// tier's keyword appear at all, and at what highest tier."
+///
+/// (#35 2026-08-15) Matches through `player_state::keyword_present` — the
+/// SAME leading word-boundary matcher the combat referee uses (a hit must
+/// start at a word edge; "campfire"/"fireplace" ≠ "fire"). The old raw
+/// `contains` made "I sit by the campfire and rest" classify as Combat
+/// (kinetic=2) while the referee correctly didn't fire.
 fn score_pillar(lower: &str, tier1: &[&str], tier2: &[&str]) -> u8 {
-    let has_t2 = tier2.iter().any(|kw| lower.contains(kw));
-    let has_t1 = tier1.iter().any(|kw| lower.contains(kw));
+    let has_t2 = tier2.iter().any(|kw| crate::player_state::keyword_present(lower, kw));
+    let has_t1 = tier1.iter().any(|kw| crate::player_state::keyword_present(lower, kw));
     if has_t2 {
         2
     } else if has_t1 {
@@ -164,7 +171,9 @@ fn score_kinetic(lower: &str) -> u8 {
 /// or unrecognized text ("I quux the fnord") would mis-classify as Downtime
 /// (kinetic=0, emotional=0) when it should be Exploration (the safe default).
 fn calm_signal(lower: &str) -> bool {
-    EMOTIONAL_CALM.iter().any(|kw| lower.contains(kw))
+    EMOTIONAL_CALM
+        .iter()
+        .any(|kw| crate::player_state::keyword_present(lower, kw))
 }
 
 /// Map the three pillar scores (+ the calm-signal flag) to a [`SceneMode`].
@@ -258,13 +267,25 @@ mod tests {
         );
     }
 
+    /// #35: the leading-boundary matcher (shared with the combat referee)
+    /// must not see "fire" inside "campfire" — a restful scene stays restful
+    /// instead of mis-classifying Combat while the referee correctly stays
+    /// silent. (Word-INITIAL compounds like "fireplace" still match — that's
+    /// #53's accepted referee semantics, unchanged here.)
+    #[test]
+    fn campfire_compound_does_not_classify_combat() {
+        assert_eq!(mode_of("I sit by the campfire and rest."), SceneMode::Downtime);
+        // A standalone "fire" remains a combat keyword (list semantics).
+        assert_eq!(mode_of("I fire my bow at the wolf."), SceneMode::Combat);
+    }
+
     #[test]
     fn no_movement_no_tension_is_downtime() {
         // Static + calm → Downtime.
-        // NOTE: avoid "fire" in test text — it substring-matches the combat
-        // keyword "fire" (the canonical list, shared with the combat Referee).
-        // That's a pre-existing false-positive in the combat keyword list,
-        // not a scene_pacing bug; out of scope here. Use "hearth" instead.
+        // NOTE: a standalone "fire" still matches the combat keyword "fire"
+        // (the canonical list, shared with the combat Referee) — use "hearth"
+        // for pure-rest fixtures. Mid-word compounds are covered by
+        // `campfire_compound_does_not_classify_combat` below.
         assert_eq!(mode_of("I sit and rest by the hearth."), SceneMode::Downtime);
         assert_eq!(mode_of("I order a drink and chat with the barkeep."), SceneMode::Downtime);
         assert_eq!(mode_of("I trade for supplies."), SceneMode::Downtime);
@@ -379,6 +400,26 @@ mod tests {
         assert_eq!(SceneMode::Downtime.dc_modifier(), -2);
         assert!(SceneMode::Combat.dc_modifier() > SceneMode::Exploration.dc_modifier());
         assert!(SceneMode::Exploration.dc_modifier() > SceneMode::Downtime.dc_modifier());
+    }
+
+    /// 2026-08-15 inversion fix: the lethality mod is the MIRRORED sign of
+    /// the skill-check mod — combat makes killing blows land easier, not
+    /// harder. Combat must never be the safest mode to take a hit.
+    #[test]
+    fn scene_mode_lethality_modifier_mirrors_dc_modifier() {
+        assert_eq!(SceneMode::Combat.lethality_dc_mod(), -1);
+        assert_eq!(SceneMode::Exploration.lethality_dc_mod(), 0);
+        assert_eq!(SceneMode::Downtime.lethality_dc_mod(), 2);
+        // Ordering: combat is the deadliest place to take a blow, downtime
+        // the safest — the intuitive reading, pinned.
+        assert!(SceneMode::Combat.lethality_dc_mod() < SceneMode::Exploration.lethality_dc_mod());
+        assert!(SceneMode::Exploration.lethality_dc_mod() < SceneMode::Downtime.lethality_dc_mod());
+        // Common-case guard (Chloe's "not too deadly"): a Soldier (+4 tier
+        // mod) still cannot one-shot an Unscathed player even in Combat —
+        // BASE 18 + 4 − 1 = 21 beats a max d20.
+        assert!(crate::player_state::BASE_LETHAL_DC + 4
+            + SceneMode::Combat.lethality_dc_mod()
+            > 20);
     }
 
     #[test]

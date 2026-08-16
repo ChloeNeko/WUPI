@@ -16,8 +16,10 @@
 // fidelity (not the downscaled stage preview).
 //
 // OUTPUT: JPEG (smaller than PNG for photos; portraits are photographic).
-// ext = "jpg". bytes = Uint8Array (converted to a plain Array at the call
-// site for the IPC, since serde wants a Vec<u8>).
+// ext = "jpg". bytes = Uint8Array — callers send it over IPC as BASE64
+// (bytesB64 over JSON, e.g. fable_player_portrait_upload_bytes). A bare
+// byte-array IPC arg does NOT deserialize through Tauri v2's invoke and
+// poisons command registration (AGENTS.md anti-pattern #5).
 //
 // The modal is appended to parentEl (the player-creator screen) + removed on
 // resolve. Esc cancels. The overlay sits below the OS-level Wupi top bar
@@ -278,7 +280,8 @@ export function openPortraitCropper(parentEl, imageSrc) {
         ctx.imageSmoothingQuality = 'high';
         ctx.drawImage(_loadedImg, sx, sy, sw2, sh2, 0, 0, OUTPUT_W, OUTPUT_H);
         const dataUrl = canvas.toDataURL('image/jpeg', 0.92);
-        // bytes for the IPC (Array → Vec<u8> on the Rust side).
+        // bytes for the caller — shipped over IPC as base64-over-JSON
+        // (bytesB64), never as a bare byte-array arg (anti-pattern #5).
         canvas.toBlob((blob) => {
           if (!blob) { done(null); return; }
           blob.arrayBuffer().then((buf) => {

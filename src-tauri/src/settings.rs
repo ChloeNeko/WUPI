@@ -49,10 +49,10 @@ pub const THINKING_ENABLED: bool = false;
 
 /// Hard deadline for the API to deliver its FIRST token (TTFT), in
 /// milliseconds. If no first byte arrives within this window, the request is
-/// treated as dead: the stream is dropped, an `api_timeout` event fires to the
-/// frontend (top-center error bubble), and the turn falls back to the local
-/// model at `CTX_FALLBACK_TURN`. Once the first token arrives the deadline is
-/// released — a working stream is never killed mid-flight, even if slow.
+/// treated as dead: the stream is dropped and the caller surfaces the loss
+/// (Fable: `api_lost` + autosave + early return; there is NO local narration
+/// fallback). Once the first token arrives the deadline is released — a
+/// working stream is never killed mid-flight, even if slow.
 pub const API_FIRST_TOKEN_TIMEOUT_MS: u64 = 10_000;
 
 // ---------------------------------------------------------------------------
@@ -62,10 +62,6 @@ pub const API_FIRST_TOKEN_TIMEOUT_MS: u64 = 10_000;
 /// API provider max_context (was 8192; raised 2026-07-31). Used by the API
 /// path's `truncate_to_budget` safety net in `llm.rs`.
 pub const CTX_API: u32 = 16384;
-
-/// Local model context when NO API is connected — the user's full local
-/// experience (narrator + agent both run locally).
-pub const CTX_LOCAL_SOLO: u32 = 4096;
 
 /// Local model context when an API IS connected. The local 12B is demoted to
 /// the silent agent (schema/memory tracking + the tool/tracker pass); the API
@@ -89,24 +85,12 @@ pub const CTX_FABLE: u32 = 3072;
 /// instruction + current schema JSON + one exchange (see schema_engine.rs).
 pub const CTX_SCHEMA: u32 = 2048;
 
-/// The one-shot context rebound for a fallback turn. When an API call fails
-/// (timeout or error) and the local model handles that single turn, it runs at
-/// 4096 so the user-visible fallback reply has full context. The next turn's
-/// normal path drops it back to `CTX_LOCAL_WITH_API` (2048) — no sticky state.
-pub const CTX_FALLBACK_TURN: u32 = 4096;
-
 // ---------------------------------------------------------------------------
 // Visible-history windows (message counts, NOT tokens)
 // ---------------------------------------------------------------------------
 
 /// Local-only chat visible window (4 user↔assistant turns).
 pub const WINDOW_LOCAL_CHAT: usize = 8;
-
-/// API-connected chat visible window (8 turns).
-pub const WINDOW_API_CHAT: usize = 16;
-
-/// Local-only Fable visible window (4 turns).
-pub const WINDOW_LOCAL_FABLE: usize = 8;
 
 /// API-connected Fable visible window (8 turns).
 pub const WINDOW_API_FABLE: usize = 16;
@@ -137,11 +121,6 @@ pub const WINDOW_TRACKER: usize = 2;
 /// — typically short, and truncating them would lose the trigger the tracker
 /// keys off). The narrator window is unaffected (it has the 16k API budget).
 pub const TRACKER_ASSISTANT_CHAR_CAP: usize = 600;
-
-/// Cache-coherent fallback window. When an API call fails and the turn falls
-/// back to local, the message window re-assembles at 6 — sized to stay inside
-/// `CTX_FALLBACK_TURN` minus the generation reserve. See `chat_send`.
-pub const WINDOW_API_FALLBACK: usize = 6;
 
 // ---------------------------------------------------------------------------
 // Sampler profiles — dist(0) terminal, greedy() BANNED

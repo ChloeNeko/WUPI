@@ -558,18 +558,25 @@ impl NpcRegistry {
     }
 
     /// Compact prompt render for the `cast:` line (the registry's roster —
-    /// distinct from the `present:` line which shows only on-camera NPCs).
+    /// distinct from `present:` which shows only on-camera NPCs).
     /// Returns `None` when dormant (no registered NPCs). Mirrors
-    /// `TravelGraph::render_line`. The narrator sees the full roster so it
+    /// `TravelGraph::render_line`. The narrator sees the roster so it
     /// knows which ids are valid `[PRESENCE]` targets; the `present:` line
     /// (rendered from `WorldSchema::presences`) narrows to who's on-camera.
     /// Format: `Mara [mara_the_innkeep], Corin [bard_corin]`.
+    ///
+    /// (#48) HARD-CAPPED at the first 16 entries + a `(+N more)` marker:
+    /// `npc_registry` grows via `[NPC_REGISTER]` with no ceiling, and this
+    /// line rides EVERY tracker + narrator prompt — uncapped it re-grew the
+    /// overflow the bounded carry-back was built to prevent.
     pub fn render_line(&self) -> Option<String> {
+        const CAST_PROMPT_CAP: usize = 16;
         if self.entries.is_empty() {
             return None;
         }
-        let parts: Vec<String> = self
-            .entries
+        let shown = self.entries.len().min(CAST_PROMPT_CAP);
+        let mut parts: Vec<String> = self
+            .entries[..shown]
             .iter()
             .map(|e| {
                 if e.name.is_empty() {
@@ -579,6 +586,10 @@ impl NpcRegistry {
                 }
             })
             .collect();
+        let hidden = self.entries.len() - shown;
+        if hidden > 0 {
+            parts.push(format!("(+{hidden} more)"));
+        }
         Some(parts.join(", "))
     }
 
@@ -736,6 +747,25 @@ impl SceneMode {
             SceneMode::Combat => 2,
             SceneMode::Exploration => 0,
             SceneMode::Downtime => -2,
+        }
+    }
+
+    /// Additive DC modifier for the COMBAT REFEREE'S LETHALITY SAVE, by
+    /// mode. LOWER = a killing blow lands easier. Deliberately the OPPOSITE
+    /// sign of [`Self::dc_modifier`] (2026-08-15, Chloe's call): mid-combat
+    /// is when blows are thrown with intent, so tension slightly raises the
+    /// stakes — the old code threaded `dc_modifier()` straight in, which
+    /// made Combat the SAFEST place to take a hit (a fresh body literally
+    /// could not die to a Soldier in a fight it couldn't lose outside one —
+    /// inverted). Magnitude is half the skill mod and the common-case
+    /// invariant is preserved: a Soldier still cannot one-shot an Unscathed
+    /// player even in Combat (DC 18 + 4 − 1 = 21 > max d20); only real
+    /// threats (Elite+) gain menace. Downtime is the safest mode (+2).
+    pub fn lethality_dc_mod(self) -> i32 {
+        match self {
+            SceneMode::Combat => -1,
+            SceneMode::Exploration => 0,
+            SceneMode::Downtime => 2,
         }
     }
 }
@@ -1115,6 +1145,41 @@ impl WorldSchema {
                     .to_string(),
             );
         }
+        // (#47 2026-08-15) Defense-in-depth: run the patch's delta-shaped
+        // fields through the SAME structural validator the schema engine
+        // uses (caps, control chars, immutability lock). The caller
+        // (`dispatch_fable_state_tool`) pre-filters to these three fields,
+        // but the mutation fn itself must not silently accept what the
+        // validator would reject — the defense belonged here, not only in
+        // the caller.
+        {
+            let mut delta = SchemaDelta::default();
+            if let Some(v) = obj.get("summary") {
+                delta.summary = serde_json::from_value(v.clone())
+                    .map_err(|e| format!("summary: {e}"))?;
+            }
+            if let Some(v) = obj.get("recent_events") {
+                delta.recent_events = serde_json::from_value(v.clone())
+                    .map_err(|e| format!("recent_events: {e}"))?;
+            }
+            if let Some(v) = obj.get("entities").and_then(|v| v.as_object()) {
+                delta.entities = Some(
+                    v.iter()
+                        .map(|(k, ev)| {
+                            (k.clone(), if ev.is_null() { None } else { Some(ev.clone()) })
+                        })
+                        .collect(),
+                );
+            }
+            let existing_keys: std::collections::HashSet<String> =
+                self.entities.keys().cloned().collect();
+            let ctx = crate::schema_validator::ValidationContext {
+                known_nodes: None,
+                immutable_keys: Some(&self.immutable_keys),
+                existing_keys: Some(&existing_keys),
+            };
+            crate::schema_validator::validate(&delta, &ctx).map_err(|f| f.to_string())?;
+        }
         let mut merged: Vec<String> = Vec::new();
         for (key, value) in obj {
             match key.as_str() {
@@ -1310,8 +1375,13 @@ impl WorldSchema {
         // registry — zero tokens). Format:
         //   `present: Mara (standing by the bar, arms crossed), Corin (tuning a lute)`
         if !self.presences.is_empty() {
-            let parts: Vec<String> = self
-                .presences
+            // (#48) HARD-CAPPED at the first 12 + a `(+N more)` marker —
+            // presence is bounded by the [PRESENCE]-per-turn rebuild + the
+            // 4-turn age-out in practice, but a burst turn (a crowded tavern)
+            // must not blow the always-on prompt line.
+            const PRESENCE_PROMPT_CAP: usize = 12;
+            let shown = self.presences.len().min(PRESENCE_PROMPT_CAP);
+            let mut parts: Vec<String> = self.presences[..shown]
                 .iter()
                 .map(|p| {
                     if p.stance.trim().is_empty() {
@@ -1321,6 +1391,10 @@ impl WorldSchema {
                     }
                 })
                 .collect();
+            let hidden = self.presences.len() - shown;
+            if hidden > 0 {
+                parts.push(format!("(+{hidden} more)"));
+            }
             out.push_str("present: ");
             out.push_str(&parts.join(", "));
             out.push('\n');
@@ -1336,15 +1410,26 @@ impl WorldSchema {
         // game, or for a node the rumor hasn't reached yet — the player can
         // travel away from a rumor and have it vanish from this line).
         if let Some(cur_id) = self.travel_graph.current_node.as_deref() {
-            let heard: Vec<&str> = self
+            // (#48) HARD-CAPPED at the first 6 heard rumors + a `(+N more)`
+            // marker — rumor texts are full prose phrases (heavy), the list
+            // grows monotonically via propagation, and this line rides every
+            // prompt.
+            const RUMORS_PROMPT_CAP: usize = 6;
+            let all_heard: Vec<&str> = self
                 .rumors
                 .iter()
                 .filter(|r| r.known_nodes.iter().any(|n| n == cur_id))
                 .map(|r| r.label.as_str())
                 .collect();
-            if !heard.is_empty() {
+            if !all_heard.is_empty() {
+                let shown = &all_heard[..all_heard.len().min(RUMORS_PROMPT_CAP)];
+                let mut line = shown.join("; ");
+                let hidden = all_heard.len() - shown.len();
+                if hidden > 0 {
+                    line.push_str(&format!("; (+{hidden} more)"));
+                }
                 out.push_str("rumors: ");
-                out.push_str(&heard.join("; "));
+                out.push_str(&line);
                 out.push('\n');
             }
         }

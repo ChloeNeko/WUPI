@@ -1844,10 +1844,10 @@ function spawnLaunchSparkles(parent, count = 18) {
     `› wupi v${bootVersion} — WUPI.gguf`,
     '› initializing kernel...',
     '› mounting shared_backend()...',
-    '› allocating LlamaContext: chat (n_ctx=4000)',
+    '› allocating LlamaContext: chat (n_ctx=2048)',
     '› allocating LlamaContext: embedder (n_ctx=512)',
     '› allocating LlamaContext: schema (n_ctx=2048)',
-    '› allocating LlamaContext: game (n_ctx=4000)',
+    '› allocating LlamaContext: game (n_ctx=3072)',
     '› loading WUPI.gguf (9.79 GB, Q6_K)...',
     '› calibrating bge-small-en-v1.5 embedder...',
     '› embedder self-test: cosine check...',
@@ -1858,7 +1858,7 @@ function spawnLaunchSparkles(parent, count = 18) {
     '› arming schema-delta engine...',
     '› arming narrator engine...',
     '› KV cache: Q8_0 type-k/type-v',
-    '› sampler: temp(1.0) top_p(0.95) min_p(0.1) greedy',
+    '› sampler: temp(0.85) top_p(0.95) min_p(0.1) dist(0)',
     '› canvas: aurora borealis (5 curtains, blur 30px)',
     '› render loop: paused=true (dormant)',
     '› boot paw: parked below viewport',
@@ -2025,8 +2025,12 @@ const dropdownMenu = document.getElementById('dropdownMenu');
   };
 
   document.getElementById('shutdownBtn')?.addEventListener('click', () => {
-    closePawMenu();
-    invoke('power_shutdown_cmd');
+    // (#64) Same rapid-click guard as Restart: Sleep/Shut Down were left
+    // unwrapped, so a double-tap fired the power command twice.
+    withShellBusy(async () => {
+      closePawMenu();
+      invoke('power_shutdown_cmd');
+    });
   });
   document.getElementById('restartBtn')?.addEventListener('click', () => {
     // Shell-wide rapid-click guard: a double-tap on Restart could fire two
@@ -2039,8 +2043,12 @@ const dropdownMenu = document.getElementById('dropdownMenu');
     });
   });
   document.getElementById('sleepBtn')?.addEventListener('click', () => {
-    closePawMenu();
-    invoke('power_sleep_cmd');
+    // (#64) Mirrors Shutdown/Restart — sleep is idempotent but the double
+    // invoke raced the canvas-pause event handling.
+    withShellBusy(async () => {
+      closePawMenu();
+      invoke('power_sleep_cmd');
+    });
   });
 
   // ── Check for Updates. Drives the tauri-plugin-updater flow from the JS
@@ -2300,6 +2308,11 @@ const dropdownMenu = document.getElementById('dropdownMenu');
     themePanel?.classList.remove('show');
     colorCodePanel?.classList.remove('show');
     updatePanel?.classList.remove('show');
+    // (#38) This path closes the audio menu WITHOUT the toggle handler's
+    // cleanup — without clearing the poll here it kept firing the 1 Hz
+    // audio_get_state IPC forever after any outside-click dismissal.
+    clearInterval(audioPollTimer);
+    audioPollTimer = null;
   });
 
   const wifiIcon = wifiBtn.querySelector('.status-icon');
@@ -2385,9 +2398,49 @@ const dropdownMenu = document.getElementById('dropdownMenu');
           btn.innerHTML = `<span class="status-dot"></span>${lock}${n.ssid}`;
           btn.addEventListener('click', (ev) => {
             ev.stopPropagation();
-            invoke('wifi_connect', { ssid: n.ssid, password: n.secure ? prompt(`Password for ${n.ssid}:`) || null : null })
-              .then(() => refreshWifi())
-              .catch((err) => console.error('[Wupi] wifi_connect failed', err));
+            if (!n.secure) {
+              invoke('wifi_connect', { ssid: n.ssid, password: null })
+                .then(() => refreshWifi())
+                .catch((err) => console.error('[Wupi] wifi_connect failed', err));
+              return;
+            }
+            // Inline password row: native prompt() is dead in the Tauri
+            // WebView (wry disables default script dialogs → returns null,
+            // which used to silently send password:null for secure nets).
+            // One row at a time; Enter connects, Esc/✕ dismisses.
+            const stale = wifiDropdownMenu.querySelector('.wifi-pass-row');
+            if (stale) stale.remove();
+            const row = document.createElement('div');
+            row.className = 'wifi-pass-row';
+            const input = document.createElement('input');
+            input.type = 'password';
+            input.placeholder = `Password for ${n.ssid}`;
+            input.autocomplete = 'off';
+            const dismiss = () => row.remove();
+            const submit = () => {
+              const pw = input.value;
+              row.remove();
+              invoke('wifi_connect', { ssid: n.ssid, password: pw || null })
+                .then(() => refreshWifi())
+                .catch((err) => console.error('[Wupi] wifi_connect failed', err));
+            };
+            input.addEventListener('keydown', (ke) => {
+              ke.stopPropagation();
+              if (ke.key === 'Enter') submit();
+              else if (ke.key === 'Escape') dismiss();
+            });
+            input.addEventListener('click', (ke) => ke.stopPropagation());
+            const go = document.createElement('button');
+            go.className = 'wifi-pass-go';
+            go.textContent = 'Join';
+            go.addEventListener('click', (ke) => { ke.stopPropagation(); submit(); });
+            const x = document.createElement('button');
+            x.className = 'wifi-pass-x';
+            x.textContent = '✕';
+            x.addEventListener('click', (ke) => { ke.stopPropagation(); dismiss(); });
+            row.append(input, go, x);
+            wifiDropdownMenu.appendChild(row);
+            input.focus();
           });
           list.appendChild(btn);
         }
@@ -2891,12 +2944,23 @@ const dropdownMenu = document.getElementById('dropdownMenu');
     // dock button (dockChat/dockProfile/etc.), which all use dockToggle.
     // Previously this was a no-op `return` when apps was already open, which
     // stranded the backdrop (the bug).
-    if (openWindows.has('apps')) { closeWindow('apps'); return; }
-    closeWindow('api');
-    closeWindow('chat');
-    closeWindow('profile');
-    closeWindow('codex');
-    openWindow('apps');
+    // (#64) Wrapped in the rapid-click guard like the other shell-chrome
+    // entry points: openWindow/closeWindow are synchronous DOM flips, so
+    // the wrapper holds shellBusy through the window show/hide transition
+    // (250ms) — the double-tap window — instead of clearing on the next
+    // microtask.
+    withShellBusy(async () => {
+      if (openWindows.has('apps')) {
+        closeWindow('apps');
+      } else {
+        closeWindow('api');
+        closeWindow('chat');
+        closeWindow('profile');
+        closeWindow('codex');
+        openWindow('apps');
+      }
+      await new Promise((resolve) => setTimeout(resolve, 250));
+    });
   });
 
   // Home-grid launcher icons (inside apps): open the matching surface.
@@ -3338,11 +3402,31 @@ const dropdownMenu = document.getElementById('dropdownMenu');
       loadEditor(p);
     });
 
+    // Two-click inline delete confirm. Native confirm() is dead in the Tauri
+    // WebView (wry disables default script dialogs → always false, a no-op
+    // button), so the first click ARMS (red state + status prompt) and the
+    // second click within the window deletes. Any selection change or other
+    // click disarms via the timeout.
+    let deleteArmTimer = 0;
+    const disarmDeleteBtn = () => {
+      clearTimeout(deleteArmTimer);
+      if (!deleteProfileBtn) return;
+      deleteProfileBtn.dataset.armed = '';
+      deleteProfileBtn.title = 'Delete selected profile';
+    };
     deleteProfileBtn?.addEventListener('click', async () => {
       const id = profileSelect.value;
       const p = findProfile(id);
-      if (!p) { setStatus('Pick a profile to delete first.', 'err'); return; }
-      if (!confirm(`Delete profile "${p.name || p.id}"?\nThis removes the saved API URL + key.`)) return;
+      if (!p) { disarmDeleteBtn(); setStatus('Pick a profile to delete first.', 'err'); return; }
+      if (deleteProfileBtn.dataset.armed !== '1') {
+        deleteProfileBtn.dataset.armed = '1';
+        deleteProfileBtn.title = `Really delete "${p.name || p.id}"? Click again.`;
+        setStatus(`Click delete again to remove "${p.name || p.id}" (URL + key).`, 'err');
+        clearTimeout(deleteArmTimer);
+        deleteArmTimer = setTimeout(disarmDeleteBtn, 5000);
+        return;
+      }
+      disarmDeleteBtn();
       setStatus('Deleting…');
       try {
         await invoke('api_profile_delete', { profileId: id });
@@ -3507,6 +3591,18 @@ const dropdownMenu = document.getElementById('dropdownMenu');
             bubble.remove();
             addErrorBubble('Failed to send: ' + err);
           }
+        })
+        .finally(() => {
+          // (#39) Backstop for a backend early-return: the invoke RESOLVED
+          // without ever emitting `done` — without this the composer locked
+          // on "Press Enter to stop" forever (generating never cleared, so
+          // send() dead-ended). On the normal path `done` has already
+          // finalized; the catch path above cleared the flag too.
+          if (!generating) return;
+          setGenerating(false);
+          if (streamed) finalizeWupiBubble(bubble, streamed);
+          else bubble.remove();
+          addErrorBubble('Turn ended unexpectedly.');
         });
     }
 
@@ -3545,6 +3641,17 @@ const dropdownMenu = document.getElementById('dropdownMenu');
         });
     }
     windowOpenHooks.set('chat', loadIntro);
+    // (#65) Tear down an in-flight turn on close: closing the Chat window
+    // mid-generation used to leave the turn streaming into a detached
+    // bubble, and the next open wiped the view while the decode ran on
+    // invisibly (self-healing only when `done` finally arrived). Mirror the
+    // Fable drawer close paths — stop the backend turn, let the .finally
+    // backstop finalize the (detached) UI state.
+    windowCloseHooks.set('chat', () => {
+      if (generating) {
+        invoke('chat_stop').catch((err) => console.warn('[Wupi] chat_stop (close) failed', err));
+      }
+    });
     loadIntro();
   })();
 

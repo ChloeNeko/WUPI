@@ -29,10 +29,10 @@
 //   4. Click-to-edit — dblclick directly on a beat's prose opens the
 //      inline editor (routes through the same onSave hook the ✎ button
 //      uses in stage.js). Single-click + native text selection untouched.
-//   5. Micro-controls fade — the ‹ n/N › ↻ ✎ bar (already rendered by
-//      beats.renderControls) is invisible by default + fades in on the
-//      beat's hover. The CSS carries this; this module owns nothing here
-//      beyond ensuring the bar keeps existing.
+//   5. Hover toolrail visibility — the per-beat `.fable-mes-drawer` rail
+//      (built by beats.buildDrawerHTML, routed by stage.js) is revealed by
+//      CSS on hover of the 2 latest beats (`vn-recent`); this module owns
+//      nothing here beyond keeping the `vn-recent` tagging (item 1) fresh.
 //
 // Wiring (stage.js):
 //   import * as vn from '../engine/vn-interactions.js';
