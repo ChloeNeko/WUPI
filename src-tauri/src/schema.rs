@@ -657,7 +657,12 @@ fn proper_noun_phrase(fragment_words: &[String], narrative: &[&str]) -> Option<S
     if fragment_words.is_empty() {
         return None;
     }
-    let clean = |t: &str| t.trim_matches(|c: char| !c.is_alphanumeric());
+    // Nested fn (not a closure): a closure returning a borrow of its own
+    // argument can't tie the two lifetimes together (E0373-class inference
+    // failure — the `move` hint doesn't fix it); elision on a fn does.
+    fn clean(t: &str) -> &str {
+        t.trim_matches(|c: char| !c.is_alphanumeric())
+    }
     let is_cap = |t: &str| -> bool {
         t.chars()
             .next()
