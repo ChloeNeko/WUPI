@@ -481,10 +481,11 @@ export async function wireStage(root, hooks) {
       else narrator.rerollLastTurn();
     }
   });
-  // VN INTERACTIONS: attach the behavior layer (history mask, snaps, flank
-  // dblclick, dblclick-to-edit) to the same feed + stage. Initialized AFTER
-  // beats.initBeats so the feedEl ref is live + any seed beats (opening scene
-  // / loaded history) are present for the first refreshHistory pass. The
+  // VN INTERACTIONS: attach the behavior layer (history tagging, snaps,
+  // flank dblclick, dblclick-to-edit) to the same feed + stage. Initialized
+  // AFTER beats.initBeats so the feedEl ref is live + any seed beats
+  // (opening scene / loaded history) are present for the first
+  // refreshHistory pass. The
   // onEditBeat hook mirrors the ✎ control-button routing at the feed click
   // handler below (user beat → editMessage, assistant → rewind-and-edit) so
   // dblclick-on-prose opens the SAME editor the ✎ button does.

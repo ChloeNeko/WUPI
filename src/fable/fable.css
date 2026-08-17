@@ -4250,7 +4250,7 @@ body.fable-active.fable-chrome-peek .top-bar { transform: translateY(0); }
    content via the first child's margin-top:auto (see rule below).
 
    WHY NOT justify-content:flex-end: that bottom-aligns short content
-   BUT makes the TOP of an overflowing (revealed) transcript unreachable
+   BUT makes the TOP of an overflowing transcript unreachable
    by scroll — the well-known flex-end overflow quirk. The user hit it
    ("can't scroll up"). The margin-top:auto trick gets the same bottom-
    alignment for short content while keeping the default flex-start
@@ -4260,7 +4260,7 @@ body.fable-active.fable-chrome-peek .top-bar { transform: translateY(0); }
    input box. When it overflows, that margin collapses to 0 + the feed
    scrolls. Best of both.                                                  */
 .fable-feed {
-    --fable-feed-pad-bot: 108px;  /* bottom padding — reserves space above the input row overlay. Also pins the sticky recent beats (see .fable-mes.vn-recent): keep both uses in sync via this var. Set so the visible gap to the input box ≈ 34px (2026-08-14 per Chloe). */
+    --fable-feed-pad-bot: 108px;  /* bottom padding — reserves space above the input row overlay. Set so the visible gap to the input box ≈ 34px (2026-08-14 per Chloe). */
     position: absolute;
     inset: 0;
     bottom: 0;
@@ -4274,26 +4274,22 @@ body.fable-active.fable-chrome-peek .top-bar { transform: translateY(0); }
     scrollbar-width: none;                /* hidden scrollbar — still scrollable */
     z-index: 5;
     pointer-events: auto;
-    overflow-anchor: none;        /* don't auto-adjust scrollTop during the history reveal */
+    overflow-anchor: none;        /* no scroll anchoring — scrollTop is hand-managed by beats.scrollDown during streaming appends */
 }
 /* Bottom-align short content WITHOUT the flex-end scroll quirk. A generated
    ::before spacer sits as the FIRST flex item with flex-grow:1 — it soaks
    up all the free space above the beats when the transcript is shorter
-   than the viewport (parking the recent 2 near the input box), and
+   than the viewport (parking the beats near the input box), and
    collapses to 0 height when content overflows (so the feed scrolls
    normally from the top). Using a pseudo-element (not a real child + not
-   margin-top:auto on the first beat) is load-bearing: (1) it survives
-   beats.js's innerHTML='' rebuilds, and (2) the reveal tween in
-   vn-interactions.js animates inline margins on .vn-history beats — a real
-   first-child that was sometimes a collapsed history beat would have its
-   auto margin clobbered by both .vn-history{margin:0} and the tween. The
-   ::before is neither a .fable-mes nor a margin target, so it's immune. */
+   margin-top:auto on the first beat) is load-bearing: it survives
+   beats.js's innerHTML='' rebuilds — a real first child would be a beat
+   whose margins get re-styled per vn-recent/vn-history tagging. */
 .fable-feed::before {
     content: '';
     flex: 1 0 auto;                /* grow to fill free space; 0 on overflow */
     min-height: 0;
     pointer-events: none;
-    order: 2;                      /* MIDDLE slot — sits BETWEEN history + recent so history can drop down from the top */
 }
 .fable-feed::-webkit-scrollbar { width: 0; height: 0; }
 .fable-feed::-webkit-scrollbar-thumb { background: transparent; }
@@ -4326,11 +4322,6 @@ body.fable-active.fable-chrome-peek .top-bar { transform: translateY(0); }
        the viewport (the "collapsed windows, unscrollable" failure). The
        feed's justify-content:flex-end still bottom-aligns short content. */
     flex: none;
-    /* Override the flex default min-height:auto so a .vn-history beat's
-       height:0 actually collapses it. Without this, flex clamps the item
-       to its content's intrinsic min-height → history beats render full-
-       size (the bug) instead of disappearing until revealed. */
-    min-height: 0;
     background: none;              /* tint moved to .fable-mes-row */
     border-radius: 0;              /* radius moved to .fable-mes-row */
     padding: 0;
@@ -4341,16 +4332,8 @@ body.fable-active.fable-chrome-peek .top-bar { transform: translateY(0); }
     position: relative;
     border: 0;
     box-shadow: none;
-    order: 1;                      /* TOP slot — history beats live above the spacer (order:2). .vn-recent overrides to 3 (bottom). */
     transform: translateX(calc(-1 * var(--fable-mes-shift)));
     animation: fable-mes-in-left 280ms ease-out;
-}
-/* The recent 2 beats sit in the BOTTOM slot (below the order:2 spacer), so
-   the feed reads top→bottom as: [hidden history][spacer][recent 2]. The
-   spacer pushes the recent 2 to the bottom (near the input box); history
-   reveals fade in above them. */
-.fable-mes.vn-recent {
-    order: 3;
 }
 @keyframes fable-mes-in-left {
     from { opacity: 0; transform: translate(calc(-1 * var(--fable-mes-shift)), 8px); }
@@ -4865,63 +4848,34 @@ body.fable-active.fable-chrome-peek .top-bar { transform: translateY(0); }
 /* ============================================================= */
 /* VN INTERACTIONS — behavior-layer additions over the .fable-mes  */
 /* feed. Driven by engine/vn-interactions.js (history tagging,     */
-/* portrait snaps, flank dblclick, dblclick edit) + native scroll   */
-/* for the history reveal (2026-08-11: the hover hysteresis is gone).*/
-/* Additive only — no rule above is rewritten + no text-            */
-/* node carries a warm tint. The vn-* prefix marks these as the    */
-/* interaction layer, distinct from the fable-mes-* structural     */
-/* contract.                                                       */
+/* portrait snaps, flank dblclick, dblclick edit). The feed is a   */
+/* plain natively-scrollable column (2026-08-17: the wheel-driven  */
+/* history reveal animation was removed). Additive only — no rule  */
+/* above is rewritten + no text-node carries a warm tint. The      */
+/* vn-* prefix marks these as the interaction layer, distinct from */
+/* the fable-mes-* structural contract.                           */
 /* ============================================================= */
 
-/* ── 1. History — fully OFF-SCREEN at rest, wheel up to open ─────── */
-/* The archive is COLLAPSED to height 0 + visibility hidden at rest —    */
-/* nothing of it is visible at all initially (no peek sliver, no fade    */
-/* mask). Wheeling up at the top opens it in ONE smooth drop (recent 2   */
-/* stay pinned at the bottom); once open it's explored with NATIVE       */
-/* scroll (scroll up past the recent beats to read older history);       */
-/* wheeling back down to the very bottom edge snaps it shut again. All   */
-/* of that lives in vn-interactions.js (onFeedWheel + openHistory /      */
-/* closeHistory); this rule is just the resting (fully hidden) state the */
-/* JS hands closed beats back to.                                        */
+/* ── 1. History — always-rendered archive, native scroll ────────── */
+/* (2026-08-17) The scroll reveal is gone: history beats render in the  */
+/* feed like every other beat, and the whole transcript is read with     */
+/* NATIVE up/down scrolling. What remains here is pure ARCHIVE STYLING  */
+/* driven by the vn-history class vn-interactions.js tags:               */
 /*                                                                       */
 /* History beats are also re-centered to the screen here: their stagger  */
 /* transform is nulled so, unlike the latest 2 (which keep the ±48px     */
-/* VN lean), the archive reads as a centered column of faceless prose.  */
+/* VN lean), the archive reads as a centered column of faceless prose.   */
+/* animation:none keeps a feed rebuild from replaying the slide-in       */
+/* keyframes across the whole archive — history spawns in place.         */
 /*                                                                       */
 /* .vn-recent beats (last 2) are never touched — full name + portrait +  */
-/* stagger + the over-avatar timestamp, exactly as built. Their inter-   */
-/* beat margin is tightened below (recent reads as a tight pair).        */
+/* stagger + the over-avatar timestamp, exactly as built. Both classes   */
+/* carry the SAME inter-beat margin so the transcript is spaced          */
+/* uniformly (see the margin note at the .vn-recent rule below).        */
 .fable-mes.vn-history {
-    height: 0;                   /* fully off-screen at rest (no layout footprint → no phantom scroll space) */
-    margin: 0;
-    overflow: hidden;
-    visibility: hidden;
-    opacity: 0;                  /* faded out at rest — the reveal is a pure opacity fade */
-    transition: opacity 260ms ease;   /* smooth fade in/out (opacity IS animatable, unlike height) */
-    animation: none;             /* don't slide in on feed rebuild */
-    transform: none;             /* centered to the screen — no ±48px stagger (latest 2 keep theirs) */
-}
-/* OPEN: stamp .vn-revealed on the feed. History beats snap to their natural
-   height (height:auto isn't animatable, so it's instant — but it happens at
-   opacity 0, so the snap is invisible) and the opacity transition fades them
-   in. The sticky recent 2 absorb the layout growth without moving. */
-.fable-feed.vn-revealed .fable-mes.vn-history {
-    height: auto;
-    margin: 28px auto;           /* the archive gap (visible gap between beats = 2× this). Bumped 10→28 2026-08-14 per Chloe — history beats were too close together. */
-    overflow: visible;
-    visibility: visible;
-    opacity: 1;
-}
-/* FADING OUT (close): keep height:auto so the beats hold their space while
-   the opacity transition fades them to 0 — collapsing height mid-fade would
-   make them vanish instantly. vn-interactions.js removes .vn-fading after the
-   transition finishes (then height collapses, invisibly). */
-.fable-feed.vn-fading .fable-mes.vn-history {
-    height: auto;
-    margin: 28px auto;
-    overflow: visible;
-    visibility: visible;
-    /* opacity falls back to the base .vn-history value (0) → transitions 1→0 */
+    margin: -4px auto;            /* mirrors .vn-recent exactly — uniform transcript spacing */
+    animation: none;              /* history spawns in place — no slide-in on feed rebuild */
+    transform: none;              /* centered to the screen — no ±48px stagger (latest 2 keep theirs) */
 }
 /* History beat outer brass edge (2026-08-12 per Chloe): once a beat reveals
    as history, a brass border hugs its OUTER edge — the LEFT side of
@@ -4946,17 +4900,13 @@ body.fable-active.fable-chrome-peek .top-bar { transform: translateY(0); }
     border-bottom-right-radius: 20px;
     box-shadow: none;
 }
-/* The latest 2 beats sit CLOSE (10px → 3px margin) so the active       */
-/* exchange reads as one tight beat-pair. The feed is a flex column      */
-/* (margins don't collapse) → the resting gap between the two is the     */
-/* sum of both margins = 6px. This is the SINGLE governing rule for the  */
-/* recent-pair margin — keep it here only. The .vn-recent { order:3 }   */
-/* block above intentionally carries NO margin: a second .vn-recent      */
-/* margin rule elsewhere would silently lose to this one (same           */
-/* specificity, this is later in source) and edits to it do nothing.     */
-/* The opposite of the archive beats, whose revealed margin (18px, the   */
-/* .vn-revealed/.vn-fading rules above) gives the transcript breathing   */
-/* room — widened 2026-08-14 per Chloe.                                  */
+/* The latest 2 beats sit CLOSE (negative margin over the base 10px) so
+   the active exchange reads as one tight beat-pair. The feed is a flex
+   column (margins don't collapse) → the resting gap between adjacent
+   beats is the sum of both margins. This is the SINGLE governing rule
+   for the recent-pair margin. The .vn-history rule above mirrors the
+   SAME -4px margin, so the whole transcript (archive + recent pair) is
+   spaced uniformly (2026-08-17 per Chloe). */
 .fable-mes.vn-recent {
     margin: -4px auto;
 }
@@ -5034,10 +4984,10 @@ body.fable-active.fable-chrome-peek .top-bar { transform: translateY(0); }
 /* portraits would also yank any sprite the player snapped into the  */
 /* foreground — defeating the whole point of snapping.               */
 
-/* (a) History beats never show their docked portrait (text-only archive).
-   The old `.vn-revealed` restore was removed 2026-08-11 — revealed history
-   now reads as faceless prose too. A snapped sprite still survives via the
-   :has(.vn-snapped) carve-out below. */
+/* (a) History beats never show their docked portrait — the archive always
+   reads as faceless prose (2026-08-11 per Chloe, carried through the
+   2026-08-17 always-rendered rework). A snapped sprite still survives via
+   the :has(.vn-snapped) carve-out below. */
 .fable-mes.vn-history .fable-mes-avatar:not(:has(.fable-mes-avatar-img.vn-snapped)) {
     display: none;
 }
@@ -5617,12 +5567,10 @@ body.fable-active.fable-chrome-peek .top-bar { transform: translateY(0); }
 /* is transparent, so visually the glyphs just float ~8px off the        */
 /* bubble with nothing between.                                          */
 /*                                                                        */
-/* Only .vn-history reveals it — the recent 2 use the gold toolrail      */
-/* instead (and at rest an unrevealed history beat is visibility:hidden, */
-/* so it can't be hovered at all). The hide transition delays the        */
-/* visibility flip until after the 160ms fade so un-hover fades out      */
-/* instead of snapping invisible; the reveal applies visibility          */
-/* immediately.                                                          */
+/* Only .vn-history reveals it — the recent 2 use the gold toolrail
+   instead. The hide transition delays the visibility flip until after
+   the 160ms fade so un-hover fades out instead of snapping invisible;
+   the reveal applies visibility immediately.                      */
 .fable-mes-histools {
     position: absolute;
     top: 50%;                       /* vertically centered on the bubble row */
