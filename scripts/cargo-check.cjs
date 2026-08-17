@@ -55,6 +55,13 @@ const args = ['check', '--release', '--lib', '--manifest-path', manifest, ...ext
 console.log(`[cargo-check] running: cargo ${args.join(' ')}`);
 
 const result = spawnSync('cargo', args, {
+  // cwd MUST be src-tauri: cargo reads .cargo/config.toml relative to the
+  // working dir, and src-tauri/.cargo/config.toml carries the DELAYLOAD
+  // rustflags + Ninja generator + CUDA/Vulkan env that `tauri build` (which
+  // runs cargo from src-tauri) bakes into every fingerprint. Running from
+  // the repo root via --manifest-path silently built a SECOND, throwaway
+  // fingerprint universe — full llama CUDA recompile on every switch.
+  cwd: join(repoRoot, 'src-tauri'),
   stdio: 'inherit',
   shell: true,
 });

@@ -10,8 +10,8 @@
 //! ## The Prime Directive (§1B of AGENTS.md)
 //!
 //! `dist(0)` is the ONLY permitted terminal sampler stage. `greedy()` is
-//! PERMANENTLY BANNED — pure argmax collapsed Gemma 12B into degenerate output.
-//! Do not reintroduce it under any sampler profile.
+//! PERMANENTLY BANNED — pure argmax collapsed the predecessor Gemma 12B into
+//! degenerate output. Do not reintroduce it under any sampler profile.
 //!
 //! ## Re-lock note (2026-07-31)
 //!
@@ -23,12 +23,13 @@
 // Thinking (the Gemma4 <|think|> control token)
 // ---------------------------------------------------------------------------
 
-/// Whether the LOCAL 12B emits its Gemma4 thought channel (`<|think|>`) on
+/// Whether the LOCAL model (Gemma 4 E4B) emits its Gemma4 thought channel (`<|think|>`) on
 /// every local pass (Wupi chat, the Fable tracker, + the schema passes).
 ///
 /// `false` (default, 2026-08-09): `<|think|>` is NOT injected. The thought
 /// channel was a precautionary coherence measure, but live measurement on the
-/// Gemma 4 12B showed it either (a) roughly 5×'d per-turn wall-clock (the model
+/// Gemma 4 12B (predecessor model) showed it either (a) roughly 5×'d per-turn
+/// wall-clock (the model
 /// reasons before every reply) or, worse, (b) could wedge into a thought
 /// channel that never closed → generation ran to `max_tokens` → a 4-minute+
 /// apparent hang with zero streamed events. Gemma 12B tracked brackets + schema
@@ -36,7 +37,8 @@
 /// upside-down. Flipping this to `false` keeps all the thought-handling
 /// machinery (ThoughtGate, the StreamFilter `<|think|>` strip, the
 /// `extract_reasoning_channel` capture) intact but DORMANT — they're no-ops
-/// when the model emits no thought channel. Re-enable by setting `true`.
+/// when the model emits no thought channel. Re-enable by setting `true`
+/// (2026-08-17: model swapped 12B→E4B — re-verify on the E4B first).
 ///
 /// Gating the 4 injection sites (chat_format system turn, build_narrator_prompt
 /// tracker, fable_command translation + seed prompts) here means flipping one
@@ -71,13 +73,20 @@ pub const API_CHUNK_IDLE_TIMEOUT_MS: u64 = 120_000;
 /// path's `truncate_to_budget` safety net in `llm.rs`.
 pub const CTX_API: u32 = 16384;
 
-/// Local model context when an API IS connected. The local 12B is demoted to
+/// Local model context when an API IS connected. The local model is demoted to
 /// the silent agent (schema/memory tracking + the tool/tracker pass); the API
-/// carries narration. 2048 fits the short, mechanical agent turns.
-pub const CTX_LOCAL_WITH_API: u32 = 2048;
+/// carries narration. **2026-08-17 E4B shakedown P0: 3072** (Chloe-signed
+/// override of the locked constant). The E4B swap bloated the Wupi-chat system
+/// prefix to ~1541 tokens — ALONE over the 2048−512=1536 prompt budget, so
+/// every chat turn (even "Hello Wupi") failed `truncate_to_fit` (truncation
+/// can only drop conversation turns, never the system prefix). 3072 gives a
+/// 2560-token prompt budget: absorbs the prefix + the manager-path world-state
+/// slice + memory block with headroom, without doubling the persistent chat
+/// KV (~50% growth). Matches CTX_FABLE.
+pub const CTX_LOCAL_WITH_API: u32 = 3072;
 
 /// Fable engine context (the tracker pass). **2026-08-08 override: 3072.** The
-/// local 12B's Fable role is TRACKING ONLY (bracket commands + schema state) —
+/// local model's Fable role is TRACKING ONLY (bracket commands + schema state) —
 /// the API narrates. The tracker window is 2 messages (1 turn) — it
 /// relies on the schema delta + Rust state, not re-read history.
 /// 3072 fits the AGENT section (~386 tok) + bracket protocol (~477 tok) +
@@ -213,3 +222,18 @@ pub const FABLE_STATUS_TAG_CAP: usize = 16;
 /// a typed action, well under the tracker budget even before the window
 /// truncation guard runs.
 pub const FABLE_ACTION_CHAR_CAP: usize = 4000;
+
+/// (2026-08-16 tracker-budget fix) TOTAL char budget for the fully rendered
+/// TRACKER prompt (system prompt + window + generation cue) — the lib.rs-side
+/// guard that keeps the fable engine's overflow backstop from ever firing.
+/// Derivation: CTX_FABLE (3072) − TRACKER_MAX_TOKENS (256, fable_engine.rs)
+/// = 2816 max prompt tokens; observed prose density on WUPI.gguf is
+/// ~3.7–4.0 chars/token, so 3.5 chars/token (the CONSERVATIVE low end) gives
+/// 2816 × 3.5 = 9856, rounded down to 9800. An over-budget render drops the
+/// lowest-priority tail block (the preceding assistant beat) and re-renders
+/// ONCE (`build_tracker_prompt_bounded`); still over = the tracker pass
+/// fails loudly instead of decoding — the engine's old front-drain silently
+/// decapitated the system prompt (bracket protocol) three separate times
+/// (2026-08-09, 2026-08-10 T52, 2026-08-16 playtest: 5→687 tokens dropped
+/// over 16 turns), which is why overflow is now a hard error in tracker mode.
+pub const TRACKER_PROMPT_CHAR_BUDGET: usize = 9_800;

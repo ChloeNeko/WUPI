@@ -8,7 +8,8 @@
 //! all sharing one leaked `&'static LlamaModel`. The doc claimed "~10GB
 //! total → ~2GB headroom on 12GB."
 //!
-//! On a 12GB GPU with the Gemma 4 12B Q6_K model that claim is FALSE. Live
+//! On a 12GB GPU with the Gemma 4 12B Q6_K model (pre-E4B swap) that claim
+//! is FALSE. Live
 //! measurement (2026-07-26 debug session): with only THREE contexts resident
 //! (chat + embedder + schema), VRAM used was **11,827 MiB / 118 MiB free**.
 //! The FableEngine's 4th-context allocation silently failed inside
@@ -40,8 +41,9 @@
 //!
 //! ## Footprint after the fix
 //!
-//! Always resident: leaked weights (~9.8GB) + embedder (~36MB) = ~9.84GB.
-//! One WUPI.gguf context active: +~75-150MB Q8_0 KV. Total ~10GB / ~2GB
+//! Always resident: leaked weights (~5.8GB, E4B Q6_K since 2026-08-17) +
+//! embedder (~36MB) = ~5.9GB.
+//! One WUPI.gguf context active: +~50-100MB Q8_0 KV. Total ~6.5GB / ~5.5GB
 //! free — stable.
 //!
 //! ## The contract
@@ -70,10 +72,10 @@ use tokio::sync::Mutex;
 /// not just a KV context. See `llm::unload_shared_model` /
 /// `reload_shared_model` (the Phase 5B weight-unload lift). The contract for
 /// an `Sd` teardown is heavier: it must (1) unload the shared LLM weights
-/// (~9.8GB), (2) load the SD model, (3) generate. The reverse swap reloads
+/// (~5.8GB), (2) load the SD model, (3) generate. The reverse swap reloads
 /// the LLM weights. The per-turn KV clear (§11.52) means there is NO KV to
 /// preserve across the swap — the only reload cost is the weight file-read
-/// (~5-10s for 12B Q6), hidden behind SD gen time. This is the architectural
+/// (~3-6s for the E4B Q6, ~5.8GB), hidden behind SD gen time. This is the architectural
 /// fit that makes the LLM⇄SD swap "seamless" — it rides free on work the
 /// engine was already doing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

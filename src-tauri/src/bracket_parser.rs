@@ -32,7 +32,7 @@
 //!
 //! Robustness: malformed brackets (`[OBJECT id=x]` missing `state=`,
 //! `[CHARACTER_TURN:` unterminated) are silently dropped, not fatal. The
-//! narrator is a 12B model; we tolerate noisy output.
+//! narrator is a compact local model (Gemma 4 E4B); we tolerate noisy output.
 
 use crate::consequence::Polarity;
 use crate::equipment;
@@ -947,6 +947,61 @@ fn has_control_chars(s: &str) -> bool {
     })
 }
 
+/// (2026-08-17 E4B shakedown P1a) The inventory-name gate, applied to every
+/// EQUIP/BELT/PACK `item_name` (text + JSON duals). The E4B occasionally
+/// mangles its own quoting — names arrive with literal leading/trailing
+/// quote chars (`"Worn Traveling Cloak`, `"Rough`, sometimes truncated
+/// fragments) and landed in the typed inventory verbatim, where the Soul-Gem
+/// panel rendered both the phantom AND the real item (pack jumped 5→13 in
+/// one playtest turn). Strip ASCII + typographic quotes at the edges,
+/// collapse internal double-quote runs to one, flatten whitespace, char-cap
+/// at INV_NAME_MAX. Returns `None` when the input carries control chars or
+/// what remains is empty / a 1-2 char fragment — a dropped bracket is
+/// better than a phantom `"Worn` stack the merge logic can never match.
+fn clean_item_name(raw: &str) -> Option<String> {
+    const EDGE_QUOTES: &[char] = &['"', '\'', '“', '”', '‘', '’'];
+    if has_control_chars(raw) {
+        return None;
+    }
+    // Flatten line breaks/tabs to spaces, then collapse ALL whitespace runs
+    // to single spaces (a quoted name may legally span a newline).
+    let mut flattened = String::with_capacity(raw.len());
+    let mut in_space = false;
+    for c in raw.chars() {
+        if c.is_whitespace() {
+            in_space = true;
+        } else {
+            if in_space && !flattened.is_empty() {
+                flattened.push(' ');
+            }
+            in_space = false;
+            flattened.push(c);
+        }
+    }
+    let trimmed = flattened.trim_matches(|c| EDGE_QUOTES.contains(&c)).trim();
+    // Collapse internal runs of `"` (incl. typographic doubles) to one.
+    let mut collapsed = String::with_capacity(trimmed.len());
+    let mut prev_quote = false;
+    for c in trimmed.chars() {
+        let is_dquote = c == '"' || c == '“' || c == '”';
+        if is_dquote {
+            if !prev_quote {
+                collapsed.push('"');
+            }
+            prev_quote = true;
+        } else {
+            collapsed.push(c);
+            prev_quote = false;
+        }
+    }
+    let cleaned = collapsed.trim().trim_matches(|c| EDGE_QUOTES.contains(&c));
+    let count = cleaned.chars().count();
+    if count < 3 || count > INV_NAME_MAX {
+        return None;
+    }
+    Some(cleaned.chars().take(INV_NAME_MAX).collect())
+}
+
 /// `[EQUIP slot=<slot> name=<item> (layer=inner) (stats=<...>)]` (equip) or
 /// `[EQUIP slot=<slot>]` (unequip — no `name=`). Returns `None` for unknown
 /// slots, oversize/contaminated values, or a missing slot. Default layer is
@@ -978,13 +1033,13 @@ fn parse_equip(rest: &str) -> Option<BracketCommand> {
     let item_name = if name.trim().is_empty() {
         None
     } else {
-        // Name caps + control-char reject (equip is the one inventory bracket
-        // that writes a name into the worn-item model, so validate it).
-        let n = name.trim();
-        if n.chars().count() > INV_NAME_MAX || has_control_chars(n) {
-            return None;
+        // (P1a) Quote-cleaned name (E4B mangled-quoting gate). Empty input
+        // stays the unequip form; a non-empty input that cleans to a
+        // fragment drops the bracket.
+        match clean_item_name(&name) {
+            Some(n) => Some(n),
+            None => return None,
         }
-        Some(n.to_string())
     };
     let item_stats = if stats.trim().is_empty() {
         None
@@ -1022,12 +1077,13 @@ fn parse_belt(rest: &str) -> Option<BracketCommand> {
     };
     // For the remove form there's no kv tail — the body is the bare name.
     if remove {
-        let name = remove_form_name(body);
-        if name.is_empty() || name.chars().count() > INV_NAME_MAX || has_control_chars(&name) {
+        // (P1a) Same quote-fragment gate as the add form — a mangled remove
+        // name would silently miss the stored stack.
+        let Some(n) = clean_item_name(&remove_form_name(body)) else {
             return None;
-        }
+        };
         return Some(BracketCommand::Belt {
-            item_name: name.to_string(),
+            item_name: n,
             qty: 0,
             item_stats: None,
             remove: true,
@@ -1067,17 +1123,27 @@ fn parse_belt(rest: &str) -> Option<BracketCommand> {
     }
     // Bare-name fallback: if no `name=` key but the body has a leading bare
     // token, treat it as the name (`[BELT health_potion qty=2]`).
+    // (P1a) When the body carries NO kv pairs at all, the WHOLE body is the
+    // name — the documented multi-word bare form (same rule as the remove
+    // form). The old first-token-only read turned the E4B's
+    // `[PACK "Worn Traveling Cloak"]` into the truncated phantom `"Worn`.
     if name.is_empty() {
-        let first_token = body.split_whitespace().next().unwrap_or("");
-        // Only adopt if it doesn't look like a kv key (no `=`).
-        if !first_token.is_empty() && !first_token.contains('=') {
-            name = first_token.to_string();
+        if !body.contains('=') {
+            name = body.to_string();
+        } else {
+            let first_token = body.split_whitespace().next().unwrap_or("");
+            // Only adopt if it doesn't look like a kv key (no `=`).
+            if !first_token.is_empty() && !first_token.contains('=') {
+                name = first_token.to_string();
+            }
         }
     }
-    let n = name.trim();
-    if n.is_empty() || n.chars().count() > INV_NAME_MAX || has_control_chars(n) {
-        return None;
-    }
+    // (P1a) Quote-cleaned name (E4B mangled-quoting gate) — phantom
+    // `"Worn`-style fragments dropped, real names edge-stripped.
+    let n = match clean_item_name(&name) {
+        Some(n) => n,
+        None => return None,
+    };
     let item_stats = if stats.trim().is_empty() {
         None
     } else {
@@ -1088,7 +1154,7 @@ fn parse_belt(rest: &str) -> Option<BracketCommand> {
         Some(s.to_string())
     };
     Some(BracketCommand::Belt {
-        item_name: n.to_string(),
+        item_name: n,
         qty,
         item_stats,
         remove: qty_zero_remove,
@@ -1110,12 +1176,12 @@ fn parse_pack(rest: &str) -> Option<BracketCommand> {
         (false, rest)
     };
     if remove {
-        let name = remove_form_name(body);
-        if name.is_empty() || name.chars().count() > INV_NAME_MAX || has_control_chars(&name) {
+        // (P1a) Same quote-fragment gate as the add form.
+        let Some(n) = clean_item_name(&remove_form_name(body)) else {
             return None;
-        }
+        };
         return Some(BracketCommand::Pack {
-            item_name: name.to_string(),
+            item_name: n,
             qty: 0,
             weight: 0.0,
             item_stats: None,
@@ -1164,16 +1230,24 @@ fn parse_pack(rest: &str) -> Option<BracketCommand> {
             _ => {}
         }
     }
+    // (P1a) Bare-name fallback mirrors parse_belt: no kv pairs at all → the
+    // whole body is the name (multi-word bare form); kv tail without `name=`
+    // → first bare token.
     if name.is_empty() {
-        let first_token = body.split_whitespace().next().unwrap_or("");
-        if !first_token.is_empty() && !first_token.contains('=') {
-            name = first_token.to_string();
+        if !body.contains('=') {
+            name = body.to_string();
+        } else {
+            let first_token = body.split_whitespace().next().unwrap_or("");
+            if !first_token.is_empty() && !first_token.contains('=') {
+                name = first_token.to_string();
+            }
         }
     }
-    let n = name.trim();
-    if n.is_empty() || n.chars().count() > INV_NAME_MAX || has_control_chars(n) {
-        return None;
-    }
+    // (P1a) Quote-cleaned name (E4B mangled-quoting gate).
+    let n = match clean_item_name(&name) {
+        Some(n) => n,
+        None => return None,
+    };
     let item_stats = if stats.trim().is_empty() {
         None
     } else {
@@ -1184,7 +1258,7 @@ fn parse_pack(rest: &str) -> Option<BracketCommand> {
         Some(s.to_string())
     };
     Some(BracketCommand::Pack {
-        item_name: n.to_string(),
+        item_name: n,
         qty,
         weight,
         item_stats,
@@ -1747,6 +1821,66 @@ fn json_to_date(obj: &serde_json::Map<String, serde_json::Value>) -> Option<Brac
     Some(BracketCommand::Date { value })
 }
 
+/// (2026-08-16 playtest P2a) `[DATE]` corruption guard: is `new` a PURE
+/// DELETION of `current` — every character of the normalized `new` appears
+/// in `current`, in order, with nothing changed and nothing added?
+///
+/// The tracker occasionally echoes the calendar label back with a span of
+/// characters dropped (the playtest saw "3rd of Harvestmonth, late in the
+/// year" rewritten to "3rd of Harvestth" — a mid-word amputation, plausibly
+/// the tracker's DRY `allowed_len=1` fighting the verbatim echo of the bigram
+/// already sitting in the `date:` render). Applying such a rewrite is pure
+/// information loss: the calendar can never legitimately ADVANCE by
+/// deleting characters. A real advance changes or adds a character
+/// ("4th of …" vs "3rd of …"), which fails the subsequence test and passes
+/// through untouched.
+///
+/// Normalization: case-folded + whitespace runs collapsed to single spaces
+/// (so case drift + re-flowed spacing are not mistaken for changes).
+/// Equal-after-normalization labels return `false` (a benign re-assert, not
+/// corruption). Pure fn, pinned by unit tests with the exact playtest
+/// strings.
+pub fn is_deletion_only_rewrite(current: &str, new: &str) -> bool {
+    let norm = |s: &str| -> String {
+        let mut out = String::with_capacity(s.len());
+        let mut last_was_space = true; // also trims the leading run
+        for c in s.chars().flat_map(|c| c.to_lowercase()) {
+            if c.is_whitespace() {
+                if !last_was_space {
+                    out.push(' ');
+                    last_was_space = true;
+                }
+            } else {
+                out.push(c);
+                last_was_space = false;
+            }
+        }
+        out.trim_end().to_string()
+    };
+    let cur = norm(current);
+    let next = norm(new);
+    if next.is_empty() || next == cur {
+        return false;
+    }
+    // Order-preserving subsequence scan: every char of `next` must be
+    // findable in `cur` from the previous match forward.
+    let mut idx = 0usize;
+    let cur_chars: Vec<char> = cur.chars().collect();
+    for nc in next.chars() {
+        loop {
+            if idx >= cur_chars.len() {
+                return false; // `new` needs a char `current` can't supply in order
+            }
+            if cur_chars[idx] == nc {
+                idx += 1;
+                break;
+            }
+            idx += 1;
+        }
+    }
+    true
+}
+
 /// Parse a `{"kind": "appearance", ...}` JSON body into
 /// `BracketCommand::Appearance` (Phase 4 Component 5, 2026-08-04). `key`
 /// read from `key` / `appearance_key` / `trait` / `field`; `value` from
@@ -1826,10 +1960,12 @@ fn json_to_equip(obj: &serde_json::Map<String, serde_json::Value>) -> Option<Bra
     let item_name = if name_raw.is_empty() {
         None
     } else {
-        if name_raw.chars().count() > INV_NAME_MAX || has_control_chars(&name_raw) {
-            return None;
+        // (P1a) Quote-cleaned name; a fragment that cleans away drops the
+        // command (same gate as the text form).
+        match clean_item_name(&name_raw) {
+            Some(n) => Some(n),
+            None => return None,
         }
-        Some(name_raw)
     };
     let stats_raw = obj
         .get("stats")
@@ -1879,9 +2015,11 @@ fn json_to_belt(obj: &serde_json::Map<String, serde_json::Value>) -> Option<Brac
         name = name[1..].trim().to_string();
         remove = true;
     }
-    if name.is_empty() || name.chars().count() > INV_NAME_MAX || has_control_chars(&name) {
-        return None;
-    }
+    // (P1a) Quote-cleaned name (E4B mangled-quoting gate, JSON side).
+    let name = match clean_item_name(&name) {
+        Some(n) => n,
+        None => return None,
+    };
     let qty_raw = obj
         .get("qty")
         .or_else(|| obj.get("count"))
@@ -1942,9 +2080,11 @@ fn json_to_pack(obj: &serde_json::Map<String, serde_json::Value>) -> Option<Brac
         name = name[1..].trim().to_string();
         remove = true;
     }
-    if name.is_empty() || name.chars().count() > INV_NAME_MAX || has_control_chars(&name) {
-        return None;
-    }
+    // (P1a) Quote-cleaned name (E4B mangled-quoting gate, JSON side).
+    let name = match clean_item_name(&name) {
+        Some(n) => n,
+        None => return None,
+    };
     let qty_raw = obj
         .get("qty")
         .or_else(|| obj.get("count"))
@@ -2297,8 +2437,8 @@ fn parse_one(bracket: &str, text_after: &str) -> Option<(BracketCommand, usize)>
     // disguise / breast_size / ears / tail); `value` is the diegetic new
     // state. The bare form `[APPEARANCE key]` (no `=`) clears that key.
     // Unknown keys + oversize/contaminated values drop silently (same
-    // leniency as every other parser — the narrator is a 12B model, we
-    // tolerate noise). Case-insensitive verb via `strip_prefix_ci`; the
+    // leniency as every other parser — the narrator is a compact local
+    // model, we tolerate noise). Case-insensitive verb via `strip_prefix_ci`; the
     // KEY is matched case-insensitively too + normalized to the canonical
     // lowercase form (so `Hair_Color` → `hair_color`). The JSON form
     // `{"kind":"appearance","key":"...","value":"..."}` is handled by the
@@ -2779,7 +2919,7 @@ fn parse_one(bracket: &str, text_after: &str) -> Option<(BracketCommand, usize)>
 /// original case — only the command verb is folded for matching.
 ///
 /// Why this exists (§11.40.F follow-up fix 2026-07-28): the live narrator
-/// model (Gemma 12B) sometimes emits `[CHARACTER_Turn:...]` with a capital T
+/// model (Gemma 12B, pre-E4B) sometimes emits `[CHARACTER_Turn:...]` with a capital T
 /// instead of the documented `CHARACTER_TURN`. The parser was case-sensitive
 /// on the prefix, so the variant leaked as literal prose. This helper makes
 /// all 7 command verbs case-insensitive at the match site, while preserving
@@ -3296,6 +3436,59 @@ mod tests {
             parsed.commands[0],
             BracketCommand::Date { value: "6th of Harvest, Year 1247".into() }
         );
+    }
+
+    /// (2026-08-16 playtest P2a) The `[DATE]` deletion-only rewrite guard,
+    /// pinned with the EXACT strings from the playtest that corrupted the
+    /// calendar ("3rd of Harvestmonth, late in the year" → "3rd of
+    /// Harvestth" — a mid-word amputation the tracker's DRY sampler
+    /// plausibly produced while fighting the verbatim echo of the bigram
+    /// already sitting in the `date:` render).
+    #[test]
+    fn deletion_only_rewrite_detected_and_blocked() {
+        // THE playtest corruption: deletions only → pure information loss.
+        assert!(is_deletion_only_rewrite(
+            "3rd of Harvestmonth, late in the year",
+            "3rd of Harvestth"
+        ));
+        // A legitimate day advance changes a character → allowed.
+        assert!(!is_deletion_only_rewrite(
+            "3rd of Harvestmonth, late in the year",
+            "4th of Harvestmonth, late in the year"
+        ));
+        // A legitimate month turn changes the month name → allowed.
+        assert!(!is_deletion_only_rewrite(
+            "3rd of Harvestmonth, late in the year",
+            "1st of Frostmonth, late in the year"
+        ));
+        // Dropping a qualifier is also deletion-only → blocked (the model
+        // must re-emit the FULL label, not a poorer one).
+        assert!(!is_deletion_only_rewrite(
+            "3rd of Harvestmonth, late in the year",
+            "3rd of Harvestmonth, late in the year, Market Day"
+        ));
+        assert!(is_deletion_only_rewrite(
+            "3rd of Harvestmonth, late in the year, Market Day",
+            "3rd of Harvestmonth"
+        ));
+        // Adding a qualifier is growth, not loss → allowed.
+        // (covered above — the mirrored pair documents both directions.)
+        // Equal (after case/space normalization) is a benign re-assert.
+        assert!(!is_deletion_only_rewrite(
+            "3rd of  Harvestmonth, late in the year",
+            "3rd of Harvestmonth, Late In The Year"
+        ));
+        // Exact equality.
+        assert!(!is_deletion_only_rewrite("Day 12", "Day 12"));
+        // Day-number regression is deletion-only → blocked.
+        assert!(is_deletion_only_rewrite("Day 12", "Day 1"));
+        // Day-number growth adds a character → allowed.
+        assert!(!is_deletion_only_rewrite("Day 1", "Day 11"));
+        // Empty rewrite is not a deletion signal (parse-level gates already
+        // reject empty; the predicate stays defensive).
+        assert!(!is_deletion_only_rewrite("Day 1", ""));
+        // A longer rewrite can never be a subsequence of a shorter current.
+        assert!(!is_deletion_only_rewrite("Day 1", "a very much longer label entirely"));
     }
 
     /// (2026-08-16 bug 13) The fenced-JSON duals run the SAME free-text
@@ -3995,7 +4188,7 @@ mod tests {
     fn pre_existing_double_spaces_in_prose_are_also_collapsed() {
         // Defensive: even if the model itself emits double spaces (not just
         // bracket-stripping artifacts), normalize fixes them. The narrator
-        // is a 12B model; prose hygiene is not guaranteed.
+        // is a local model; prose hygiene is not guaranteed.
         let raw = "The  fire   crackles.";
         let parsed = parse(raw);
         assert_eq!(parsed.prose, "The fire crackles.");
@@ -4319,7 +4512,7 @@ mod tests {
 
     // ========================================================================
     // Case-insensitive command-verb matching (§11.40.F fix, 2026-07-28).
-    // The live narrator model (Gemma 12B) sometimes emits bracket commands
+    // The live narrator model (Gemma 12B, pre-E4B) sometimes emits bracket commands
     // with non-canonical casing — most observed: `[CHARACTER_Turn:...]`
     // (capital T). Before the fix, the parser was case-sensitive on the
     // verb prefix, so the variant leaked as literal prose. These tests pin
@@ -5022,6 +5215,73 @@ mod tests {
             BracketCommand::Pack { item_name, remove, .. } => {
                 assert_eq!(item_name, "Old Map");
                 assert!(*remove);
+            }
+            other => panic!("expected Pack, got {:?}", other),
+        }
+    }
+
+    // ---------- P1a: E4B phantom-quote corruption (2026-08-17 playtest) ----------
+    // Actual corrupted emissions: names with literal leading/trailing quote
+    // chars + truncated fragments (`"Worn`, `"Rough`, `"WILLOW-BARK`) landed
+    // in the typed inventory verbatim and the Soul-Gem panel rendered both
+    // the phantom AND the real item.
+
+    #[test]
+    fn belt_quoted_bare_body_keeps_full_name_not_first_fragment() {
+        // The observed corruption: `[PACK "Worn Traveling Cloak"]` (name
+        // quoted, no name= key) → old first-token read = `"Worn`.
+        let parsed = parse("[PACK \"Worn Traveling Cloak\"]");
+        assert_eq!(parsed.commands.len(), 1, "whole-body bare name must parse");
+        match &parsed.commands[0] {
+            BracketCommand::Pack { item_name, remove, .. } => {
+                assert_eq!(item_name, "Worn Traveling Cloak");
+                assert!(!*remove);
+            }
+            other => panic!("expected Pack, got {:?}", other),
+        }
+        // Same form on the belt.
+        let parsed = parse("[BELT \"Mire Oil\"]");
+        match &parsed.commands[0] {
+            BracketCommand::Belt { item_name, .. } => assert_eq!(item_name, "Mire Oil"),
+            other => panic!("expected Belt, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn belt_doubled_quote_value_recovers_or_drops() {
+        // `name=""Worn Traveling Cloak""` — the tokenizer's quoted read
+        // yields an empty value (opener+closer collide), so no phantom name
+        // may survive; the bracket either recovers the name or drops cleanly.
+        let parsed = parse("[BELT name=\"\"Worn Traveling Cloak\"\"]");
+        for cmd in &parsed.commands {
+            if let BracketCommand::Belt { item_name, .. } = cmd {
+                assert!(
+                    !item_name.starts_with('"') && !item_name.ends_with('"'),
+                    "no literal quotes may persist in the name: {item_name:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn bracket_fragment_names_dropped_entirely() {
+        // 1-2 char fragments + quote-only husks → bracket dropped (a dropped
+        // bracket beats a phantom stack the merge logic can never match).
+        assert_eq!(parse("[BELT \"W]").commands.len(), 0);
+        assert_eq!(parse("[PACK \"\"").commands.len(), 0);
+        assert_eq!(parse("[PACK -\"Ro]").commands.len(), 0);
+    }
+
+    #[test]
+    fn bracket_edge_quotes_stripped_from_kv_names() {
+        // The tokenizer keeps a trailing quote fragment inside the value when
+        // the model doubles only ONE side (`name="Worn Cloak"` is clean, but
+        // the mangled `name='Rope'` / smart-quote variants arrive raw).
+        let parsed = parse("[PACK name=\u{2018}Rope\u{2019} qty=2]");
+        match &parsed.commands[0] {
+            BracketCommand::Pack { item_name, qty, .. } => {
+                assert_eq!(item_name, "Rope", "typographic quotes stripped at edges");
+                assert_eq!(*qty, 2);
             }
             other => panic!("expected Pack, got {:?}", other),
         }

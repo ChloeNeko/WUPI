@@ -277,7 +277,7 @@ pub struct AppState {
     /// once in setup; the `api_*` IPC saves to it. OnceLock for the same
     /// reason as `theme_path`: needs the Tauri app handle.
     pub api_config_path: Arc<std::sync::OnceLock<std::path::PathBuf>>,
-    /// The active chat source (`Local` = WUPI.gguf 12B, `Api` = HTTP endpoint).
+    /// The active chat source (`Local` = WUPI.gguf (Gemma 4 E4B), `Api` = HTTP endpoint).
     /// Mirrors `api_config.model_source` but held separately so `chat_send`
     /// reads it without locking the whole config (and so the swap logic can
     /// flip it atomically with the model teardown). Defaults to Local.
@@ -474,7 +474,7 @@ pub struct AppState {
     /// **The local-model turn lock (2026-08-08).** Serializes the THREE
     /// local-model consumers — chat (`chat_send`), the Fable tracker
     /// (`fable_send` Stage 1), and the schema engine (`request_delta`/
-    /// `request_translation`) — so at most ONE decodes on the local 12B at
+    /// `request_translation`) — so at most ONE decodes on the local model at
     /// any instant. Whichever acquires first runs to completion; the others
     /// await at their `.lock().await`.
     ///
@@ -486,7 +486,7 @@ pub struct AppState {
     /// and fable are *different engines on different slots*, so those
     /// per-engine mutexes don't block each other. Without this lock, a
     /// mid-Fable Wupi-drawer chat and the Fable tracker could both reach
-    /// the local 12B near-simultaneously → the swap-lock would evict one
+    /// the local model near-simultaneously → the swap-lock would evict one
     /// mid-turn → corruption. This lock is the actual "one local decode at
     /// a time" authority; the swap-lock is now a pure VRAM layer beneath it
     /// (with zero concurrent acquirers, eliminating the "concurrent
@@ -592,7 +592,7 @@ pub fn run() {
     tracing::info!("=== WUPI starting ===");
     // Single-instance lock: a second launch of wupi.exe focuses the existing
     // window instead of booting a duplicate (which would re-run all of
-    // setup(), re-load the 9.8 GB model, and create a second tray paw). The
+    // setup(), re-load the ~5.8 GB model, and create a second tray paw). The
     // callback reuses system_menu::power_wake (show + set_focus + canvas-resume).
     //
     // RESTART OPT-OUT: power_restart spawns a fresh exe via Command::new while
@@ -2000,10 +2000,10 @@ async fn boot_load_model(app: tauri::AppHandle, state: tauri::State<'_, AppState
                 }
 
                 // If the user was on an API profile at last shutdown, boot
-                // brought the 12B up as a safe default. Now that the chat
+                // brought the local model up as a safe default. Now that the chat
                 // model is ready, re-perform the API swap so Wupi comes
                 // back up on the same connection the user last had. On any
-                // error we stay on local 12B: boot must never fail.
+                // error we stay on local: boot must never fail.
                 let restore = {
                     let cfg = app_state
                         .api_config
@@ -2018,7 +2018,7 @@ async fn boot_load_model(app: tauri::AppHandle, state: tauri::State<'_, AppState
                             "boot: restoring last-used API connection"
                         );
                         // v0.6.3 local-always: do NOT tear down the
-                        // freshly-loaded 12B. It stays resident as the
+                        // freshly-loaded local model. It stays resident as the
                         // silent agent + seamless fallback. Just flip
                         // model_source so chat_send routes to the API; the
                         // local engine remains hot.
@@ -2377,7 +2377,7 @@ async fn acquire_schema_engine_from_arcs(
 ///    path. If disabled or no model, no-op (never strand the game).
 /// 2. **Acquire the `ContextRole::Sd` lease** — the swap-lock evicts whatever
 ///    LLM context is resident. Held for the whole cycle.
-/// 3. **`unload_shared_model()`** — frees the LLM weights (~9.8GB).
+/// 3. **`unload_shared_model()`** — frees the LLM weights (~5.8GB).
 /// 4. **Load SD** — populate `sd_engine_slot` + `load(model_path)`.
 /// 5. **Generate** — run the caller's fully-built `SceneImageRequest` (FABLE
 ///    passes a prompt+dest+defaults request; Prism passes a request built by
@@ -2545,7 +2545,7 @@ async fn run_sd_swap_core(
     // (#42) Free the SD VRAM BEFORE the reload. The lease's teardown is LAZY
     // (LeaseGuard drop only marks the slot free; the teardown closure fires
     // on the NEXT cross-role acquire), so "drop(lease) frees SD VRAM" was
-    // never true — reloading the ~9.8GB LLM while the SD model still held
+    // never true — reloading the ~5.8GB LLM while the SD model still held
     // VRAM could OOM on tight cards (the stranded-chat reload failure).
     // Unload + clear the slot explicitly here; each cycle loads a fresh SD
     // backend anyway (step 4), so nothing warm is lost.
@@ -3124,6 +3124,37 @@ fn strip_invalid_relationship_writes(
     stripped
 }
 
+/// Assemble the Wupi-chat system prompt from its stable sections: the authored
+/// copilot directive (`data/wupi.prompt`), the `wupi.sim` persona render, the
+/// user profile, + the `<current_context>` block. Pure (2026-08-17 E4B
+/// shakedown P0): the assembly is what `chat_send` renders every turn, and
+/// its total size is the chat lockout surface — the system prefix is
+/// untouchable by `truncate_to_fit`, so a prefix over the prompt budget
+/// (CTX_LOCAL_WITH_API − 512) bricks the copilot. Extracted so the regression
+/// test can pin prefix-size < budget without spinning an engine.
+fn assemble_wupi_system_prompt(
+    role: Option<&str>,
+    persona: Option<&str>,
+    user_profile: Option<&str>,
+    effective_ctx: u32,
+    conversation_budget: u32,
+) -> String {
+    let mut sections: Vec<String> = Vec::new();
+    if let Some(w) = role.map(str::trim).filter(|s| !s.is_empty()) {
+        sections.push(w.to_owned());
+    }
+    if let Some(p) = persona.map(str::trim).filter(|s| !s.trim().is_empty()) {
+        sections.push(p.to_owned());
+    }
+    if let Some(p) = user_profile.map(str::trim).filter(|s| !s.trim().is_empty()) {
+        sections.push(p.to_owned());
+    }
+    sections.push(format!(
+        "<current_context>\ncontext_size: {effective_ctx}\nconversation_budget: {conversation_budget}\n</current_context>"
+    ));
+    sections.join("\n\n")
+}
+
 #[tauri::command]
 async fn chat_send(
     text: String,
@@ -3324,26 +3355,13 @@ async fn chat_send(
     // above) returns early for management intents, so this assembly only runs
     // for the NotACommand fall-through (normal Wupi chat) in either context.
     let effective_ctx = settings::CTX_LOCAL_WITH_API;
-    let mut sections: Vec<String> = Vec::new();
-    if let Some(w) = state
-        .wupi_prompts
-        .get()
-        .map(|p| p.role.trim())
-        .filter(|s| !s.is_empty())
-    {
-        sections.push(w.to_owned());
-    }
-    if let Some(p) = persona.as_deref().filter(|s| !s.trim().is_empty()) {
-        sections.push(p.to_owned());
-    }
-    if let Some(p) = user_profile.as_deref().filter(|s| !s.trim().is_empty()) {
-        sections.push(p.to_owned());
-    }
-    sections.push(format!(
-        "<current_context>\ncontext_size: {effective_ctx}\nconversation_budget: {}\n</current_context>",
-        settings.conversation_budget
-    ));
-    let system_prompt = sections.join("\n\n");
+    let system_prompt = assemble_wupi_system_prompt(
+        state.wupi_prompts.get().map(|p| p.role.as_str()),
+        persona.as_deref(),
+        user_profile.as_deref(),
+        effective_ctx,
+        settings.conversation_budget,
+    );
 
     // Append the user message to the session. The message window is re-read
     // later by `run_local_or_echo` (inside `run_agent_loop`) directly from
@@ -3378,7 +3396,7 @@ async fn chat_send(
     //
     // The teardown callback tears down the chat backend on the next
     // cross-role acquire. It calls `LlamaCppBackend::shutdown` (synchronous
-    // .join, frees the chat context's ~75-150MB Q8_0 KV — NOT the weights,
+    // .join, frees the chat context's ~50-100MB Q8_0 KV — NOT the weights,
     // which stay leaked for the process lifetime + reuse by the next
     // spawn_from_shared).
     let context_swap_clone = state.context_swap.clone();
@@ -3495,7 +3513,7 @@ async fn chat_send(
     // 6-window render, so feeding it the same shape keeps the delta path fast.
     //
     // TOOL ROUTING (v0.8): tool calling is ALWAYS local, even when the API is
-    // the active narrator. The local 12B stays resident as the silent agent
+    // the active narrator. The local model stays resident as the silent agent
     // (§8 v0.6.3), so we run the agent loop against it FIRST. If the model
     // emits tool calls → execute locally, the local reply is final. If no
     // tools fired AND source==Api → discard the local prose and hand the turn
@@ -3552,7 +3570,7 @@ async fn chat_send(
 
     // ── Wupi chat is LOCAL-ONLY (2026-08-08 override) ───────────────────
     // The API branch is DELETED. Wupi chat (OS home + the Fable Wupi drawer)
-    // always runs on the local 12B at 2048, temp 0.85, with `<think>` always
+    // always runs on the local model at 2048, temp 0.85, with `<think>` always
     // on + tools. The API is reserved exclusively for Fable narration
     // (`fable_send`, a separate path). `model_source` no longer drives chat
     // routing — it's now purely a Fable-eligibility flag.
@@ -3691,7 +3709,7 @@ async fn chat_send(
         let user = s.messages.len().checked_sub(2).and_then(|i| s.messages.get(i)).map(|m| m.content.clone());
         (user, result.content.clone())
     };
-    // The delta pass is a full 12B forward pass. Skip it for clearly non-
+    // The delta pass is a full local-model (E4B) forward pass. Skip it for clearly non-
     // substantive turns (short filler like "ok"/"thanks", or empty replies)
     //: see `should_fire_delta` for the conservative heuristic. 99% of real
     // turns still fire; the user's typing time masks the generation cost.
@@ -4813,13 +4831,23 @@ async fn apply_phase3_bracket_commands(
                 } else {
                     now_minutes.saturating_add(*duration_minutes)
                 };
+                // (P1b, 2026-08-17 E4B shakedown) Enum-validate the kind
+                // discriminator against the approved mechanic-lane domain
+                // (`consequence::APPROVED_TAG_KINDS`). The E4B stamped
+                // `kind:"disguise"` onto unrelated labels — kinded tags are
+                // EXCLUDED from `count_by_polarity`, so the miscategorized
+                // tags silently vanished from the lethality condition-penalty
+                // DC. Unapproved kind → STRIP (the tag stays a pure
+                // buff/debuff, polarity preserved) + a loud warning; approved
+                // → normalized to the canonical lowercase lane id.
+                let kind = consequence::sanitize_tag_kind(tag_kind, label);
                 let tag = consequence::StatusTag {
                     label: label.clone(),
                     polarity: *polarity,
                     expires_at,
                     source: String::new(),
                     // §11.44: thread the parser's tag_kind into StatusTag.kind.
-                    kind: tag_kind.clone(),
+                    kind,
                 };
                 // (2026-08-15 audit fix) upsert instead of add: dedupe on
                 // (label, kind) + a 16-tag cap — a re-emitted effect extends
@@ -5013,6 +5041,12 @@ async fn apply_phase3_bracket_commands(
         // tracker emits the NEW verbatim label on a calendar advance (a day+
         // passes, a month flips, etc. — no Rust arithmetic). Last-wins on
         // multiples (mirrors [WEATHER]). Empty clears the label.
+        // (2026-08-16 playtest P2a) Deletion-only guard: a rewrite whose
+        // normalized text is a pure character-deletion of the current label
+        // ("3rd of Harvestmonth, late in the year" → "3rd of Harvestth") is
+        // tracker echo-loss, never a legitimate advance — the calendar cannot
+        // advance by deleting characters. Treated as no-signal: warn + keep
+        // the current label.
         let last_date = date_cmds.iter().rev().find_map(|cmd| {
             if let bracket_parser::BracketCommand::Date { value } = cmd {
                 Some(value)
@@ -5021,12 +5055,32 @@ async fn apply_phase3_bracket_commands(
             }
         });
         if let Some(value) = last_date {
-            if undo_snapshot.is_none() {
-                undo_snapshot = Some(s.clone());
+            let deletion_only = s
+                .calendar
+                .as_deref()
+                .map(|cur| {
+                    !cur.trim().is_empty()
+                        && bracket_parser::is_deletion_only_rewrite(cur, value)
+                })
+                .unwrap_or(false);
+            if deletion_only {
+                tracing::warn!(
+                    current = ?s.calendar,
+                    rejected = %value,
+                    "[DATE] rejected a deletion-only rewrite (tracker echo-loss); keeping the current label"
+                );
+            } else {
+                if undo_snapshot.is_none() {
+                    undo_snapshot = Some(s.clone());
+                }
+                s.calendar = if value.is_empty() { None } else { Some(value.clone()) };
+                // (P1d) A fresh label is synchronized with the clock by
+                // definition — stamp it so the render's >48h staleness
+                // fallback restarts its measurement.
+                s.calendar_synced_minutes = Some(s.world_clock.current_minutes);
+                mutated = true;
+                tracing::info!(calendar = %value, "[DATE] calendar label set");
             }
-            s.calendar = if value.is_empty() { None } else { Some(value.clone()) };
-            mutated = true;
-            tracing::info!(calendar = %value, "[DATE] calendar label set");
         }
 
         // [DISCOVER] — dynamic world-seeding (the fix for sandbox cards that
@@ -5100,19 +5154,28 @@ async fn apply_phase3_bracket_commands(
         // 2026-07-28). Single-region schema-tracking command, last-wins on
         // multiples (mirrors [WEATHER] / [TIME]). Rust is the SOLE authority
         // on legality:
-        //   (a) destination must EXIST in the graph (else REJECT + directive —
-        //       the anti-teleport gate that still matters);
+        //   (a) an unresolvable destination is MINTED as a new node (P1c,
+        //       2026-08-17 E4B shakedown — replaces the old reject+directive:
+        //       the E4B obeyed the anti-teleport directive so well it stopped
+        //       traveling entirely; 0 [DISCOVER] in 51 turns, T49–50 never
+        //       left market-square). Walking somewhere unmapped IS evidence
+        //       the place exists; the mint carries a ≥0.75 typo-guard that
+        //       resolves near-misses to the existing node, + the
+        //       MAX_TRAVEL_NODES cap. Only a mint failure (empty slug / cap)
+        //       still rejects.
         //   (b) if `current_node` is set + the destination is a KNOWN node but
         //       NOT a declared neighbor, AUTO-LINK the bidirectional edge +
         //       ALLOW the move (2026-08-10). The player walking there IS the
         //       evidence the two locations are connected — this is the organic
         //       edge-formation path for cards that ship no <locations> block,
-        //       so dynamically-discovered nodes don't strand the player.
+        //       so dynamically-discovered nodes don't strand the player. A
+        //       freshly minted node reaches this arm by construction (it has
+        //       no neighbors yet) — the auto-link wires it to the origin.
         //   (c) the FIRST `[TRAVEL]` from `current_node: None` is allowed
         //       (seeds initial location without scenario-card wiring).
-        // Reject directives (only the unknown-node case now) surface to the
-        // narrator via the return tuple; the caller merges them into the
-        // `<directives>` block.
+        // Reject directives (mint-failure only) surface to the narrator via
+        // the return tuple; the caller merges them into the `<directives>`
+        // block.
         let last_travel = travel_cmds.iter().rev().find_map(|cmd| {
             if let bracket_parser::BracketCommand::Travel { destination } = cmd {
                 Some(destination.clone())
@@ -5127,13 +5190,30 @@ async fn apply_phase3_bracket_commands(
             // so a legal move isn't rejected on a casing/spelling technicality
             // (2026-08-10, T52 Open Issue #1 — location was stuck all 52 turns
             // because every `[TRAVEL Market Square]` hit the unknown-node reject).
-            match s.travel_graph.resolve_node_id(&dest_raw) {
+            // On a resolve miss, mint (P1c) — snapshotting the PRE-mint schema
+            // so a rollback undoes the node creation with the move.
+            let resolved = match s.travel_graph.resolve_node_id(&dest_raw) {
+                Some(id) => Some(id),
                 None => {
-                    // Unknown destination — the Tracker invented a node id that
-                    // doesn't fuzzy-match anything. List the known node ids.
+                    let pre = s.clone();
+                    match s.travel_graph.resolve_or_mint_node(&dest_raw) {
+                        Some(id) => {
+                            if pre.travel_graph.find_node(&id).is_none() {
+                                undo_snapshot.get_or_insert(pre);
+                            }
+                            Some(id)
+                        }
+                        None => None,
+                    }
+                }
+            };
+            match resolved {
+                None => {
+                    // Mint failed (empty slug or the 96-node cap) — the only
+                    // remaining reject case. List the known node ids.
                     let known: Vec<&str> =
                         s.travel_graph.nodes.iter().map(|n| n.id.as_str()).collect();
-                    tracing::warn!(dest = %dest_raw, known = ?known, "[TRAVEL] rejected — unknown node");
+                    tracing::warn!(dest = %dest_raw, known = ?known, "[TRAVEL] rejected — unresolvable + unmintable destination");
                     reject_directives.push(format!(
                         "Travel to \"{dest_raw}\" is not possible — that location is not in the world. \
                          Known locations: {}. Stay where you are or travel to a known location.",
@@ -5772,7 +5852,7 @@ async fn apply_phase3_bracket_commands(
 /// forever). Even post-lock-drop, firing from inside `fable_send` orphans
 /// the FableEngine: the schema lease acquire evicts the fable context whose
 /// teardown joins via `Arc::try_unwrap`, which fails while the caller still
-/// holds an engine clone (the ~510 MB VRAM leak). Callers therefore capture
+/// holds an engine clone (the ~70 MB fable-context VRAM leak). Callers therefore capture
 /// the returned `tick_armed` flag and fire [`fire_world_progression_tick`]
 /// ONLY after dropping the turn lock, lease, and engine Arc.
 ///
@@ -5807,6 +5887,15 @@ async fn apply_time_command_and_maybe_tick(
     //    reject regressions (a buggy narrator going backward in time).
     //    Determine whether this is the first-ever [TIME] so we can stamp the
     //    baseline instead of firing.
+    //    (P1d, 2026-08-17 E4B shakedown) Pacing-aware clamp: one [TIME]
+    //    bracket may advance at most SceneMode::time_clamp_minutes (Downtime
+    //    24h / Exploration 6h / Combat 1h). The E4B jumped +20175 min (~14
+    //    days) in a single bracket — the clamp kills day-scale jumps without
+    //    judging prose. Overshoot clamps to the cap + pushes a warn directive
+    //    for the next turn. Day-crossing advances with no [DATE] on the same
+    //    turn push the stale-calendar directive (the label lagged forever in
+    //    the playtest — 0 [DATE] in 51 turns).
+    let mut time_directives: Vec<String> = Vec::new();
     let (was_first_set, prev_minutes, schema_snapshot) = {
         let mut s = state.fable_schema.lock().await;
         let was_first = !s.world_clock.is_set();
@@ -5819,17 +5908,44 @@ async fn apply_time_command_and_maybe_tick(
             );
             return false;
         }
+        // (P1d) Pacing-aware clamp + directive derivation (pure core in
+        // schema::clamp_time_advance). The first-set baseline takes the
+        // tracker's value verbatim — a cold clock stamps the card's start
+        // time, whatever it is.
+        let (effective_minutes, dirs) = if was_first {
+            (new_minutes, Vec::new())
+        } else {
+            let date_rode_this_turn = parsed.commands.iter().any(|c| {
+                matches!(c, bracket_parser::BracketCommand::Date { .. })
+            });
+            schema::clamp_time_advance(
+                prev,
+                new_minutes,
+                s.scene_pacing.mode,
+                s.calendar.as_deref().filter(|c| !c.is_empty()),
+                date_rode_this_turn,
+            )
+        };
+        if !dirs.is_empty() {
+            tracing::info!(count = dirs.len(), "[TIME] pacing clamp/day-crossing directives queued");
+        }
+        time_directives.extend(dirs);
+        // (P1d) Bootstrap the sync stamp on the first observation of a
+        // legacy/seeded label (assume it was accurate as of now).
+        if s.calendar.is_some() && s.calendar_synced_minutes.is_none() {
+            s.calendar_synced_minutes = Some(effective_minutes);
+        }
         // Snapshot for undo BEFORE the mutation. On the first-set the
         // baseline stamp below captures the same transition (clock was 0→N,
         // not a meaningful "undo" target); skip the snapshot to keep the
         // ring clean. The clone is dropped into the history push after we
         // release this lock.
-        let undo_snapshot = if !was_first && new_minutes != prev {
+        let undo_snapshot = if !was_first && effective_minutes != prev {
             Some(s.clone())
         } else {
             None
         };
-        s.world_clock.current_minutes = new_minutes;
+        s.world_clock.current_minutes = effective_minutes;
         let live_snapshot = s.clone();
         if let Some(snap) = undo_snapshot {
             drop(s);
@@ -5837,6 +5953,12 @@ async fn apply_time_command_and_maybe_tick(
         }
         (was_first, prev, live_snapshot)
     };
+    // Surface the P1d clamp/staleness directives to the next fable_send (the
+    // same <directives> block the tick directives use).
+    if !time_directives.is_empty() {
+        let mut td = state.pending_tick_directives.lock().await;
+        td.extend(time_directives);
+    }
     tracing::info!(
         new_minutes,
         prev_minutes,
@@ -6049,7 +6171,7 @@ async fn apply_time_command_and_maybe_tick(
 /// lock, the Fable lease, AND every `Arc<FableEngine>` clone: the schema
 /// lease acquire evicts the resident fable context (teardown joins its
 /// thread via `Arc::try_unwrap`), which requires no outstanding clones —
-/// otherwise the context is orphaned in VRAM (~510 MB leak). The [TIME]
+/// otherwise the context is orphaned in VRAM (~70 MB leak). The [TIME]
 /// gate + pure-Rust tick mutations already ran inline in
 /// [`apply_time_command_and_maybe_tick`]; only the model translation pass
 /// is deferred to here. Off-screen simulation by design: results are
@@ -6579,7 +6701,8 @@ async fn api_connect(
 ) -> Result<(), String> {
     match api_connect_inner(profile_id, app.clone(), &state).await {
         Ok(()) => Ok(()),
-        // Safety net for the title indicator: if connect failed, the 12B is
+        // Safety net for the title indicator: if connect failed, the local
+        // model is
         // still loaded (validation runs before any teardown; if teardown ran
         // and then something downstream failed, the runtime is genuinely
         // offline). Emit model-status so the frontend's title self-corrects
@@ -6651,11 +6774,11 @@ async fn api_connect_inner(
     }
 
     tracing::info!("api_connect: selecting API as chat source (local stays resident)");
-    // v0.6.3 local-always redesign: the local 12B is NEVER torn down. It runs
+    // v0.6.3 local-always redesign: the local model is NEVER torn down. It runs
     // all the time as the silent agent doing schema/memory tracking (the
     // schema engine already kept its own WUPI.gguf copy in both modes — this
     // just extends the same pattern to the chat backend). Keeping the chat
-    // backend resident costs ~75MB of idle Q8_0 KV cache (weights are shared
+    // backend resident costs ~50MB of idle Q8_0 KV cache (weights are shared
     // via the leaked singleton), which is what makes the seamless per-turn
     // fallback in chat_send zero-latency: there's no model to reload when the
     // API drops, the local engine is already hot.
@@ -6697,7 +6820,7 @@ async fn api_connect_inner(
 }
 
 /// Disconnect the API: flip model_source back to Local. Under the v0.6.3
-/// local-always redesign there is NO model to reload — the local 12B stayed
+/// local-always redesign there is NO model to reload — the local model stayed
 /// resident the whole time (it was the silent agent + fallback). So this is
 /// now pure bookkeeping: clear nothing, just flip the source + persist. The
 /// next chat_send routes to the local backend directly (no fallback needed).
@@ -7477,7 +7600,7 @@ async fn enter_fable_session(
     // v0.6.4 VRAM swap-lock (see `context_swap.rs` + AGENTS.md §7B
     // correction), only ONE `WUPI.gguf` context may be resident at a time.
     // Keeping a resident FableEngine while no turn is in flight would hold
-    // ~75-150MB of Q8_0 KV idle for the whole game session — VRAM the chat
+    // ~50-100MB of Q8_0 KV idle for the whole game session — VRAM the chat
     // engine (Wupi-as-game-manager) needs when the user asks her a question.
     //
     // Instead the engine is spawned LAZILY on the first `fable_send` under
@@ -8292,6 +8415,60 @@ pub(crate) fn cap_assistant_prose(
 // + the test below all key off them. Keep the tag names stable.
 // ───────────────────────────────────────────────────────────────────────────
 
+/// (2026-08-16 tracker-budget fix) Render the TRACKER's `<|turn>` prompt
+/// under the char budget (`settings::TRACKER_PROMPT_CHAR_BUDGET`), bounded to
+/// 2 attempts — the overflow backstop that PRESERVES THE SYSTEM-PROMPT HEAD:
+///
+///   • Attempt 1: the full render (system + capped window).
+///   • Attempt 2 (only if over budget): drop the lowest-priority tail block —
+///     everything in the window except the trailing user action (the trigger
+///     the tracker keys off). The preceding assistant beat is context, not
+///     trigger; it goes first.
+///   • Still over budget → `Err(char_count)`: the caller must FAIL THE
+///     TRACKER PASS LOUDLY (skip brackets + a hard error log) — never feed
+///     the model a headless prompt. The old behavior (the fable engine's
+///     front-drain) chopped the AGENT directive + bracket protocol, which is
+///     the exact failure that silently killed bracket emission for 19 turns
+///     in the 2026-08-16 playtest.
+///
+/// Chars, not tokens (no tokenizer access at the prompt layer; the engine's
+/// token-level backstop remains as the final guard — a hard error in tracker
+/// mode since the same fix). Pure + unit-tested.
+pub(crate) fn build_tracker_prompt_bounded(
+    system_prompt: &str,
+    window: &[session::Message],
+) -> Result<String, usize> {
+    let full = build_narrator_prompt(system_prompt, window);
+    if full.chars().count() <= settings::TRACKER_PROMPT_CHAR_BUDGET {
+        return Ok(full);
+    }
+    // Attempt 2: keep only the trailing user action(s) — the trigger. Drops
+    // the preceding assistant beat (the lowest-priority tail block).
+    let mut trimmed: Vec<session::Message> = Vec::new();
+    for m in window.iter().rev() {
+        if m.role == session::Role::User {
+            trimmed.push(m.clone());
+        } else {
+            break;
+        }
+    }
+    trimmed.reverse();
+    let slim = build_narrator_prompt(system_prompt, &trimmed);
+    let count = slim.chars().count();
+    if count <= settings::TRACKER_PROMPT_CHAR_BUDGET {
+        tracing::warn!(
+            budget = settings::TRACKER_PROMPT_CHAR_BUDGET,
+            full_chars = full.chars().count(),
+            slim_chars = count,
+            "tracker prompt over char budget; re-rendered without the preceding assistant beat"
+        );
+        Ok(slim)
+    } else {
+        Err(count)
+    }
+}
+
+
 /// Render the player's handle for the narrator, falling back to a neutral
 /// "User" when the card carries no player name (mirrors the §11.29
 /// anti-positivity-bias neutral handle — never a title like "protagonist").
@@ -8341,24 +8518,33 @@ fn assemble_narrator_skeleton(
 }
 
 /// Tracker system prompt. The tracker reads the **agent** section of the
-/// authored `.prompt` file (its mechanical job), the card identity (name/
-/// setting/tone from the `.sim`), the live per-turn state blocks (assembled
-/// by `assemble_narrator_skeleton`), and the bracket-command list.
+/// authored `.prompt` file (its mechanical job), the live per-turn state
+/// blocks (assembled by `assemble_narrator_skeleton`), and the
+/// bracket-command list.
 ///
 /// **Voice-authoring is gone from Rust.** This function does NOT author any
 /// narrator voice/style/behavior prose — that lives in `fable.prompt`. It only
-/// (a) slots the authored agent prose, (b) slots the card identity, (c) slots
-/// the live data tags, (d) appends the bracket-command protocol reference.
+/// (a) slots the authored agent prose, (b) slots the live data tags,
+/// (c) appends the bracket-command protocol reference.
 /// The bracket list stays in Rust (load-bearing: `bracket_parser::parse` keys
 /// off the exact forms; a typo'd bracket in a `.prompt` file would silently
 /// break state tracking with no compile error to catch it).
+///
+/// **Retrieval diet (2026-08-16, tracker-budget fix): this builder takes NO
+/// memory block — structurally.** The tracker's memory IS the schema: it
+/// needs the ids (`cast:`/`exits:` lines from `<world_state>`), not lore
+/// prose. `<retrieved_knowledge>` grows with episodic accumulation (5 → 687
+/// dropped tokens over 16 turns in the playtest), which made the tracker's
+/// 3072-token overflow progressive. The API narrator KEEPS the block
+/// (`build_api_narrator_system_prompt` — it has the full CTX_API 16384
+/// budget). The param is removed (not ignored) so no caller can reintroduce
+/// it without a compile error.
 fn build_narrator_system_prompt(
     prompts: &prompts::FablePrompts,
     _card: &sim_card::SimCard,
     world_state: Option<&str>,
     pacing: schema::ScenePacing,
     player_action: Option<&str>,
-    memory_block: Option<&str>,
 ) -> String {
     let mut out = String::with_capacity(2048);
 
@@ -8384,44 +8570,52 @@ fn build_narrator_system_prompt(
         out.push_str("\n\n");
     }
 
-    // (b) Live per-turn state blocks (world_state, retrieved_knowledge,
-    // scene_pacing, player_action). Zero authored prose here.
+    // (b) Live per-turn state blocks (world_state, scene_pacing,
+    // player_action). Zero authored prose here. The memory block is
+    // deliberately NOT passed (retrieval diet — see fn doc): `None` below is
+    // the structural gate, not a placeholder.
     out.push_str(&assemble_narrator_skeleton(
-        player_action, world_state, pacing, memory_block,
+        player_action, world_state, pacing, None,
     ));
 
     // (c) Bracket-command protocol reference. The tracker emits these
     // alongside its prose so Rust can apply the mechanical truth. One TIGHT
     // line each — the syntax only; the WHEN/WHY guidance lives in the AGENT
     // prose above (the <item_rules> block covers tag classification, the
-    // <emit_order> block covers emit-only-on-change). KEPT LEAN per the Prime
-    // Directive: this list is in the always-on system prompt, so every byte
-    // costs context budget on every tracker turn. Detailed bracket semantics
-    // are in the card's codex (retrieved on-demand), NOT here.
+    // <emit_order> block covers emit-only-on-change, <anchors> covers the
+    // per-line triggers). KEPT LEAN per the Prime Directive: this list is in
+    // the always-on system prompt, so every byte costs context budget on
+    // every tracker turn. Detailed bracket semantics are in the card's codex
+    // (retrieved on-demand), NOT here.
     // (#26 2026-08-15: every line below is pinned to the PARSER's actual
     // grammar — the applier is the authority, drift here produces slugs like
     // `id_mara` / silently mis-parsed tasks.)
+    // (2026-08-16 tracker-budget fix: the when/why clauses that duplicated
+    // <emit_order>/<anchors>/<item_rules> verbatim were cut — the list was
+    // 3379 chars (~870 tok), 70% of the whole tracker budget with the AGENT
+    // section. Every bracket FORM, key/slot list, bare-first-token note, the
+    // kind=disguise hoist, and the quote rule are byte-preserved.)
     out.push_str("Track changes with these brackets (emit one per genuine change this turn — see <emit_order> for exactly when each fires):\n");
-    out.push_str("- [TIME Day N, HH:MM] — advance the clock when the turn spans hours (travel, sleep, a long task). Use the real time, never a placeholder.\n");
-    out.push_str("- [DATE <new calendar label>] — when a day or more passes or a calendar boundary is crossed (a new day dawns, a month turns, a festival begins). Emit the NEW full date label verbatim (e.g. \"4th of Harvest, Year 1247, Market Day\") — the whole label is rewritten, no arithmetic. Only fires when a `date:` anchor is in use; otherwise omit.\n");
-    out.push_str("- [WEATHER <condition>] — when the narrated weather shifts (fog lifts, rain starts, night falls). One word: fog, rain, snow, clear, overcast, storm, etc.\n");
-    out.push_str("- [TRAVEL <node_id>] — when the player arrives at a different location. Use a node_id from the location line's exits (or one you seed via [DISCOVER]).\n");
-    out.push_str("- [RUMOR <rumor_text>] — when a rumor is actually heard or spread in the scene. The whole phrase is the rumor.\n");
-    out.push_str("- [NPC_REGISTER <npc_id> name=<name> (role=<role>) (tier=minion|soldier|elite|boss|legendary)] — the FIRST time a named NPC who is NOT in the cast line appears. The npc_id is the bare first token (never `id=`). Register them once, then use [PRESENCE]. Omit tier for civilians.\n");
-    out.push_str("- [PRESENCE <npc_id> <stance or micro-location>] — when an NPC enters the scene or is already on-camera. Resolves names from the cast line. Example: [PRESENCE mara \"behind the bar, drying a glass\"].\n");
-    out.push_str("- [DISCOVER <node_id> name=<name> (setting=indoor|outdoor) (neighbors=<ids>)] — when the player reaches a place that is not yet in the location line's exits. The node_id is the bare first token (never `id=`). Adds it as a travelable node.\n");
+    out.push_str("- [TIME Day N, HH:MM] — real elapsed time, never a placeholder.\n");
+    out.push_str("- [DATE <new calendar label>] — emit the NEW full label verbatim (e.g. \"4th of Harvest, Year 1247, Market Day\") — the whole label is rewritten, no arithmetic. Only when a `date:` anchor is in use.\n");
+    out.push_str("- [WEATHER <condition>] — one word: fog, rain, snow, clear, overcast, storm, etc.\n");
+    out.push_str("- [TRAVEL <node_id>] — use a node_id from the exits, or name a new destination when leaving the map; the engine links it.\n");
+    out.push_str("- [RUMOR <rumor_text>] — the whole phrase is the rumor.\n");
+    out.push_str("- [NPC_REGISTER <npc_id> name=<name> (role=<role>) (tier=minion|soldier|elite|boss|legendary)] — the npc_id is the bare first token (never `id=`). Omit tier for civilians.\n");
+    out.push_str("- [PRESENCE <npc_id> <stance or micro-location>] — resolves names from the cast line. Example: [PRESENCE mara \"behind the bar, drying a glass\"].\n");
+    out.push_str("- [DISCOVER <node_id> name=<name> (setting=indoor|outdoor) (neighbors=<ids>)] — node_id is the bare first token (never `id=`). Adds a travelable node.\n");
     // (2026-08-16 audit fix #19) Teach the grammar the parser actually reads:
     // the old `[kind=disguise]` notation (literal brackets) tokenizes as key
     // `[kind` → kind stayed empty → the §7.2 disguise gate NEVER engaged. The
     // parser reads a bare trailing `kind=disguise` token on the positional
     // form (bracket_parser.rs hoists it before the kv/positional split).
-    out.push_str("- [EFFECT <label> buff|debuff <minutes>] — when a buff/debuff takes hold. The number is MINUTES (0 = permanent). Disguises use the same verb with a trailing kind token: [EFFECT <label> buff <minutes> kind=disguise].\n");
-    out.push_str("- [MILESTONE <npc_id> <event_id>] — when a relationship meaningfully shifts (alliance forged, trust broken).\n");
-    out.push_str("- [TASK <npc_id> <description> | <difficulty> <suitability> <eta-minutes>] — when an NPC starts an off-screen task you should track. All five fields; the pipe separates the description from the three trailing fields.\n");
-    out.push_str("- [APPEARANCE key=value] — when the player's look LASTINGLY changes (a disguise applied, hair cut, a scar earned). Keys: hair_color, outfit, eye_color, scars, wounds, tattoos, disguise, body_type, skin_complexion, hair_length, hair_style, breast_size, ears, tail, horn. Bare [APPEARANCE key] clears.\n");
-    out.push_str("- [EQUIP slot=<slot> name=<item> (layer=outer|inner) (stats=<note>) (tags=<tags>)] — when a garment or READY weapon is put ON. Slots: head, chest, main_hand, off_hand, legs, feet. main_hand/off_hand are for readied weapons/tools ONLY — a sheathed or belt-hung blade goes in [BELT], not a hand slot. Bare [EQUIP slot=<slot>] unequips. Quote multi-word names.\n");
-    out.push_str("- [BELT name=<item> (qty=N) (tags=<tags>)] / [BELT -<name>] — when a quick-access item (a belt knife, a potion, a pouch) is gained or stowed. This is where belt-hung knives belong.\n");
-    out.push_str("- [PACK name=<item> (qty=N) (tags=<tags>)] / [PACK -<name>] — when an item is acquired into deep storage or removed. Check the pack line first so you don't re-add what's already there.\n");
+    out.push_str("- [EFFECT <label> buff|debuff <minutes>] — minutes (0 = permanent). Disguises add a trailing kind token: [EFFECT <label> buff <minutes> kind=disguise].\n");
+    out.push_str("- [MILESTONE <npc_id> <event_id>] — a relationship meaningfully shifts.\n");
+    out.push_str("- [TASK <npc_id> <description> | <difficulty> <suitability> <eta-minutes>] — all five fields; the pipe separates description from the three trailing fields.\n");
+    out.push_str("- [APPEARANCE key=value] — keys: hair_color, outfit, eye_color, scars, wounds, tattoos, disguise, body_type, skin_complexion, hair_length, hair_style, breast_size, ears, tail, horn. Bare [APPEARANCE key] clears.\n");
+    out.push_str("- [EQUIP slot=<slot> name=<item> (layer=outer|inner) (stats=<note>) (tags=<tags>)] — slots: head, chest, main_hand, off_hand, legs, feet. main_hand/off_hand are READIED weapons only — belt-hung blades go in [BELT]. Bare [EQUIP slot=<slot>] unequips. Quote multi-word names.\n");
+    out.push_str("- [BELT name=<item> (qty=N) (tags=<tags>)] / [BELT -<name>] — quick-access items (a belt knife, a potion, a pouch).\n");
+    out.push_str("- [PACK name=<item> (qty=N) (tags=<tags>)] / [PACK -<name>] — deep storage add/remove; check the pack line first.\n");
     out.push_str("Tags (EQUIP/BELT/PACK): consumable, equippable, pocketable — see <item_rules> above.\n");
     // NOTE (#26c, 2026-08-15): `CharacterTurn` / `Object` / `Fx` are
     // LEGACY-RECOGNIZED only — the parser + streaming filter still accept +
@@ -8770,6 +8964,205 @@ fn render_fable_world_state(
     }
 
     rendered
+}
+
+/// (2026-08-16 tracker-budget fix) LEAN world-state render for the TRACKER's
+/// 3072-token context. The narrator's `render_fable_world_state` is shaped
+/// for prose (16k API budget); the tracker needs IDS + mechanical facts, not
+/// lore. The per-field legal maxima of the rich render (4000-char summary +
+/// 5×1000-char events + 12 presences with 120-char stances + wound-history
+/// descriptors) compose past the tracker's ENTIRE prompt budget, so the
+/// tracker path applies staged, always-on caps:
+///
+///   • `injuries:` / `amputated:` lines are DROPPED — the Rust Combat
+///     Referee owns body state; no bracket mutates it. Wound descriptors
+///     are narrator material (the narrator's rich render keeps them).
+///   • Stage 0 (normal play — generous caps that rarely bite): `present:`
+///     640, `rumors:` 240, `summary:` 270, newest 3 events × 170, `pack:`
+///     240, `custom:` 260. `cast:` uncapped (the [PRESENCE] id whitelist).
+///   • Stage 1/2 (only when the rendered world-state alone would exceed
+///     `WS_BUDGET`): progressively tighter caps; stage 2 also caps the
+///     `cast:` line (a clipped whitelist still tracks the scene's
+///     principals — the alternative at that composition is the loud skip).
+///   • Hard bound: after stage 2, a line-boundary tail truncation to
+///     `WS_BUDGET` — the render ORDER puts the load-bearing anchors first
+///     (date/clock/weather/location/present), so the tail that falls off
+///     is the lowest-priority carry-back. This makes "world-state ≤
+///     WS_BUDGET" an invariant, which is what keeps the whole worst-case
+///     tracker prompt under `settings::TRACKER_PROMPT_CHAR_BUDGET`.
+///   • Turn directives are NOT rendered — they are referee outcomes for the
+///     NARRATOR's prose, dead weight for bracket emission.
+///
+/// Surgery is LINE-based, safe because every trimmed field is flattened to
+/// a single line at render time (`flatten_inline`). The API narrator path
+/// is untouched (rich render, 16k budget).
+/// Per-line lean caps for one surgery pass of
+/// [`render_tracker_world_state`]. All stage consts spell every field out
+/// (no struct-update syntax) so each stage reads as a whole.
+#[derive(Clone, Copy)]
+struct LeanCaps {
+    present: usize,
+    rumors: usize,
+    summary: usize,
+    events_shown: usize,
+    event_chars: usize,
+    pack: usize,
+    custom: usize,
+    /// `None` = the cast line passes through uncapped (stage 0 — it is
+    /// the [PRESENCE] id whitelist, clipped only under real pressure).
+    cast: Option<usize>,
+}
+
+fn render_tracker_world_state(s: &schema::WorldSchema) -> String {
+    // Stage 0 — normal play. Sized for a busy-but-real scene.
+    const STAGE0: LeanCaps = LeanCaps {
+        present: 640,
+        rumors: 240,
+        summary: 270,
+        events_shown: 3,
+        event_chars: 170,
+        pack: 240,
+        custom: 260,
+        cast: None,
+    };
+    // Stage 1 — long-campaign bloat: narrative context shrinks first.
+    const STAGE1: LeanCaps = LeanCaps {
+        present: 640,
+        rumors: 160,
+        summary: 150,
+        events_shown: 2,
+        event_chars: 170,
+        pack: 200,
+        custom: 260,
+        cast: None,
+    };
+    // Stage 2 — pathological composition: everything clipped, cast included.
+    const STAGE2: LeanCaps = LeanCaps {
+        present: 480,
+        rumors: 120,
+        summary: 100,
+        events_shown: 1,
+        event_chars: 170,
+        pack: 160,
+        custom: 160,
+        cast: Some(520),
+    };
+    // The world-state's share of TRACKER_PROMPT_CHAR_BUDGET: fixed overhead
+    // (AGENT prose ~3380 + bracket list ~2260 + wrappers ~180) + a realistic
+    // worst window (~700) leaves ~3.2k. Derived + measured 2026-08-16.
+    const WS_BUDGET: usize = 3_200;
+
+    let rich = render_fable_world_state(s, &[]);
+    let mut lean = lean_world_state_surgery(&rich, &STAGE0);
+    if lean.chars().count() > WS_BUDGET {
+        lean = lean_world_state_surgery(&rich, &STAGE1);
+    }
+    if lean.chars().count() > WS_BUDGET {
+        lean = lean_world_state_surgery(&rich, &STAGE2);
+    }
+    if lean.chars().count() > WS_BUDGET {
+        // Hard bound of last resort (irreducible lines alone over budget —
+        // e.g. a maxed calendar + full player_state + hub node). Cut at a
+        // line boundary; the anchors lead the render, so the tail lost is
+        // the lowest-priority carry-back.
+        lean = truncate_at_line_boundary(&lean, WS_BUDGET);
+    }
+    lean
+}
+
+/// One line-surgery pass of [`render_tracker_world_state`] over the rich
+/// render, applying `caps`. Pure.
+fn lean_world_state_surgery(rich: &str, caps: &LeanCaps) -> String {
+    let mut out: Vec<String> = Vec::with_capacity(32);
+    let mut in_events = false;
+    let mut event_lines: Vec<String> = Vec::new();
+
+    let flush_events = |out: &mut Vec<String>, event_lines: &mut Vec<String>| {
+        if event_lines.is_empty() {
+            return;
+        }
+        out.push("recent_events:".to_string());
+        let keep_from = event_lines.len().saturating_sub(caps.events_shown);
+        for ev in &event_lines[keep_from..] {
+            out.push(lean_truncate_line(ev, caps.event_chars));
+        }
+        event_lines.clear();
+    };
+
+    for line in rich.lines() {
+        if line.starts_with("recent_events:") {
+            flush_events(&mut out, &mut event_lines);
+            in_events = true;
+            continue;
+        }
+        if in_events {
+            if line.starts_with("  - ") {
+                event_lines.push(line.to_string());
+                continue;
+            }
+            // A non-event line ends the block; flush before processing it.
+            flush_events(&mut out, &mut event_lines);
+            in_events = false;
+        }
+        // Referee-owned body state: narrator material, not bracket fuel.
+        if line.starts_with("  injuries:") || line.starts_with("  amputated:") {
+            continue;
+        }
+        let capped = if let Some(v) = line.strip_prefix("present: ") {
+            Some(format!("present: {}", lean_truncate_line(v, caps.present)))
+        } else if let Some(v) = line.strip_prefix("rumors: ") {
+            Some(format!("rumors: {}", lean_truncate_line(v, caps.rumors)))
+        } else if let Some(v) = line.strip_prefix("summary: ") {
+            Some(format!("summary: {}", lean_truncate_line(v, caps.summary)))
+        } else if let Some(v) = line.strip_prefix("pack: ") {
+            Some(format!("pack: {}", lean_truncate_line(v, caps.pack)))
+        } else if let Some(v) = line.strip_prefix("custom: ") {
+            Some(format!("custom: {}", lean_truncate_line(v, caps.custom)))
+        } else if let (Some(v), Some(cap)) = (line.strip_prefix("cast: "), caps.cast) {
+            Some(format!("cast: {}", lean_truncate_line(v, cap)))
+        } else {
+            None
+        };
+        out.push(capped.unwrap_or_else(|| line.to_string()));
+    }
+    flush_events(&mut out, &mut event_lines);
+    out.join("\n")
+}
+
+/// Char-safe truncation for a single flattened render line: hard cut at `cap`
+/// CHARS (never bytes — anti-pattern #6), preferring a `", "` / `"; "`
+/// boundary in the back half of the window so list-shaped lines lose a whole
+/// entry rather than half of one. Appends an ellipsis marker so the model
+/// knows the line was trimmed.
+fn lean_truncate_line(s: &str, cap: usize) -> String {
+    if s.chars().count() <= cap {
+        return s.to_string();
+    }
+    let cut: String = s.chars().take(cap).collect();
+    let sep = cut
+        .rfind(", ")
+        .filter(|&i| i > cap / 2)
+        .or_else(|| cut.rfind("; ").filter(|&i| i > cap / 2));
+    match sep {
+        // Byte index from `rfind` on an ASCII separator is a char boundary.
+        Some(i) => format!("{} …", &cut[..i]),
+        None => format!("{}…", cut.trim_end()),
+    }
+}
+
+/// (2026-08-16 tracker-budget fix) Hard char bound of last resort for the
+/// lean world-state render: cut at the last line boundary inside `cap`
+/// chars + mark with an ellipsis. Chars, never bytes; the newline search is
+/// on an ASCII byte so the index is a char boundary.
+fn truncate_at_line_boundary(s: &str, cap: usize) -> String {
+    if s.chars().count() <= cap {
+        return s.to_string();
+    }
+    let cut: String = s.chars().take(cap).collect();
+    match cut.rfind('\n').filter(|&i| i > cap / 2) {
+        Some(i) => format!("{}\n…\n", &cut[..i]),
+        None => format!("{}…", cut.trim_end()),
+    }
 }
 
 /// Backend launch guard (2026-08-07 architectural override). Fable narration
@@ -9143,7 +9536,8 @@ async fn fable_send(
     debug_assert!(true, "narrator path: tools excluded by construction");
 
     // Architectural override (2026-08-07): Fable narration is API-ONLY. The
-    // local 12B never narrates (Gemma 12B cannot roleplay without stat-spam —
+    // local
+    // model never narrates (the local Gemma cannot roleplay without stat-spam —
     // it compulsively emits tracking brackets in prose). The frontend launch
     // gate (`launchFable` → `model_source_get`) blocks entering Fable without
     // an active API profile; this is the backend backstop so a stale frontend
@@ -9247,7 +9641,7 @@ async fn fable_send(
     // chat/schema/SD already use. The old lease→lock order left a window
     // where a chat turn or an SD swap cycle could acquire the lease and evict
     // the fable role while this frame still held an engine clone (its
-    // teardown's Arc::try_unwrap then failed → the ~510MB fable context
+    // teardown's Arc::try_unwrap then failed → the ~70MB fable context
     // orphaned in VRAM alongside the new role's context; for the SD path,
     // unload_shared_model could free the weights under the still-live
     // LlamaContext — memory-unsafe). Holding the turn lock from before the
@@ -9654,12 +10048,16 @@ async fn fable_send(
             turn_directives.push(td.clone());
         }
 
-        // Render the canonical world-state snapshot (now reflects any injury +
-        // any relationship transitions above). The render + the turn-scoped
+        // Render the world-state snapshot (now reflects any injury + any
+        // relationship transitions above). The render + the turn-scoped
         // directives block are factored into render_fable_world_state so the
         // API branch can re-invoke it after the tracker stage mutates the
         // schema (§11.41 DM / Voice-Actor split).
-        let rendered = render_fable_world_state(&s, &turn_directives);
+        // (2026-08-16 tracker-budget fix) The TRACKER gets the LEAN render
+        // (`render_tracker_world_state` — capped lines, no injury prose, no
+        // directives); the API narrator re-renders the RICH form post-tracker
+        // below. One schema, two prompt shapes.
+        let rendered = render_tracker_world_state(&s);
 
         // Push the single undo snapshot (if any engine mutated). Done after
         // the lock release to keep lock-ordering uniform.
@@ -9719,13 +10117,17 @@ async fn fable_send(
         .get()
         .expect("fable_prompts is set in setup()");
 
+    // (2026-08-16 retrieval diet) The TRACKER system prompt takes NO memory
+    // block (see build_narrator_system_prompt's doc): the retrieval below is
+    // still performed — the API narrator consumes it (10091-ish call site)
+    // and `codex_was_injected` gates archival echo-skip on it — it just never
+    // enters the tracker's 3072-token budget.
     let system_prompt = build_narrator_system_prompt(
         fable_prompts,
         &card,
         world_state.as_deref(),
         pacing,
         player_action.as_deref(),
-        memory_block.as_deref(),
     );
 
     // Append the user turn to the per-card game conversation, then window the
@@ -9891,7 +10293,7 @@ async fn fable_send(
     // v0.6.3 API routing for the narrator. §11.41 (2026-07-28, DM / Voice-Actor
     // split): a narrator turn is TWO stages.
     //
-    //   Stage 1 — TRACKER (local 12B): runs FIRST. Emits bracket/JSON tracking
+    //   Stage 1 — TRACKER (local model): runs FIRST. Emits bracket/JSON tracking
     //   commands that decide the mechanical truth of the turn (time advanced,
     //   buffs gained, milestones hit, tasks queued). NO prose — its output is
     //   hidden from the user via a no-op on_chunk. The brackets are applied to
@@ -9908,7 +10310,7 @@ async fn fable_send(
     //   injects `<|think|>` — API narration never thinks.
     //
     // Architectural override (2026-08-07): this API path is now the ONLY path.
-    // The local 12B never narrates. On any API failure there is NO local
+    // The local model never narrates. On any API failure there is NO local
     // fallback — instead the turn aborts, an `api_lost` event is emitted, the
     // autosave runs (so progress is never lost), and the frontend locks the
     // composer until the API is reconnected. The LOCAL two-pass path (local
@@ -9921,7 +10323,7 @@ async fn fable_send(
     // does), so the final bracket parse is a no-op for state (the tracker
     // already applied them) but still cleans/strips the prose.
     let reply: fable_engine::FableReply = {
-        // ---- Stage 1: TRACKER (local 12B, hidden) ----
+        // ---- Stage 1: TRACKER (local model, hidden) ----
         // The tracker gets the Tracker prompt (build_narrator_system_prompt —
         // narration + brackets), but with the PRE-tracker world_state (the
         // authoritative state before this turn's brackets land). Its prose is
@@ -9934,38 +10336,65 @@ async fn fable_send(
         // under the process-wide `local_model_lock` (`_tracker_model_guard`,
         // taken before acquire_fable_engine_leased) so they never overlap a
         // concurrent `chat_send`, schema-delta, or SD-swap decode on the local
-        // 12B / shared VRAM. Whichever consumer acquires first runs to
+        // model / shared VRAM. Whichever consumer acquires first runs to
         // completion; the others queue. The guard drops at the end of this
         // block — BEFORE Stage 2 (the API narrator never takes it).
         let noop_chunk: llm::ChunkFn = Arc::new(|_: &str| {});
         // The tracker uses the tight 1-turn window (WINDOW_TRACKER = 2), NOT
         // the narrator's 16-message window. It relies on the schema delta +
         // Rust state, not re-read history (2026-08-10).
-        let tracker_prompt = build_narrator_prompt(&system_prompt, &tracker_window);
+        //
+        // (2026-08-16 tracker-budget fix) Bounded render: over-budget → drop
+        // the preceding assistant beat + re-render once; STILL over → skip
+        // the tracker pass entirely with a hard error (never decode a
+        // headless prompt — the front-drain's silent bracket-protocol chop
+        // hid for 19 turns last time).
+        let tracker_prompt_opt: Option<String> =
+            match build_tracker_prompt_bounded(&system_prompt, &tracker_window) {
+                Ok(p) => Some(p),
+                Err(chars) => {
+                    tracing::error!(
+                        budget = settings::TRACKER_PROMPT_CHAR_BUDGET,
+                        rendered = chars,
+                        "⚠ TRACKER PROMPT OVER BUDGET even after the tail-drop re-render — \
+                         SKIPPING the tracker pass (brackets skipped this turn; the narrator \
+                         still runs on pre-tracker state). This is a prompt-bloat regression: \
+                         shrink the prompt per the Prime Directive, never raise the context."
+                    );
+                    None
+                }
+            };
         tracing::info!("fable_send: API mode — tracker stage (local) starting");
         let engine = engine_opt
             .as_ref()
             .expect("tracker engine alive (dropped only in the API arm, post-tracker)");
-        let tracker_reply_opt: Option<fable_engine::FableReply> = match engine
-            .request_turn(tracker_prompt, noop_chunk.clone(), cancel.clone(), true)
-        {
-            Ok(reply_rx) => {
-                match tokio::task::spawn_blocking(move || reply_rx.recv()).await {
-                    Ok(Ok(r)) => Some(r),
-                    Ok(Err(e)) => {
-                        tracing::warn!(error = %e, "fable_send: tracker channel recv failed; skipping tracker stage");
-                        None
+        let tracker_reply_opt: Option<fable_engine::FableReply> = match tracker_prompt_opt {
+            Some(tracker_prompt) => {
+                match engine
+                    .request_turn(tracker_prompt, noop_chunk.clone(), cancel.clone(), true)
+                {
+                    Ok(reply_rx) => {
+                        match tokio::task::spawn_blocking(move || reply_rx.recv()).await {
+                            Ok(Ok(r)) => Some(r),
+                            Ok(Err(e)) => {
+                                tracing::warn!(error = %e, "fable_send: tracker channel recv failed; skipping tracker stage");
+                                None
+                            }
+                            Err(e) => {
+                                tracing::warn!(error = %e, "fable_send: tracker join failed; skipping tracker stage");
+                                None
+                            }
+                        }
                     }
                     Err(e) => {
-                        tracing::warn!(error = %e, "fable_send: tracker join failed; skipping tracker stage");
+                        tracing::warn!(error = %format!("{e:#}"), "fable_send: tracker request_turn failed; skipping tracker stage");
                         None
                     }
                 }
             }
-            Err(e) => {
-                tracing::warn!(error = %format!("{e:#}"), "fable_send: tracker request_turn failed; skipping tracker stage");
-                None
-            }
+            // Over-budget render: the tracker pass was already failed loudly
+            // above — proceed to the API narrator with pre-tracker state.
+            None => None,
         };
 
         // Apply the tracker's brackets to fable_schema (if it produced any).
@@ -9990,9 +10419,9 @@ async fn fable_send(
                     // — and VASTLY better — NPC dialogue + scene description
                     // in prose, so emitting the tracker's CharacterTurn
                     // would either (a) duplicate the narrator's dialogue
-                    // or (b) leak the local 12B's malformed bracket
+                    // or (b) leak the local model's malformed bracket
                     // arguments straight to the user (the §11.43.A bug,
-                    // found 2026-07-28: the local 12B loops on `(player)`
+                    // found 2026-07-28: the local 12B (pre-E4B) loops on `(player)`
                     // template-placeholder syntax inside character_turn
                     // lines, producing garbage like "the (player) is
                     // (player) at the (player)"). The apply_phase3 helpers
@@ -10041,7 +10470,7 @@ async fn fable_send(
 
         // The tracker's local-model work is done — release the local-model
         // turn lock NOW so a concurrent chat_send / schema-delta can use the
-        // local 12B while Stage 2 (the API narrator, below) streams over
+        // local model while Stage 2 (the API narrator, below) streams over
         // HTTP. The API never touches the local model, so holding the lock
         // across it would needlessly block every Wupi-drawer message for the
         // entire narrator generation.
@@ -10053,7 +10482,7 @@ async fn fable_send(
         // cycle queued on the turn lock could wake, cross-role acquire, and
         // run the swap-lock's eviction teardown with this frame's engine
         // clone still alive — `Arc::try_unwrap` fails and context_swap
-        // PROCEEDS ANYWAY, allocating the new context while the ~510 MB
+        // PROCEEDS ANYWAY, allocating the new context while the ~70 MB
         // fable context is still resident (the exact VRAM-eviction window
         // the turn-lock-before-lease invariant exists to close; memory-
         // unsafe for the SD unload path). The dev-only local-narrator arm
@@ -10471,7 +10900,7 @@ async fn fable_send(
     // brackets out of the stored prose. The old defensive apply site re-
     // applied whatever the narrator emitted: a no-op for the API narrator
     // (prose-only prompt, no commands) but in the DEV local-narrator arm
-    // the 12B stat-spams brackets, so a duplicate [TIME] double-advanced
+    // the local model stat-spams brackets, so a duplicate [TIME] double-advanced
     // the clock. No scene_events are emitted for narrator-stage commands
     // either (the tracker's Stage-1 loop above owns emission; dev-mode
     // duplicates would double-fire UI notifications).
@@ -14032,7 +14461,9 @@ async fn retrack_edited_assistant_message(
     let pacing = scene_pacing::evaluate(&pacing_text);
     let world_state = {
         let s = state.fable_schema.lock().await;
-        let rendered = render_fable_world_state(&s, &[]);
+        // (2026-08-16 tracker-budget fix) Lean tracker render — same shape
+        // discipline as fable_send's tracker stage.
+        let rendered = render_tracker_world_state(&s);
         if rendered.trim().is_empty() { None } else { Some(rendered) }
     };
     let fable_prompts = state
@@ -14045,9 +14476,26 @@ async fn retrack_edited_assistant_message(
         world_state.as_deref(),
         pacing,
         player_action.as_deref(),
-        None,
     );
-    let tracker_prompt = build_narrator_prompt(&system_prompt, &tracker_window);
+    // (2026-08-16 tracker-budget fix) Same bounded render as fable_send:
+    // over-budget → tail-drop re-render; still over → fail the pass loudly
+    // (never decode a headless prompt). On Err the retrack takes the
+    // existing failure path: restore the pre-edit schema, prose edit stands.
+    let tracker_prompt: String = match build_tracker_prompt_bounded(&system_prompt, &tracker_window)
+    {
+        Ok(p) => p,
+        Err(chars) => {
+            tracing::error!(
+                budget = settings::TRACKER_PROMPT_CHAR_BUDGET,
+                rendered = chars,
+                "⚠ EDIT RE-TRACK tracker prompt over budget even after the tail-drop \
+                 re-render — skipping the tracker pass. Prompt-bloat regression: shrink \
+                 the prompt per the Prime Directive, never raise the context."
+            );
+            *state.fable_schema.lock().await = displaced;
+            return;
+        }
+    };
 
     // Fresh cancel token in the RESERVED retrack slot (2026-08-15 audit fix):
     // this pass runs detached + can overlap a Stage-2 narrator stream, so the
@@ -15276,7 +15724,7 @@ mod tests {
     #[test]
     fn effective_local_ctx_always_returns_with_api_constant() {
         // Wupi chat is LOCAL-ONLY (2026-08-08 override): the chat backend
-        // ALWAYS runs at CTX_LOCAL_WITH_API (2048). The 4096 context is
+        // ALWAYS runs at CTX_LOCAL_WITH_API. The 4096 context is
         // retired for chat — it was for narrative, which the local model no
         // longer does. The source param is now read-ignored; both variants
         // return the same constant.
@@ -15289,13 +15737,54 @@ mod tests {
         assert_eq!(
             effective_local_ctx(api::ModelSource::Api, &settings),
             settings::CTX_LOCAL_WITH_API,
-            "API mode must return CTX_LOCAL_WITH_API (the chat context is always 2048)"
+            "API mode must return CTX_LOCAL_WITH_API (the chat context is always the local constant)"
         );
         // The settings value must NOT leak through (read-ignored).
         let default = WupiSettings::default();
         assert_eq!(
             effective_local_ctx(api::ModelSource::Local, &default),
             settings::CTX_LOCAL_WITH_API
+        );
+    }
+
+    #[test]
+    fn wupi_system_prefix_fits_chat_prompt_budget() {
+        // 2026-08-17 E4B shakedown P0 regression: the system prefix (the
+        // system turn — role + persona + profile + current_context) is
+        // untouchable by truncate_to_fit, so prefix ≥ budget bricks the
+        // copilot on EVERY turn (the 1541-vs-1536 lockout). Pin the REAL
+        // authored data (repo-root data/) against the prompt budget with
+        // 200 tokens of slack for short-term drift. Token estimate uses a
+        // harsher density than observed (3 chars/token vs the measured
+        // 3.7–4.0, so it OVERESTIMATES tokens; if the overestimate fits,
+        // the real render fits) and folds in a representative worst-case
+        // inter-turn memory + world_state block, which shares the same
+        // prompt budget.
+        let data = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../data");
+        let prompts = prompts::load_wupi_prompts(&data.join("wupi.prompt"));
+        let persona = std::fs::read_to_string(data.join("wupi.sim"))
+            .ok()
+            .and_then(|xml| sim_card::parse_from_xml_str(&xml).ok())
+            .map(|c| c.render_for_prompt())
+            .filter(|s| !s.trim().is_empty());
+        let profile = user_profile::load(Some(&data.join("user.xml")))
+            .map(|p| p.render_for_prompt())
+            .filter(|s| !s.trim().is_empty())
+            .or_else(|| Some("<user_profile>\nname: User\n</user_profile>".to_owned()));
+        let system = assemble_wupi_system_prompt(
+            Some(prompts.role.as_str()),
+            persona.as_deref(),
+            profile.as_deref(),
+            settings::CTX_LOCAL_WITH_API,
+            8000,
+        );
+        let budget = (settings::CTX_LOCAL_WITH_API - 512) as usize;
+        let worst_case_chars = system.chars().count() + 1_200 + 600; // + memory block + world_state
+        let approx_tokens = worst_case_chars / 3;
+        assert!(
+            approx_tokens < budget.saturating_sub(200),
+            "system prefix ~{approx_tokens} tokens (worst case) must stay under budget−200 ({}) — a larger authored prompt locks the copilot out",
+            budget.saturating_sub(200)
         );
     }
 
@@ -15520,14 +16009,15 @@ mod tests {
         );
     }
 
-    /// §7 sibling (2026-07-29): the narrator prompt builders MUST accept + render
-    /// a `memory_block` (the retrieved fable.codex knowledge) as a
-    /// `<retrieved_knowledge>` block. This is the core fix that makes the prompt
-    /// distillation safe: the offloaded detail (bracket semantics, narrative
-    /// discipline, common errors) lives in the codex and arrives on semantic
-    /// match, keeping the inline prompt lean. Pin the wiring so a future refactor
-    /// that drops the `memory_block` param fails loudly. Mirrors
-    /// `fable_send_never_includes_tools` for the retrieval path.
+    /// §7 sibling (2026-07-29, amended 2026-08-16 retrieval diet): the API
+    /// NARRATOR prompt builder MUST render a `memory_block` (the retrieved
+    /// fable.codex knowledge) as a `<retrieved_knowledge>` block — the core
+    /// fix that makes the prompt distillation safe. The TRACKER builder, by
+    /// contrast, takes NO memory block AT ALL (structurally: the param was
+    /// removed): the tracker's memory is the schema, and episodic
+    /// `<retrieved_knowledge>` growth is what made its 3072-token overflow
+    /// progressive (5 → 687 dropped tokens over 16 turns in the playtest).
+    /// Pin BOTH directions so a future refactor fails loudly either way.
     #[test]
     fn narrator_prompt_renders_retrieved_knowledge_block() {
         use crate::schema::{SceneMode, ScenePacing};
@@ -15566,47 +16056,31 @@ mod tests {
         };
         let block = "Reference knowledge\n<c title=\"Bracket Commands Reference\">the full per-command detail</c>";
 
-        // Tracker path: the block must render between <world_state> and <scene_pacing>.
+        // Tracker path: NO memory block — the builder has no param for one
+        // (compile-level enforcement), and the render must contain no
+        // retrieved-knowledge tag even with retrieval live in the turn.
         let tracker_prompt = build_narrator_system_prompt(
             &prompts::FablePrompts::test_default(),
             &card,
             Some("gold: 100"),
             pacing,
             None,
-            Some(block),
         );
         assert!(
-            tracker_prompt.contains("<retrieved_knowledge>"),
-            "tracker prompt must render the <retrieved_knowledge> block when memory_block is Some"
+            !tracker_prompt.contains("<retrieved_knowledge>"),
+            "tracker prompt must NEVER render <retrieved_knowledge> (retrieval diet — \
+             the schema is its memory; the block belongs to the 16k API narrator)"
         );
         assert!(
-            tracker_prompt.contains("Bracket Commands Reference"),
-            "tracker prompt must contain the retrieved codex content"
+            !tracker_prompt.contains("Bracket Commands Reference"),
+            "tracker prompt must not carry retrieved codex content"
         );
-        // Ordering: retrieved_knowledge AFTER world_state, BEFORE scene_pacing.
-        let ws = tracker_prompt.find("<world_state>").expect("world_state tag");
-        let rk = tracker_prompt
-            .find("<retrieved_knowledge>")
-            .expect("retrieved_knowledge tag");
-        let sp = tracker_prompt.find("<scene_pacing").expect("scene_pacing tag");
-        assert!(ws < rk, "retrieved_knowledge must come after world_state");
-        assert!(rk < sp, "retrieved_knowledge must come before scene_pacing");
+        // The tracker's id sources survive: world_state + scene_pacing still render.
+        assert!(tracker_prompt.contains("<world_state>"));
+        assert!(tracker_prompt.contains("<scene_pacing"));
 
-        // None memory_block → no block emitted (zero baseline cost).
-        let no_block_prompt = build_narrator_system_prompt(
-            &prompts::FablePrompts::test_default(),
-            &card,
-            None,
-            pacing,
-            None,
-            None,
-        );
-        assert!(
-            !no_block_prompt.contains("<retrieved_knowledge>"),
-            "tracker prompt must NOT render the block when memory_block is None"
-        );
-
-        // API narrator path: same wiring.
+        // API narrator path: the block must render between <world_state> and
+        // <scene_pacing>.
         let api_prompt = build_api_narrator_system_prompt(
             &prompts::FablePrompts::test_default(),
             &card,
@@ -15619,6 +16093,365 @@ mod tests {
             api_prompt.contains("<retrieved_knowledge>"),
             "API narrator prompt must render the <retrieved_knowledge> block"
         );
+        let ws = api_prompt.find("<world_state>").expect("world_state tag");
+        let rk = api_prompt
+            .find("<retrieved_knowledge>")
+            .expect("retrieved_knowledge tag");
+        let sp = api_prompt.find("<scene_pacing").expect("scene_pacing tag");
+        assert!(ws < rk, "retrieved_knowledge must come after world_state");
+        assert!(rk < sp, "retrieved_knowledge must come before scene_pacing");
+
+        // None memory_block → no block emitted (zero baseline cost).
+        let no_block_prompt = build_api_narrator_system_prompt(
+            &prompts::FablePrompts::test_default(),
+            &card,
+            None,
+            pacing,
+            None,
+            None,
+        );
+        assert!(
+            !no_block_prompt.contains("<retrieved_knowledge>"),
+            "API narrator prompt must NOT render the block when memory_block is None"
+        );
+    }
+
+    /// (2026-08-16 tracker-budget fix, P1.4) THE WORST-CASE BUDGET TEST.
+    ///
+    /// Renders the tracker prompt with EVERY variable component at its legal
+    /// maximum and asserts the bounded render fits — the regression pin for
+    /// the third recurrence of the overflow → headless-prompt →
+    /// zero-brackets failure mode. Any growth in the bracket list, the lean
+    /// world-state caps, or the authored AGENT section trips this before it
+    /// ships. Chars, not tokens (no tokenizer at the prompt layer); the
+    /// budget constant already encodes the conservative 3.5 chars/token
+    /// ratio vs the observed 3.7–4.0.
+    #[test]
+    fn tracker_prompt_worst_case_fits_char_budget() {
+        use crate::schema::{SceneMode, ScenePacing};
+
+        // The authored AGENT prose is the real fixed cost — load the real
+        // data/fable.prompt when the test runs from the crate root (cargo
+        // test cwd = src-tauri), else fall back to a synthetic section
+        // GENEROUSLY larger than the real one so the pin still bites.
+        let prompts = match std::path::Path::new("../data/fable.prompt").exists() {
+            true => prompts::load_fable_prompts(std::path::Path::new("../data/fable.prompt")),
+            false => prompts::FablePrompts {
+                narrator: String::new(),
+                agent: "agent ".repeat(800), // 4000 chars > real ~3380
+            },
+        };
+
+        let schema = maxed_world_schema();
+        let world_state = render_tracker_world_state(&schema);
+        let pacing = ScenePacing {
+            mode: SceneMode::Combat,
+            spatial: 2,
+            emotional: 2,
+            kinetic: 2,
+        };
+        // Longest realistic action: a detailed typed action (the 4000-char
+        // FABLE_ACTION_CHAR_CAP is a paste backstop, not the design point —
+        // at 4000 the prompt tail-drop can't recover and the pass fails
+        // loudly by design).
+        let action = "I ".to_owned() + &"advance through the burning market, sword up. ".repeat(14);
+        let window = vec![
+            tmsg(
+                session::Role::Assistant,
+                "n".repeat(crate::settings::TRACKER_ASSISTANT_CHAR_CAP),
+            ),
+            tmsg(session::Role::User, action.clone()),
+        ];
+
+        let system_prompt = build_narrator_system_prompt(
+            &prompts,
+            &fake_tracker_card(),
+            Some(&world_state),
+            pacing,
+            // No armed manual player_action in the worst case: the window's
+            // user message IS the action. (An armed action REPLACES typing
+            // — counting both double-charges the budget; the skeleton block
+            // and the window never carry the same text twice in live play.)
+            None,
+        );
+        match build_tracker_prompt_bounded(&system_prompt, &window) {
+            Ok(p) => {
+                assert!(
+                    p.chars().count() <= settings::TRACKER_PROMPT_CHAR_BUDGET,
+                    "worst-case tracker prompt {} chars > budget {}",
+                    p.chars().count(),
+                    settings::TRACKER_PROMPT_CHAR_BUDGET
+                );
+                // The trigger (user action) must survive every trim path.
+                assert!(p.contains("<|turn>user"), "the user action must never be dropped");
+            }
+            Err(chars) => panic!(
+                "worst-case tracker prompt over budget even after the tail-drop: \
+                 {} chars > {}. Shrink the prompt per the Prime Directive.",
+                chars,
+                settings::TRACKER_PROMPT_CHAR_BUDGET
+            ),
+        }
+    }
+
+    /// P1.4 sibling: the tail-drop re-render — an over-budget window loses
+    /// the preceding assistant beat (lowest-priority tail block) and keeps
+    /// the trailing user action; an unfixable prompt (system alone over
+    /// budget) errs for the caller to fail loudly on.
+    #[test]
+    fn tracker_prompt_bounded_tail_drop_and_err() {
+        // Tail-drop: system ~5.6k chars + beat 600 + action ~3.9k → over the
+        // 9800 budget; dropping the beat recovers it.
+        let system = "s".repeat(5_600);
+        let window = vec![
+            tmsg(
+                session::Role::Assistant,
+                "ASSISTANT-BEAT-MARKER ".repeat(28), // ~600 chars
+            ),
+            tmsg(session::Role::User, "u".repeat(3_900)),
+        ];
+        let full = build_narrator_prompt(&system, &window);
+        assert!(full.chars().count() > settings::TRACKER_PROMPT_CHAR_BUDGET);
+        let bounded =
+            build_tracker_prompt_bounded(&system, &window).expect("tail-drop must recover");
+        assert!(bounded.chars().count() <= settings::TRACKER_PROMPT_CHAR_BUDGET);
+        assert!(
+            !bounded.contains("ASSISTANT-BEAT-MARKER"),
+            "the preceding assistant beat is the lowest-priority tail block — dropped first"
+        );
+        assert!(bounded.contains(&"u".repeat(100)), "the user action survives");
+
+        // Unfixable: the system prompt ALONE busts the budget → Err (the
+        // caller skips the tracker pass loudly instead of decoding headless).
+        let fat_system = "s".repeat(settings::TRACKER_PROMPT_CHAR_BUDGET + 1);
+        assert!(build_tracker_prompt_bounded(&fat_system, &window).is_err());
+    }
+
+    /// P1.4 sibling: the lean tracker world-state render — injury prose is
+    /// narrator material (dropped), list lines cap at their budgets, and the
+    /// newest events survive over the oldest.
+    #[test]
+    fn lean_tracker_world_state_caps_and_drops() {
+        let schema = maxed_world_schema();
+        let lean = render_tracker_world_state(&schema);
+        let rich = render_fable_world_state(&schema, &[]);
+
+        assert!(lean.chars().count() < rich.chars().count() / 2,
+            "the lean render must be decisively smaller (lean {} vs rich {})",
+            lean.chars().count(), rich.chars().count());
+        assert!(!lean.contains("injuries:"), "referee-owned injury prose is dropped for the tracker");
+        assert!(rich.contains("injuries:"), "the narrator's rich render KEEPS injuries");
+        // The id anchors survive verbatim — the bracket whitelist.
+        assert!(lean.contains("cast:"));
+        assert!(lean.contains("location:"));
+        // Newest events kept, oldest dropped (5 authored, 3 shown).
+        assert!(lean.contains("event-newest"), "newest event survives");
+        assert!(!lean.contains("event-oldest"), "oldest event is dropped");
+        // The summary line is capped.
+        let summary_len = lean
+            .lines()
+            .find(|l| l.starts_with("summary: "))
+            .map(|l| l.chars().count())
+            .unwrap_or(0);
+        assert!(summary_len < 400, "summary capped in the lean render, got {summary_len}");
+    }
+
+    /// Helper for the budget tests: a world schema with every rendered
+    /// component at (or past) its legal maximum.
+    fn tmsg(role: session::Role, content: String) -> session::Message {
+        session::Message {
+            id: format!("test-{}", content.len()),
+            role,
+            content,
+            reasoning: String::new(),
+            raw_output: String::new(),
+            timestamp: 0,
+            variants: Vec::new(),
+            raw_outputs: Vec::new(),
+            active_idx: 0,
+            base_schema: None,
+            variant_schemas: Vec::new(),
+            base_schema_ref: None,
+            variant_schema_refs: Vec::new(),
+        }
+    }
+
+    fn maxed_world_schema() -> schema::WorldSchema {
+        use crate::player_state::{BodyPart, BodyPartState, PlayerState, Stamina};
+        use crate::rumor::Rumor;
+        use crate::schema::{
+            Node, NpcEntry, NpcRegistry, Presence, TravelGraph, Weather, WorldClock,
+        };
+
+        let mut s = schema::WorldSchema::default();
+        // Model-authored prose at the validator caps.
+        s.summary = "m".repeat(4_000);
+        s.recent_events = vec![
+            "event-oldest: ".to_owned() + &"o".repeat(990),
+            "e".repeat(1_000),
+            "e".repeat(1_000),
+            "e".repeat(1_000),
+            "event-newest: ".to_owned() + &"n".repeat(985),
+        ];
+        s.calendar = Some("9".repeat(200));
+        s.weather = Weather {
+            condition: "torrential storm with lashing rain".to_owned(),
+            started_at_minutes: 600,
+        };
+        s.world_clock = WorldClock {
+            current_minutes: 14_400, // Day 10 16:00-ish
+            last_tick_minutes: 14_400,
+        };
+        // Hub node with 12 neighbors (render caps exits at 8 + marker).
+        let mut nodes: Vec<Node> = (0..12)
+            .map(|i| Node {
+                id: format!("district_{i}"),
+                name: format!("District {i} of the Old Quarter"),
+                neighbors: vec!["grand_market".to_owned()],
+                setting: String::new(),
+            })
+            .collect();
+        nodes.push(Node {
+            id: "grand_market".to_owned(),
+            name: "The Grand Market of Ashfall".to_owned(),
+            neighbors: (0..12).map(|i| format!("district_{i}")).collect(),
+            setting: String::new(),
+        });
+        s.travel_graph = TravelGraph {
+            nodes,
+            current_node: Some("grand_market".to_owned()),
+        };
+        // Cast at the render cap (16 shown + marker).
+        s.npc_registry = NpcRegistry {
+            entries: (0..20)
+                .map(|i| NpcEntry {
+                    id: format!("npc_{i}_with_a_long_slug"),
+                    name: format!("Character {i} Longname"),
+                    role: "merchant of the western stalls".to_owned(),
+                    tier: Some("elite".to_owned()),
+                    aliases: vec![format!("char{i}")],
+                })
+                .collect(),
+        };
+        // 12 presences with maxed stances (120 chars each).
+        s.presences = (0..12)
+            .map(|i| Presence {
+                npc_id: format!("npc_{i}_with_a_long_slug"),
+                name: format!("Character {i} Longname"),
+                stance: "s".repeat(120),
+                ttl: 4,
+            })
+            .collect();
+        // 6 rumors heard at the current node.
+        s.rumors = (0..6)
+            .map(|i| Rumor {
+                label: format!("rumor {i}: {}", "r".repeat(85)),
+                origin_node: "grand_market".to_owned(),
+                known_nodes: vec!["grand_market".to_owned()],
+                born_minutes: 14_000,
+            })
+            .collect();
+        // Belt full (4), pack past the cap (15), custom past the cap (12).
+        let mut ps = PlayerState {
+            stamina: Stamina::Exhausted,
+            wealth: 9_999,
+            reputation: -420,
+            ..PlayerState::default()
+        };
+        ps.belt = (0..4)
+            .map(|i| crate::equipment::StackItem {
+                name: format!("Belt Item Number {i}"),
+                ..crate::equipment::StackItem::default()
+            })
+            .collect();
+        ps.pack = (0..15)
+            .map(|i| crate::equipment::StackItem {
+                name: format!("Pack Item {i} of the deep store"),
+                qty: 3,
+                ..crate::equipment::StackItem::default()
+            })
+            .collect();
+        // Injuries with maxed per-zone histories (5 descriptors each).
+        let wounded = [
+            BodyPart::Head,
+            BodyPart::LeftUpperArm,
+            BodyPart::RightLowerLeg,
+            BodyPart::LowerTorso,
+        ];
+        for part in wounded {
+            ps.body.insert(part, BodyPartState::Orange);
+            ps.injury_details.insert(
+                part,
+                (0..5).map(|i| format!("Deep wound descriptor {i}")).collect(),
+            );
+        }
+        // Appearance deltas at the full key set.
+        for (i, key) in [
+            "hair_color", "outfit", "eye_color", "scars", "wounds", "tattoos", "disguise",
+            "body_type", "skin_complexion", "hair_length", "hair_style", "breast_size", "ears",
+        ]
+        .iter()
+        .enumerate()
+        {
+            ps.current_appearance_deltas.insert((*key).to_owned(), format!("value {i} of the look"));
+        }
+        // Equipped: all six slots with outer items.
+        for slot in crate::equipment::EquipSlot::all() {
+            ps.equipment.insert(
+                *slot,
+                crate::equipment::SlotLayers {
+                    outer: Some(crate::equipment::EquippedItem {
+                        name: "The Very Long Named Item of Wearing".to_owned(),
+                        stats: Some("+2 ATK, +1 DEF".to_owned()),
+                        tags: vec![crate::equipment::ItemTag::Equippable],
+                    }),
+                    inner: None,
+                },
+            );
+        }
+        s.player_state = ps;
+        // Custom tags past the render cap (12).
+        s.custom_tags = (0..12)
+            .map(|i| (format!("standing_{i}"), format!("faction number {i} reputation")))
+            .collect();
+        // A handful of entities (not rendered, but realistic).
+        for i in 0..10 {
+            s.entities.insert(
+                format!("npc.npc_{i}.note"),
+                serde_json::Value::String("some note text".to_owned()),
+            );
+        }
+        s
+    }
+
+    /// Minimal card for the tracker budget test (the tracker builder takes
+    /// the card only for signature stability — it renders none of it).
+    fn fake_tracker_card() -> crate::sim_card::SimCard {
+        crate::sim_card::SimCard {
+            id: "budget-test".to_owned(),
+            name: "Budget Test Scenario".to_owned(),
+            card_type: "roleplay".to_owned(),
+            subtype: None,
+            core_persona: "x".repeat(2_000),
+            traits: String::new(),
+            appearance: String::new(),
+            role_instruction: String::new(),
+            responsibilities: String::new(),
+            conversational_rules: String::new(),
+            technical_rules: String::new(),
+            introductions: Vec::new(),
+            intro: String::new(),
+            setting: Some("s".repeat(2_000)),
+            plot: Some("p".repeat(1_000)),
+            tone: Some("grim atmospheric long-winded".to_owned()),
+            player_name: Some("Kaelen".to_owned()),
+            start_npc_ids: Vec::new(),
+            declared_activities: Vec::new(),
+            locations: Vec::new(),
+            cast: Vec::new(),
+            start: crate::sim_card::CardStart::default(),
+            custom_tags: Default::default(),
+        }
     }
 
     /// Phase 3 guard: the tool registry is non-empty (so the chat path CAN

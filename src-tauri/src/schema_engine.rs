@@ -14,7 +14,8 @@
 //! independent KV state, no cross-contamination, with zero duplicate weight
 //! allocation. Same isolation pattern as the embedder (§3B). The schema
 //! engine shares weights but owns its own context (2026-07-23 dedupe: it
-//! previously loaded its own 9.8GB copy, a redundant ~9.8GB VRAM cost).
+//! previously loaded its own duplicate weight copy — ~9.8GB in the 12B era,
+//! ~5.8GB today — a redundant full-model VRAM cost).
 //!
 //! # The micro-delta contract
 //!
@@ -62,7 +63,7 @@ use crate::schema_validator;
 /// The schema context's token budget. Smaller than chat's 4000: the delta
 /// pass only needs: system instruction (~150 tokens) + current schema JSON
 /// (~200-800) + last exchange (~100-400) + generation room. 2048 is generous
-/// headroom; the KV cost at Q8_0 is ~75MB.
+/// headroom; the KV cost at Q8_0 is ~50MB (E4B).
 const SCHEMA_CTX: u32 = crate::settings::CTX_SCHEMA;
 const SCHEMA_BATCH: u32 = 512;
 /// Cap on generated tokens for a delta pass. A compliant micro-delta is
@@ -241,7 +242,7 @@ enum SchemaMsg {
     RequestBootstrap(Box<BootstrapRequest>),
     /// Shut the schema thread down cleanly (drop its `LlamaContext`, freeing
     /// its KV cache, then join). Required by the VRAM-hibernate path so the
-    /// schema context's ~75MB is reclaimable without process restart. Mirrors
+    /// schema context's ~50MB is reclaimable without process restart. Mirrors
     /// `ChatEngine::shutdown` / `FableEngine::shutdown`. (2026-07-23.)
     Shutdown,
 }
@@ -329,7 +330,7 @@ impl SchemaEngine {
     /// Spawn the schema thread. The chat backend MUST be loaded first: the
     /// schema engine borrows the leaked shared model (`shared_model()`) — it
     /// no longer loads its own copy (2026-07-23 schema-dedupe: the redundant
-    /// second 9.8GB WUPI.gguf allocation is gone; chat+schema+fable now share
+    /// second WUPI.gguf weight allocation is gone; chat+schema+fable now share
     /// ONE weight copy, matching AGENTS.md §2).
     ///
     /// Returns `Err` via the readiness receiver if `shared_model()` is `None`
@@ -535,7 +536,7 @@ impl SchemaEngine {
     /// Shut the schema thread down cleanly. Posts `Shutdown`, then joins the
     /// thread so the caller is guaranteed the `SchemaRuntime` (the
     /// `LlamaContext` + its KV cache) has been dropped — that's what frees the
-    /// schema context's ~75MB on the VRAM-hibernate path. Idempotent across
+    /// schema context's ~50MB on the VRAM-hibernate path. Idempotent across
     /// repeated calls (the `JoinHandle` is taken under the mutex). Mirrors
     /// `ChatEngine::shutdown` / `FableEngine::shutdown`. (2026-07-23.)
     pub fn shutdown(&self) {
@@ -697,7 +698,7 @@ impl SchemaEngine {
     /// Initialize the schema runtime: borrow the leaked shared chat model
     /// (`shared_model()`) + create an isolated context on it. The schema
     /// engine no longer loads its own copy (2026-07-23 schema-dedupe): the
-    /// redundant second 9.8GB WUPI.gguf allocation is gone — chat+schema+
+    /// redundant second WUPI.gguf weight allocation is gone — chat+schema+
     /// fable now share ONE weight copy. The schema's isolated `LlamaContext`
     /// still provides the load-bearing KV isolation (schema deltas never
     /// pollute the chat cache); only the weights are shared.
@@ -784,6 +785,22 @@ impl SchemaRuntime {
             &req.current_schema_json,
             &req.deferred_attempts,
         );
+        // (2026-08-17 E4B shakedown P0) Manager-path prefix telemetry — the
+        // sibling of engine.rs's [PREFIX] chat line. The schema prompts are
+        // char-capped upstream, so this is an approx-token readout (chars÷3.7,
+        // the observed density) whose only alarm condition is approaching the
+        // middle-drop threshold, where the schema JSON the model must diff
+        // against starts losing contiguous bands.
+        {
+            let approx_tokens = initial_prompt.len() / 4;
+            let budget = (SCHEMA_CTX as usize).saturating_sub(SCHEMA_MAX_TOKENS as usize);
+            eprintln!(
+                "[DEBUG] [PREFIX] manager translation render: {} chars (~{} tokens of ~{}-token budget)",
+                initial_prompt.len(),
+                approx_tokens,
+                budget
+            );
+        }
         self.generate_with_repair(
             &initial_prompt,
             AttemptSource::Translation {
@@ -1303,7 +1320,7 @@ fn render_accumulated_repair_prompt(prior_raw: &[String], prior_errors: &[String
 
 /// Cheap content gate for whether the schema delta pass should fire this turn.
 ///
-/// The delta pass is a FULL 12B forward pass (tokenize + prefill + greedy
+/// The delta pass is a FULL local-model (E4B) forward pass (tokenize + prefill + greedy
 /// decode up to 256 tokens). Firing it unconditionally on every turn -
 /// including "ok", "thanks", "lol", "yes": burns ~1-4s of dedicated GPU time
 /// for a turn that changed nothing in the world. This gate skips those.
@@ -1550,7 +1567,7 @@ mod tests {
         assert!(prompt.contains(&"x".repeat(500)));
     }
 
-    // The gate is the M2 overhead fix: skip the full 12B forward pass on
+    // The gate is the M2 overhead fix: skip the full local-model forward pass on
     // clearly non-substantive turns. The contract is conservative: when in
     // doubt, fire (the cost of a missed world-state change > one wasted pass).
 

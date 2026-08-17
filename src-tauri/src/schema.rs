@@ -481,6 +481,106 @@ impl TravelGraph {
         }
         changed
     }
+
+    /// (2026-08-17 E4B shakedown P1c) Resolve a raw `[TRAVEL]` destination OR
+    /// mint it as a new node. The E4B obeys the old unknown-destination
+    /// reject directive so well it stops traveling — 0 `[DISCOVER]`
+    /// emissions in the 51-turn playtest, and the T49–50 departure via the
+    /// King's Road never moved `loc` off `market-square`. Walking somewhere
+    /// unmapped IS the evidence the place exists (the same principle as the
+    /// known-but-non-adjacent auto-link), so an unresolvable destination
+    /// now MINTS a node: slugified id from the emitted name, diegetic name
+    /// from the raw text, no neighbors (the caller's auto-link arm wires it
+    /// to `current_node` bidirectionally), subject to the same
+    /// `MAX_TRAVEL_NODES` cap as `[DISCOVER]`.
+    ///
+    /// **Typo guard:** before minting, similarity-match the raw + slug forms
+    /// against every node's id + name. A ≥0.75 best match RESOLVES to that
+    /// node instead of minting (`[TRAVEL mrket square]` → `market-square`,
+    /// not a phantom twin). Returns the canonical node id; `None` only when
+    /// the raw is empty or the graph is at its cap (the caller then rejects
+    /// as before). Pure graph mechanics — no undo snapshot here (the caller
+    /// owns snapshotting discipline).
+    pub fn resolve_or_mint_node(&mut self, raw: &str) -> Option<String> {
+        let raw_trimmed = raw.trim();
+        if raw_trimmed.is_empty() {
+            return None;
+        }
+        let slug = slugify(raw_trimmed);
+        if slug.is_empty() {
+            return None;
+        }
+        // Typo guard: best similarity ≥0.75 across (raw|slug) × (id|name).
+        let mut best: Option<(f32, String)> = None;
+        for n in &self.nodes {
+            let slug_name = slugify(&n.name);
+            for (a, b) in [
+                (raw_trimmed, n.id.as_str()),
+                (raw_trimmed, n.name.as_str()),
+                (slug.as_str(), n.id.as_str()),
+                (slug.as_str(), slug_name.as_str()),
+            ] {
+                if b.is_empty() {
+                    continue;
+                }
+                let s = similarity(a, b);
+                if best.as_ref().map(|(bs, _)| s > *bs).unwrap_or(true) {
+                    best = Some((s, n.id.clone()));
+                }
+            }
+        }
+        if let Some((score, id)) = best.filter(|(s, _)| *s >= 0.75) {
+            tracing::info!(
+                raw = %raw_trimmed,
+                resolved = %id,
+                similarity = score,
+                "[TRAVEL] typo-guard: near-mint resolved to the existing node instead"
+            );
+            return Some(id);
+        }
+        let name = if raw_trimmed.chars().count() > 80 {
+            raw_trimmed.chars().take(80).collect()
+        } else {
+            raw_trimmed.to_string()
+        };
+        let node = Node {
+            id: slug.clone(),
+            name,
+            neighbors: Vec::new(),
+            setting: String::new(),
+        };
+        if self.upsert_node(node) {
+            tracing::info!(node_id = %slug, "[TRAVEL] minted unknown destination as a new node");
+            Some(slug)
+        } else {
+            // Cap reached (upsert_node refuses at MAX_TRAVEL_NODES) or a
+            // lost race — either way the caller treats None as reject.
+            None
+        }
+    }
+}
+
+/// Normalized Levenshtein similarity in [0,1] (1 = identical). Chars-based
+/// (anti-pattern #6: byte-index math on multi-byte input panics); the
+/// classic O(m·n) DP is fine for short location labels on a small graph.
+fn similarity(a: &str, b: &str) -> f32 {
+    let a: Vec<char> = a.to_lowercase().chars().collect();
+    let b: Vec<char> = b.to_lowercase().chars().collect();
+    if a.is_empty() || b.is_empty() {
+        return 0.0;
+    }
+    let mut prev: Vec<u32> = (0..=b.len() as u32).collect();
+    let mut cur: Vec<u32> = vec![0; b.len() + 1];
+    for (i, ca) in a.iter().enumerate() {
+        cur[0] = i as u32 + 1;
+        for (j, cb) in b.iter().enumerate() {
+            let cost = if ca == cb { 0 } else { 1 };
+            cur[j + 1] = (prev[j + 1] + 1).min(cur[j] + 1).min(prev[j] + cost);
+        }
+        std::mem::swap(&mut prev, &mut cur);
+    }
+    let dist = prev[b.len()] as f32;
+    1.0 - dist / a.len().max(b.len()) as f32
 }
 
 /// One named NPC in the Rust-authoritative registry (Fable Phase 5A,
@@ -823,6 +923,56 @@ impl SceneMode {
             SceneMode::Downtime => 2,
         }
     }
+
+    /// (2026-08-17 E4B shakedown P1d) Max clock advance a single `[TIME]`
+    /// bracket may apply, by mode, in MINUTES. The E4B once jumped the clock
+    /// +20175 minutes (~14 days) in one turn — the pacing-aware clamp kills
+    /// day-scale jumps without judging prose: Downtime 24h (a long rest or
+    /// travel leg), Exploration 6h, Combat 1h (a fight is seconds-scale; an
+    /// hour is already generous). Overshoot clamps to the cap; the applier
+    /// warns the tracker via a next-turn directive.
+    pub fn time_clamp_minutes(self) -> i64 {
+        match self {
+            SceneMode::Combat => 60,
+            SceneMode::Exploration => 6 * 60,
+            SceneMode::Downtime => 24 * 60,
+        }
+    }
+}
+
+/// (2026-08-17 E4B shakedown P1d) Pure core of the `[TIME]` apply: clamp the
+/// requested advance to the pacing-aware cap + derive the next-turn
+/// directives (clamp warning; stale-calendar nudge on a midnight crossing
+/// with no `[DATE]` the same turn). Returns `(effective_minutes, directives)`.
+/// The caller handles the first-set baseline (no clamp on a cold clock) and
+/// the regression guard — this fn assumes `requested >= prev`.
+pub fn clamp_time_advance(
+    prev: i64,
+    requested: i64,
+    mode: SceneMode,
+    calendar_label: Option<&str>,
+    date_rode_this_turn: bool,
+) -> (i64, Vec<String>) {
+    let mut directives = Vec::new();
+    let clamp = mode.time_clamp_minutes();
+    let effective = if requested > prev.saturating_add(clamp) {
+        directives.push(format!(
+            "Time advance clamped: this scene's pacing allows at most {clamp} minutes of \
+             in-world advance per turn. The clock now reads the clamped time — continue from \
+             it in smaller steps; do not repeat the large jump."
+        ));
+        prev.saturating_add(clamp)
+    } else {
+        requested
+    };
+    if calendar_label.is_some() && !date_rode_this_turn && effective / 1440 > prev / 1440 {
+        directives.push(
+            "The clock crossed a midnight boundary but the `date:` label is now stale — emit \
+             [DATE <new full label>] this turn to advance the calendar."
+                .to_string(),
+        );
+    }
+    (effective, directives)
 }
 
 /// Per-turn scene pacing state, computed by `scene_pacing::evaluate` from the
@@ -978,6 +1128,19 @@ pub struct WorldSchema {
     /// saves loadable as dormant (None → no `date:` line).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub calendar: Option<String>,
+
+    /// (2026-08-17 E4B shakedown P1d) The clock minute the `calendar` label
+    /// was last synchronized (`[DATE]` apply stamps it). The playtest let the
+    /// label sit at "17th of Peatfall…" forever while the clock reached
+    /// Day ~17 — no `[DATE]` in 51 turns. Day-crossing `[TIME]` advances push
+    /// a next-turn directive asking the tracker to re-emit `[DATE]`; if the
+    /// label stays >48h stale anyway, `render_for_prompt` appends the true
+    /// `— day N` suffix so the prompt never asserts a date the clock has
+    /// passed. `None` = not yet stamped: a legacy save or a card-seeded label
+    /// is assumed synced as of the first `[TIME]` apply (the apply path
+    /// bootstraps the stamp) — no suffix until staleness is actually observed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calendar_synced_minutes: Option<i64>,
 
     /// Custom extensions (2026-08-13): a flat key→value string map seeded from
     /// the card's `<custom_tags>` (sim) + the SavedPlayer's `custom_tags`
@@ -1557,6 +1720,21 @@ impl WorldSchema {
         if let Some(cal) = self.calendar.as_deref().filter(|s| !s.is_empty()) {
             out.push_str("date: ");
             out.push_str(cal);
+            // (P1d, 2026-08-17 E4B shakedown) Staleness fallback: if the label
+            // wasn't refreshed via [DATE] in >48h of clock time, append the
+            // true day counter so the prompt never asserts a date the clock
+            // has long passed (the playtest label said "17th of Peatfall"
+            // forever while the clock reached Day ~17 — 0 [DATE] in 51 turns).
+            // The day-crossing directive nudges the tracker first; this is
+            // the mechanical backstop when it doesn't comply.
+            if let Some(synced) = self.calendar_synced_minutes {
+                if self.world_clock.is_set()
+                    && self.world_clock.current_minutes.saturating_sub(synced) > 48 * 60
+                {
+                    let day = self.world_clock.current_minutes / 1440 + 1;
+                    out.push_str(&format!(" — day {day}"));
+                }
+            }
             out.push('\n');
             if let Some(tod) = self.world_clock.render_time_of_day() {
                 out.push_str("clock: ");
@@ -3670,6 +3848,171 @@ mod tests {
         let g = sample_travel_graph();
         assert_eq!(g.resolve_node_id("Mordor"), None);
         assert_eq!(g.resolve_node_id("nonexistent_node"), None);
+    }
+
+    // ---- P1c (2026-08-17 E4B shakedown): TRAVEL node minting + typo guard ----
+
+    #[test]
+    fn resolve_or_mint_creates_unknown_destination_then_autolinks() {
+        // The playtest case: T49-50 `[TRAVEL king_s_road]` from
+        // market-square never moved the player (unknown → reject). Now the
+        // mint creates the node + the caller's auto-link arm wires the edge.
+        let mut g = sample_travel_graph();
+        g.current_node = Some("market_square".to_string());
+        let id = g.resolve_or_mint_node("King's Road").expect("unknown destination mints");
+        assert_eq!(id, "king_s_road", "slug derived from the emitted name");
+        let node = g.find_node("king_s_road").expect("node exists");
+        assert_eq!(node.name, "King's Road", "diegetic name preserved");
+        assert!(node.neighbors.is_empty(), "mint carries no neighbors — the caller links");
+        // The applier's auto-link arm: current_node ↔ minted node.
+        assert!(g.link_nodes("market_square", "king_s_road"));
+        assert!(g.is_adjacent_to_current("king_s_road"));
+        let minted = g.find_node("king_s_road").unwrap();
+        assert!(minted.neighbors.contains(&"market_square".to_string()), "bidirectional edge");
+        g.current_node = Some("king_s_road".to_string());
+        assert_eq!(g.current().unwrap().id, "king_s_road", "current_node advances");
+    }
+
+    #[test]
+    fn resolve_or_mint_typo_guard_resolves_near_misses() {
+        // "mrket square" must NOT mint a phantom twin of market_square.
+        let mut g = sample_travel_graph();
+        g.current_node = Some("tavern".to_string());
+        let id = g.resolve_or_mint_node("mrket square").expect("near-miss resolves");
+        assert_eq!(id, "market_square");
+        assert_eq!(g.nodes.len(), 3, "no phantom node minted");
+        // Diegetic-name typos resolve too ("The Rusty Ancor").
+        let id2 = g.resolve_or_mint_node("The Rusty Ancor").expect("name typo resolves");
+        assert_eq!(id2, "tavern");
+        assert_eq!(g.nodes.len(), 3);
+    }
+
+    #[test]
+    fn resolve_or_mint_genuinely_new_places_mint() {
+        let mut g = sample_travel_graph();
+        // Low similarity against every existing node → mint (the organic
+        // world-growth path the E4B needs to leave town).
+        let id = g.resolve_or_mint_node("ferry landing").expect("new place mints");
+        assert_eq!(id, "ferry_landing");
+        assert_eq!(g.nodes.len(), 4);
+    }
+
+    #[test]
+    fn resolve_or_mint_refuses_at_cap_and_empty() {
+        let mut g = sample_travel_graph();
+        assert_eq!(g.resolve_or_mint_node("   "), None, "blank raw never mints");
+        assert_eq!(g.resolve_or_mint_node("!!!"), None, "slug-empty raw never mints");
+        // Cap: fill to MAX_TRAVEL_NODES, then mint must refuse.
+        for i in g.nodes.len()..MAX_TRAVEL_NODES {
+            g.upsert_node(Node {
+                id: format!("n{i}"),
+                name: format!("Node {i}"),
+                neighbors: vec![],
+                setting: String::new(),
+            });
+        }
+        assert_eq!(g.nodes.len(), MAX_TRAVEL_NODES);
+        assert_eq!(g.resolve_or_mint_node("brand new place"), None, "cap refuses new nodes");
+    }
+
+    #[test]
+    fn similarity_orders_exact_partial_and_distant() {
+        assert!((similarity("market_square", "market_square") - 1.0).abs() < 1e-6);
+        assert!(similarity("mrket_square", "market_square") >= 0.75, "single dropped char resolves");
+        assert!(similarity("king_s_road", "market_square") < 0.75, "different place mints");
+        assert_eq!(similarity("", "anything"), 0.0);
+    }
+
+    // ---- P1d (2026-08-17 E4B shakedown): TIME clamp + calendar coupling ----
+
+    #[test]
+    fn time_clamp_table_per_scene_mode() {
+        assert_eq!(SceneMode::Combat.time_clamp_minutes(), 60);
+        assert_eq!(SceneMode::Exploration.time_clamp_minutes(), 360);
+        assert_eq!(SceneMode::Downtime.time_clamp_minutes(), 1440);
+    }
+
+    #[test]
+    fn clamp_time_advance_kills_the_14_day_jump() {
+        // The playtest regression: prev = Day 1 09:00 (780), the tracker
+        // emitted +20175 min in ONE bracket. Downtime (the sleep case) clamps
+        // to 24h; a clamp directive fires.
+        let prev = 780i64;
+        let requested = prev + 20_175;
+        let (effective, dirs) =
+            clamp_time_advance(prev, requested, SceneMode::Downtime, None, false);
+        assert_eq!(effective, prev + 1440, "clamped to the 24h Downtime cap");
+        assert_eq!(dirs.len(), 1);
+        assert!(dirs[0].contains("clamped"), "the clamp warns the tracker");
+        // Combat clamps to 1h, Exploration to 6h.
+        let (e_combat, _) = clamp_time_advance(prev, requested, SceneMode::Combat, None, false);
+        assert_eq!(e_combat, prev + 60);
+        let (e_expl, _) = clamp_time_advance(prev, requested, SceneMode::Exploration, None, false);
+        assert_eq!(e_expl, prev + 360);
+    }
+
+    #[test]
+    fn clamp_time_advance_passes_legit_advances() {
+        // An 8h sleep in Downtime is legal (T42's +360 was NOT the bug — the
+        // 14-day jump was). No directive, no clamp.
+        let (effective, dirs) = clamp_time_advance(780, 780 + 480, SceneMode::Downtime, None, false);
+        assert_eq!(effective, 780 + 480);
+        assert!(dirs.is_empty());
+        // Same advance in Exploration (6h cap) clamps.
+        let (effective, dirs) =
+            clamp_time_advance(780, 780 + 480, SceneMode::Exploration, None, false);
+        assert_eq!(effective, 780 + 360);
+        assert_eq!(dirs.len(), 1);
+    }
+
+    #[test]
+    fn day_crossing_directive_fires_once_per_crossing() {
+        // With a calendar label set + no [DATE] this turn, a midnight
+        // crossing nudges the tracker to refresh the label — exactly once.
+        let prev = 23 * 60; // 23:00, Day 1
+        let (effective, dirs) = clamp_time_advance(
+            prev,
+            prev + 120, // crosses midnight
+            SceneMode::Downtime,
+            Some("17th of Peatfall, Year 214"),
+            false,
+        );
+        assert_eq!(effective, prev + 120);
+        assert_eq!(dirs.len(), 1, "one stale-calendar directive");
+        assert!(dirs[0].contains("[DATE"));
+        // A [DATE] on the same turn suppresses it.
+        let (_, dirs) = clamp_time_advance(
+            prev,
+            prev + 120,
+            SceneMode::Downtime,
+            Some("17th of Peatfall, Year 214"),
+            true,
+        );
+        assert!(dirs.is_empty(), "[DATE] the same turn = not stale");
+        // The NEXT turn (prev now on Day 2) crossing again within the day
+        // boundary fires again only when ANOTHER midnight is crossed.
+        let (e2, dirs2) =
+            clamp_time_advance(effective, effective + 60, SceneMode::Downtime, Some("label"), false);
+        assert_eq!(e2, effective + 60);
+        assert!(dirs2.is_empty(), "no new midnight — no repeat directive");
+        // No calendar label → no directive ever.
+        let (_, dirs3) = clamp_time_advance(prev, prev + 120, SceneMode::Downtime, None, false);
+        assert!(dirs3.is_empty());
+    }
+
+    #[test]
+    fn calendar_render_appends_day_suffix_only_when_48h_stale() {
+        let mut schema = WorldSchema::default();
+        schema.calendar = Some("17th of Peatfall, Year 214".into());
+        schema.world_clock.current_minutes = 9 * 60; // Day 1, 09:00
+        schema.calendar_synced_minutes = Some(9 * 60);
+        let fresh = schema.render_for_prompt();
+        assert!(fresh.contains("date: 17th of Peatfall"));
+        assert!(!fresh.contains("day "), "fresh label renders clean");
+        // 48h+ of drift → the true day counter rides along.
+        schema.world_clock.current_minutes = 9 * 60 + 49 * 60; // +49h → Day 3, 10:00
+        let stale = schema.render_for_prompt();
+        assert!(stale.contains("day 3"), "the true day counters the stale label: {stale}");
     }
 
     #[test]

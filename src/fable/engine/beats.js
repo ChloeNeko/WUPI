@@ -24,7 +24,7 @@
 //   channel events → see narrator.js
 // =============================================================
 
-import { variantCount, computeDrawerState, swipeNextAction } from './drawer-logic.js';
+import { variantCount, computeDrawerState, swipeNextAction, canEditMessage } from './drawer-logic.js';
 
 let feedEl = null;
 
@@ -472,7 +472,7 @@ export function refreshDrawer(beat) {
 // Re-export the pure swipe-next decision + the pure disabled-state helper so
 // stage.js's delegated handler routes › through the same logic the unit
 // tests pin (one import path).
-export { swipeNextAction, computeDrawerState };
+export { swipeNextAction, computeDrawerState, canEditMessage };
 
 function appendMes(root) {
   if (!feedEl) return null;
@@ -894,7 +894,27 @@ export function enterEditMode(beat, opts = {}) {
       const text = ta.value;
       body.innerHTML = renderMarkdown(text);
       beat.dataset.raw = text;
-      if (typeof opts.onSave === 'function') return opts.onSave(text);
+      if (typeof opts.onSave === 'function') {
+        const saving = opts.onSave(text);
+        // (P2b, 2026-08-17 E4B shakedown) The optimistic write above must not
+        // survive a REFUSED save: editMessage/rewindAndEditUser catch the
+        // backend error internally + resolve `false` (the refusal is
+        // surfaced as an error beat), which used to leave this beat showing
+        // the never-saved text — or blank — until some later feed rebuild.
+        // Restore the committed prose when the save reports failure.
+        Promise.resolve(saving).then((ok) => {
+          if (ok === false && bodyEl(beat)) {
+            bodyEl(beat).innerHTML = renderMarkdown(original);
+            beat.dataset.raw = original;
+          }
+        }).catch(() => {
+          if (bodyEl(beat)) {
+            bodyEl(beat).innerHTML = renderMarkdown(original);
+            beat.dataset.raw = original;
+          }
+        });
+        return saving;
+      }
     } else {
       body.innerHTML = renderMarkdown(original);
       beat.dataset.raw = original;

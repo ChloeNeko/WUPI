@@ -162,7 +162,7 @@ function centroid(poly) {
   return { x: sx / poly.length, y: sy / poly.length };
 }
 
-// ─── Module state ────────────────────────────────────────────────
+// Module state ────────────────────────────────────────────────
 // One overlay per drawer. `overlayEl` holds the 6 gems; `backpackEl` is the
 // master toggle; `paperdollImg` is the <img> whose box drives the body
 // targets. `isOpen` mirrors the CSS class; `animating` is the cooldown flag;
@@ -177,6 +177,14 @@ let isOpen = false;
 let animating = false;
 let activeGem = null;
 let currentGender = 'male';
+
+// (P2a, 2026-08-17 E4B shakedown) Last-known-GOOD stamp cache: the inline
+// styles written by the last non-degenerate place() pass. On a degenerate
+// measurement (hidden/mid-slide drawer — the save→title→Continue resume
+// stamped the cluster at x=−119…−426, the whole inventory UI offscreen),
+// place() re-stamps these instead of persisting garbage coordinates. Null
+// until the first good pass (fresh nodes default to the backpack origin).
+let lastGoodStamps = null;
 
 // Build one soul-gem SVG node (art only — positioning is applied by the
 // caller). The diamond art: glow + brass frame + ruby stone + light facet.
@@ -323,6 +331,28 @@ function clampSlotBelowAstrolabe(slot, rootBox) {
 export function repositionToBody() {
   if (!overlayEl || !backpackEl || !drawerRoot) return;
 
+  // (P2a) Re-stamp the last known good anchors when the current measurement
+  // is degenerate — a hidden or mid-slide drawer must never overwrite good
+  // coordinates with offscreen garbage.
+  const restampLastGood = () => {
+    if (!lastGoodStamps || !overlayEl) return;
+    for (const [gemId, stamp] of Object.entries(lastGoodStamps.gems)) {
+      const node = overlayEl.querySelector(`[${SOUL_GEM_DATA_ATTR}="${gemId}"]`);
+      if (!node) continue;
+      node.style.left = stamp.left;
+      node.style.top = stamp.top;
+      node.style.setProperty('--target-x', stamp.tx);
+      node.style.setProperty('--target-y', stamp.ty);
+    }
+    const slot = drawerRoot.querySelector('#inventory-panel-slot');
+    if (slot) {
+      slot.style.right = lastGoodStamps.slot.right;
+      slot.style.left = 'auto';
+      slot.style.bottom = lastGoodStamps.slot.bottom;
+      slot.style.top = 'auto';
+    }
+  };
+
   const place = () => {
     if (!overlayEl || !backpackEl || !drawerRoot) return false;
     const img = paperdollImg;
@@ -331,8 +361,22 @@ export function repositionToBody() {
     // gems just stack at the backpack until an img is provided.
     const rootBox = drawerRoot.getBoundingClientRect();
     const bpBox = backpackEl.getBoundingClientRect();
+    // (P2a) Degenerate-box guard: a hidden (display:none → 0×0) or
+    // mid-slide (anchor outside the root box) drawer measures garbage —
+    // the save→title→Continue resume stamped the cluster at negative x.
+    // Bail to the last known good anchors instead of persisting them.
+    const degenerate =
+      rootBox.width < 2 || rootBox.height < 2 ||
+      bpBox.width < 2 || bpBox.height < 2;
     const backpackCx = bpBox.left - rootBox.left + bpBox.width / 2;
     const backpackCy = bpBox.top - rootBox.top + bpBox.height / 2;
+    const anchorOutsideRoot =
+      backpackCx < -2 || backpackCx > rootBox.width + 2 ||
+      backpackCy < -2 || backpackCy > rootBox.height + 2;
+    if (degenerate || anchorOutsideRoot) {
+      restampLastGood();
+      return false;
+    }
 
     // Resolve the body anchor (lower_torso centroid) for the current gender.
     const poly = getHitbox(ANCHOR_PART_ID, currentGender);
@@ -360,6 +404,7 @@ export function repositionToBody() {
       ? imgBox.height / CALIB_HEIGHT_PX
       : 1;
 
+    const stamps = { gems: {}, slot: {} };
     for (const gem of GEMS) {
       const node = overlayEl.querySelector(`[${SOUL_GEM_DATA_ATTR}="${gem.id}"]`);
       if (!node) continue;
@@ -390,6 +435,7 @@ export function repositionToBody() {
       }
       node.style.setProperty('--target-x', tx + 'px');
       node.style.setProperty('--target-y', ty + 'px');
+      stamps.gems[gem.id] = { left: backpackCx + 'px', top: backpackCy + 'px', tx: tx + 'px', ty: ty + 'px' };
     }
 
     // Position the #inventory-panel-slot above the backpack. The slot is
@@ -414,7 +460,13 @@ export function repositionToBody() {
         slot.style.bottom = (bpTopFromDrawerBottom + SLOT_GAP_ABOVE_BACKPACK) + 'px';
         slot.style.top = 'auto';
         clampSlotBelowAstrolabe(slot, rootBox);
+        stamps.slot = { right: SLOT_RIGHT_MARGIN + 'px', bottom: slot.style.bottom };
       }
+    }
+
+    // (P2a) Cache the good pass (only once every gem + the slot stamped).
+    if (Object.keys(stamps.gems).length === GEMS.length && stamps.slot.right) {
+      lastGoodStamps = stamps;
     }
 
     // Force the writes to commit under the suppressed transition, then drop
@@ -427,6 +479,33 @@ export function repositionToBody() {
 
   if (!place() && paperdollImg) {
     paperdollImg.addEventListener('load', place, { once: true });
+  }
+}
+
+// (P2a, 2026-08-17 E4B shakedown) Stage-entry recompute: re-measure the gem
+// cluster a bounded series of frames AFTER the stage is shown, so a
+// mid-transition first measure (the immediate one inside buildSoulGems) is
+// always superseded by a settled one. Every stage entry path funnels through
+// wireStage (title Continue resume, Load, New Game, the direct-launch
+// --card/--save boot) — wireStage calls this right after mountSoulGems.
+// The frame ladder covers the entry-hold/wipe classes (~2 frames), the
+// drawer slide (~6), and slow paints (~16 ≈ 260ms at 60fps); each run is
+// transition-suppressed + degenerate-guarded, so extra runs are free.
+let entryRepositionToken = 0;
+export function scheduleSoulGemReposition() {
+  const token = ++entryRepositionToken;
+  // The frame ladder covers the entry-hold/wipe classes (~2 frames), the
+  // drawer slide (~6), and slow paints (~16 ≈ 260ms at 60fps). A later
+  // settled measure always wins — repositionToBody overwrites every stamp,
+  // so mid-ladder passes simply get corrected.
+  for (const delayFrames of [2, 4, 8, 16]) {
+    setTimeout(() => {
+      if (token !== entryRepositionToken) return; // a newer entry superseded us
+      requestAnimationFrame(() => {
+        if (token !== entryRepositionToken) return;
+        repositionToBody();
+      });
+    }, delayFrames * 16);
   }
 }
 
@@ -711,6 +790,11 @@ export function clearSoulGems(root) {
   backpackEl = null;
   paperdollImg = null;
   drawerRoot = null;
+  // (P2a) Drop the last-good anchors with the rest of the state — the next
+  // build re-measures from scratch (a stale anchor must never outlive its
+  // overlay).
+  lastGoodStamps = null;
+  entryRepositionToken += 1; // cancel any in-flight entry ladder
   if (!root) return;
   const overlay = root.querySelector('.soul-gem-overlay');
   if (overlay) overlay.remove();

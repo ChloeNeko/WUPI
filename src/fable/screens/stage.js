@@ -66,6 +66,7 @@ import { saveNow } from '../engine/saves-io.js';
 // (one marker file, not per-card). Self-contained: builds + caches its own
 // overlay appended to the stage (mirrors the save-overlay pattern).
 import * as backgrounds from '../engine/backgrounds.js';
+import * as soulGems from '../engine/soul-gem.js';
 // ONLINE PANEL (2026-08-14): the 5th WUPI-drawer foot button (API). Opens the
 // same in-Fable API connection window the title's ONLINE button uses
 // (buildOnlinePanel — body-mounted, self-contained close) so the player can
@@ -426,6 +427,14 @@ export async function wireStage(root, hooks) {
       beat = fresh;
     }
     if (act === 'edit') {
+      // (P2b) Click-time authority, mirroring the › gate: the ✎ must respect
+      // the backend edit_message contract — any USER beat, or the TRAILING
+      // assistant beat. A mid-history AI edit is refused server-side; the old
+      // optimistic editor left the beat blank on the failed save.
+      if (!beats.canEditMessage({
+        role,
+        isLastAssistant: beats.isTrailingAssistant(beat),
+      })) return;
       beats.enterEditMode(beat, {
         onSave: (text) => {
           // Player → rewind + branch + regen ("I changed what I did");
@@ -505,6 +514,12 @@ export async function wireStage(root, hooks) {
       const index = Number.parseInt(beat.dataset.index || '-1', 10);
       if (index < 0) return; // unindexed beat — not a backend message
       const isUser = beat.dataset.role === 'user';
+      // (P2b) The ✎-button gate applies to the dblclick path too — a
+      // mid-history AI beat must never open a doomed editor.
+      if (!beats.canEditMessage({
+        role: isUser ? 'user' : 'assistant',
+        isLastAssistant: beats.isTrailingAssistant(beat),
+      })) return;
       beats.enterEditMode(beat, {
         onSave: (text) => {
           // Player → rewind + branch + regen ("I changed what I did"); AI
@@ -929,9 +944,32 @@ export async function wireStage(root, hooks) {
   const footApi = root.querySelector('[data-foot-api]');
   const footHome = root.querySelector('[data-foot-home]');
 
+  // (P2c, 2026-08-17 E4B shakedown) Foot-button cooldown: every foot action
+  // closes the Wupi drawer, and the close ANIMATION shifts the footer's
+  // layout — a click landing at STALE coordinates mid-slide fired the WRONG
+  // foot action (the playtest's save-modal → ✕ → stale-coordinate Load click
+  // ended in a screenless limbo). Disable the whole footer for the close
+  // window — the gems' 350ms `animating` pattern; disabled buttons swallow
+  // clicks natively.
+  const FOOT_COOLDOWN_MS = 350;
+  let footCooldownTimer = null;
+  function armFootCooldown() {
+    for (const b of [footBg, footSave, footLoad, footApi, footHome]) {
+      if (b) b.disabled = true;
+    }
+    if (footCooldownTimer) clearTimeout(footCooldownTimer);
+    footCooldownTimer = setTimeout(() => {
+      for (const b of [footBg, footSave, footLoad, footApi, footHome]) {
+        if (b) b.disabled = false;
+      }
+      footCooldownTimer = null;
+    }, FOOT_COOLDOWN_MS);
+  }
+
   // Save icon → open the modal + focus the name input.
   on(footSave, 'click', () => {
     if (footSave.disabled) return;
+    armFootCooldown();
     if (!saveOverlay) return;
     wupiDrawer.closeDrawer();
     saveOverlay.hidden = false;
@@ -977,6 +1015,7 @@ export async function wireStage(root, hooks) {
 
   on(footLoad, 'click', () => {
     if (footLoad.disabled) return;
+    armFootCooldown();
     wupiDrawer.closeDrawer();
     if (onLoadHook) onLoadHook();
   });
@@ -985,8 +1024,9 @@ export async function wireStage(root, hooks) {
   // fresh session's wireStage resets it.
   let homeFired = false;
   on(footHome, 'click', () => {
-    if (homeFired) return;
+    if (footHome.disabled || homeFired) return;
     homeFired = true;
+    armFootCooldown();
     wupiDrawer.closeDrawer();
     if (onExitHook) onExitHook();
   });
@@ -995,6 +1035,7 @@ export async function wireStage(root, hooks) {
   // is stage-appended (z:46, above the drawer's z:40) + Esc/backdrop-dismiss.
   on(footBg, 'click', () => {
     if (footBg.disabled) return;
+    armFootCooldown();
     wupiDrawer.closeDrawer();
     backgrounds.openBackgroundsPanel(root);
   });
@@ -1005,6 +1046,7 @@ export async function wireStage(root, hooks) {
   // composer locked by a mid-session api_lost — see onStageApiChanged.
   on(footApi, 'click', () => {
     if (footApi.disabled) return;
+    armFootCooldown();
     wupiDrawer.closeDrawer();
     openStageOnlinePanel();
   });
@@ -1051,6 +1093,16 @@ export async function wireStage(root, hooks) {
   // an existing overlay returns early (leftDrawerEl is resolved above, line
   // ~744, the same element refreshAll/resetLeftDrawer act on).
   leftDrawer.mountSoulGems(leftDrawerEl);
+  // (P2a, 2026-08-17 E4B shakedown) Post-layout recompute on EVERY stage
+  // entry path (they all funnel through wireStage: title Continue resume,
+  // Load, New Game, the direct-launch --card/--save boot). The immediate
+  // measure inside buildSoulGems can land mid-layout — the save→title→
+  // Continue resume stamped the whole gem cluster at negative x. The ladder
+  // re-measures at settled frames, degenerate-guarded with last-good
+  // fallbacks inside soul-gem.js.
+  try { soulGems.scheduleSoulGemReposition(); } catch (e) {
+    console.warn('[stage] soul-gem entry recompute failed:', e);
+  }
 
   // Background Library (2026-08-11): paint the saved active background (if any)
   // onto .fable-stage-bg on entry. Best-effort + non-blocking — a fetch failure

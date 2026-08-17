@@ -34,6 +34,7 @@
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import { AppLifecycle } from '../app-lifecycle.js';
+import { withShellBusy } from '../shell-guard.js';
 import './fable.css';
 import './flow-cinematic.css';
 
@@ -1407,8 +1408,30 @@ function enterStageViaTransition(openingScene, loadMessages, opts = {}) {
           // the title + open the SAME worlds→saves picker the title's LOAD
           // opens (mid-session save-swaps go through the standard flow; the
           // in-flight-turn guards live on the backend).
+          // (P2c, 2026-08-17 E4B shakedown) The load-flow entry is a
+          // multi-step async chain (stage teardown → title → transition →
+          // worlds grid). A failure anywhere in the middle used to leave the
+          // app SCREENLESS (0×0 drawer, no visible screen, flow-ambience
+          // stuck — only a webview reload recovered). withShellBusy drops
+          // overlapping input during the chain + the catch guarantees SOME
+          // screen is shown.
           onLoad: () => {
-            void returnToTitle().then(() => onLoadClicked());
+            void withShellBusy(async () => {
+              try {
+                await returnToTitle();
+                await onLoadClicked();
+              } catch (e) {
+                console.error('[fable] Load flow failed mid-chain — recovering to a visible screen', e);
+                try {
+                  // If the worlds grid never rendered, land on the title (the
+                  // pre-flow state) + kill any half-started flow ambience.
+                  if (!(screens.worlds && !screens.worlds.hidden)) {
+                    stopFlowAmbiance();
+                    showScreen('title');
+                  }
+                } catch (_) { /* last resort: leave whatever is visible */ }
+              }
+            });
           },
           openingScene,
           loadMessages,

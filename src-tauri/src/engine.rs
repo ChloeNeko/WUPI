@@ -575,8 +575,39 @@ impl EngineRuntime {
         // tokenizer: rejected (model-swap would corrupt saved chats).
         // Truncation cold-reset is the accepted cost until the Memory engine
         // keeps visible history short enough that truncation rarely fires.
+        //
+        // (2026-08-17 E4B shakedown P0) System-prefix telemetry: the Wupi-chat
+        // lockout was a 1541-token system prefix vs a 1536 prompt budget —
+        // invisible until EVERY turn failed truncation (`truncate_to_fit` can
+        // only drop conversation turns, never the system prefix). One line per
+        // render, house style (same channel as the perf block below), + a
+        // once-per-boot warning when the prefix alone exceeds 70% of the
+        // prompt budget so a future prompt-path regression is loud on the
+        // FIRST render, not after lockout.
         let generation_reserve = (self.n_ctx as usize / 4).max(GENERATION_RESERVE_FLOOR_TOKENS);
         let max_prompt_len = (self.n_ctx as usize).saturating_sub(generation_reserve);
+        let system_prefix_len = self.estimate_system_prefix_len(&full_tokens);
+        {
+            static PREFIX_WARNED: std::sync::atomic::AtomicBool =
+                std::sync::atomic::AtomicBool::new(false);
+            let pct = if max_prompt_len > 0 {
+                system_prefix_len * 100 / max_prompt_len
+            } else {
+                0
+            };
+            eprintln!(
+                "[DEBUG] [PREFIX] chat render: {} prompt tokens, system prefix {} tokens, budget {} tokens ({}%)",
+                full_tokens.len(), system_prefix_len, max_prompt_len, pct
+            );
+            if pct > 70
+                && !PREFIX_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed)
+            {
+                eprintln!(
+                    "[DEBUG] [PREFIX] WARNING: system prefix {} tokens is >70% of the {}-token prompt budget — one more prompt-path addition locks the copilot out (truncation cannot shrink the prefix). Shrink the prompt, not the budget.",
+                    system_prefix_len, max_prompt_len
+                );
+            }
+        }
         let full_tokens = if full_tokens.len() > max_prompt_len {
             if self.turn_marker.is_empty() {
                 // Plain family has no turn markers: can't truncate safely.
@@ -586,7 +617,6 @@ impl EngineRuntime {
                 );
             }
             let boundaries = scan_turn_boundaries(&full_tokens, &self.turn_marker);
-            let system_prefix_len = self.estimate_system_prefix_len(&full_tokens);
             match truncate_to_fit(&full_tokens, max_prompt_len, system_prefix_len, &boundaries) {
                 Some(truncated) => {
                     tracing::info!(

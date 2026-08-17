@@ -1148,7 +1148,7 @@ input[type="password"]::-webkit-credentials-auto-fill-button {
     color: #ffffff;
 }
 
-/* Online bubble: mirrors the LOCAL 12B bubble shape. Inactive = muted gray;
+/* Online bubble: mirrors the LOCAL model bubble shape. Inactive = muted gray;
    .active = same magenta glow treatment as the local bubble so the visual
    language matches. */
 .ai-online-bubble {
@@ -2276,7 +2276,7 @@ html[data-colorcode="Vibrant"] .boot-loading-text span.lit {
 
 /* Progress bar: a thin track + a magenta fill that grows with
    overall_downloaded / overall_total. The fill has a soft glow that reads
-   as "alive" during the long 9.8 GB pull. */
+   as "alive" during the long ~6 GB pull. */
 .download-progress-wrap {
     width: 100%;
     height: 12px;

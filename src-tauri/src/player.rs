@@ -248,10 +248,12 @@ pub struct PlayerMeta {
 // (it anchors the narrator + the picker tile); prose fields allow a
 // substantial paragraph each. Trait fields (single-value appearance
 // answers from the wizard slides) get a tighter cap — they're labels,
-// not prose.
+// not prose. 2026-08-17: TRAIT_MAX 128 → 256 — rich hair/appearance
+// detail kept overflowing; the cap stays Rust-side ONLY (stating a
+// number in GLM's prompt makes it target that number).
 const NAME_MAX: usize = 64;
 const PROSE_MAX: usize = 4000;
-const TRAIT_MAX: usize = 128;
+const TRAIT_MAX: usize = 256;
 /// Per-key cap for `custom_tags` keys (short identifiers like
 /// "starting_currency", "guard_reputation"). Tighter than a trait — these
 /// are field names, not values.

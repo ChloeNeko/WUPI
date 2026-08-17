@@ -151,7 +151,7 @@ pub fn parse_tool_calls(raw: &str) -> Vec<ToolCall> {
 /// it here would prevent the repair prompt from ever showing the model its
 /// error.
 ///
-/// **Two-stage parse (§11.17 fix for the local Gemma 12B unquoted-key case):**
+/// **Two-stage parse (§11.17 fix for the local Gemma unquoted-key case):**
 /// the strict `serde_json::from_str` is tried first. On failure, we run the
 /// span through `json_repair::repair` (the microsecond-cost syntactic pre-
 /// parser that fixes unquoted keys, smart quotes, trailing commas, bare
@@ -645,9 +645,9 @@ impl Tool for FileRead {
         let path = ctx.resolve(&rel)?;
         // Read is allowed anywhere under the install (no allowlist gate),
         // BUT bounded (2026-08-15 audit fix): an unbounded read_to_string on
-        // models/WUPI.gguf (~9.8 GB) loads the whole file into RAM before
+        // models/WUPI.gguf (~5.8 GB) loads the whole file into RAM before
         // UTF-8 validation fails — OOM/thrash on a process already holding
-        // ~10.9 GB. Binary + credential paths are refused outright: a .gguf
+        // ~6.5 GB. Binary + credential paths are refused outright: a .gguf
         // is never useful text, and the API config carries the plaintext key
         // (readable → quotable into chat → archived into memory.sqlite).
         const FILE_READ_MAX_BYTES: u64 = 2 * 1024 * 1024;
@@ -1119,7 +1119,8 @@ mod tests {
     // --- parse_args_lenient §11.17 fix: unquoted-key repair ---
 
     /// The live WEAVER-Scribe failure (2026-07-29 playtest): the local Gemma
-    /// 12B emits the `updates` wrapper correctly but leaves the KEY unquoted
+    /// (12B, pre-E4B)
+    /// emits the `updates` wrapper correctly but leaves the KEY unquoted
     /// (`{updates:[...]}` not `{"updates":[...]}`). Strict serde_json rejects
     /// at the lexer. The json_repair stage recovers it — this is the test that
     /// would have caught the bug that left every WEAVER draft empty.

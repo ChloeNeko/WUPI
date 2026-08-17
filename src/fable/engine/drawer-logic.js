@@ -48,3 +48,15 @@ export function swipeNextAction({ count, active }) {
   if (active + 1 < count) return { kind: 'swipe', variantIdx: active + 1 };
   return { kind: 'reroll' };
 }
+
+// (P2b, 2026-08-17 E4B shakedown) Mirror of the backend `edit_message`
+// contract: ANY user beat is editable; an assistant beat only when it is the
+// TRAILING one (the backend refuses a mid-history AI edit — "index N is not
+// the trailing assistant message" — installing an older turn's schema would
+// discard later turns' world state while their prose stays). The ✎ affordance
+// used to open regardless: the failed save left the beat blank until a feed
+// rebuild. Re-derived at CLICK TIME like canNext (#84 pattern — the stamped
+// state is advisory).
+export function canEditMessage({ role, isLastAssistant }) {
+  return role === 'user' || !!isLastAssistant;
+}

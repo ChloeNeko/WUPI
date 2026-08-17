@@ -697,6 +697,79 @@ pub enum Polarity {
     Debuff,
 }
 
+/// (2026-08-17 E4B shakedown P1b) The approved kinded-tag domain. `kind` is a
+/// MECHANIC ROUTE, not free text: `"disguise"` routes the tag into the
+/// disguise Referee gate (auto-pass vs scrutiny). The E4B stamped
+/// `kind:"disguise"` onto six unrelated labels (perception/Focus/Stealth/
+/// wounded/Stamina/disguise) — kinded tags are EXCLUDED from
+/// `count_by_polarity`, so five phantom "buffs/debuffs" silently vanished
+/// from the lethality condition-penalty DC. Every new mechanic lane that
+/// starts reading a kind must add its id here FIRST. Empty string = generic
+/// (always valid).
+pub const APPROVED_TAG_KINDS: &[&str] = &["disguise"];
+
+/// True when `kind` is the generic empty string or an approved mechanic lane.
+/// The apply path strips unapproved kinds (keeping the tag as a pure
+/// buff/debuff — polarity preserved) instead of persisting the miscategorization.
+pub fn valid_tag_kind(kind: &str) -> bool {
+    kind.is_empty() || APPROVED_TAG_KINDS.contains(&kind)
+}
+
+/// Label terms that plausibly describe a DISGUISE (a worn identity). The
+/// playtest's phantom disguises were single generic stat words (Focus,
+/// perception, Stealth, wounded, Stamina) — none describes a costume. A
+/// real disguise label names the guise: "dockhand pose", "city guard
+/// uniform", "traveler's cloak". Word-boundary matched, case-insensitive.
+const DISGUISE_LABEL_TERMS: &[&str] = &[
+    "disguise",
+    "guise",
+    "pose",
+    "uniform",
+    "costume",
+    "garb",
+    "attire",
+    "outfit",
+    "mask",
+    "cloak",
+    "veil",
+    "persona",
+    "identity",
+    "semblance",
+];
+
+fn label_describes_disguise(label: &str) -> bool {
+    let lower = label.trim().to_lowercase();
+    lower.split_whitespace().any(|word| {
+        let bare = word.trim_matches(|c: char| !c.is_alphanumeric());
+        DISGUISE_LABEL_TERMS.contains(&bare)
+    })
+}
+
+/// Sanitize a parser-supplied `tag_kind` for a `StatusTag`: trim + lowercase
+/// (the lane consumers compare exactly, so `Disguise` used to fall out of
+/// every lane), validate against [`APPROVED_TAG_KINDS`], and — for the
+/// disguise lane — require the LABEL to plausibly describe a disguise
+/// ([`DISGUISE_LABEL_TERMS`]). Anything else returns `""`: the tag degrades
+/// to a pure buff/debuff (polarity preserved) with a one-line warning on
+/// stderr. Mechanical strip per the P1b spec — no prompt text involved.
+pub fn sanitize_tag_kind(raw_kind: &str, label: &str) -> String {
+    let normalized = raw_kind.trim().to_lowercase();
+    if !valid_tag_kind(&normalized) {
+        eprintln!(
+            "[DEBUG] [EFFECT] stripped unapproved tag_kind {raw_kind:?} — tag kept as a pure buff/debuff (approved lanes: {APPROVED_TAG_KINDS:?})"
+        );
+        return String::new();
+    }
+    if normalized == "disguise" && !label_describes_disguise(label) {
+        eprintln!(
+            "[DEBUG] [EFFECT] stripped disguise kind from label {label:?} — it names no guise/costume, not a disguise lane tag"
+        );
+        return String::new();
+    }
+    normalized
+}
+
+
 impl Default for StatusTag {
     /// Default is a generic, non-expiring Buff with no source and no kind —
     /// matches the historical pre-Phase-4 construction shape so existing
@@ -1627,6 +1700,68 @@ mod tests {
         let json = serde_json::to_string(&tag).unwrap();
         let back: StatusTag = serde_json::from_str(&json).unwrap();
         assert_eq!(back.kind, "disguise");
+    }
+
+    // ---- P1b (2026-08-17 E4B shakedown): tag_kind domain validation ----
+
+    #[test]
+    fn sanitize_tag_kind_strips_unapproved_kinds() {
+        // The playtest evidence: six labels (perception/Focus/Stealth/
+        // wounded/Stamina/disguise) carried the disguise lane — the five
+        // miscategorized ones silently left the lethality condition-penalty
+        // count. Unapproved kind VALUES strip to "" (pure buff/debuff).
+        assert_eq!(sanitize_tag_kind("perception", "perception"), "");
+        assert_eq!(sanitize_tag_kind("focus", "Focus"), "");
+        assert_eq!(sanitize_tag_kind("stealth", "Stealth"), "");
+        assert_eq!(sanitize_tag_kind("wounded", "wounded"), "");
+        assert_eq!(sanitize_tag_kind("stamina", "Stamina"), "");
+        assert_eq!(sanitize_tag_kind("enchanted", "Sword-sharp"), "");
+        // Generic (empty) stays generic.
+        assert_eq!(sanitize_tag_kind("", "Focus"), "");
+    }
+
+    #[test]
+    fn sanitize_tag_kind_disguise_lane_requires_disguise_label() {
+        // The plan's pinned cases: a disguise kind on a stat label strips;
+        // on a genuine guise label it stays.
+        assert_eq!(sanitize_tag_kind("disguise", "Focus"), "", "Focus names no guise");
+        assert_eq!(sanitize_tag_kind("disguise", "perception"), "");
+        assert_eq!(sanitize_tag_kind("disguise", "Stealth"), "");
+        assert_eq!(sanitize_tag_kind("disguise", "wounded"), "");
+        assert_eq!(sanitize_tag_kind("disguise", "Stamina"), "");
+        // Genuine disguises keep the lane (case/space normalized).
+        assert_eq!(sanitize_tag_kind("disguise", "dockhand pose"), "disguise");
+        assert_eq!(sanitize_tag_kind(" Disguise ", "city guard uniform"), "disguise");
+        assert_eq!(sanitize_tag_kind("disguise", "traveler's cloak"), "disguise");
+        assert_eq!(sanitize_tag_kind("disguise", "masked beggar persona"), "disguise");
+    }
+
+    #[test]
+    fn sanitized_focus_tag_counts_in_polarity_again() {
+        // End-to-end intent: `[EFFECT label=Focus polarity=buff kind=disguise]`
+        // lands with NO kind → it renders in the buff lane + counts toward
+        // condition_penalty again.
+        let tags = vec![StatusTag {
+            label: "Focus".into(),
+            polarity: Polarity::Buff,
+            expires_at: 10_000,
+            source: String::new(),
+            kind: sanitize_tag_kind("disguise", "Focus"),
+        }];
+        assert_eq!(tags[0].kind, "", "the phantom lane is stripped");
+        assert_eq!(count_by_polarity(&tags, Polarity::Buff, 0), 1, "a stripped tag counts again");
+        let rendered = render_tags_for_prompt(&tags, 0).unwrap();
+        assert!(rendered.contains("buffs: Focus"), "a stripped tag renders in the buff lane");
+        // And the real disguise lane keeps working: dockhand pose stays a disguise.
+        let disguise_tags = vec![StatusTag {
+            label: "dockhand pose".into(),
+            polarity: Polarity::Buff,
+            expires_at: 10_000,
+            source: String::new(),
+            kind: sanitize_tag_kind("disguise", "dockhand pose"),
+        }];
+        let rendered = render_tags_for_prompt(&disguise_tags, 0).unwrap();
+        assert!(rendered.contains("disguises: dockhand pose"));
     }
 
     #[test]

@@ -38,11 +38,13 @@ use crate::schema::{SceneMode, ScenePacing};
 
 // ---------------------------------------------------------------------------
 // Pillar keyword tables. Matched case-insensitively through
-// `player_state::keyword_present` (leading word boundary — the SAME matcher
-// convention as `player_state::COMBAT_KEYWORDS`, #35). Conservative:
-// false-negative cost is a "neutral" classification (default Exploration);
-// false-positive cost is a mis-paced scene. Both are recoverable on the next
-// turn, so the bar is "good default + obvious matches."
+// `player_state::keyword_present` (BOTH-side word boundaries — the SAME
+// matcher convention as `player_state::COMBAT_KEYWORDS`, #35 + 2026-08-16
+// P2b). Conservative: false-negative cost is a "neutral" classification
+// (default Exploration); false-positive cost is a mis-paced scene. Both are
+// recoverable on the next turn, so the bar is "good default + obvious
+// matches." Inflections are explicit (the trailing boundary killed the old
+// free suffix ride: "streets" no longer contains "street" as a whole word).
 // ---------------------------------------------------------------------------
 
 /// Spatial scale: how enclosed is the immediate environment?
@@ -59,37 +61,88 @@ const SPATIAL_ENCLOSED: &[&str] = &[
 ];
 
 const SPATIAL_OPEN_CIVIL: &[&str] = &[
-    "street", "market", "square", "plaza", "alley", "road", "path", "bridge",
-    "harbor", "dock", "wharf", "gate", "wall", "tower", "courtyard", "yard",
-    "village", "town", "city",
+    "street", "streets", "market", "markets", "square", "squares", "plaza",
+    "plazas", "alley", "alleys", "road", "roads", "path", "paths", "bridge",
+    "bridges", "harbor", "docks", "dock", "wharf", "gate", "gates", "wall",
+    "walls", "tower", "towers", "courtyard", "courtyards", "yard", "yards",
+    "village", "villages", "town", "towns", "city",
 ];
 
 const SPATIAL_WILDERNESS: &[&str] = &[
-    "forest", "woods", "jungle", "desert", "mountain", "hill", "valley",
-    "ocean", "sea", "river", "lake", "stream", "field", "meadow", "plain",
-    "swamp", "marsh", "wastes", "wilderlands", "trail", "wilderness",
-    "dungeon", "ruin", "wilds",
+    "forest", "forests", "woods", "jungle", "jungles", "desert", "deserts",
+    "mountain", "mountains", "hill", "hills", "valley", "valleys",
+    "ocean", "sea", "seas", "river", "rivers", "lake", "lakes", "stream",
+    "streams", "field", "fields", "meadow", "meadows", "plain", "plains",
+    "swamp", "swamps", "marsh", "marshes", "wastes", "wilderlands", "trail",
+    "trails", "wilderness", "dungeon", "dungeons", "ruin", "ruins", "wilds",
 ];
 
 /// Emotional vector: the affective register of the scene.
 const EMOTIONAL_CALM: &[&str] = &[
-    "rest", "sleep", "relax", "wait", "sit", "drink", "eat", "dine", "chat",
-    "talk", "listen", "watch", "trade", "barter", "buy", "sell", "shop",
-    "browse", "hum", "sing softly", "think",
+    "rest", "rests", "rested", "resting",
+    "sleep", "sleeps", "slept", "sleeping",
+    "relax", "relaxes", "relaxed", "relaxing",
+    "wait", "waits", "waited", "waiting",
+    "sit", "sits", "sat", "sitting",
+    "drink", "drinks", "drank", "drinking",
+    "eat", "eats", "ate", "eating",
+    "dine", "dines", "dined", "dining",
+    "chat", "chats", "chatted", "chatting",
+    "talk", "talks", "talked", "talking",
+    "listen", "listens", "listened", "listening",
+    "watch", "watches", "watched", "watching",
+    "trade", "trades", "traded", "trading",
+    "barter", "barters", "bartered", "bartering",
+    "buy", "buys", "buying", "bought",
+    "sell", "sells", "sold", "selling",
+    "shop", "shops", "shopping",
+    "browse", "browses", "browsing",
+    "hum", "hums", "humming",
+    "sing softly", "singing softly",
+    "think", "thinks", "thinking",
     // (2026-08-16 audit fix #7) The recovery Referee needs Downtime AND a
     // REST_KEYWORD; these rest verbs were in REST_KEYWORDS but NOT here, so
     // "we camp for the night" classified Exploration → zero recovery — the
     // monotonic-decline economy the recovery seam exists to exit persisted
     // for exactly the verbs its own doc comment lists. "watch" stays OUT of
     // the tense pillar (see below) but IN here — a watching sentry camps.
-    "camp", "nap", "recuperate", "convalesce", "bandage", "mend",
+    "camp", "camps", "camped", "camping",
+    "nap", "naps", "napped", "napping",
+    "recuperate", "recuperating", "convalesce", "convalescing",
+    "bandage", "bandages", "bandaging", "mend", "mends", "mending",
+    // (P1e, 2026-08-17 E4B shakedown) The T43 gap: "exhaustion wins — I
+    // sleep, hard, for several hours" classified Exploration, so the
+    // Recovery Referee's Downtime gate never opened. sleep/nap were already
+    // here — the missing rest phrasings are the lie-down + doze families.
+    "lie down", "lies down", "lay down", "laid down", "lying down",
+    "doze", "dozes", "dozed", "dozing",
+    "bed down", "beds down", "bedded down",
+    "turn in", "turns in", "turned in",
 ];
 
 const EMOTIONAL_TENSE: &[&str] = &[
-    "argue", "argu", "disagree", "negotiate", "bargain hard", "suspect",
-    "suspicious", "wary", "distrust", "tense", "uneasy", "guard",
-    "study", "investigate", "search", "examine", "interrogate", "question",
-    "plead", "beg", "plea",
+    // (2026-08-16 P2b) the old prefix stub "argu" is dead under the boundary
+    // matcher — explicit forms replace it.
+    "argue", "argues", "argued", "arguing",
+    "disagree", "disagrees", "disagreed", "disagreeing",
+    "negotiate", "negotiates", "negotiated", "negotiating",
+    "bargain hard", "bargaining hard",
+    "suspect", "suspects", "suspected", "suspecting",
+    "suspicious", "suspiciously",
+    "wary", "warily", "wariness",
+    "distrust", "distrusts", "distrusted", "distrusting",
+    "tense", "tensely", "tensed",
+    "uneasy", "uneasily",
+    "guard", "guards", "guarded", "guarding",
+    "study", "studies", "studied", "studying",
+    "investigate", "investigates", "investigated", "investigating",
+    "search", "searches", "searched", "searching",
+    "examine", "examines", "examined", "examining",
+    "interrogate", "interrogates", "interrogated", "interrogating",
+    "question", "questions", "questioned", "questioning",
+    "plead", "pleads", "pleaded", "pleading",
+    "beg", "begs", "begged", "begging",
+    "plea", "pleas",
     // (2026-08-15 audit fix) "watch" REMOVED — it also lives in CALM, and the
     // tier scoring let TENSE win, so "I sit and watch the fire" classified
     // Exploration instead of Downtime (also suppressing the recovery referee:
@@ -98,32 +151,52 @@ const EMOTIONAL_TENSE: &[&str] = &[
 ];
 
 const EMOTIONAL_ALARMED: &[&str] = &[
-    "panic", "flee", "run away", "ambush", "trap", "danger", "terrified",
-    "horror", "scream", "shriek", "stampede", "alarm", "trap is sprung",
-    "betrayal", "betrayed",
+    "panic", "panics", "panicked", "panicking",
+    "flee", "flees", "fled", "fleeing",
+    "run away", "runs away", "ran away", "running away",
+    "ambush", "ambushes", "ambushed", "ambushing",
+    "trap", "traps", "trapped",
+    "danger", "dangers", "dangerous",
+    "terrify", "terrifies", "terrified", "terrifying",
+    "horror", "horrors", "horrified",
+    "scream", "screams", "screamed", "screaming",
+    "shriek", "shrieks", "shrieked", "shrieking",
+    "stampede", "stampedes", "stampeded",
+    "alarm", "alarms", "alarmed", "alarming",
+    "trap is sprung",
+    "betrayal", "betrayals", "betrayed",
 ];
 
-/// Kinetic scale: the action intensity. The Combat tier reuses the EXACT
-/// `player_state::COMBAT_KEYWORDS` list so scene-pacing and the combat
-/// Referee agree on what counts as "combat" (single source of truth: if the
-/// Referee fires, the mode is Combat).
-///
-/// We re-declare here (rather than `use`) because the combat list is private
-/// to `player_state`. The lists MUST stay in sync — the
+/// Kinetic scale: the action intensity. The Combat tier delegates to the
+/// SHARED two-tier combat gate (`player_state::combat_triggered` over
+/// `COMBAT_HARD_KEYWORDS` / `COMBAT_SOFT_KEYWORDS`, P1e 2026-08-17) so
+/// scene-pacing and the combat Referee agree on what counts as "combat" BY
+/// CONSTRUCTION — one source of truth, no mirror list to keep in sync (the
+/// old re-declared `KINETIC_COMBAT` mirror is gone; the
 /// `combat_keywords_match_scene_pacing_combat` test in `player_state.rs`
-/// pins this (it asserts every combat keyword triggers Combat classification).
-/// If you add a combat keyword to `player_state::COMBAT_KEYWORDS`, add it
-/// here too AND verify the test passes.
-const KINETIC_COMBAT: &[&str] = &[
-    "attack", "swing", "strike", "slash", "stab", "punch", "kick", "block",
-    "dodge", "parry", "shoot", "fire", "cast", "throw", "tackle", "grapple",
-    "charge", "run", "sprint", "climb", "jump", "leap", "swim",
-];
+/// still pins the agreement through the shared gate).
+/// Soft keywords (hunt/raid/arrest/fight/chase) corroborate — a gossip
+/// question about "arrests" + "hunting" (T46) no longer mis-paces a
+/// stew-and-chat turn as Combat.
 
 const KINETIC_MOBILE: &[&str] = &[
-    "walk", "go to", "head to", "travel", "wander", "stroll", "march",
-    "ride", "sail", "fly", "teleport", "fast-travel", "fast travel",
-    "journey", "depart", "leave", "enter", "arrive",
+    "walk", "walks", "walked", "walking",
+    "go to", "goes to", "went to", "going to",
+    "head to", "heads to", "headed to", "heading to",
+    "travel", "travels", "traveled", "traveling", "travelling",
+    "wander", "wanders", "wandered", "wandering",
+    "stroll", "strolls", "strolled", "strolling",
+    "march", "marches", "marched", "marching",
+    "ride", "rides", "rode", "ridden", "riding",
+    "sail", "sails", "sailed", "sailing",
+    "fly", "flies", "flew", "flown", "flying",
+    "teleport", "teleports", "teleported", "teleporting",
+    "fast-travel", "fast travel", "fast-traveling", "fast traveling",
+    "journey", "journeys", "journeyed", "journeying",
+    "depart", "departs", "departed", "departing",
+    "leave", "leaves", "left", "leaving",
+    "enter", "enters", "entered", "entering",
+    "arrive", "arrives", "arrived", "arriving",
 ];
 
 // ---------------------------------------------------------------------------
@@ -172,9 +245,19 @@ fn score_emotional(lower: &str) -> u8 {
 }
 
 /// Kinetic pillar. 0 = static, 1 = mobile, 2 = violent.
-/// Combat (Tier2) reuses the combat Referee's keyword list.
+/// Combat (Tier2) = the SHARED two-tier combat gate (hard-alone or ≥2 soft)
+/// — see the module-level comment above.
 fn score_kinetic(lower: &str) -> u8 {
-    score_pillar(lower, KINETIC_MOBILE, KINETIC_COMBAT)
+    if crate::player_state::combat_triggered(lower) {
+        2
+    } else if KINETIC_MOBILE
+        .iter()
+        .any(|kw| crate::player_state::keyword_present(lower, kw))
+    {
+        1
+    } else {
+        0
+    }
 }
 
 /// Calm-signal flag: did any calm/rest/chat/trade keyword appear? Used by
@@ -238,7 +321,11 @@ pub fn evaluate(text: &str) -> ScenePacing {
         // Empty / whitespace → neutral Exploration (all pillar scores 0).
         return ScenePacing::default();
     }
-    let lower = text.to_lowercase();
+    // (P1e, 2026-08-17 E4B shakedown) Dialogue-stripped scoring: quoted
+    // speech is not action. T46's "Is Harsk still hunting…" (spoken as a
+    // question) must not pace the scene as Combat, and T22's quoted "The
+    // rest when the heat dies down" must not heal anyone.
+    let lower = crate::player_state::strip_dialogue(text).to_lowercase();
     let spatial = score_spatial(&lower);
     let emotional = score_emotional(&lower);
     let kinetic = score_kinetic(&lower);
@@ -291,6 +378,38 @@ mod tests {
         assert_eq!(mode_of("I fire my bow at the wolf."), SceneMode::Combat);
     }
 
+    /// (2026-08-16 P2b) Inflected forms classify identically to their base
+    /// verbs — the keyword lists carry explicit inflection entries now that
+    /// `keyword_present` enforces both word boundaries.
+    #[test]
+    fn inflected_forms_classify_like_base_verbs() {
+        // Combat inflections.
+        assert_eq!(mode_of("The goblin is attacking me."), SceneMode::Combat);
+        assert_eq!(mode_of("I was attacked from the shadows."), SceneMode::Combat);
+        assert_eq!(mode_of("We swam across the lake."), SceneMode::Combat);
+        assert_eq!(mode_of("They charged the gate."), SceneMode::Combat);
+        // Mobile inflections → Exploration.
+        assert_eq!(mode_of("I am walking to the market."), SceneMode::Exploration);
+        assert_eq!(mode_of("We traveled north for hours."), SceneMode::Exploration);
+        // Calm/rest inflections → Downtime.
+        assert_eq!(mode_of("I am resting by the hearth."), SceneMode::Downtime);
+        assert_eq!(mode_of("We slept until dawn."), SceneMode::Downtime);
+        assert_eq!(mode_of("I watched the dancers while I ate."), SceneMode::Downtime);
+        // Tense inflections → Exploration (kinetic 0, emotional 1).
+        assert_eq!(mode_of("We argued about the price."), SceneMode::Exploration);
+        assert_eq!(mode_of("I studied the stranger suspiciously."), SceneMode::Exploration);
+        // Alarmed inflections → emotional 2.
+        let s = evaluate("The villagers panicked and fled.");
+        assert_eq!(s.emotional, 2, "inflected alarmed verbs must score");
+        // Spatial inflections still score.
+        let s = evaluate("I walked from the streets into the mountains.");
+        assert_eq!(s.spatial, 2, "wilderness beats civil with both inflected");
+        // Compounds stay inert: derived nouns must never classify.
+        assert_ne!(mode_of("A runner arrived with a message."), SceneMode::Combat);
+        assert_eq!(mode_of("The firelight was warm."), SceneMode::Exploration,
+            "'firelight' must not classify Combat");
+    }
+
     #[test]
     fn no_movement_no_tension_is_downtime() {
         // Static + calm → Downtime.
@@ -338,6 +457,83 @@ mod tests {
         assert_eq!(mode_of("   "), SceneMode::Exploration);
         // Text with no recognized keywords (proper noun prose) → Exploration.
         assert_eq!(mode_of("I quux the fnord."), SceneMode::Exploration);
+    }
+
+    // --- P1e (2026-08-17 E4B shakedown): the false-positive corpus ---
+    // Built from the ACTUAL 51-turn playtest turns (T22/T43/T46/T47) — the
+    // E4B's failure mode was keywords matching inside SPOKEN text and
+    // single soft verbs matching ABOUT-OTHERS gossip. Dialogue is stripped
+    // before scoring; soft combat verbs corroborate.
+
+    #[test]
+    fn p1e_t46_gossip_questions_are_not_combat() {
+        // T46 verbatim fragments: a stew-and-gossip turn mis-classified
+        // Combat (real injury rolls followed — one Purple).
+        assert_eq!(
+            mode_of("I eat slowly and keep my voice low. \"Have there been any arrests since the docks? Is Harsk still hunting for the one who cut the moorings?\""),
+            SceneMode::Downtime,
+            "quoted gossip questions must not pace Combat (T46)"
+        );
+        // Unquoted ABOUT-OTHERS gossip: a SINGLE soft verb corroborates
+        // nothing — it must not fire alone.
+        assert_ne!(
+            mode_of("I ask whether there have been any arrests."),
+            SceneMode::Combat,
+            "a lone about-others 'arrests' must not pace Combat"
+        );
+        // (NB: "the watch raided…" is a poor fixture — noun "watch" is a
+        // CALM keyword, correctly classifying Downtime. Use a watch-free
+        // report; the P1e invariant under test is NOT-Combat either way.)
+        assert_ne!(
+            mode_of("They say the constables raided the eel-shed last night."),
+            SceneMode::Combat,
+            "a reported raid is news, not a fight (T47)"
+        );
+    }
+
+    #[test]
+    fn p1e_t43_sleep_classifies_downtime() {
+        // T43 verbatim: "exhaustion wins — I sleep, hard, for several hours"
+        // classified Exploration, so the Recovery Referee's Downtime gate
+        // never opened. sleep was already a calm keyword — the classification
+        // died on the long turn's other words; pin the canonical phrasings.
+        assert_eq!(
+            mode_of("exhaustion wins — I sleep, hard, for several hours"),
+            SceneMode::Downtime
+        );
+        assert_eq!(mode_of("I lie down on the straw and doze off."), SceneMode::Downtime);
+        assert_eq!(mode_of("We bed down for the night."), SceneMode::Downtime);
+    }
+
+    #[test]
+    fn p1e_positive_combat_controls_still_fire() {
+        // The referee's bar must survive the two-tier split: direct violence
+        // fires ALONE, quoted or not.
+        assert_eq!(mode_of("I attack the goblin."), SceneMode::Combat);
+        assert_eq!(mode_of("I stab the bartender."), SceneMode::Combat);
+        assert_eq!(mode_of("I shove past the guard and lunge for the door."), SceneMode::Combat);
+        assert_eq!(mode_of("The goblin is attacking me!"), SceneMode::Combat);
+        // Two soft verbs corroborate: an actual hunt + chase is kinetic.
+        assert_eq!(
+            mode_of("We are hunting the stag, chasing it through the brush."),
+            SceneMode::Combat
+        );
+    }
+
+    #[test]
+    fn p1e_quoted_speech_never_paces_the_scene() {
+        // The T22 family: quoted dialogue is speech, not action — a quoted
+        // combat verb inside a negotiation must not pace Combat.
+        assert_eq!(
+            mode_of("I raise my hands. \"I'm not here to fight, I only want to talk.\""),
+            SceneMode::Exploration,
+            "a quoted 'fight' inside a de-escalation line must not pace Combat"
+        );
+        assert_eq!(
+            mode_of("I drink while Mara laughs. \"The rest when the heat dies down,\" she says."),
+            SceneMode::Downtime,
+            "unquoted calm actions pace the scene; the quoted 'rest' must not do referee work (T22)"
+        );
     }
 
     // --- Pillar scores (kept for tracing + future tuning) ---

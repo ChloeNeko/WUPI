@@ -6,6 +6,7 @@ import {
   variantCount,
   computeDrawerState,
   swipeNextAction,
+  canEditMessage,
 } from '../src/fable/engine/drawer-logic.js';
 
 let passed = 0;
@@ -98,6 +99,23 @@ test('swipeNext: single variant at end → reroll (the fold)', () => {
 });
 test('swipeNext: active 0 of 3 → swipe to 1', () => {
   assert.deepEqual(swipeNextAction({ count: 3, active: 0 }), { kind: 'swipe', variantIdx: 1 });
+});
+
+// ── canEditMessage (P2b 2026-08-17: the ✎ mirrors the edit_message contract) ─
+test('canEdit: any USER beat is editable (mid-history included)', () => {
+  assert.equal(canEditMessage({ role: 'user', isLastAssistant: false }), true);
+  assert.equal(canEditMessage({ role: 'user', isLastAssistant: true }), true);
+});
+test('canEdit: the TRAILING assistant beat is editable', () => {
+  assert.equal(canEditMessage({ role: 'assistant', isLastAssistant: true }), true);
+});
+test('canEdit: a mid-history assistant beat is NOT editable (backend refuses)', () => {
+  // The playtest case: ✎ on beat 44 → edit_message refused "not the trailing
+  // assistant message" → the beat rendered blank until a rebuild.
+  assert.equal(canEditMessage({ role: 'assistant', isLastAssistant: false }), false);
+});
+test('canEdit: isLastAssistant is REQUIRED for assistant beats (no undefined ride)', () => {
+  assert.equal(canEditMessage({ role: 'assistant', isLastAssistant: undefined }), false);
 });
 
 console.log('\n%d passed, %d failed', passed, failed);

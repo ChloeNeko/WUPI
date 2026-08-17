@@ -96,7 +96,8 @@ impl ModelFamily {
         let lower = filename.to_lowercase();
         // The chat model is always shipped as `WUPI.gguf` (locked naming
         // convention 2026-07-12: any future chat model reuses this name).
-        // Today's WUPI.gguf is a Gemma 4 12B quant, so it resolves to Gemma4.
+        // Today's WUPI.gguf is a Gemma 4 E4B quant (Q6_K, swapped in
+        // 2026-08-17 from the 12B), so it resolves to Gemma4.
         // If you ever ship a NON-Gemma chat model under `WUPI.gguf`, add a new
         // variant + ChatFormat impl and route on the model's GGUF metadata
         // (`general.architecture`) instead of the filename.
@@ -196,7 +197,7 @@ impl ChatFormat for Gemma4Format {
             //
             // DISABLED 2026-08-09 (`THINKING_ENABLED`): thinking 5×'d per-turn
             // wall-clock + could wedge into a non-terminating thought channel
-            // (→ max_tokens hang). Gemma 12B tracks cleanly without it. The
+            // (→ max_tokens hang). The Gemma 12B tracked cleanly without it. The
             // ThoughtGate / StreamFilter / extract_reasoning machinery stays
             // resident but dormant (no-ops when no thought is emitted).
             if crate::settings::THINKING_ENABLED {

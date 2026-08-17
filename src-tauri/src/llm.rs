@@ -843,7 +843,7 @@ pub fn shared_model() -> Option<&'static LlamaModel> {
 }
 
 /// Phase 5B (2026-07-29): unload the shared LLM weights from VRAM. Reclaims
-/// the leaked `Box<LlamaModel>` via `Box::from_raw` + drops it → frees ~9.8GB.
+/// the leaked `Box<LlamaModel>` via `Box::from_raw` + drops it → frees ~5.8GB.
 /// After this, `shared_model()` returns `None` until `reload_shared_model`
 /// re-leaks.
 ///
@@ -866,7 +866,7 @@ pub fn unload_shared_model() -> bool {
     };
     let ptr = g.take();
     drop(g); // release the write lock BEFORE the drop (the drop itself is fine,
-             // but holding the lock through a ~9.8GB free is unnecessary).
+             // but holding the lock through a ~5.8GB free is unnecessary).
     if let Some(wrapped) = ptr {
         // Unwrap the newtype; SAFETY as below.
         let nn = wrapped.0;
@@ -905,7 +905,7 @@ pub fn reload_shared_model(path: &std::path::Path, n_gpu_layers: u32) -> anyhow:
     let mut g = SHARED_MODEL.write().map_err(|e| anyhow::anyhow!("SHARED_MODEL lock poisoned: {e}"))?;
     // Expect-empty overwrite: a still-resident prior model must be RECLAIMED,
     // not silently replaced — the old behavior orphaned the prior leaked Box
-    // (~9.8GB leak until process exit) if two reload paths ever raced. The
+    // (~5.8GB leak until process exit) if two reload paths ever raced. The
     // SD cycle is serialized under the local-model turn lock so this branch
     // is a should-never-happen backstop; reclaiming with a loud log is the
     // lesser evil vs leaking (mirrors unload_shared_model's SAFETY).

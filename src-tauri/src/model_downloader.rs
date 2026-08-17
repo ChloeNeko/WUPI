@@ -1,6 +1,6 @@
 //! First-run GGUF downloader: pulls `WUPI.gguf` + `Embed.gguf` from a private
 //! Hugging Face repo on first launch so the installer can ship without the
-//! ~9.8 GB of models baked in.
+//! ~5.8 GB of models baked in.
 //!
 //! ## Why this exists
 //! GitHub caps single files at 100 MB (and soft-caps repos at ~1 GB), so the
@@ -109,7 +109,7 @@ pub const REQUIRED_FILES: &[&str] = &["WUPI.gguf", "Embed.gguf"];
 /// size.
 
 /// Throttle window for `download-progress` event emission. Emitting on every
-/// TLS-sized chunk of a 9.8 GB file = ~1M events over a long download; that
+/// TLS-sized chunk of a 5.8 GB file = ~0.5M events over a long download; that
 /// floods the IPC channel and starves the UI thread. Emit at most every 500ms
 /// instead — the polled `get_download_progress` (a direct IPC read) is the
 /// authoritative UI source between emits.
@@ -123,7 +123,7 @@ const EMIT_INTERVAL_MS: u64 = 500;
 /// `current_file_offset` + `current_file_total` describe the file actively
 /// streaming; `overall_downloaded` + `overall_total` span both files so the
 /// UI can render one progress bar for the whole job (the meaningful number
-/// for a 9.8 GB + 36 MB download).
+/// for a 5.8 GB + 36 MB download).
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct DownloadProgress {
     /// Which phase the downloader is in.
@@ -434,7 +434,7 @@ pub async fn download_all(
 
         // Retry-with-resume loop. Each attempt re-hits `/resolve/` for a fresh
         // signed CDN URL and resumes from the `.part` file's current length,
-        // so a transient blip a few minutes into a ~10 GB pull doesn't throw
+        // so a transient blip a few minutes into a ~6 GB pull doesn't throw
         // away the bytes already on disk. download_one is already
         // resume-correct (its resume_offset = existing .part size, append mode),
         // so a retry is literally a second `download_one` call for the same

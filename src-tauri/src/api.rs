@@ -63,14 +63,14 @@ pub struct ApiProfile {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ModelSource {
-    /// Local `WUPI.gguf` (12B): the default, and ALWAYS resident. Even when
+    /// Local `WUPI.gguf` (Gemma 4 E4B): the default, and ALWAYS resident. Even when
     /// the API is connected it stays loaded as the silent schema/memory
     /// tracking agent + the seamless per-turn fallback (see `chat_send` /
     /// `game_send` in lib.rs: on any API error the turn transparently drops
     /// to local — no error surfaced, no rollback unless local also fails).
     Local,
     /// An API endpoint is the PRIMARY chat source (wider message window:
-    /// 12 chat / 16 game vs local's 6 / 8). The local 12B is NOT torn down
+    /// 12 chat / 16 game vs local's 6 / 8). The local model is NOT torn down
     /// on connect — it stays resident as the silent agent + fallback.
     /// `api_connect`/`api_disconnect` are pure bookkeeping (flip this flag +
     /// persist); no model reload either way. Disconnecting returns local to

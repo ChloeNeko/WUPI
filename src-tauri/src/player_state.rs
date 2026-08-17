@@ -780,26 +780,108 @@ impl AttackerTier {
 pub(crate) const BASE_LETHAL_DC: i32 = 18;
 
 
-/// Combat / exertion keywords that trigger a Referee roll. Matched as
-/// whole-word, case-insensitive substrings of the player's turn text.
-/// Conservative: short, action-verb list. False-negative cost (missed roll)
-/// is one less injury; false-positive cost (rolled on "I walk to the bar")
-/// is a spurious wound. Walking/chatting/looking never triggers.
-const COMBAT_KEYWORDS: &[&str] = &[
+/// Combat / exertion keywords that trigger a Referee roll. TWO-TIER split
+/// (2026-08-17 E4B shakedown P1e): the playtest showed single soft words
+/// ("hunting", "raids", "arrests" — verbs ABOUT others, asked in gossip)
+/// flipping stew-and-chat turns into Combat mode with real injury rolls.
+/// Matched through `keyword_present` (BOTH-side word boundaries,
+/// case-insensitive) over dialogue-STRIPPED text (see `strip_dialogue`).
+///
+/// - **HARD** (below): direct first-person violence/action verbs — ONE fires
+///   alone. This is the full pre-P1e combat list (attack + swing + strike +
+///   …) PLUS the plan's additions (shove, duck, lunge families).
+/// - **SOFT** ([`COMBAT_SOFT_KEYWORDS`]): violence-adjacent but commonly
+///   figurative or about-others (hunt / raid / arrest / fight / chase) —
+///   they corroborate: ≥2 DISTINCT soft keywords, or any hard keyword.
+///   DEVIATION FROM THE PLAN (flagged for Chloe): the plan soft-listed
+///   "attack" too, but "I attack the goblin" / "The goblin is attacking me"
+///   are pinned combat controls (this file's sync test + scene_pacing's
+///   suite) and the game's core loop — a soft-single "attack" would break
+///   both. The evidence's false positives (arrests / hunting / raided) are
+///   fully covered by the other five families.
+///   both. Keep this file's TEST_COMBAT_KEYWORDS copy in lockstep (the sync
+///   test pins the hard list fires BOTH consumers through the shared gate).
+const COMBAT_HARD_KEYWORDS: &[&str] = &[
+    // base verbs
     "attack", "swing", "strike", "slash", "stab", "punch", "kick", "block", "dodge",
     "parry", "shoot", "fire", "cast", "throw", "tackle", "grapple", "charge",
     "run", "sprint", "climb", "jump", "leap", "swim",
+    // (P1e) the plan's first-person violence additions
+    "shove", "shoves", "shoved", "shoving",
+    "duck", "ducks", "ducked", "ducking",
+    "lunge", "lunges", "lunged", "lunging",
+    // inflected forms (P2b)
+    "attacks", "attacked", "attacking",
+    "swings", "swung", "swinging",
+    "strikes", "struck", "striking",
+    "slashes", "slashed", "slashing",
+    "stabs", "stabbed", "stabbing",
+    "punches", "punched", "punching",
+    "kicks", "kicked", "kicking",
+    "blocks", "blocked", "blocking",
+    "dodges", "dodged", "dodging",
+    "parries", "parried", "parrying",
+    "shoots", "shot", "shooting",
+    "fires", "fired", "firing",
+    "casts", "casting",
+    "throws", "threw", "thrown", "throwing",
+    "tackles", "tackled", "tackling",
+    "grapples", "grappled", "grappling",
+    "charges", "charged", "charging",
+    "runs", "running", "ran",
+    "sprints", "sprinted", "sprinting",
+    "climbs", "climbed", "climbing",
+    "jumps", "jumped", "jumping",
+    "leaps", "leapt", "leaping", "leaped",
+    "swims", "swam", "swimming",
 ];
+
+/// (P1e) Soft combat triggers: violence-adjacent verbs that commonly appear
+/// in ABOUT-OTHERS / reported / gossip phrasing ("Is Harsk still hunting…",
+/// "Have there been any arrests?", "the watch raided the docks"). A single
+/// soft word fires NOTHING; two DISTINCT soft words (or any hard word) fire.
+const COMBAT_SOFT_KEYWORDS: &[&str] = &[
+    "hunt", "hunts", "hunted", "hunting",
+    "raid", "raids", "raided", "raiding",
+    "arrest", "arrests", "arrested", "arresting",
+    "fight", "fights", "fought", "fighting",
+    "chase", "chases", "chased", "chasing",
+];
+
+/// (P1e) The two-tier combat gate: any hard keyword alone, or ≥2 DISTINCT
+/// soft keywords. Shared verbatim by the combat Referee + scene-pacing's
+/// kinetic pillar so the two can never disagree.
+pub(crate) fn combat_triggered(lower_dialogue_stripped: &str) -> bool {
+    let hard = COMBAT_HARD_KEYWORDS
+        .iter()
+        .any(|kw| keyword_present(lower_dialogue_stripped, kw));
+    if hard {
+        return true;
+    }
+    COMBAT_SOFT_KEYWORDS
+        .iter()
+        .filter(|kw| keyword_present(lower_dialogue_stripped, kw))
+        .count()
+        >= 2
+}
 
 /// (2026-08-15 recovery seam) Rest keywords that trigger the recovery
 /// Referee. Same whole-word, case-insensitive matcher as COMBAT_KEYWORDS.
-/// Deliberately short + rest-specific: "rest", "sleep", "camp" — the verbs
-/// a player types when their character actually rests. "watch" (a common
+/// Deliberately rest-specific: "rest"/"sleep"/"camp" families — the verbs a
+/// player types when their character actually rests. "watch" (a common
 /// camp activity) is intentionally ABSENT: it is already a TENSE pillar
 /// keyword in scene_pacing, and a watchkeeping sentry is not resting.
+/// (2026-08-16 P2b) Inflections explicit (trailing boundary).
 const REST_KEYWORDS: &[&str] = &[
-    "rest", "rests", "sleep", "sleeps", "nap", "camp", "recuperate", "convalesce",
-    "bandage", "binds", "mend", "recovers",
+    "rest", "rests", "rested", "resting",
+    "sleep", "sleeps", "slept", "sleeping",
+    "nap", "naps", "napped", "napping",
+    "camp", "camps", "camped", "camping",
+    "recuperate", "recuperates", "recuperating",
+    "convalesce", "convalesces", "convalescing",
+    "bandage", "bandages", "bandaged", "bandaging",
+    "binds", "mend", "mends", "mending",
+    "recovers", "recover", "recovered", "recovering",
 ];
 
 /// (2026-08-15 recovery seam) The recovery Referee's verdict for one turn.
@@ -832,7 +914,9 @@ pub fn referee_evaluate_recovery(
     if !is_downtime {
         return None;
     }
-    let lower = text.to_lowercase();
+    // (P1e) Dialogue-stripped: a quoted "The rest when the heat dies down"
+    // (T22) must not heal real injuries across a negotiation.
+    let lower = strip_dialogue(text).to_lowercase();
     if !REST_KEYWORDS.iter().any(|kw| keyword_present(&lower, kw)) {
         return None;
     }
@@ -1063,34 +1147,86 @@ pub fn referee_evaluate(
 ///
 /// Pure fn — no I/O. The entity map is `&HashMap<String, String>` (the
 /// WorldSchema's `entities` field shape).
-/// Substring keyword match with a LEADING word boundary: the character
-/// before the hit (if any) must be non-alphanumeric. This kills MID-WORD
-/// compounds only ("I light the camp**fire**" does not match "fire");
-/// word-initial compounds still fire ("**fire**place", "**run**es" → "run",
-/// "a **block**ade") and standalone uses always match — there is
-/// deliberately NO trailing boundary, so "attacks"/"swings" still match
-/// "attack"/"swing". A trailing boundary would also kill those legit
-/// inflections; killing word-initial compounds needs a morphology list,
-/// which is out of scope for a dice trigger.
-/// `pub(crate)`: also the matcher for `scene_pacing::score_pillar` (#35 —
-/// the pacing scorer used raw `contains`, so "campfire" classified Combat
-/// via "fire" while this referee correctly stayed silent).
+/// (2026-08-16 P2b) BOTH-side word-boundary keyword matcher: the keyword
+/// must start at a word edge (the char before it is non-alphanumeric or
+/// start-of-string) AND end at one (the char after is non-alphanumeric or
+/// end-of-string). The old matcher checked only the leading edge, so it did
+/// unpaid inflection duty — "attacks"/"swings" rode "attack"/"swing", but
+/// "runner" also matched "run", "firelight" matched "fire", and a player in
+/// a "restaurant" triggered the recovery Referee's "rest". With both
+/// boundaries enforced, inflections must be explicit entries in the keyword
+/// lists (every list was extended in the same change); compounds
+/// ("campfire", "firelight") can never match their embedded keywords.
+///
+/// Case-insensitive by contract: callers pass `text.to_lowercase()` and
+/// ASCII keywords. `pub(crate)`: also the matcher for `scene_pacing::score_
+/// pillar` + `calm_signal` (#35) and `has_suspicious_action` — every
+/// keyword referee in the codebase shares this one fn.
 pub(crate) fn keyword_present(lower: &str, kw: &str) -> bool {
     let mut from = 0;
     while let Some(pos) = lower[from..].find(kw) {
         let at = from + pos;
-        // ASCII keywords can only match at char boundaries, so `at` is one.
+        let end = at + kw.len();
+        // ASCII keywords can only match at char boundaries, so `at`/`end`
+        // are boundaries.
         let leading_ok = lower[..at]
             .chars()
             .next_back()
             .map(|c| !c.is_alphanumeric())
             .unwrap_or(true);
-        if leading_ok {
+        let trailing_ok = lower[end..]
+            .chars()
+            .next()
+            .map(|c| !c.is_alphanumeric())
+            .unwrap_or(true);
+        if leading_ok && trailing_ok {
             return true;
         }
         from = at + kw.len().max(1);
     }
     false
+}
+
+/// (2026-08-17 E4B shakedown P1e) Strip double-quoted dialogue spans from
+/// the player's action text before ANY keyword matching — dialogue is SPEECH,
+/// not action. The playtest false-positives all matched inside quoted lines:
+/// T22's recovery Referee healed 3 injury grades across a tavern negotiation
+/// because Mara's quoted "The rest when the heat dies down" contained the
+/// rest keyword, and T46/T47's gossip questions ("Is Harsk still hunting…")
+/// flipped Combat mode. Straight `"` AND typographic `“”` quotes delimit a
+/// span; each span collapses to a single space (word separation). An
+/// UNTERMINATED quote swallows the rest of the text — the conservative
+/// direction (speech tail can't trigger referees). Every keyword referee
+/// (combat / recovery / skill checks / suspicious-action) + scene-pacing
+/// score on the STRIPPED text.
+pub(crate) fn strip_dialogue(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut in_quote = false;
+    let mut quote_char: Option<char> = None;
+    for c in text.chars() {
+        match c {
+            '"' | '“' | '”' => {
+                if in_quote && quote_char == Some(c) || (in_quote && c == '”') {
+                    // Closing quote: end the span with one space.
+                    in_quote = false;
+                    quote_char = None;
+                    out.push(' ');
+                } else if !in_quote {
+                    in_quote = true;
+                    quote_char = Some(c);
+                } else {
+                    // A different quote flavor inside a span: literal speech
+                    // punctuation, drop it (it's still dialogue).
+                }
+            }
+            _ => {
+                if !in_quote {
+                    out.push(c);
+                }
+            }
+        }
+    }
+    out
 }
 
 pub fn select_attacker_tier_from_entities(
@@ -1180,8 +1316,11 @@ pub fn referee_evaluate_with_tier(
     debuff_tag_count: usize,
     pacing_dc_mod: i32,
 ) -> Option<RefereeOutcome> {
-    let lower = text.to_lowercase();
-    let triggered = COMBAT_KEYWORDS.iter().any(|kw| keyword_present(&lower, kw));
+    // (P1e) Dialogue-stripped + two-tier combat gate: quoted speech never
+    // triggers, and soft about-others verbs corroborate instead of firing
+    // alone.
+    let lower = strip_dialogue(text).to_lowercase();
+    let triggered = combat_triggered(&lower);
     if !triggered {
         return None;
     }
@@ -1396,13 +1535,13 @@ struct SkillSpec {
     /// success; false-positive cost (rolled on "I tell the truth about
     /// persuasion") is a spurious check. Mirror COMBAT_KEYWORDS' bar.
     keywords: &'static [&'static str],
-    /// (2026-08-16 audit LOW) Keywords that must match as a COMPLETE word
-    /// (boundaries on both sides). `keyword_present` deliberately skips the
-    /// trailing boundary so "attacks" inflects "attack" — but "lie" then
-    /// fires on "liege" +, worse, the everyday "lie down" (a rest action,
-    /// not deception — it ALSO misroutes the recovery seam's classification
-    /// energy into a deceive roll). Only set where inflection tolerance
-    /// causes real damage; everything else keeps the lenient default.
+    /// (2026-08-16 audit LOW; folded into P2b) Keywords that were promoted
+    /// to whole-word matching because their lenient form false-positived on
+    /// everyday prose ("lie" fired on "liege" + "lie down"). Since the
+    /// trailing-boundary fix, EVERY keyword matches whole-word — this field
+    /// survives as documentation of WHICH entries earned the distinction;
+    /// its matcher (`keyword_whole_word`) is now a delegate of
+    /// `keyword_present`.
     whole_word: &'static [&'static str],
     /// Base DC before the ScenePacing modifier (Combat +2, Exploration +0,
     /// Downtime −2). Tuned for d20 (1..=20): 12 = coin-flip for an untrained
@@ -1425,7 +1564,11 @@ struct SkillSpec {
 const SKILL_TABLE: &[SkillSpec] = &[
     SkillSpec {
         name: "lockpick",
-        keywords: &["pick the lock", "pick lock", "lockpick", "pick a lock", "pickpocket"],
+        keywords: &[
+            "pick the lock", "pick lock", "pick a lock", "picks the lock", "picked the lock",
+            "picking the lock", "lockpick", "lockpicks", "lockpicked", "lockpicking",
+            "pickpocket", "pickpockets", "pickpocketed", "pickpocketing",
+        ],
         whole_word: &[],
         base_dc: 12,
         success_seed: "the lock clicks open",
@@ -1433,7 +1576,14 @@ const SKILL_TABLE: &[SkillSpec] = &[
     },
     SkillSpec {
         name: "sneak",
-        keywords: &["sneak", "sneak past", "stealth", "hide", "slip past", "creep"],
+        keywords: &[
+            "sneak", "sneaks", "sneaked", "snuck", "sneaking",
+            "sneak past", "sneaking past",
+            "stealth", "stealthy", "stealthily",
+            "hide", "hides", "hid", "hidden", "hiding",
+            "slip past", "slipping past",
+            "creep", "creeps", "crept", "creeping",
+        ],
         whole_word: &[],
         base_dc: 12,
         success_seed: "you move unseen",
@@ -1441,7 +1591,12 @@ const SKILL_TABLE: &[SkillSpec] = &[
     },
     SkillSpec {
         name: "persuade",
-        keywords: &["persuade", "convince", "talk into", "talk him into", "talk her into"],
+        keywords: &[
+            "persuade", "persuades", "persuaded", "persuading", "persuasion",
+            "convince", "convinces", "convinced", "convincing",
+            "talk into", "talks into", "talked into", "talking into",
+            "talk him into", "talk her into", "talking them into",
+        ],
         whole_word: &[],
         base_dc: 14,
         success_seed: "your words land",
@@ -1449,7 +1604,16 @@ const SKILL_TABLE: &[SkillSpec] = &[
     },
     SkillSpec {
         name: "deceive",
-        keywords: &["bluff", "deceive", "fast-talk", "fast talk", "con "],
+        keywords: &[
+            "bluff", "bluffs", "bluffed", "bluffing",
+            "deceive", "deceives", "deceived", "deceiving", "deception",
+            "fast-talk", "fast talk", "fast-talking", "fast talking",
+            // "con" as a complete word ("I con the guard"); the old
+            // trailing-space form "con " breaks under the boundary matcher
+            // (the char after the space is a letter). Compounds like
+            // "convince"/"connection" can't match — the boundary blocks.
+            "con",
+        ],
         // "lie" moved here: "lie down" (rest) + "liege" (a noun) used to roll
         // a deceive check — a complete-word match only fires on the verb.
         whole_word: &["lie"],
@@ -1459,7 +1623,12 @@ const SKILL_TABLE: &[SkillSpec] = &[
     },
     SkillSpec {
         name: "intimidate",
-        keywords: &["intimidate", "threaten", "scare", "menace"],
+        keywords: &[
+            "intimidate", "intimidates", "intimidated", "intimidating", "intimidation",
+            "threaten", "threatens", "threatened", "threatening", "threats",
+            "scare", "scares", "scared", "scaring",
+            "menace", "menaces", "menacing",
+        ],
         whole_word: &[],
         base_dc: 13,
         success_seed: "they flinch",
@@ -1467,30 +1636,14 @@ const SKILL_TABLE: &[SkillSpec] = &[
     },
 ];
 
-/// Whole-word variant of [`keyword_present`]: the keyword must sit at word
-/// boundaries on BOTH sides (used only for keywords whose lenient match
-/// false-positives on everyday prose — see `SkillSpec::whole_word`).
+/// Whole-word variant of [`keyword_present`]. (2026-08-16 P2b) now a pure
+/// delegate: `keyword_present` enforces BOTH boundaries since the trailing-
+/// boundary fix, so the two matchers are one semantics. Retained as the
+/// named call site for `SkillSpec::whole_word` — the field documents WHICH
+/// keywords were promoted for false-positive reasons ("lie" vs "liege"),
+/// even though the matcher no longer differs.
 pub(crate) fn keyword_whole_word(lower: &str, kw: &str) -> bool {
-    let mut from = 0;
-    while let Some(pos) = lower[from..].find(kw) {
-        let at = from + pos;
-        let end = at + kw.len();
-        let leading_ok = lower[..at]
-            .chars()
-            .next_back()
-            .map(|c| !c.is_alphanumeric())
-            .unwrap_or(true);
-        let trailing_ok = lower[end..]
-            .chars()
-            .next()
-            .map(|c| !c.is_alphanumeric())
-            .unwrap_or(true);
-        if leading_ok && trailing_ok {
-            return true;
-        }
-        from = at + kw.len().max(1);
-    }
-    false
+    keyword_present(lower, kw)
 }
 
 /// Roll a single d20 (1..=20) using the provided Roller. Exposed so tests can
@@ -1523,7 +1676,8 @@ pub(crate) fn roll_d20(roller: &mut Roller) -> u32 {
 /// different rolls (the skill_index offset + the text hash compound). Same
 /// text + same pacing → same outcome (testable).
 pub fn referee_evaluate_skill_checks(text: &str, pacing_dc_mod: i32) -> Vec<SkillCheckOutcome> {
-    let lower = text.to_lowercase();
+    // (P1e) Dialogue-stripped matching: spoken words don't attempt checks.
+    let lower = strip_dialogue(text).to_lowercase();
     let text_hash = hash_text(text);
     let mut out = Vec::new();
     for (idx, spec) in SKILL_TABLE.iter().enumerate() {
@@ -1623,26 +1777,52 @@ const DECEPTION_BASE_DC: u32 = 14;
 ///     suspicious)
 ///   - protocol mistakes: wrong name, forget, confuse, salute wrong, etc.
 ///
-/// Whole-word, case-insensitive substring match (same pattern as
-/// COMBAT_KEYWORDS + SKILL_TABLE keywords). Kept conservative: only flags
-/// behavior a guard would actually notice.
+/// Matched via `keyword_present` (BOTH-side word boundaries). Kept
+/// conservative: only flags behavior a guard would actually notice.
+/// (2026-08-16 P2b) Inflections explicit — the old prefix stubs ("hesitat")
+/// and free suffix rides died with the trailing boundary.
 const SUSPICIOUS_ACTIONS: &[&str] = &[
     // nervous tells — visible distress
-    "sweat", "sweaty", "nervous", "tense", "tremble", "trembling",
-    "stutter", "stuttering", "stammer", "stammering", "hesitate", "hesitat",
-    "flinch", "flinching", "mumble", "mutter", "fidget", "fumble",
-    "falter", "stiffen", "rigid",
+    "sweat", "sweats", "sweating", "sweaty", "nervous", "nervously",
+    "tense", "tensed", "tensely",
+    "tremble", "trembles", "trembled", "trembling",
+    "stutter", "stutters", "stuttered", "stuttering",
+    "stammer", "stammers", "stammered", "stammering",
+    "hesitate", "hesitates", "hesitated", "hesitating",
+    "flinch", "flinches", "flinched", "flinching",
+    "mumble", "mumbles", "mumbled", "mumbling",
+    "mutter", "mutters", "muttered", "muttering",
+    "fidget", "fidgets", "fidgeting",
+    "fumble", "fumbles", "fumbled", "fumbling",
+    "falter", "falters", "faltered", "faltering",
+    "stiffen", "stiffens", "stiffened", "stiffening",
+    "rigid", "rigidly",
     // eye behavior — the classic tell
-    "avoid eye contact", "look away", "avert eyes", "avert gaze",
-    "stare at the ground", "eyes dart", "glance around",
+    "avoid eye contact", "avoids eye contact", "avoiding eye contact",
+    "look away", "looks away", "looking away",
+    "avert eyes", "averts eyes", "averting eyes",
+    "avert gaze", "averts gaze", "averting gaze",
+    "stare at the ground", "stares at the ground", "staring at the ground",
+    "eyes dart", "eyes darting",
+    "glance around", "glances around", "glancing around",
     // furtive movement — trying not to be noticed IS suspicious in uniform
-    "sneak", "sneaking", "creep", "creeping", "lurk", "lurking",
-    "slink", "tiptoe", "slip past", "edge away", "skulk",
+    "sneak", "sneaks", "snuck", "sneaking",
+    "creep", "creeps", "crept", "creeping",
+    "lurk", "lurks", "lurking",
+    "slink", "slinks", "slinking",
+    "tiptoe", "tiptoes", "tiptoeing",
+    "slip past", "slipping past",
+    "edge away", "edges away", "edging away",
+    "skulk", "skulks", "skulking",
     // protocol mistakes — the disguise breaks down
-    "wrong name", "forget", "forgot", "confuse", "confused",
-    "salute wrong", "wrong salute", "don't know", "do not know",
-    "blunder", "stumble over", "misspell", "wrong badge", "no badge",
-    "wrong uniform", "wrong color", "wrong rank",
+    "wrong name", "forget", "forgets", "forgot", "forgetting",
+    "confuse", "confuses", "confused", "confusing",
+    "salute wrong", "wrong salute",
+    "don't know", "do not know",
+    "blunder", "blunders", "blundering",
+    "stumble over", "stumbles over", "stumbling over",
+    "misspell", "misspells", "misspelled", "misspelling",
+    "wrong badge", "no badge", "wrong uniform", "wrong color", "wrong rank",
 ];
 
 /// Find the active disguise tag, if any. Returns the first tag with
@@ -1655,9 +1835,9 @@ pub fn find_disguise_tag(tags: &[crate::consequence::StatusTag]) -> Option<&crat
 
 /// True if the player's turn text contains any suspicious-action keyword.
 /// Pure keyword scan; case-insensitive. Used by the gate to decide whether
-/// to revoke the auto-pass.
+/// to revoke the auto-pass. (P1e) Scored on dialogue-stripped text.
 pub fn has_suspicious_action(text: &str) -> bool {
-    let lower = text.to_lowercase();
+    let lower = strip_dialogue(text).to_lowercase();
     SUSPICIOUS_ACTIONS.iter().any(|kw| keyword_present(&lower, kw))
 }
 
@@ -2072,8 +2252,8 @@ mod tests {
     #[test]
     fn referee_combat_keyword_returns_some() {
         let s = fresh_state();
-        // Every keyword should fire.
-        for kw in COMBAT_KEYWORDS {
+        // Every HARD keyword should fire alone (the two-tier gate).
+        for kw in COMBAT_HARD_KEYWORDS {
             let text = format!("I {} at the goblin", kw);
             assert!(
                 referee_evaluate(&text, &s).is_some(),
@@ -2081,6 +2261,17 @@ mod tests {
                 kw,
             );
         }
+        // Soft keywords corroborate: one alone fires nothing, two distinct do.
+        assert_eq!(
+            referee_evaluate("Is Harsk still hunting for the stranger?", &s),
+            None,
+            "a single soft keyword must not roll injuries (T46)"
+        );
+        assert!(
+            referee_evaluate("They are hunting the stranger and chasing him down the lane.", &s)
+                .is_some(),
+            "two distinct soft keywords corroborate into a roll"
+        );
     }
 
     #[test]
@@ -2088,6 +2279,169 @@ mod tests {
         let s = fresh_state();
         assert!(referee_evaluate("I ATTACK the dragon", &s).is_some());
         assert!(referee_evaluate("I Swing my sword", &s).is_some());
+    }
+
+    /// (2026-08-16 P2b) The trailing word boundary, pinned in both
+    /// directions: compounds + agent-nouns can never fire their embedded
+    /// keyword, while explicitly-listed inflections still do.
+    #[test]
+    fn keyword_present_enforces_trailing_boundary() {
+        // Compounds and derived words must NOT match the embedded keyword.
+        assert!(!keyword_present("a runner arrives with a message", "run"),
+            "'runner' must not match 'run'");
+        assert!(!keyword_present("the firelight flickers", "fire"),
+            "'firelight' must not match 'fire'");
+        assert!(!keyword_present("we sit by the campfire and eat", "camp"),
+            "'campfire' must not match 'camp'");
+        assert!(!keyword_present("we sit by the campfire and eat", "fire"),
+            "'campfire' must not match 'fire' either side");
+        assert!(!keyword_present("I dine at the restaurant", "rest"),
+            "'restaurant' must not match 'rest'");
+        assert!(!keyword_present("the blockage holds", "block"),
+            "'blockage' must not match 'block'");
+        // Explicit inflection entries still match (whole words).
+        assert!(keyword_present("I am running late", "running"));
+        assert!(keyword_present("the goblin is attacking", "attacking"));
+        assert!(keyword_present("I was attacked from behind", "attacked"));
+        assert!(keyword_present("we swam the river", "swam"));
+        // Base forms still match standalone.
+        assert!(keyword_present("I attack", "attack"));
+        assert!(keyword_present("run!", "run"));
+        // Punctuation + end-of-string are valid trailing edges.
+        assert!(keyword_present("I run, then rest.", "run"));
+        assert!(keyword_present("I run, then rest.", "rest"));
+        // Case-insensitivity is the CALLER's contract (text arrives
+        // lowercased) — the matcher itself is byte-exact.
+        assert!(keyword_present("running", "running"));
+        assert!(!keyword_present("RUNNING", "running"));
+    }
+
+    /// (2026-08-16 P2b) The headline regression: a narrator beat describing
+    /// "a runner" used to drain one stamina tier per turn via the combat
+    /// Referee's "run" keyword riding inside the compound. Both the referee
+    /// AND the scene-pacing classifier must stay silent on it, while real
+    /// exertion still fires both.
+    #[test]
+    fn runner_does_not_drain_but_running_does() {
+        let s = fresh_state();
+        assert_eq!(
+            referee_evaluate("A runner arrives at the gate with a message.", &s),
+            None,
+            "'runner' must not fire the combat Referee"
+        );
+        assert_ne!(
+            crate::scene_pacing::evaluate("A runner arrives at the gate with a message.").mode,
+            crate::schema::SceneMode::Combat,
+            "'runner' must not classify Combat"
+        );
+        assert!(referee_evaluate("I am running from the guards.", &s).is_some(),
+            "'running' (explicit entry) must fire the combat Referee");
+        assert_eq!(
+            crate::scene_pacing::evaluate("I am running from the guards.").mode,
+            crate::schema::SceneMode::Combat,
+            "'running' must classify Combat"
+        );
+    }
+
+    /// (2026-08-16 P2b) The recovery Referee's rest keywords under the
+    /// boundary matcher: explicit inflections fire, compounds don't.
+    #[test]
+    fn rest_inflections_fire_recovery_but_restaurant_does_not() {
+        // The keyword GATE is what matters: a rest-inflected text must clear
+        // it as a whole-word match, not via substring luck.
+        for text in [
+            "I rest for the night.",
+            "We rested until dawn.",
+            "I am resting by the hearth.",
+            "We camp for the night.",
+            "I slept soundly.",
+        ] {
+            let lower = text.to_lowercase();
+            assert!(
+                REST_KEYWORDS.iter().any(|kw| keyword_present(&lower, kw)),
+                "{text:?} must match a REST_KEYWORD"
+            );
+        }
+        let lower = "I dine at the restaurant".to_lowercase();
+        assert!(
+            !REST_KEYWORDS.iter().any(|kw| keyword_present(&lower, kw)),
+            "'restaurant' must not match any REST_KEYWORD"
+        );
+        // With something to recover, an inflected rest text under Downtime
+        // produces an outcome; the restaurant text does not.
+        let mut tired = fresh_state();
+        tired.stamina = Stamina::Winded;
+        assert!(
+            referee_evaluate_recovery("I am resting by the hearth.", &tired, true).is_some(),
+            "resting must recover a winded player"
+        );
+        assert!(
+            referee_evaluate_recovery("I dine at the restaurant.", &tired, true).is_none(),
+            "'restaurant' must not trigger recovery"
+        );
+    }
+
+    /// (P1e, 2026-08-17 E4B shakedown) The T22 regression: a QUOTED rest
+    /// phrase inside a tavern negotiation healed 3 injury grades across
+    /// three turns. Dialogue is speech, not action — the recovery gate
+    /// scores on dialogue-stripped text.
+    #[test]
+    fn quoted_rest_phrase_never_triggers_recovery() {
+        let mut tired = fresh_state();
+        tired.stamina = Stamina::Winded;
+        // The verbatim quoted line from the playtest, embedded in the
+        // player's turn.
+        assert!(
+            referee_evaluate_recovery(
+                "I haggle over the pouch. Mara smiles. \"The rest when the heat dies down,\" she says. I slide another coin across the wood.",
+                &tired,
+                true,
+            )
+            .is_none(),
+            "a quoted 'rest' must not heal anyone (T22)"
+        );
+        // The same rest spoken by the PLAYER (their own declared action,
+        // also quoted) is still speech, not a camp.
+        assert!(
+            referee_evaluate_recovery("\"I'll rest once this is settled,\" I tell her.", &tired, true)
+                .is_none(),
+            "spoken intent to rest is not resting"
+        );
+        // An unquoted actual rest still recovers.
+        assert!(
+            referee_evaluate_recovery("I rest for the night by the hearth.", &tired, true).is_some(),
+            "positive control: an actual rest recovers"
+        );
+    }
+
+    /// (P1e) The T46/T47 regression on the REFEREE side: gossip about
+    /// arrests/hunts/raids rolled real injuries. Single soft verbs never
+    /// fire; quoted questions never fire.
+    #[test]
+    fn gossip_about_violence_never_rolls_injuries() {
+        let s = fresh_state();
+        assert_eq!(
+            referee_evaluate(
+                "I eat slowly and keep my voice low. \"Have there been any arrests since the docks? Is Harsk still hunting for the one who cut the moorings?\"",
+                &s
+            ),
+            None,
+            "quoted gossip questions must not roll injuries (T46)"
+        );
+        assert_eq!(
+            referee_evaluate("They say the watch raided the eel-shed last night.", &s),
+            None,
+            "a reported raid is news, not a blow (T47)"
+        );
+        // Positive controls: direct violence fires.
+        assert!(
+            referee_evaluate("I stab the thug who grabs my arm.", &s).is_some(),
+            "positive control: direct violence rolls"
+        );
+        assert!(
+            referee_evaluate("I shove him back and lunge for the door.", &s).is_some(),
+            "positive control: the new hard verbs fire alone"
+        );
     }
 
     #[test]
@@ -2472,27 +2826,53 @@ mod tests {
 
     // --- Phase 3: combat-keyword / scene-pacing sync ---
 
-    /// The combat-keyword list in `player_state::COMBAT_KEYWORDS` and the
-    /// kinetic-combat list in `scene_pacing::KINETIC_COMBAT` MUST stay in
-    /// sync — they're independently declared (the lists are private to their
-    /// modules). If they drift, the combat Referee could fire on a turn the
+    /// The combat-keyword gate `player_state::combat_triggered`
+    /// (`COMBAT_HARD_KEYWORDS` / `COMBAT_SOFT_KEYWORDS`) and scene-pacing's
+    /// kinetic pillar now share ONE implementation — the scene_pacing
+    /// `KINETIC_COMBAT` mirror list was deleted in the 2026-08-17 P1e
+    /// two-tier split, so the two can no longer drift apart. If they ever
+    /// disagree again, the combat Referee could fire on a turn the
     /// scene-pacing classifies as non-Combat (or vice versa), which would
     /// break the anti-sycophancy contract (Referee injury with no combat
     /// pacing directive, or combat pacing with no injury).
     ///
-    /// This test re-declares the canonical combat list here and asserts
+    /// This test re-declares the canonical HARD combat list here and asserts
     /// (a) every keyword fires `referee_evaluate` AND (b) every keyword
-    /// triggers `SceneMode::Combat` via `scene_pacing::evaluate`. The
-    /// re-declaration is the load-bearing check: it's the same literal list,
-    /// and any drift between the three copies (player_state, scene_pacing,
-    /// this test) will surface as a test failure. The list itself is the
-    /// canonical one from `player_state::COMBAT_KEYWORDS` (the comment above
-    /// that const says "swap for a real RNG later" — same list, kept here
-    /// verbatim).
+    /// triggers `SceneMode::Combat` via `scene_pacing::evaluate` — the
+    /// re-declaration is the load-bearing check that the shared gate is
+    /// wired into BOTH consumers.
     const TEST_COMBAT_KEYWORDS: &[&str] = &[
         "attack", "swing", "strike", "slash", "stab", "punch", "kick", "block", "dodge",
         "parry", "shoot", "fire", "cast", "throw", "tackle", "grapple", "charge",
         "run", "sprint", "climb", "jump", "leap", "swim",
+        // (P1e) first-person violence additions
+        "shove", "duck", "lunge",
+        // inflected forms (2026-08-16 P2b) — the trailing boundary requires
+        // these as explicit entries; the sync test pins that they ALL fire.
+        "attacks", "attacked", "attacking",
+        "swings", "swung", "swinging",
+        "strikes", "struck", "striking",
+        "slashes", "slashed", "slashing",
+        "stabs", "stabbed", "stabbing",
+        "punches", "punched", "punching",
+        "kicks", "kicked", "kicking",
+        "blocks", "blocked", "blocking",
+        "dodges", "dodged", "dodging",
+        "parries", "parried", "parrying",
+        "shoots", "shot", "shooting",
+        "fires", "fired", "firing",
+        "casts", "casting",
+        "throws", "threw", "thrown", "throwing",
+        "tackles", "tackled", "tackling",
+        "grapples", "grappled", "grappling",
+        "charges", "charged", "charging",
+        "runs", "running", "ran",
+        "sprints", "sprinted", "sprinting",
+        "climbs", "climbed", "climbing",
+        "jumps", "jumped", "jumping",
+        "leaps", "leapt", "leaping", "leaped",
+        "swims", "swam", "swimming",
+        "shoves", "lunges", "ducks",
     ];
 
     #[test]

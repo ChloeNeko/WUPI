@@ -23,7 +23,7 @@
 // Single-instance: both exes share the identifier `com.wupi.desktop`, so they
 // are mutually exclusive (can't run wupi.exe + fable.exe at once). Launching
 // one while the other runs focuses the existing window — safe (prevents a
-// duplicate 12B VRAM load + SQLite write collisions).
+// duplicate E4B VRAM load + SQLite write collisions).
 //
 // In release builds, run on the Windows GUI subsystem so no console window is
 // allocated. In debug builds we keep the console (the default) so log output is

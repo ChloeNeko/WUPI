@@ -16,9 +16,11 @@
 //! embedder pattern (§3B). Under the v0.6.4 VRAM swap-lock (§2B), only ONE
 //! of {chat, schema, fable} is resident at a time; the embedder is exempt.
 //! **chat (4000) + embedder (512) + schema (2048) + game (3072)** share one
-//! leaked `&'static LlamaModel` + one `shared_backend()`. Weights (~9.8 GB)
-//! + embedder (~36 MB) + one resident context (~75-150 MB Q8_0 KV) ≈ ~10 GB
-//! → ~2 GB headroom on 12 GB (game context cut 4000 → 3072 on 2026-07-26).
+//! leaked `&'static LlamaModel` + one `shared_backend()`. Weights (~5.8 GB,
+//! Gemma 4 E4B Q6_K since 2026-08-17)
+//! + embedder (~36 MB) + one resident context (~50-100 MB Q8_0 KV) ≈ ~6.5 GB
+//! → ~5.5 GB headroom on 12 GB (the 12B's 4000→3072 cut of 2026-07-26 was a
+//! VRAM measure of the pre-E4B era).
 //!
 //! # Streaming, not one-shot
 //!
@@ -83,8 +85,9 @@ use crate::llm::{shared_backend, shared_model, CancelToken, ChunkFn};
 /// FABLE_MAX_TOKENS restored 512→1024 and the LOCAL window 6→8 (the
 /// shortcut amputations reversed).
 ///
-/// **2026-08-08 override: CTX_FABLE set to 3072.** The local 12B's Fable role
-/// is now TRACKING ONLY (bracket commands + schema state) — the API narrates
+/// **2026-08-08 override: CTX_FABLE set to 3072.** The local model's Fable
+/// role is now TRACKING ONLY (bracket commands + schema state) — the API
+/// narrates
 /// exclusively (§3A override). The tracker window is 2 messages (1 turn)
 /// — it relies on the schema delta + Rust state, not re-read
 /// history. 3072 fits the fixed overhead (AGENT ~386 + bracket protocol ~477 =
@@ -93,11 +96,14 @@ use crate::llm::{shared_backend, shared_model, CancelToken, ChunkFn};
 /// The prior 4096 was for the deleted local-narrator path; 2048 was too tight
 /// (the fixed overhead alone ate nearly half the budget).
 ///
-/// **VRAM cost:** the Q8_0 KV cache at n_ctx=3072 is ~510 MiB. Under the §2B
+/// **VRAM cost (2026-08-17 E4B figures):** the Q8_0 KV cache at n_ctx=3072
+/// is ~70 MiB (the E4B runs 2 KV-heads, a 512-token sliding window on 5 of
+/// every 6 layers, + 18 shared-KV layers — read the exact MiB off the boot
+/// telemetry). Under the §2B
 /// swap-lock + the 2026-08-08 local-model turn lock, only ONE of {chat, schema,
-/// fable} is resident + decoding at a time, so worst case is weights (~9.8 GB)
-/// + one KV (~75-510 MiB) + embed (34 MiB, always resident) + compute buffer
-/// (~530 MiB) ≈ 10.9 GB of 12 GB → ~1.1 GB headroom. Stable.
+/// fable} is resident + decoding at a time, so worst case is weights (~5.8 GB)
+/// + one KV (~50-100 MiB) + embed (34 MiB, always resident) + compute buffer
+/// (~530 MiB) ≈ ~6.5 GB of 12 GB → ~5.5 GB headroom. Stable.
 ///
 /// The front-truncation guard below protects against overflow on the rare
 /// turn where the prompt exceeds `FABLE_CTX - reserve` (reserve is mode-aware:
@@ -140,7 +146,7 @@ const TRACKER_MAX_TOKENS: i32 = 256;
 // ---------------------------------------------------------------------------
 //
 // The tracker's contract is BRACKETS ONLY — prose belongs to the Stage-2 API
-// narrator. When the local 12B has emitted its bracket set and then starts
+// narrator. When the local model has emitted its bracket set and then starts
 // generating narrative prose (the failure mode: "ghostlyly quiet...", 460-1024
 // tokens of rambling that never carries a bracket), the sniper detects the
 // bracket→prose transition and BREAKS the decode loop within ~100ms — before
@@ -616,7 +622,7 @@ impl FableEngine {
     /// Initialize the game runtime. Prefers the chat engine's already-loaded
     /// `&'static LlamaModel` via `shared_model()`: sharing weights is the
     /// ONLY way four contexts (chat 4000 + embedder 512 + schema 2048 +
-    /// game 4000) fit on a 12GB GPU. Loading a second 12B copy would OOM
+    /// game 4000) fit on a 12GB GPU. Loading a second model copy would OOM
     /// (the 2026-07-18 `NullResult` lesson). The `path` arg is kept for
     /// forward-compat (a future dedicated narrator model); it's only used
     /// if `shared_model()` returns `None`.
@@ -707,18 +713,18 @@ impl FableRuntime {
                 "game tokenized prompt is empty"
             )));
         }
-        // Truncate from the front if the prompt alone exceeds context (keep
-        // the system prompt's tail + recent turns + generation cue). Mirror
-        // of the schema engine's guard.
+        // Overflow guard: if the prompt alone exceeds context minus the
+        // generation reserve, tracker mode REFUSES the decode (hard error —
+        // see the in-block comment) and narrator mode (dev-only) front-
+        // truncates. The fix per the Prime Directive is always to SHRINK the
+        // prompt so this guard never fires; lib.rs's
+        // `build_tracker_prompt_bounded` is the first line of defense.
         //
-        // WARNING (2026-08-10, 3rd recurrence): a front-drain chops the SYSTEM
+        // HISTORY (2026-08-10, 3rd recurrence): a front-drain chops the SYSTEM
         // PROMPT (the AGENT directive + bracket protocol), which is the exact
         // bug that silently killed all bracket emission: the tracker ran but
         // never saw the bracket syntax → zero brackets every turn → frozen
-        // schema. The fix per the Prime Directive is to SHRINK the prompt so
-        // this guard never fires. If it DOES fire (dropped > 0), treat it as a
-        // P0 prompt-bloat regression — the bracket protocol is likely being
-        // chopped. The log line below surfaces it loudly for exactly that reason.
+        // schema. Any overflow (either mode) is a P0 prompt-bloat regression.
         //
         // Reserve is MODE-AWARE (2026-08-10 fix): the tracker needs only
         // TRACKER_MAX_TOKENS (256 — raised from 150 post-T52) of generation
@@ -732,15 +738,39 @@ impl FableRuntime {
         let reserve = if req.tracker_mode { TRACKER_MAX_TOKENS } else { FABLE_MAX_TOKENS };
         let max_prompt = (FABLE_CTX as usize).saturating_sub(reserve as usize);
         if tokens.len() > max_prompt {
+            // (2026-08-16, 4th recurrence KILLED) Tracker mode REFUSES to
+            // decode an over-budget prompt. The old front-drain chopped the
+            // SYSTEM PROMPT (AGENT directive + bracket protocol) — the exact
+            // mechanism that silently killed bracket emission three times
+            // (2026-08-09, 2026-08-10 T52, and the 2026-08-16 playtest where
+            // episodic `<retrieved_knowledge>` growth made the drain
+            // progressive: 5 → 687 tokens dropped over 16 turns). A refused
+            // pass fails loudly (the caller skips brackets + logs) and the
+            // narrator still runs on pre-tracker state — strictly better
+            // than a confident decode of a headless prompt. The lib.rs
+            // char-budget guard (`build_tracker_prompt_bounded`) should
+            // catch this first; reaching this arm means that guard was
+            // bypassed or the tokenizer defied the chars/token ratio.
+            if req.tracker_mode {
+                return Err(GenerationOutcome::GenerationErr(anyhow::anyhow!(
+                    "TRACKER PROMPT OVERFLOW: {} tokens > {} max — refusing to decode a \
+                     headless prompt (the bracket protocol must never be front-chopped). \
+                     Fix the prompt budget, not the context.",
+                    tokens.len(),
+                    max_prompt
+                )));
+            }
+            // Narrator mode (dev-only local-narrator path): keep the
+            // front-truncate safety valve — the narrator's 16-message window
+            // routinely exceeds its 2048-token slice in dev, and degraded
+            // prose is acceptable there (the shipped build is API-only).
             let drop = tokens.len() - max_prompt;
             tokens.drain(0..drop);
             tracing::warn!(
                 dropped = drop,
                 total = tokens.len(),
                 max = max_prompt,
-                "⚠ PROMPT OVERFLOW: game prompt exceeded context; front-truncated. \
-                 If the tracker emits no brackets, the system prompt (bracket protocol) \
-                 was likely chopped — shrink the prompt per the Prime Directive."
+                "⚠ PROMPT OVERFLOW: game prompt exceeded context; front-truncated (narrator/dev path)."
             );
         }
 
@@ -828,7 +858,7 @@ impl FableRuntime {
         // `stream_filter::truncate_repetition` firewall on finalized prose.
         // A prior attempt added `penalties(-1, 1.1, 0.0, 0.0)` as the first
         // chain stage; it was REVERTED the same day after live testing — on
-        // Gemma 12B, repetition_penalty 1.1 suppresses common tokens (`the`,
+        // Gemma 12B (pre-E4B), repetition_penalty 1.1 suppresses common tokens (`the`,
         // `is`, `player`) progressively, causing the model to loop on
         // whatever high-logit token remains (the `(player) is (player)`
         // regression). DRY replaced it because DRY structurally can't cause

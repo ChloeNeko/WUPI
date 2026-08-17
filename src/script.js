@@ -547,7 +547,8 @@ window.addEventListener('focus', () => {
 
 // "WUPI" title: live AI-status indicator
 // The title reflects the live state of the chat model. Wupi chat is LOCAL-ONLY
-// (2026-08-08 override): the local 12B is ALWAYS the chat model — the API is
+// (2026-08-08 override): the local model (Gemma 4 E4B) is ALWAYS the chat
+// model — the API is
 // reserved exclusively for Fable narration (a separate path). Three states:
 //   - 'idle'    : connected, not generating → steady medium white glow
 //   - 'offline' : boot pre-load or model error → fast red flash
@@ -615,7 +616,19 @@ function setTitleState(state) {
       // typing state is owned by the chat flag; don't clobber it here. Only
       // model-status transitions affect idle/offline.
       if (titleState === 'typing') return;
-      if (status === 'ready') setTitleState('idle');
+      if (status === 'ready') {
+        setTitleState('idle');
+        // (P2d, 2026-08-17 E4B shakedown) Retire the never-shown first-run
+        // download overlay completely once the model is confirmed loaded —
+        // it otherwise lingers in the DOM as display:flex; opacity:0;
+        // pointer-events:none forever (harmless, but it pollutes DOM scans
+        // + screenshots). An ACTIVE overlay (.show — models were missing,
+        // download in flight) is never touched; that path ends in a reload.
+        const dlOverlay = document.getElementById('download-overlay');
+        if (dlOverlay && !dlOverlay.classList.contains('show')) {
+          dlOverlay.style.display = 'none';
+        }
+      }
       else if (status === 'error' || status === 'no_model' || status === 'missing') setTitleState('offline');
     });
   } catch (err) {
@@ -1004,7 +1017,7 @@ function spawnLaunchSparkles(parent, count = 18) {
 // real fix for "aurora load-in looks laggy": it's not the aurora alone, it's
 // the aurora + top-bar blur running concurrently.
 //
-// Gate: chat `model-status: ready` (the 12B load — Rust's single source of
+// Gate: chat `model-status: ready` (the local-model load — Rust's single source of
 // truth, Rust is untouched) AND a minimum dwell timer. Both must resolve
 // before the flight begins (the entry + hops always run regardless — they're
 // the loading animation that hides the model load). The existing model-status
@@ -3046,9 +3059,10 @@ const dropdownMenu = document.getElementById('dropdownMenu');
 
   // AI: Connection Profile panel (LOCAL | ONLINE mode selector + profile CRUD)
   // Source of truth = api_config.json (loaded at boot into AppState). The
-  // panel shows two large mode boxes: LOCAL (the single WUPI 12B bubble) or
-  // ONLINE (saved endpoint profiles + an editor). Selecting ONLINE triggers
-  // the model swap (12B unloads, Agent.gguf spins up for schema/memory);
+  // panel shows two large mode boxes: LOCAL (the single WUPI E4B bubble) or
+  // ONLINE (saved endpoint profiles + an editor). Selecting ONLINE is pure
+  // bookkeeping (v0.6.3 local-always: the local model stays resident as the
+  // silent agent + fallback — nothing unloads);
   // selecting LOCAL reverts it. Temperature is fixed at 1.0 (no UI field).
   // The model field is a dropdown populated from the endpoint's /models
   // list after a successful connect: never free text.

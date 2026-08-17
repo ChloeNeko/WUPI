@@ -1271,7 +1271,7 @@ mod tests {
 
     #[test]
     fn bare_channel_opener_stripped() {
-        // Bug 1 regression: a non-thought channel opener. The 12B narrator
+        // Bug 1 regression: a non-thought channel opener. The local narrator
         // sometimes regresses to emitting `<|channel>reply` or a bare
         // `<|channel>` opener during creative RP; without the bare marker in
         // the list, the entire opener + its content leaked live. The bare

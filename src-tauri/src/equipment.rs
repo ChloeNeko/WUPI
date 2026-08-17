@@ -305,12 +305,22 @@ pub fn stack_weight(items: &[StackItem]) -> f32 {
 }
 
 /// Upsert a stack item into a list by name: if an entry with the same
-/// (case-insensitive) name exists, add `qty` to it (taking the max of the two
-/// per-unit weights so a heavier restack wins); otherwise push a new entry.
-/// Returns true if a new entry was added (for the belt's FIFO eviction check).
+/// (case-insensitive, whitespace-trimmed) name exists, add `qty` to it (taking
+/// the max of the two per-unit weights so a heavier restack wins); otherwise
+/// push a new entry. Returns true if a new entry was added (for the belt's
+/// FIFO eviction check).
+///
+/// (2026-08-17 E4B shakedown P1a) The comparison normalizes BOTH sides — the
+/// parse-time `clean_item_name` gate already strips mangled quoting upstream,
+/// and the trim+lowercase match here is the merge-on-add backstop for entries
+/// minted by other paths (the Soul Gem UI, legacy saves): a re-acquisition of
+/// an existing item must stack, never append a twin the panel renders twice.
 pub fn stack_upsert(items: &mut Vec<StackItem>, item: StackItem) -> bool {
-    let key = item.name.to_lowercase();
-    if let Some(existing) = items.iter_mut().find(|i| i.name.to_lowercase() == key) {
+    let key = item.name.trim().to_lowercase();
+    if let Some(existing) = items
+        .iter_mut()
+        .find(|i| i.name.trim().to_lowercase() == key)
+    {
         existing.qty = existing.qty.saturating_add(item.qty);
         if item.weight > existing.weight {
             existing.weight = item.weight;
@@ -340,7 +350,7 @@ pub fn stack_upsert(items: &mut Vec<StackItem>, item: StackItem) -> bool {
 pub fn stack_remove(items: &mut Vec<StackItem>, name: &str, qty: u32) -> bool {
     let key = name.trim().to_lowercase();
     for idx in 0..items.len() {
-        if items[idx].name.to_lowercase() == key {
+        if items[idx].name.trim().to_lowercase() == key {
             if qty == 0 || items[idx].qty <= qty {
                 items.remove(idx);
             } else {
@@ -590,6 +600,22 @@ mod tests {
         assert_eq!(items.len(), 1);
         assert!(items[0].tags.contains(&ItemTag::Consumable), "consumable tag kept on restack");
         assert!(items[0].tags.contains(&ItemTag::Pocketable), "pocketable tag unioned in");
+    }
+
+    #[test]
+    fn stack_upsert_merges_despite_whitespace_and_case_noise() {
+        // 2026-08-17 E4B shakedown P1a: the belt re-added existing items as
+        // new entries in the playtest. The comparison now normalizes BOTH
+        // sides — `Coin` merges with ` coin ` (Soul-Gem UI / legacy-save
+        // entries that skipped the parser's clean gate).
+        let mut items = vec![StackItem { name: "coin".into(), qty: 3, weight: 0.1, stats: None, ..Default::default() }];
+        let added = stack_upsert(&mut items, StackItem { name: " Coin ".into(), qty: 2, weight: 0.1, stats: None, ..Default::default() });
+        assert!(!added, "re-acquisition of an existing item must stack, not append");
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].qty, 5);
+        // The remove path normalizes the same way.
+        assert!(stack_remove(&mut items, "  COIN ", 0));
+        assert!(items.is_empty());
     }
 
     #[test]
