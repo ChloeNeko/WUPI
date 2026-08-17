@@ -1,0 +1,144 @@
+diff --git a/stable-diffusion.cpp/src/model_loader.cpp b/stable-diffusion.cpp/src/model_loader.cpp
+index 8d37d39..56d7e31 100644
+--- a/stable-diffusion.cpp/src/model_loader.cpp
++++ b/stable-diffusion.cpp/src/model_loader.cpp
+@@ -18,6 +18,7 @@
+ #include "model_io/gguf_io.h"
+ #include "model_io/safetensors_io.h"
+ #include "model_io/torch_legacy_io.h"
++#include "gguf.h"
+ #include "model_io/torch_zip_io.h"
+ #include "model_loader.h"
+ #include "stable-diffusion.h"
+@@ -290,11 +291,112 @@ bool ModelLoader::init_from_gguf_file(const std::string& file_path, const std::s
+         return false;
+     }
+ 
++    // ── WUPI PATCH (§11.59, Bug B): preset version_ from GGUF metadata ──
++    // A ComfyUI-convention GGUF UNet stores ONLY the diffusion-model tensors
++    // under bare input_blocks.* names (no embedded CLIP/VAE). sd.cpp's tensor-
++    // name-based version detection (get_sd_version) is a CIRCULAR dependency
++    // for this layout: is_unet (used to pick the CLIP prefix) is derived from
++    // get_sd_version, which needs a token_embedding tensor (from CLIP) that
++    // isn't loaded yet → is_unet=false → CLIP-G gets the "text_encoders.*"
++    // prefix → version detection never sees cond_stage_model.1 → returns
++    // VERSION_COUNT → "get sd version from file failed".
++    //
++    // Fix: ComfyUI GGUFs carry their architecture in the `general.architecture`
++    // metadata key (verified: image.gguf = "sdxl"). Read it here and preset
++    // version_; get_sd_version() short-circuits on a preset version_ (see the
++    // early-return added at the top of get_sd_version). This breaks the circle
++    // without touching the detection heuristics for non-GGUF checkpoints.
++    if (version_ == VERSION_COUNT) {
++        gguf_context* ctx_arch = gguf_init_from_file(file_path.c_str(), {false, nullptr});
++        if (ctx_arch != nullptr) {
++            int64_t key_id = gguf_find_key(ctx_arch, "general.architecture");
++            if (key_id >= 0) {
++                const char* arch = gguf_get_val_str(ctx_arch, key_id);
++                if (arch != nullptr) {
++                    std::string arch_str(arch);
++                    LOG_INFO("gguf general.architecture = '%s'", arch_str.c_str());
++                    if (arch_str == "sdxl") {
++                        version_ = VERSION_SDXL;
++                    } else if (arch_str == "sd1") {
++                        version_ = VERSION_SD1;
++                    } else if (arch_str == "sd2" || arch_str == "sd2.x") {
++                        version_ = VERSION_SD2;
++                    } else if (arch_str == "flux") {
++                        version_ = VERSION_FLUX;
++                    } else if (arch_str == "sd3") {
++                        version_ = VERSION_SD3;
++                    }
++                    // Other architectures fall through; tensor-name detection
++                    // handles them (or returns VERSION_COUNT as before).
++                }
++            }
++            gguf_free(ctx_arch);
++        }
++    }
++
+     size_t file_index = add_file_path(file_path);
+ 
++    // ── WUPI PATCH (§11.59, Bug C): recover original shapes from ComfyUI metadata ──
++    // ComfyUI-quantized GGUFs store quantization-RESHAPED tensor dims on the
++    // tensor itself (e.g. a [3,3,4,320] conv weight becomes [256,45] after Q8_0
++    // block-packing). The TRUE original PyTorch shape is preserved in
++    // `comfy.gguf.orig_shape.<tensor_name>` metadata keys as an int32 array.
++    // sd.cpp's model validation (model_manager.cpp:450) compares each tensor's
++    // `ne` against the architecture's expected shape — without this fix EVERY
++    // conv/linear weight mismatches and validation fails ("model metadata
++    // validation failed"). ComfyUI/A1111 both read this key; sd.cpp (vendored
++    // 0.1.20) does not. Build a name→shape map here, then overwrite each
++    // tensor's ne (reversed: PyTorch [out,in,kH,kW] → ggml ne[0..3]=[kW,kH,in,out]).
++    std::unordered_map<std::string, std::vector<int64_t>> orig_shapes;
++    {
++        gguf_context* ctx_shape = gguf_init_from_file(file_path.c_str(), {false, nullptr});
++        if (ctx_shape != nullptr) {
++            int64_t n_kv = gguf_get_n_kv(ctx_shape);
++            for (int64_t i = 0; i < n_kv; i++) {
++                const char* key_cstr = gguf_get_key(ctx_shape, i);
++                if (key_cstr == nullptr) continue;
++                std::string key(key_cstr);
++                const std::string prefix_str = "comfy.gguf.orig_shape.";
++                if (key.size() <= prefix_str.size() ||
++                    key.compare(0, prefix_str.size(), prefix_str) != 0) {
++                    continue;
++                }
++                // Only int32 arrays are valid orig_shape entries.
++                if (gguf_get_kv_type(ctx_shape, i) != GGUF_TYPE_ARRAY) continue;
++                if (gguf_get_arr_type(ctx_shape, i) != GGUF_TYPE_INT32) continue;
++                size_t n = gguf_get_arr_n(ctx_shape, i);
++                if (n == 0 || n > SD_MAX_DIMS) continue;
++                const int32_t* data = (const int32_t*)gguf_get_arr_data(ctx_shape, i);
++                std::string tensor_name = key.substr(prefix_str.size());
++                std::vector<int64_t> shape(n);
++                for (size_t j = 0; j < n; j++) {
++                    shape[j] = (int64_t)data[j];
++                }
++                orig_shapes[tensor_name] = std::move(shape);
++            }
++            gguf_free(ctx_shape);
++        }
++        if (!orig_shapes.empty()) {
++            LOG_INFO("gguf: recovered %zu original tensor shapes from comfy.gguf.orig_shape metadata",
++                     orig_shapes.size());
++        }
++    }
++
+     for (auto& tensor_storage : tensor_storages) {
+         // LOG_DEBUG("%s", tensor_storage.name.c_str());
+ 
++        // Apply the recovered original shape (before prefixing — the metadata
++        // key uses the bare tensor name). Reverse PyTorch order → ggml ne order.
++        auto it = orig_shapes.find(tensor_storage.name);
++        if (it != orig_shapes.end()) {
++            const auto& shape = it->second;  // PyTorch: [d0, d1, ...]
++            int n = (int)shape.size();
++            for (int i = 0; i < SD_MAX_DIMS; i++) {
++                tensor_storage.ne[i] = (i < n) ? shape[n - 1 - i] : 1;
++            }
++            tensor_storage.n_dims = n;
++        }
++
+         if (!starts_with(tensor_storage.name, prefix)) {
+             tensor_storage.name = prefix + tensor_storage.name;
+         }
+@@ -425,6 +527,18 @@ bool ModelLoader::init_from_diffusers_file(const std::string& file_path, const s
+ }
+ 
+ SDVersion ModelLoader::get_sd_version() {
++    // ── WUPI PATCH (§11.59, Bug B): honor a preset version_ ──
++    // init_from_gguf_file presets version_ from the GGUF's general.architecture
++    // metadata (sdxl → VERSION_SDXL, etc.). Return it here WITHOUT the tensor-
++    // name scan, which is a circular dependency for ComfyUI GGUF UNets (the
++    // scan needs a CLIP token_embedding tensor that loads AFTER this call —
++    // see init_from_gguf_file's patch comment). Only short-circuits when a
++    // version was explicitly preset; the default VERSION_COUNT falls through
++    // to the original scan (unchanged behavior for non-GGUF checkpoints).
++    if (version_ != VERSION_COUNT) {
++        return version_;
++    }
++
+     TensorStorage token_embedding_weight, input_block_weight, context_ebedding_weight;
+ 
+     bool has_multiple_encoders = false;

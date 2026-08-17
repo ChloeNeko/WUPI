@@ -1,0 +1,110 @@
+diff --git a/build.rs b/build.rs
+index 22b9b8a..7c68f7c 100644
+--- a/build.rs
++++ b/build.rs
+@@ -75,6 +75,27 @@ fn main() {
+         .very_verbose(true)
+         .pic(true);
+ 
++    // WUPI PATCH (2026-08-15): DUAL-STATIC-GGML SYMBOL-DEDUP FIX.
++    //
++    // wupi.exe ALSO links llama-cpp-sys's ggml. Two statically-linked ggml
++    // copies in one binary export identical symbol names (gguf_init_from_file,
++    // ggml_*, ggml_backend_*). The MSVC linker resolves each name to whichever
++    // .lib it met first, so sd.cpp silently called LLAMA's ggml — a different
++    // version built against the debug CRT — and the first SD model load died
++    // in llama's UCRT (`_osfile(fh) & FOPEN` debug assertion, exit
++    // 0x80000003). Building the SD stack as DLLs isolates symbol resolution
++    // per module: each DLL binds its own ggml internally at its own link
++    // step, so cross-dedup with llama's copy is impossible. Needs BOTH flags:
++    // SD_BUILD_SHARED_LIBS (sd.cpp's own lib) + SD_BUILD_SHARED_GGML_LIB
++    // (lets the ggml subproject build shared instead of force-disabling it).
++    // The DLLs are copied next to the cargo exe below (Windows loads DLLs
++    // from the exe's directory first, so `cargo run` / `tauri dev` find them).
++    let sd_shared = target.contains("msvc");
++    if sd_shared {
++        config.define("SD_BUILD_SHARED_LIBS", "ON");
++        config.define("SD_BUILD_SHARED_GGML_LIB", "ON");
++    }
++
+     #[allow(unused_assignments)]
+     #[allow(unused_mut)]
+     let mut use_metal = false;
+@@ -228,33 +249,67 @@ fn main() {
+     // Build stable-diffusion
+     let destination = config.build();
+ 
++    // WUPI PATCH (2026-08-15, dual-static-ggml fix): on the shared build,
++    // copy the produced DLLs next to the cargo output exe. OUT_DIR is
++    // target/<profile>/build/<crate>-<hash>/out, so ../../../ is
++    // target/<profile> — the directory `cargo run` / `tauri dev` launches
++    // the exe from.
++    if sd_shared {
++        let target_dir = out.join("../../../");
++        let _ = std::fs::create_dir_all(&target_dir);
++        copy_dlls(&destination, &target_dir);
++    }
++
+     add_link_search_path(&out.join("lib")).unwrap();
+     add_link_search_path(&out.join("build")).unwrap();
+     add_link_search_path(&out).unwrap();
+ 
+     println!("cargo:rustc-link-search=native={}", destination.display());
+-    println!("cargo:rustc-link-lib=static=stable-diffusion");
+-    println!("cargo:rustc-link-lib=static=ggml-base");
+-    println!("cargo:rustc-link-lib=static=ggml-cpu");
+-    println!("cargo:rustc-link-lib=static=ggml");
++    // WUPI PATCH (2026-08-15): link the DLL import libs (dylib=) on the
++    // shared MSVC build; the original static= lines remain for non-MSVC
++    // static builds.
++    let sd_link = if sd_shared { "dylib" } else { "static" };
++    println!("cargo:rustc-link-lib={sd_link}=stable-diffusion");
++    println!("cargo:rustc-link-lib={sd_link}=ggml-base");
++    println!("cargo:rustc-link-lib={sd_link}=ggml-cpu");
++    println!("cargo:rustc-link-lib={sd_link}=ggml");
+ 
+     #[cfg(feature = "cuda")]
+-    println!("cargo:rustc-link-lib=static=ggml-cuda");
++    println!("cargo:rustc-link-lib={sd_link}=ggml-cuda");
+ 
+     #[cfg(feature = "hipblas")]
+-    println!("cargo:rustc-link-lib=static=ggml-hip");
++    println!("cargo:rustc-link-lib={sd_link}=ggml-hip");
+ 
+     if use_metal {
+-        println!("cargo:rustc-link-lib=static=ggml-blas");
+-        println!("cargo:rustc-link-lib=static=ggml-metal");
++        println!("cargo:rustc-link-lib={sd_link}=ggml-blas");
++        println!("cargo:rustc-link-lib={sd_link}=ggml-metal");
+     }
+ 
+     if use_vulkan {
+-        println!("cargo:rustc-link-lib=static=ggml-vulkan");
++        println!("cargo:rustc-link-lib={sd_link}=ggml-vulkan");
+     }
+ 
+     #[cfg(feature = "sycl")]
+-    println!("cargo:rustc-link-lib=static=ggml-sycl");
++    println!("cargo:rustc-link-lib={sd_link}=ggml-sycl");
++}
++
++/// WUPI PATCH (2026-08-15): recursively copy every built DLL from the cmake
++/// build tree into `target/<profile>` so the exe can load them at startup.
++fn copy_dlls(build_dir: &Path, target_dir: &Path) {
++    let Ok(entries) = read_dir(build_dir) else {
++        return;
++    };
++    for entry in entries.flatten() {
++        let path = entry.path();
++        if path.is_dir() {
++            copy_dlls(&path, target_dir);
++        } else if path.extension().and_then(|e| e.to_str()).map(|e| e.eq_ignore_ascii_case("dll")).unwrap_or(false) {
++            let dest = target_dir.join(entry.file_name());
++            if let Err(e) = std::fs::copy(&path, &dest) {
++                println!("cargo:warning=failed to copy {} -> {}: {}", path.display(), dest.display(), e);
++            }
++        }
++    }
+ }
+ 
+ fn add_link_search_path(dir: &Path) -> std::io::Result<()> {

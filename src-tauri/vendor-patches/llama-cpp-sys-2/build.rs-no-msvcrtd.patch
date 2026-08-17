@@ -1,0 +1,34 @@
+diff --git a/build.rs b/build.rs
+index 10fab76..0058653 100644
+--- a/build.rs
++++ b/build.rs
+@@ -1243,16 +1243,19 @@ fn main() {
+     match target_os {
+         TargetOs::Windows(WindowsVariant::Msvc) => {
+             println!("cargo:rustc-link-lib=advapi32");
+-            let crt_static = env::var("CARGO_CFG_TARGET_FEATURE")
+-                .unwrap_or_default()
+-                .contains("crt-static");
+-            if cfg!(debug_assertions) {
+-                if crt_static {
+-                    println!("cargo:rustc-link-lib=libcmtd");
+-                } else {
+-                    println!("cargo:rustc-link-lib=dylib=msvcrtd");
+-                }
+-            }
++            // ── WUPI PATCH (§11.59 dual-CRT fix, 2026-08-16): the debug CRT
++            // is NEVER linked. Upstream 0.1.151 had an `if cfg!(debug_assertions)`
++            // block here emitting `dylib=msvcrtd` (or `libcmtd` under
++            // crt-static). WUPI compiles llama.cpp's C++ in Release config
++            // even for dev builds (see the vendor/diffusion-rs-sys note —
++            // LNK2038 RuntimeLibrary avoidance), so no /MDd objects exist
++            // that need it; the line only pulled a SECOND C runtime
++            // (ucrtbased.dll alongside ucrtbase.dll) into every dev exe.
++            // FILE*/fd crossings between the two CRTs fired UCRT debug
++            // asserts inside sd.cpp (exit 0x80000003) right AFTER the first
++            // render's PNG landed. Cargo compiles build scripts with
++            // debug-assertions ON in dev, so the cfg fires even though the
++            // native code is Release — the line is removed, not re-gated. ──
+         }
+         TargetOs::Linux => {
+             if cfg!(feature = "static-stdcxx") {
