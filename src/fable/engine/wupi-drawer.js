@@ -306,11 +306,20 @@ async function sendWupiTurn(text) {
     // leave the drawer's `generating` latched: the input stays disabled
     // until stage exit. Every terminal path runs setGenerating(false), so
     // still-generating here means no terminal arrived — settle defensively.
-    if (generating) {
+    // (2026-08-17 E4B verification) Settle on a short grace timer, NOT
+    // synchronously: the invoke resolve can beat the last queued channel
+    // message to the page (the synchronous manager paths —
+    // QueryWorldState/MutateWorldState — send chunk+done then return
+    // immediately), and a synchronous settle nulled activeBubble before the
+    // chunk landed, rendering the manager reply as an EMPTY bubble. A real
+    // terminal event arrives within the grace window and clears generating
+    // itself; only a genuinely event-less resolve runs the settle.
+    setTimeout(() => {
+      if (!generating) return;
       finalizeBubble(activeBubble, null);
       activeBubble = null;
       setGenerating(false);
-    }
+    }, 150);
   } catch (err) {
     finalizeBubble(activeBubble, null);
     addWupiError(String(err));

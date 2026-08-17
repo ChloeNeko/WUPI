@@ -4661,12 +4661,34 @@ async fn apply_phase3_bracket_commands(
     parsed: &bracket_parser::ParsedNarration,
     state: &tauri::State<'_, AppState>,
     decay_presence: bool,
+    narrative_window: &[session::Message],
 ) -> (bool, Vec<String>) {
     // `decay_presence`: the TTL grace-decay runs ONCE per turn (the tracker
     // stage's call). The defensive narrator-stage call passes false — the
     // tracker already decayed this turn, and a second pass halved the grace
     // window (a re-asserted NPC ended the turn at ttl 3, a departing one
     // aged out in 2 turns instead of 4).
+    //
+    // (2026-08-17 E4B follow-up) `narrative_window` is the tracker's OWN
+    // window (player action + preceding narrator beat) — the corpus for
+    // one-word item-fragment resolution. The tracker's knowledge is bounded
+    // by this text, so a fragment it emitted ("dark", "tin") can only refer
+    // to words that appear here. Freshest first: the player's action, then
+    // the preceding beats.
+    let narrative_corpus: Vec<&str> = {
+        let mut texts: Vec<&str> = Vec::with_capacity(narrative_window.len());
+        for m in narrative_window.iter().rev() {
+            if m.role == session::Role::User {
+                texts.push(m.content.as_str());
+            }
+        }
+        for m in narrative_window.iter().rev() {
+            if m.role == session::Role::Assistant {
+                texts.push(m.content.as_str());
+            }
+        }
+        texts
+    };
     // Collect the relevant commands first (no lock held).
     let effects: Vec<&bracket_parser::BracketCommand> = parsed
         .commands
@@ -5109,8 +5131,26 @@ async fn apply_phase3_bracket_commands(
                 if id.is_empty() {
                     continue;
                 }
+                // (2026-08-17 rec-2 follow-up) Ghost guard, same corruption
+                // class as the TRAVEL/NPC twins: a shorthand discovery whose
+                // words uniquely subset an EXISTING node ("market" when
+                // "market-square" is on the graph) is a re-discovery of that
+                // node — the documented no-op — never a ghost twin.
+                if let Some(existing) = s.travel_graph.resolve_fragment_alias(&id) {
+                    tracing::info!(
+                        emitted = %id,
+                        resolved = %existing,
+                        "[DISCOVER] shorthand resolves to an existing node — re-discovery no-op"
+                    );
+                    continue;
+                }
                 let label = if name.trim().is_empty() {
-                    id.clone()
+                    // Name-less discovery: prefer the story's capitalized
+                    // place-phrase over the bare slug ("greywater" → the
+                    // narrative's "Greywater Village"), mirroring the TRAVEL
+                    // mint's diegetic naming.
+                    schema::proper_noun_phrase_for(&id, &narrative_corpus)
+                        .unwrap_or_else(|| id.clone())
                 } else {
                     name.trim().to_string()
                 };
@@ -5196,7 +5236,10 @@ async fn apply_phase3_bracket_commands(
                 Some(id) => Some(id),
                 None => {
                     let pre = s.clone();
-                    match s.travel_graph.resolve_or_mint_node(&dest_raw) {
+                    match s
+                        .travel_graph
+                        .resolve_or_mint_node(&dest_raw, &narrative_corpus)
+                    {
                         Some(id) => {
                             if pre.travel_graph.find_node(&id).is_none() {
                                 undo_snapshot.get_or_insert(pre);
@@ -5425,8 +5468,10 @@ async fn apply_phase3_bracket_commands(
                 // applied to the tracker's raw output upstream, but a defensive
                 // whitespace-normalize here is cheap insurance).
                 let stance_clean = stance.trim();
-                // Resolve against the registry (id OR alias, case-insensitive).
-                match registry_entries.iter().find(|e| e.matches(npc_id)) {
+                // Resolve against the registry (id OR alias, case-insensitive,
+                // then the unique fragment-alias pass — "harsk" →
+                // "captain-harsk"; Chloe's recommendation 2, 2026-08-17).
+                match schema::resolve_npc_surface(&registry_entries, npc_id) {
                     Some(entry) => {
                         asserted.insert(entry.id.clone(), stance_clean.to_string());
                     }
@@ -5588,6 +5633,25 @@ async fn apply_phase3_bracket_commands(
         // map stays tight). One undo snapshot for the batch (coalesced). Last-
         // wins per (slot, layer) within a turn (two equips to the same slot —
         // the second replaces the first, matching the "what's true now" read).
+        //
+        // (2026-08-17 E4B follow-up) All stored item names, for one-word
+        // fragment resolution below ("rough" → the stored "Rough Mooring
+        // Rope" stack). Built once for all three inventory appliers.
+        let existing_item_names: Vec<String> = {
+            let mut names: Vec<String> = s
+                .player_state
+                .belt
+                .iter()
+                .map(|i| i.name.clone())
+                .collect();
+            names.extend(s.player_state.pack.iter().map(|i| i.name.clone()));
+            for layers in s.player_state.equipment.values() {
+                for item in [&layers.outer, &layers.inner].into_iter().flatten() {
+                    names.push(item.name.clone());
+                }
+            }
+            names
+        };
         for cmd in &equip_cmds {
             if let bracket_parser::BracketCommand::Equip {
                 slot,
@@ -5597,6 +5661,24 @@ async fn apply_phase3_bracket_commands(
                 item_tags,
             } = cmd
             {
+                // (2026-08-17 E4B follow-up) Resolve a one-word add fragment
+                // to the story's full noun phrase BEFORE the no-op check, so
+                // a re-emitted shorthand for the already-equipped item
+                // dedupes instead of re-equipping a terse twin.
+                let equip_resolved: Option<String> = item_name.as_ref().and_then(|n| {
+                    equipment::resolve_item_fragment(n, &narrative_corpus, &existing_item_names)
+                });
+                if let Some(r) = &equip_resolved {
+                    eprintln!(
+                        "[DEBUG] [INVENTORY] resolved fragment \"{}\" → \"{}\"",
+                        item_name.as_deref().unwrap_or(""),
+                        r
+                    );
+                }
+                let item_name: Option<&str> = match (&equip_resolved, item_name) {
+                    (Some(r), _) => Some(r.as_str()),
+                    (None, orig) => orig.as_deref(),
+                };
                 // (P3 fix) Skip true no-ops BEFORE snapshotting: an unequip
                 // of an empty slot changes nothing, and an equip of the
                 // identical item already in the layer re-writes the same
@@ -5674,7 +5756,7 @@ async fn apply_phase3_bracket_commands(
                     }
                     Some(name) => {
                         let item = equipment::EquippedItem {
-                            name: name.clone(),
+                            name: name.to_string(),
                             stats: item_stats.clone(),
                             tags: item_tags.clone(),
                         };
@@ -5732,6 +5814,22 @@ async fn apply_phase3_bracket_commands(
                 item_tags,
             } = cmd
             {
+                // (2026-08-17 E4B follow-up) One-word fragment resolution.
+                // Removals resolve against STORED names only — you remove
+                // what's on the rack, not what the narrator is describing.
+                let belt_corpus: &[&str] = if *remove { &[] } else { &narrative_corpus };
+                let belt_resolved = equipment::resolve_item_fragment(
+                    item_name,
+                    belt_corpus,
+                    &existing_item_names,
+                );
+                if let Some(r) = &belt_resolved {
+                    eprintln!(
+                        "[DEBUG] [INVENTORY] resolved fragment \"{}\" → \"{}\"",
+                        item_name, r
+                    );
+                }
+                let item_name: &str = belt_resolved.as_deref().unwrap_or(item_name);
                 let pre_list = s.player_state.belt.clone();
                 let pre_schema = s.clone();
                 if *remove {
@@ -5745,7 +5843,7 @@ async fn apply_phase3_bracket_commands(
                     equipment::stack_upsert(
                         &mut s.player_state.belt,
                         equipment::StackItem {
-                            name: item_name.clone(),
+                            name: item_name.to_string(),
                             qty: *qty,
                             weight: 0.0, // belt items are weightless (quick-access)
                             stats: item_stats.clone(),
@@ -5799,6 +5897,22 @@ async fn apply_phase3_bracket_commands(
                 item_tags,
             } = cmd
             {
+                // (2026-08-17 E4B follow-up) Same fragment resolution as
+                // [BELT]: adds expand through the narrative window, removals
+                // match stored names only.
+                let pack_corpus: &[&str] = if *remove { &[] } else { &narrative_corpus };
+                let pack_resolved = equipment::resolve_item_fragment(
+                    item_name,
+                    pack_corpus,
+                    &existing_item_names,
+                );
+                if let Some(r) = &pack_resolved {
+                    eprintln!(
+                        "[DEBUG] [INVENTORY] resolved fragment \"{}\" → \"{}\"",
+                        item_name, r
+                    );
+                }
+                let item_name: &str = pack_resolved.as_deref().unwrap_or(item_name);
                 let pre_list = s.player_state.pack.clone();
                 let pre_schema = s.clone();
                 if *remove {
@@ -5812,7 +5926,7 @@ async fn apply_phase3_bracket_commands(
                     equipment::stack_upsert(
                         &mut s.player_state.pack,
                         equipment::StackItem {
-                            name: item_name.clone(),
+                            name: item_name.to_string(),
                             qty: *qty,
                             weight: *weight,
                             stats: item_stats.clone(),
@@ -10453,7 +10567,8 @@ async fn fable_send(
                     // hard facts, and the narrator has already seen the legal
                     // `location:` line + exits in `<world_state>`.
                     let (_, travel_rejects) =
-                        apply_phase3_bracket_commands(&tracker_parsed, &state, true).await;
+                        apply_phase3_bracket_commands(&tracker_parsed, &state, true, &tracker_window)
+                            .await;
                     turn_directives.extend(travel_rejects);
                     tick_armed =
                         apply_time_command_and_maybe_tick(&tracker_parsed, &state).await;
@@ -14541,7 +14656,7 @@ async fn retrack_edited_assistant_message(
             tracing::info!(count = parsed.commands.len(), "edit re-track: applying brackets");
             // Travel rejects are ignored — there is no narrator stage here
             // to carry them as directives.
-            let _ = apply_phase3_bracket_commands(&parsed, state, true).await;
+            let _ = apply_phase3_bracket_commands(&parsed, state, true, &tracker_window).await;
             tick_armed = apply_time_command_and_maybe_tick(&parsed, state).await;
         }
         Ok(())

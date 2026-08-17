@@ -363,6 +363,170 @@ pub fn stack_remove(items: &mut Vec<StackItem>, name: &str, qty: u32) -> bool {
 }
 
 // ---------------------------------------------------------------------------
+// (2026-08-17 E4B follow-up) Narrative phrase resolution for item fragments.
+// ---------------------------------------------------------------------------
+
+/// Tokens that terminate noun-phrase absorption. Deliberately broad: a false
+/// stop keeps the fragment as-emitted (harmless), while absorbing a stopword
+/// bakes "dark and" / "tin of" into a stored item name.
+const PHRASE_STOPWORDS: &[&str] = &[
+    "a", "an", "the", "and", "or", "but", "nor", "so", "yet", "of", "in", "on",
+    "at", "to", "for", "with", "from", "by", "into", "onto", "over", "under",
+    "up", "down", "out", "off", "near", "past", "than", "then", "as", "if",
+    "while", "when", "before", "after", "is", "are", "was", "were", "be",
+    "been", "being", "am", "do", "does", "did", "have", "has", "had", "i",
+    "you", "he", "she", "it", "we", "they", "me", "him", "her", "us", "them",
+    "my", "your", "his", "its", "our", "their", "this", "that", "these",
+    "those", "here", "there", "all", "any", "both", "each", "few", "more",
+    "most", "other", "some", "such", "no", "not", "only", "own", "same", "too",
+    "very", "just", "like", "one",
+];
+
+/// How many narrative words may follow the fragment into the resolved name
+/// ("hard" → "hard cheese" is 1; "rough" → "rough mooring rope" is 2). Caps
+/// runaway chains before a stopword happens to appear.
+const MAX_ABSORBED_WORDS: usize = 3;
+
+fn phrase_words(name: &str) -> Vec<String> {
+    name.to_lowercase()
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|t| !t.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+fn name_contains_word(name: &str, word_lower: &str) -> bool {
+    phrase_words(name).iter().any(|w| w == word_lower)
+}
+
+/// Strip edge punctuation (incl. typographic quotes/dashes) from a narrative
+/// token so "cheese," / "ale." / "“cold" absorb as clean words.
+fn strip_token_edges(tok: &str) -> &str {
+    tok.trim_matches(|c: char| {
+        c.is_whitespace() || c.is_ascii_punctuation() || "\u{2018}\u{2019}\u{201c}\u{201d}\u{2014}\u{2013}\u{2026}".contains(c)
+    })
+}
+
+/// Expand a ONE-WORD tracker item fragment ("dark", "tin", "rough") into the
+/// full name the story actually used. The E4B tracker routinely grabs the
+/// highest-attention modifier as shorthand for a multi-word purchase
+/// (observed 2026-08-17: "a wedge of hard cheese" → `[PACK hard]`), which
+/// lands as janky Soul-Gem entries and misses later merges/removals. This is
+/// the mechanical fix per the Prime Mandate — no prompt tokens spent.
+///
+/// Resolution order (first hit wins, deterministic):
+/// 1. **Narrative noun phrase** — scan `narrative` (the tracker's own window:
+///    the player's action, then preceding narrator beats) for the fragment;
+///    absorb up to [`MAX_ABSORBED_WORDS`] following name-y words up to a
+///    stopword → "dark" + "…cold dark ale and a block…" → "dark ale".
+///    - If the phrase matches an existing stored name (equal words, or the
+///      stored name is a superset), return the STORED spelling so the add
+///      merges into that stack.
+///    - Else the phrase IS the item's full name (a new item).
+/// 2. **Single unambiguous inventory match** — exactly one existing name
+///    contains the fragment as a whole word → that stored name (re-links
+///    shorthand to the stack it clearly means). Ambiguous (2+ candidates)
+///    keeps the fragment — a wrong merge is worse than a terse name.
+/// 3. `None` — keep the fragment verbatim.
+///
+/// Multi-word fragments are never resolved (`None`): they are specific
+/// enough, and rewriting them risks fighting a correct emission. Pure fn.
+pub fn resolve_item_fragment(
+    fragment: &str,
+    narrative: &[&str],
+    existing_names: &[String],
+) -> Option<String> {
+    let frag_raw = fragment.trim();
+    if frag_raw.is_empty() || frag_raw.chars().any(char::is_whitespace) {
+        return None; // only one-word fragments (the observed shorthand)
+    }
+    let frag_lower = frag_raw.to_lowercase();
+    if PHRASE_STOPWORDS.contains(&frag_lower.as_str()) {
+        return None; // "and"/"the" is not an item
+    }
+
+    // ── Step 1: narrative noun-phrase expansion ──────────────────────────
+    for text in narrative {
+        for (tok_raw, nexts) in noun_phrase_windows(text) {
+            if tok_raw.to_lowercase() != frag_lower {
+                continue;
+            }
+            if nexts.is_empty() {
+                continue; // fragment IS the head noun here; nothing to absorb
+            }
+            let words: Vec<String> = std::iter::once(tok_raw.clone())
+                .chain(nexts.iter().cloned())
+                .collect();
+            let candidate: String = words
+                .join(" ")
+                .chars()
+                .take(crate::bracket_parser::INV_NAME_MAX)
+                .collect();
+            let cand_words = phrase_words(&candidate);
+            // Prefer the STORED spelling when the phrase is (or narrows to)
+            // an existing stack — keeps merges exact + panel-consistent.
+            for stored in existing_names {
+                let stored_words = phrase_words(stored);
+                let equal = stored_words == cand_words;
+                let superset = stored_words.len() > cand_words.len()
+                    && cand_words.iter().all(|w| stored_words.contains(w));
+                if equal || superset {
+                    return Some(stored.clone());
+                }
+            }
+            return Some(candidate); // a genuinely new, fully-named item
+        }
+    }
+
+    // ── Step 2: single unambiguous inventory match ───────────────────────
+    let mut hits: Vec<&String> = existing_names
+        .iter()
+        .filter(|n| name_contains_word(n.as_str(), &frag_lower))
+        .collect();
+    hits.dedup_by(|a, b| a.trim().eq_ignore_ascii_case(b.trim()));
+    if hits.len() == 1 {
+        return Some(hits[0].clone());
+    }
+
+    None
+}
+
+/// Tokenize `text` into (token, up-to-`MAX_ABSORBED_WORDS` absorbable
+/// following words) pairs. Tokens keep their narrative casing; absorbed
+/// words are edge-stripped and stop at the first stopword / non-word token.
+fn noun_phrase_windows(text: &str) -> Vec<(String, Vec<String>)> {
+    let raw_toks: Vec<&str> = text.split_whitespace().collect();
+    let mut out = Vec::with_capacity(raw_toks.len());
+    for (i, tok) in raw_toks.iter().enumerate() {
+        let tok_raw = strip_token_edges(tok).to_string();
+        if tok_raw.is_empty() {
+            continue;
+        }
+        let mut nexts: Vec<String> = Vec::new();
+        for n in raw_toks.get(i + 1..).unwrap_or(&[]) {
+            if nexts.len() >= MAX_ABSORBED_WORDS {
+                break;
+            }
+            let clean = strip_token_edges(n);
+            if clean.is_empty() || !clean.chars().next().is_some_and(char::is_alphanumeric) {
+                break; // punctuation wall / ellipsis → stop
+            }
+            let lower = clean.to_lowercase();
+            if PHRASE_STOPWORDS.contains(&lower.as_str()) {
+                break;
+            }
+            let bare = clean.strip_suffix("'s").unwrap_or(clean);
+            if bare.chars().count() < 2 {
+                break;
+            }
+            nexts.push(bare.to_string());
+        }
+        out.push((tok_raw, nexts));
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
 // Legacy migration: item_*/inv_* entity keys → typed inventory (one-shot).
 // ---------------------------------------------------------------------------
 
@@ -802,5 +966,114 @@ mod tests {
             entities.contains_key("item_strange"),
             "structured value left in entity map"
         );
+    }
+
+    // ── Narrative phrase resolution (2026-08-17 E4B follow-up) ───────────
+    // Every narrative string below is VERBATIM from the live playtest turns
+    // (V5 shop scene + the innkeeper example) — the exact corpus that
+    // produced the one-word shorthand emissions ("hard", "dark", "tin",
+    // "rough").
+
+    const V5_SHOP_TEXT: &str = "I find the general store and buy provisions for the road: a wedge of hard cheese, a loaf of dark bread, and a coil of rough mooring rope like my old one, plus a cheap tin lantern. I count out coin from my pouch — prices up here are fairer than Cinderfen's.";
+
+    #[test]
+    fn fragment_resolves_to_the_narrative_noun_phrase() {
+        let none: Vec<String> = Vec::new();
+        assert_eq!(
+            resolve_item_fragment("hard", &[V5_SHOP_TEXT], &none),
+            Some("hard cheese".to_string())
+        );
+        assert_eq!(
+            resolve_item_fragment("dark", &[V5_SHOP_TEXT], &none),
+            Some("dark bread".to_string())
+        );
+        assert_eq!(
+            resolve_item_fragment("tin", &[V5_SHOP_TEXT], &none),
+            Some("tin lantern".to_string())
+        );
+        // Absorption stops at the stopword "like".
+        assert_eq!(
+            resolve_item_fragment("rough", &[V5_SHOP_TEXT], &none),
+            Some("rough mooring rope".to_string())
+        );
+        // The innkeeper example: the stopword "and" ends the phrase.
+        let inn = "The innkeeper slides over a cold dark ale and a block of hard biscuit.";
+        assert_eq!(
+            resolve_item_fragment("dark", &[inn], &none),
+            Some("dark ale".to_string())
+        );
+        assert_eq!(
+            resolve_item_fragment("hard", &[inn], &none),
+            Some("hard biscuit".to_string())
+        );
+    }
+
+    #[test]
+    fn fragment_prefers_the_stored_stack_spelling_and_merges() {
+        let existing = vec!["Rough Mooring Rope".to_string()];
+        assert_eq!(
+            resolve_item_fragment("rough", &[V5_SHOP_TEXT], &existing),
+            Some("Rough Mooring Rope".to_string()),
+            "narrative phrase narrows to the stored stack — exact-merge spelling"
+        );
+        // And the follow-on stack_upsert merges into it (no twin entry).
+        let mut pack = vec![StackItem {
+            name: "Rough Mooring Rope".to_string(),
+            qty: 2,
+            ..Default::default()
+        }];
+        let added = stack_upsert(
+            &mut pack,
+            StackItem {
+                name: resolve_item_fragment("rough", &[V5_SHOP_TEXT], &existing).unwrap(),
+                qty: 1,
+                ..Default::default()
+            },
+        );
+        assert!(!added, "resolved fragment merged into the existing stack");
+        assert_eq!(pack.len(), 1);
+        assert_eq!(pack[0].qty, 3);
+    }
+
+    #[test]
+    fn fragment_inventory_relink_and_ambiguity_rules() {
+        let none: Vec<String> = Vec::new();
+        // Unique containment relinks ("mire" → the stored mire-oil) — the
+        // removal path's only resolution arm.
+        let existing = vec!["mire-oil".to_string()];
+        assert_eq!(
+            resolve_item_fragment("mire", &[], &existing),
+            Some("mire-oil".to_string())
+        );
+        // Exact stored name is a no-op relink ("coin" → "coin").
+        assert_eq!(
+            resolve_item_fragment("coin", &[], &["coin".to_string()]),
+            Some("coin".to_string())
+        );
+        // Ambiguous containment declines (wrong merge beats terse name).
+        let both = vec!["dark ale".to_string(), "dark bread".to_string()];
+        assert_eq!(resolve_item_fragment("dark", &[], &both), None);
+        // But the narrative phrase disambiguates against the stored names.
+        assert_eq!(
+            resolve_item_fragment("dark", &["I buy a loaf of dark bread from her."], &both),
+            Some("dark bread".to_string())
+        );
+    }
+
+    #[test]
+    fn fragment_boundaries_keep_correct_emissions_verbatim() {
+        let none: Vec<String> = Vec::new();
+        // Multi-word fragments are NEVER rewritten.
+        assert_eq!(resolve_item_fragment("rough rope", &[V5_SHOP_TEXT], &none), None);
+        // Stopword fragments are not items.
+        assert_eq!(resolve_item_fragment("and", &[V5_SHOP_TEXT], &none), None);
+        // A head-noun fragment (nothing to absorb: next word is a stopword)
+        // stays as-emitted — "food." followed by "The moment…" absorbs nothing.
+        assert_eq!(
+            resolve_item_fragment("food", &["eat the last crumbs of my food. The moment I sit down, exhaustion wins"], &none),
+            None
+        );
+        // Unknown single word with no narrative hit + no inventory match.
+        assert_eq!(resolve_item_fragment("lantern", &[], &none), None);
     }
 }

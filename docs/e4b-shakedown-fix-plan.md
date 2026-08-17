@@ -1,5 +1,74 @@
 # E4B Shakedown — Fix Plan (2026-08-17)
 
+> **FOLLOW-UP IMPLEMENTED 2026-08-17 (same day, Chloe's recommendations
+> 1–3):** the one-word item-name shorthand ("a bag full of hard/dark/tin")
+> is now resolved mechanically in Rust, zero prompt tokens.
+> - **Rec 1 — narrative phrase resolution** (`equipment.rs::
+>   resolve_item_fragment`, wired into the EQUIP/BELT/PACK appliers):
+>   (1) scan the tracker's OWN window (player action + preceding beat) for
+>   the fragment + absorb up to 3 following non-stopword words → "hard" +
+>   "a wedge of hard cheese" → "hard cheese" / "dark" + "cold dark ale and…"
+>   → "dark ale", preferring the STORED spelling when the phrase equals or
+>   narrows to an existing stack; (2) unique whole-word inventory match
+>   ("mire" → mire-oil). Ambiguous or head-noun fragments keep the emission
+>   verbatim. ADD paths use narrative+inventory; REMOVE paths
+>   inventory-only. Tests use the V5 shop turn's sentences verbatim.
+> - **Rec 2 — location + entity aliasing:** `resolve_or_mint_node` gains a
+>   FRAGMENT ALIAS before minting ("market" → market-square — its
+>   Levenshtein ≈0.46 sits under the 0.75 typo guard and used to mint a
+>   ghost twin; unique-only, longest word ≥4) + proper-noun mint NAMING from
+>   the window's capitalized place-phrase ("greywater" + "Greywater
+>   Village" → id `greywater_village`). `NpcRegistry` resolution gains the
+>   same unique word-containment alias ("harsk" → captain-harsk via id/
+>   name/alias words) and `upsert_entry` a GHOST GUARD (a shorthand
+>   re-registration is the duplicate no-op, never a new cast entry).
+> - **Rec 3 — boundary rules:** the resolver is wired ONLY into the three
+>   item-name appliers; pacing modes, tag kinds (P1b strip), and TIME
+>   deltas stay on their strict enum/range validators, untouched.
+> - NOTE: the cargo build/test run is Chloe's (`cargo test --lib` then her
+>   `npx tauri build`) per the build-safety rule.
+
+> **VERIFIED 2026-08-17 (same day, live CDP runbook).** Launched the card's
+> `Launch Stranded in Cinderfen.lnk` direct-boot path (`fable.exe --card
+> stranded-in-cinderfen` + CDP 9222) against the 51-turn autosave and drove
+> 8 continuation turns + the full P2 UI repro sequence. Results:
+> - **P0 PASS** — drawer "Hello Wupi" replies; `[PREFIX]` telemetry live
+>   (prefix 1541 / budget 2304, 66%, no >70% boot warning). **P0 manager
+>   query: one NEW bug found + fixed** — the drawer's `.finally` backstop
+>   settled synchronously while the invoke resolve can beat the queued
+>   chunk/done channel messages to the page (~1ms observed), so the
+>   synchronous QueryWorldState/MutateWorldState reply rendered as an EMPTY
+>   bubble (backend verified fine via direct-channel capture). Fix:
+>   `wupi-drawer.js` settles on a 150ms grace timer; regression suite
+>   `tests/wupi-drawer.test.mjs` drives the real module with the observed
+>   event ordering (fails pre-fix, passes fixed). Needs her `npx tauri
+>   build` to reach the exe.
+> - **P1a PASS** — 6 live turns, zero new quote-fragment names; re-adds
+>   merge (coin 26→38→76, mire-oil 1→2). Observation: the E4B often emits
+>   one-word shorthand item names ("hard", "tin") for multi-word purchases —
+>   model behavior, names are clean; MAY-tune prompt line only if it grates.
+> - **P1b PASS** — 3 live strips of `kind=disguise` on a "Stamina" label
+>   (eprintln telemetry); every new tag landed kind-less.
+> - **P1c PASS** — two organic mints (`hollow-between-boulders`,
+>   `greywater_village`), bidirectional auto-links, `current_node` advances
+>   (nodes 8→10). The T49-50 travel paralysis is gone.
+> - **P1d vacuous-live** — the tracker emitted 0 `[TIME]` this session
+>   (its known TIME-reticence), so the clamp/directive/suffix chain had no
+>   hook; clamp + `— day N` suffix are unit-pinned (`schema.rs` tests).
+> - **P1e PASS** — quoted raid/hunt/arrest/attack gossip → Exploration, 0
+>   injuries (pre-fix rolled Purples); quoted rest/bed → no false Downtime
+>   heal; "I sleep, hard" → Downtime + one-grade heal + one stamina tier;
+>   unquoted "I attack, slashing" → Combat + injury roll (positive control).
+> - **P2 all PASS** — P2a gem cluster onscreen (x≈338) on BOTH the
+>   direct-launch boot and save→title→Continue (pre-fix stamped −119…−426);
+>   P2b ✎ refused on a mid-history AI beat, opens on user beats;
+>   P2c cooldown arms on foot clicks, releases at 350ms, the exact
+>   save-modal→✕→stale-Load repro leaves the stage intact; P2d overlay
+>   `display:none` post-boot.
+> - Driver: `scripts/cdp_verify_e4b.cjs` (composer turns + before/after
+>   schema diffs + UI probes); results `logs/e4b_verify_turns.json`,
+>   shots `logs/e4b_*.jpg`, app log `logs/e4b_launch.log`.
+
 > **IMPLEMENTED 2026-08-17 (same day).** All P0/P1/P2 items below are landed
 > on `ui-shell` + verified: `cargo test --lib` 1136/1136 green (incl. every
 > new test this plan specified), all 6 JS suites green (136 tests), `vite

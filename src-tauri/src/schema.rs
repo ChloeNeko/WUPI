@@ -311,6 +311,36 @@ impl TravelGraph {
         }
     }
 
+    /// (2026-08-17 rec-2 follow-up) Unique word-containment fragment alias,
+    /// shared by the TRAVEL resolve chain AND the `[DISCOVER]` ghost guard:
+    /// the emitted fragment's words must be a STRICT word-subset of exactly
+    /// ONE node's id/name words ("market" → "market-square" — Levenshtein
+    /// ≈0.46, under the typo guard, so without this arm it minted a ghost
+    /// twin). Longest fragment word must be ≥4 chars (stops "the" noise);
+    /// ambiguity (2+ hits) declines — no silent teleport guess.
+    pub fn resolve_fragment_alias(&self, fragment: &str) -> Option<String> {
+        let frag_words = word_list(fragment);
+        if !fragment_is_specific(&frag_words) {
+            return None;
+        }
+        let mut hits: Vec<&Node> = self
+            .nodes
+            .iter()
+            .filter(|n| {
+                let mut node_words = word_list(&n.id);
+                node_words.extend(word_list(&n.name));
+                node_words.len() > frag_words.len()
+                    && frag_words.iter().all(|w| node_words.contains(w))
+            })
+            .collect();
+        hits.dedup_by(|a, b| a.id == b.id);
+        if hits.len() == 1 {
+            Some(hits[0].id.clone())
+        } else {
+            None
+        }
+    }
+
     /// Resolve a raw `[TRAVEL]` destination to a canonical node id, tolerating
     /// the model's tendency to emit diegetic names instead of bare slugs
     /// (2026-08-10, T52 Open Issue #1: the model wrote `[TRAVEL Market Square]`
@@ -499,9 +529,20 @@ impl TravelGraph {
     /// node instead of minting (`[TRAVEL mrket square]` → `market-square`,
     /// not a phantom twin). Returns the canonical node id; `None` only when
     /// the raw is empty or the graph is at its cap (the caller then rejects
-    /// as before). Pure graph mechanics — no undo snapshot here (the caller
+    /// as before).
+    ///
+    /// (2026-08-17 recommendation 2) Two further arms before minting:
+    /// **Fragment alias** — a shorthand destination whose words are a strict
+    /// word-subset of exactly ONE known node ("market" → "market-square";
+    /// the Levenshtein similarity for that pair is ≈0.46, under the typo
+    /// guard, so it used to MINT a ghost twin) resolves to that node.
+    /// **Proper-noun naming** — when a genuinely new node is minted,
+    /// `narrative` (the tracker's own window) is scanned for the
+    /// capitalized place-phrase the story uses ("greywater" → "Greywater
+    /// Village") so the node carries a real diegetic name + a matching id.
+    /// Pure graph mechanics — no undo snapshot here (the caller
     /// owns snapshotting discipline).
-    pub fn resolve_or_mint_node(&mut self, raw: &str) -> Option<String> {
+    pub fn resolve_or_mint_node(&mut self, raw: &str, narrative: &[&str]) -> Option<String> {
         let raw_trimmed = raw.trim();
         if raw_trimmed.is_empty() {
             return None;
@@ -538,20 +579,39 @@ impl TravelGraph {
             );
             return Some(id);
         }
-        let name = if raw_trimmed.chars().count() > 80 {
-            raw_trimmed.chars().take(80).collect()
+        // Fragment alias: a strict word-subset of exactly ONE known node.
+        if let Some(id) = self.resolve_fragment_alias(&slug) {
+            tracing::info!(
+                raw = %raw_trimmed,
+                resolved = %id,
+                "[TRAVEL] fragment alias: shorthand resolved to the existing node"
+            );
+            return Some(id);
+        }
+        // Mint. Prefer the narrative's capitalized place-phrase for both the
+        // diegetic name AND the id ("greywater" + "Greywater Village" in the
+        // window → id "greywater_village"); the model's bare shorthand still
+        // re-finds the node later via the fragment-alias arm above.
+        let phrase = proper_noun_phrase_for(&slug, narrative);
+        let name_src = phrase.unwrap_or_else(|| raw_trimmed.to_string());
+        let id = slugify(&name_src);
+        if id.is_empty() {
+            return None;
+        }
+        let name = if name_src.chars().count() > 80 {
+            name_src.chars().take(80).collect()
         } else {
-            raw_trimmed.to_string()
+            name_src
         };
         let node = Node {
-            id: slug.clone(),
+            id: id.clone(),
             name,
             neighbors: Vec::new(),
             setting: String::new(),
         };
         if self.upsert_node(node) {
-            tracing::info!(node_id = %slug, "[TRAVEL] minted unknown destination as a new node");
-            Some(slug)
+            tracing::info!(node_id = %id, "[TRAVEL] minted unknown destination as a new node");
+            Some(id)
         } else {
             // Cap reached (upsert_node refuses at MAX_TRAVEL_NODES) or a
             // lost race — either way the caller treats None as reject.
@@ -581,6 +641,80 @@ fn similarity(a: &str, b: &str) -> f32 {
     }
     let dist = prev[b.len()] as f32;
     1.0 - dist / a.len().max(b.len()) as f32
+}
+
+/// (2026-08-17 recommendation 2) Scan the narrative window for a capitalized
+/// proper-noun phrase containing one of the emitted fragment's words
+/// ("greywater" → the story's "Greywater" / "Greywater Village"). Absorbs
+/// following capitalized words (with `of/the/and`-style connectors only when
+/// another capitalized word follows), capped at 5 words. A lowercase
+/// mid-sentence mention never anchors — the story must itself treat the word
+/// as a name. Returns `None` when the narrative never capitalizes the
+/// fragment; the mint then falls back to the raw emitted text.
+fn proper_noun_phrase(fragment_words: &[String], narrative: &[&str]) -> Option<String> {
+    const CONNECTORS: &[&str] = &["of", "the", "and", "de", "du", "al"];
+    const MAX_WORDS: usize = 5;
+    if fragment_words.is_empty() {
+        return None;
+    }
+    let clean = |t: &str| t.trim_matches(|c: char| !c.is_alphanumeric());
+    let is_cap = |t: &str| -> bool {
+        t.chars()
+            .next()
+            .is_some_and(|c| c.is_uppercase() && !c.is_numeric())
+    };
+    for text in narrative {
+        let toks: Vec<&str> = text.split_whitespace().collect();
+        for (i, tok) in toks.iter().enumerate() {
+            let bare = clean(tok);
+            if !is_cap(bare) {
+                continue;
+            }
+            let lower = bare.to_lowercase();
+            if !fragment_words.iter().any(|w| *w == lower) {
+                continue;
+            }
+            let mut words: Vec<String> = vec![bare.to_string()];
+            let mut j = i + 1;
+            while words.len() < MAX_WORDS && j < toks.len() {
+                let nb = clean(toks[j]);
+                // Length ≥2 keeps the pronoun "I"/"A" out of place-names
+                // ("Greywater Village. I want…" → "Greywater Village").
+                if is_cap(nb) && nb.chars().count() >= 2 {
+                    words.push(nb.to_string());
+                    j += 1;
+                } else if CONNECTORS.contains(&nb.to_lowercase().as_str())
+                    && words.len() + 2 <= MAX_WORDS
+                {
+                    // A connector joins only when a capitalized word follows
+                    // ("Hall of the Grey King"), else it ends the phrase.
+                    let nb2 = toks.get(j + 1).map(|t| clean(t)).unwrap_or("");
+                    if is_cap(nb2) && nb2.chars().count() >= 2 {
+                        words.push(nb.to_string());
+                        words.push(nb2.to_string());
+                        j += 2;
+                    } else {
+                        break;
+                    }
+                } else {
+                    break;
+                }
+            }
+            return Some(words.join(" "));
+        }
+    }
+    None
+}
+
+/// (2026-08-17 rec-2 follow-up) Applier-facing wrapper: derive the ≥4-char
+/// anchor words from a raw emitted fragment/id, then scan the narrative.
+/// Shared by the TRAVEL mint path and the `[DISCOVER]` label fallback.
+pub fn proper_noun_phrase_for(fragment: &str, narrative: &[&str]) -> Option<String> {
+    let words: Vec<String> = word_list(fragment)
+        .into_iter()
+        .filter(|w| w.chars().count() >= 4)
+        .collect();
+    proper_noun_phrase(&words, narrative)
 }
 
 /// One named NPC in the Rust-authoritative registry (Fable Phase 5A,
@@ -644,6 +778,75 @@ impl NpcEntry {
     }
 }
 
+/// Lowercase word list of an id/name/alias, split on every non-alphanumeric
+/// char ("captain-harsk" → ["captain", "harsk"]). Shared by the travel-node
+/// + NPC fragment-alias arms (Chloe's recommendation 2, 2026-08-17: the E4B
+/// emits shorthand fragments — "market", "harsk" — that must resolve to the
+/// full stored id instead of minting ghost twins or tripping the
+/// anti-hallucination reject).
+fn word_list(s: &str) -> Vec<String> {
+    s.to_lowercase()
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|t| !t.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// A fragment is alias-worthy only if it carries real signal: its longest
+/// word is ≥4 chars. Blocks "the"-style noise from subset-matching a
+/// long compound id ("the" ⊆ "the-crooked-lantern-tavern").
+fn fragment_is_specific(words: &[String]) -> bool {
+    words
+        .iter()
+        .map(|w| w.chars().count())
+        .max()
+        .unwrap_or(0)
+        >= 4
+}
+
+/// Resolve a `[PRESENCE]` surface form against a registry slice: exact
+/// id/alias first, then a UNIQUE whole-word-containment alias pass
+/// ("harsk" → "captain-harsk" when exactly one entry's id/name/alias words
+/// contain every fragment word). Ambiguous (2+ hits) or unspecific
+/// fragments return `None` — the caller's anti-hallucination reject stands
+/// (a wrong assert is worse than a rejected one). Free fn so the lib.rs
+/// applier can use it over its cloned registry slice without the full
+/// `NpcRegistry` borrow.
+pub fn resolve_npc_surface<'a>(entries: &'a [NpcEntry], surface: &str) -> Option<&'a NpcEntry> {
+    let c = surface.trim();
+    if let Some(e) = entries.iter().find(|e| e.matches(c)) {
+        return Some(e);
+    }
+    let words = word_list(c);
+    if !fragment_is_specific(&words) {
+        return None;
+    }
+    let mut hits: Vec<&NpcEntry> = entries
+        .iter()
+        .filter(|e| {
+            let mut entry_words = word_list(&e.id);
+            entry_words.extend(word_list(&e.name));
+            for a in &e.aliases {
+                entry_words.extend(word_list(a));
+            }
+            // Strict subset: every fragment word present AND the entry
+            // strictly longer (an equal match was the exact pass above).
+            entry_words.len() > words.len() && words.iter().all(|w| entry_words.contains(w))
+        })
+        .collect();
+    hits.dedup_by(|a, b| a.id == b.id);
+    if hits.len() == 1 {
+        tracing::info!(
+            surface = %c,
+            resolved = %hits[0].id,
+            "[PRESENCE] fragment alias: shorthand resolved to the existing entry"
+        );
+        Some(hits[0])
+    } else {
+        None
+    }
+}
+
 /// The Rust-authoritative named-NPC registry (Phase 5A, 2026-07-29). Seeded
 /// from the scenario card's `<cast>` block; the source of truth for which NPC
 /// ids exist (the `[PRESENCE]` whitelist). `Vec` (not a map) — matches the
@@ -681,8 +884,11 @@ impl NpcRegistry {
     /// Case-insensitive. Returns `None` for unknown forms — the caller (the
     /// `[PRESENCE]` applier) treats that as a reject-directive (the
     /// anti-hallucination gate). This is the load-bearing normalization fn.
+    /// (2026-08-17 recommendation 2) Falls through to the unique
+    /// fragment-alias pass (`resolve_npc_surface`) so shorthand ids
+    /// ("harsk" → "captain-harsk") resolve instead of rejecting.
     pub fn resolve(&self, surface: &str) -> Option<&NpcEntry> {
-        self.entries.iter().find(|e| e.matches(surface))
+        resolve_npc_surface(&self.entries, surface)
     }
 
     /// Compact prompt render for the `cast:` line (the registry's roster —
@@ -734,6 +940,20 @@ impl NpcRegistry {
             return false;
         }
         if self.find(&entry.id).is_some() {
+            return false;
+        }
+        // (2026-08-17 recommendation 2) Ghost guard: a shorthand id that
+        // fragment-aliases to an EXISTING entry ("harsk" when
+        // "captain-harsk" is registered) is a re-registration of that NPC,
+        // not a new one — treat as the duplicate no-op instead of minting a
+        // ghost twin the cast: roster + presence whitelist then carry
+        // forever.
+        if let Some(existing) = resolve_npc_surface(&self.entries, &entry.id) {
+            tracing::info!(
+                emitted = %entry.id,
+                resolved = %existing.id,
+                "[NPC_REGISTER] shorthand resolves to an existing entry — no ghost twin"
+            );
             return false;
         }
         // (2026-08-16 audit fix #14) Registry cap, same growth guard as the
@@ -3859,7 +4079,7 @@ mod tests {
         // mint creates the node + the caller's auto-link arm wires the edge.
         let mut g = sample_travel_graph();
         g.current_node = Some("market_square".to_string());
-        let id = g.resolve_or_mint_node("King's Road").expect("unknown destination mints");
+        let id = g.resolve_or_mint_node("King's Road", &[]).expect("unknown destination mints");
         assert_eq!(id, "king_s_road", "slug derived from the emitted name");
         let node = g.find_node("king_s_road").expect("node exists");
         assert_eq!(node.name, "King's Road", "diegetic name preserved");
@@ -3878,11 +4098,11 @@ mod tests {
         // "mrket square" must NOT mint a phantom twin of market_square.
         let mut g = sample_travel_graph();
         g.current_node = Some("tavern".to_string());
-        let id = g.resolve_or_mint_node("mrket square").expect("near-miss resolves");
+        let id = g.resolve_or_mint_node("mrket square", &[]).expect("near-miss resolves");
         assert_eq!(id, "market_square");
         assert_eq!(g.nodes.len(), 3, "no phantom node minted");
         // Diegetic-name typos resolve too ("The Rusty Ancor").
-        let id2 = g.resolve_or_mint_node("The Rusty Ancor").expect("name typo resolves");
+        let id2 = g.resolve_or_mint_node("The Rusty Ancor", &[]).expect("name typo resolves");
         assert_eq!(id2, "tavern");
         assert_eq!(g.nodes.len(), 3);
     }
@@ -3892,7 +4112,7 @@ mod tests {
         let mut g = sample_travel_graph();
         // Low similarity against every existing node → mint (the organic
         // world-growth path the E4B needs to leave town).
-        let id = g.resolve_or_mint_node("ferry landing").expect("new place mints");
+        let id = g.resolve_or_mint_node("ferry landing", &[]).expect("new place mints");
         assert_eq!(id, "ferry_landing");
         assert_eq!(g.nodes.len(), 4);
     }
@@ -3900,8 +4120,8 @@ mod tests {
     #[test]
     fn resolve_or_mint_refuses_at_cap_and_empty() {
         let mut g = sample_travel_graph();
-        assert_eq!(g.resolve_or_mint_node("   "), None, "blank raw never mints");
-        assert_eq!(g.resolve_or_mint_node("!!!"), None, "slug-empty raw never mints");
+        assert_eq!(g.resolve_or_mint_node("   ", &[]), None, "blank raw never mints");
+        assert_eq!(g.resolve_or_mint_node("!!!", &[]), None, "slug-empty raw never mints");
         // Cap: fill to MAX_TRAVEL_NODES, then mint must refuse.
         for i in g.nodes.len()..MAX_TRAVEL_NODES {
             g.upsert_node(Node {
@@ -3912,7 +4132,188 @@ mod tests {
             });
         }
         assert_eq!(g.nodes.len(), MAX_TRAVEL_NODES);
-        assert_eq!(g.resolve_or_mint_node("brand new place"), None, "cap refuses new nodes");
+        assert_eq!(g.resolve_or_mint_node("brand new place", &[]), None, "cap refuses new nodes");
+    }
+
+    // ---- Recommendation 2 (2026-08-17): travel fragment alias + proper-noun mint naming ----
+
+    #[test]
+    fn travel_fragment_alias_resolves_shorthand_destination() {
+        // "market" vs "market-square" scores ≈0.46 under the typo guard —
+        // without the alias arm this MINTED a ghost twin of the real node.
+        let mut g = sample_travel_graph();
+        let id = g
+            .resolve_or_mint_node("market", &[])
+            .expect("shorthand resolves instead of minting");
+        assert_eq!(id, "market_square");
+        assert_eq!(g.nodes.len(), 3, "no phantom twin minted");
+        // Through the diegetic NAME as well ("anchor" → The Rusty Anchor).
+        let id2 = g.resolve_or_mint_node("anchor", &[]).expect("name fragment resolves");
+        assert_eq!(id2, "tavern");
+        assert_eq!(g.nodes.len(), 3);
+        // A re-emitted bare shorthand finds a phrase-named mint ("greywater"
+        // → the earlier "greywater-village" mint).
+        g.upsert_node(Node {
+            id: "greywater-village".to_string(),
+            name: "Greywater Village".to_string(),
+            neighbors: vec![],
+            setting: String::new(),
+        });
+        let id3 = g.resolve_or_mint_node("greywater", &[]).expect("re-finds the mint");
+        assert_eq!(id3, "greywater-village");
+        assert_eq!(g.nodes.len(), 4);
+    }
+
+    #[test]
+    fn travel_fragment_alias_ambiguous_mints_and_noise_never_resolves() {
+        // Two nodes contain "market" → ambiguous → the alias arm declines
+        // (a wrong teleport is worse than a mint).
+        let mut g = sample_travel_graph();
+        g.upsert_node(Node {
+            id: "market-stalls".to_string(),
+            name: "Market Stalls".to_string(),
+            neighbors: vec![],
+            setting: String::new(),
+        });
+        let id = g.resolve_or_mint_node("market", &[]).expect("ambiguous fragment mints fresh");
+        assert_eq!(id, "market", "minted as its own node — no silent guess between the two");
+        // Noise fragments ("the") must never subset-match a long compound id.
+        let mut g2 = sample_travel_graph();
+        g2.upsert_node(Node {
+            id: "the-crooked-lantern-tavern".to_string(),
+            name: "The Crooked Lantern Tavern".to_string(),
+            neighbors: vec![],
+            setting: String::new(),
+        });
+        let id2 = g2
+            .resolve_or_mint_node("the", &[])
+            .expect("noise input is GIGO-minted, not aliased");
+        assert_ne!(id2, "the-crooked-lantern-tavern", "stopword fragment never aliases");
+    }
+
+    #[test]
+    fn travel_mint_names_the_node_from_the_narrative_proper_noun() {
+        // The story says "Greywater Village" → the mint carries the real
+        // place-name + a matching id (slugify's underscore style); the bare
+        // shorthand re-finds it via the fragment alias.
+        let mut g = sample_travel_graph();
+        let narrative = [
+            "I take the left branch toward a village in the next valley — the goatherd called it Greywater Village. I want to reach it before dark.",
+        ];
+        let id = g
+            .resolve_or_mint_node("greywater", &narrative)
+            .expect("new place mints");
+        assert_eq!(id, "greywater_village", "id slugged from the narrative phrase");
+        let node = g.find_node("greywater_village").unwrap();
+        assert_eq!(node.name, "Greywater Village", "diegetic name from the story");
+        assert_eq!(
+            g.resolve_or_mint_node("greywater", &[]),
+            Some("greywater_village".to_string()),
+            "the bare shorthand re-finds the phrase-named mint"
+        );
+        // Lowercase-only mentions never anchor — the raw text is the name.
+        let mut g2 = sample_travel_graph();
+        let id2 = g2
+            .resolve_or_mint_node("fog hollow", &["we sleep in a fog hollow off the track"])
+            .expect("mint still works without a capitalized mention");
+        assert_eq!(id2, "fog_hollow");
+        assert_eq!(g2.find_node("fog_hollow").unwrap().name, "fog hollow");
+    }
+
+    // ---- Recommendation 2 (2026-08-17): NPC fragment alias + ghost guard ----
+
+    fn harsk_registry() -> NpcRegistry {
+        NpcRegistry {
+            entries: vec![NpcEntry {
+                id: "captain-harsk".to_string(),
+                name: "Captain Harsk".to_string(),
+                role: "watch captain".to_string(),
+                tier: None,
+                aliases: vec!["harsk of the watch".to_string()],
+            }],
+        }
+    }
+
+    #[test]
+    fn npc_fragment_alias_resolves_shorthand_surface() {
+        let reg = harsk_registry();
+        // Exact id still first.
+        assert_eq!(reg.resolve("captain-harsk").unwrap().id, "captain-harsk");
+        // Shorthand via id words, via NAME words, and via ALIAS words.
+        assert_eq!(reg.resolve("harsk").unwrap().id, "captain-harsk");
+        assert_eq!(reg.resolve("captain").unwrap().id, "captain-harsk");
+        assert_eq!(reg.resolve("watch").unwrap().id, "captain-harsk");
+        // Unspecific (all words <4 chars) + genuinely unknown stay rejected.
+        assert!(reg.resolve("mar").is_none());
+        assert!(reg.resolve("vera").is_none());
+        // Ambiguity declines: two entries contain "captain".
+        let mut amb = harsk_registry();
+        amb.entries.push(NpcEntry {
+            id: "captain-brann".to_string(),
+            name: "Captain Brann".to_string(),
+            role: String::new(),
+            tier: None,
+            aliases: vec![],
+        });
+        assert!(amb.resolve("captain").is_none(), "no silent guess between captains");
+        assert_eq!(amb.resolve("harsk").unwrap().id, "captain-harsk", "still unique through the name");
+    }
+
+    #[test]
+    fn npc_register_shorthand_never_mints_a_ghost_twin() {
+        let mut reg = harsk_registry();
+        let inserted = reg.upsert_entry(NpcEntry {
+            id: "harsk".to_string(),
+            name: "Harsk".to_string(),
+            role: String::new(),
+            tier: None,
+            aliases: vec![],
+        });
+        assert!(!inserted, "shorthand re-registration is the duplicate no-op");
+        assert_eq!(reg.entries.len(), 1, "no ghost twin in the cast roster");
+        assert_eq!(reg.entries[0].id, "captain-harsk", "the canonical entry stands");
+        // A genuinely new NPC still registers.
+        let inserted2 = reg.upsert_entry(NpcEntry {
+            id: "mara".to_string(),
+            name: "Mara".to_string(),
+            role: String::new(),
+            tier: None,
+            aliases: vec![],
+        });
+        assert!(inserted2);
+        assert_eq!(reg.entries.len(), 2);
+    }
+
+    #[test]
+    fn discover_ghost_guard_resolves_shorthand_before_upserting() {
+        // The [DISCOVER] applier's guard rides resolve_fragment_alias: a
+        // shorthand discovery of a known node is a re-discovery no-op,
+        // never a ghost twin (the same corruption class as the TRAVEL
+        // mint twins and the NPC register ghosts).
+        let g = sample_travel_graph();
+        assert_eq!(
+            g.resolve_fragment_alias("market"),
+            Some("market_square".to_string())
+        );
+        assert_eq!(
+            g.resolve_fragment_alias("greywater"),
+            None,
+            "unknown place is a genuine discovery — the guard lets it through"
+        );
+        // Two near-identical nodes already on the graph → ambiguity declines
+        // (no silent guess); the discovery proceeds as-emitted.
+        let mut g2 = sample_travel_graph();
+        g2.upsert_node(Node {
+            id: "market-square".to_string(),
+            name: "Market Square".to_string(),
+            neighbors: vec![],
+            setting: String::new(),
+        });
+        assert_eq!(
+            g2.resolve_fragment_alias("market"),
+            None,
+            "ambiguous containment declines — the guard only blocks high-confidence dupes"
+        );
     }
 
     #[test]
