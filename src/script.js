@@ -1742,6 +1742,12 @@ function spawnLaunchSparkles(parent, count = 18) {
       if (result) {
         if (result.ok) {
           appendTerminalLine(`› updated to v${result.version} ✓`, false);
+          // The update applied but the updater's relaunch retries all failed
+          // (transient lock on the freshly-written exe) — this boot is a
+          // manual launch. Honest, one line, no error styling.
+          if (result.relaunched === false) {
+            appendTerminalLine('› auto-restart failed — this was a manual launch', false);
+          }
         } else {
           appendTerminalLine(
             `› last update failed: ${String(result.error || '').slice(0, 80)}`,

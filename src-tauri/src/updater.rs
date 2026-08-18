@@ -197,13 +197,20 @@ pub async fn perform_update(
 }
 
 /// The outcome the updater.exe writes to `data/_update_result.json` for the
-/// relaunched wupi.exe to read on its next boot (so the UI can show "Updated to
-/// vX.Y.Z" or surface the error). Mirrors the JSON the updater binary writes.
+/// relaunched wupi.exe to read on its next boot (so the UI can show "Updated
+/// to vX.Y.Z" or surface the error). Mirrors the JSON the updater binary writes.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UpdateResult {
     pub ok: bool,
     pub version: Option<String>,
     pub error: Option<String>,
+    /// Whether the updater's post-apply relaunch produced a living wupi.exe
+    /// (2026-08-18 self-healing-relaunch fix): `None` = not attempted
+    /// (copy-phase-failure policy) or marker written by an older updater;
+    /// `Some(false)` = the update applied but every spawn attempt failed —
+    /// the boot toast tells the user this was a manual launch.
+    #[serde(default)]
+    pub relaunched: Option<bool>,
 }
 
 /// Read + DELETE `data/_update_result.json` under `exe_dir`. Returns `None`

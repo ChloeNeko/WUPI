@@ -29,8 +29,10 @@
 //! 4. **Purge legacy dead paths** (`purge.rs`) — the compile-time removal
 //!    list (dead pre-reorg state folders, retired engine files). Best-effort;
 //!    a locked path never fails the update.
-//! 5. Clean up the staging dir + the downloaded zip, spawn the new
-//!    `<target>/wupi.exe`, write a result marker, and exit.
+//! 5. Clean up the staging dir + the downloaded zip, RELAUNCH the new
+//!    `<target>/wupi.exe` (retried + alive-verified — see
+//!    `spawn_wupi_robust`), write a result marker carrying the relaunch
+//!    outcome, and exit.
 //!
 //! ## Why it runs from %TEMP% — and why it self-deletes
 //!
@@ -39,13 +41,15 @@
 //! means the install's `bin/updater.exe` is just an ordinary unlocked file —
 //! the next update overwrites it naturally as part of the payload.
 //!
-//! The temp copy + its debug log are then REMOVED by `self_delete_temp_copy`
-//! before exit: this binary is the one-shot "file deleter" of the §8C purge
-//! design, and it leaves no remnants of itself anywhere — not in the install,
-//! not in `%TEMP%`. (A running Windows exe can't delete its own image, so the
-//! delete is done by a tiny detached `cmd` that outlives this process by ~2s;
-//! guarded to ONLY fire when actually running from `%TEMP%` so dev builds in
-//! `target/` never eat their own binary.)
+//! The temp copy is then REMOVED by `self_delete_temp_copy` before exit: this
+//! binary is the one-shot "file deleter" of the §8C purge design. (A running
+//! Windows exe can't delete its own image, so the delete is done by a tiny
+//! detached `cmd` that outlives this process by ~2s; guarded to ONLY fire
+//! when actually running from `%TEMP%` so dev builds in `target/` never eat
+//! their own binary.) The DEBUG LOG is deliberately kept for that sweep —
+//! `sweep_temp_residue` cleans logs older than the 10-minute freshness floor
+//! on the next update, and in the meantime the log is the only forensic trail
+//! when a relaunch fails.
 //!
 //! ## Failure model
 //!
@@ -58,6 +62,15 @@
 //! (#40) every file is complete (never truncated), and the updater does NOT
 //! relaunch a mixed install: the user re-launches via the shortcut once the
 //! disk issue is resolved; the failure marker + log explain what happened.
+//!
+//! A relaunch that fails EVERY retry (2026-08-18 fix — observed live on the
+//! 0.23.3 → 0.23.5 update: the apply completed, but a single immediate
+//! CreateProcess on the freshly rename-replaced 299 MB exe lost a race with
+//! the transient handles holding new executable content — both cleanup
+//! removes failed on the same locks that second, and the relaunch vanished
+//! silently: no boot log line, no panic file, no WER) leaves the update
+//! APPLIED and the marker reports `relaunched: false`, so the next manual
+//! boot tells the user exactly what happened instead of looking dead.
 
 // Headless binary: no console is ever allocated for it, even if a future
 // spawn site drops the creation flag (belt-and-braces alongside the
@@ -109,14 +122,6 @@ fn main() {
         }
     };
 
-    // Record the outcome for the relaunched wupi.exe to surface on its boot.
-    write_result(
-        &args.target_dir,
-        ok,
-        Some(&args.version),
-        error.as_ref().map(|e| e.message.as_str()),
-    );
-
     // Relaunch on SUCCESS + on PRE-COPY failures (the untouched old exe boots
     // back into the prior version). (#40 2026-08-15) SKIP the relaunch when
     // the copy phase itself errored: with per-file atomic replace every file
@@ -124,19 +129,35 @@ fn main() {
     // exports etc.) — auto-booting it hid the failure behind a crash loop.
     // The user relaunches via the shortcut once the disk issue is resolved;
     // the failure marker + log explain what happened.
-    if !install_touched {
-        spawn_wupi(&args.target_dir);
+    //
+    // The relaunch runs BEFORE the marker write so the marker can carry the
+    // relaunch OUTCOME (`relaunched`). The spawned app reads the marker
+    // seconds later (frontend boot gate), well after the ~2.5s alive-check
+    // below resolves — and a missing toast is cosmetic, a lying one is not.
+    let relaunched: Option<bool> = if !install_touched {
+        Some(spawn_wupi_robust(&args.target_dir))
     } else {
         log("skipping relaunch: the copy phase failed (install possibly version-mixed)");
-    }
+        None
+    };
+
+    // Record the outcome for the relaunched wupi.exe to surface on its boot.
+    write_result(
+        &args.target_dir,
+        ok,
+        Some(&args.version),
+        error.as_ref().map(|e| e.message.as_str()),
+        relaunched,
+    );
 
     // Sweep stale %TEMP% residue left by PRIOR updates (a pre-0.19 updater
-    // never self-deleted its temp copy + log). Our own files are excluded —
-    // self_delete_temp_copy removes those at exit.
+    // never self-deleted its temp copy). Our own live files are excluded;
+    // our log intentionally survives for a LATER sweep (forensics).
     sweep_temp_residue();
 
-    // Remove our own %TEMP% copy + log (the no-remnants rule). No-op when not
-    // running from %TEMP% (dev builds) or on non-Windows.
+    // Remove our own %TEMP% exe copy (the no-remnants rule, exe only — the
+    // log stays, see self_delete_temp_copy). No-op when not running from
+    // %TEMP% (dev builds) or on non-Windows.
     self_delete_temp_copy();
 
     std::process::exit(if ok { 0 } else { 1 });
@@ -248,45 +269,105 @@ fn wait_for_exit(_pid: u32, _timeout_ms: u32) {
 
 /// Spawn the (now-current) `wupi.exe` in the target dir as a detached process
 /// with no console window, so this updater can exit without taking the new app
-/// down with it.
-fn spawn_wupi(target_dir: &Path) {
+/// down with it — RETRIED with backoff and VERIFIED alive (2026-08-18 fix).
+///
+/// Why retry: the one-shot spawn races whatever transiently holds handles on
+/// freshly-written executable content (AV/indexer/sync scanning the ~1.2 GB
+/// the copy just laid down). Observed live on the 0.23.3 → 0.23.5 update: the
+/// apply completed, both best-effort cleanups (`wupi_stage_*`, `data/_update`)
+/// failed on those same locks within the same second, and the single immediate
+/// spawn vanished without a trace — no boot log line (not even the first,
+/// which the async tracing writer flushes within milliseconds of a living
+/// process), no panic file, no WER report. A CreateProcess failure on a locked
+/// image logs here and used to end the update silently; retrying converts the
+/// race into a wait. The alive-check catches the mirror case — a spawn that
+/// SUCCEEDS but whose child dies in the loader before executing any code.
+///
+/// Returns whether a living wupi.exe was produced.
+fn spawn_wupi_robust(target_dir: &Path) -> bool {
+    /// Backoff between attempts (secs). Six attempts spanning ~45s total:
+    /// long enough to outlast any realistic scan window, short enough that a
+    /// genuinely-broken relaunch doesn't hang a headless updater for minutes.
+    const BACKOFF_SECS: [u64; 5] = [2, 4, 6, 8, 10];
+    /// How long a spawned child must survive before it counts as a real boot
+    /// (a loader death happens well inside this; the app's first visible
+    /// work starts immediately).
+    const ALIVE_GRACE_MS: u64 = 2_500;
+
     let exe = target_dir.join(exe_basename());
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        // CREATE_NO_WINDOW alone — headless launch, no console flash. Do NOT
-        // add DETACHED_PROCESS: Windows ignores CREATE_NO_WINDOW when the two
-        // are combined, and a console-less detached process spawning a console
-        // app with default flags gets a NEW VISIBLE console for it. Lifetime
-        // is not a concern either — Windows children always outlive their
-        // parent, so the new wupi.exe survives this updater's exit regardless.
-        // 0x0800_0000 per winbase.h — 0x0200_0000 is a different flag
-        // (CREATE_PRESERVE_CODE_AUTHZ_LEVEL, a no-op) and leaves console
-        // children with a VISIBLE window.
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        if let Err(e) = std::process::Command::new(&exe)
-            .creation_flags(CREATE_NO_WINDOW)
-            .spawn()
-        {
-            log(format!("spawn wupi.exe failed: {e}"));
+    for attempt in 1..=(BACKOFF_SECS.len() + 1) {
+        #[cfg(windows)]
+        let spawned = {
+            use std::os::windows::process::CommandExt;
+            // CREATE_NO_WINDOW alone — headless launch, no console flash. Do NOT
+            // add DETACHED_PROCESS: Windows ignores CREATE_NO_WINDOW when the two
+            // are combined, and a console-less detached process spawning a console
+            // app with default flags gets a NEW VISIBLE console for it. Lifetime
+            // is not a concern either — Windows children always outlive their
+            // parent, so the new wupi.exe survives this updater's exit regardless.
+            // 0x0800_0000 per winbase.h — 0x0200_0000 is a different flag
+            // (CREATE_PRESERVE_CODE_AUTHZ_LEVEL, a no-op) and leaves console
+            // children with a VISIBLE window.
+            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+            std::process::Command::new(&exe)
+                .creation_flags(CREATE_NO_WINDOW)
+                .spawn()
+        };
+        #[cfg(not(windows))]
+        let spawned = std::process::Command::new(&exe).spawn();
+
+        match spawned {
+            Ok(mut child) => {
+                // Dropping the Child never kills it (std's Child drop leaks
+                // the handle on purpose); it only stops us from reaping.
+                std::thread::sleep(std::time::Duration::from_millis(ALIVE_GRACE_MS));
+                match child.try_wait() {
+                    Ok(None) => {
+                        log(format!(
+                            "spawn wupi.exe succeeded on attempt {attempt} (child alive)"
+                        ));
+                        return true;
+                    }
+                    Ok(Some(status)) => log(format!(
+                        "spawn wupi.exe attempt {attempt} child died within {ALIVE_GRACE_MS}ms (status {status})"
+                    )),
+                    // Can't query — assume the child is fine rather than
+                    // risk spawning a duplicate instance.
+                    Err(e) => {
+                        log(format!("spawn wupi.exe try_wait failed: {e} — assuming alive"));
+                        return true;
+                    }
+                }
+            }
+            Err(e) => log(format!("spawn wupi.exe attempt {attempt} failed: {e}")),
+        }
+        if attempt <= BACKOFF_SECS.len() {
+            std::thread::sleep(std::time::Duration::from_secs(BACKOFF_SECS[attempt - 1]));
         }
     }
-    #[cfg(not(windows))]
-    {
-        let _ = std::process::Command::new(&exe).spawn();
-    }
+    log("spawn wupi.exe FAILED after all retries — update applied, WUPI must be started manually");
+    false
 }
 
 /// Write `<target>/data/_update_result.json` for the relaunched wupi.exe to
 /// read on its next boot (so it can show "Updated to vX.Y.Z" or surface the
-/// error). Best-effort — a failure here just means the user won't see the toast.
-fn write_result(target_dir: &Path, ok: bool, version: Option<&str>, error: Option<&str>) {
+/// error). `relaunched`: `Some(bool)` = a relaunch was attempted + how it
+/// ended; `None` = skipped by the copy-phase-failure policy. Best-effort — a
+/// failure here just means the user won't see the toast.
+fn write_result(
+    target_dir: &Path,
+    ok: bool,
+    version: Option<&str>,
+    error: Option<&str>,
+    relaunched: Option<bool>,
+) {
     let data_dir = target_dir.join("data");
     let _ = std::fs::create_dir_all(&data_dir);
     let body = serde_json::json!({
         "ok": ok,
         "version": version,
         "error": error,
+        "relaunched": relaunched,
     });
     if let Ok(s) = serde_json::to_string_pretty(&body) {
         let _ = std::fs::write(data_dir.join("_update_result.json"), s);
@@ -302,10 +383,15 @@ fn exe_basename() -> String {
     }
 }
 
-/// Remove this binary's own `%TEMP%` copy + its debug log AFTER we exit —
-/// the "no remnants of the file deleter" rule (§8C). A running Windows exe
-/// cannot delete its own image, so we spawn a tiny detached `cmd` that waits
-/// ~2s (by which point this process has exited) and then deletes both files.
+/// Remove this binary's own `%TEMP%` copy AFTER we exit — the "no remnants
+/// of the file deleter" rule (§8C), exe only. A running Windows exe cannot
+/// delete its own image, so we spawn a tiny detached `cmd` that waits ~2s
+/// (by which point this process has exited) and then deletes it.
+///
+/// The DEBUG LOG is intentionally NOT deleted anymore (2026-08-18): it is
+/// the only forensic trail when a relaunch fails, and `sweep_temp_residue`
+/// already owns cleaning `wupi_updater_*.log` files past the 10-minute
+/// freshness floor on every subsequent update.
 ///
 /// GUARDED to only fire when the running exe actually lives under `%TEMP%`
 /// (the normal wupi.exe handoff) — a dev invocation straight from
@@ -322,14 +408,12 @@ fn self_delete_temp_copy() {
     if !exe.starts_with(&temp) {
         return; // Not the %TEMP% handoff copy (dev build) — leave it alone.
     }
-    let log_path = temp.join(format!("wupi_updater_{}.log", std::process::id()));
     // `ping -n 3` ≈ 2s sleep (the canonical console-free wait; `timeout`
     // misbehaves with redirected stdin). Quoted paths; %TEMP% never needs
     // escaping beyond quotes for cmd.
     let script = format!(
-        "ping -n 3 127.0.0.1 >nul & del /f /q \"{}\" & del /f /q \"{}\"",
-        exe.display(),
-        log_path.display()
+        "ping -n 3 127.0.0.1 >nul & del /f /q \"{}\"",
+        exe.display()
     );
     use std::os::windows::process::CommandExt;
     // CREATE_NO_WINDOW ALONE — this is the load-bearing fix. With
@@ -347,10 +431,10 @@ fn self_delete_temp_copy() {
     let mut cmd = std::process::Command::new("cmd.exe");
     // raw_arg, not args: std's default Windows argument quoting wraps the
     // script in quotes and escapes the inner path quotes as \" — cmd.exe
-    // reads those as literal characters, so both `del`s silently miss their
-    // targets and the temp copy + log survive (observed live on the
+    // reads those as literal characters, so the `del` silently misses its
+    // target and the temp copy survives (observed live on the
     // 0.19.0→0.19.1 hop). raw_arg passes the script verbatim so the quoted
-    // paths reach cmd intact.
+    // path reaches cmd intact.
     cmd.raw_arg(format!("/C {script}"));
     let _ = cmd.creation_flags(CREATE_NO_WINDOW).spawn();
 }
@@ -361,11 +445,12 @@ fn self_delete_temp_copy() {}
 
 /// Delete leftover `%TEMP%` residue from PRIOR updates: any `wupi_updater_*.exe`
 /// / `wupi_updater_*.log` file and any `wupi_stage_*` directory other than OUR
-/// own (our temp copy + log are removed by `self_delete_temp_copy` at exit).
-/// Updates applied by a pre-0.19 updater leave their temp copy + log behind —
-/// this sweep runs on every update so `%TEMP%` converges without any boot-time
-/// wiring. Scoped to WUPI's namespace only; best-effort (locked files are
-/// skipped, never fatal).
+/// own live ones (our temp exe is removed by `self_delete_temp_copy` at exit;
+/// our log is deliberately left for a LATER sweep — it is the forensic trail
+/// if this run's relaunch fails). Updates applied by a pre-0.19 updater leave
+/// their temp copy behind — this sweep runs on every update so `%TEMP%`
+/// converges without any boot-time wiring. Scoped to WUPI's namespace only;
+/// best-effort (locked files are skipped, never fatal).
 ///
 /// **Age floor (#70):** only entries older than 10 minutes (by mtime) are
 /// swept. During the exit→relaunch window a manual relaunch can re-detect
@@ -399,7 +484,7 @@ fn sweep_temp_residue() {
         }
         let path = entry.path();
         if own_exe.as_deref() == Some(path.as_path()) || path == own_log {
-            continue; // ours — self_delete_temp_copy handles these at exit
+            continue; // ours — exe: self-delete at exit; log: a LATER sweep
         }
         // (#70) Young entries may belong to a CONCURRENT updater mid-run —
         // leave them for a later sweep rather than kill a live staging dir.
