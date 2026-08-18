@@ -93,11 +93,49 @@ See `src-tauri/vendor-patches/README.md` for what each patch does.
   - Single-file path no longer applies runtime `weight_type(Q8_0)` to GGUFs
     (already quantized; re-quantizing is lossy + a multi-GB pointless pass).
   - `sd_repro` seed LOCKED at 42 — A/B determinism (one lever per run).
-- Model inventory: `models/sd/` = `image.gguf` ONLY (the safetensors
-  checkpoint + external clip_l/clip_g/vae were removed 2026-08-17; the full
-  GGUF embeds all of them). If a slim UNet-only GGUF returns later, the
-  sibling CLIP/VAE files must return with it — and re-test the external-VAE
-  conv-scale interaction before trusting it.
+- Model inventory: `models/sd/` = the FOUR-FILE shipped set (2026-08-18,
+  live as of v0.23.0): `image.gguf` (full NoobAI-XL-v1.1-merge Q8_0,
+  embedded VAE + conditioners), `clip_l.safetensors` + `clip_g.safetensors`
+  (the provenance-correct fp16 sidecars EXTRACTED from the checkpoint's own
+  source — the ClipOverride path consumes these; stock SDXL encoders
+  render mush, see the weight-provenance rule), and `vae.safetensors`
+  (distributed for completeness; the engine deliberately does NOT consume
+  an external VAE — the GGUF's embedded VAE + sd.cpp's SDXL Conv2D guard
+  stay active). All four are auto-downloaded via the boot overlay
+  (`model_downloader::REQUIRED_FILES`) from the private `ChloeNeko/WUPI`
+  HF repo under these exact names. **They must be uploaded there BEFORE
+  testers pull the v0.23.0 update** — the overlay has no skip button, and
+  a missing repo file is a permanent 404 failure (fail-fast, no retry), so
+  an updated install is stuck on the overlay until the files land.
+- **v0.23.0 release note (published 2026-08-18) + the launch-crash
+  incident:** `release.cjs` built BOTH exes with `--features diffusion-rs`
+  (diffusion-rs-sys compiled, both exes embed-verified) — but the portable
+  staging MISSED the SD stack's DLLs and **v0.23.0 could not launch on any
+  fresh install** ("stable-diffusion.dll not found"). Root cause: the
+  shared-libs build emits `stable-diffusion.dll` + `ggml{,-base,-cpu,
+  -cuda,-vulkan}.dll` next to the exes, and BOTH exes STATICALLY imported
+  that chain (+ `ggml-cuda.dll → cublas64_13.dll`) — resolved at process
+  start, before `SetDllDirectoryW(bin)`. **v0.23.1 fix (clean-root
+  ruling: the ONLY root DLL is msvcp140.dll, everything else in bin/,
+  never a duplicate):** `src-tauri/.cargo/config.toml` adds
+  `/DELAYLOAD:stable-diffusion.dll` (mirroring llama's cublas/cudart
+  delayloads) so the whole chain resolves at the first SD symbol call,
+  through `SetDllDirectoryW(bin)`; `release.cjs` stages the six SD DLLs +
+  the VC++ trio (`VCRUNTIME140.dll`, `VCRUNTIME140_1.dll`,
+  `MSVCP140_CODECVT_IDS.dll`) into `bin/` (cublas64_13 already lives
+  there — no duplicate), and runs a **static-import guard** (PE
+  import-table parse over both exes) that fails the release on ANY
+  non-system static import other than msvcp140.dll — the mechanical
+  backstop so this class of bug can never ship again. NOTE: the delayload
+  rustflags change invalidates the cached bin links — expect a relink of
+  the exes (NOT a full CUDA rebuild; the .obj fingerprint unchanged). If a
+  future -sys upgrade drags a data import into the exe link it fails
+  LOUDLY with LNK1194 — fix the binding, never move the DLL to the root.
+  v0.23.0 installs cannot self-update (the updater runs inside the app) —
+  minimal manual unstick: drop the six SD DLLs + a copy of
+  `bin\cublas64_13.dll` at the install ROOT of the v0.23.0 install (its
+  exe statically imports them there), then the in-app updater pulls the
+  next release and the root copies can be deleted.
 - Pending: ~~verify through the FULL app~~ **VERIFIED 2026-08-17 23:47** —
   PRISM generate through `sd:dev` with the single-file routing: 41.99 s,
   clean swap + gallery row + LLM reload. Backend + app integration DONE.

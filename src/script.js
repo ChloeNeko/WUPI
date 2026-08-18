@@ -819,7 +819,8 @@ function spawnLaunchSparkles(parent, count = 18) {
     console.error('[Wupi] check_models failed; assuming present to avoid blocking boot', err);
     return; // Don't trap the user behind a broken overlay; let boot proceed.
   }
-  const needDownload = status?.wupi === 'missing' || status?.embed === 'missing';
+  const needDownload = status?.wupi === 'missing' || status?.embed === 'missing'
+    || status?.sd === 'missing';
   if (!needDownload) return;
 
   const overlay = document.getElementById('download-overlay');
@@ -838,6 +839,17 @@ function spawnLaunchSparkles(parent, count = 18) {
   // through). The overlay's CSS fade-in (0.8s) gives a soft reveal.
   overlay.classList.add('show');
 
+  // Size hint for the idle subtitle, derived from WHAT is missing: a fresh
+  // install pulls everything (~12 GB); a 0.21 → 0.22 update already has both
+  // GGUFs and only fetches the PRISM SD set (~6 GB). Honest copy either way.
+  const sdOnlyUpdate = status?.wupi === 'present' && status?.embed === 'present';
+  const idleSubtitle = sdOnlyUpdate
+    ? 'Update setup: download the PRISM image-generation models (~6 GB). One-time only.'
+    : 'Setup: download the AI models (~12 GB — chat, memory, and PRISM image-gen). One-time only.';
+  // Apply immediately — the static HTML copy is the generic fresh-install
+  // variant; an update run must see the ~6 GB variant before any progress.
+  if (subtitle) subtitle.textContent = idleSubtitle;
+
   // Human-readable byte formatting for the stats line.
   const fmtBytes = (n) => {
     if (!n || n <= 0) return '0 MB';
@@ -854,7 +866,7 @@ function spawnLaunchSparkles(parent, count = 18) {
       case 'finalizing': return `Saving ${file || 'file'}…`;
       case 'done': return 'Download complete — click LAUNCH to continue.';
       case 'failed': return 'Download failed.';
-      default: return 'First-run setup: download the AI models (~10 GB). One-time only.';
+      default: return idleSubtitle;
     }
   };
 
@@ -1095,7 +1107,7 @@ function spawnLaunchSparkles(parent, count = 18) {
 
     try {
       const status = await invoke('check_models');
-      if (status?.wupi === 'missing' || status?.embed === 'missing') {
+      if (status?.wupi === 'missing' || status?.embed === 'missing' || status?.sd === 'missing') {
         console.log(`[Wupi] ${tag}: models missing, deferring to download overlay`);
         return;
       }
@@ -1138,7 +1150,7 @@ function spawnLaunchSparkles(parent, count = 18) {
   // to play the paw on a misfire than strand the user on a blank screen).
   try {
     const status = await invoke('check_models');
-    if (status?.wupi === 'missing' || status?.embed === 'missing') {
+    if (status?.wupi === 'missing' || status?.embed === 'missing' || status?.sd === 'missing') {
       console.log('[Wupi] models missing; skipping boot paw (download overlay takes over)');
       return;
     }

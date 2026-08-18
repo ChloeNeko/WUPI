@@ -89,14 +89,15 @@ let flowState = {
   playerDraft: null,      // the player wizard's draft (starting conditions for fable_start)
   simDraft: null,         // the sim wizard's draft (context for the launch)
   pendingImport: null,    // a SillyTavern import { charData, portraitDataUrl?, portraitExt? } seeded by the IMPORT tile → the Player Wizard
-  pendingSimIntro: null,  // imported first_mes + alternate_greetings carried into the SIM card's <intro> (set by the IMPORT tile)
 };
 // The blank flowState every full reset stamps (exitFlowToTitle + closeFable).
-// A surviving state would resume a stale step on the next flow entry — worse,
-// a surviving pendingSimIntro can seed a fresh session's SIM card with an
-// old import's greeting.
+// A surviving state would resume a stale step on the next flow entry.
+// (2026-08-18) pendingSimIntro is GONE: an import's greetings now ride into a
+// SIM wizard ONLY via that wizard's own IMPORT tile (flowCreateSim's direct
+// presetIntro param) — a player-side import can never leak its greeting into
+// an unrelated fresh world's <intro>.
 function freshFlowState() {
-  return { step: null, slideOneHasBack: false, selectedCardId: null, selectedPlayerId: null, playerDraft: null, simDraft: null, pendingImport: null, pendingSimIntro: null };
+  return { step: null, slideOneHasBack: false, selectedCardId: null, selectedPlayerId: null, playerDraft: null, simDraft: null, pendingImport: null };
 }
 
 // Start/stop the persistent New Game / Load flow ambiance (deep void +
@@ -930,9 +931,11 @@ async function flowImportPlayer(selectedBtn) {
   // picker — the second would burn/render over the first's chain.
   if (flowBusy) return;
   flowState.pendingImport = result;
-  // Carry the imported greetings (first_mes + alternate_greetings) into the
-  // SIM card's <intro> so the authored opening survives verbatim (2026-08-13).
-  flowState.pendingSimIntro = result.introText || null;
+  // (2026-08-18) The import's greetings (first_mes + alternate_greetings) NO
+  // LONGER ride toward the SIM step from a player-side import — that carry
+  // seeded an unrelated fresh world's <intro> with this card's opening beat.
+  // They survive only in charData (the wizard's import context); a SIM card
+  // gets an import's greetings only via the SIM pair's own IMPORT tile.
   setFlowBusy(true);
   const rejected = siblingTilesExcept(selectedBtn);
   playBurnTransition({
@@ -957,8 +960,7 @@ async function flowImportPlayer(selectedBtn) {
         onCreated: ({ playerId, draft }) => {
           flowState.selectedPlayerId = playerId;
           flowState.playerDraft = draft;
-          // keepStaleIntro: the import's greetings ride into the SIM card.
-          flowSimPair(true);
+          flowSimPair();
         },
         back: () => returnToPlayerPair(),
       });
@@ -1026,20 +1028,16 @@ function advanceAfterPlayer(playerId) {
 // <start>, the travel graph via <locations>, the opening cast via <cast>) so
 // the tracker has them from turn 1. Reached from the SIM pair (NEW / IMPORT).
 // `presetImport` seeds the wizard from a SillyTavern import; `presetIntro`
-// carries the import's greetings into the card's <intro>. On CREATE →
+// carries THAT import's greetings into the card's <intro> (passed directly by
+// flowImportSim — the only source since 2026-08-18). On CREATE →
 // advanceFromSim (the content-aware skip matrix).
 function flowCreateSim(presetImport = null, presetIntro = null) {
   showScreen('creator-chat');
   setFlowStep('creator-chat');
-  // Consume any import-carried opening beat (first_mes + alternate_greetings
-  // from the IMPORT tile) so it lands in the SIM card's <intro>. Cleared after
-  // consumption so a later non-import run starts clean.
-  const intro = presetIntro != null ? presetIntro : (flowState.pendingSimIntro || null);
-  flowState.pendingSimIntro = null;
   renderCreatorChat(screens['creator-chat'], {
     creatorKind: 'sim',
     presetImportData: presetImport,
-    presetIntro: intro,
+    presetIntro,
     onCreated: ({ cardId, draft }) => {
       flowState.selectedCardId = cardId;
       flowState.simDraft = draft;
@@ -1077,12 +1075,7 @@ function spawnFlowTiles() {
 }
 
 // --- SIM pair: NEW SIM CARD / LOAD SIM CARD / IMPORT ---------------------
-// `keepStaleIntro` is passed ONLY by the player-IMPORT path — its
-// pendingSimIntro (the imported first_mes/greetings) must survive into
-// flowCreateSim's fallback. Every non-import entry clears it so a stale
-// import greeting can never seed a fresh SIM card.
-function flowSimPair(keepStaleIntro = false) {
-  if (!keepStaleIntro) flowState.pendingSimIntro = null;
+function flowSimPair() {
   buildFlowPairTiles({
     pair: [
       { caption: 'NEW SIM CARD', act: 'new-sim', onClick: (b) => burnPairTile(b, () => flowCreateSim()) },
@@ -1134,7 +1127,6 @@ async function flowImportSim(selectedBtn) {
   // (2026-08-15 audit fix) Re-check flowBusy AFTER the dialog await (see
   // flowImportPlayer): two rapid clicks both passed the pre-await guard.
   if (flowBusy) return;
-  flowState.pendingSimIntro = result.introText || null;
   setFlowBusy(true);
   const rejected = siblingTilesExcept(selectedBtn);
   playBurnTransition({
@@ -1936,9 +1928,7 @@ function closeFable() {
     stopNewGameMusic(fableRoot, { immediate: true });
     // Reset the New Game flow machine + chrome (mirrors exitFlowToTitle):
     // closeFable can fire mid-flow, and a surviving flowState would resume a
-    // stale step on reopen — worse, a surviving pendingSimIntro could seed
-    // the NEXT session's fresh SIM card with this session's old import
-    // greeting.
+    // stale step on reopen.
     stopFlowAmbiance();
     if (flowChrome) {
       flowChrome.hideBack();

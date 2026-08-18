@@ -36,8 +36,7 @@ import './prism.css';
 import { activateChrome, deactivateChrome } from './engine/chrome.js';
 import { sdStatus, clearLatch } from './engine/api.js';
 import { buildEl as buildComposer, wire as wireComposer, teardown as teardownComposer,
-  setDone as composerDone, setLastSeed as composerSetLastSeed,
-  loadFromImage as composerLoadFromImage } from './screens/composer.js';
+  setDone as composerDone, loadFromImage as composerLoadFromImage } from './screens/composer.js';
 import { buildEl as buildGallery, wire as wireGallery, teardown as teardownGallery,
   refresh as galleryRefresh } from './screens/gallery.js';
 import { buildEl as buildFork, wire as wireFork, teardown as teardownFork,
@@ -223,15 +222,12 @@ function resumePrism() {
 //
 // The single subscriber for `prism-gen-done`. Routes the result to the active
 // screen: composer re-enables its Generate button; fork swaps B's image. On
-// failure, surface a toast. Captures the result's seed into the composer's
-// seed-lock (so a locked session iterates on the real seed).
+// failure, surface a toast.
 
 function onGenDone(payload) {
   if (!payload) return;
   if (payload.ok && payload.image) {
     const img = payload.image;
-    // Capture the real seed into the composer's lock (no-op if unlocked).
-    composerSetLastSeed(img.seed);
     // Route to the active screen.
     if (activeScreen === 'composer') {
       composerDone(screens.composer.el);

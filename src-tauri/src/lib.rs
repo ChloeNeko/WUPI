@@ -1193,9 +1193,7 @@ pub fn run() {
             prism_gallery_list,
             prism_gallery_get,
             prism_gallery_favorite,
-            prism_gallery_trash,
-            prism_gallery_restore,
-            prism_gallery_purge,
+            prism_gallery_delete,
             player_state_get,
             fable_active_card_get,
             fable_schema_get,
@@ -1560,6 +1558,40 @@ fn resolve_sd_model_path(app: &tauri::AppHandle) -> Option<std::path::PathBuf> {
     None
 }
 
+/// Resolve the SD checkpoint for the Prism IPCs: the boot-time stash if
+/// set, else a fresh disk re-scan (the SD analog of `boot_load_model`'s
+/// post-download re-scan). The first-run download overlay ends in
+/// `location.reload()` — a WEBVIEW reload only — so the process that
+/// started with no SD files never re-runs setup() and the stash stays
+/// `None` until a full app restart (fresh installs downloaded all 4 SD
+/// files fine, then Prism kept showing "no model found"). The same holds
+/// for a checkpoint dropped into `models/sd/` while the app runs. A
+/// re-scan hit is written back to the stash so later reads skip the scan;
+/// the downloader's `.part` staging + `pick_sd_checkpoint`'s extension
+/// filter mean a mid-download scan can never see a partial final file.
+fn sd_model_path_or_rescan(app: &tauri::AppHandle, state: &AppState) -> Option<std::path::PathBuf> {
+    let stashed = state
+        .pending_sd_model_path
+        .lock()
+        .expect("pending_sd_model_path mutex")
+        .clone();
+    if stashed.is_some() {
+        return stashed;
+    }
+    let resolved = resolve_sd_model_path(app);
+    if resolved.is_some() {
+        tracing::info!(
+            "prism: SD model resolved via on-demand re-scan \
+             (post-download reload / manual-drop path)"
+        );
+        *state
+            .pending_sd_model_path
+            .lock()
+            .expect("pending_sd_model_path mutex") = resolved.clone();
+    }
+    resolved
+}
+
 /// Pick a single SD checkpoint from a directory. Preference order:
 ///
 /// 1. **Assembled multi-file GGUF layout** (2026-08-15): when the dir holds
@@ -1663,33 +1695,69 @@ fn resolve_embed_model_dirs(app: &tauri::AppHandle) -> Option<std::path::PathBuf
 // ── First-run GGUF downloader IPC ──────────────────────────────────────────
 //
 // Four commands power the boot download overlay:
-//   - check_models            : are WUPI.gguf / Embed.gguf present?
-//   - download_models         : stream both from HF into <exe_dir>/data/models
+//   - check_models            : are WUPI.gguf / Embed.gguf / the PRISM SD set
+//                               (models/sd/{image.gguf, vae.safetensors,
+//                               clip_l.safetensors, clip_g.safetensors})
+//                               present?
+//   - download_models         : stream whatever's missing from HF into
+//                               <install>/models (+ models/sd/), fire-and-
+//                               forget on a detached tokio task
 //   - get_download_progress   : polled snapshot of the in-flight download
 //   - cancel_download         : signal an in-flight download to stop
 //
-// The flow (driven from script.js's setupBootSplash gate):
+// The flow (driven from script.js's setupModelDownloadGate):
 //   1. setup emits `model-status: missing` when no gguf is found (lib.rs
 //      setup() above).
-//   2. script.js calls check_models to confirm, shows #download-overlay.
+//   2. script.js calls check_models; ANY missing file shows
+//      #download-overlay (v0.22.0: this includes the SD set, which is how
+//      0.21 → 0.22 updaters meet the overlay once more for the SD pull).
 //   3. User clicks "Download" → download_models fires; the overlay subscri
 //      cribes to `download-progress` events + polls get_download_progress.
-//   4. On Done, script.js calls app_ready (which re-resolves the model and
-//      triggers a reload via the existing model-status path).
+//      Present files are skipped, so an update run downloads ONLY the gap.
+//   4. On Done, the LAUNCH button reloads the page so setup() re-runs with
+//      every model present and the normal boot proceeds.
 
-/// Check whether the chat model + embedder model are present in any candidate
-/// `models/` dir. Returns a JSON object the frontend uses to decide whether
-/// to show the download overlay. Both-present ⇒ boot normally; either
-/// missing ⇒ show the overlay (the downloader fetches BOTH regardless, so
-/// the simple "either missing" gate is correct).
+/// Check whether the chat model, embedder model, and the full PRISM SD set
+/// are present in any candidate `models/` dir. Returns a JSON object the
+/// frontend uses to decide whether to show the download overlay. All-present
+/// ⇒ boot normally; anything missing ⇒ show the overlay (the downloader
+/// fetches everything missing and skips what's there, so the simple
+/// "anything missing" gate is correct — and it's what surfaces the SD
+/// download on the 0.21 → 0.22 update: existing installs have both GGUFs but
+/// none of `models/sd/`, so they meet the overlay exactly once more).
 #[tauri::command]
 fn check_models(app: tauri::AppHandle) -> serde_json::Value {
     let wupi = resolve_model_path(&app).is_some();
     let embed = resolve_embed_model_dirs(&app).is_some();
+    let sd = sd_models_present(&app);
     serde_json::json!({
         "wupi": if wupi { "present" } else { "missing" },
         "embed": if embed { "present" } else { "missing" },
+        "sd": if sd { "present" } else { "missing" },
     })
+}
+
+/// Whether the complete four-file PRISM checkpoint set (`image.gguf`,
+/// `vae.safetensors`, `clip_l.safetensors`, `clip_g.safetensors` — the
+/// exact names `model_downloader::REQUIRED_FILES` fetches) exists in the
+/// `sd/` subdir of ANY candidate models dir. Deliberately an exact-name
+/// check, NOT `resolve_sd_model_path`: the download gate must fire until the
+/// exact shipped set is on disk (a lone stray checkpoint isn't "present" —
+/// the downloader's files are what the release recipe is proven against).
+fn sd_models_present(app: &tauri::AppHandle) -> bool {
+    const SD_FILES: [&str; 4] = [
+        "image.gguf",
+        "vae.safetensors",
+        "clip_l.safetensors",
+        "clip_g.safetensors",
+    ];
+    for dir in model_search_dirs(app) {
+        let sd_dir = dir.join("sd");
+        if SD_FILES.iter().all(|f| sd_dir.join(f).exists()) {
+            return true;
+        }
+    }
+    false
 }
 
 /// The target `models/` dir for downloads: `<exe_dir>/models` (§8C promoted
@@ -9008,8 +9076,10 @@ fn build_creator_assistant_system_prompt(creator_kind: &str) -> String {
          - IMPORTED reference data (delivered as an <import> block): preserve its \
          authored lore faithfully — map fields onto the schema with high fidelity, \
          not a rewrite. LIVE chat responses: actively curate + format them as \
-         above. The distinction matters: imports are authored work to keep; chat \
-         is rough material to refine.\n\
+         above. The distinction matters: imports are authored work to keep by \
+         default; chat is rough material to refine — and a live concept that \
+         supersedes the import wins outright (discard rule in the <import> \
+         block).\n\
          Curating is reformatting and condensing facts the user gave you — never \
          inventing details they did not supply.\n\n",
     );
@@ -11757,15 +11827,23 @@ async fn creator_assistant_turn(
     });
     if let Some(data) = import_data {
         // Fold the mechanically-extracted import data in as a second system
-        // message: the user's starting concept, to map onto the schema + refine
-        // (never invent details that conflict with it).
+        // message: the user's starting concept, to map onto the schema + refine.
+        // Precedence law (2026-08-18): the user's live instructions outrank the
+        // import — refinements keep the authored lore, but a concept that
+        // supersedes it wins via the discard_import signal (the frontend then
+        // drops this block + rebuilds the draft). Without this the wizard fused
+        // the import with whatever the user described next (the "combining my
+        // information with the imported card" report).
         let mut content = String::with_capacity(128 + data.to_string().len());
         content.push_str(
             "Imported reference data, mechanically extracted from an external file. \
              Treat it as the user's AUTHORED starting concept — map its fields onto \
              the schema with high fidelity (preserve its lore; do not rewrite, \
-             condense, or paraphrase it away), fill gaps by asking, and never invent \
-             details that conflict with it:\n<import>",
+             condense, or paraphrase it away), and fill gaps by asking. The user's \
+             live instructions outrank it: if they clearly describe a different \
+             concept than this import, discard the imported material entirely — \
+             emit \"discard_import\": true in your envelope and rebuild the draft \
+             from their words alone, keeping exactly one concept per card:\n<import>",
         );
         content.push_str(&data.to_string());
         content.push_str("</import>");
@@ -12060,15 +12138,17 @@ async fn fable_player_action_set(
 /// The Prism status snapshot for the UI's status banner. `model_present`
 /// tells the UI whether a checkpoint exists in `models/sd/`; `disabled` is
 /// the one-strike failure latch (a prior render OOM'd/errored). Both gate the
-/// Generate button's enabled state.
+/// Generate button's enabled state. Re-scans `models/sd/` when the boot stash
+/// is empty, so a completed first-run download (webview reload, NOT a process
+/// restart) or a manually dropped checkpoint is picked up on the next Prism
+/// open — the banner's "drop a checkpoint in + reopen Prism" promise.
 #[tauri::command]
-async fn prism_sd_status(state: tauri::State<'_, AppState>) -> Result<serde_json::Value, String> {
+async fn prism_sd_status(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+) -> Result<serde_json::Value, String> {
     use std::sync::atomic::Ordering;
-    let model_path = state
-        .pending_sd_model_path
-        .lock()
-        .expect("pending_sd_model_path mutex")
-        .clone();
+    let model_path = sd_model_path_or_rescan(&app, state.inner());
     Ok(serde_json::json!({
         "model_present": model_path.is_some(),
         "model_name": model_path.as_ref().and_then(|p| p.file_name()).and_then(|n| n.to_str()).unwrap_or(""),
@@ -12124,13 +12204,10 @@ async fn prism_generate(
         .cloned()
         .ok_or_else(|| "Prism gallery database is unavailable (boot init failed)".to_string())?;
 
-    // Resolve the SD model path (None → no checkpoint in models/sd/).
-    let sd_model_path = state
-        .pending_sd_model_path
-        .lock()
-        .expect("pending_sd_model_path mutex")
-        .clone();
-    let sd_model_path = sd_model_path.ok_or_else(|| {
+    // Resolve the SD model path (None → no checkpoint in models/sd/). The
+    // helper re-scans disk when the boot stash is empty (the post-download
+    // reload / manual-drop path) — same contract as the LLM re-scan below.
+    let sd_model_path = sd_model_path_or_rescan(&app, state.inner()).ok_or_else(|| {
         "No Stable Diffusion model found. Drop a checkpoint (.safetensors or .gguf) into the models/sd/ folder.".to_string()
     })?;
 
@@ -12152,17 +12229,19 @@ async fn prism_generate(
 
     // Snapshot the params + metadata for the gallery insert (the request is
     // moved into the swap core; the row needs its own copies).
+    // LOCKED RECIPE (2026-08-17): the row records what the USER composed +
+    // what actually rendered — row_prompt is the user prompt (the injected
+    // quality prefix is engine machinery, invisible + NOT stored), the
+    // negative block likewise isn't stored, and cfg/steps/sampler come from
+    // the REQUEST (the enforced values), not the ignored params fields.
     let row_prompt = params.prompt.clone();
-    let row_negative = params
-        .negative_prompt
-        .clone()
-        .unwrap_or_default();
+    let row_negative = String::new();
     let row_seed = params.seed;
-    let row_cfg = params.cfg;
-    let row_steps = params.steps;
+    let row_cfg = request.cfg_scale;
+    let row_steps = request.steps as i32;
     let row_width = request.width as i32;
     let row_height = request.height as i32;
-    let row_sampler = params.sampler;
+    let row_sampler = request.sampling_method;
     let row_model = model_name.clone();
     let dest_for_insert = dest.clone();
     let created_at_for_insert = created_at;
@@ -12244,7 +12323,7 @@ async fn prism_generate(
                         match gallery_for_insert.insert(&new_row) {
                             Ok(id) => {
                                 // Re-read the row to get the full GalleryImage
-                                // (id + favorite/trashed defaults) for the event.
+                                // (id + favorite default) for the event.
                                 let img = gallery_for_insert.get(id).ok().flatten();
                                 let _ = app_handle.emit(
                                     "prism-gen-done",
@@ -12351,9 +12430,12 @@ async fn prism_gallery_favorite(
     gallery.set_favorite(id, fav).map_err(|e| format!("{e:#}"))
 }
 
-/// Soft-delete (move to trash).
+/// PERMANENT delete (2026-08-18 Chloe ruling): remove the row AND unlink the
+/// PNG file. There is NO trash / soft delete / restore for gallery images —
+/// one click on Delete and the image is gone, period. Best-effort file unlink
+/// (a missing file isn't an error — the row removal is the source of truth).
 #[tauri::command]
-async fn prism_gallery_trash(
+async fn prism_gallery_delete(
     id: i64,
     state: tauri::State<'_, AppState>,
 ) -> Result<(), String> {
@@ -12362,37 +12444,7 @@ async fn prism_gallery_trash(
         .get()
         .cloned()
         .ok_or_else(|| "Prism gallery database is unavailable".to_string())?;
-    gallery.trash(id).map_err(|e| format!("{e:#}"))
-}
-
-/// Restore from trash.
-#[tauri::command]
-async fn prism_gallery_restore(
-    id: i64,
-    state: tauri::State<'_, AppState>,
-) -> Result<(), String> {
-    let gallery = state
-        .prism_db
-        .get()
-        .cloned()
-        .ok_or_else(|| "Prism gallery database is unavailable".to_string())?;
-    gallery.restore(id).map_err(|e| format!("{e:#}"))
-}
-
-/// Hard-delete: remove the row AND unlink the PNG file. Used by the trash
-/// empty action. Best-effort file unlink (a missing file isn't an error — the
-/// row removal is the source of truth).
-#[tauri::command]
-async fn prism_gallery_purge(
-    id: i64,
-    state: tauri::State<'_, AppState>,
-) -> Result<(), String> {
-    let gallery = state
-        .prism_db
-        .get()
-        .cloned()
-        .ok_or_else(|| "Prism gallery database is unavailable".to_string())?;
-    let path = gallery.purge(id).map_err(|e| format!("{e:#}"))?;
+    let path = gallery.delete(id).map_err(|e| format!("{e:#}"))?;
     if let Some(p) = path {
         let _ = std::fs::remove_file(&p); // best-effort; missing file is fine
     }

@@ -2,7 +2,7 @@
 // PRISM FORK & EDIT — seed-locked A/B iteration.
 //
 // A/B split-screen: left = the source image (seed-locked), right = a new
-// generation with the SAME seed but editable prompt/CFG/sampler. A vertical
+// generation with the SAME seed but an editable prompt. A vertical
 // drag-to-compare slider scrubs between the two images so the user sees
 // exactly how changing tags altered the base.
 //
@@ -10,13 +10,18 @@
 // identical pixels (the diffusion-rs `.seed(i64)` contract, verified in the
 // §1a investigation). Forking locks the source's seed + re-renders with the
 // edited prompt; only the changed tags differ. The "Edit" action hands the
-// seed + edited params to the composer.
+// seed + edited prompt to the composer.
+//
+// LOCKED RECIPE (Chloe ruling, 2026-08-17): B's ONLY editable knob is the
+// prompt — the sampler/steps/CFG (and the old negative lane) are locked
+// server-side constants with NO control surface here or anywhere. The seed
+// is display-locked to A's.
 //
 // Workflow:
 //   1. fork.load(image) — seeds the source (A) + the editable form (B) with
-//      the image's params. B's prompt/sampler/CFG are editable; seed is LOCKED.
+//      the image's prompt. B's prompt is editable; seed is LOCKED.
 //   2. "Regenerate B" — calls prism_generate with the locked seed + B's
-//      edited params; the result lands as B's image.
+//      edited prompt; the result lands as B's image.
 //   3. "Keep B" — B's result is already in the gallery (prism_generate
 //      inserted it); this just routes back to the gallery to show it.
 //   4. The drag slider is pure CSS clip — no generation, just reveal.
@@ -25,7 +30,7 @@
 // =============================================================
 
 import { convertFileSrc } from '@tauri-apps/api/core';
-import { SAMPLERS, generate } from '../engine/api.js';
+import { generate } from '../engine/api.js';
 
 // The source image (A) + the editable B params.
 let source = null;            // GalleryImage
@@ -71,18 +76,6 @@ export function buildEl(routerHooks = {}) {
           <textarea id="fork-prompt" class="prism-textarea" data-b="prompt" rows="4"></textarea>
         </div>
         <div class="prism-field">
-          <label class="prism-field-label" for="fork-negative">Negative (B)</label>
-          <textarea id="fork-negative" class="prism-textarea" data-b="negative_prompt" rows="2"></textarea>
-        </div>
-        <div class="prism-field">
-          <label class="prism-field-label" for="fork-cfg">CFG <span class="prism-field-value" data-readout="cfg">5.0</span></label>
-          <input id="fork-cfg" type="range" min="1" max="20" step="0.5" value="5" class="prism-range" data-b="cfg" />
-        </div>
-        <div class="prism-field">
-          <label class="prism-field-label" for="fork-sampler">Sampler (B)</label>
-          <select id="fork-sampler" class="prism-select" data-b="sampler">${samplerOptions()}</select>
-        </div>
-        <div class="prism-field">
           <span class="prism-field-label">Seed <span class="prism-seed-locked">🔒 locked to A</span></span>
           <div class="prism-seed-locked-value mono" data-seed-display>—</div>
         </div>
@@ -94,10 +87,6 @@ export function buildEl(routerHooks = {}) {
     </div>
   `;
   return el;
-}
-
-function samplerOptions() {
-  return SAMPLERS.map((s) => `<option value="${s.value}">${s.label}</option>`).join('');
 }
 
 export function wire(rootEl) {
@@ -124,20 +113,18 @@ export function teardown() {
 export function load(rootEl, img) {
   if (!img) return;
   source = img;
-  // Seed B with the source's params + LOCK the seed to the source's seed.
+  // Seed B with the source's prompt + LOCK the seed to the source's seed.
   // If the source seed was -1 (random), we can't truly lock — fall back to
   // a fresh random for B (Fork from a random-seed image isn't reproducible;
-  // the metadata panel surfaces this).
+  // the metadata panel surfaces this). Dims ride the source verbatim (the
+  // A/B compare must render at A's size, even for a legacy pre-bucket row);
+  // everything else about the recipe is locked server-side.
   const lockedSeed = img.seed >= 0 ? img.seed : -1;
   bParams = {
     prompt: img.prompt || '',
-    negative_prompt: img.negative_prompt || '',
     seed: lockedSeed,
-    cfg: img.cfg,
-    steps: img.steps,
     width: img.width,
     height: img.height,
-    sampler: img.sampler,
   };
   bResultPath = img.path;  // initially, B mirrors A (no edit yet)
 
@@ -164,28 +151,12 @@ function setLayerImage(rootEl, which, path) {
 function reflectBFields(rootEl) {
   const prompt = rootEl.querySelector('[data-b="prompt"]');
   if (prompt) prompt.value = bParams.prompt;
-  const neg = rootEl.querySelector('[data-b="negative_prompt"]');
-  if (neg) neg.value = bParams.negative_prompt;
-  const cfg = rootEl.querySelector('[data-b="cfg"]');
-  if (cfg) cfg.value = bParams.cfg;
-  const sampler = rootEl.querySelector('[data-b="sampler"]');
-  if (sampler) sampler.value = String(bParams.sampler);
-  const cfgRo = rootEl.querySelector('[data-readout="cfg"]');
-  if (cfgRo) cfgRo.textContent = bParams.cfg.toFixed(1);
   const seedDisp = rootEl.querySelector('[data-seed-display]');
   if (seedDisp) seedDisp.textContent = bParams.seed >= 0 ? bParams.seed : 'random (source had no locked seed)';
 }
 
 function onBFieldChange(rootEl, ctrl) {
-  const key = ctrl.dataset.b;
-  let val = ctrl.value;
-  if (key === 'cfg') val = Math.round(Number(val) * 10) / 10;
-  if (key === 'sampler') val = Number(val);
-  bParams[key] = val;
-  if (key === 'cfg') {
-    const ro = rootEl.querySelector('[data-readout="cfg"]');
-    if (ro) ro.textContent = bParams.cfg.toFixed(1);
-  }
+  bParams[ctrl.dataset.b] = ctrl.value;
 }
 
 // ── Regenerate B ────────────────────────────────────────────────────────

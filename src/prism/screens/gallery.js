@@ -3,23 +3,26 @@
 //
 // A masonry grid reading from prism_gallery_list (lazy-paged by scroll).
 // Each thumbnail: convertFileSrc(path) for the <img>. Hover-state Quick
-// Actions (Favorite, Trash, Send to Composer). Click a thumbnail → frosted-
-// glass metadata panel slides in with the full prompt/seed/sampler/etc +
-// a Fork button (loads the image's params + seed into Fork & Edit).
+// Actions (Favorite, Delete, Send to Composer). Click a thumbnail → frosted-
+// glass metadata panel slides in with the prompt + size + a Fork button
+// (loads the image's params + seed into Fork & Edit).
 //
-// Filter bar: All / Favorites / Trash + a search box (case-insensitive
+// Filter bar: All / Favorites + a search box (case-insensitive
 // prompt substring, handled Rust-side).
+//
+// DELETE IS PERMANENT (2026-08-18 ruling): no trash, no restore — the
+// row AND the PNG are removed the moment Delete is confirmed.
 //
 // Build/wire/teardown triplet (FABLE convention).
 // =============================================================
 
 import { convertFileSrc } from '@tauri-apps/api/core';
 import {
-  galleryList, galleryFavorite, galleryTrash, galleryPurge,
+  galleryList, galleryFavorite, galleryDelete,
 } from '../engine/api.js';
 
 // The current filter + pagination cursor.
-let filter = { favorites_only: false, trashed_only: false, search: '' };
+let filter = { favorites_only: false, search: '' };
 let page = 0;              // offset = page * PAGE_SIZE
 const PAGE_SIZE = 60;
 let loading = false;
@@ -36,7 +39,7 @@ let scrollHandler = null;
 
 export function buildEl(routerHooks = {}) {
   hooks = routerHooks;
-  filter = { favorites_only: false, trashed_only: false, search: '' };
+  filter = { favorites_only: false, search: '' };
   page = 0;
   rows = [];
   exhausted = false;
@@ -49,7 +52,6 @@ export function buildEl(routerHooks = {}) {
       <div class="prism-gallery-filters">
         <button class="prism-chip is-active" data-filter="all">All</button>
         <button class="prism-chip" data-filter="favorites">★ Favorites</button>
-        <button class="prism-chip" data-filter="trash">🗑 Trash</button>
       </div>
       <input class="prism-gallery-search" type="text" placeholder="Search prompts…"
              autocomplete="off" spellcheck="false" />
@@ -160,10 +162,9 @@ function tileHtml(img) {
           <button class="prism-tile-btn" data-act="favorite" title="Favorite">${img.favorite ? '★' : '☆'}</button>
           <button class="prism-tile-btn" data-act="compose" title="Send to Composer">✎</button>
           <button class="prism-tile-btn" data-act="fork" title="Fork & Edit">⇄</button>
-          <button class="prism-tile-btn prism-tile-btn-danger" data-act="trash" title="Delete">${img.trashed ? '♻' : '🗑'}</button>
+          <button class="prism-tile-btn prism-tile-btn-danger" data-act="delete" title="Delete">🗑</button>
         </div>
       </div>
-      <div class="prism-tile-seed" title="seed">${img.seed >= 0 ? img.seed : 'random'}</div>
     </div>
   `;
 }
@@ -181,7 +182,6 @@ function onFilterChip(rootEl, chip) {
   const f = chip.dataset.filter;
   filter = {
     favorites_only: f === 'favorites',
-    trashed_only: f === 'trash',
     search: filter.search,
   };
   refresh(rootEl);
@@ -217,14 +217,11 @@ async function onQuickAction(rootEl, id, act, btn) {
       img.favorite = now ? 1 : 0;
       btn.textContent = now ? '★' : '☆';
       btn.closest('.prism-tile').classList.toggle('is-favorite', now);
-    } else if (act === 'trash') {
-      if (img.trashed) {
-        // In the trash view, the button purges (permanent delete) — confirm.
-        if (!confirm('Permanently delete this image?')) return;
-        await galleryPurge(id);
-      } else {
-        await galleryTrash(id);
-      }
+    } else if (act === 'delete') {
+      // PERMANENT: no trash, no undo — confirm, then the row AND the PNG
+      // are gone. One confirm guards the irreversible click.
+      if (!confirm('Permanently delete this image? This cannot be undone.')) return;
+      await galleryDelete(id);
       await refresh(rootEl);
     } else if (act === 'compose') {
       if (hooks.onSendToComposer) hooks.onSendToComposer(img);
@@ -249,7 +246,9 @@ function openMetadata(rootEl, id) {
     rootEl.appendChild(panel);
   }
   const url = convertFileSrc(img.path);
-  const samplerName = samplerLabel(img.sampler);
+  // The panel shows ONLY the prompts + the size (2026-08-17 ruling) — the
+  // seed/sampler/CFG/steps/model machinery is invisible; seed iteration
+  // lives in Fork & Edit.
   panel.innerHTML = `
     <div class="prism-meta-backdrop" data-act="close"></div>
     <aside class="prism-meta-card">
@@ -258,14 +257,7 @@ function openMetadata(rootEl, id) {
       <div class="prism-meta-fields">
         <div class="prism-meta-field"><span class="prism-meta-k">Prompt</span><p class="prism-meta-v">${escapeHtml(img.prompt) || '<em>(empty)</em>'}</p></div>
         ${img.negative_prompt ? `<div class="prism-meta-field"><span class="prism-meta-k">Negative</span><p class="prism-meta-v">${escapeHtml(img.negative_prompt)}</p></div>` : ''}
-        <div class="prism-meta-grid">
-          <div><span class="prism-meta-k">Seed</span><span class="prism-meta-v mono">${img.seed >= 0 ? img.seed : 'random'}</span></div>
-          <div><span class="prism-meta-k">Sampler</span><span class="prism-meta-v">${escapeHtml(samplerName)}</span></div>
-          <div><span class="prism-meta-k">CFG</span><span class="prism-meta-v mono">${img.cfg.toFixed(1)}</span></div>
-          <div><span class="prism-meta-k">Steps</span><span class="prism-meta-v mono">${img.steps}</span></div>
-          <div><span class="prism-meta-k">Size</span><span class="prism-meta-v mono">${img.width}×${img.height}</span></div>
-          <div><span class="prism-meta-k">Model</span><span class="prism-meta-v">${escapeHtml(img.model) || '—'}</span></div>
-        </div>
+        <div class="prism-meta-field"><span class="prism-meta-k">Size</span><p class="prism-meta-v mono">${img.width}×${img.height}</p></div>
         <div class="prism-meta-actions">
           <button class="prism-btn prism-btn-ghost" data-act="compose">Send to Composer</button>
           <button class="prism-btn prism-btn-primary" data-act="fork">Fork &amp; Edit</button>
@@ -294,17 +286,6 @@ function openMetadata(rootEl, id) {
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────────
-
-function samplerLabel(value) {
-  // Local lookup mirrors engine/api.js SAMPLERS (kept in sync). Avoids a
-  // cross-module import for a pure display helper.
-  const names = [
-    'Euler', 'Euler a', 'Heun', 'DPM2', 'DPM++ 2S a', 'DPM++ 2M',
-    'DPM++ 2M v2', 'IPNDM', 'IPNDM v', 'LCM', 'DDIM trailing', 'TCD',
-    'Res multistep', 'Res 2S', 'ER SDE', 'Euler CFG++', 'Euler a CFG++', 'Euler GE',
-  ];
-  return names[value] || `Sampler ${value}`;
-}
 
 function escapeHtml(s) {
   if (s == null) return '';

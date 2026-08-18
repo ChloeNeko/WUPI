@@ -332,7 +332,17 @@ console.log(`[release] running: npx tauri build`);
 if (dryRun) {
   console.log('[release] (dry-run) skipping actual build');
 } else {
-  const buildResult = spawnSync('npx', ['tauri', 'build'], {
+  const buildResult = spawnSync('npx', [
+    'tauri', 'build',
+    // v0.22.0: PRISM ships to end users — the release build MUST compile the
+    // real Stable Diffusion backend. Without this flag the exe builds with
+    // the NoopImageGenerator stub (prism_sd_status reports backend_real:
+    // false and every "generation" writes an empty file). The first release
+    // build after adding this flag pays the one-time ~20-40 min CUDA compile
+    // of the SD stack (docs/phase5b-diffusion-rs-cargo-procedure.md).
+    // fable.exe below mirrors this feature set EXACTLY.
+    '--features', 'diffusion-rs',
+  ], {
     env: childEnv,
     stdio: 'inherit',
     shell: true,  // npx is a .cmd on Windows; shell:true to invoke
@@ -400,7 +410,10 @@ if (!dryRun) {
     // assets embedded — the launcher then opened to WebView2's "localhost
     // refused to connect" (no splash, dead window). The Step 3.7 embed
     // verification below is the backstop if this ever drifts again.
-    '--features', 'tauri/custom-protocol',
+    // v0.22.0: `diffusion-rs` joins the mirror — a fable.exe built without
+    // it while wupi.exe has it is a split-backend install (PRISM works in
+    // one launcher and silently no-ops in the other).
+    '--features', 'tauri/custom-protocol,diffusion-rs',
   ], { stdio: 'inherit', cwd: join(repoRoot, 'src-tauri'), shell: true });
   if (fableBuild.status !== 0) {
     console.error(`[release] fable build failed (exit ${fableBuild.status}).`);
@@ -797,7 +810,157 @@ if (!existsSync(vcompSrc)) {
   console.warn('              error on a fresh install, install the VC++ 2015-2022 x64 Redistributable.');
 } else {
   copyFileSync(vcompSrc, join(stageBinDir, 'vcomp140.dll'));
-  console.log(`[release] copied vcomp140.dll → bin/ (delay-loaded)`);
+  console.log('[release] copied vcomp140.dll → bin/ (delay-loaded)');
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// SD-stack DLLs → `bin/` (v0.23.1 — the v0.23.0 launch-crash fix, clean-root
+// edition).
+//
+// The diffusion-rs feature links sd.cpp's ggml as SHARED DLLs (the
+// build.rs-shared-libs patch — dual-ggml symbol isolation; NEVER build the
+// SD stack static on MSVC). v0.23.0 shipped the exes with `stable-diffusion.dll`
+// (+ its chain: ggml{,-base,-cpu,-cuda,-vulkan}.dll → cublas64_13.dll) as
+// STATIC imports — resolved at process start, before SetDllDirectoryW(bin),
+// so no fresh install could launch. The fix is NOT root copies (the root
+// stays CLEAN: wupi.exe, fable.exe, msvcp140.dll, wupi.html, assets/, data/
+// — msvcp140 is the ONE root DLL, the LNK1194 data-symbol exception):
+// `src-tauri/.cargo/config.toml` delay-loads `stable-diffusion.dll` (same
+// trick as llama's cublas/cudart), so the entire chain resolves at the
+// first SD symbol call — long after boot_preflight's SetDllDirectoryW(bin).
+// These six DLLs therefore live in bin/, and ggml-cuda's cublas64_13
+// resolves against the bin/ copy that's ALREADY staged (no duplicate).
+// ──────────────────────────────────────────────────────────────────────────
+const SD_BIN_DLLS = [
+  'stable-diffusion.dll',
+  'ggml.dll',
+  'ggml-base.dll',
+  'ggml-cpu.dll',
+  'ggml-cuda.dll',
+  'ggml-vulkan.dll',
+];
+let sdDllBytes = 0;
+for (const f of SD_BIN_DLLS) {
+  const src = join(cargoTargetDir, 'release', f);
+  if (!existsSync(src)) {
+    console.error(`[release] !! ${src} not found.`);
+    console.error('              The diffusion-rs build emits these next to the exes in');
+    console.error('              target/release. A missing one means the build ran WITHOUT');
+    console.error('              --features diffusion-rs, or the shared-libs patch flipped to');
+    console.error('              static. REFUSING to ship a zip that cannot start.');
+    process.exit(1);
+  }
+  copyFileSync(src, join(stageBinDir, f));
+  sdDllBytes += statSync(src).size;
+}
+console.log(`[release] copied ${SD_BIN_DLLS.length} SD-stack DLLs → bin/ (${(sdDllBytes / 1024 / 1024).toFixed(0)} MB, delay-loaded via stable-diffusion.dll)`);
+
+// The C++-built SD DLLs import the VC++ runtime pair (VCRUNTIME140.dll,
+// VCRUNTIME140_1.dll) + msvcp140's codecvt satellite (MSVCP140_CODECVT_IDS).
+// When the delay-load helper LoadLibrary's stable-diffusion.dll from bin/,
+// its dependencies resolve through the SAME search path — exe dir covers
+// msvcp140 itself (root), bin/ covers the trio. Rust's own binaries get
+// these statically, which is why pre-SD releases worked without them.
+// Warn-only if absent on the dev box (same pattern as msvcp140/vcomp140).
+for (const f of ['VCRUNTIME140.dll', 'VCRUNTIME140_1.dll', 'MSVCP140_CODECVT_IDS.dll']) {
+  const src = join(system32, f);
+  if (existsSync(src)) {
+    copyFileSync(src, join(stageBinDir, f));
+  } else {
+    console.warn(`[release] !! ${f} not found in ${system32} — skipping.`);
+    console.warn('              The SD DLLs import it; a machine WITHOUT the VC++ 2015-2022');
+    console.warn('              x64 redist will fail to load SD. Install the redist on the');
+    console.warn('              dev box + re-release.');
+  }
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// Static-import guard (v0.23.1): parse each exe's PE IMPORT TABLE and fail
+// the release if it statically imports any DLL that is neither a system DLL
+// nor the one sanctioned root exception (msvcp140.dll). This is the
+// mechanical backstop for the exact v0.23.0 failure: a new static import
+// (stable-diffusion.dll) that process-start resolution can't satisfy from
+// bin/. Delay-load entries do NOT appear in the import directory (they live
+// in the delay-import directory), so a correctly delay-loaded SD stack
+// passes this check with a clean root.
+// ──────────────────────────────────────────────────────────────────────────
+function peStaticImports(exePath) {
+  const buf = readFileSync(exePath);
+  const peOff = buf.readUInt32LE(0x3c);
+  if (buf.readUInt32LE(peOff) !== 0x00004550) throw new Error(`${exePath}: not a PE file`);
+  const optOff = peOff + 24;
+  const magic = buf.readUInt16LE(optOff);
+  const ddOff = magic === 0x20b ? optOff + 112 : optOff + 96; // PE32+ vs PE32
+  const importRva = buf.readUInt32LE(ddOff + 8);              // data directory 1
+  if (importRva === 0) return [];
+  const nSec = buf.readUInt16LE(peOff + 6);
+  const secOff = peOff + 24 + buf.readUInt16LE(peOff + 20);
+  const secs = [];
+  for (let i = 0; i < nSec; i++) {
+    const s = secOff + i * 40;
+    secs.push({
+      vaddr: buf.readUInt32LE(s + 12),
+      vsize: buf.readUInt32LE(s + 8),
+      roff: buf.readUInt32LE(s + 20),
+      rsize: buf.readUInt32LE(s + 16),
+    });
+  }
+  const rvaToOff = (rva) => {
+    for (const sec of secs) {
+      if (rva >= sec.vaddr && rva < sec.vaddr + Math.max(sec.vsize, sec.rsize)) {
+        return sec.roff + (rva - sec.vaddr);
+      }
+    }
+    return null;
+  };
+  const names = [];
+  let desc = rvaToOff(importRva);
+  while (desc !== null) {
+    const nameRva = buf.readUInt32LE(desc + 12);
+    if (nameRva === 0) break;
+    const nameOff = rvaToOff(nameRva);
+    if (nameOff === null) break;
+    let end = nameOff;
+    while (buf[end] !== 0) end++;
+    names.push(buf.toString('ascii', nameOff, end).toLowerCase());
+    desc += 20;
+  }
+  return names;
+}
+
+// System DLLs the OS (or the GPU driver, for vulkan-1) always provides.
+const SYSTEM_STATIC_IMPORTS = new Set([
+  'kernel32.dll', 'ntdll.dll', 'user32.dll', 'gdi32.dll', 'shell32.dll',
+  'shlwapi.dll', 'ole32.dll', 'oleaut32.dll', 'comctl32.dll', 'dwmapi.dll',
+  'advapi32.dll', 'ws2_32.dll', 'iphlpapi.dll', 'wlanapi.dll', 'bcrypt.dll',
+  'bcryptprimitives.dll', 'vulkan-1.dll',
+]);
+// The ONE DLL allowed as a non-system static import: msvcp140.dll (LNK1194
+// data-symbol exception, staged at the install root).
+const ROOT_DLL_EXCEPTIONS = new Set(['msvcp140.dll']);
+const isSystemImport = (n) =>
+  SYSTEM_STATIC_IMPORTS.has(n) || n.startsWith('api-ms-') || n.startsWith('ext-ms-');
+
+for (const exe of [join(stageWupiDir, 'wupi.exe'), join(stageWupiDir, 'fable.exe')]) {
+  let imports;
+  try {
+    imports = peStaticImports(exe);
+  } catch (e) {
+    console.error(`[release] !! could not parse ${exe} for the static-import guard: ${e.message}`);
+    process.exit(1);
+  }
+  const bad = imports.filter((n) => !isSystemImport(n) && !ROOT_DLL_EXCEPTIONS.has(n));
+  if (bad.length > 0) {
+    console.error(`[release] !! ${basename(exe)} statically imports non-system DLL(s): ${bad.join(', ')}`);
+    console.error('              Static imports resolve at PROCESS START, before');
+    console.error('              SetDllDirectoryW(bin) — the app cannot launch unless they sit');
+    console.error('              at the install ROOT, and the root stays clean (msvcp140.dll');
+    console.error('              only). Add the DLL to the /DELAYLOAD rustflags in');
+    console.error('              src-tauri/.cargo/config.toml (see the stable-diffusion.dll');
+    console.error('              entry) and rebuild. REFUSING to ship a zip that cannot start.');
+    process.exit(1);
+  }
+  console.log(`[release] ${basename(exe)} static-import guard clean (delay-load layout OK)`);
 }
 
 // bin/updater.exe: the temp-staged update pipeline's apply binary, built from

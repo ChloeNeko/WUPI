@@ -37,8 +37,11 @@ export function clearLatch() {
  * Kick off one generation. Returns immediately with the resolved dest path
  * (`pending: true`); the final result arrives via the `prism-gen-done` event.
  *
- * @param {object} params — the GenerateParams (prompt, negative_prompt?,
- *   seed, cfg, steps, width, height, sampler). Defaults applied Rust-side.
+ * @param {object} params — the GenerateParams. LOCKED RECIPE: only
+ *   `prompt`, `seed`, `width`, `height` are live; `cfg`/`steps`/`sampler`/
+ *   `negative_prompt` remain accepted by the IPC but are IGNORED — Rust
+ *   enforces the locked NoobAI v1.1 official recipe (Euler a + discrete,
+ *   30 steps, CFG 6.0, injected quality prefix + negative block).
  * @returns {Promise<{pending: boolean, path: string}>}
  */
 export function generate(params) {
@@ -49,7 +52,7 @@ export function generate(params) {
 
 /**
  * List gallery images (the masonry grid). Newest first, paginated.
- * @param {object} filter — { favorites_only?, trashed_only?, search? }
+ * @param {object} filter — { favorites_only?, search? }
  * @returns {Promise<Array<GalleryImage>>}
  */
 export function galleryList(filter = {}, limit = 100, offset = 0) {
@@ -66,60 +69,26 @@ export function galleryFavorite(id, fav) {
   return invoke('prism_gallery_favorite', { id, fav });
 }
 
-/** Soft-delete (move to trash). */
-export function galleryTrash(id) {
-  return invoke('prism_gallery_trash', { id });
+/**
+ * PERMANENT delete: remove the row + unlink the PNG. There is NO trash /
+ * restore — one click and the image is gone, period (2026-08-18 ruling).
+ * @param {number} id
+ */
+export function galleryDelete(id) {
+  return invoke('prism_gallery_delete', { id });
 }
-
-/** Restore from trash. */
-export function galleryRestore(id) {
-  return invoke('prism_gallery_restore', { id });
-}
-
-/** Hard-delete: remove the row + unlink the PNG. */
-export function galleryPurge(id) {
-  return invoke('prism_gallery_purge', { id });
-}
-
-// ── Sampler catalog (the dropdown source of truth) ─────────────────────
-//
-// Mirrors the i32 discriminants in scene_art.rs's sampler_from_i32 (the C
-// enum sample_method_t ordering). 18 real variants (the 19th is the COUNT
-// sentinel — never exposed). The `value` is what crosses the IPC; the Rust
-// side maps it back to the crate enum. If stable-diffusion.cpp adds a
-// variant, extend BOTH this list + sampler_from_i32.
-
-export const SAMPLERS = [
-  { value: 0,  label: 'Euler' },
-  { value: 1,  label: 'Euler a' },
-  { value: 2,  label: 'Heun' },
-  { value: 3,  label: 'DPM2' },
-  { value: 4,  label: 'DPM++ 2S a' },
-  { value: 5,  label: 'DPM++ 2M' },          // default (DPMPP2M_DISCRIMINANT)
-  { value: 6,  label: 'DPM++ 2M v2' },
-  { value: 7,  label: 'IPNDM' },
-  { value: 8,  label: 'IPNDM v' },
-  { value: 9,  label: 'LCM' },                // for LCM-LoRA acceleration
-  { value: 10, label: 'DDIM trailing' },
-  { value: 11, label: 'TCD' },
-  { value: 12, label: 'Res multistep' },
-  { value: 13, label: 'Res 2S' },
-  { value: 14, label: 'ER SDE' },
-  { value: 15, label: 'Euler CFG++' },
-  { value: 16, label: 'Euler a CFG++' },
-  { value: 17, label: 'Euler GE' },           // guidance-embedded (Flux/SD3)
-];
-
-/** The default sampler value (DPM++ 2M, the SDXL clean baseline). */
-export const DEFAULT_SAMPLER = 5;
 
 // ── Generation defaults (mirror prism.rs's serde defaults) ──────────────
+//
+// LOCKED RECIPE (Chloe ruling, 2026-08-17): sampler (Euler a + discrete),
+// steps (30), CFG (6.0) + the quality/negative meta are SERVER-SIDE
+// constants enforced in prism::build_request — they are NOT settings and
+// have no client representation. The only defaults that matter here are
+// the two user-facing knobs: the default size (the portrait NoobAI bucket)
+// + the random seed.
 
 export const GEN_DEFAULTS = {
   seed: -1,        // -1 = random; >= 0 = locked (Fork & Edit)
-  cfg: 5.0,
-  steps: 28,
-  width: 1024,
-  height: 576,
-  sampler: DEFAULT_SAMPLER,
+  width: 832,
+  height: 1216,
 };

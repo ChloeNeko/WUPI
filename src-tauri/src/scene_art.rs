@@ -78,9 +78,12 @@ pub struct SceneImageRequest {
     /// the `diffusion-rs` cargo feature (the enum is feature-gated). The
     /// `DiffusionRsGenerator::generate` impl maps it back to `SampleMethod`
     /// inside the `#[cfg(feature)]` block via `sampler_from_i32`. Default
-    /// `DPMPP2M` (the SDXL clean-baseline sampler; was hardcoded pre-Prism).
-    /// `i32` rather than `u32` because the crate's `sample_method_t` enum is a
-    /// C `enum` (signed `int`) — matches the FFI representation exactly.
+    /// Euler a (`EULER_A_DISCRIMINANT`) — the LOCKED sampler (2026-08-17
+    /// switch from the launch DPM++ 2M: the NoobAI v1.1 official card
+    /// recommends Euler a, and the Illustrious-lineage community baseline
+    /// is A1111-style Euler a). `i32` rather than `u32` because the crate's
+    /// `sample_method_t` enum is a C `enum` (signed `int`) — matches the FFI
+    /// representation exactly.
     pub sampling_method: i32,
 }
 
@@ -90,34 +93,31 @@ impl Default for SceneImageRequest {
             prompt: String::new(),
             dest: PathBuf::new(),
             negative_prompt: None,
-            // SDXL-native 16:9 cinematic dimensions (1024×576 is one of SDXL's
-            // official cinematic presets). The §11.58 scaffold used 768×432
-            // (SD 1.5 values) — corrected to SDXL when the backend target
-            // moved to the Illustrious-XL family (NoobAI-XL / WAI, per the
-            // 2026-07-30 staged rollout). The 12 GB VRAM budget handles SDXL
-            // fp16 at this resolution; GGUF Q8 fits with headroom.
-            width: 1024,
-            height: 576,
-            // 28 steps is the SDXL "clean baseline" for DPM++ 2M (the
-            // community-standard SDXL recipe). The §11.58 scaffold's 25 was an
-            // SD 1.5 value. Stage 2 acceleration LoRAs drop this to 4-8.
-            steps: 28,
+            // NoobAI training buckets (the LOCKED size presets): portrait
+            // 832×1216 is the default (characters are the primary use);
+            // 1216×832 landscape + 1024×1024 square are the composer's other
+            // presets. The old 1024×576 default was off-bucket + under the
+            // SDXL training area (0.59 vs ~1.0 MP) — environment-biased,
+            // under-trained detail (retired 2026-08-17).
+            width: PRISM_DEFAULT_WIDTH as u32,
+            height: PRISM_DEFAULT_HEIGHT as u32,
+            // The LOCKED recipe (2026-08-17 switch, Chloe ruling): Euler a at
+            // its full step budget — ancestral samplers converge LATE, so the
+            // old 20 (tuned for DPM++ 2M + Karras early convergence) no
+            // longer applies. Enforced for real in prism::build_request
+            // (this Default only serves non-Prism callers/tests — Prism
+            // always routes through build_request).
+            steps: PRISM_LOCKED_STEPS as u32,
             model_path: PathBuf::new(),
-            // `-1` = random seed (the crate default). FABLE scene-art wants a
-            // fresh scene each turn; Prism's Fork & Edit overrides this with a
-            // captured seed for seed-locked iteration.
+            // `-1` = random seed (the crate default). The seed is the ONE
+            // knob that stays user-facing (Fork & Edit's primitive).
             seed: -1,
-            // 5.0 is the conservative clean-SDXL default (was hardcoded in the
-            // §11.58 generate impl; promoted to a field so Prism's CFG slider
-            // can override it). FABLE's scene-art path keeps this value →
-            // behavior unchanged.
-            cfg_scale: 5.0,
-            // DPMPP2M (discriminant value matches the crate's
-            // `SampleMethod::DPMPP2M_SAMPLE_METHOD`). Was hardcoded in the
-            // §11.58 generate impl; promoted to a field so Prism's sampler
-            // dropdown can override it. The `DPMPP2M_DISCRIMINANT` const below
-            // is the single source of truth for this value.
-            sampling_method: DPMPP2M_DISCRIMINANT,
+            // 6.0 = the NoobAI 1.1 official CFG sweet spot (locked recipe).
+            cfg_scale: PRISM_LOCKED_CFG,
+            // Euler a (`EULER_A_DISCRIMINANT`) — the LOCKED sampler since the
+            // 2026-08-17 switch (the NoobAI v1.1 official card rec; pairs
+            // with the DISCRETE scheduler applied in `generate`).
+            sampling_method: EULER_A_DISCRIMINANT,
         }
     }
 }
@@ -131,6 +131,63 @@ impl Default for SceneImageRequest {
 /// the feature-independent mirror, validated by `sampler_round_trip` in the
 /// feature-gated tests.
 pub const DPMPP2M_DISCRIMINANT: i32 = 5;
+
+/// The `i32` discriminant of `SampleMethod::EULER_A_SAMPLE_METHOD` — the
+/// LOCKED sampler (2026-08-17 switch, Chloe ruling: the NoobAI v1.1 official
+/// card recommends Euler a; the Illustrious-lineage community baseline is
+/// A1111-style Euler a on the DISCRETE schedule). Variant 1 in the C
+/// `enum sample_method_t` ordering — same named-const + pinned-test
+/// discipline as `DPMPP2M_DISCRIMINANT` above.
+pub const EULER_A_DISCRIMINANT: i32 = 1;
+
+// ────────────────────────────────────────────────────────────────────────────
+// The LOCKED NoobAI recipe (Chloe ruling, 2026-08-17 — switched to the model
+// card's official parameter set the same day; the launch recipe was
+// DPM++ 2M + KARRAS at 20 steps)
+// ────────────────────────────────────────────────────────────────────────────
+// Sampler Euler a + DISCRETE schedule, 30 steps, CFG 6.0, NoobAI training
+// buckets for sizes, the NoobAI v1.1 official quality prefix
+// auto-prepended, the matching negative block auto-injected — ALL
+// server-side, none of it in the UI. The engine flags (discrete scheduler +
+// flash attention) are applied in `DiffusionRsGenerator::generate`; the
+// prompt/meta injection + the knob
+// overrides are enforced in `prism::build_request` (the single chokepoint
+// every generation goes through). These are LOCKED like the sampler profiles
+// in settings.rs — changing any of them is Chloe's explicit call.
+
+/// The quality-meta prefix prepended to EVERY Prism prompt — the NoobAI v1.1
+/// official recommended positive set (Chloe ruling, 2026-08-17; `newest`
+/// matters: the v1.1 recency axis pairs with `old`/`early` in the negative
+/// block). INVISIBLE by design: never rendered in the UI, never in the
+/// search catalog, and NOT stored in gallery rows (rows record the user
+/// prompt — the prefix is an engine constant, like the sampler).
+pub const PRISM_QUALITY_PREFIX: &str =
+    "masterpiece, best quality, newest, absurdres, highres";
+
+/// The NoobAI v1.1 official recommended negative set — `old`/`early` pair
+/// with the `newest` positive (recency), and `bad hands`/`mutated hands`
+/// directly suppress the extra-limb/hand drift. Injected on every render;
+/// the old user-authored negative lane is deleted. Same invisibility rules
+/// as the prefix.
+pub const PRISM_NEGATIVE_BLOCK: &str =
+    "worst quality, old, early, low quality, lowres, signature, username, logo, bad hands, mutated hands";
+
+/// Locked step count (2026-08-17): Euler a is ANCESTRAL — it converges
+/// late + needs its full step budget. 30 sits at the top of the official
+/// NoobAI v1.1 recommendation (25–30) — the extra headroom over the old
+/// 20/28 values buys late-step detail (Chloe bump, 2026-08-17).
+pub const PRISM_LOCKED_STEPS: i32 = 30;
+
+/// Locked CFG (the NoobAI 1.1 official sweet spot; above ~7 saturates/burns).
+pub const PRISM_LOCKED_CFG: f32 = 6.0;
+
+/// Default size — the portrait NoobAI training bucket (characters are the
+/// primary use). The composer's preset list is bucket-only:
+/// 832×1216 / 1216×832 / 1024×1024 (~1.0 MP each, matching the SDXL
+/// training area). Off-bucket sizes (the old 1024×576 default) bias toward
+/// environment + render under-trained detail.
+pub const PRISM_DEFAULT_WIDTH: i32 = 832;
+pub const PRISM_DEFAULT_HEIGHT: i32 = 1216;
 
 /// The result of a successful generation. The caller (the done-beat spawn)
 /// emits this as a `{type:"image", url}` channel event so the frontend can
@@ -256,33 +313,52 @@ mod phase5b_tests {
         let _ = std::fs::remove_file(&dest);
     }
 
-    /// The request type defaults to SDXL-native cinematic values (1024×576,
-    /// 28 steps). Pins the defaults so a future tuning change is intentional.
-    /// (§11.58 scaffold used SD 1.5 values 768×432/25; corrected 2026-07-30
-    /// when the backend target moved to the Illustrious-XL family.)
+    /// The request type defaults to the LOCKED NoobAI v1.1 official recipe
+    /// (832×1216 portrait bucket, Euler a, 30 steps). Pins the defaults so a
+    /// future tuning change is intentional. (The historical defaults:
+    /// 1024×576/28-discrete → 832×1216/20/DPM++ 2M+Karras → both retired
+    /// 2026-08-17 when the recipe switched onto the model card's set.)
     #[test]
     fn scene_image_request_defaults_are_sane() {
         let req = SceneImageRequest::default();
-        assert_eq!(req.width, 1024, "SDXL-native cinematic 16:9");
-        assert_eq!(req.height, 576, "SDXL cinematic preset (16:9)");
-        assert_eq!(req.steps, 28, "DPM++ 2M clean-SDXL baseline");
-        assert!(req.negative_prompt.is_none());
+        assert_eq!(req.width, 832, "NoobAI portrait training bucket");
+        assert_eq!(req.height, 1216, "NoobAI portrait training bucket");
+        assert_eq!(req.steps, PRISM_LOCKED_STEPS as u32, "Euler a's full convergence budget (30, official NoobAI rec)");
+        assert!(req.negative_prompt.is_none(), "engine-level default is bare; the block is injected in prism::build_request");
     }
 
-    /// Prism (2026-07-31): the three new fields default to values that
-    /// preserve the pre-Prism FABLE scene-art behavior EXACTLY — `-1` seed
-    /// (random, the crate default), `5.0` CFG (was hardcoded in the §11.58
-    /// generate impl), `DPMPP2M` sampler (was hardcoded). Pinning these here
-    /// means a future change to FABLE's behavior is intentional + obvious.
+    /// Prism (locked recipe, 2026-08-17): the locked knobs default to the
+    /// NoobAI recipe — `-1` seed (the ONE user-facing knob left), `6.0` CFG,
+    /// DPM++ 2M. Pinning these here means a future change is intentional +
+    /// obvious. (The real enforcement is prism::build_request — this Default
+    /// only keeps non-Prism constructors in lockstep.)
     #[test]
     fn scene_image_request_defaults_pin_prism_fields() {
         let req = SceneImageRequest::default();
-        assert_eq!(req.seed, -1, "-1 = random seed (crate default; FABLE fresh-scene behavior)");
-        assert_eq!(req.cfg_scale, 5.0, "5.0 = conservative clean-SDXL CFG (pre-Prism hardcoded value)");
+        assert_eq!(req.seed, -1, "-1 = random seed (crate default; the user-facing knob)");
+        assert_eq!(req.cfg_scale, PRISM_LOCKED_CFG, "6.0 = the NoobAI 1.1 official CFG (locked)");
         assert_eq!(
-            req.sampling_method, DPMPP2M_DISCRIMINANT,
-            "DPM++ 2M = SDXL clean baseline (pre-Prism hardcoded sampler)",
+            req.sampling_method, EULER_A_DISCRIMINANT,
+            "Euler a = the LOCKED sampler (discrete schedule applied in generate)",
         );
+    }
+
+    /// The locked-recipe meta constants are exactly the NoobAI v1.1
+    /// official recommended sets — pin them verbatim so a typo'd edit
+    /// can't ship.
+    #[test]
+    fn locked_recipe_constants_match_the_noobai_recipe() {
+        assert_eq!(
+            PRISM_QUALITY_PREFIX,
+            "masterpiece, best quality, newest, absurdres, highres",
+        );
+        assert_eq!(
+            PRISM_NEGATIVE_BLOCK,
+            "worst quality, old, early, low quality, lowres, signature, username, logo, bad hands, mutated hands",
+        );
+        assert_eq!(PRISM_LOCKED_STEPS, 30);
+        assert_eq!(PRISM_LOCKED_CFG, 6.0);
+        assert_eq!(EULER_A_DISCRIMINANT, 1);
     }
 
     /// The DPMPP2M discriminant const must equal 5 (variant 5 in the C
@@ -378,7 +454,7 @@ pub fn default_sd_backend() -> Box<dyn SceneImageGenerator> {
 /// serializes all SD access).
 ///
 /// STAGED ROLLOUT (per §11.58 + Chloe's 2026-07-30 call):
-///   Stage 1 (this impl): SDXL checkpoint, NO LoRA, full 28 steps. Proves the
+///   Stage 1 (this impl): SDXL checkpoint, NO LoRA, full step budget. Proves the
 ///     engine produces a clean image through the cpp wrapper. Recommended
 ///     samplers/sizes below are the SDXL-community canonical "clean SDXL"
 ///     recipe (Euler/a artifacts on SDXL — DPM++ 2M is the baseline).
@@ -453,6 +529,49 @@ pub struct DiffusionRsGenerator {
     /// legacy single-file checkpoint layout. See `SdModelLayout` + the
     /// `load`/`generate` doc for the §11.59 multi-file SDXL contract.
     multi_file: std::sync::Mutex<Option<SdModelLayout>>,
+    /// The fp16 text-encoder override, stashed by `load` when the checkpoint
+    /// is a FULL-checkpoint GGUF sitting next to the fp16 CLIP-L + CLIP-G
+    /// sidecar pair. See `ClipOverride` for the shadow mechanism. None in
+    /// every other layout.
+    clip_override: std::sync::Mutex<Option<ClipOverride>>,
+}
+
+/// The fp16 text-encoder override (2026-08-17): a full-checkpoint GGUF kept
+/// on the single-file `model` path while external fp16 CLIP-L/CLIP-G
+/// sidecars SHADOW the embedded quantized encoders.
+///
+/// MECHANISM (why this works without touching sd.cpp): `new_sd_ctx` loads
+/// the checkpoint first, then the clip files, into ONE name-keyed tensor
+/// map (`add_tensor_storage`: plain map assignment — later writes win).
+/// After `convert_tensors_name`, the embedded `conditioner.embedders.0/1.*`
+/// tensors and the external files' tensors canonicalize to the IDENTICAL
+/// `cond_stage_model[.1].transformer.text_model.*` names (the prefix_map
+/// `conditioner.embedders.0/1.` → `cond_stage_model[.1].` rewrite +
+/// `convert_open_clip_to_hf_clip_name` normalizing `model.*` ↔
+/// `transformer.text_model.*`), so the later-loaded fp16 storages replace
+/// the embedded q8_0 ones by collision. The conditioner runner then reads
+/// the same canonical names it always did — now backed by fp16 weights.
+///
+/// WHY (the extra-limb diagnosis, 2026-08-17): image.gguf's CONDITIONER is
+/// majority-q8_0 (323/585 tensors), and quantized CLIP conditioning degrades
+/// prompt adherence → duplicated limbs/subjects. fp16 encoders are the fix;
+/// the UNet's own q8_0 majority (mild, tolerable) stays.
+///
+/// NO EXTERNAL VAE, DELIBERATELY: the embedded VAE is kept, so sd.cpp's
+/// automatic SDXL Conv2D 1/32 guard applies (`vae_path` empty) — an external
+/// VAE bypasses that guard and is the documented §9 external-VAE noise-era
+/// hazard. A `sdxl_vae_fp16_fix.safetensors` sibling may sit in the dir
+/// unused by this layout (it goes live only for the §11.59 bare-UNet
+/// multi-file layout).
+#[cfg(feature = "diffusion-rs")]
+#[derive(Clone, Debug)]
+pub struct ClipOverride {
+    /// The full-checkpoint GGUF (passed as `model` — single-file path).
+    pub model: PathBuf,
+    /// The fp16 CLIP-L (openCLIP ViT-L) sidecar.
+    pub clip_l: PathBuf,
+    /// The fp16 CLIP-G (openCLIP ViT-bigG) sidecar.
+    pub clip_g: PathBuf,
 }
 
 /// The multi-file SDXL layout: a ComfyUI-convention GGUF UNet (loaded as
@@ -504,6 +623,7 @@ impl DiffusionRsGenerator {
         Self {
             model_path: std::sync::Mutex::new(None),
             multi_file: std::sync::Mutex::new(None),
+            clip_override: std::sync::Mutex::new(None),
         }
     }
 }
@@ -704,15 +824,22 @@ fn is_gguf_unet(path: &std::path::Path) -> bool {
 /// MB is always sufficient — the 4.18 GB full-checkpoint GGUF's name table
 /// ends ~150 KB in even with dense per-tensor metadata.
 ///
-/// WHY THE SNIFF (2026-08-17, §11.61): a full-checkpoint GGUF MUST ride the
-/// single-file `model` path, not the multi-file `diffusion_model` path —
-/// `init_from_file(path, "model.diffusion_model.")` prefixes every tensor it
-/// doesn't recognize as already-prefixed, so the embedded
+/// WHY THE SNIFF (2026-08-17, §11.61): a full-checkpoint GGUF by default
+/// rides the single-file `model` path, not the multi-file `diffusion_model`
+/// path — `init_from_file(path, "model.diffusion_model.")` prefixes every
+/// tensor it doesn't recognize as already-prefixed, so the embedded
 /// `conditioner.embedders.*` / `first_stage_model.*` tensors would become
 /// `model.diffusion_model.conditioner…` (unreachable) and the external
 /// clip_l/clip_g the multi-file path requires wouldn't exist → version
 /// detection fails. On the `model` path (no prefix) every native name lands
 /// as-is and name-based version detection sees the full marker set.
+///
+/// EXCEPTION (the 2026-08-17 encoder override in `load`): when the fp16
+/// CLIP-L + CLIP-G sidecar pair sits next to the GGUF, the full checkpoint
+/// still rides the single-file `model` path — but with the external clip
+/// paths attached, which SHADOW the embedded (quantized) encoders by
+/// name-collision replacement in sd.cpp's tensor map (see `ClipOverride`).
+/// The embedded VAE is kept either way (no external VAE — §9 hazard).
 #[cfg(feature = "diffusion-rs")]
 fn gguf_embeds_full_checkpoint(path: &std::path::Path) -> bool {
     use std::io::Read;
@@ -801,41 +928,74 @@ impl SceneImageGenerator for DiffusionRsGenerator {
             message: format!("diffusion-rs model_path mutex poisoned: {e}"),
         })? = Some(model_path.to_path_buf());
 
-        // §11.59 multi-file SDXL detection: if the picked checkpoint is a
-        // ComfyUI-convention GGUF UNet (bare input_blocks.* names, no embedded
-        // CLIP/VAE), resolve the sibling CLIP-L / CLIP-G / VAE files in the
-        // same dir + stash the multi-file layout. `generate` then routes to
-        // the diffusion_model + clip_l/g + vae setters instead of the single
-        // `model` setter (see SdModelLayout doc for the version-detection
-        // rationale — CLIP-G is REQUIRED for sd.cpp to classify it as SDXL).
+        // GGUF layout resolution (§11.59 + §11.61 + the 2026-08-17 encoder
+        // override). Three outcomes:
         //
-        // §11.61: a GGUF that embeds the FULL checkpoint (conditioner + VAE
-        // tensors in-file — e.g. a whole safetensors quantized to Q8_0)
-        // deliberately does NOT take this path: the `diffusion_model` prefix
-        // pass would bury its embedded encoder/VAE names, and the single-file
-        // `model` path needs no siblings at all. Only a bare UNet GGUF goes
-        // multi-file.
-        let layout = if is_gguf_unet(model_path) && !gguf_embeds_full_checkpoint(model_path) {
+        //  (A) Bare UNet GGUF (§11.59, ComfyUI convention — bare
+        //      input_blocks.* names, no embedded CLIP/VAE): the multi-file
+        //      layout with whatever siblings resolve (clip_g strongly
+        //      recommended — sd.cpp version detection needs its
+        //      conditioner.embedders.1 markers).
+        //  (B) FULL-checkpoint GGUF + the fp16 CLIP-L/CLIP-G sidecar PAIR:
+        //      the encoder override (`ClipOverride`) — the GGUF stays on the
+        //      proven single-file `model` path while the external fp16
+        //      encoders SHADOW the embedded Q8_0 ones (name-collision
+        //      replacement; see ClipOverride doc). The VAE sidecar is
+        //      deliberately NOT consumed here — the embedded VAE keeps
+        //      sd.cpp's automatic SDXL Conv2D 1/32 guard, and external VAEs
+        //      are the documented §9 noise-era hazard.
+        //  (C) Anything else (no sidecar pair / safetensors): single-file
+        //      with the checkpoint's own embedded encoders/VAE (§11.61).
+        let (layout, clip_override) = if is_gguf_unet(model_path) {
             let dir = model_path.parent().unwrap_or_else(|| std::path::Path::new("."));
             match resolve_multi_file_layout(dir) {
                 Ok(mut l) => {
                     // Fill in the GGUF UNet path (resolve_multi_file_layout
                     // only resolves the CLIP/VAE siblings, not the UNet itself).
                     l.diffusion_model = model_path.to_path_buf();
-                    if l.clip_g.is_none() {
-                        tracing::warn!(
-                            "diffusion-rs: GGUF UNet has NO CLIP-G sibling in {} — sd.cpp version detection will likely fail (needs conditioner.embedders.1 markers). Drop clip_g.safetensors / text_encoder_2.safetensors into the sd/ dir.",
-                            dir.display()
+                    if !gguf_embeds_full_checkpoint(model_path) {
+                        // (A) the original §11.59 bare-UNet multi-file layout.
+                        if l.clip_g.is_none() {
+                            tracing::warn!(
+                                "diffusion-rs: GGUF UNet has NO CLIP-G sibling in {} — sd.cpp version detection will likely fail (needs conditioner.embedders.1 markers). Drop clip_g.safetensors / text_encoder_2.safetensors into the sd/ dir.",
+                                dir.display()
+                            );
+                        }
+                        tracing::info!(
+                            gguf = %model_path.display(),
+                            clip_l = ?l.clip_l.as_ref().map(|p| p.display().to_string()),
+                            clip_g = ?l.clip_g.as_ref().map(|p| p.display().to_string()),
+                            vae = ?l.vae.as_ref().map(|p| p.display().to_string()),
+                            "diffusion-rs: GGUF UNet detected — multi-file SDXL layout resolved",
                         );
+                        (Some(l), None)
+                    } else if let (Some(cl), Some(cg)) = (&l.clip_l, &l.clip_g) {
+                        // (B) the fp16-encoder override: the external pair
+                        // shadows the embedded quantized encoders; the
+                        // embedded VAE is kept (guard intact).
+                        tracing::info!(
+                            gguf = %model_path.display(),
+                            clip_l = %cl.display(),
+                            clip_g = %cg.display(),
+                            "diffusion-rs: full-checkpoint GGUF + fp16 CLIP-L/CLIP-G sidecars — external encoders SHADOW the embedded quantized ones (embedded VAE kept)",
+                        );
+                        let ov = ClipOverride {
+                            model: model_path.to_path_buf(),
+                            clip_l: cl.clone(),
+                            clip_g: cg.clone(),
+                        };
+                        (None, Some(ov))
+                    } else {
+                        // (C) full checkpoint, no sidecar pair → embedded
+                        // everything (single-file).
+                        tracing::info!(
+                            path = %model_path.display(),
+                            has_clip_l = l.clip_l.is_some(),
+                            has_clip_g = l.clip_g.is_some(),
+                            "diffusion-rs: full-checkpoint GGUF WITHOUT the fp16 CLIP-L + CLIP-G sidecar pair — single-file path (embedded encoders/VAE)",
+                        );
+                        (None, None)
                     }
-                    tracing::info!(
-                        gguf = %model_path.display(),
-                        clip_l = ?l.clip_l.as_ref().map(|p| p.display().to_string()),
-                        clip_g = ?l.clip_g.as_ref().map(|p| p.display().to_string()),
-                        vae = ?l.vae.as_ref().map(|p| p.display().to_string()),
-                        "diffusion-rs: GGUF UNet detected — multi-file SDXL layout resolved",
-                    );
-                    Some(l)
                 }
                 Err(e) => {
                     // Soft-fail: log + proceed as single-file. The single-file
@@ -846,16 +1006,19 @@ impl SceneImageGenerator for DiffusionRsGenerator {
                     // GGUF (e.g. a full-checkpoint GGUF, not a UNet) still
                     // tries the single-file path.
                     tracing::warn!(error = %e, "diffusion-rs: multi-file layout resolution failed; falling back to single-file load");
-                    None
+                    (None, None)
                 }
             }
         } else {
             tracing::info!(path = %model_path.display(), "diffusion-rs: single-file SD checkpoint staged");
-            None
+            (None, None)
         };
         *self.multi_file.lock().map_err(|e| SceneImageError {
             message: format!("diffusion-rs multi_file mutex poisoned: {e}"),
         })? = layout;
+        *self.clip_override.lock().map_err(|e| SceneImageError {
+            message: format!("diffusion-rs clip_override mutex poisoned: {e}"),
+        })? = clip_override;
         Ok(())
     }
 
@@ -864,7 +1027,7 @@ impl SceneImageGenerator for DiffusionRsGenerator {
         // request's i32 sampler discriminant to the enum via sampler_from_i32
         // (which imports its own `SampleMethod::*`), so the only reference in
         // this body is the value passed through `.sampling_method(...)`.
-        use diffusion_rs::api::{gen_img, ConfigBuilder, ModelConfigBuilder, WeightType};
+        use diffusion_rs::api::{gen_img, ConfigBuilder, ModelConfigBuilder, Scheduler, WeightType};
 
         let start = std::time::Instant::now();
 
@@ -884,14 +1047,20 @@ impl SceneImageGenerator for DiffusionRsGenerator {
         // the expensive VRAM parse happens inside gen_img. WUPI loads CUSTOM
         // local files — do NOT use PresetBuilder (it auto-downloads).
         //
-        // §11.59 TWO LAYOUTS:
-        //  (A) Multi-file SDXL (a ComfyUI GGUF UNet + sibling CLIP/VAE): pass
-        //      diffusion_model + clip_l/g + vae. The GGUF is ALREADY Q8
+        // §11.59 THREE LAYOUTS:
+        //  (A) Multi-file SDXL (a ComfyUI GGUF UNet + sibling CLIP/VAE):
+        //      pass diffusion_model + clip_l/g + vae. The GGUF is ALREADY Q8
         //      (pre-quantized at conversion), so NO weight_type override —
         //      setting Q8_0 here would try to re-quantize a GGUF (wrong).
         //      CLIP-G MUST be present for sd.cpp's version detection to
         //      classify the model as SDXL (see SdModelLayout doc).
-        //  (B) Single-file checkpoint (legacy fp16 safetensors): pass `model`
+        //  (B) ENCODER OVERRIDE (2026-08-17): a full-checkpoint GGUF + the
+        //      fp16 CLIP-L/CLIP-G pair — single-file `model` PLUS the
+        //      external clip paths, which shadow the embedded quantized
+        //      encoders by name collision (see ClipOverride doc). The
+        //      embedded VAE serves decode (no vae path → sd.cpp's SDXL
+        //      conv-scale guard applies). NO weight_type (GGUF quant).
+        //  (C) Single-file checkpoint (legacy fp16 safetensors): pass `model`
         //      + weight_type(Q8_0) for runtime quantization (the §11.58 OOM
         //      fix #3, preserved for the original layout).
         let layout = {
@@ -900,11 +1069,17 @@ impl SceneImageGenerator for DiffusionRsGenerator {
             })?;
             g.clone()
         };
+        let clip_override = {
+            let g = self.clip_override.lock().map_err(|e| SceneImageError {
+                message: format!("diffusion-rs clip_override mutex poisoned: {e}"),
+            })?;
+            g.clone()
+        };
 
         let mut mb = ModelConfigBuilder::default();
-        match &layout {
-            Some(l) => {
-                // Multi-file SDXL (GGUF UNet).
+        match (&layout, &clip_override) {
+            (Some(l), _) => {
+                // (A) multi-file SDXL (GGUF UNet).
                 mb.diffusion_model(l.diffusion_model.as_path());
                 if let Some(c) = &l.clip_l { mb.clip_l(c.as_path()); }
                 if let Some(c) = &l.clip_g { mb.clip_g(c.as_path()); }
@@ -912,14 +1087,25 @@ impl SceneImageGenerator for DiffusionRsGenerator {
                 mb.vae_tiling(true);
                 // NO weight_type — GGUF carries its own quantization.
             }
-            None => {
-                // Single-file checkpoint: a legacy fp16 safetensors OR a
-                // full-checkpoint GGUF (§11.61 — embedded conditioner + VAE,
-                // no siblings needed). Runtime Q8_0 re-quantization applies
-                // ONLY to the safetensors form (the §11.58 OOM fix #3); a
-                // GGUF carries its own quantization, and re-quantizing an
-                // already-Q8 file is both lossy (Q8→F32→Q8 round trip) and
-                // a multi-GB pointless conversion pass at load.
+            (None, Some(co)) => {
+                // (B) the fp16-encoder override: single-file GGUF + external
+                // fp16 CLIP-L/CLIP-G shadowing the embedded quantized
+                // encoders. Same no-weight_type rule as (A) — the GGUF
+                // carries its own quant.
+                mb.model(co.model.as_path());
+                mb.clip_l(co.clip_l.as_path());
+                mb.clip_g(co.clip_g.as_path());
+                mb.vae_tiling(true);
+            }
+            (None, None) => {
+                // (C) single-file checkpoint: a legacy fp16 safetensors OR a
+                // full-checkpoint GGUF without sidecars (§11.61 — embedded
+                // conditioner + VAE, no siblings needed). Runtime Q8_0
+                // re-quantization applies ONLY to the safetensors form (the
+                // §11.58 OOM fix #3); a GGUF carries its own quantization,
+                // and re-quantizing an already-Q8 file is both lossy
+                // (Q8→F32→Q8 round trip) and a multi-GB pointless conversion
+                // pass at load.
                 mb.model(model_path.as_path()).vae_tiling(true);
                 let is_gguf = model_path
                     .extension()
@@ -931,6 +1117,18 @@ impl SceneImageGenerator for DiffusionRsGenerator {
                 }
             }
         }
+        // The LOCKED engine flags (2026-08-17 switch — applied after the
+        // match so no layout branch can skip them):
+        //   · DISCRETE scheduler — Euler a's native schedule (A1111-style
+        //     Euler a; the model card rec is sampler-only, no Karras). The
+        //     launch recipe's KARRAS was a DPM++ 2M early-convergence trick
+        //     that no longer applies to an ancestral sampler.
+        //   · flash attention — the CUDA attention fast path at SDXL
+        //     resolutions, quality-neutral. Verify a render + the [sd] logs
+        //     after any sd.cpp/vendored rebuild (sd_repro, seed 42) — if the
+        //     vendored build lacks FA kernels the engine falls back + logs.
+        mb.scheduler(Scheduler::DISCRETE_SCHEDULER);
+        mb.flash_attention(true);
         let mut model_config = mb.build().map_err(|e| SceneImageError {
             message: format!("diffusion-rs ModelConfig build failed: {e}"),
         })?;
@@ -939,9 +1137,11 @@ impl SceneImageGenerator for DiffusionRsGenerator {
         // Build the per-turn Config from the request. All setters confirmed
         // on docs.rs/diffusion_rs/latest/diffusion_rs/api/struct.ConfigBuilder.
         // html: prompt, negative_prompt, width, height, steps, sampling_method,
-        // cfg_scale, output. The sampler/steps/cfg below are the SDXL
-        // canonical-clean recipe (NOT SD 1.5 defaults — Euler/a artifacts on
-        // SDXL; DPM++ 2M Karras-class at 28 is the community standard).
+        // cfg_scale, output. The sampler/steps/cfg below carry the LOCKED
+        // NoobAI v1.1 official recipe (Euler a / 30 / 6.0 — set upstream in
+        // prism::build_request; the launch-era "Euler/a artifacts on SDXL,
+        // DPM++ 2M is the clean baseline" wisdom was generic-SDXL, superseded
+        // by the model card's own recommendation for this checkpoint).
         //
         // derive_builder's `setter(into, strip_option)` makes the chain return
         // `&mut ConfigBuilder`, so we build the base chain to a local then

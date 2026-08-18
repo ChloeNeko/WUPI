@@ -76,7 +76,7 @@ pub struct GalleryImage {
     pub width: i32,
     pub height: i32,
     /// The sampler discriminant (mirrors `SceneImageRequest.sampling_method`'s
-    /// i32 contract — see `scene_art::DPMPP2M_DISCRIMINANT` + `sampler_from_i32`).
+    /// i32 contract — see `scene_art::EULER_A_DISCRIMINANT` + `sampler_from_i32`).
     pub sampler: i32,
     /// The model file name (not full path — just the leaf, e.g.
     /// "Image.safetensors"). The full path is reconstructable from
@@ -85,23 +85,15 @@ pub struct GalleryImage {
     pub model: String,
     /// 1 if favorited, 0 otherwise. Drives the favorites filter.
     pub favorite: i32,
-    /// 1 if soft-deleted (in the Trash), 0 otherwise. Delete is a trash-mark,
-    /// not a row removal — matches every gallery UX the user will have used.
-    /// A separate IPC purges trashed rows + their files.
-    pub trashed: i32,
 }
 
-/// The filter for [`GalleryDb::list`]. The default (all three false/empty) is
-/// "all non-trashed images, newest first."
+/// The filter for [`GalleryDb::list`]. The default (both false/empty) is
+/// "all images, newest first."
 #[derive(Debug, Clone, Default, serde::Deserialize)]
 pub struct GalleryFilter {
     /// Only favorited images.
     #[serde(default)]
     pub favorites_only: bool,
-    /// Only trashed images (the Trash view). When false, trashed images are
-    /// excluded; when true, ONLY trashed images are returned.
-    #[serde(default)]
-    pub trashed_only: bool,
     /// Case-insensitive substring search across `prompt`. Empty = no filter.
     #[serde(default)]
     pub search: String,
@@ -112,32 +104,46 @@ pub struct GalleryFilter {
 /// type from `SceneImageRequest` because the user doesn't supply the `dest`
 /// path or the `model_path` (those are resolved server-side) — the IPC surface
 /// is intentionally narrower than the internal request.
+///
+/// **LOCKED RECIPE (Chloe ruling, 2026-08-17):** `cfg`, `steps`, `sampler`,
+/// and `negative_prompt` are ACCEPTED BUT IGNORED — [`build_request`] always
+/// normalizes onto the locked NoobAI v1.1 official recipe (Euler a + the
+/// discrete schedule, 30 steps, CFG 6.0, injected quality prefix + negative
+/// block; the launch recipe was DPM++ 2M + Karras at 20 — switched the same
+/// day onto the model card's recommended parameters). The fields stay
+/// deserializable so stale frontends + old Fork payloads keep working; the
+/// only live knobs are `prompt`, `seed`, `width`, `height`.
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct GenerateParams {
     pub prompt: String,
+    /// IGNORED (locked recipe): the negative block is engine-injected.
     #[serde(default)]
     pub negative_prompt: Option<String>,
-    /// `-1` = random; `>= 0` = locked (Fork & Edit). Mirrors the crate.
+    /// `-1` = random; `>= 0` = locked (Fork & Edit).
     #[serde(default = "default_seed")]
     pub seed: i64,
+    /// IGNORED (locked recipe): always 6.0.
     #[serde(default = "default_cfg")]
     pub cfg: f32,
+    /// IGNORED (locked recipe): always 30.
     #[serde(default = "default_steps")]
     pub steps: i32,
+    /// Bucket presets only (the 7 NoobAI buckets).
     #[serde(default = "default_width")]
     pub width: i32,
     #[serde(default = "default_height")]
     pub height: i32,
+    /// IGNORED (locked recipe): always Euler a.
     #[serde(default = "default_sampler")]
     pub sampler: i32,
 }
 
 fn default_seed() -> i64 { -1 }
-fn default_cfg() -> f32 { 5.0 }
-fn default_steps() -> i32 { 28 }
-fn default_width() -> i32 { 1024 }
-fn default_height() -> i32 { 576 }
-fn default_sampler() -> i32 { scene_art::DPMPP2M_DISCRIMINANT }
+fn default_cfg() -> f32 { scene_art::PRISM_LOCKED_CFG }
+fn default_steps() -> i32 { scene_art::PRISM_LOCKED_STEPS }
+fn default_width() -> i32 { scene_art::PRISM_DEFAULT_WIDTH }
+fn default_height() -> i32 { scene_art::PRISM_DEFAULT_HEIGHT }
+fn default_sampler() -> i32 { scene_art::EULER_A_DISCRIMINANT }
 
 /// Manual `Default` so the derived shape matches the `#[serde(default)]`
 /// helpers EXACTLY — a `GenerateParams { prompt, ..Default::default() }`
@@ -195,8 +201,8 @@ impl GalleryDb {
         conn.execute(
             "INSERT INTO images
                 (created_at, path, prompt, negative_prompt, seed, cfg, steps,
-                 width, height, sampler, model, favorite, trashed)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 0, 0)",
+                 width, height, sampler, model, favorite)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 0)",
             params![
                 row.created_at,
                 row.path,
@@ -225,14 +231,13 @@ impl GalleryDb {
         // count always matches the bound params. rusqlite uses positional `?`
         // (NOT named params), so the search clause contributes one extra `?`
         // before the limit/offset pair — the two branches bind matching tuples.
-        let trashed_clause = if filter.trashed_only { "1" } else { "0" };
-        let fav_clause = if filter.favorites_only { "AND favorite = 1" } else { "" };
+        let fav_clause = if filter.favorites_only { "WHERE favorite = 1" } else { "" };
         let order = "ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?";
         let select = "SELECT id, created_at, path, prompt, negative_prompt, seed, cfg,
-                             steps, width, height, sampler, model, favorite, trashed
+                             steps, width, height, sampler, model, favorite
                       FROM images";
         if filter.search.trim().is_empty() {
-            let sql = format!("{select} WHERE trashed = {trashed_clause} {fav_clause} {order}");
+            let sql = format!("{select} {fav_clause} {order}");
             let mut stmt = conn.prepare(&sql).map_err(|e| anyhow::anyhow!("gallery list prepare: {e:?}"))?;
             let rows = stmt
                 .query_map(params![limit, offset], row_to_image)
@@ -244,8 +249,9 @@ impl GalleryDb {
             // `%...%` wildcards wrap the trimmed search term.
             let needle = format!("%{}%", filter.search.trim());
             let sql = format!(
-                "{select} WHERE trashed = {trashed_clause} {fav_clause} \
-                 AND LOWER(prompt) LIKE LOWER(?) {order}"
+                "{select} {fav_clause} \
+                 {} LOWER(prompt) LIKE LOWER(?) {order}",
+                if filter.favorites_only { "AND" } else { "WHERE" }
             );
             let mut stmt = conn.prepare(&sql).map_err(|e| anyhow::anyhow!("gallery list prepare: {e:?}"))?;
             let rows = stmt
@@ -256,13 +262,13 @@ impl GalleryDb {
         }
     }
 
-    /// Fetch one image by id (regardless of trashed state).
+    /// Fetch one image by id.
     pub fn get(&self, id: i64) -> anyhow::Result<Option<GalleryImage>> {
         let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("gallery mutex: {e}"))?;
         let mut stmt = conn
             .prepare(
                 "SELECT id, created_at, path, prompt, negative_prompt, seed, cfg,
-                        steps, width, height, sampler, model, favorite, trashed
+                        steps, width, height, sampler, model, favorite
                  FROM images WHERE id = ?",
             )
             .map_err(|e| anyhow::anyhow!("gallery get prepare: {e:?}"))?;
@@ -287,40 +293,27 @@ impl GalleryDb {
         Ok(())
     }
 
-    /// Soft-delete (move to trash). Reversible via [`restore`].
-    pub fn trash(&self, id: i64) -> anyhow::Result<()> {
-        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("gallery mutex: {e}"))?;
-        conn.execute("UPDATE images SET trashed = 1 WHERE id = ?", params![id])
-            .map_err(|e| anyhow::anyhow!("gallery trash: {e:?}"))?;
-        Ok(())
-    }
-
-    /// Restore from trash.
-    pub fn restore(&self, id: i64) -> anyhow::Result<()> {
-        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("gallery mutex: {e}"))?;
-        conn.execute("UPDATE images SET trashed = 0 WHERE id = ?", params![id])
-            .map_err(|e| anyhow::anyhow!("gallery restore: {e:?}"))?;
-        Ok(())
-    }
-
-    /// HARD delete: remove the row + return its path so the caller can unlink
-    /// the PNG file. Used by the trash-empty action. Returns Ok(None) if the
-    /// row didn't exist (idempotent).
-    pub fn purge(&self, id: i64) -> anyhow::Result<Option<String>> {
+    /// PERMANENT delete (Chloe ruling, 2026-08-18): there is NO soft delete /
+    /// trash for gallery images — one click on Delete and the image is gone,
+    /// period. Remove the row + return its path so the caller can unlink the
+    /// PNG file. The file unlink is the CALLER's job (lib.rs IPC) so this
+    /// method stays pure-SQL + testable. Returns Ok(None) if the row didn't
+    /// exist (idempotent).
+    pub fn delete(&self, id: i64) -> anyhow::Result<Option<String>> {
         let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("gallery mutex: {e}"))?;
         let path: Option<String> = conn
             .query_row("SELECT path FROM images WHERE id = ?", params![id], |r| r.get(0))
             .ok();
         if path.is_some() {
             conn.execute("DELETE FROM images WHERE id = ?", params![id])
-                .map_err(|e| anyhow::anyhow!("gallery purge: {e:?}"))?;
+                .map_err(|e| anyhow::anyhow!("gallery delete: {e:?}"))?;
         }
         Ok(path)
     }
 }
 
 /// The insert payload (the fields the generation entrypoint fills before
-/// `GalleryDb::insert`). Sibling of `GalleryImage` minus the id/favorite/trashed
+/// `GalleryDb::insert`). Sibling of `GalleryImage` minus the id/favorite
 /// (those are DB-assigned).
 #[derive(Debug, Clone)]
 pub struct NewImage {
@@ -355,7 +348,6 @@ fn row_to_image(row: &rusqlite::Row<'_>) -> rusqlite::Result<GalleryImage> {
         sampler: row.get(10)?,
         model: row.get(11)?,
         favorite: row.get(12)?,
-        trashed: row.get(13)?,
     })
 }
 
@@ -364,6 +356,12 @@ fn row_to_image(row: &rusqlite::Row<'_>) -> rusqlite::Result<GalleryImage> {
 /// migration runner. Additive only (a future column is an `ALTER TABLE ADD
 /// COLUMN` guarded by a PRAGMA check, never a destructive change — gallery
 /// rows are user data).
+///
+/// (2026-08-18) The `trashed` column is REMOVED from the fresh schema —
+/// delete is permanent (no trash system). Pre-0.22.0 dev databases keep
+/// their legacy `trashed` column on disk (harmless: every SELECT names its
+/// columns, so an extra dead column never round-trips); only rows still
+/// marked trashed there are strays from the deleted soft-delete era.
 fn init_schema(conn: &Connection) -> anyhow::Result<()> {
     conn.execute_batch(
         r#"
@@ -380,11 +378,9 @@ fn init_schema(conn: &Connection) -> anyhow::Result<()> {
             height           INTEGER NOT NULL DEFAULT 576,
             sampler          INTEGER NOT NULL DEFAULT 5,
             model            TEXT    NOT NULL DEFAULT '',
-            favorite         INTEGER NOT NULL DEFAULT 0,
-            trashed          INTEGER NOT NULL DEFAULT 0
+            favorite         INTEGER NOT NULL DEFAULT 0
         );
         CREATE INDEX IF NOT EXISTS idx_images_created_at ON images (created_at DESC);
-        CREATE INDEX IF NOT EXISTS idx_images_trashed     ON images (trashed);
         CREATE INDEX IF NOT EXISTS idx_images_favorite    ON images (favorite);
         "#,
     )
@@ -418,25 +414,273 @@ pub fn dest_path(gallery_dir: &Path, seed: i64, created_at_ms: i64) -> PathBuf {
     unreachable!("u64 retry counter cannot exhaust the filesystem namespace")
 }
 
+// ────────────────────────────────────────────────────────────────────────────
+// Subject classification — the crowd-logic tag gate (Chloe ruling, 2026-08-17)
+// ────────────────────────────────────────────────────────────────────────────
+// The composer's vocabulary is full danbooru, so subject-count tags are the
+// reliable signal for how many figures the frame holds. The gate injects ONE
+// derived tag into every real prompt (engine machinery, same invisibility
+// rules as the quality prefix — never rendered, never stored in gallery
+// rows):
+//
+// | Prompt                                  | Injected    | Why                          |
+// |-----------------------------------------|-------------|------------------------------|
+// | single subject tag (1girl/1boy/1other), | `solo`      | isolates the subject; locks  |
+// | no crowd tags                           |             | down extra-limb/clone drift  |
+// | crowd/multi tags (2boys, crowd, group…) | — (nothing) | secondary figures render     |
+// |                                         |             | cleanly, no tag fighting     |
+// | no subject tags at all (scenery mode)   | `no humans` | drop all character-render    |
+// |                                         |             | logic; 100% environment      |
+
+/// Injected when exactly ONE subject is named.
+const SUBJECT_TAG_SOLO: &str = "solo";
+/// Injected when NO subject is named (scenery mode).
+const SUBJECT_TAG_NO_HUMANS: &str = "no humans";
+
+/// Exactly-one-subject count tags (danbooru canonical). TWO DISTINCT singles
+/// in one prompt (e.g. `1girl, 1boy`) is a two-subject scene → Multiple.
+const SINGLE_SUBJECT_TAGS: [&str; 3] = ["1boy", "1girl", "1other"];
+
+/// Many-subject tags: numeric counts ≥2, the `multiple *` family, and the
+/// crowd/group family. Any one of these beats single tags — `1girl, crowd`
+/// is a crowd scene with a foreground girl, not a solo.
+const MULTI_SUBJECT_TAGS: &[&str] = &[
+    "2boys", "2girls", "2others",
+    "3boys", "3girls", "3others",
+    "4boys", "4girls", "4others",
+    "5boys", "5girls", "5others",
+    "6boys", "6girls", "6others",
+    "6+boys", "6+girls", "6+others",
+    "multiple boys", "multiple girls", "multiple others", "multiple people",
+    "crowd", "group", "couple", "twins",
+];
+
+/// The crowd-logic classification of a comma-separated tag prompt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubjectClass {
+    /// Exactly one subject named → inject `solo`.
+    Single,
+    /// Two or more subjects named → inject nothing.
+    Multiple,
+    /// No subjects named → inject `no humans`.
+    Scenery,
+}
+
+/// Normalize one comma-separated term for subject-tag comparison: trimmed,
+/// lowercased, danbooru underscores folded to spaces. The composer emits
+/// space-form tags, but hand-edited / forked / legacy payloads may carry the
+/// underscore form (`multiple_girls`, `no_humans`) — both spellings of every
+/// tag in the sets must match.
+fn normalize_subject_tag(raw: &str) -> String {
+    raw.trim().to_ascii_lowercase().replace('_', " ")
+}
+
+/// Classify a tag prompt by its subject-count tags. Pure + order-independent
+/// (flags are collected, then applied by precedence): an explicit
+/// `no humans` wins over everything (the authored scenery declaration must
+/// never fight an injected `solo`), crowd/multi tags beat singles, and an
+/// absent-everything prompt is scenery.
+pub fn classify_subject(prompt: &str) -> SubjectClass {
+    let mut has_no_humans = false;
+    let mut has_multi = false;
+    let mut singles = 0usize;
+    for raw in prompt.split(',') {
+        let tag = normalize_subject_tag(raw);
+        if tag == SUBJECT_TAG_NO_HUMANS {
+            has_no_humans = true;
+        } else if MULTI_SUBJECT_TAGS.contains(&tag.as_str()) {
+            has_multi = true;
+        } else if SINGLE_SUBJECT_TAGS.contains(&tag.as_str()) {
+            singles += 1;
+        }
+    }
+    if has_no_humans {
+        SubjectClass::Scenery
+    } else if has_multi || singles >= 2 {
+        SubjectClass::Multiple
+    } else if singles == 1 {
+        SubjectClass::Single
+    } else {
+        SubjectClass::Scenery
+    }
+}
+
+/// Apply the crowd-logic gate to a NON-EMPTY user prompt: append the
+/// classified tag unless the user already authored it (a typed `solo` or
+/// `no humans` is respected verbatim — never duplicated, never stripped).
+fn inject_subject_tag(user_prompt: &str) -> String {
+    let tag = match classify_subject(user_prompt) {
+        SubjectClass::Single => SUBJECT_TAG_SOLO,
+        SubjectClass::Multiple => return user_prompt.to_string(),
+        SubjectClass::Scenery => SUBJECT_TAG_NO_HUMANS,
+    };
+    let already = user_prompt
+        .split(',')
+        .any(|t| normalize_subject_tag(t) == tag);
+    if already {
+        user_prompt.to_string()
+    } else {
+        format!("{user_prompt}, {tag}")
+    }
+}
+
+// ── The SFW-default rating steering (Chloe ruling, 2026-08-17) ──────────
+//
+// The locked recipe carries no rating axis, so NoobAI falls back to its raw
+// Danbooru prior — which skews suggestive/NSFW for perfectly innocent
+// prompts like "1girl, classroom, school uniform". The default is
+// therefore SFW steering in Danbooru's own rating vocabulary: `safe` rides
+// the positive prefix, `nsfw` rides the negative block. The steering is
+// DROPPED the moment the user prompt carries an explicit/questionable tag —
+// people who want NSFW search with NSFW tags and the tags do the work;
+// nothing is force-inverted and nobody fights an injected censor.
+
+/// The SFW positive steering tag (appended to the quality prefix).
+const RATING_TAG_SFW: &str = "safe";
+/// The SFW negative steering tag (appended to the negative block).
+const RATING_TAG_NSFW: &str = "nsfw";
+
+/// Explicit/questionable markers — any ONE in the user prompt drops the SFW
+/// steering. Chloe-tunable: this is the opt-out flip condition, not a censor
+/// list. Two layers:
+///
+/// 1. this list — WHOLE-TAG equality (`classic` must never substring-match
+///    `ass`; `pantyhose` must never match `panties`);
+/// 2. [`EXPLICIT_PROMPT_ROOTS`] — substring roots for the danbooru families
+///    with too many variants to enumerate (`nude cover`, `pussy juice`,
+///    `puffy nipples`…).
+const EXPLICIT_PROMPT_TAGS: &[&str] = &[
+    // rating axis / meta words
+    "nsfw", "explicit", "questionable", "sensitive", "ecchi", "hentai",
+    "18+", "r18", "rating:explicit", "rating:questionable", "rating:sensitive",
+    // orientation / h-families
+    "yaoi", "yuri", "futanari", "trap", "otokonoko",
+    // sex acts / aftermath
+    "sex", "sexy", "vaginal", "anal", "oral", "group sex", "sex from behind",
+    "imminent sex", "after sex", "cum", "cumshot", "creampie", "ahegao",
+    "erection", "dildo", "vibrator", "sex toy", "bondage", "bdsm", "groping",
+    "undressing", "striptease", "lactation", "deepthroat", "rimjob",
+    "fingering", "spanking",
+    // provocative poses / body focus
+    "provocative pose", "spread legs", "bent over", "ass", "sideboob",
+    "underboob", "cameltoe", "upskirt", "panty shot",
+    // suggestive clothing / state
+    "thong", "garter belt", "bra", "underwear", "see-through",
+    "transparent clothes",
+];
+
+/// Substring roots — flip when the normalized tag CONTAINS the root. Every
+/// entry is individually cleared against the SFW vocabulary: `panties` is a
+/// root but `panty` is NOT (`pantyhose` is SFW); `nude`/`naked`/`lingerie`
+/// are roots but `sex`/`anal`/`oral`/`cum` stay exact-only (`unisex`,
+/// `canal`, `floral`, `cucumber` are real SFW tags).
+const EXPLICIT_PROMPT_ROOTS: &[&str] = &[
+    "nude", "naked", "topless", "bottomless",
+    "nipple", "areolae", "pussy", "penis", "testicle",
+    "lingerie", "panties", "cleavage",
+    "blowjob", "handjob", "footjob", "cunnilingus", "paizuri",
+    "masturbation", "presenting", "orgasm", "ejaculation",
+];
+
+/// True when the user prompt carries any explicit/questionable tag — the
+/// SFW steering's opt-out. Underscore + case tolerant via
+/// [`normalize_subject_tag`] (hand-edited / forked payloads).
+fn prompt_wants_explicit(user_prompt: &str) -> bool {
+    user_prompt.split(',').any(|raw| {
+        let tag = normalize_subject_tag(raw);
+        if EXPLICIT_PROMPT_TAGS.contains(&tag.as_str()) {
+            return true;
+        }
+        EXPLICIT_PROMPT_ROOTS.iter().any(|root| tag.contains(*root))
+    })
+}
+
 /// Convert user-supplied [`GenerateParams`] into the internal
 /// [`SceneImageRequest`] that the shared swap pipeline consumes. Pure (no I/O);
 /// pulled out so the params→request mapping is unit-testable without the SD
 /// backend. `model_path` is the resolved SD checkpoint; `dest` is the output
 /// PNG path (from [`dest_path`]).
+///
+/// **THE LOCKED-RECIPE CHOKEPOINT (Chloe ruling, 2026-08-17):** the sampler
+/// (Euler a), schedule (discrete — applied engine-side in
+/// `DiffusionRsGenerator::generate`), steps (30), CFG (6.0), the NoobAI
+/// v1.1 quality prefix, and the negative block are LOCKED — no matter
+/// what the frontend sends, this fn normalizes the request onto the recipe:
+///
+/// - `steps`/`cfg`/`sampler` from `params` are IGNORED (the IPC fields stay
+///   deserializable for stale frontends + old Fork payloads; they just no
+///   longer do anything).
+/// - The prompt gets [`scene_art::PRISM_QUALITY_PREFIX`] prepended (skipped
+///   only when the prompt already starts with it — the legacy-row guard; the
+///   live UI never produces that, but a hand-edited payload might).
+/// - The subject-tag gate ([`classify_subject`]) appends `solo` / `no humans`
+///   per the crowd-logic table to every NON-EMPTY prompt — engine-injected
+///   like the prefix, never stored in gallery rows, never duplicated against
+///   an authored tag. An EMPTY prompt stays prefix-alone (the generic
+///   top-cluster fallback is not "scenery mode").
+/// - SFW rating steering (2026-08-17): `safe` rides the positive prompt +
+///   `nsfw` rides the negative block by DEFAULT. A prompt carrying any
+///   [`EXPLICIT_PROMPT_TAGS`] marker drops BOTH (an authored `safe` tag is
+///   honored verbatim, never duplicated).
+/// - `negative_prompt` from `params` is IGNORED — the request always carries
+///   [`scene_art::PRISM_NEGATIVE_BLOCK`] (+ `nsfw` unless explicit).
+/// - `width`/`height`/`seed` pass through (clamped as before): size is the
+///   composer's bucket presets, seed is Fork & Edit's primitive.
 pub fn build_request(
     p: &GenerateParams,
     model_path: PathBuf,
     dest: PathBuf,
 ) -> SceneImageRequest {
+    let trimmed = p.prompt.trim();
+    // The crowd-logic gate applies to real prompts only — an empty prompt
+    // stays the prefix-alone fallback (generic top-cluster art; classifying
+    // "nothing chosen" as scenery would silently flip that fallback to
+    // environment-only art).
+    let user_prompt = if trimmed.is_empty() {
+        String::new()
+    } else {
+        inject_subject_tag(trimmed)
+    };
+    // SFW steering unless the user opted out with an explicit tag. A
+    // hand-edited payload that already authors `safe` is honored as-is.
+    let explicit = !user_prompt.is_empty() && prompt_wants_explicit(&user_prompt);
+    let has_own_safe = user_prompt
+        .split(',')
+        .any(|t| normalize_subject_tag(t) == RATING_TAG_SFW);
+    let steered = !explicit && !has_own_safe;
+    let prompt = if user_prompt.is_empty() {
+        // No user tags → the prefix alone (generic top-cluster art) + the
+        // SFW steer. The UI's guard asks for ≥1 tag, but the IPC is not
+        // trusted to enforce that.
+        format!("{}, {}", scene_art::PRISM_QUALITY_PREFIX, RATING_TAG_SFW)
+    } else if user_prompt.starts_with(scene_art::PRISM_QUALITY_PREFIX) {
+        // Legacy/duplicate guard: already prefixed — never double-prefix.
+        if steered {
+            format!("{user_prompt}, {}", RATING_TAG_SFW)
+        } else {
+            user_prompt
+        }
+    } else if steered {
+        format!("{}, {}, {}", scene_art::PRISM_QUALITY_PREFIX, RATING_TAG_SFW, user_prompt)
+    } else {
+        format!("{}, {}", scene_art::PRISM_QUALITY_PREFIX, user_prompt)
+    };
+    let negative_prompt = if explicit {
+        // Explicit mode: no `nsfw` in the negative — the user asked for it;
+        // the explicit tags carry the intent.
+        scene_art::PRISM_NEGATIVE_BLOCK.to_string()
+    } else {
+        format!("{}, {}", scene_art::PRISM_NEGATIVE_BLOCK, RATING_TAG_NSFW)
+    };
     SceneImageRequest {
-        prompt: p.prompt.clone(),
-        negative_prompt: p.negative_prompt.clone().filter(|s| !s.trim().is_empty()),
+        prompt,
+        negative_prompt: Some(negative_prompt),
         seed: p.seed,
-        cfg_scale: p.cfg,
-        steps: p.steps.max(1) as u32,
+        cfg_scale: scene_art::PRISM_LOCKED_CFG,
+        steps: scene_art::PRISM_LOCKED_STEPS.max(1) as u32,
         width: p.width.max(64) as u32,
         height: p.height.max(64) as u32,
-        sampling_method: p.sampler,
+        sampling_method: scene_art::EULER_A_DISCRIMINANT,
         model_path,
         dest,
     }
@@ -530,7 +774,6 @@ mod tests {
         assert_eq!(r.sampler, scene_art::DPMPP2M_DISCRIMINANT);
         assert_eq!(r.model, "Image.safetensors");
         assert_eq!(r.favorite, 0);
-        assert_eq!(r.trashed, 0);
     }
 
     #[test]
@@ -558,7 +801,7 @@ mod tests {
         assert!(db.get(999999).unwrap().is_none());
     }
 
-    // ── favorite / trash / restore / purge ─────────────────────────────────
+    // ── favorite / delete ──────────────────────────────────────────────────
 
     #[test]
     fn favorite_toggles() {
@@ -589,38 +832,19 @@ mod tests {
     }
 
     #[test]
-    fn trash_excludes_from_default_and_appears_in_trash_view() {
+    fn delete_is_permanent_and_idempotent() {
         let db = temp_db();
         let a = db.insert(&sample_new_image(1)).unwrap();
         let _b = db.insert(&sample_new_image(2)).unwrap();
-        db.trash(a).unwrap();
-        // default excludes trashed
-        let live = db.list(&GalleryFilter::default(), 10, 0).unwrap();
-        assert_eq!(live.len(), 1);
-        assert_ne!(live[0].id, a, "trashed row excluded");
-        // trashed_only shows only trashed
-        let trash = db.list(
-            &GalleryFilter { trashed_only: true, ..Default::default() },
-            10,
-            0,
-        ).unwrap();
-        assert_eq!(trash.len(), 1);
-        assert_eq!(trash[0].id, a);
-        // restore brings it back
-        db.restore(a).unwrap();
-        let live = db.list(&GalleryFilter::default(), 10, 0).unwrap();
-        assert_eq!(live.len(), 2, "restored row reappears");
-    }
-
-    #[test]
-    fn purge_removes_row_and_returns_path() {
-        let db = temp_db();
-        let id = db.insert(&sample_new_image(1)).unwrap();
-        let path = db.purge(id).unwrap();
+        // Delete returns the path (the caller unlinks the PNG) and the row is
+        // GONE — no trash, no restore, no trashed flag.
+        let path = db.delete(a).unwrap();
         assert_eq!(path.as_deref(), Some("/tmp/img.png"));
-        assert!(db.get(id).unwrap().is_none(), "purged row gone");
-        // purge again is a no-op (idempotent).
-        let again = db.purge(id).unwrap();
+        assert!(db.get(a).unwrap().is_none(), "deleted row gone for good");
+        let live = db.list(&GalleryFilter::default(), 10, 0).unwrap();
+        assert_eq!(live.len(), 1, "the other row survives");
+        // delete again is a no-op (idempotent).
+        let again = db.delete(a).unwrap();
         assert!(again.is_none());
     }
 
@@ -647,63 +871,307 @@ mod tests {
     // ── generation entrypoint (no SD backend needed) ───────────────────────
 
     #[test]
-    fn build_request_maps_all_params() {
+    fn build_request_enforces_the_locked_recipe() {
+        // Whatever a stale frontend / hand-crafted IPC payload sends for the
+        // locked knobs, the request carries the LOCKED recipe (Chloe ruling
+        // 2026-08-17): sampler Euler a, steps 30, CFG 6.0, the NoobAI v1.1
+        // quality prefix prepended, the NoobAI negative block + the SFW
+        // steer injected.
         let p = GenerateParams {
             prompt: "1girl".into(),
-            negative_prompt: Some("  ".into()), // whitespace-only → None
+            negative_prompt: Some("user authored negative".into()), // ignored
             seed: 12345,
-            cfg: 7.5,
-            steps: 20,
-            width: 832,
-            height: 1216,
-            sampler: 1, // Euler a
+            cfg: 9.5,     // ignored → 6.0
+            steps: 50,    // ignored → 30
+            width: 1216,
+            height: 832,
+            sampler: 5,   // ignored → Euler a (DPM++ 2M sent on purpose: the
+                          // old locked value, proving the field is ignored)
         };
         let req = build_request(&p, PathBuf::from("/m/Image.safetensors"), PathBuf::from("/o/out.png"));
-        assert_eq!(req.prompt, "1girl");
-        assert!(req.negative_prompt.is_none(), "whitespace-only negative → None");
+        assert_eq!(
+            req.prompt,
+            format!("{}, safe, 1girl, solo", scene_art::PRISM_QUALITY_PREFIX),
+            "quality-meta prefix + SFW steer prepended; the crowd-logic gate injects solo (single subject)",
+        );
+        let expected_negative = format!("{}, nsfw", scene_art::PRISM_NEGATIVE_BLOCK);
+        assert_eq!(
+            req.negative_prompt.as_deref(),
+            Some(expected_negative.as_str()),
+            "the locked NoobAI negative block + the nsfw steer replace any user negative",
+        );
         assert_eq!(req.seed, 12345, "locked seed passes through");
-        assert_eq!(req.cfg_scale, 7.5);
-        assert_eq!(req.steps, 20);
-        assert_eq!(req.width, 832);
-        assert_eq!(req.height, 1216);
-        assert_eq!(req.sampling_method, 1);
-        assert_eq!(req.model_path, PathBuf::from("/m/Image.safetensors"));
-        assert_eq!(req.dest, PathBuf::from("/o/out.png"));
+        assert_eq!(req.cfg_scale, 6.0, "CFG is locked at 6.0");
+        assert_eq!(req.steps, 30, "steps are locked at 30");
+        assert_eq!(req.sampling_method, scene_art::EULER_A_DISCRIMINANT, "sampler is locked at Euler a");
+        assert_eq!(req.width, 1216);
+        assert_eq!(req.height, 832);
     }
 
     #[test]
-    fn build_request_defaults_match_fable_scene_art() {
-        // An empty/minimal params object should produce a request whose
-        // sampler/cfg/steps/dims defaults match the §11.58 FABLE scene-art
-        // shape (so a no-op Prism gen is byte-identical to a FABLE scene gen).
+    fn build_request_prefix_guards_empty_and_prefixed_prompts() {
+        // Empty prompt → the prefix + the SFW steer alone (the UI asks for
+        // ≥1 tag; the IPC is not trusted to). An already-prefixed prompt
+        // (legacy row / hand payload) is never double-prefixed.
+        let empty = GenerateParams { prompt: "   ".into(), ..Default::default() };
+        let req = build_request(&empty, PathBuf::new(), PathBuf::new());
+        assert_eq!(
+            req.prompt,
+            format!("{}, safe", scene_art::PRISM_QUALITY_PREFIX),
+        );
+
+        let pre = GenerateParams {
+            prompt: format!("{}, 1girl", scene_art::PRISM_QUALITY_PREFIX),
+            ..Default::default()
+        };
+        let req = build_request(&pre, PathBuf::new(), PathBuf::new());
+        // Never double-PREFIXED; the subject gate + steer still apply (single
+        // subject → solo appended, SFW default → safe appended).
+        assert_eq!(
+            req.prompt,
+            format!("{}, 1girl, solo, safe", scene_art::PRISM_QUALITY_PREFIX),
+            "already-prefixed prompt is never double-prefixed",
+        );
+    }
+
+    #[test]
+    fn build_request_defaults_are_the_locked_recipe() {
+        // An empty/minimal params object produces the LOCKED NoobAI v1.1
+        // official recipe — 30 steps, CFG 6.0, the portrait bucket, Euler a,
+        // prefix + SFW steer + negative block injected.
         let p = GenerateParams {
             prompt: "x".into(),
             ..Default::default()
         };
         let req = build_request(&p, PathBuf::new(), PathBuf::new());
         assert_eq!(req.seed, -1, "default random seed");
-        assert_eq!(req.cfg_scale, 5.0);
-        assert_eq!(req.steps, 28);
-        assert_eq!(req.width, 1024);
-        assert_eq!(req.height, 576);
-        assert_eq!(req.sampling_method, scene_art::DPMPP2M_DISCRIMINANT);
+        assert_eq!(req.cfg_scale, 6.0);
+        assert_eq!(req.steps, 30);
+        assert_eq!(req.width, 832);
+        assert_eq!(req.height, 1216);
+        assert_eq!(req.sampling_method, scene_art::EULER_A_DISCRIMINANT);
+        assert_eq!(
+            req.prompt,
+            format!("{}, safe, x, no humans", scene_art::PRISM_QUALITY_PREFIX),
+            "no subject tags → scenery mode injects no humans; the SFW steer rides the front",
+        );
+        let expected_negative = format!("{}, nsfw", scene_art::PRISM_NEGATIVE_BLOCK);
+        assert_eq!(req.negative_prompt.as_deref(), Some(expected_negative.as_str()));
+    }
+
+    /// The SFW rating steering (2026-08-17): `safe` positive + `nsfw`
+    /// negative by default; one explicit/questionable marker drops BOTH;
+    /// matching is underscore/case tolerant (whole-tag OR a cleared
+    /// substring root — see [`EXPLICIT_PROMPT_ROOTS`]); an authored `safe`
+    /// is honored verbatim.
+    #[test]
+    fn build_request_sfw_steering_and_the_explicit_opt_out() {
+        // The SFW default — "1girl, classroom, school uniform" must not ride
+        // the model's raw Danbooru prior.
+        let sfw = GenerateParams {
+            prompt: "1girl, classroom, school uniform".into(),
+            ..Default::default()
+        };
+        let req = build_request(&sfw, PathBuf::new(), PathBuf::new());
+        assert!(req.prompt.contains(", safe, 1girl"), "steered: {}", req.prompt);
+        let expected_negative = format!("{}, nsfw", scene_art::PRISM_NEGATIVE_BLOCK);
+        assert_eq!(req.negative_prompt.as_deref(), Some(expected_negative.as_str()));
+
+        // One explicit marker drops BOTH steering tags — the explicit tags
+        // carry the intent; nothing is force-inverted.
+        let explicit = GenerateParams {
+            prompt: "1girl, classroom, nude".into(),
+            ..Default::default()
+        };
+        let req = build_request(&explicit, PathBuf::new(), PathBuf::new());
+        assert!(!req.prompt.contains("safe"), "explicit prompt is never steered: {}", req.prompt);
+        assert_eq!(
+            req.negative_prompt.as_deref(),
+            Some(scene_art::PRISM_NEGATIVE_BLOCK),
+            "no nsfw negative against an explicit prompt",
+        );
+
+        // Underscore/case tolerance (hand-edited / forked payloads).
+        let ugly = GenerateParams { prompt: "1girl, Nude_Female".into(), ..Default::default() };
+        let req = build_request(&ugly, PathBuf::new(), PathBuf::new());
+        assert!(!req.prompt.contains("safe"), "underscored explicit marker still flips");
+
+        // Whole-tag equality only — `classy` must never substring-match.
+        let tricky = GenerateParams { prompt: "classy, 1girl".into(), ..Default::default() };
+        let req = build_request(&tricky, PathBuf::new(), PathBuf::new());
+        assert!(req.prompt.contains(", safe,"), "non-marker tags stay steered: {}", req.prompt);
+
+        // An authored `safe` is honored, never duplicated.
+        let authored = GenerateParams { prompt: "safe, 1girl".into(), ..Default::default() };
+        let req = build_request(&authored, PathBuf::new(), PathBuf::new());
+        assert_eq!(req.prompt.matches("safe").count(), 1);
+    }
+
+    /// The marker VOCABULARY: the yaoi/yuri/pose/clothing families flip the
+    /// steer; the SFW look-alike traps (`pantyhose`, `floral print`,
+    /// `cucumber`, `unisex`, `canal`) never do.
+    #[test]
+    fn build_request_explicit_marker_vocabulary() {
+        let flips = [
+            // orientation / h families
+            "2girls, yuri", "2boys, yaoi", "1girl, futanari",
+            // clothing / state
+            "1girl, lingerie", "1girl, panties", "1girl, bra, underwear",
+            "1girl, topless", "1girl, bottomless",
+            // poses / focus
+            "1girl, spread legs", "1girl, bent over", "1girl, provocative pose",
+            "1girl, upskirt", "1girl, panty shot",
+            // root-covered variants
+            "1girl, completely nude", "1girl, naked apron", "1girl, puffy nipples",
+            "1girl, spread pussy", "1girl, side cleavage", "1girl, double blowjob",
+            // rating words
+            "1girl, ecchi", "1girl, 18+",
+        ];
+        for p in flips {
+            let req = build_request(
+                &GenerateParams { prompt: p.into(), ..Default::default() },
+                PathBuf::new(),
+                PathBuf::new(),
+            );
+            assert!(!req.prompt.contains("safe"), "flip case must drop the steer: {p}");
+            assert_eq!(
+                req.negative_prompt.as_deref(),
+                Some(scene_art::PRISM_NEGATIVE_BLOCK),
+                "flip case must drop the nsfw negative: {p}",
+            );
+        }
+
+        // SFW traps — near-miss spellings that must STAY steered.
+        let stays = [
+            "1girl, pantyhose",        // `panty` is deliberately NOT a root
+            "1girl, floral print",     // `oral` is exact-only
+            "cucumber, no humans",     // `cum` is exact-only
+            "1girl, unisex clothes",   // `sex` is exact-only
+            "canal, no humans",        // `anal` is exact-only
+            "1girl, classy",           // `ass` is exact-only
+            "1girl, swimsuit",         // sensitive-tier clothing stays SFW-default
+        ];
+        for p in stays {
+            let req = build_request(
+                &GenerateParams { prompt: p.into(), ..Default::default() },
+                PathBuf::new(),
+                PathBuf::new(),
+            );
+            assert!(req.prompt.contains(", safe,"), "trap case must stay steered: {p}");
+        }
     }
 
     #[test]
-    fn build_request_clamps_nonpositive_dims_and_steps() {
+    fn build_request_clamps_nonpositive_dims() {
         // Defensive: a bad UI value (0 / negative) never reaches the crate as
         // 0 (which would fail or hang the render). Clamped to sane floors.
+        // (Steps need no clamp anymore — the value is locked, not passed.)
         let p = GenerateParams {
             prompt: "x".into(),
-            steps: 0,
             width: -100,
             height: 0,
             ..Default::default()
         };
         let req = build_request(&p, PathBuf::new(), PathBuf::new());
-        assert!(req.steps >= 1);
         assert!(req.width >= 64);
         assert!(req.height >= 64);
+    }
+
+    // ── subject classification (the crowd-logic gate) ──────────────────────
+
+    /// The crowd-logic table, row by row: single → solo, crowd/multi →
+    /// nothing, scenery → no humans. Plus the precedence edges (two singles =
+    /// multi, crowd beats single, authored no-humans wins, underscore tags
+    /// match the space-form sets).
+    #[test]
+    fn subject_classification_matches_the_crowd_logic_table() {
+        // Single subject chosen (1boy / 1girl / 1other), no crowd tags.
+        assert_eq!(classify_subject("1girl, long hair, sunset"), SubjectClass::Single);
+        assert_eq!(classify_subject("monkey d. luffy, 1boy, straw hat"), SubjectClass::Single);
+        assert_eq!(classify_subject("1other, cloak"), SubjectClass::Single);
+
+        // Crowd / multiple people chosen.
+        for multi in [
+            "2boys", "2girls", "6+girls", "multiple girls", "crowd", "group",
+            "couple", "twins", "multiple people",
+        ] {
+            assert_eq!(classify_subject(multi), SubjectClass::Multiple, "tag: {multi}");
+        }
+        // A crowd tag beats a single tag ("1girl, crowd" is a crowd scene
+        // with a foreground girl, not a solo).
+        assert_eq!(classify_subject("1girl, crowd"), SubjectClass::Multiple);
+        // Two DISTINCT singles = two subjects.
+        assert_eq!(classify_subject("1girl, 1boy"), SubjectClass::Multiple);
+
+        // No characters chosen / scenery mode.
+        assert_eq!(classify_subject("landscape, ocean, sunset"), SubjectClass::Scenery);
+        assert_eq!(classify_subject("dungeon, torches"), SubjectClass::Scenery);
+        assert_eq!(classify_subject(""), SubjectClass::Scenery);
+
+        // An authored no-humans is the explicit scenery declaration — it wins
+        // even if stray character tags remain in the prompt.
+        assert_eq!(classify_subject("1girl, no humans"), SubjectClass::Scenery);
+
+        // Underscore (danbooru canonical) spellings match the space-form sets
+        // (hand-edited / forked payloads may carry either form).
+        assert_eq!(classify_subject("multiple_girls"), SubjectClass::Multiple);
+        assert_eq!(classify_subject("no_humans, scenery"), SubjectClass::Scenery);
+        assert_eq!(classify_subject("2girls, classroom"), SubjectClass::Multiple);
+
+        // Case/whitespace tolerance.
+        assert_eq!(classify_subject("  1Girl , Crowd "), SubjectClass::Multiple);
+    }
+
+    #[test]
+    fn build_request_injects_the_classified_subject_tag() {
+        // Single → solo appended after the user tags.
+        let single = GenerateParams {
+            prompt: "monkey d. luffy, 1boy, outdoors, ocean, straw hat, sunset".into(),
+            ..Default::default()
+        };
+        let req = build_request(&single, PathBuf::new(), PathBuf::new());
+        assert_eq!(
+            req.prompt,
+            format!(
+                "{}, safe, monkey d. luffy, 1boy, outdoors, ocean, straw hat, sunset, solo",
+                scene_art::PRISM_QUALITY_PREFIX
+            )
+        );
+
+        // Crowd → NOTHING injected (secondary figures render without fighting).
+        let multi = GenerateParams {
+            prompt: "1girl, crowd, festival".into(),
+            ..Default::default()
+        };
+        let req = build_request(&multi, PathBuf::new(), PathBuf::new());
+        assert_eq!(
+            req.prompt,
+            format!("{}, safe, 1girl, crowd, festival", scene_art::PRISM_QUALITY_PREFIX)
+        );
+
+        // Scenery → no humans appended.
+        let scenery = GenerateParams {
+            prompt: "landscape, ocean, cloudy sky".into(),
+            ..Default::default()
+        };
+        let req = build_request(&scenery, PathBuf::new(), PathBuf::new());
+        assert_eq!(
+            req.prompt,
+            format!("{}, safe, landscape, ocean, cloudy sky, no humans", scene_art::PRISM_QUALITY_PREFIX)
+        );
+    }
+
+    #[test]
+    fn build_request_never_duplicates_an_authored_subject_tag() {
+        // A typed `solo` is respected verbatim — no double injection.
+        let solo = GenerateParams { prompt: "1girl, solo".into(), ..Default::default() };
+        let req = build_request(&solo, PathBuf::new(), PathBuf::new());
+        assert_eq!(req.prompt.matches("solo").count(), 1, "no duplicate solo");
+
+        // A typed `no humans` likewise.
+        let nh = GenerateParams { prompt: "castle, no humans".into(), ..Default::default() };
+        let req = build_request(&nh, PathBuf::new(), PathBuf::new());
+        assert_eq!(req.prompt.matches("no humans").count(), 1, "no duplicate no humans");
     }
 
     #[test]

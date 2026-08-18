@@ -67,6 +67,21 @@
 }
 .app-window.prism-app.show { display: flex; flex-direction: column; }
 
+/* Invisible scrollbars app-wide (Chloe ruling, 2026-08-17): every scroll
+   surface (the tag dropdown, screens, drawers, gallery) keeps scrolling,
+   the bar itself never renders. */
+.prism-app,
+.prism-app * {
+  scrollbar-width: none;      /* standard */
+  -ms-overflow-style: none;   /* legacy Edge */
+}
+.prism-app ::-webkit-scrollbar,
+.prism-app::-webkit-scrollbar {
+  display: none;
+  width: 0;
+  height: 0;
+}
+
 /* ── Top bar ────────────────────────────────────────────────────────── */
 .prism-topbar {
   display: flex;
@@ -238,11 +253,6 @@
   cursor: grab;
   user-select: none;
 }
-/* Negative lane keeps a muted red tint — functional signal, not decorative. */
-.prism-pill[data-lane="negative"], .prism-lane[data-lane="negative"] .prism-pill {
-  background: rgba(255, 85, 119, 0.10);
-  border-color: rgba(255, 85, 119, 0.30);
-}
 .prism-pill:active { cursor: grabbing; }
 .prism-pill-x {
   background: transparent;
@@ -255,7 +265,12 @@
 }
 .prism-pill-x:hover { color: var(--prism-danger); }
 
-.prism-lane-input {
+.prism-lane-input,
+.prism-tagsearch-input {
+  /* border-box is load-bearing: width:100% + horizontal padding + the 1px
+     border must fit INSIDE the lane (content-box made the field overhang
+     the panel's right edge). */
+  box-sizing: border-box;
   width: 100%;
   background: rgba(0,0,0,0.30);
   border: 1px solid var(--prism-border);
@@ -265,10 +280,61 @@
   font-size: 0.92em;
   font-family: inherit;
 }
-.prism-lane-input:focus {
+.prism-lane-input:focus,
+.prism-tagsearch-input:focus {
   outline: none;
   border-color: var(--prism-border-glow);
   box-shadow: 0 0 0 3px rgba(255, 255, 255, 0.10);
+}
+
+/* ── Tag search engine (the prompt-builder search box + suggestions) ── */
+/* The input is a SEARCH, never free text: matching Danbooru tags appear in
+   an absolute dropdown beneath it; click/Enter adds a pill. The dropdown is
+   a frosted-glass panel floating over the pill box. */
+.prism-tagsearch { position: relative; }
+.prism-suggest {
+  position: absolute;
+  top: calc(100% + 6px);
+  left: 0;
+  right: 0;
+  z-index: 60;
+  max-height: 320px;
+  overflow-y: auto;
+  background: var(--prism-surface-solid);
+  border: 1px solid var(--prism-border-strong);
+  border-radius: var(--prism-radius-sm);
+  box-shadow: 0 14px 38px rgba(0, 0, 0, 0.55);
+  padding: 4px;
+}
+.prism-suggest-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  width: 100%;
+  background: transparent;
+  border: none;
+  color: var(--prism-text);
+  text-align: left;
+  font-family: inherit;
+  font-size: 0.88em;
+  padding: 7px 10px;
+  border-radius: 6px;
+  cursor: pointer;
+}
+.prism-suggest-item.is-active {
+  background: rgba(255, 255, 255, 0.07);
+  box-shadow: inset 0 0 0 1px var(--prism-border-glow);
+}
+.prism-suggest-tag { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* The settings-rail note explaining the locked recipe (no sliders to see). */
+.prism-recipe-note {
+  font-size: 0.75em;
+  color: var(--prism-text-faint);
+  line-height: 1.5;
+  border-top: 1px solid var(--prism-border);
+  padding-top: 12px;
+  margin-top: 4px;
 }
 
 /* ── Compose actions ───────────────────────────────────────────────── */
@@ -318,6 +384,10 @@
   vertical-align: middle;
 }
 @keyframes prism-spin { to { transform: rotate(360deg); } }
+/* The base display:inline-block overrides the UA stylesheet's [hidden]
+   { display:none } — without this guard the spinner animates on every
+   idle Generate button (the "infinite loading circle" bug). */
+.prism-generate-spinner[hidden] { display: none; }
 
 /* ── Settings rail ─────────────────────────────────────────────────── */
 .prism-settings-rail {
@@ -357,16 +427,6 @@
   width: 100%;
   accent-color: var(--prism-text);                /* white range thumb — no cyan */
 }
-.prism-seed-row { display: flex; gap: 6px; }
-.prism-seed-row .prism-input { flex: 1; }
-.prism-seed-lock {
-  flex: 0 0 auto;
-  width: 38px;
-  padding: 8px 0;
-  font-size: 1em;
-  line-height: 1;
-}
-.prism-seed-hint { font-size: 0.75em; color: var(--prism-text-faint); margin-top: 5px; }
 
 /* ── Gallery (the Glass Vault) ─────────────────────────────────────── */
 .prism-gallery-bar {
@@ -467,17 +527,6 @@
 }
 .prism-tile-btn:hover { background: rgba(255, 255, 255, 0.18); border-color: var(--prism-border-glow); }
 .prism-tile-btn-danger:hover { background: rgba(255, 85, 119, 0.30); border-color: var(--prism-danger); }
-.prism-tile-seed {
-  position: absolute;
-  top: 6px; right: 6px;
-  background: rgba(0,0,0,0.6);
-  backdrop-filter: blur(6px);
-  color: var(--prism-text-dim);
-  font-size: 0.72em;
-  padding: 2px 7px;
-  border-radius: 10px;
-  font-family: 'Consolas', monospace;
-}
 
 .prism-gallery-empty, .prism-gallery-loading {
   text-align: center;
@@ -542,13 +591,6 @@
   word-break: break-word;
 }
 .prism-meta-v.mono { font-family: 'Consolas', monospace; color: var(--prism-text); }  /* was cyan */
-.prism-meta-grid {
-  display: grid;
-  grid-template-columns: 1fr 1fr;
-  gap: 12px;
-  margin: 16px 0;
-}
-.prism-meta-grid > div { display: flex; flex-direction: column; gap: 3px; }
 .prism-meta-actions { display: flex; gap: 8px; margin-top: 18px; }
 .prism-meta-actions .prism-btn { flex: 1; text-align: center; }
 

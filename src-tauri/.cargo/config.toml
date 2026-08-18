@@ -56,12 +56,31 @@ CMAKE_GENERATOR = "Ninja"
 # (release.cjs copies it there, not to bin/). This is the one loose DLL at
 # the root in the v0.3.7 bin/ layout.
 #
-# This rustflags change invalidates the cached `wupi_lib` build → forces the
-# 30+ min CUDA recompile (AGENTS.md §13). That's the cost of the bin/ move.
+# v0.23.1: `stable-diffusion.dll` joins the delay-load set (the v0.23.0
+# launch-crash fix). The diffusion-rs feature statically imports it in BOTH
+# exes, and its own dependency chain (ggml{,-base,-cpu,-cuda,-vulkan}.dll →
+# cublas64_13.dll) resolved at process start — before SetDllDirectoryW —
+# which is why v0.23.0 couldn't launch without root copies. Delay-loaded,
+# the whole chain resolves at the first SD symbol call (well after boot)
+# through `bin/`, where release.cjs stages the SD DLLs and cublas64_13
+# already lives. sd.cpp's C API is pure functions (sd_* + callbacks), so
+# the LNK1194 data-symbol failure mode doesn't apply; if a future -sys
+# upgrade drags a data import in, the link fails LOUDLY with LNK1194 —
+# do NOT then move the DLL to the root; fix the binding.
+#
+# !! FROZEN (Chloe ruling, 2026-08-18): the AGENT never edits this file —
+# not the flags, not [env], nothing. ANY change here re-fingerprints EVERY
+# build script → full CUDA recompile of llama-cpp-sys-2 + diffusion-rs-sys
+# (~20-40 min, EVERY time, NOT a one-time cost). `npm run release` must
+# NEVER rebuild the CUDA cores; if a link change is ever needed, Chloe
+# decides and Chloe executes it herself. The 2026-08-18 incident: an agent
+# added the delay-load line below with this warning stripped and Chloe's
+# routine release paid the CUDA cost blind. Never again.
 [build]
 rustflags = [
     "-C", "link-args=/DELAYLOAD:cublas64_13.dll",
     "-C", "link-args=/DELAYLOAD:cudart64_13.dll",
     "-C", "link-args=/DELAYLOAD:vcomp140.dll",
+    "-C", "link-args=/DELAYLOAD:stable-diffusion.dll",
     "-C", "link-args=delayimp.lib",
 ]

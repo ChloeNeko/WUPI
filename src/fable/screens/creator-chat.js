@@ -21,6 +21,12 @@
 // The INTRO wizard was REMOVED 2026-08-15 (Chloe): the SIM Wizard asks
 // the mandatory intro question itself + serializeSimCard embeds the
 // agreed `<intro>` sibling in-file — no post-card intro step exists.
+//
+// 2026-08-18 Chloe: IMPORTS are ONE-SHOT conversions — no interview chat.
+// An import seeds a single conversion turn (the bronze ring + blur, same
+// overlay as the pencil edit), and its `ready` lands straight on the FINAL
+// review card; the corner pencil is the change path. The chat surface only
+// appears as a fallback (GLM asks anyway, a failure, or ‹ from review).
 // =============================================================
 
 import { invoke, Channel, convertFileSrc } from '@tauri-apps/api/core';
@@ -50,8 +56,19 @@ import { renderIdCard, wireIdCard, PENCIL_SVG } from './id-card.js';
 
 const GREETINGS = {
   player: "Describe your character in detail and I'll help you design your PLAYER Card. Be as vague or descriptive as you'd like and I'll help guide you.",
-  sim: "Start by telling me whether your SIM Card is a character, a scenario, or perhaps a whole new world? Describe your SIM Card in detail, you may be as descriptive or as vague as you'd like and I'll help guide you.",
+  sim: "Start by telling me whether your SIM Card is a character, a scenario, or perhaps a whole new world? Describe your SIM Card in detail, you may be as descriptive or vague as you'd like and I'll help guide you.",
   codex: "The CODEX is the facts of the simulation which is unique to your SIM Card only. This information can be accessed at any time by your narrator. You may start by giving me a detailed list or vague ideas and I'll help you craft the lore.",
+};
+
+// (2026-08-18 Chloe) Imports are ONE-SHOT conversions, not interviews. The
+// single user turn below replaces the gathering conversation: GLM must map
+// the <import> block onto the WUPI schema and emit ready in that same turn —
+// the result lands straight on the review card, where the corner pencil is
+// the change path. Chat exists only as the fallback surface (ask / failure).
+const IMPORT_CONVERT_INSTRUCTIONS = {
+  player: 'Convert the imported character into a final PLAYER Card draft NOW — a one-shot conversion, not an interview. Map every content-bearing field from the import onto the schema (identity, appearance, clothing, inventory, persona, backstory), derive any missing mandatory field sensibly from the import itself, and emit ready in this single turn. Do not ask the user questions — they review and edit the card afterward.',
+  sim: 'Convert the imported card into a final SIM Card draft NOW — a one-shot conversion, not an interview. Choose the card_type the import actually is (npc / scenario / world), map every content-bearing field onto that branch, derive the universal anchors (date, time, weather, location) from the import\'s setting, and carry its first_mes / alternate_greetings straight into draft.intro as the agreed intro. Emit ready in this single turn. Do not ask the user questions — they review and edit the card afterward.',
+  codex: 'Convert the imported lorebook into final codex entries NOW — one concept per entry, each body under 1400 characters (split longer concepts into "— Part 1/Part 2" entries so nothing is truncated). Emit ready in this single turn. Do not ask the user questions — they review and edit the result afterward.',
 };
 
 // Build the screen element (registered once in fable.js).
@@ -118,6 +135,13 @@ export function renderCreatorChat(root, config) {
     busy: false,
     done: false,
   };
+  // (2026-08-18 Chloe) Import runs skip the interview entirely: the bronze
+  // ring spins over the blurred screen (same overlay as the review-card
+  // pencil edit) while GLM converts the import in ONE turn, then the FINAL
+  // review card lands — the corner pencil is the change path. The chat
+  // surface survives only as the fallback (GLM asks anyway / a failure / the
+  // review ‹ back).
+  const importConvert = !!config.presetImportData && !config.seedDraft;
   // (P1 fix) Stale-turn firewall: ‹/⌂ stay clickable during a GLM turn, so
   // exiting mid-generation left the turn running — its `done` handler then
   // corrupted the NEXT wizard run on this shared screen (hid the prompt
@@ -185,22 +209,12 @@ export function renderCreatorChat(root, config) {
   reviewEl.innerHTML = '';
   inputEl.value = '';
   inputEl.disabled = false;
-  // The greeting opens the conversation unless an initial message is supplied
-  // or a seed draft is provided (edit mode skips straight to the review card).
-  if (!config.initialMessage && !config.seedDraft) {
+  // The greeting opens the conversation unless an initial message is supplied,
+  // a seed draft is provided (edit mode skips straight to the review card), or
+  // this is an import run (no chat at all — the one-shot conversion fires at
+  // the render tail below).
+  if (!importConvert && !config.initialMessage && !config.seedDraft) {
     appendBubble(messagesEl, 'assistant', GREETINGS[creatorKind] || GREETINGS.player);
-  }
-  // Pre-seeded import (the IMPORT tile on the Player pair screen, or the
-  // codex Import step): surface a confirmation bubble naming the imported
-  // character so the user sees the import loaded + knows GLM will work from
-  // it. Replaces the old in-screen Import button's post-pick bubble.
-  if (config.presetImportData) {
-    const nm = config.presetImportData.name || 'the imported file';
-    appendBubble(
-      messagesEl,
-      'assistant',
-      `Imported "${nm}". I will work from it — tell me anything you want changed, or send a concept to begin.`
-    );
   }
   // Edit mode: a pre-seeded draft (e.g. editing a saved player) loads straight
   // into the review card — CREATE to save the edits, Edit to modify via chat.
@@ -271,6 +285,13 @@ export function renderCreatorChat(root, config) {
     if (root._creatorRetryTimer) {
       clearTimeout(root._creatorRetryTimer);
       root._creatorRetryTimer = null;
+      // (2026-08-18) endEditGen on this path too — Escape during a retry
+      // pause left the bronze ring stuck over the screen with no turn behind
+      // it (the timer was the only thing that would have re-fired callApi).
+      endEditGen();
+      if (importConvert) {
+        exitReviewToChat('Import conversion cancelled — describe what you want here, or press ‹ to go back.');
+      }
       setBusy(false);
       trace('retry pause cancelled (stop) — turn aborted');
       return;
@@ -334,11 +355,14 @@ export function renderCreatorChat(root, config) {
         // Mid-stream abort (Escape/Stop): restore the prior prompt + re-enable.
         if (bubble) { bubble.setTyping(false); bubble.restore(priorText); }
         if (editMode) endEditGen();   // un-blur — the review card returns untouched
+        if (importConvert) {
+          exitReviewToChat('Import conversion cancelled — describe what you want here, or press ‹ to go back.');
+        }
         setBusy(false);
         trace('cancelled (stop) — turn aborted');
       } else if (msg.type === 'api_lost') {
         if (bubble) { bubble.setTyping(false); bubble.update(`⚠ ${msg.message || 'The API connection was lost.'}`); }
-        if (editMode) { endEditGen(); showReviewError(`⚠ ${msg.message || 'The API connection was lost.'}`); }
+        if (editMode) { endEditGen(); surfaceEditModeError(`⚠ ${msg.message || 'The API connection was lost.'}`); }
         setBusy(false);
         trace(`api_lost: ${msg.message || ''}`);
       } else if (msg.type === 'validation_error') {
@@ -370,7 +394,7 @@ export function renderCreatorChat(root, config) {
           }, 900);
         } else {
           const failMsg = '⚠ The assistant could not fit a codex entry under the 1400-character cap — edit again or describe the split yourself.';
-          if (editMode) { endEditGen(); showReviewError(failMsg); }
+          if (editMode) { endEditGen(); surfaceEditModeError(failMsg); }
           else if (bubble) { bubble.setTyping(false); bubble.update(failMsg); }
           setBusy(false);
           trace('codex validation retries exhausted — user intervention needed');
@@ -386,7 +410,7 @@ export function renderCreatorChat(root, config) {
       });
     } catch (e) {
       if (bubble) { bubble.setTyping(false); bubble.update(`⚠ ${e.message || e}`); }
-      if (editMode) { endEditGen(); showReviewError(`⚠ ${e.message || e}`); }
+      if (editMode) { endEditGen(); surfaceEditModeError(`⚠ ${e.message || e}`); }
       setBusy(false);
     }
   }
@@ -422,7 +446,7 @@ export function renderCreatorChat(root, config) {
       }, 900);
     } else {
       const msg = `⚠ The assistant could not fill the mandatory fields: ${labels}. Tell it the missing details and it will finalize.`;
-      if (editMode) { endEditGen(); showReviewError(msg); }
+      if (editMode) { endEditGen(); surfaceEditModeError(msg); }
       else if (bubble) { bubble.setTyping(false); bubble.update(msg); }
       setBusy(false);
       state.mandatoryRetries = 0;
@@ -447,7 +471,32 @@ export function renderCreatorChat(root, config) {
       }
       return;
     }
-    if (env.draft && typeof env.draft === 'object') mergeDraft(state.draft, env.draft);
+    // (2026-08-18) Import supersession: GLM signals the user's concept
+    // replaced the import (the <import> block's discard rule). Drop the import
+    // context for every later turn + rebuild the draft from THIS envelope
+    // alone — mergeDraft can never remove import-derived keys (empty-skip), so
+    // a plain merge would keep fusing the two. The imported portrait goes with
+    // it (it is the imported character's likeness, not the new concept's).
+    if (env.discard_import === true && state.importData) {
+      state.importData = null;
+      state.portraitBytes = null;
+      state.portraitExt = null;
+      state.portraitPreview = null;
+      const fresh = {};
+      if (env.draft && typeof env.draft === 'object') mergeDraft(fresh, env.draft);
+      state.draft = fresh;
+      trace('import discarded — draft rebuilt from envelope');
+    } else if (env.draft && typeof env.draft === 'object') {
+      mergeDraft(state.draft, env.draft);
+    }
+    // (2026-08-18) An explicit intro decline clears any seeded/accumulated
+    // intro — the model cannot blank a field itself (mergeDraft's empty-skip),
+    // so the decline is enforced mechanically. Without this, a user who
+    // declined an intro still shipped the pre-seeded import greeting as the
+    // card's <intro>.
+    if (env.draft && env.draft.intro_answered === false) {
+      delete state.draft.intro;
+    }
     trace(`envelope action=${env.action || '(none)'} draftKeys=[${Object.keys(env.draft || {}).join(',')}]`);
     if (env.action === 'ready') {
       // The gate: no incomplete draft ever shows the review card. Runs on the
@@ -535,6 +584,16 @@ export function renderCreatorChat(root, config) {
     note.className = 'fable-creator-review-error';
     note.textContent = msg;
     reviewEl.appendChild(note);
+  }
+
+  // Edit-mode error routing: with a review card on screen the error lands ON
+  // it (showReviewError); during a one-shot import conversion there is no
+  // review yet — showReviewError no-ops while review is hidden, which would
+  // make the failure invisible. Drop to the chat surface instead so the ⚠ is
+  // readable and the composer offers a retry path.
+  function surfaceEditModeError(msg) {
+    if (importConvert) exitReviewToChat(msg);
+    else showReviewError(msg);
   }
 
   // --- the edit popup (corner pencil → centered mini-editor) --------------
@@ -862,9 +921,21 @@ export function renderCreatorChat(root, config) {
     }
   }
 
-  // Auto-send an initial message (a caller-seeded opening turn, if ever
-  // needed — currently unused by the three wizards).
-  if (config.initialMessage) {
+  // The one-shot import conversion: seed the history with the conversion
+  // instruction + fire the turn in edit mode — the SAME bronze-ring blur the
+  // review-card pencil edit uses (callApi({editMode:true})): ring up for the
+  // whole conversion, showReview() lands the final card on `ready`
+  // (mandatory-gate retries re-fire beneath the still-spinning ring). The
+  // chat surface is only the fallback surface (ask / failure / ‹ from
+  // review).
+  if (importConvert) {
+    state.history.push({
+      role: 'user',
+      content: IMPORT_CONVERT_INSTRUCTIONS[creatorKind] || IMPORT_CONVERT_INSTRUCTIONS.player,
+    });
+    trace(`import convert (${creatorKind}) — one-shot turn fired`);
+    callApi({ editMode: true });
+  } else if (config.initialMessage) {
     inputEl.value = config.initialMessage;
     send();
   } else if (!config.seedDraft) {

@@ -1,14 +1,18 @@
-//! First-run GGUF downloader: pulls `WUPI.gguf` + `Embed.gguf` from a private
-//! Hugging Face repo on first launch so the installer can ship without the
-//! ~5.8 GB of models baked in.
+//! Model downloader: pulls every required model file from a private
+//! Hugging Face repo so the installer can ship without the ~12 GB of
+//! weights baked in. Originally the two GGUFs on first launch (v0.3.x);
+//! since v0.22.0 the set also includes the four PRISM Stable Diffusion
+//! files, so EXISTING installs see the boot download overlay again on the
+//! 0.21 → 0.22 update to fetch them.
 //!
 //! ## Why this exists
 //! GitHub caps single files at 100 MB (and soft-caps repos at ~1 GB), so the
-//! GGUFs can't live in the repo. Beta testers get a small installer exe; on
-//! first run (no models detected) the boot overlay hands control to this
-//! module, which streams both files into `app_data_dir/models/` — the 5th
-//! entry in `model_search_dirs` (lib.rs), so the existing resolver picks them
-//! up on the next boot scan with ZERO resolver changes.
+//! model files can't live in the repo. Beta testers get a small installer
+//! exe; when files are missing the boot overlay hands control to this
+//! module, which streams them into `<install>/models/` (chat GGUFs at the
+//! root, SD files under `sd/`) — every location is on
+//! `model_search_dirs`'s candidate list (lib.rs), so the existing resolvers
+//! pick them up on the next boot scan with ZERO resolver changes.
 //!
 //! ## Auth model
 //! The HF repo is PRIVATE. A fine-grained read-only access token scoped to
@@ -31,18 +35,20 @@
 //! `hf_hub_download` uses under the hood.
 //!
 //! ## Atomicity
-//! Each file downloads to `<name>.gguf.part`. On full completion: fsync the
-//! `.part`, then rename to `<name>.gguf`. A crash / cancel / network drop
-//! leaves ONLY the `.part` file behind — never a half-written final file —
-//! so the resolver never sees a corrupt gguf. The `.part` is reused on the
-//! next resume attempt (truncated-to-correct-offset logic below).
+//! Each file downloads to `<name>.part` (in the file's destination dir). On
+//! full completion: fsync the `.part`, then rename to the final name. A
+//! crash / cancel / network drop leaves ONLY the `.part` file behind —
+//! never a half-written final file — so the resolvers never see a corrupt
+//! model. The `.part` is reused on the next resume attempt
+//! (truncated-to-correct-offset logic below).
 //!
 //! ## Concurrency
 //! One downloader at a time. The frontend gates the overlay on
-//! `download_models` returning; there's no multi-file parallelism (the two
-//! files stream sequentially: WUPI first since the app can't boot without it,
-//! Embed second). Sequential is also friendlier to flaky upstream bandwidth
-//! than splitting across two sockets.
+//! `download_models` returning; there's no multi-file parallelism (the files
+//! stream sequentially: WUPI first since the app can't boot without it,
+//! then Embed, then the four SD files — PRISM needs all four to render).
+//! Sequential is also friendlier to flaky upstream bandwidth than splitting
+//! across sockets.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -98,10 +104,31 @@ const HF_TOKEN: &str = match option_env!("HF_TOKEN") {
     None => "",
 };
 
-/// The two files we need, in download order. WUPI first because the chat
-/// engine can't boot without it; Embed is best-effort (the embedder falls
-/// back to StubEmbedder on miss, see lib.rs setup).
-pub const REQUIRED_FILES: &[&str] = &["WUPI.gguf", "Embed.gguf"];
+/// One required file: its HF repo filename + the subdirectory under the
+/// models root it lands in (`""` = the models root itself).
+pub struct RequiredFile {
+    pub name: &'static str,
+    pub subdir: &'static str,
+}
+
+/// The files we need, in download order. WUPI first because the chat engine
+/// can't boot without it; Embed is best-effort (the embedder falls back to
+/// StubEmbedder on miss, see lib.rs setup). The four SD files (v0.22.0) are
+/// the PRISM checkpoint set: `image.gguf` (the full NoobAI-XL v1.1 Q8_0
+/// checkpoint — embedded VAE + conditioners), the fp16 `clip_l`/`clip_g`
+/// encoder sidecars (the provenance-correct ones EXTRACTED from the
+/// checkpoint's own source, scene_art.rs ClipOverride), and `vae.safetensors`
+/// (distributed for layout completeness; the single-file path deliberately
+/// keeps the GGUF's embedded VAE — sd.cpp's SDXL Conv2D guard depends on it).
+/// They land in `models/sd/`, exactly where `resolve_sd_model_path` looks.
+pub const REQUIRED_FILES: &[RequiredFile] = &[
+    RequiredFile { name: "WUPI.gguf", subdir: "" },
+    RequiredFile { name: "Embed.gguf", subdir: "" },
+    RequiredFile { name: "image.gguf", subdir: "sd" },
+    RequiredFile { name: "vae.safetensors", subdir: "sd" },
+    RequiredFile { name: "clip_l.safetensors", subdir: "sd" },
+    RequiredFile { name: "clip_g.safetensors", subdir: "sd" },
+];
 
 /// Chunk size: reqwest's `bytes_stream()` yields its own chunks (typically
 /// 8-16 KB from the TLS layer); we don't impose a fixed read size. Progress
@@ -121,9 +148,10 @@ const EMIT_INTERVAL_MS: u64 = 500;
 /// the frontend) and emitted as the `download-progress` event payload.
 ///
 /// `current_file_offset` + `current_file_total` describe the file actively
-/// streaming; `overall_downloaded` + `overall_total` span both files so the
-/// UI can render one progress bar for the whole job (the meaningful number
-/// for a 5.8 GB + 36 MB download).
+/// streaming; `overall_downloaded` + `overall_total` span every file THIS RUN
+/// still has to fetch (already-present files are skipped entirely, so the
+/// overall bar reflects the remaining job — on a 0.21 → 0.22 update that's
+/// just the ~6 GB of SD files, not the already-present GGUFs).
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct DownloadProgress {
     /// Which phase the downloader is in.
@@ -137,8 +165,14 @@ pub struct DownloadProgress {
     pub current_file_total: u64,
     /// Bytes downloaded across ALL files this run (for the overall bar).
     pub overall_downloaded: u64,
-    /// Sum of both files' totals (set once both sizes are known).
+    /// Sum of this run's files' totals — grows as each file's size is
+    /// learned on its first response (a file's total must fold in EXACTLY
+    /// once; retry attempts re-resolve and must not double-count).
     pub overall_total: u64,
+    /// Filenames whose totals have already been folded into `overall_total`.
+    /// Bookkeeping for the once-only accounting above; never serialized.
+    #[serde(skip)]
+    pub counted_files: std::collections::HashSet<String>,
     /// Human-readable error if `phase == Failed`. Empty otherwise.
     pub error: String,
 }
@@ -276,10 +310,15 @@ async fn download_one(
         p.phase = DownloadPhase::Downloading;
         p.current_file_offset = resume_offset;
         p.current_file_total = absolute_total;
-        if p.overall_total == 0 {
-            // First-file total unknown until now; seed it. Second file's
-            // total adds in when it resolves.
-            p.overall_total = absolute_total;
+        // Fold this file's total into the overall total EXACTLY once — the
+        // first response that reports it. Retry attempts (fresh `/resolve/`
+        // per attempt) hit this same block; the counted_files guard keeps
+        // the sum honest across them. (The pre-0.22.0 code seeded
+        // overall_total only when it was 0, which silently dropped the
+        // second file's total — invisible at 36 MB, wrong at 6 GB of SD
+        // files riding a 4th bar segment.)
+        if absolute_total > 0 && p.counted_files.insert(filename.to_owned()) {
+            p.overall_total += absolute_total;
         }
     }
 
@@ -406,11 +445,14 @@ fn is_permanent_error(err: &str) -> bool {
         || err.contains("byte counter overflow")
 }
 
-/// Download every file in `REQUIRED_FILES` into `dest_dir`. Skips files that
-/// already exist at their final path (idempotent re-runs). Updates `progress`
-/// throughout; honors `cancel`. Transient mid-stream failures (the kind that
-/// correlate with the window being alt-tabbed / hidden) trigger an automatic
-/// resume-from-`.part` retry; permanent errors fail fast.
+/// Download every file in `REQUIRED_FILES` into `dest_dir` (each under its
+/// own `subdir`). Skips files that already exist at their final path
+/// (idempotent re-runs — this is what makes the 0.21 → 0.22 update download
+/// ONLY the SD files on installs that already hold the GGUFs). Updates
+/// `progress` throughout; honors `cancel`. Transient mid-stream failures
+/// (the kind that correlate with the window being alt-tabbed / hidden)
+/// trigger an automatic resume-from-`.part` retry; permanent errors fail
+/// fast.
 pub async fn download_all(
     dest_dir: PathBuf,
     progress: Arc<std::sync::Mutex<DownloadProgress>>,
@@ -422,13 +464,24 @@ pub async fn download_all(
 
     let client = http_client()?;
 
-    for filename in REQUIRED_FILES {
+    for rf in REQUIRED_FILES {
         if cancel.load(Ordering::Relaxed) {
             return Err("cancelled".to_owned());
         }
-        let final_path = dest_dir.join(filename);
+        // The file's destination dir (models root, or models/sd/ for the SD
+        // set) — created lazily so a no-download run never materializes an
+        // empty sd/ folder.
+        let file_dir = if rf.subdir.is_empty() {
+            dest_dir.clone()
+        } else {
+            let d = dest_dir.join(rf.subdir);
+            std::fs::create_dir_all(&d)
+                .map_err(|e| format!("create models dir {}: {e}", d.display()))?;
+            d
+        };
+        let final_path = file_dir.join(rf.name);
         if final_path.exists() {
-            tracing::info!(file = filename, "already present; skipping");
+            tracing::info!(file = rf.name, "already present; skipping");
             continue;
         }
 
@@ -445,8 +498,8 @@ pub async fn download_all(
                 return Err("cancelled".to_owned());
             }
             match download_one(
-                filename,
-                &dest_dir,
+                rf.name,
+                &file_dir,
                 &client,
                 Arc::clone(&progress),
                 Arc::clone(&cancel),
@@ -472,7 +525,7 @@ pub async fn download_all(
                     // the phase as Downloading (don't flip to Failed) so the
                     // UI's bar holds steady; the user sees continuous progress.
                     tracing::warn!(
-                        file = filename,
+                        file = rf.name,
                         attempt,
                         error = %e,
                         "transient download error; will resume from .part after backoff"
