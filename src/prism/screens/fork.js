@@ -118,13 +118,17 @@ export function load(rootEl, img) {
   // a fresh random for B (Fork from a random-seed image isn't reproducible;
   // the metadata panel surfaces this). Dims ride the source verbatim (the
   // A/B compare must render at A's size, even for a legacy pre-bucket row);
-  // everything else about the recipe is locked server-side.
+  // the steering toggles inherit the source's bits (B's only EDITABLE knob
+  // stays the prompt — toggle changes belong to the Composer); everything
+  // else about the recipe is locked server-side.
   const lockedSeed = img.seed >= 0 ? img.seed : -1;
   bParams = {
     prompt: img.prompt || '',
     seed: lockedSeed,
     width: img.width,
     height: img.height,
+    nsfw: !!img.nsfw,
+    furry: !!img.furry,
   };
   bResultPath = img.path;  // initially, B mirrors A (no edit yet)
 

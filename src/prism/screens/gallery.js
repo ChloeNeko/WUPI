@@ -258,6 +258,10 @@ function openMetadata(rootEl, id) {
         <div class="prism-meta-field"><span class="prism-meta-k">Prompt</span><p class="prism-meta-v">${escapeHtml(img.prompt) || '<em>(empty)</em>'}</p></div>
         ${img.negative_prompt ? `<div class="prism-meta-field"><span class="prism-meta-k">Negative</span><p class="prism-meta-v">${escapeHtml(img.negative_prompt)}</p></div>` : ''}
         <div class="prism-meta-field"><span class="prism-meta-k">Size</span><p class="prism-meta-v mono">${img.width}×${img.height}</p></div>
+        ${(img.nsfw || img.furry) ? `<div class="prism-meta-field"><span class="prism-meta-k">Toggles</span><p class="prism-meta-v">
+          ${img.nsfw ? '<span class="prism-meta-badge is-nsfw">NSFW</span>' : ''}
+          ${img.furry ? '<span class="prism-meta-badge is-furry">FURRY</span>' : ''}
+        </p></div>` : ''}
         <div class="prism-meta-actions">
           <button class="prism-btn prism-btn-ghost" data-act="compose">Send to Composer</button>
           <button class="prism-btn prism-btn-primary" data-act="fork">Fork &amp; Edit</button>

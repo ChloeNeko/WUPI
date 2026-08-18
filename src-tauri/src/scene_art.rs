@@ -78,10 +78,11 @@ pub struct SceneImageRequest {
     /// the `diffusion-rs` cargo feature (the enum is feature-gated). The
     /// `DiffusionRsGenerator::generate` impl maps it back to `SampleMethod`
     /// inside the `#[cfg(feature)]` block via `sampler_from_i32`. Default
-    /// Euler a (`EULER_A_DISCRIMINANT`) — the LOCKED sampler (2026-08-17
-    /// switch from the launch DPM++ 2M: the NoobAI v1.1 official card
-    /// recommends Euler a, and the Illustrious-lineage community baseline
-    /// is A1111-style Euler a). `i32` rather than `u32` because the crate's
+    /// DPM++ 2M (`DPMPP2M_DISCRIMINANT`) — the LOCKED base-pass sampler
+    /// (recipe v2, 2026-08-18: with the mandatory hires refine pass the base
+    /// pass owns composition + DPM++ 2M Karras is the fast-convergence
+    /// workhorse; the Euler-a single-pass era ended the same day).
+    /// `i32` rather than `u32` because the crate's
     /// `sample_method_t` enum is a C `enum` (signed `int`) — matches the FFI
     /// representation exactly.
     pub sampling_method: i32,
@@ -101,12 +102,12 @@ impl Default for SceneImageRequest {
             // under-trained detail (retired 2026-08-17).
             width: PRISM_DEFAULT_WIDTH as u32,
             height: PRISM_DEFAULT_HEIGHT as u32,
-            // The LOCKED recipe (2026-08-17 switch, Chloe ruling): Euler a at
-            // its full step budget — ancestral samplers converge LATE, so the
-            // old 20 (tuned for DPM++ 2M + Karras early convergence) no
-            // longer applies. Enforced for real in prism::build_request
-            // (this Default only serves non-Prism callers/tests — Prism
-            // always routes through build_request).
+            // The LOCKED recipe v2 (2026-08-18, Chloe ruling): DPM++ 2M +
+            // Karras converges early — 20 steps is the classic workhorse
+            // budget for the composition pass; the mandatory hires refine
+            // adds effective sampling on top. Enforced for real in
+            // prism::build_request (this Default only serves non-Prism
+            // callers/tests — Prism always routes through build_request).
             steps: PRISM_LOCKED_STEPS as u32,
             model_path: PathBuf::new(),
             // `-1` = random seed (the crate default). The seed is the ONE
@@ -114,10 +115,10 @@ impl Default for SceneImageRequest {
             seed: -1,
             // 6.0 = the NoobAI 1.1 official CFG sweet spot (locked recipe).
             cfg_scale: PRISM_LOCKED_CFG,
-            // Euler a (`EULER_A_DISCRIMINANT`) — the LOCKED sampler since the
-            // 2026-08-17 switch (the NoobAI v1.1 official card rec; pairs
-            // with the DISCRETE scheduler applied in `generate`).
-            sampling_method: EULER_A_DISCRIMINANT,
+            // DPM++ 2M (`DPMPP2M_DISCRIMINANT`) — the LOCKED base-pass
+            // sampler of recipe v2 (2026-08-18; pairs with the KARRAS
+            // scheduler applied in `generate`).
+            sampling_method: DPMPP2M_DISCRIMINANT,
         }
     }
 }
@@ -132,28 +133,32 @@ impl Default for SceneImageRequest {
 /// feature-gated tests.
 pub const DPMPP2M_DISCRIMINANT: i32 = 5;
 
-/// The `i32` discriminant of `SampleMethod::EULER_A_SAMPLE_METHOD` — the
-/// LOCKED sampler (2026-08-17 switch, Chloe ruling: the NoobAI v1.1 official
-/// card recommends Euler a; the Illustrious-lineage community baseline is
-/// A1111-style Euler a on the DISCRETE schedule). Variant 1 in the C
-/// `enum sample_method_t` ordering — same named-const + pinned-test
-/// discipline as `DPMPP2M_DISCRIMINANT` above.
+/// The `i32` discriminant of `SampleMethod::EULER_A_SAMPLE_METHOD` —
+/// variant 1 in the C `enum sample_method_t` ordering. Retired as the
+/// locked sampler by recipe v2 (2026-08-18: DPM++ 2M + the mandatory hires
+/// refine pass replaced the single-pass Euler-a recipe); the value stays a
+/// named const because `sampler_from_i32` still maps it for stale gallery
+/// rows + the discriminant table stays self-documenting.
 pub const EULER_A_DISCRIMINANT: i32 = 1;
 
 // ────────────────────────────────────────────────────────────────────────────
-// The LOCKED NoobAI recipe (Chloe ruling, 2026-08-17 — switched to the model
-// card's official parameter set the same day; the launch recipe was
-// DPM++ 2M + KARRAS at 20 steps)
+// The LOCKED NoobAI recipe v2 (Chloe ruling, 2026-08-18 — the two-stage era)
 // ────────────────────────────────────────────────────────────────────────────
-// Sampler Euler a + DISCRETE schedule, 30 steps, CFG 6.0, NoobAI training
-// buckets for sizes, the NoobAI v1.1 official quality prefix
-// auto-prepended, the matching negative block auto-injected — ALL
-// server-side, none of it in the UI. The engine flags (discrete scheduler +
-// flash attention) are applied in `DiffusionRsGenerator::generate`; the
-// prompt/meta injection + the knob
-// overrides are enforced in `prism::build_request` (the single chokepoint
-// every generation goes through). These are LOCKED like the sampler profiles
-// in settings.rs — changing any of them is Chloe's explicit call.
+// Base: DPM++ 2M + KARRAS schedule, 20 steps, CFG 6.0, NoobAI training
+// buckets, the v1.1 quality prefix auto-prepended + the v2 negative block
+// auto-injected. MANDATORY second stage on every render (no toggle): the
+// built-in hires fix — RealESRGAN_x4plus_anime_6B scaffold → a low-denoise
+// DPM++ 2M refine re-render at 1.5× the bucket. With a mandatory refine
+// pass the base sampler's job is composition (DPM++ 2M Karras is the
+// fast-convergence workhorse; Euler a's full-budget requirement was a
+// single-pass constraint that no longer applies), and the refine pass is
+// the detail engine that fixes dull output / lazy eyes / weak faces. All
+// of it is server-side; the engine flags (karras scheduler + flash
+// attention + the hires params) are applied in
+// `DiffusionRsGenerator::generate`, the prompt/meta injection + knob
+// overrides in `prism::build_request` (the single chokepoint every
+// generation goes through). LOCKED like the sampler profiles in
+// settings.rs — changing any of it is Chloe's explicit call.
 
 /// The quality-meta prefix prepended to EVERY Prism prompt — the NoobAI v1.1
 /// official recommended positive set (Chloe ruling, 2026-08-17; `newest`
@@ -164,22 +169,52 @@ pub const EULER_A_DISCRIMINANT: i32 = 1;
 pub const PRISM_QUALITY_PREFIX: &str =
     "masterpiece, best quality, newest, absurdres, highres";
 
-/// The NoobAI v1.1 official recommended negative set — `old`/`early` pair
-/// with the `newest` positive (recency), and `bad hands`/`mutated hands`
-/// directly suppress the extra-limb/hand drift. Injected on every render;
-/// the old user-authored negative lane is deleted. Same invisibility rules
-/// as the prefix.
+/// The negative block (v2, Chloe ruling 2026-08-18): `old`/`early` pair
+/// with the `newest` positive (recency), `text` suppresses rendered
+/// lettering/watermark text. The hand tags are GONE — a negative tag the
+/// model has no positive concept for mostly dilutes the tokens that DO
+/// work (token-weight dilution), and the refine pass is what actually
+/// fixes hands. Injected on every render; same invisibility rules as the
+/// prefix.
 pub const PRISM_NEGATIVE_BLOCK: &str =
-    "worst quality, old, early, low quality, lowres, signature, username, logo, bad hands, mutated hands";
+    "worst quality, old, early, low quality, lowres, signature, username, logo, text";
 
-/// Locked step count (2026-08-17): Euler a is ANCESTRAL — it converges
-/// late + needs its full step budget. 30 sits at the top of the official
-/// NoobAI v1.1 recommendation (25–30) — the extra headroom over the old
-/// 20/28 values buys late-step detail (Chloe bump, 2026-08-17).
-pub const PRISM_LOCKED_STEPS: i32 = 30;
+/// Locked base-pass step count (v2): DPM++ 2M + Karras converges early —
+/// 20 is the classic SDXL workhorse budget, and with the mandatory hires
+/// refine pass adding effective sampling on top, the base pass only needs
+/// to lock composition (Chloe ruling, 2026-08-18).
+pub const PRISM_LOCKED_STEPS: i32 = 20;
 
 /// Locked CFG (the NoobAI 1.1 official sweet spot; above ~7 saturates/burns).
 pub const PRISM_LOCKED_CFG: f32 = 6.0;
+
+/// Hires refine scale (v2): 1.5× the bucket (832×1216 → 1248×1824, ~2.27 MP
+/// — fits 12 GB with the LLM unloaded during the SD swap; 2× is the stretch
+/// config, not the default).
+pub const PRISM_HIRES_SCALE: f32 = 1.5;
+
+/// Hires refine EFFECTIVE steps. sd.cpp uses sd-webui semantics
+/// (`make_hires_sigma_schedule` scales the schedule by 1/denoise then
+/// trims, so this many steps ACTUALLY run — unlike the naive
+/// steps×strength model). 12 effective steps of DPM++ 2M Karras at 2.27 MP
+/// keeps the whole two-stage render near ~1.5× the old single-pass cost;
+/// 15-20 buys depth at proportional cost (Chloe-tunable, 2026-08-18).
+pub const PRISM_HIRES_STEPS: i32 = 12;
+
+/// Hires refine denoise strength: 0.45 keeps composition locked (the base
+/// pass owns layout — chairs, poses) while re-rendering detail (faces,
+/// eyes, hands, texture). Above ~0.5 the refine starts repainting
+/// composition; below ~0.35 it's mostly a sharpen (Chloe bump, 2026-08-18).
+pub const PRISM_HIRES_DENOISE: f32 = 0.45;
+
+/// The ESRGAN scaffold model filename — a SIBLING of the SD checkpoint in
+/// `models/sd/` (rides the boot download overlay like the SD set). This is
+/// the RealESRGAN_x4plus_anime_6B model, shipped under the short name
+/// `esrgan.pth` (Chloe's rename, 2026-08-18 — the name must match the HF
+/// repo file for the overlay to fetch it). When absent, `generate` falls
+/// back to the LANCZOS pixel upscaler (zero download, slightly softer
+/// scaffold — the refine pass still runs).
+pub const PRISM_HIRES_ESRGAN_FILE: &str = "esrgan.pth";
 
 /// Default size — the portrait NoobAI training bucket (characters are the
 /// primary use). The composer's preset list is bucket-only:
@@ -313,39 +348,39 @@ mod phase5b_tests {
         let _ = std::fs::remove_file(&dest);
     }
 
-    /// The request type defaults to the LOCKED NoobAI v1.1 official recipe
-    /// (832×1216 portrait bucket, Euler a, 30 steps). Pins the defaults so a
-    /// future tuning change is intentional. (The historical defaults:
-    /// 1024×576/28-discrete → 832×1216/20/DPM++ 2M+Karras → both retired
-    /// 2026-08-17 when the recipe switched onto the model card's set.)
+    /// The request type defaults to the LOCKED recipe v2 (832×1216 portrait
+    /// bucket, DPM++ 2M, 20 steps). Pins the defaults so a future tuning
+    /// change is intentional. (The recipe history: 1024×576/28-discrete →
+    /// 832×1216/20/DPM++ 2M+Karras → 832×1216/30/Euler a+discrete → v2
+    /// 2026-08-18: back to DPM++ 2M+Karras at 20 + the mandatory ESRGAN
+    /// hires refine pass.)
     #[test]
     fn scene_image_request_defaults_are_sane() {
         let req = SceneImageRequest::default();
         assert_eq!(req.width, 832, "NoobAI portrait training bucket");
         assert_eq!(req.height, 1216, "NoobAI portrait training bucket");
-        assert_eq!(req.steps, PRISM_LOCKED_STEPS as u32, "Euler a's full convergence budget (30, official NoobAI rec)");
+        assert_eq!(req.steps, PRISM_LOCKED_STEPS as u32, "DPM++ 2M + Karras early-convergence budget (20, recipe v2)");
         assert!(req.negative_prompt.is_none(), "engine-level default is bare; the block is injected in prism::build_request");
     }
 
-    /// Prism (locked recipe, 2026-08-17): the locked knobs default to the
-    /// NoobAI recipe — `-1` seed (the ONE user-facing knob left), `6.0` CFG,
-    /// DPM++ 2M. Pinning these here means a future change is intentional +
-    /// obvious. (The real enforcement is prism::build_request — this Default
-    /// only keeps non-Prism constructors in lockstep.)
+    /// Prism (locked recipe v2, 2026-08-18): the locked knobs default to the
+    /// two-stage recipe — `-1` seed (the ONE user-facing knob left), `6.0`
+    /// CFG, DPM++ 2M. Pinning these here means a future change is
+    /// intentional + obvious. (The real enforcement is prism::build_request
+    /// — this Default only keeps non-Prism constructors in lockstep.)
     #[test]
     fn scene_image_request_defaults_pin_prism_fields() {
         let req = SceneImageRequest::default();
         assert_eq!(req.seed, -1, "-1 = random seed (crate default; the user-facing knob)");
         assert_eq!(req.cfg_scale, PRISM_LOCKED_CFG, "6.0 = the NoobAI 1.1 official CFG (locked)");
         assert_eq!(
-            req.sampling_method, EULER_A_DISCRIMINANT,
-            "Euler a = the LOCKED sampler (discrete schedule applied in generate)",
+            req.sampling_method, DPMPP2M_DISCRIMINANT,
+            "DPM++ 2M = the LOCKED base-pass sampler (karras schedule applied in generate)",
         );
     }
 
-    /// The locked-recipe meta constants are exactly the NoobAI v1.1
-    /// official recommended sets — pin them verbatim so a typo'd edit
-    /// can't ship.
+    /// The locked-recipe meta constants are pinned verbatim so a typo'd edit
+    /// can't ship (v2, 2026-08-18: hand tags out, `text` in; hires constants).
     #[test]
     fn locked_recipe_constants_match_the_noobai_recipe() {
         assert_eq!(
@@ -354,11 +389,17 @@ mod phase5b_tests {
         );
         assert_eq!(
             PRISM_NEGATIVE_BLOCK,
-            "worst quality, old, early, low quality, lowres, signature, username, logo, bad hands, mutated hands",
+            "worst quality, old, early, low quality, lowres, signature, username, logo, text",
         );
-        assert_eq!(PRISM_LOCKED_STEPS, 30);
+        assert_eq!(PRISM_LOCKED_STEPS, 20);
         assert_eq!(PRISM_LOCKED_CFG, 6.0);
-        assert_eq!(EULER_A_DISCRIMINANT, 1);
+        assert_eq!(DPMPP2M_DISCRIMINANT, 5);
+        // The mandatory hires refine pass (v2): 1.5× scale, 12 effective
+        // steps (sd-webui semantics), 0.45 denoise.
+        assert_eq!(PRISM_HIRES_SCALE, 1.5);
+        assert_eq!(PRISM_HIRES_STEPS, 12);
+        assert_eq!(PRISM_HIRES_DENOISE, 0.45);
+        assert_eq!(PRISM_HIRES_ESRGAN_FILE, "esrgan.pth");
     }
 
     /// The DPMPP2M discriminant const must equal 5 (variant 5 in the C
@@ -1117,18 +1158,72 @@ impl SceneImageGenerator for DiffusionRsGenerator {
                 }
             }
         }
-        // The LOCKED engine flags (2026-08-17 switch — applied after the
+        // The LOCKED engine flags (recipe v2, 2026-08-18 — applied after the
         // match so no layout branch can skip them):
-        //   · DISCRETE scheduler — Euler a's native schedule (A1111-style
-        //     Euler a; the model card rec is sampler-only, no Karras). The
-        //     launch recipe's KARRAS was a DPM++ 2M early-convergence trick
-        //     that no longer applies to an ancestral sampler.
+        //   · KARRAS scheduler — the sigma schedule both passes ride (v2
+        //     switched the base sampler back to DPM++ 2M, whose classic
+        //     pairing is Karras early convergence; the single-pass Euler-a
+        //     DISCRETE lock retired the same day).
         //   · flash attention — the CUDA attention fast path at SDXL
         //     resolutions, quality-neutral. Verify a render + the [sd] logs
         //     after any sd.cpp/vendored rebuild (sd_repro, seed 42) — if the
         //     vendored build lacks FA kernels the engine falls back + logs.
-        mb.scheduler(Scheduler::DISCRETE_SCHEDULER);
+        //   · the MANDATORY hires refine pass — see the block below.
+        mb.scheduler(Scheduler::KARRAS_SCHEDULER);
         mb.flash_attention(true);
+
+        // The MANDATORY second stage (recipe v2, no toggle): upscale the
+        // base latent to PRISM_HIRES_SCALE× via the ESRGAN anime scaffold
+        // (a `models/sd/` sibling of the checkpoint), then re-render at
+        // PRISM_HIRES_DENOISE with PRISM_HIRES_STEPS EFFECTIVE steps of the
+        // same sampler/schedule/CFG (sd.cpp reuses the call's sample params
+        // for the hires pass). `hires_params` is wired end-to-end in the
+        // crate (unlike ControlNet's dead control_image field): the builder
+        // fills a real `sd_hires_params_t` (own scale/target/steps/denoise)
+        // into the single gen_img call, and generate_image loads the MODEL
+        // upscaler itself from `model_path` — no separate upscaler ctx.
+        // Missing ESRGAN file → LANCZOS pixel upscale (zero-download
+        // fallback; the refine pass still runs, slightly softer scaffold).
+        let esrgan_path = model_path
+            .parent()
+            .map(|dir| dir.join(PRISM_HIRES_ESRGAN_FILE))
+            .filter(|p| p.is_file());
+        let hires_params = diffusion_rs::api::HiresParamsBuilder::default()
+            .width((request.width as f32 * PRISM_HIRES_SCALE).round() as i32)
+            .height((request.height as f32 * PRISM_HIRES_SCALE).round() as i32)
+            .steps(PRISM_HIRES_STEPS)
+            .denoising_strength(PRISM_HIRES_DENOISE)
+            .build()
+            .map_err(|e| SceneImageError {
+                message: format!("diffusion-rs HiresParams build failed: {e}"),
+            })?;
+        match &esrgan_path {
+            Some(p) => {
+                tracing::info!(
+                    esrgan = %p.display(),
+                    scale = PRISM_HIRES_SCALE,
+                    steps = PRISM_HIRES_STEPS,
+                    denoise = PRISM_HIRES_DENOISE,
+                    "prism hires refine: RealESRGAN scaffold + low-denoise re-render (mandatory)",
+                );
+                mb.hires_params(
+                    diffusion_rs::api::Upscaler::SD_HIRES_UPSCALER_MODEL,
+                    hires_params,
+                    Some(p.as_path()),
+                );
+            }
+            None => {
+                tracing::warn!(
+                    file = PRISM_HIRES_ESRGAN_FILE,
+                    "prism hires refine: ESRGAN model missing in models/sd/ — falling back to the LANCZOS upscaler (refine pass still runs; drop the file in for the sharper scaffold)",
+                );
+                mb.hires_params(
+                    diffusion_rs::api::Upscaler::SD_HIRES_UPSCALER_LANCZOS,
+                    hires_params,
+                    None,
+                );
+            }
+        }
         let mut model_config = mb.build().map_err(|e| SceneImageError {
             message: format!("diffusion-rs ModelConfig build failed: {e}"),
         })?;
@@ -1138,10 +1233,9 @@ impl SceneImageGenerator for DiffusionRsGenerator {
         // on docs.rs/diffusion_rs/latest/diffusion_rs/api/struct.ConfigBuilder.
         // html: prompt, negative_prompt, width, height, steps, sampling_method,
         // cfg_scale, output. The sampler/steps/cfg below carry the LOCKED
-        // NoobAI v1.1 official recipe (Euler a / 30 / 6.0 — set upstream in
-        // prism::build_request; the launch-era "Euler/a artifacts on SDXL,
-        // DPM++ 2M is the clean baseline" wisdom was generic-SDXL, superseded
-        // by the model card's own recommendation for this checkpoint).
+        // recipe v2 (DPM++ 2M / 20 / 6.0 — set upstream in
+        // prism::build_request; the base pass owns composition, the mandatory
+        // hires refine pass owns detail).
         //
         // derive_builder's `setter(into, strip_option)` makes the chain return
         // `&mut ConfigBuilder`, so we build the base chain to a local then

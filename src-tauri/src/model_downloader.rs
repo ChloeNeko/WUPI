@@ -120,6 +120,8 @@ pub struct RequiredFile {
 /// checkpoint's own source, scene_art.rs ClipOverride), and `vae.safetensors`
 /// (distributed for layout completeness; the single-file path deliberately
 /// keeps the GGUF's embedded VAE — sd.cpp's SDXL Conv2D guard depends on it).
+/// The ESRGAN file (recipe v2, 2026-08-18) is the mandatory hires-refine
+/// scaffold (~18 MB; a miss is non-fatal — scene_art falls back to LANCZOS).
 /// They land in `models/sd/`, exactly where `resolve_sd_model_path` looks.
 pub const REQUIRED_FILES: &[RequiredFile] = &[
     RequiredFile { name: "WUPI.gguf", subdir: "" },
@@ -128,6 +130,12 @@ pub const REQUIRED_FILES: &[RequiredFile] = &[
     RequiredFile { name: "vae.safetensors", subdir: "sd" },
     RequiredFile { name: "clip_l.safetensors", subdir: "sd" },
     RequiredFile { name: "clip_g.safetensors", subdir: "sd" },
+    // The mandatory hires-refine ESRGAN scaffold (recipe v2, 2026-08-18 —
+    // ~18 MB, the RealESRGAN_x4plus_anime_6B model under its short shipped
+    // name). A missing file is NOT fatal: scene_art falls back to the
+    // LANCZOS upscaler, but it must ride the overlay so fresh installs get
+    // the sharper scaffold by default.
+    RequiredFile { name: "esrgan.pth", subdir: "sd" },
 ];
 
 /// Chunk size: reqwest's `bytes_stream()` yields its own chunks (typically

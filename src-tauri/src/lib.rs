@@ -1737,23 +1737,26 @@ fn check_models(app: tauri::AppHandle) -> serde_json::Value {
     })
 }
 
-/// Whether the complete four-file PRISM checkpoint set (`image.gguf`,
-/// `vae.safetensors`, `clip_l.safetensors`, `clip_g.safetensors` — the
-/// exact names `model_downloader::REQUIRED_FILES` fetches) exists in the
-/// `sd/` subdir of ANY candidate models dir. Deliberately an exact-name
-/// check, NOT `resolve_sd_model_path`: the download gate must fire until the
-/// exact shipped set is on disk (a lone stray checkpoint isn't "present" —
-/// the downloader's files are what the release recipe is proven against).
+/// Whether the complete PRISM checkpoint set — every `models/sd/` file
+/// `model_downloader::REQUIRED_FILES` fetches (`image.gguf`,
+/// `vae.safetensors`, `clip_l.safetensors`, `clip_g.safetensors`, and since
+/// recipe v2 `esrgan.pth`) — exists in the `sd/` subdir of ANY candidate
+/// models dir. Derived from REQUIRED_FILES itself, NOT a hand-copied list:
+/// the 2026-08-18 esrgan add shipped in the downloader while this check kept
+/// the old four-file list, so installs missing only esrgan.pth read
+/// "present" and never met the overlay to fetch it. Deliberately an
+/// exact-name check, NOT `resolve_sd_model_path`: the download gate must
+/// fire until the exact shipped set is on disk (a lone stray checkpoint
+/// isn't "present" — the downloader's files are what the release recipe is
+/// proven against).
 fn sd_models_present(app: &tauri::AppHandle) -> bool {
-    const SD_FILES: [&str; 4] = [
-        "image.gguf",
-        "vae.safetensors",
-        "clip_l.safetensors",
-        "clip_g.safetensors",
-    ];
     for dir in model_search_dirs(app) {
         let sd_dir = dir.join("sd");
-        if SD_FILES.iter().all(|f| sd_dir.join(f).exists()) {
+        if model_downloader::REQUIRED_FILES
+            .iter()
+            .filter(|rf| rf.subdir == "sd")
+            .all(|rf| sd_dir.join(rf.name).exists())
+        {
             return true;
         }
     }
@@ -12229,11 +12232,13 @@ async fn prism_generate(
 
     // Snapshot the params + metadata for the gallery insert (the request is
     // moved into the swap core; the row needs its own copies).
-    // LOCKED RECIPE (2026-08-17): the row records what the USER composed +
+    // LOCKED RECIPE v2 (2026-08-18): the row records what the USER composed +
     // what actually rendered — row_prompt is the user prompt (the injected
-    // quality prefix is engine machinery, invisible + NOT stored), the
-    // negative block likewise isn't stored, and cfg/steps/sampler come from
-    // the REQUEST (the enforced values), not the ignored params fields.
+    // quality prefix + steering tags are engine machinery, invisible + NOT
+    // stored), the negative block likewise isn't stored, and cfg/steps/sampler
+    // come from the REQUEST (the enforced values), not the ignored params
+    // fields. The nsfw/furry TOGGLE BITS persist (they re-derive the
+    // invisible steering on Send-to-Composer / Fork).
     let row_prompt = params.prompt.clone();
     let row_negative = String::new();
     let row_seed = params.seed;
@@ -12243,6 +12248,8 @@ async fn prism_generate(
     let row_height = request.height as i32;
     let row_sampler = request.sampling_method;
     let row_model = model_name.clone();
+    let row_nsfw = params.nsfw as i32;
+    let row_furry = params.furry as i32;
     let dest_for_insert = dest.clone();
     let created_at_for_insert = created_at;
     let gallery_for_insert = gallery.clone();
@@ -12319,6 +12326,8 @@ async fn prism_generate(
                             height: row_height,
                             sampler: row_sampler,
                             model: row_model,
+                            nsfw: row_nsfw,
+                            furry: row_furry,
                         };
                         match gallery_for_insert.insert(&new_row) {
                             Ok(id) => {

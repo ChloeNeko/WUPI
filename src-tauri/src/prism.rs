@@ -85,6 +85,14 @@ pub struct GalleryImage {
     pub model: String,
     /// 1 if favorited, 0 otherwise. Drives the favorites filter.
     pub favorite: i32,
+    /// 1 if the NSFW toggle was ON at generation time (2026-08-18). The
+    /// steering TAGS are engine machinery (never stored in the prompt); the
+    /// toggle bit is what "Send to Composer" / Fork restore.
+    #[serde(default)]
+    pub nsfw: i32,
+    /// 1 if the Furry toggle was ON at generation time. See `nsfw`.
+    #[serde(default)]
+    pub furry: i32,
 }
 
 /// The filter for [`GalleryDb::list`]. The default (both false/empty) is
@@ -105,14 +113,13 @@ pub struct GalleryFilter {
 /// path or the `model_path` (those are resolved server-side) — the IPC surface
 /// is intentionally narrower than the internal request.
 ///
-/// **LOCKED RECIPE (Chloe ruling, 2026-08-17):** `cfg`, `steps`, `sampler`,
+/// **LOCKED RECIPE v2 (Chloe ruling, 2026-08-18):** `cfg`, `steps`, `sampler`,
 /// and `negative_prompt` are ACCEPTED BUT IGNORED — [`build_request`] always
-/// normalizes onto the locked NoobAI v1.1 official recipe (Euler a + the
-/// discrete schedule, 30 steps, CFG 6.0, injected quality prefix + negative
-/// block; the launch recipe was DPM++ 2M + Karras at 20 — switched the same
-/// day onto the model card's recommended parameters). The fields stay
-/// deserializable so stale frontends + old Fork payloads keep working; the
-/// only live knobs are `prompt`, `seed`, `width`, `height`.
+/// normalizes onto the locked two-stage recipe (DPM++ 2M + Karras at 20 steps
+/// base + the mandatory ESRGAN hires refine at 1.5×/12 effective steps/0.4
+/// denoise, CFG 6.0, injected quality prefix + negative block). The fields
+/// stay deserializable so stale frontends + old Fork payloads keep working;
+/// the live knobs are `prompt`, `seed`, `width`, `height`, `nsfw`, `furry`.
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct GenerateParams {
     pub prompt: String,
@@ -125,7 +132,7 @@ pub struct GenerateParams {
     /// IGNORED (locked recipe): always 6.0.
     #[serde(default = "default_cfg")]
     pub cfg: f32,
-    /// IGNORED (locked recipe): always 30.
+    /// IGNORED (locked recipe): always 20.
     #[serde(default = "default_steps")]
     pub steps: i32,
     /// Bucket presets only (the 7 NoobAI buckets).
@@ -133,9 +140,20 @@ pub struct GenerateParams {
     pub width: i32,
     #[serde(default = "default_height")]
     pub height: i32,
-    /// IGNORED (locked recipe): always Euler a.
+    /// IGNORED (locked recipe): always DPM++ 2M.
     #[serde(default = "default_sampler")]
     pub sampler: i32,
+    /// The NSFW toggle (2026-08-18, replacing the tag-detection steering):
+    /// true → `nsfw, explicit` ride the positive + `safe` rides the
+    /// negative; false (default) → `safe` positive + `nsfw, explicit`
+    /// negative. Toggle-driven, never inferred from prompt content.
+    #[serde(default)]
+    pub nsfw: bool,
+    /// The Furry toggle (2026-08-18): true → `furry, anthro` ride the
+    /// positive; false (default) → they ride the NEGATIVE (the checkpoint's
+    /// training mix is furry-heavy — the negative suppresses the leakage).
+    #[serde(default)]
+    pub furry: bool,
 }
 
 fn default_seed() -> i64 { -1 }
@@ -143,7 +161,7 @@ fn default_cfg() -> f32 { scene_art::PRISM_LOCKED_CFG }
 fn default_steps() -> i32 { scene_art::PRISM_LOCKED_STEPS }
 fn default_width() -> i32 { scene_art::PRISM_DEFAULT_WIDTH }
 fn default_height() -> i32 { scene_art::PRISM_DEFAULT_HEIGHT }
-fn default_sampler() -> i32 { scene_art::EULER_A_DISCRIMINANT }
+fn default_sampler() -> i32 { scene_art::DPMPP2M_DISCRIMINANT }
 
 /// Manual `Default` so the derived shape matches the `#[serde(default)]`
 /// helpers EXACTLY — a `GenerateParams { prompt, ..Default::default() }`
@@ -161,6 +179,8 @@ impl Default for GenerateParams {
             width: default_width(),
             height: default_height(),
             sampler: default_sampler(),
+            nsfw: false,
+            furry: false,
         }
     }
 }
@@ -201,8 +221,8 @@ impl GalleryDb {
         conn.execute(
             "INSERT INTO images
                 (created_at, path, prompt, negative_prompt, seed, cfg, steps,
-                 width, height, sampler, model, favorite)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 0)",
+                 width, height, sampler, model, favorite, nsfw, furry)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 0, ?12, ?13)",
             params![
                 row.created_at,
                 row.path,
@@ -215,6 +235,8 @@ impl GalleryDb {
                 row.height,
                 row.sampler,
                 row.model,
+                row.nsfw,
+                row.furry,
             ],
         )
         .map_err(|e| anyhow::anyhow!("gallery insert: {e:?}"))?;
@@ -234,7 +256,7 @@ impl GalleryDb {
         let fav_clause = if filter.favorites_only { "WHERE favorite = 1" } else { "" };
         let order = "ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?";
         let select = "SELECT id, created_at, path, prompt, negative_prompt, seed, cfg,
-                             steps, width, height, sampler, model, favorite
+                             steps, width, height, sampler, model, favorite, nsfw, furry
                       FROM images";
         if filter.search.trim().is_empty() {
             let sql = format!("{select} {fav_clause} {order}");
@@ -268,7 +290,7 @@ impl GalleryDb {
         let mut stmt = conn
             .prepare(
                 "SELECT id, created_at, path, prompt, negative_prompt, seed, cfg,
-                        steps, width, height, sampler, model, favorite
+                        steps, width, height, sampler, model, favorite, nsfw, furry
                  FROM images WHERE id = ?",
             )
             .map_err(|e| anyhow::anyhow!("gallery get prepare: {e:?}"))?;
@@ -328,6 +350,10 @@ pub struct NewImage {
     pub height: i32,
     pub sampler: i32,
     pub model: String,
+    /// The NSFW toggle bit at generation time (1/0). See `GalleryImage.nsfw`.
+    pub nsfw: i32,
+    /// The Furry toggle bit at generation time (1/0). See `GalleryImage.furry`.
+    pub furry: i32,
 }
 
 /// Map a rusqlite row (in the fixed SELECT column order) to a `GalleryImage`.
@@ -348,6 +374,8 @@ fn row_to_image(row: &rusqlite::Row<'_>) -> rusqlite::Result<GalleryImage> {
         sampler: row.get(10)?,
         model: row.get(11)?,
         favorite: row.get(12)?,
+        nsfw: row.get::<_, Option<i32>>(13)?.unwrap_or(0),
+        furry: row.get::<_, Option<i32>>(14)?.unwrap_or(0),
     })
 }
 
@@ -378,13 +406,37 @@ fn init_schema(conn: &Connection) -> anyhow::Result<()> {
             height           INTEGER NOT NULL DEFAULT 576,
             sampler          INTEGER NOT NULL DEFAULT 5,
             model            TEXT    NOT NULL DEFAULT '',
-            favorite         INTEGER NOT NULL DEFAULT 0
+            favorite         INTEGER NOT NULL DEFAULT 0,
+            nsfw             INTEGER NOT NULL DEFAULT 0,
+            furry            INTEGER NOT NULL DEFAULT 0
         );
         CREATE INDEX IF NOT EXISTS idx_images_created_at ON images (created_at DESC);
         CREATE INDEX IF NOT EXISTS idx_images_favorite    ON images (favorite);
         "#,
     )
     .map_err(|e| anyhow::anyhow!("gallery init_schema: {e:?}"))?;
+    // Additive migration (2026-08-18): the nsfw/furry toggle columns, added
+    // after the toggle steering replaced tag detection. `CREATE TABLE IF NOT
+    // EXISTS` does nothing on an EXISTING database — the PRAGMA check +
+    // ALTER below is the only path that upgrades a pre-0.24 gallery.sqlite
+    // in place (the documented additive-only pattern). Rows that predate the
+    // toggles read as both-off (SQL default), which is also the correct
+    // routing for their era's stored prompts.
+    for col in ["nsfw", "furry"] {
+        let present = conn
+            .prepare("PRAGMA table_info(images)")
+            .and_then(|mut stmt| {
+                stmt.query_map([], |row| row.get::<_, String>(1))
+                    .and_then(|rows| rows.collect::<Result<Vec<String>, _>>())
+            })
+            .map_err(|e| anyhow::anyhow!("gallery table_info: {e:?}"))?;
+        if !present.iter().any(|c| c == col) {
+            conn.execute_batch(&format!(
+                "ALTER TABLE images ADD COLUMN {col} INTEGER NOT NULL DEFAULT 0;"
+            ))
+            .map_err(|e| anyhow::anyhow!("gallery add column {col}: {e:?}"))?;
+        }
+    }
     Ok(())
 }
 
@@ -524,75 +576,67 @@ fn inject_subject_tag(user_prompt: &str) -> String {
     }
 }
 
-// ── The SFW-default rating steering (Chloe ruling, 2026-08-17) ──────────
+// ── The toggle steering (Chloe ruling, 2026-08-18) ───────────────────────
 //
-// The locked recipe carries no rating axis, so NoobAI falls back to its raw
-// Danbooru prior — which skews suggestive/NSFW for perfectly innocent
-// prompts like "1girl, classroom, school uniform". The default is
-// therefore SFW steering in Danbooru's own rating vocabulary: `safe` rides
-// the positive prefix, `nsfw` rides the negative block. The steering is
-// DROPPED the moment the user prompt carries an explicit/questionable tag —
-// people who want NSFW search with NSFW tags and the tags do the work;
-// nothing is force-inverted and nobody fights an injected censor.
+// The tag-DETECTION steering era is over: scanning the prompt for explicit
+// markers (the EXPLICIT_PROMPT_TAGS/ROOTS lists) guessed intent from
+// content and got both directions wrong (innocent prompts near a marker
+// word lost their steer; explicit prompts WITHOUT a listed marker kept a
+// censor fighting them). The rating/furry axes are now two explicit user
+// TOGGLES on the composer, routed verbatim in Danbooru's own vocabulary:
+//
+// | Toggle state              | Positive injection | Negative injection       |
+// |---------------------------|--------------------|--------------------------|
+// | NSFW off (default)        | `safe`             | `nsfw, explicit`         |
+// | NSFW on                   | `nsfw, explicit`   | `safe`                   |
+// | Furry off (default)       | —                  | `furry, anthro`          |
+// | Furry on                  | `furry, anthro`    | —                        |
+//
+// The furry-negative default exists because the checkpoint's training mix
+// is furry-heavy — the negative suppresses the style leakage into human
+// characters. Injections are engine machinery (invisible, never in gallery
+// rows — the ROW stores the toggle bits instead). An AUTHORED tag is never
+// duplicated (hand-edited payloads).
 
-/// The SFW positive steering tag (appended to the quality prefix).
-const RATING_TAG_SFW: &str = "safe";
-/// The SFW negative steering tag (appended to the negative block).
-const RATING_TAG_NSFW: &str = "nsfw";
+/// Rating/furry steering tags (danbooru canonical, lowercase).
+const TAG_SAFE: &str = "safe";
+const TAG_NSFW: &str = "nsfw";
+const TAG_EXPLICIT: &str = "explicit";
+const TAG_FURRY: &str = "furry";
+const TAG_ANTHRO: &str = "anthro";
 
-/// Explicit/questionable markers — any ONE in the user prompt drops the SFW
-/// steering. Chloe-tunable: this is the opt-out flip condition, not a censor
-/// list. Two layers:
-///
-/// 1. this list — WHOLE-TAG equality (`classic` must never substring-match
-///    `ass`; `pantyhose` must never match `panties`);
-/// 2. [`EXPLICIT_PROMPT_ROOTS`] — substring roots for the danbooru families
-///    with too many variants to enumerate (`nude cover`, `pussy juice`,
-///    `puffy nipples`…).
-const EXPLICIT_PROMPT_TAGS: &[&str] = &[
-    // rating axis / meta words
-    "nsfw", "explicit", "questionable", "sensitive", "ecchi", "hentai",
-    "18+", "r18", "rating:explicit", "rating:questionable", "rating:sensitive",
-    // orientation / h-families
-    "yaoi", "yuri", "futanari", "trap", "otokonoko",
-    // sex acts / aftermath
-    "sex", "sexy", "vaginal", "anal", "oral", "group sex", "sex from behind",
-    "imminent sex", "after sex", "cum", "cumshot", "creampie", "ahegao",
-    "erection", "dildo", "vibrator", "sex toy", "bondage", "bdsm", "groping",
-    "undressing", "striptease", "lactation", "deepthroat", "rimjob",
-    "fingering", "spanking",
-    // provocative poses / body focus
-    "provocative pose", "spread legs", "bent over", "ass", "sideboob",
-    "underboob", "cameltoe", "upskirt", "panty shot",
-    // suggestive clothing / state
-    "thong", "garter belt", "bra", "underwear", "see-through",
-    "transparent clothes",
-];
+/// True when the (already subject-gate-normalized) user prompt authors the
+/// tag verbatim — underscore/case tolerant via [`normalize_subject_tag`].
+fn prompt_authors_tag(user_prompt: &str, tag: &str) -> bool {
+    user_prompt
+        .split(',')
+        .any(|t| normalize_subject_tag(t) == tag)
+}
 
-/// Substring roots — flip when the normalized tag CONTAINS the root. Every
-/// entry is individually cleared against the SFW vocabulary: `panties` is a
-/// root but `panty` is NOT (`pantyhose` is SFW); `nude`/`naked`/`lingerie`
-/// are roots but `sex`/`anal`/`oral`/`cum` stay exact-only (`unisex`,
-/// `canal`, `floral`, `cucumber` are real SFW tags).
-const EXPLICIT_PROMPT_ROOTS: &[&str] = &[
-    "nude", "naked", "topless", "bottomless",
-    "nipple", "areolae", "pussy", "penis", "testicle",
-    "lingerie", "panties", "cleavage",
-    "blowjob", "handjob", "footjob", "cunnilingus", "paizuri",
-    "masturbation", "presenting", "orgasm", "ejaculation",
-];
-
-/// True when the user prompt carries any explicit/questionable tag — the
-/// SFW steering's opt-out. Underscore + case tolerant via
-/// [`normalize_subject_tag`] (hand-edited / forked payloads).
-fn prompt_wants_explicit(user_prompt: &str) -> bool {
-    user_prompt.split(',').any(|raw| {
-        let tag = normalize_subject_tag(raw);
-        if EXPLICIT_PROMPT_TAGS.contains(&tag.as_str()) {
-            return true;
-        }
-        EXPLICIT_PROMPT_ROOTS.iter().any(|root| tag.contains(*root))
-    })
+/// The toggle-driven injections for one generation: (positive, negative).
+/// Pure — the routing table above, minus any tag the user already authored.
+fn steering_injections(nsfw: bool, furry: bool, user_prompt: &str) -> (Vec<&'static str>, Vec<&'static str>) {
+    let mut pos = Vec::new();
+    let mut neg = Vec::new();
+    if nsfw {
+        pos.push(TAG_NSFW);
+        pos.push(TAG_EXPLICIT);
+        neg.push(TAG_SAFE);
+    } else {
+        pos.push(TAG_SAFE);
+        neg.push(TAG_NSFW);
+        neg.push(TAG_EXPLICIT);
+    }
+    if furry {
+        pos.push(TAG_FURRY);
+        pos.push(TAG_ANTHRO);
+    } else {
+        neg.push(TAG_FURRY);
+        neg.push(TAG_ANTHRO);
+    }
+    pos.retain(|t| !prompt_authors_tag(user_prompt, t));
+    neg.retain(|t| !prompt_authors_tag(user_prompt, t));
+    (pos, neg)
 }
 
 /// Convert user-supplied [`GenerateParams`] into the internal
@@ -601,11 +645,12 @@ fn prompt_wants_explicit(user_prompt: &str) -> bool {
 /// backend. `model_path` is the resolved SD checkpoint; `dest` is the output
 /// PNG path (from [`dest_path`]).
 ///
-/// **THE LOCKED-RECIPE CHOKEPOINT (Chloe ruling, 2026-08-17):** the sampler
-/// (Euler a), schedule (discrete — applied engine-side in
-/// `DiffusionRsGenerator::generate`), steps (30), CFG (6.0), the NoobAI
-/// v1.1 quality prefix, and the negative block are LOCKED — no matter
-/// what the frontend sends, this fn normalizes the request onto the recipe:
+/// **THE LOCKED-RECIPE CHOKEPOINT (Chloe ruling, recipe v2 2026-08-18):** the
+/// base sampler (DPM++ 2M), schedule (karras — applied engine-side in
+/// `DiffusionRsGenerator::generate`), steps (20), CFG (6.0), the NoobAI
+/// v1.1 quality prefix, the negative block, and the mandatory ESRGAN hires
+/// refine pass are LOCKED — no matter what the frontend sends, this fn
+/// normalizes the request onto the recipe:
 ///
 /// - `steps`/`cfg`/`sampler` from `params` are IGNORED (the IPC fields stay
 ///   deserializable for stale frontends + old Fork payloads; they just no
@@ -618,12 +663,11 @@ fn prompt_wants_explicit(user_prompt: &str) -> bool {
 ///   like the prefix, never stored in gallery rows, never duplicated against
 ///   an authored tag. An EMPTY prompt stays prefix-alone (the generic
 ///   top-cluster fallback is not "scenery mode").
-/// - SFW rating steering (2026-08-17): `safe` rides the positive prompt +
-///   `nsfw` rides the negative block by DEFAULT. A prompt carrying any
-///   [`EXPLICIT_PROMPT_TAGS`] marker drops BOTH (an authored `safe` tag is
-///   honored verbatim, never duplicated).
+/// - Toggle steering (2026-08-18): the NSFW/Furry toggles inject the rating
+///   + furry tags per the table in the module section above — never inferred
+///   from prompt content, never duplicated against an authored tag.
 /// - `negative_prompt` from `params` is IGNORED — the request always carries
-///   [`scene_art::PRISM_NEGATIVE_BLOCK`] (+ `nsfw` unless explicit).
+///   [`scene_art::PRISM_NEGATIVE_BLOCK`] + the toggle negatives.
 /// - `width`/`height`/`seed` pass through (clamped as before): size is the
 ///   composer's bucket presets, seed is Fork & Edit's primitive.
 pub fn build_request(
@@ -641,37 +685,35 @@ pub fn build_request(
     } else {
         inject_subject_tag(trimmed)
     };
-    // SFW steering unless the user opted out with an explicit tag. A
-    // hand-edited payload that already authors `safe` is honored as-is.
-    let explicit = !user_prompt.is_empty() && prompt_wants_explicit(&user_prompt);
-    let has_own_safe = user_prompt
-        .split(',')
-        .any(|t| normalize_subject_tag(t) == RATING_TAG_SFW);
-    let steered = !explicit && !has_own_safe;
+    let (pos_inject, neg_inject) = steering_injections(p.nsfw, p.furry, &user_prompt);
+    let pos_prefix = pos_inject.join(", ");
     let prompt = if user_prompt.is_empty() {
-        // No user tags → the prefix alone (generic top-cluster art) + the
-        // SFW steer. The UI's guard asks for ≥1 tag, but the IPC is not
-        // trusted to enforce that.
-        format!("{}, {}", scene_art::PRISM_QUALITY_PREFIX, RATING_TAG_SFW)
-    } else if user_prompt.starts_with(scene_art::PRISM_QUALITY_PREFIX) {
-        // Legacy/duplicate guard: already prefixed — never double-prefix.
-        if steered {
-            format!("{user_prompt}, {}", RATING_TAG_SFW)
-        } else {
-            user_prompt
+        // No user tags → the prefix + the positive steering alone (generic
+        // top-cluster art). The UI's guided slots ask for a subject + pose,
+        // but the IPC is not trusted to enforce that.
+        match pos_prefix.is_empty() {
+            true => scene_art::PRISM_QUALITY_PREFIX.to_string(),
+            false => format!("{}, {}", scene_art::PRISM_QUALITY_PREFIX, pos_prefix),
         }
-    } else if steered {
-        format!("{}, {}, {}", scene_art::PRISM_QUALITY_PREFIX, RATING_TAG_SFW, user_prompt)
+    } else if user_prompt.starts_with(scene_art::PRISM_QUALITY_PREFIX) {
+        // Legacy/duplicate guard: already prefixed — never double-prefix;
+        // the steering tags still append after the user tags (an
+        // already-prefixed payload is a hand-edit, not the UI shape).
+        match pos_prefix.is_empty() {
+            true => user_prompt,
+            false => format!("{}, {}", user_prompt, pos_prefix),
+        }
     } else {
-        format!("{}, {}", scene_art::PRISM_QUALITY_PREFIX, user_prompt)
+        match pos_prefix.is_empty() {
+            true => format!("{}, {}", scene_art::PRISM_QUALITY_PREFIX, user_prompt),
+            false => format!("{}, {}, {}", scene_art::PRISM_QUALITY_PREFIX, pos_prefix, user_prompt),
+        }
     };
-    let negative_prompt = if explicit {
-        // Explicit mode: no `nsfw` in the negative — the user asked for it;
-        // the explicit tags carry the intent.
-        scene_art::PRISM_NEGATIVE_BLOCK.to_string()
-    } else {
-        format!("{}, {}", scene_art::PRISM_NEGATIVE_BLOCK, RATING_TAG_NSFW)
-    };
+    let mut negative_prompt = scene_art::PRISM_NEGATIVE_BLOCK.to_string();
+    for tag in neg_inject {
+        negative_prompt.push_str(", ");
+        negative_prompt.push_str(tag);
+    }
     SceneImageRequest {
         prompt,
         negative_prompt: Some(negative_prompt),
@@ -680,7 +722,7 @@ pub fn build_request(
         steps: scene_art::PRISM_LOCKED_STEPS.max(1) as u32,
         width: p.width.max(64) as u32,
         height: p.height.max(64) as u32,
-        sampling_method: scene_art::EULER_A_DISCRIMINANT,
+        sampling_method: scene_art::DPMPP2M_DISCRIMINANT,
         model_path,
         dest,
     }
@@ -734,6 +776,8 @@ mod tests {
             height: 576,
             sampler: scene_art::DPMPP2M_DISCRIMINANT,
             model: "Image.safetensors".into(),
+            nsfw: 0,
+            furry: 0,
         }
     }
 
@@ -761,7 +805,10 @@ mod tests {
     #[test]
     fn insert_then_list_round_trip() {
         let db = temp_db();
-        let id = db.insert(&sample_new_image(42)).unwrap();
+        let mut row = sample_new_image(42);
+        row.nsfw = 1;
+        row.furry = 1;
+        let id = db.insert(&row).unwrap();
         let rows = db.list(&GalleryFilter::default(), 10, 0).unwrap();
         assert_eq!(rows.len(), 1);
         let r = &rows[0];
@@ -774,6 +821,8 @@ mod tests {
         assert_eq!(r.sampler, scene_art::DPMPP2M_DISCRIMINANT);
         assert_eq!(r.model, "Image.safetensors");
         assert_eq!(r.favorite, 0);
+        assert_eq!(r.nsfw, 1, "the NSFW toggle bit round-trips");
+        assert_eq!(r.furry, 1, "the Furry toggle bit round-trips");
     }
 
     #[test]
@@ -873,46 +922,51 @@ mod tests {
     #[test]
     fn build_request_enforces_the_locked_recipe() {
         // Whatever a stale frontend / hand-crafted IPC payload sends for the
-        // locked knobs, the request carries the LOCKED recipe (Chloe ruling
-        // 2026-08-17): sampler Euler a, steps 30, CFG 6.0, the NoobAI v1.1
-        // quality prefix prepended, the NoobAI negative block + the SFW
-        // steer injected.
+        // locked knobs, the request carries the LOCKED recipe v2 (Chloe
+        // ruling 2026-08-18): sampler DPM++ 2M, steps 20, CFG 6.0, the
+        // quality prefix prepended, the v2 negative block + the default
+        // toggle steering injected.
         let p = GenerateParams {
             prompt: "1girl".into(),
             negative_prompt: Some("user authored negative".into()), // ignored
             seed: 12345,
             cfg: 9.5,     // ignored → 6.0
-            steps: 50,    // ignored → 30
+            steps: 50,    // ignored → 20
             width: 1216,
             height: 832,
-            sampler: 5,   // ignored → Euler a (DPM++ 2M sent on purpose: the
+            sampler: 1,   // ignored → DPM++ 2M (Euler a sent on purpose: the
                           // old locked value, proving the field is ignored)
+            ..Default::default()
         };
         let req = build_request(&p, PathBuf::from("/m/Image.safetensors"), PathBuf::from("/o/out.png"));
         assert_eq!(
             req.prompt,
             format!("{}, safe, 1girl, solo", scene_art::PRISM_QUALITY_PREFIX),
-            "quality-meta prefix + SFW steer prepended; the crowd-logic gate injects solo (single subject)",
+            "quality-meta prefix + default (off) NSFW steering prepended; the crowd-logic gate injects solo (single subject)",
         );
-        let expected_negative = format!("{}, nsfw", scene_art::PRISM_NEGATIVE_BLOCK);
+        let expected_negative = format!(
+            "{}, nsfw, explicit, furry, anthro",
+            scene_art::PRISM_NEGATIVE_BLOCK
+        );
         assert_eq!(
             req.negative_prompt.as_deref(),
             Some(expected_negative.as_str()),
-            "the locked NoobAI negative block + the nsfw steer replace any user negative",
+            "the locked v2 negative block + both default (off) toggle negatives replace any user negative",
         );
         assert_eq!(req.seed, 12345, "locked seed passes through");
         assert_eq!(req.cfg_scale, 6.0, "CFG is locked at 6.0");
-        assert_eq!(req.steps, 30, "steps are locked at 30");
-        assert_eq!(req.sampling_method, scene_art::EULER_A_DISCRIMINANT, "sampler is locked at Euler a");
+        assert_eq!(req.steps, 20, "steps are locked at 20");
+        assert_eq!(req.sampling_method, scene_art::DPMPP2M_DISCRIMINANT, "sampler is locked at DPM++ 2M");
         assert_eq!(req.width, 1216);
         assert_eq!(req.height, 832);
     }
 
     #[test]
     fn build_request_prefix_guards_empty_and_prefixed_prompts() {
-        // Empty prompt → the prefix + the SFW steer alone (the UI asks for
-        // ≥1 tag; the IPC is not trusted to). An already-prefixed prompt
-        // (legacy row / hand payload) is never double-prefixed.
+        // Empty prompt → the prefix + the default steering alone (the guided
+        // slots ask for a subject; the IPC is not trusted to). An
+        // already-prefixed prompt (legacy row / hand payload) is never
+        // double-prefixed.
         let empty = GenerateParams { prompt: "   ".into(), ..Default::default() };
         let req = build_request(&empty, PathBuf::new(), PathBuf::new());
         assert_eq!(
@@ -926,7 +980,7 @@ mod tests {
         };
         let req = build_request(&pre, PathBuf::new(), PathBuf::new());
         // Never double-PREFIXED; the subject gate + steer still apply (single
-        // subject → solo appended, SFW default → safe appended).
+        // subject → solo appended, default NSFW-off → safe appended).
         assert_eq!(
             req.prompt,
             format!("{}, 1girl, solo, safe", scene_art::PRISM_QUALITY_PREFIX),
@@ -936,9 +990,9 @@ mod tests {
 
     #[test]
     fn build_request_defaults_are_the_locked_recipe() {
-        // An empty/minimal params object produces the LOCKED NoobAI v1.1
-        // official recipe — 30 steps, CFG 6.0, the portrait bucket, Euler a,
-        // prefix + SFW steer + negative block injected.
+        // An empty/minimal params object produces the LOCKED recipe v2 —
+        // 20 steps, CFG 6.0, the portrait bucket, DPM++ 2M, prefix +
+        // default toggle steering + negative block injected.
         let p = GenerateParams {
             prompt: "x".into(),
             ..Default::default()
@@ -946,119 +1000,111 @@ mod tests {
         let req = build_request(&p, PathBuf::new(), PathBuf::new());
         assert_eq!(req.seed, -1, "default random seed");
         assert_eq!(req.cfg_scale, 6.0);
-        assert_eq!(req.steps, 30);
+        assert_eq!(req.steps, 20);
         assert_eq!(req.width, 832);
         assert_eq!(req.height, 1216);
-        assert_eq!(req.sampling_method, scene_art::EULER_A_DISCRIMINANT);
+        assert_eq!(req.sampling_method, scene_art::DPMPP2M_DISCRIMINANT);
         assert_eq!(
             req.prompt,
             format!("{}, safe, x, no humans", scene_art::PRISM_QUALITY_PREFIX),
-            "no subject tags → scenery mode injects no humans; the SFW steer rides the front",
+            "no subject tags → scenery mode injects no humans; the default steering rides the front",
         );
-        let expected_negative = format!("{}, nsfw", scene_art::PRISM_NEGATIVE_BLOCK);
+        let expected_negative = format!(
+            "{}, nsfw, explicit, furry, anthro",
+            scene_art::PRISM_NEGATIVE_BLOCK
+        );
         assert_eq!(req.negative_prompt.as_deref(), Some(expected_negative.as_str()));
     }
 
-    /// The SFW rating steering (2026-08-17): `safe` positive + `nsfw`
-    /// negative by default; one explicit/questionable marker drops BOTH;
-    /// matching is underscore/case tolerant (whole-tag OR a cleared
-    /// substring root — see [`EXPLICIT_PROMPT_ROOTS`]); an authored `safe`
-    /// is honored verbatim.
+    /// The toggle steering (2026-08-18): the NSFW/Furry TOGGLES route the
+    /// rating + furry tags; prompt content NEVER influences routing (the
+    /// tag-detection era is gone); an authored tag is honored, never
+    /// duplicated.
     #[test]
-    fn build_request_sfw_steering_and_the_explicit_opt_out() {
-        // The SFW default — "1girl, classroom, school uniform" must not ride
-        // the model's raw Danbooru prior.
-        let sfw = GenerateParams {
+    fn build_request_toggle_steering_routes_verbatim() {
+        // NSFW on: `nsfw, explicit` positive + `safe` negative; furry stays
+        // negative (off).
+        let on = GenerateParams {
             prompt: "1girl, classroom, school uniform".into(),
+            nsfw: true,
             ..Default::default()
         };
-        let req = build_request(&sfw, PathBuf::new(), PathBuf::new());
-        assert!(req.prompt.contains(", safe, 1girl"), "steered: {}", req.prompt);
-        let expected_negative = format!("{}, nsfw", scene_art::PRISM_NEGATIVE_BLOCK);
-        assert_eq!(req.negative_prompt.as_deref(), Some(expected_negative.as_str()));
-
-        // One explicit marker drops BOTH steering tags — the explicit tags
-        // carry the intent; nothing is force-inverted.
-        let explicit = GenerateParams {
-            prompt: "1girl, classroom, nude".into(),
-            ..Default::default()
-        };
-        let req = build_request(&explicit, PathBuf::new(), PathBuf::new());
-        assert!(!req.prompt.contains("safe"), "explicit prompt is never steered: {}", req.prompt);
+        let req = build_request(&on, PathBuf::new(), PathBuf::new());
+        assert_eq!(
+            req.prompt,
+            format!("{}, nsfw, explicit, 1girl, classroom, school uniform, solo", scene_art::PRISM_QUALITY_PREFIX),
+            "NSFW-on rides the positive front cluster: {}",
+            req.prompt,
+        );
         assert_eq!(
             req.negative_prompt.as_deref(),
-            Some(scene_art::PRISM_NEGATIVE_BLOCK),
-            "no nsfw negative against an explicit prompt",
+            Some(format!("{}, safe, furry, anthro", scene_art::PRISM_NEGATIVE_BLOCK).as_str()),
         );
 
-        // Underscore/case tolerance (hand-edited / forked payloads).
-        let ugly = GenerateParams { prompt: "1girl, Nude_Female".into(), ..Default::default() };
-        let req = build_request(&ugly, PathBuf::new(), PathBuf::new());
-        assert!(!req.prompt.contains("safe"), "underscored explicit marker still flips");
+        // Furry on (NSFW off): `furry, anthro` move to the positive; the
+        // rating stays SFW-default.
+        let furry = GenerateParams {
+            prompt: "1girl, forest".into(),
+            furry: true,
+            ..Default::default()
+        };
+        let req = build_request(&furry, PathBuf::new(), PathBuf::new());
+        assert_eq!(
+            req.prompt,
+            format!("{}, safe, furry, anthro, 1girl, forest, solo", scene_art::PRISM_QUALITY_PREFIX),
+        );
+        assert_eq!(
+            req.negative_prompt.as_deref(),
+            Some(format!("{}, nsfw, explicit", scene_art::PRISM_NEGATIVE_BLOCK).as_str()),
+            "furry-on REMOVES furry/anthro from the negative",
+        );
 
-        // Whole-tag equality only — `classy` must never substring-match.
-        let tricky = GenerateParams { prompt: "classy, 1girl".into(), ..Default::default() };
-        let req = build_request(&tricky, PathBuf::new(), PathBuf::new());
-        assert!(req.prompt.contains(", safe,"), "non-marker tags stay steered: {}", req.prompt);
-
-        // An authored `safe` is honored, never duplicated.
-        let authored = GenerateParams { prompt: "safe, 1girl".into(), ..Default::default() };
-        let req = build_request(&authored, PathBuf::new(), PathBuf::new());
-        assert_eq!(req.prompt.matches("safe").count(), 1);
+        // Both on.
+        let both = GenerateParams {
+            prompt: "1girl".into(),
+            nsfw: true,
+            furry: true,
+            ..Default::default()
+        };
+        let req = build_request(&both, PathBuf::new(), PathBuf::new());
+        assert!(req.prompt.contains(", nsfw, explicit, furry, anthro, 1girl"), "{}", req.prompt);
+        assert_eq!(
+            req.negative_prompt.as_deref(),
+            Some(format!("{}, safe", scene_art::PRISM_NEGATIVE_BLOCK).as_str()),
+        );
     }
 
-    /// The marker VOCABULARY: the yaoi/yuri/pose/clothing families flip the
-    /// steer; the SFW look-alike traps (`pantyhose`, `floral print`,
-    /// `cucumber`, `unisex`, `canal`) never do.
+    /// Routing is TOGGLE-ONLY: explicit content tags in the prompt no longer
+    /// flip anything (the deleted detection lists are gone by design), and
+    /// an authored steering tag is never duplicated.
     #[test]
-    fn build_request_explicit_marker_vocabulary() {
-        let flips = [
-            // orientation / h families
-            "2girls, yuri", "2boys, yaoi", "1girl, futanari",
-            // clothing / state
-            "1girl, lingerie", "1girl, panties", "1girl, bra, underwear",
-            "1girl, topless", "1girl, bottomless",
-            // poses / focus
-            "1girl, spread legs", "1girl, bent over", "1girl, provocative pose",
-            "1girl, upskirt", "1girl, panty shot",
-            // root-covered variants
-            "1girl, completely nude", "1girl, naked apron", "1girl, puffy nipples",
-            "1girl, spread pussy", "1girl, side cleavage", "1girl, double blowjob",
-            // rating words
-            "1girl, ecchi", "1girl, 18+",
-        ];
-        for p in flips {
-            let req = build_request(
-                &GenerateParams { prompt: p.into(), ..Default::default() },
-                PathBuf::new(),
-                PathBuf::new(),
-            );
-            assert!(!req.prompt.contains("safe"), "flip case must drop the steer: {p}");
-            assert_eq!(
-                req.negative_prompt.as_deref(),
-                Some(scene_art::PRISM_NEGATIVE_BLOCK),
-                "flip case must drop the nsfw negative: {p}",
-            );
-        }
+    fn build_request_content_tags_never_flip_the_steering() {
+        // The old detection era flipped on `nude`; the toggle era does not.
+        let explicit_tags = GenerateParams {
+            prompt: "1girl, nude".into(),
+            ..Default::default()
+        };
+        let req = build_request(&explicit_tags, PathBuf::new(), PathBuf::new());
+        assert!(req.prompt.contains(", safe, 1girl, nude"), "toggle-off stays SFW-steered regardless of content: {}", req.prompt);
+        assert!(req.negative_prompt.as_deref().unwrap().contains("nsfw"));
 
-        // SFW traps — near-miss spellings that must STAY steered.
-        let stays = [
-            "1girl, pantyhose",        // `panty` is deliberately NOT a root
-            "1girl, floral print",     // `oral` is exact-only
-            "cucumber, no humans",     // `cum` is exact-only
-            "1girl, unisex clothes",   // `sex` is exact-only
-            "canal, no humans",        // `anal` is exact-only
-            "1girl, classy",           // `ass` is exact-only
-            "1girl, swimsuit",         // sensitive-tier clothing stays SFW-default
-        ];
-        for p in stays {
-            let req = build_request(
-                &GenerateParams { prompt: p.into(), ..Default::default() },
-                PathBuf::new(),
-                PathBuf::new(),
-            );
-            assert!(req.prompt.contains(", safe,"), "trap case must stay steered: {p}");
-        }
+        // An authored `safe` is honored — the off-toggle injection skips it.
+        let authored = GenerateParams { prompt: "safe, 1girl".into(), ..Default::default() };
+        let req = build_request(&authored, PathBuf::new(), PathBuf::new());
+        assert_eq!(req.prompt.matches("safe").count(), 1, "no duplicate safe");
+        assert!(req.negative_prompt.as_deref().unwrap().contains("nsfw"));
+
+        // An authored `furry` (furry toggle off) suppresses only the
+        // NEGATIVE duplicate — the user asked for it in the prompt.
+        let furry_authored = GenerateParams { prompt: "furry, 1girl".into(), ..Default::default() };
+        let req = build_request(&furry_authored, PathBuf::new(), PathBuf::new());
+        assert_eq!(req.prompt.matches("furry").count(), 1);
+        assert!(!req.negative_prompt.as_deref().unwrap().contains("furry"), "no negative fighting an authored furry");
+
+        // Underscore/case tolerance on the authored check (hand-edited payloads).
+        let ugly = GenerateParams { prompt: "Safe, 1girl".into(), ..Default::default() };
+        let req = build_request(&ugly, PathBuf::new(), PathBuf::new());
+        assert_eq!(req.prompt.matches("safe").count(), 1, "authored Safe suppresses the duplicate injection (case-tolerant)");
     }
 
     #[test]

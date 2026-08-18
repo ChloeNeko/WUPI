@@ -37,11 +37,13 @@ export function clearLatch() {
  * Kick off one generation. Returns immediately with the resolved dest path
  * (`pending: true`); the final result arrives via the `prism-gen-done` event.
  *
- * @param {object} params — the GenerateParams. LOCKED RECIPE: only
- *   `prompt`, `seed`, `width`, `height` are live; `cfg`/`steps`/`sampler`/
- *   `negative_prompt` remain accepted by the IPC but are IGNORED — Rust
- *   enforces the locked NoobAI v1.1 official recipe (Euler a + discrete,
- *   30 steps, CFG 6.0, injected quality prefix + negative block).
+ * @param {object} params — the GenerateParams. LOCKED RECIPE v2: only
+ *   `prompt`, `seed`, `width`, `height`, `nsfw`, `furry` are live;
+ *   `cfg`/`steps`/`sampler`/`negative_prompt` remain accepted by the IPC but
+ *   are IGNORED — Rust enforces the locked two-stage recipe (DPM++ 2M +
+ *   Karras at 20 steps base, the mandatory ESRGAN hires refine at 1.5× /
+ *   12 effective steps / 0.45 denoise, CFG 6.0, injected quality prefix +
+ *   negative block; the toggles route the rating/furry steering tags).
  * @returns {Promise<{pending: boolean, path: string}>}
  */
 export function generate(params) {
@@ -80,15 +82,18 @@ export function galleryDelete(id) {
 
 // ── Generation defaults (mirror prism.rs's serde defaults) ──────────────
 //
-// LOCKED RECIPE (Chloe ruling, 2026-08-17): sampler (Euler a + discrete),
-// steps (30), CFG (6.0) + the quality/negative meta are SERVER-SIDE
-// constants enforced in prism::build_request — they are NOT settings and
-// have no client representation. The only defaults that matter here are
-// the two user-facing knobs: the default size (the portrait NoobAI bucket)
-// + the random seed.
+// LOCKED RECIPE v2 (Chloe ruling, 2026-08-18): sampler (DPM++ 2M + Karras),
+// steps (20), CFG (6.0), the quality/negative meta + the mandatory ESRGAN
+// hires refine are SERVER-SIDE constants enforced in prism::build_request /
+// scene_art — they are NOT settings and have no client representation. The
+// defaults that matter here are the user-facing knobs: the default size
+// (the portrait NoobAI bucket), the random seed, + the two steering
+// toggles (both default off = SFW + furry-negative).
 
 export const GEN_DEFAULTS = {
   seed: -1,        // -1 = random; >= 0 = locked (Fork & Edit)
   width: 832,
   height: 1216,
+  nsfw: false,     // the NSFW toggle (rating-tag routing is Rust-side)
+  furry: false,    // the Furry toggle (furry/anthro routing is Rust-side)
 };
