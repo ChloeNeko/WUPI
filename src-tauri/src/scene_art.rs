@@ -602,12 +602,76 @@ pub fn install_sd_abort_callback() {
     });
 }
 
+// ===========================================================================
+// §11.61 SD engine log bridge — `install_sd_log_bridge`
+// ===========================================================================
+// WHY THIS EXISTS: stable-diffusion.cpp logs EVERYTHING (version detection,
+// per-file load results, the VAE conv-scale path, per-step sampling) through
+// `log_printf` → `sd_log_cb` — and when NO callback is registered the message
+// is silently DROPPED (there is no stderr default; see util.cpp:584). Neither
+// diffusion-rs 0.1.20 nor WUPI ever installed one, so the SD engine has been
+// running mute: the 2026-08-17 renders produced noise with ZERO engine-side
+// telemetry to diagnose from (the version-detection line, the "No valid VAE
+// specified … using Conv2D scale" warning, everything — invisible).
+//
+// This mirrors `install_sd_abort_callback`: Once-guarded, registered before
+// any gen_img call, capture-only. The callback receives sd.cpp's pre-formatted
+// line ("file.cc:123 - message"); we eprintln! INFO+ so it lands on the live
+// console AND in `logs/sd-out.log` via the `sd:dev` 2>&1 redirect (the same
+// engine-pulse doctrine as the llama `[DEBUG]` telemetry), and mirror to
+// tracing so `%TEMP%/wupi.log` carries it too. DEBUG stays tracing-only (it
+// is chatty per-step; RUST_LOG gates it). Must never panic (C callback).
+#[cfg(feature = "diffusion-rs")]
+pub fn install_sd_log_bridge() {
+    use diffusion_rs_sys::{sd_log_level_t, sd_set_log_callback};
+    use std::os::raw::c_char;
+    use std::sync::Once;
+
+    static INSTALL: Once = Once::new();
+
+    INSTALL.call_once(|| {
+        extern "C" fn on_log(
+            level: sd_log_level_t,
+            msg: *const c_char,
+            _data: *mut std::ffi::c_void,
+        ) {
+            // Safety: sd.cpp's log_printf formats into a static buffer that
+            // stays alive for the duration of the callback (same contract as
+            // the abort callback's message).
+            let text = if msg.is_null() {
+                "<null log message>".to_string()
+            } else {
+                unsafe { std::ffi::CStr::from_ptr(msg).to_string_lossy().into_owned() }
+            };
+            let line = text.trim_end();
+            match level {
+                sd_log_level_t::SD_LOG_WARN | sd_log_level_t::SD_LOG_ERROR => {
+                    eprintln!("[sd] {line}");
+                    tracing::warn!("{line}");
+                }
+                sd_log_level_t::SD_LOG_INFO => {
+                    eprintln!("[sd] {line}");
+                    tracing::info!("{line}");
+                }
+                _ => {
+                    tracing::debug!("{line}");
+                }
+            }
+        }
+
+        unsafe {
+            sd_set_log_callback(Some(on_log), std::ptr::null_mut());
+        }
+        tracing::info!("diffusion-rs: sd.cpp log bridge installed (engine logs flow to stderr + wupi.log)");
+    });
+}
+
 /// Detect whether a checkpoint is a ComfyUI-convention GGUF UNet (the §11.59
-/// multi-file SDXL layout). True iff the file is a GGUF AND its
-/// `general.architecture` metadata is `sdxl` (or absent — ComfyUI GGUFs may
-/// omit it). A full-checkpoint GGUF (rare) or a `.safetensors` returns false
-/// → the single-file load path. Sniffs only the first 4 bytes (GGUF magic) +
-/// does NOT parse the whole file (cheap, called once at load).
+/// multi-file SDXL layout). True iff the file is a GGUF (magic sniff; a bare
+/// UNet GGUF is then routed to the multi-file `diffusion_model` path by
+/// `load`, gated on `gguf_embeds_full_checkpoint` being false). A
+/// `.safetensors` returns false → the single-file load path. Cheap (4 bytes),
+/// called once at load.
 #[cfg(feature = "diffusion-rs")]
 fn is_gguf_unet(path: &std::path::Path) -> bool {
     let is_gguf = path
@@ -626,6 +690,42 @@ fn is_gguf_unet(path: &std::path::Path) -> bool {
             use std::io::Read;
             let mut buf = [0u8; 4];
             f.read_exact(&mut buf).is_ok() && &buf == b"GGUF"
+        }
+        Err(_) => false,
+    }
+}
+
+/// Detect whether a GGUF carries a FULL checkpoint (embedded CLIP text
+/// encoders + VAE) vs a bare ComfyUI-convention UNet. True iff the byte
+/// pattern `first_stage_model` (the VAE tensor-name prefix — present in every
+/// full SD/SDXL checkpoint, absent from a UNet-only GGUF) appears in a bounded
+/// prefix of the file. Tensor names live at the TOP of a GGUF (header + KV
+/// metadata + tensor-info table, before the multi-GB data section), so a few
+/// MB is always sufficient — the 4.18 GB full-checkpoint GGUF's name table
+/// ends ~150 KB in even with dense per-tensor metadata.
+///
+/// WHY THE SNIFF (2026-08-17, §11.61): a full-checkpoint GGUF MUST ride the
+/// single-file `model` path, not the multi-file `diffusion_model` path —
+/// `init_from_file(path, "model.diffusion_model.")` prefixes every tensor it
+/// doesn't recognize as already-prefixed, so the embedded
+/// `conditioner.embedders.*` / `first_stage_model.*` tensors would become
+/// `model.diffusion_model.conditioner…` (unreachable) and the external
+/// clip_l/clip_g the multi-file path requires wouldn't exist → version
+/// detection fails. On the `model` path (no prefix) every native name lands
+/// as-is and name-based version detection sees the full marker set.
+#[cfg(feature = "diffusion-rs")]
+fn gguf_embeds_full_checkpoint(path: &std::path::Path) -> bool {
+    use std::io::Read;
+    const WINDOW: usize = 4 * 1024 * 1024; // 4 MB prefix
+    const NEEDLE: &[u8] = b"first_stage_model";
+    let mut buf = Vec::with_capacity(WINDOW);
+    match std::fs::File::open(path) {
+        Ok(f) => {
+            // take(WINDOW) bounds the read on multi-GB files.
+            match f.take(WINDOW as u64).read_to_end(&mut buf) {
+                Ok(_) => buf.windows(NEEDLE.len()).any(|w| w == NEEDLE),
+                Err(_) => false,
+            }
         }
         Err(_) => false,
     }
@@ -708,7 +808,14 @@ impl SceneImageGenerator for DiffusionRsGenerator {
         // the diffusion_model + clip_l/g + vae setters instead of the single
         // `model` setter (see SdModelLayout doc for the version-detection
         // rationale — CLIP-G is REQUIRED for sd.cpp to classify it as SDXL).
-        let layout = if is_gguf_unet(model_path) {
+        //
+        // §11.61: a GGUF that embeds the FULL checkpoint (conditioner + VAE
+        // tensors in-file — e.g. a whole safetensors quantized to Q8_0)
+        // deliberately does NOT take this path: the `diffusion_model` prefix
+        // pass would bury its embedded encoder/VAE names, and the single-file
+        // `model` path needs no siblings at all. Only a bare UNet GGUF goes
+        // multi-file.
+        let layout = if is_gguf_unet(model_path) && !gguf_embeds_full_checkpoint(model_path) {
             let dir = model_path.parent().unwrap_or_else(|| std::path::Path::new("."));
             match resolve_multi_file_layout(dir) {
                 Ok(mut l) => {
@@ -806,10 +913,22 @@ impl SceneImageGenerator for DiffusionRsGenerator {
                 // NO weight_type — GGUF carries its own quantization.
             }
             None => {
-                // Single-file checkpoint (legacy).
-                mb.model(model_path.as_path())
-                    .weight_type(WeightType::SD_TYPE_Q8_0)
-                    .vae_tiling(true);
+                // Single-file checkpoint: a legacy fp16 safetensors OR a
+                // full-checkpoint GGUF (§11.61 — embedded conditioner + VAE,
+                // no siblings needed). Runtime Q8_0 re-quantization applies
+                // ONLY to the safetensors form (the §11.58 OOM fix #3); a
+                // GGUF carries its own quantization, and re-quantizing an
+                // already-Q8 file is both lossy (Q8→F32→Q8 round trip) and
+                // a multi-GB pointless conversion pass at load.
+                mb.model(model_path.as_path()).vae_tiling(true);
+                let is_gguf = model_path
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .map(|e| e.eq_ignore_ascii_case("gguf"))
+                    .unwrap_or(false);
+                if !is_gguf {
+                    mb.weight_type(WeightType::SD_TYPE_Q8_0);
+                }
             }
         }
         let mut model_config = mb.build().map_err(|e| SceneImageError {

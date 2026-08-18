@@ -62,14 +62,49 @@ See `src-tauri/vendor-patches/README.md` for what each patch does.
   them from symbol-deduping into each other. Never build the SD stack
   static on MSVC.
 
-## Status (2026-08-16)
+## Status (2026-08-17, evening)
 
-- First render achieved 2026-08-15 end-to-end to the PNG (multi-file GGUF
-  layout, defaults) — then the dual-CRT UCRT assert killed the process
-  post-PNG (gallery row/event/LLM reload never ran).
-- Dual-CRT fix landed 2026-08-16 via the vendored llama-cpp-sys-2 patch
-  (`build.rs-no-msvcrtd.patch`). **Pending re-verification on the next
-  `sd:dev` run**: PNG lands, gallery row commits, `prism-gen-done` fires,
-  chat still answers after (LLM reload), one-strike latch stays clear.
-- Next fix target after that: the single-file `image.safetensors` sd.cpp
-  load (use `sd_repro` to capture the real error first).
+- 2026-08-15: first render end-to-end to the PNG (multi-file GGUF layout,
+  defaults) — then the dual-CRT UCRT assert killed the process post-PNG.
+  Dual-CRT fix landed 2026-08-16 (vendored llama-cpp-sys-2
+  `build.rs-no-msvcrtd.patch`); verified 2026-08-17: PNG lands, gallery row
+  commits, `prism-gen-done` fires, LLM reloads, one-strike latch stays clear.
+- Both 08-15 + 08-17 app renders were NOISE (saturated mush, mean RGB
+  ~[190,235,231] / [250,238,188] vs a healthy ~[96,68,51]). Root cause
+  eliminated 2026-08-17: that layout used the placeholder UNet-only GGUF +
+  an external "valid" fp16-fix VAE, and sd.cpp applies its SDXL Conv2D 1/32
+  overflow guard ONLY when no valid external VAE is present (see the
+  `stable-diffusion.cpp:886` "No valid VAE specified ... using Conv2D scale
+  0.031" warning — it never fired on the old path, fires now).
+- **2026-08-17: FIRST CLEAN RENDER** — `sd_repro` on the new
+  `models/sd/image.gguf` (the FULL NoobAI-XL-v1.1-merge checkpoint quantized
+  to Q8_0, ~4.18 GB, embedded CLIP-L/G + VAE, no GGUF metadata): coherent
+  apple-on-table image, `Version: SDXL`, eps-prediction, 28 steps DPM++ 2M
+  (discrete schedule), seed 42, ~40 s in the debug build (~1.1 s/it).
+- New machinery this cycle (§11.61, all in `scene_art.rs`):
+  - `install_sd_log_bridge` — registers `sd_set_log_callback`; without it
+    sd.cpp DROPS every LOG_* line (no stderr default). Engine logs now flow
+    to stderr (`[sd]`-prefixed → `sd-out.log` via `sd:dev`'s 2>&1) +
+    `wupi.log`. Wired in `lib.rs` boot + `sd_repro`.
+  - `gguf_embeds_full_checkpoint` — a GGUF carrying embedded VAE/conditioner
+    tensors routes to the SINGLE-FILE `model` path (the `diffusion_model`
+    prefix pass would bury its embedded names; the model path needs no
+    sibling files). UNet-only GGUFs still go multi-file.
+  - Single-file path no longer applies runtime `weight_type(Q8_0)` to GGUFs
+    (already quantized; re-quantizing is lossy + a multi-GB pointless pass).
+  - `sd_repro` seed LOCKED at 42 — A/B determinism (one lever per run).
+- Model inventory: `models/sd/` = `image.gguf` ONLY (the safetensors
+  checkpoint + external clip_l/clip_g/vae were removed 2026-08-17; the full
+  GGUF embeds all of them). If a slim UNet-only GGUF returns later, the
+  sibling CLIP/VAE files must return with it — and re-test the external-VAE
+  conv-scale interaction before trusting it.
+- Pending: ~~verify through the FULL app~~ **VERIFIED 2026-08-17 23:47** —
+  PRISM generate through `sd:dev` with the single-file routing: 41.99 s,
+  clean swap + gallery row + LLM reload. Backend + app integration DONE.
+  Remaining work is quality tuning, not correctness: the 23:47 render
+  ("1girl, classroom, sunset, masterpiece" @ CFG 5, 1024×576) produced the
+  classroom but dropped the girl — prompt-recipe/CFG/aspect-ratio territory
+  (NoobAI wants its quality-tag prefix, CFG 5-7, portrait buckets like
+  832×1216; clip_skip is already correct — sd.cpp auto-resolves 2 for SDXL,
+  conditioner.hpp:377). Scheduler still DISCRETE for DPM++ 2M; karras is the
+  usual companion.

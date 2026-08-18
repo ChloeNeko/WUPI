@@ -576,6 +576,14 @@ pub fn run() {
     #[cfg(feature = "diffusion-rs")]
     scene_art::install_sd_abort_callback();
 
+    // §11.61 SD engine log bridge — sd.cpp drops every LOG_* line when no
+    // callback is registered (no stderr default), so without this the SD
+    // engine runs mute: version detection, VAE conv-scale path, per-step
+    // sampling are all invisible. Installed beside the abort capture; see
+    // scene_art::install_sd_log_bridge.
+    #[cfg(feature = "diffusion-rs")]
+    scene_art::install_sd_log_bridge();
+
     let log_dir = std::env::temp_dir();
     let file_appender = tracing_appender::rolling::never(&log_dir, "wupi.log");
     let (non_blocking, _guard) = tracing_appender::non_blocking(file_appender);

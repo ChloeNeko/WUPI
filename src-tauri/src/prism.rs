@@ -454,20 +454,26 @@ pub fn build_request(
 mod tests {
     use super::*;
 
+    /// Unique-per-process temp-name suffix. pid + a monotonic counter — NOT
+    /// `SystemTime` nanos: the Windows clock tick (~0.5-15.6 ms) is coarser
+    /// than parallel test scheduling, so two nanos-named temps created within
+    /// one tick collide on the SAME file (observed 2026-08-17:
+    /// `favorites_only_filter` listed a third row a sibling test had inserted
+    /// into its DB). The counter makes uniqueness by construction.
+    fn unique_suffix() -> String {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        format!(
+            "{}-{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        )
+    }
+
     /// A fresh temp gallery DB. Each test gets its own file.
     fn temp_db() -> GalleryDb {
         let dir = std::env::temp_dir();
-        let path = dir.join(format!("wupi_prism_test_{}.sqlite", std::process::id()));
-        let _ = std::fs::remove_file(&path);
-        // try a unique name per test invocation to avoid parallel-test collisions
-        let path = dir.join(format!(
-            "wupi_prism_test_{}-{}.sqlite",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let path = dir.join(format!("wupi_prism_test_{}.sqlite", unique_suffix()));
         GalleryDb::open(&path).expect("open temp gallery db")
     }
 
@@ -493,13 +499,7 @@ mod tests {
     fn open_is_idempotent() {
         // Opening twice (re-open existing) must succeed + not duplicate schema.
         let dir = std::env::temp_dir();
-        let path = dir.join(format!(
-            "wupi_prism_idem_{}.sqlite",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let path = dir.join(format!("wupi_prism_idem_{}.sqlite", unique_suffix()));
         let _ = std::fs::remove_file(&path);
         {
             let db = GalleryDb::open(&path).expect("first open");
@@ -725,13 +725,7 @@ mod tests {
     /// get a suffixed path instead of overwriting the first PNG.
     #[test]
     fn dest_path_bumps_suffix_on_collision() {
-        let dir = std::env::temp_dir().join(format!(
-            "wupi_prism_dest_{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let dir = std::env::temp_dir().join(format!("wupi_prism_dest_{}", unique_suffix()));
         std::fs::create_dir_all(&dir).unwrap();
         let first = dest_path(&dir, 42, 1000);
         std::fs::write(&first, b"png").unwrap();
@@ -759,13 +753,7 @@ mod tests {
         // the request-building → backend → dest-exists path is wired.
         use crate::scene_art::SceneImageGenerator; // trait methods (load/generate/unload)
         let gen = scene_art::NoopImageGenerator;
-        let dest = std::env::temp_dir().join(format!(
-            "wupi_prism_noop_{}.png",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let dest = std::env::temp_dir().join(format!("wupi_prism_noop_{}.png", unique_suffix()));
         let _ = std::fs::remove_file(&dest);
         let req = build_request(
             &GenerateParams { prompt: "test".into(), ..Default::default() },

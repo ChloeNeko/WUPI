@@ -27,7 +27,7 @@
 //! Read it BEFORE pulling any lever (Q8_0 / VAE / v-pred probe) — §9.
 
 use wupi_lib::scene_art::{
-    default_sd_backend, install_sd_abort_callback, SceneImageGenerator, SceneImageRequest,
+    default_sd_backend, install_sd_abort_callback, install_sd_log_bridge, SceneImageRequest,
 };
 
 fn main() {
@@ -62,12 +62,20 @@ fn main() {
     // Capture ggml aborts BEFORE any backend call so even a load-time
     // GGML_ASSERT lands in logs/sd-abort.txt.
     install_sd_abort_callback();
+    // §11.61: bridge sd.cpp's engine logs (version detection, VAE path,
+    // per-step) to stderr — without a registered callback they are dropped.
+    install_sd_log_bridge();
 
     let prompt = "a red apple on a wooden table, studio lighting, photograph".to_string();
     let request = SceneImageRequest {
         prompt,
         dest: dest.clone(),
         model_path: checkpoint.clone(),
+        // LOCKED seed: the harness is an A/B isolation tool — identical
+        // params must produce identical pixels so a changed lever (VAE,
+        // layout, backend) is the only variable between runs. (-1 would
+        // randomize every render + make comparisons meaningless.)
+        seed: 42,
         ..SceneImageRequest::default()
     };
 
