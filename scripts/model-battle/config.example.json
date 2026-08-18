@@ -1,0 +1,10 @@
+{
+  "endpoint": "https://api.z.ai/api/paas/v4",
+  "apiKey": "PASTE-YOUR-KEY-HERE",
+  "models": [
+    { "id": "glm-4.7", "label": "GLM 4.7" },
+    { "id": "glm-5.2", "label": "GLM 5.2" },
+    { "id": "glm-5.3", "label": "GLM 5.3" }
+  ],
+  "wupiRoot": "C:/WUPI"
+}

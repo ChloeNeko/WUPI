@@ -29,3 +29,8 @@ __pycache__/
 
 # Runtime playtest / debug captures (CUDA logs, etc.) — not source.
 logs/
+
+# GLM prose-battle harness (scripts/model-battle) — local config holds the API
+# key; results are run transcripts. The harness + scenario ARE source.
+scripts/model-battle/config.json
+scripts/model-battle/results/
