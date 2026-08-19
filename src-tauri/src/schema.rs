@@ -1568,6 +1568,19 @@ impl WorldSchema {
     /// - `entities`: for each (key, value) in the delta: `Some(v)` → upsert,
     ///   `None` → remove the key (no-op if it didn't exist).
     pub fn apply_delta(&mut self, delta: SchemaDelta) {
+        crate::logs::log(
+            "SCHEMA",
+            &format!(
+                "apply_delta summary={} events={} entities={}",
+                delta.summary.is_some(),
+                delta
+                    .recent_events
+                    .as_ref()
+                    .map(|v| v.len())
+                    .unwrap_or(0),
+                delta.entities.as_ref().map(|v| v.len()).unwrap_or(0)
+            ),
+        );
         if let Some(summary) = delta.summary {
             self.summary = summary;
         }
@@ -1880,6 +1893,10 @@ impl WorldSchema {
         if !merged.is_empty() {
             self.enforce_typed_caps();
         }
+        crate::logs::log(
+            "SCHEMA",
+            &format!("merge_patch applied_fields={}", merged.join(",")),
+        );
         Ok(merged)
     }
 
@@ -2722,7 +2739,17 @@ impl SchemaDelta {
         // Keeps the locked §5 contract intact — this is syntactic only; semantic
         // repair (wrong keys/types) still goes through the 3-pass loop.
         let repaired = crate::json_repair::repair(cleaned);
-        serde_json::from_str(&repaired)
+        let result = serde_json::from_str(&repaired);
+        crate::logs::log(
+            "SCHEMA",
+            &format!(
+                "json_parse reply_chars={} repair_applied={} ok={}",
+                reply.chars().count(),
+                cleaned != repaired,
+                result.is_ok()
+            ),
+        );
+        result
     }
 
     /// True if the delta carries ANY actual change (summary, events, or entity

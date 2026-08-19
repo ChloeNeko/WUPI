@@ -923,6 +923,14 @@ impl SchemaRuntime {
             }
             last_raw = reply.clone();
             raw_outputs.push(reply.clone());
+            crate::logs::log(
+                "SCHEMA",
+                &format!(
+                    "{label} pass={pass} reply_chars={} reply={}",
+                    reply.chars().count(),
+                    crate::logs::brief_with(&reply, 60)
+                ),
+            );
 
             // Parse the JSON (channel-protocol + fence strip happens inside
             // from_model_output; on a reply already stripped this is a no-op).
@@ -938,6 +946,13 @@ impl SchemaRuntime {
                         raw_preview = %reply.chars().take(200).collect::<String>(),
                         "{label} parse failed"
                     );
+                    crate::logs::log(
+                        "SCHEMA",
+                        &format!(
+                            "{label} pass={pass} PARSE_FAIL err={}",
+                            crate::logs::brief_with(&e.to_string(), 120)
+                        ),
+                    );
                     errors.push(msg);
                     continue; // next pass
                 }
@@ -949,6 +964,13 @@ impl SchemaRuntime {
             if let Err(vfail) = schema_validator::validate(&delta, &validation_ctx) {
                 let msg = format!("pass {pass} validation: {vfail}");
                 tracing::warn!(label, pass, failure = %vfail, "{label} validation failed");
+                crate::logs::log(
+                    "SCHEMA",
+                    &format!(
+                        "{label} pass={pass} VALIDATION_FAIL {}",
+                        crate::logs::brief_with(&vfail.to_string(), 140)
+                    ),
+                );
                 errors.push(msg);
                 continue; // next pass — repair prompt will show the failure
             }
@@ -960,6 +982,19 @@ impl SchemaRuntime {
                 tokens = reply.len(),
                 deferred = prior_deferred.len(),
                 "{label} committed on pass {pass}"
+            );
+            crate::logs::log(
+                "SCHEMA",
+                &format!(
+                    "{label} COMMITTED pass={pass} summary={} events={} entities={}",
+                    delta.summary.is_some(),
+                    delta
+                        .recent_events
+                        .as_ref()
+                        .map(|v| v.len())
+                        .unwrap_or(0),
+                    delta.entities.as_ref().map(|v| v.len()).unwrap_or(0)
+                ),
             );
             return Ok(AttemptOutcome::Committed { raw_output: reply, delta });
         }
@@ -985,6 +1020,13 @@ impl SchemaRuntime {
             passes = MAX_DELTA_PASSES,
             errors = errors.join(" | "),
             "{label} failed all {MAX_DELTA_PASSES} passes; carrying for re-attempt"
+        );
+        crate::logs::log(
+            "SCHEMA",
+            &format!(
+                "{label} ALL_PASSES_FAILED errors={}",
+                crate::logs::brief_with(&errors.join(" | "), 200)
+            ),
         );
         Ok(AttemptOutcome::Failed {
             last_raw_output: last_raw,

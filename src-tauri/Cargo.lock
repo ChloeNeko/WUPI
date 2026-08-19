@@ -6620,6 +6620,7 @@ version = "0.23.5"
 dependencies = [
  "anyhow",
  "cc",
+ "chrono",
  "diffusion-rs",
  "diffusion-rs-sys",
  "encoding_rs",

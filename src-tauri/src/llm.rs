@@ -411,8 +411,13 @@ impl GenerationClient for HttpBackend {
             // turn kept the fable cancel slot occupied, so `fable_turn_in_
             // flight` stayed true and fable_end/load/start all refused; the
             // only recovery was killing the process.
+            let ttft_start = std::time::Instant::now();
             let ttft_deadline = tokio::time::Instant::now()
                 + std::time::Duration::from_millis(crate::settings::API_FIRST_TOKEN_TIMEOUT_MS);
+            crate::logs::log(
+                "API",
+                &format!("stream start host={}", endpoint_host_of(&url)),
+            );
             let response = {
                 let send_fut = client.post(&url).json(&body).send();
                 tokio::select! {
@@ -432,6 +437,13 @@ impl GenerationClient for HttpBackend {
                         });
                     }
                     _ = tokio::time::sleep_until(ttft_deadline) => {
+                        crate::logs::log(
+                            "API",
+                            &format!(
+                                "TIMEOUT: no response headers in {}ms — provider hung on request",
+                                crate::settings::API_FIRST_TOKEN_TIMEOUT_MS
+                            ),
+                        );
                         return Err(anyhow::anyhow!(
                             "API_TIMEOUT: no response headers within {}ms — provider hung on request",
                             crate::settings::API_FIRST_TOKEN_TIMEOUT_MS
@@ -537,6 +549,13 @@ impl GenerationClient for HttpBackend {
                                 Some(other) => other.to_string(),
                                 None => String::new(),
                             };
+                            crate::logs::log(
+                                "API",
+                                &format!(
+                                    "IN-BAND provider error: {}",
+                                    crate::logs::brief_with(&msg, 120)
+                                ),
+                            );
                             return LineOutcome::Fail(msg);
                         }
                     }
@@ -564,6 +583,13 @@ impl GenerationClient for HttpBackend {
                                     // TTFT deadline window for all subsequent
                                     // reads (don't kill a slow-but-working stream).
                                     *got_first_token = true;
+                                    crate::logs::log(
+                                        "API",
+                                        &format!(
+                                            "first token ttft={}ms",
+                                            ttft_start.elapsed().as_millis()
+                                        ),
+                                    );
                                     on_chunk(&piece);
                                     full_content.push_str(&piece);
                                     // §11.43 kill switch: scan the rolling
@@ -580,6 +606,13 @@ impl GenerationClient for HttpBackend {
                                     // of `stream`) at function return severs
                                     // the TCP connection.
                                     if rep_guard.push(&piece) {
+                                        crate::logs::log(
+                                            "API",
+                                            &format!(
+                                                "REPETITION kill-switch fired at chars={}",
+                                                full_content.chars().count()
+                                            ),
+                                        );
                                         // (2026-08-15 audit fix) Forensics
                                         // contract parity with the local
                                         // engines: raw_output carries the
@@ -628,6 +661,13 @@ impl GenerationClient for HttpBackend {
                             Err(_elapsed) => {
                                 buffer.clear();
                                 drop(stream);
+                                crate::logs::log(
+                                    "API",
+                                    &format!(
+                                        "TIMEOUT: stream stalled >{}ms after first token — connection dead",
+                                        crate::settings::API_CHUNK_IDLE_TIMEOUT_MS
+                                    ),
+                                );
                                 return Err(anyhow::anyhow!(
                                     "API_TIMEOUT: stream stalled for over {}ms after the first token — connection dead",
                                     crate::settings::API_CHUNK_IDLE_TIMEOUT_MS
@@ -657,6 +697,13 @@ impl GenerationClient for HttpBackend {
                                 // `API_TIMEOUT` prefix.
                                 buffer.clear();
                                 drop(stream);
+                                crate::logs::log(
+                                    "API",
+                                    &format!(
+                                        "TIMEOUT: no first token in {}ms — provider hung",
+                                        crate::settings::API_FIRST_TOKEN_TIMEOUT_MS
+                                    ),
+                                );
                                 return Err(anyhow::anyhow!(
                                     "API_TIMEOUT: no first token within {}ms — provider hung on request",
                                     crate::settings::API_FIRST_TOKEN_TIMEOUT_MS
@@ -727,6 +774,16 @@ impl GenerationClient for HttpBackend {
                 }
             }
 
+            crate::logs::log(
+                "API",
+                &format!(
+                    "stream complete {}ms chars={} clean_done={} cancelled={}",
+                    ttft_start.elapsed().as_millis(),
+                    full_content.chars().count(),
+                    stream_done,
+                    cancel.load(std::sync::atomic::Ordering::Relaxed)
+                ),
+            );
             Ok(ParsedOutput {
                 content: full_content,
                 reasoning: String::new(),
@@ -747,6 +804,16 @@ impl GenerationClient for HttpBackend {
 /// exists only between `load_blocking` and `into_static`, after which the model
 /// is leaked to `&'static` and handed to the engine. The backend is NOT owned
 /// here; it's the process-wide singleton from `shared_backend`.
+/// Host-only view of an API endpoint for the diagnostic log (never the key,
+/// never the path).
+fn endpoint_host_of(endpoint: &str) -> String {
+    let no_scheme = endpoint
+        .split_once("://")
+        .map(|(_, rest)| rest)
+        .unwrap_or(endpoint);
+    no_scheme.split('/').next().unwrap_or(no_scheme).to_string()
+}
+
 pub struct LlamaModelHandle {
     model: LlamaModel,
     family: ModelFamily,
@@ -952,6 +1019,17 @@ impl LlamaCppBackend {
         std::thread::spawn(move || match Self::load_blocking(&path, n_gpu_layers) {
             Ok(handle) => {
                 tracing::info!("model loaded from {}", path.display());
+                crate::logs::log(
+                    "SYS",
+                    &format!(
+                        "chat model loaded: {} gpu_layers={} ctx={}",
+                        path.file_name()
+                            .map(|f| f.to_string_lossy())
+                            .unwrap_or_default(),
+                        n_gpu_layers,
+                        context_size
+                    ),
+                );
                 let name = path
                     .file_stem()
                     .and_then(|s| s.to_str())

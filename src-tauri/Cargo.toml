@@ -111,6 +111,10 @@ regex = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tracing-appender = "0.2"
+# Local-time timestamps + crash-report-style rotation filenames for the
+# share-safe diagnostic log (diaglog.rs). Already transitive via tauri —
+# direct dep adds no new packages to the graph.
+chrono = "0.4"
 # GPU backends (local inference for the 12B chat model). Both are compiled
 # in: llama.cpp tries CUDA first (NVIDIA), falls through to Vulkan (AMD /
 # Intel) if CUDA init fails, then to CPU. This is ADDITIVE — `cuda` and

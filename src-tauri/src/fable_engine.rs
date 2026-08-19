@@ -1065,6 +1065,12 @@ impl FableRuntime {
                             out_len_chars = out.len(),
                             "🎯 SNIPER: tracker bracket→prose transition detected; early-stopping decode"
                         );
+                        crate::logs::log(
+                            "ENG",
+                            &format!(
+                                "tracker SNIPER early-stop at token {gen_count} (bracket→prose transition)"
+                            ),
+                        );
                         break;
                     }
                 }
@@ -1113,6 +1119,18 @@ impl FableRuntime {
                 head_200 = %head,
                 tail_200 = %tail,
                 "FABLE DECODE: complete"
+            );
+            crate::logs::log(
+                "ENG",
+                &format!(
+                    "fable decode: gen_tokens={} max={} elapsed_ms={} tok_s={} out_chars={} hit_max={}",
+                    gen_count,
+                    max_tokens,
+                    elapsed_ms,
+                    if elapsed_ms > 0 { (gen_count as u128 * 1000 / elapsed_ms) } else { 0 },
+                    out.len(),
+                    gen_count >= max_tokens
+                ),
             );
         }
 

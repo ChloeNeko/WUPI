@@ -142,6 +142,16 @@ pub fn parse_tool_calls(raw: &str) -> Vec<ToolCall> {
         calls.push(ToolCall { name, args });
         search_from = close_idx + close.len();
     }
+    if crate::logs::is_on() && !calls.is_empty() {
+        crate::logs::log(
+            "TOOL",
+            &format!(
+                "parse_tool_calls found {} call(s): {}",
+                calls.len(),
+                calls.iter().map(|c| c.name.as_str()).collect::<Vec<_>>().join(",")
+            ),
+        );
+    }
     calls
 }
 
@@ -175,11 +185,25 @@ fn parse_args_lenient(span: &str) -> serde_json::Value {
             let repaired = crate::json_repair::repair(trimmed);
             if repaired != trimmed {
                 if let Ok(v) = serde_json::from_str::<serde_json::Value>(&repaired) {
+                    crate::logs::log(
+                        "TOOL",
+                        &format!(
+                            "tool args STRICT_PARSE_FAILED — json_repair rescued span={}",
+                            crate::logs::brief_with(trimmed, 90)
+                        ),
+                    );
                     return v;
                 }
             }
             // Both stages failed: carry the raw text so the executor can
             // surface a helpful error to the repair loop.
+            crate::logs::log(
+                "TOOL",
+                &format!(
+                    "tool args UNREPAIRABLE JSON (carried raw) span={}",
+                    crate::logs::brief_with(trimmed, 90)
+                ),
+            );
             serde_json::json!({ "raw": trimmed })
         }
     }

@@ -14,6 +14,7 @@ pub mod hardware;
 pub mod json_repair;
 pub mod kv_buffer;
 pub mod llm;
+pub mod logs;
 pub mod memory;
 pub mod memory_embedder;
 pub mod memory_embedder_llama;
@@ -565,7 +566,22 @@ pub fn run() {
     std::panic::set_hook(Box::new(|info| {
         let msg = format!("{info}\nbacktrace: {}", std::backtrace::Backtrace::force_capture());
         let _ = std::fs::write(std::env::temp_dir().join("wupi_panic.txt"), &msg);
+        // Crash report: logs/crash-YYYYMMDD-HHMMSS.log = panic + the last
+        // 100 diagnostic lines from the RAM ring buffer (logs.rs) — an
+        // abnormal crash is readable without opening the full session log.
+        logs::dump_crash(&info.to_string());
     }));
+
+    // Share-safe rotating diagnostic log (logs/diagnostics.log) — the file
+    // users attach to bug reports. Arm it BEFORE anything else so boot-time
+    // events and the panic hook above land in it. Same install root as
+    // memory/ and apps/ (exe parent). See logs.rs for the privacy contract.
+    if let Some(root) = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(|p| p.to_path_buf()))
+    {
+        logs::init(&root);
+    }
 
     // §11.59 SD abort capture. Installed as early as possible (before any
     // gen_img call can fire) so a crash at any point in the SD pipeline lands
@@ -2822,6 +2838,10 @@ async fn route_to_fable_manager(
     };
 
     let delta_applied = delta.has_changes();
+    crate::logs::log(
+        "SCHEMA",
+        &format!("manager translation applied={}", delta_applied),
+    );
     if delta_applied {
         push_fable_history(&state).await;
         let mut s = state.fable_schema.lock().await;
@@ -3733,6 +3753,16 @@ async fn chat_send(
             // One turn id for BOTH rows (user + assistant, all their chunks):
             // the §4 retention key the prune evicts whole turns by.
             let turn_uuid = memory::new_turn_uuid();
+            crate::logs::log(
+                "MEM",
+                &format!(
+                    "chat archive armed turn={} user_chars={} asst_chars={} echo_skip={}",
+                    turn_uuid,
+                    user_text.as_ref().map(|t| t.chars().count()).unwrap_or(0),
+                    asst_text.chars().count(),
+                    codex_was_injected
+                ),
+            );
             tokio::spawn(async move {
                 if let Some(text) = user_text {
                     if let Err(e) = engine.add_memory(text, &card_id, memory::Role::User, 1.0, Some(&turn_uuid)).await {
@@ -3741,6 +3771,7 @@ async fn chat_send(
                 }
                 if codex_was_injected {
                     tracing::debug!("codex echo-skip: assistant reply not archived (codex reference was injected this turn)");
+                    crate::logs::log("MEM", "codex echo-skip — assistant reply NOT archived");
                 } else if let Err(e) = engine.add_memory(asst_text, &card_id, memory::Role::Assistant, 1.0, Some(&turn_uuid)).await {
                     tracing::warn!(error = %format!("{e:#}"), "archive assistant turn failed");
                 }
@@ -3800,7 +3831,16 @@ async fn chat_send(
             user_words = user_text_for_gate.split_whitespace().count(),
             "schema delta skipped by content gate (non-substantive turn)"
         );
+        crate::logs::log(
+            "SCHEMA",
+            &format!(
+                "delta gate SKIP user_words={} user_chars={}",
+                user_text_for_gate.split_whitespace().count(),
+                user_text_for_gate.chars().count()
+            ),
+        );
     } else {
+        crate::logs::log("SCHEMA", "delta gate FIRE");
         let current_schema = state.schema.lock().await.clone();
         // Drain the failed-delta queue (fail-proof contract §5 layer 3):
         // prior turns' attempts that exhausted all 3 passes WITHOUT
@@ -3816,6 +3856,10 @@ async fn chat_send(
             tracing::info!(
                 deferred = deferred.len(),
                 "delta attempt includes deferred re-attempts"
+            );
+            crate::logs::log(
+                "SCHEMA",
+                &format!("failed_delta_queue drained count={}", deferred.len()),
             );
         }
         let schema_slot = state.schema.clone();
@@ -3845,6 +3889,13 @@ async fn chat_send(
                 Ok(t) => t,
                 Err(e) => {
                     tracing::warn!(error = %e, "schema delta: could not acquire schema engine; schema unchanged");
+                    crate::logs::log(
+                        "SCHEMA",
+                        &format!(
+                            "delta infra fail: engine acquire err={}",
+                            crate::logs::brief_with(&e, 90)
+                        ),
+                    );
                     reenqueue_failed_attempts(&failed_queue_slot, deferred, "failed_delta_queue").await;
                     return;
                 }
@@ -4404,9 +4455,19 @@ async fn run_agent_loop(
                             }
                             Err(e) => (false, format!("invalid args: {e}")),
                         },
-                        None => (false, format!("unknown tool: {}", call.name)),
-                    },
-                };
+                    None => (false, format!("unknown tool: {}", call.name)),
+                },
+            };
+            crate::logs::log(
+                "TOOL",
+                &format!(
+                    "dispatch {} ok={} args={} result={}",
+                    call.name,
+                    outcome.0,
+                    crate::logs::brief_with(&call.args.to_string(), 60),
+                    crate::logs::brief_with(&outcome.1, 60)
+                ),
+            );
 
             // delete_sim_card removed the card FOLDER; its memory partition
             // lives in memory.sqlite outside that tree. Same contract as
@@ -4548,6 +4609,7 @@ fn push_failed_attempt_capped(
             queue_len = q.len(),
             "failed_delta_queue overflow; evicted oldest entry"
         );
+        crate::logs::log("SCHEMA", "failed queue OVERFLOW — evicted oldest entry");
     }
     q.push(attempt);
 }
@@ -4571,6 +4633,13 @@ fn bump_retry_budget(
         tracing::warn!(
             passes = attempt.passes_used,
             "failed schema attempt exhausted its retry budget; dropping (systematic failure — see the errors above)"
+        );
+        crate::logs::log(
+            "SCHEMA",
+            &format!(
+                "circuit breaker DROPPED a failed attempt (budget spent) errors={}",
+                crate::logs::brief_with(&attempt.errors, 140)
+            ),
         );
         return None;
     }
@@ -4603,6 +4672,10 @@ async fn reenqueue_failed_attempts(    queue: &Arc<tokio::sync::Mutex<Vec<schema
         queue = label,
         count,
         "infra failure before the deferred re-attempts ran — restored to the queue"
+    );
+    crate::logs::log(
+        "SCHEMA",
+        &format!("infra fail — restored {count} deferred attempt(s) to {label}"),
     );
 }
 
@@ -6099,6 +6172,10 @@ async fn apply_time_command_and_maybe_tick(
                 prev_minutes = prev,
                 "ignoring [TIME] regression: clock only moves forward"
             );
+            crate::logs::log(
+                "BRK",
+                &format!("[TIME] REGRESSION rejected new={new_minutes} prev={prev}"),
+            );
             return false;
         }
         // (P1d) Pacing-aware clamp + directive derivation (pure core in
@@ -6121,6 +6198,13 @@ async fn apply_time_command_and_maybe_tick(
         };
         if !dirs.is_empty() {
             tracing::info!(count = dirs.len(), "[TIME] pacing clamp/day-crossing directives queued");
+            crate::logs::log(
+                "BRK",
+                &format!(
+                    "[TIME] clamped prev={} asked={} effective={} dirs={}",
+                    prev, new_minutes, effective_minutes, dirs.len()
+                ),
+            );
         }
         time_directives.extend(dirs);
         // (P1d) Bootstrap the sync stamp on the first observation of a
@@ -6157,6 +6241,15 @@ async fn apply_time_command_and_maybe_tick(
         prev_minutes,
         first_set = was_first_set,
         "clock advanced via [TIME] bracket"
+    );
+    crate::logs::log(
+        "BRK",
+        &format!(
+            "[TIME] advanced prev={} -> applied={} (first_set={})",
+            prev_minutes,
+            schema_snapshot.world_clock.current_minutes,
+            was_first_set
+        ),
     );
 
     // 3. First-call baseline: stamp `last_tick_minutes` and bail (no fire).
@@ -6436,6 +6529,10 @@ async fn fire_world_progression_tick(
     };
     if !deferred.is_empty() {
         tracing::info!(deferred = deferred.len(), "progression tick includes deferred re-attempts");
+        crate::logs::log(
+            "SCHEMA",
+            &format!("world tick FIRED (deferred re-attempts: {})", deferred.len()),
+        );
     }
 
     let context_swap = state.context_swap.clone();
@@ -6501,6 +6598,10 @@ async fn fire_world_progression_tick(
     // queues at its boundary for exactly this reason).
     if !tick_session_live(state, turn_card_id, turn_generation).await {
         drop(deferred);
+        crate::logs::log(
+            "SCHEMA",
+            "world tick DROPPED — session identity changed during the LLM wait",
+        );
         return;
     }
 
@@ -6561,8 +6662,16 @@ async fn fire_world_progression_tick(
                     .unwrap_or(0),
                 "world progression delta applied to game_schema"
             );
+            crate::logs::log(
+                "SCHEMA",
+                &format!(
+                    "world tick delta applied entities={}",
+                    delta.entities.as_ref().map(|m| m.len()).unwrap_or(0)
+                ),
+            );
         } else {
             tracing::debug!("world progression pass emitted empty delta (nothing moved)");
+            crate::logs::log("SCHEMA", "world tick emitted EMPTY delta");
         }
     }
 
@@ -9571,6 +9680,10 @@ async fn emit_fable_api_lost(
     // api_lost reverts just completed above, so the captured pairing is the
     // reverted state, not a later racing snapshot.
     spawn_reserved_autosave(app, state).await;
+    crate::logs::log(
+        "FABLE",
+        &format!("api_lost msg={}", crate::logs::brief_with(message, 90)),
+    );
     on_event
         .send(serde_json::json!({
             "type": "api_lost",
@@ -9713,6 +9826,16 @@ async fn fable_send(
     reroll: Option<bool>,
 ) -> Result<(), String> {
     tracing::info!(?text, regenerate, reroll, "fable_send");
+    crate::logs::log(
+        "FABLE",
+        &format!(
+            "turn start action={} chars={} regenerate={} reroll={}",
+            crate::logs::brief(&text),
+            text.chars().count(),
+            regenerate.unwrap_or(false),
+            reroll.unwrap_or(false)
+        ),
+    );
     // `regenerate: Some(true)` is set by the frontend after a rewind-and-edit
     // mutation: the user turn to reply to is already the last message in
     // `fable_session` (the mutation command left it there), so we SKIP pushing
@@ -9936,6 +10059,13 @@ async fn fable_send(
         } else {
             scene_pacing::evaluate(&text)
         };
+        crate::logs::log(
+            "REF",
+            &format!(
+                "pacing mode={:?} spatial={} emotional={} kinetic={} redo={}",
+                pacing.mode, pacing.spatial, pacing.emotional, pacing.kinetic, is_redo_turn
+            ),
+        );
 
         // Track whether anything mutated so we snapshot once for undo. All
         // three engines share a single history push (the snapshot captures
@@ -10077,6 +10207,17 @@ async fn fable_send(
                 attacker_tier = ?attacker_tier,
                 "referee fired on combat/exertion keyword"
             );
+            crate::logs::log(
+                "REF",
+                &format!(
+                    "combat tier={:?} part={} state={:?} stamina={:?} lethal={}",
+                    attacker_tier,
+                    outcome.part.id(),
+                    outcome.new_state,
+                    outcome.stamina_after,
+                    outcome.lethal
+                ),
+            );
             if undo_snapshot.is_none() {
                 undo_snapshot = Some(s.clone());
             }
@@ -10096,6 +10237,15 @@ async fn fable_send(
         // world_state so they ride inside the existing `<world_state>` tag
         // the narrator already treats as hard fact.
         let skills = player_state::referee_evaluate_skill_checks(&text, pacing.mode.dc_modifier());
+        for sc in &skills {
+            crate::logs::log(
+                "REF",
+                &format!(
+                    "skill_check {} roll={} dc={} success={}",
+                    sc.skill, sc.roll, sc.dc, sc.success
+                ),
+            );
+        }
 
         // (3a) Phase 4 §11.44 (Component 1): Disguise Referee — the Rust-side
         // gate. Pure fn, no mutation (mirrors the skill-check Referee's
@@ -10138,6 +10288,7 @@ async fn fable_send(
                     tracing::info!(
                         "[disguise] scrutiny FAILED — disguise tag revoked mechanically"
                     );
+                    crate::logs::log("REF", "disguise scrutiny FAILED — tag revoked");
                 }
             }
         }
@@ -10182,6 +10333,17 @@ async fn fable_send(
             }
             line.push('.');
             tracing::info!("recovery referee fired (stamina={}, healed={:?})", r.stamina_recovered, r.healed.is_some());
+            crate::logs::log(
+                "REF",
+                &format!(
+                    "recovery stamina={} healed={}",
+                    r.stamina_recovered,
+                    r.healed
+                        .as_ref()
+                        .map(|(p, st)| format!("{}->{:?}", p.id(), st))
+                        .unwrap_or_else(|| "-".into())
+                ),
+            );
             line
         });
 
@@ -10220,11 +10382,22 @@ async fn fable_send(
         }
         if disguise_directive.is_some() {
             tracing::info!("disguise gate directive injected");
+            crate::logs::log(
+                "REF",
+                &format!(
+                    "disguise directive={}",
+                    crate::logs::brief_with(&disguise_directive.as_ref().map(|d| d.render()).unwrap_or_default(), 80)
+                ),
+            );
         }
         if !tick_directives.is_empty() {
             tracing::info!(
                 count = tick_directives.len(),
                 "off-screen task directives injected (from world progression tick)"
+            );
+            crate::logs::log(
+                "REF",
+                &format!("tick_directives_injected count={}", tick_directives.len()),
             );
         }
         if let Some(cd) = &combat_directive {
@@ -10560,6 +10733,7 @@ async fn fable_send(
                 }
             };
         tracing::info!("fable_send: API mode — tracker stage (local) starting");
+        let tracker_t0 = std::time::Instant::now();
         let engine = engine_opt
             .as_ref()
             .expect("tracker engine alive (dropped only in the API arm, post-tracker)");
@@ -10591,6 +10765,22 @@ async fn fable_send(
             // above — proceed to the API narrator with pre-tracker state.
             None => None,
         };
+        crate::logs::log(
+            "FABLE",
+            &format!(
+                "tracker done {}ms ok={} cancelled={} raw_chars={}",
+                tracker_t0.elapsed().as_millis(),
+                tracker_reply_opt
+                    .as_ref()
+                    .map(|r| r.error.is_empty())
+                    .unwrap_or(false),
+                tracker_reply_opt.as_ref().map(|r| r.cancelled).unwrap_or(false),
+                tracker_reply_opt
+                    .as_ref()
+                    .map(|r| r.raw_output.chars().count())
+                    .unwrap_or(0)
+            ),
+        );
 
         // Apply the tracker's brackets to fable_schema (if it produced any).
         // Reuses the existing apply pipeline verbatim — zero new apply code.
@@ -10599,6 +10789,19 @@ async fn fable_send(
             if tracker_reply.error.is_empty() {
                 let cleaned_tracker = schema::extract_reply_channel(&tracker_reply.raw_output);
                 let tracker_parsed = bracket_parser::parse(&cleaned_tracker);
+                for cmd in &tracker_parsed.commands {
+                    crate::logs::log(
+                        "BRK",
+                        &format!(
+                            "cmd {}",
+                            crate::logs::brief_with(
+                                &serde_json::to_string(cmd)
+                                    .unwrap_or_else(|_| "<unserializable>".into()),
+                                110
+                            )
+                        ),
+                    );
+                }
                 if !tracker_parsed.commands.is_empty() {
                     tracing::info!(
                         cmd_count = tracker_parsed.commands.len(),
@@ -10650,16 +10853,40 @@ async fn fable_send(
                     let (_, travel_rejects) =
                         apply_phase3_bracket_commands(&tracker_parsed, &state, true, &tracker_window)
                             .await;
+                    for rd in &travel_rejects {
+                        crate::logs::log(
+                            "BRK",
+                            &format!("reject {}", crate::logs::brief_with(rd, 110)),
+                        );
+                    }
+                    let reject_count = travel_rejects.len();
                     turn_directives.extend(travel_rejects);
                     tick_armed =
                         apply_time_command_and_maybe_tick(&tracker_parsed, &state).await;
+                    crate::logs::log(
+                        "BRK",
+                        &format!(
+                            "applied {} cmd(s), {} reject directive(s), tick_armed={}",
+                            tracker_parsed.commands.len(),
+                            reject_count,
+                            tick_armed
+                        ),
+                    );
                 } else {
                     tracing::info!("fable_send: tracker produced no bracket commands");
+                    crate::logs::log("BRK", "tracker produced no bracket commands");
                 }
             } else {
                 tracing::warn!(
                     error = %tracker_reply.error,
                     "fable_send: tracker stage errored; proceeding to API narrator with pre-tracker state"
+                );
+                crate::logs::log(
+                    "FABLE",
+                    &format!(
+                        "tracker ERRORED err={}",
+                        crate::logs::brief_with(&tracker_reply.error, 120)
+                    ),
                 );
             }
         }
@@ -10859,12 +11086,30 @@ async fn fable_send(
                 raw_output: String::new(),
             });
         }
+        crate::logs::log(
+            "API",
+            &format!(
+                "narrator stream start msgs={} ctx={}",
+                api_msgs.len(),
+                context_size
+            ),
+        );
+        let narrator_t0 = std::time::Instant::now();
         let http = http_backend_cached(&state, &profile);
         match http
             .stream(api_msgs, None, None, Vec::new(), context_size, on_chunk.clone(), cancel.clone())
             .await
         {
-            Ok(out) => fable_engine::FableReply {
+            Ok(out) => {
+                crate::logs::log(
+                    "API",
+                    &format!(
+                        "narrator stream done {}ms cancelled={}",
+                        narrator_t0.elapsed().as_millis(),
+                        cancel.load(std::sync::atomic::Ordering::Relaxed)
+                    ),
+                );
+                fable_engine::FableReply {
                 // The API has no Gemma4 protocol markers, so raw_output is
                 // just the content. extract_reply_channel downstream is a
                 // no-op on marker-free text (rsplit_once finds no
@@ -10876,7 +11121,8 @@ async fn fable_send(
                 // cancelled (the same contract as the local engine) instead
                 // of being saved as a normal turn.
                 cancelled: cancel.load(std::sync::atomic::Ordering::Relaxed),
-            },
+                }
+            }
             Err(e) => {
                 // Architectural override (2026-08-07): NO local narration
                 // fallback. The API is the sole narrator. On failure we save
@@ -10915,6 +11161,13 @@ async fn fable_send(
             turn_card = %card.id,
             "fable_send: session ended mid-turn; dropping the turn (no ghost archival)"
         );
+        crate::logs::log(
+            "FABLE",
+            &format!(
+                "session changed mid-turn (card={}) — turn DROPPED, no ghost archival",
+                card.id
+            ),
+        );
         let _ = on_event.send(serde_json::json!({
             "type": "done",
             "final_text": "",
@@ -10934,6 +11187,7 @@ async fn fable_send(
     // consumed once. This is distinct from a soft `fable_stop` cancel
     // (reply.cancelled without the abort flag), which keeps its partial prose.
     if state.fable_abort_requested.swap(false, std::sync::atomic::Ordering::Relaxed) {
+        crate::logs::log("FABLE", "turn ABORTED (interrupt-reroll) — reverting schema + tick directives");
         // The drained tick directives never reached a delivered beat —
         // restore them for the next turn (2026-08-15 audit fix: a reroll
         // abort used to permanently drop one-shot world events).
@@ -11130,6 +11384,7 @@ async fn fable_send(
     // pop (same flags as the HTTP-Err path above).
     if parsed.prose.trim().is_empty() {
         tracing::warn!("fable_send: narrator returned empty prose; emitting api_lost (no phantom turn)");
+        crate::logs::log("API", "narrator returned EMPTY prose — api_lost path");
         restore_tick_directives(&state, &directives_at_turn_start).await;
         return emit_fable_api_lost(
             &on_event,
@@ -11179,6 +11434,19 @@ async fn fable_send(
         // One turn id for BOTH rows: the §4 retention key (same as the chat
         // archive spawn — the prune is partition-scoped, not path-scoped).
         let turn_uuid = memory::new_turn_uuid();
+        crate::logs::log(
+            "MEM",
+            &format!(
+                "fable archive armed turn={} user_chars={} asst_chars={} skip_asst={} (codex={} reroll={} regen={})",
+                turn_uuid,
+                user_text.chars().count(),
+                asst_text.chars().count(),
+                skip_asst_archive,
+                codex_was_injected,
+                reroll,
+                regenerate
+            ),
+        );
         tokio::spawn(async move {
             // (P3) A reroll/regenerate turn carries an EMPTY user text —
             // don't archive it (add_memory would warn "chunked to nothing"
@@ -11273,6 +11541,14 @@ async fn fable_send(
     // [TIME] gate already stamped the tick baseline — skipping the off-screen
     // pass made the clock advance with no world progression, permanently.
     // Log + fire the tick anyway.
+    crate::logs::log(
+        "FABLE",
+        &format!(
+            "turn done prose_chars={} cancelled={}",
+            parsed.prose.chars().count(),
+            reply.cancelled
+        ),
+    );
     if let Err(e) = on_event.send(serde_json::json!({
         "type": "done",
         "final_text": parsed.prose,
@@ -11310,6 +11586,7 @@ async fn fable_send(
 #[tauri::command]
 async fn fable_stop(state: tauri::State<'_, AppState>) -> Result<(), String> {
     tracing::info!("fable_stop requested");
+    crate::logs::log("FABLE", "fable_stop — soft cancel signaled (full revert on next check)");
     for slot in [&state.active_fable_cancel, &state.active_retrack_cancel] {
         let slot = slot.lock().expect("cancel slot mutex");
         if let Some(cancel) = slot.as_ref() {
@@ -11330,6 +11607,7 @@ async fn fable_stop(state: tauri::State<'_, AppState>) -> Result<(), String> {
 #[tauri::command]
 async fn fable_interrupt_reroll(state: tauri::State<'_, AppState>) -> Result<(), String> {
     tracing::info!("fable_interrupt_reroll requested");
+    crate::logs::log("FABLE", "interrupt_reroll — abort flag set (discard + revert + fresh roll)");
     state
         .fable_abort_requested
         .store(true, std::sync::atomic::Ordering::Relaxed);
@@ -13913,6 +14191,7 @@ async fn fable_rollback(
         hist.pop_back().map(|(_tag, snap)| snap)
     };
     let prior = prior.ok_or_else(|| "nothing to roll back: history is empty".to_string())?;
+    crate::logs::log("FABLE", "rollback — restoring prior schema snapshot from the ring");
     let diff = {
         let live = state.fable_schema.lock().await;
         // diff_schemas(prior=before-rollback-state, live=after-rollback-state):
@@ -14465,6 +14744,14 @@ async fn edit_message(
     app: tauri::AppHandle,
 ) -> Result<EditResponse, String> {
     let card_id = active_fable_card_id(&state)?;
+    crate::logs::log(
+        "FABLE",
+        &format!(
+            "edit_message index={} new_text={}",
+            index,
+            crate::logs::brief(&new_text)
+        ),
+    );
     let is_assistant = {
         let mut gs = state.fable_session.lock().await;
         // (2026-08-16 bug 14) Refuse a non-trailing ASSISTANT edit UP FRONT.
@@ -14528,6 +14815,7 @@ async fn retrack_edited_assistant_message(
     state: &tauri::State<'_, AppState>,
     app: &tauri::AppHandle,
 ) {
+    crate::logs::log("FABLE", &format!("edit re-track START index={index}"));
     // (2026-08-16 bug 8) Session identity captured at ENTRY for the deferred
     // tick. The old fire-site read pulled `active_card_id` FRESH and passed
     // it to the guard — comparing the live slot against itself, a no-op that
@@ -14562,6 +14850,14 @@ async fn retrack_edited_assistant_message(
                 index,
                 total = gs.messages.len(),
                 "edit re-track refused: message is not the trailing assistant beat (later turns' world state would be discarded)"
+            );
+            crate::logs::log(
+                "FABLE",
+                &format!(
+                    "edit re-track REFUSED index={} (not trailing; len={})",
+                    index,
+                    gs.messages.len()
+                ),
             );
             return;
         }
@@ -14800,6 +15096,7 @@ async fn delete_message(
     let card_id = active_fable_card_id(&state)?;
     let messages = {
         let mut gs = state.fable_session.lock().await;
+        crate::logs::log("FABLE", &format!("delete_message index={}", index));
         gs.remove_at(index)?;
         project_messages(&gs)
     };
@@ -14886,6 +15183,13 @@ async fn swipe_variant(
     // work (no re-tracking, per the binding's design). Push the displaced live
     // schema to the ring buffer so manual fable_rollback can still return.
     let schema_installed = install_schema.is_some();
+    crate::logs::log(
+        "FABLE",
+        &format!(
+            "swipe_variant index={} variant_idx={} schema_installed={}",
+            index, variant_idx, schema_installed
+        ),
+    );
     if let Some(schema) = install_schema {
         let snap = state.fable_schema.lock().await.clone();
         push_fable_history_snapshot(&state, snap).await;
@@ -14915,6 +15219,7 @@ async fn rewind_and_edit_user(
     app: tauri::AppHandle,
 ) -> Result<EditResponse, String> {
     let card_id = active_fable_card_id(&state)?;
+    let new_text_brief = crate::logs::brief(&new_text);
     let (messages, surviving) = {
         let mut gs = state.fable_session.lock().await;
         apply_rewind_and_edit(&mut gs, index, new_text)?;
@@ -14924,6 +15229,13 @@ async fn rewind_and_edit_user(
         let surviving = gs.messages.len();
         (project_messages(&gs), surviving)
     };
+    crate::logs::log(
+        "FABLE",
+        &format!(
+            "rewind_and_edit_user index={} surviving={} new_text={}",
+            index, surviving, new_text_brief
+        ),
+    );
     // (#36) Pop the ring to the surviving length, SERVER-SIDE. The old
     // contract returned `deleted assistant turns` and let the frontend call
     // `fable_rollback` N times — but a turn pushes 0..3+ entries (referee /

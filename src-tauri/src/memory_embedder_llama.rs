@@ -343,6 +343,14 @@ fn run_self_test(runtime: &mut EmbedderRuntime) {
                     cosine = %format!("{cos:.4}"),
                     "embedder self-test pair"
                 );
+                crate::logs::log(
+                    "MEM",
+                    &format!(
+                        "self-test target={} expected={} cos={cos:.4}",
+                        crate::logs::brief_with(target, 40),
+                        label
+                    ),
+                );
             }
             Err(e) => {
                 tracing::warn!(error = %format!("{e:#}"), "self-test: failed to embed '{target}'");

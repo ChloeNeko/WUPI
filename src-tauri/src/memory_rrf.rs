@@ -198,26 +198,37 @@ pub fn fuse_scored_rrf(
     // `codex_floor`; everything else uses `dense_cosine_floor`. This is the
     // domain-asymmetry fix (§2P): declarative reference docs embed lower
     // than conversational turns at equal relevance, so they get a lower bar.
-    let dense_survivors: Vec<(MemoryId, f32)> = dense
-        .iter()
-        .filter(|(id, distance)| {
-            // vec0's DEFAULT metric is L2 (Euclidean), NOT cosine — the DDL
-            // does not declare distance_metric=cosine, and sqlite-vec 0.1.9
-            // defaults to L2. For the L2-normalized vectors the embedder
-            // emits, L2² = 2 − 2·cos, so cos = 1 − d²/2 is EXACT. The prior
-            // `1.0 - distance` sat on the wrong (1−L2) scale: monotone in
-            // cosine, so RANKING was always correct, but every floor and
-            // panel number was on an unlabeled axis (P1 scale fix).
-            let cosine = 1.0 - distance * distance / 2.0;
-            let floor = if codex_ids.contains(id) {
-                codex_floor
-            } else {
-                dense_cosine_floor
-            };
-            cosine >= floor
-        })
-        .cloned()
-        .collect();
+    // Loop form (was a .filter closure) so floor rejections are OBSERVABLE:
+    // the diag log's floor_rej lines are the calibration dataset for
+    // DENSE_COSINE_FLOOR / CODEX_DENSE_FLOOR — each rejected candidate's
+    // true cosine vs the floor that cut it (logs.rs, share-safe).
+    let mut dense_survivors: Vec<(MemoryId, f32)> = Vec::with_capacity(dense.len());
+    let mut floor_rejected: usize = 0;
+    for (id, distance) in dense.iter() {
+        // vec0's DEFAULT metric is L2 (Euclidean), NOT cosine — the DDL
+        // does not declare distance_metric=cosine, and sqlite-vec 0.1.9
+        // defaults to L2. For the L2-normalized vectors the embedder
+        // emits, L2² = 2 − 2·cos, so cos = 1 − d²/2 is EXACT. The prior
+        // `1.0 - distance` sat on the wrong (1−L2) scale: monotone in
+        // cosine, so RANKING was always correct, but every floor and
+        // panel number was on an unlabeled axis (P1 scale fix).
+        let cosine = 1.0 - distance * distance / 2.0;
+        let is_codex = codex_ids.contains(id);
+        let floor = if is_codex {
+            codex_floor
+        } else {
+            dense_cosine_floor
+        };
+        if cosine >= floor {
+            dense_survivors.push((*id, *distance));
+        } else {
+            floor_rejected += 1;
+            crate::logs::log(
+                "MEM",
+                &format!("floor_rej id={id} cos={cosine:.3} floor={floor:.3} codex={is_codex}"),
+            );
+        }
+    }
 
     // Each entry in the map carries: accumulated weighted score, dense rank
     // (if present), sparse rank (if present), and the raw dense cosine (for
@@ -266,6 +277,21 @@ pub fn fuse_scored_rrf(
             .unwrap_or(std::cmp::Ordering::Equal)
             .then_with(|| a.0.cmp(&b.0))
     });
+
+    if crate::logs::is_on() {
+        crate::logs::log(
+            "MEM",
+            &format!(
+                "fuse: sparse={} dense={} pass_floor={} floor_rej={} keep=min({},{})",
+                sparse.len(),
+                dense.len(),
+                ranked.len(),
+                floor_rejected,
+                ranked.len(),
+                limit
+            ),
+        );
+    }
 
     ranked
         .into_iter()

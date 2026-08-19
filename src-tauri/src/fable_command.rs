@@ -62,8 +62,16 @@ pub fn classify(text: &str) -> FableCommand {
         "list my ", "what do i have", "what am i carrying",
         "where am i", "who is here", "who's here",
     ];
-    if query_starters.iter().any(|s| trimmed.starts_with(s)) {
-        return FableCommand::QueryWorldState(extract_focus(trimmed));
+    if let Some(starter) = query_starters.iter().find(|s| trimmed.starts_with(*s)) {
+        let focus = extract_focus(trimmed);
+        crate::logs::log(
+            "TOOL",
+            &format!(
+                "classify QUERY starter={starter:?} focus={focus} text={}",
+                crate::logs::brief(text)
+            ),
+        );
+        return FableCommand::QueryWorldState(focus);
     }
 
     // "make it X", "set X to Y", "change X to Y", "give me X", "remove X",
@@ -76,7 +84,14 @@ pub fn classify(text: &str) -> FableCommand {
         "teleport ", "travel to ", "fast-travel to ", "fast travel to ",
         "spawn ",
     ];
-    if mutation_starters.iter().any(|s| trimmed.starts_with(s)) {
+    if let Some(starter) = mutation_starters.iter().find(|s| trimmed.starts_with(*s)) {
+        crate::logs::log(
+            "TOOL",
+            &format!(
+                "classify MUTATE starter={starter:?} text={}",
+                crate::logs::brief(text)
+            ),
+        );
         // For the MVP we return a PLACEHOLDER delta: the actual LLM
         // translation ("make it stormy" → {weather: stormy}) happens in
         // `fable_command::translate_to_delta`, called from `chat_send` after
@@ -88,9 +103,17 @@ pub fn classify(text: &str) -> FableCommand {
     // Some management intents don't start with a clear verb but contain
     // strong domain keywords. Match a few high-value ones.
     let keyword_signals = ["inventory", "weather", "time of day", "fast travel"];
-    if keyword_signals.iter().any(|kw| trimmed.contains(kw)) {
+    if let Some(kw) = keyword_signals.iter().find(|kw| trimmed.contains(*kw)) {
         // Distinguish query vs mutation by verb presence.
-        if contains_mutation_verb(trimmed) {
+        let is_mutation = contains_mutation_verb(trimmed);
+        crate::logs::log(
+            "TOOL",
+            &format!(
+                "classify KEYWORD kw={kw:?} mutation_verb={is_mutation} text={}",
+                crate::logs::brief(text)
+            ),
+        );
+        if is_mutation {
             return FableCommand::MutateWorldState(SchemaDelta::default());
         }
         return FableCommand::QueryWorldState(extract_focus(trimmed));

@@ -1410,6 +1410,18 @@ pub fn referee_evaluate_with_tier(
     // was lethal; Minions always lethal, Legendary 45%, a Downed player
     // unfinishable).
     let lethal = (lethality_roll as i32) >= lethality_dc;
+    crate::logs::log(
+        "REF",
+        &format!(
+            "combat dice: d20={} dc={} (tier_mod={} cond={} pacing={}) -> lethal={}",
+            lethality_roll,
+            lethality_dc,
+            attacker_tier.lethality_dc_mod(),
+            condition_penalty,
+            pacing_dc_mod,
+            lethal
+        ),
+    );
 
     // Narrative hint: a short second-person prose seed. The narrator reads the
     // canonical body-state change as hard fact; this hint just nudges prose.
@@ -1701,6 +1713,18 @@ pub fn referee_evaluate_skill_checks(text: &str, pacing_dc_mod: i32) -> Vec<Skil
         let dc = (spec.base_dc as i32 + pacing_dc_mod)
             .clamp(1, 30) as u32;
         let success = roll >= dc;
+        crate::logs::log(
+            "REF",
+            &format!(
+                "skill dice: {} d20={} dc={} (base={} pacing={}) -> {}",
+                spec.name,
+                roll,
+                dc,
+                spec.base_dc,
+                pacing_dc_mod,
+                if success { "SUCCESS" } else { "FAIL" }
+            ),
+        );
         let seed_text = if success { spec.success_seed } else { spec.fail_seed };
         let directive = format!(
             "{} (DC {}): {}. {}.",
@@ -1949,6 +1973,16 @@ pub fn evaluate_disguise_gate(
         let roll = roll_d20(&mut roller);
         let dc = (DECEPTION_BASE_DC as i32 + 3 + pacing_dc_mod).clamp(1, 30) as u32;
         let success = roll >= dc;
+        crate::logs::log(
+            "REF",
+            &format!(
+                "disguise dice (elite+): d20={} dc={} (base+3+pacing{}) -> {}",
+                roll,
+                dc,
+                pacing_dc_mod,
+                if success { "HOLDS" } else { "BLOWN" }
+            ),
+        );
         let s = if success {
             "the player's composure withstands a captain's eye; the disguise holds — for now"
         } else {
@@ -1977,6 +2011,16 @@ pub fn evaluate_disguise_gate(
     let roll = roll_d20(&mut roller);
     let dc = (DECEPTION_BASE_DC as i32 + pacing_dc_mod).clamp(1, 30) as u32;
     let success = roll >= dc;
+    crate::logs::log(
+        "REF",
+        &format!(
+            "disguise dice (suspicious): d20={} dc={} (base+pacing{}) -> {}",
+            roll,
+            dc,
+            pacing_dc_mod,
+            if success { "HOLDS" } else { "BLOWN" }
+        ),
+    );
     let s = if success { SCRUTINIZED_SUCCESS_SEED } else { SCRUTINIZED_FAIL_SEED };
     Some(DisguiseDirective::Scrutinized {
         label,

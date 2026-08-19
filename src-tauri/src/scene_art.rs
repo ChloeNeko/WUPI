@@ -748,6 +748,11 @@ pub fn install_sd_abort_callback() {
             // swallowed (an abort callback must NEVER panic — no unwinding
             // through FFI).
             let _ = std::fs::write(&dest, &body);
+            // Crash report with diagnostic context (logs.rs RAM ring):
+            // an abort() never reaches the Rust panic hook, so the ring
+            // dump is wired HERE for the image-gen path. Same must-never-
+            // panic discipline (dump_crash is best-effort, errors swallowed).
+            crate::logs::dump_crash(&format!("SD gen_img abort: {text}"));
             // ALSO emit to the tracing log (best-effort; the non-blocking
             // writer may or may not flush before abort, but the direct
             // fs::write above is the guaranteed capture).
