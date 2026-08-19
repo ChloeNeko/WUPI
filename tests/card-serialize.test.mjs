@@ -105,27 +105,48 @@ test('serializePlayer: conditional traits only when present', () => {
 });
 
 test('serializePlayer: clothing array carried, blanks dropped', () => {
+  // v2: clothing is the <inventory> sibling seed (the mutable state), not an
+  // identity field — it lands on player.inventory.clothing.
   const { player } = serializePlayer({ name: 'A', clothing: ['cloak', '  ', 'boots'] });
-  assert.deepEqual(player.clothing, ['cloak', 'boots']);
+  assert.deepEqual(player.inventory.clothing, ['cloak', 'boots']);
 });
 
-test('serializePlayer: new fields (horn/custom_tags/chip lists) emitted when present', () => {
+test('serializePlayer: new fields (horn/custom_tags/inventory) emitted when present', () => {
   const { player } = serializePlayer({
     name: 'Nyx', race: 'tiefling', horn: 'curled red', job: 'thief',
+    equipped: ['Notched Iron Broadsword'],
     gear: ['compass', '  ', 'rope'],
     custom_tags: { starting_currency: '200 gold', guard_reputation: '-20', blank: '' },
   });
   assert.equal(player.horn, 'curled red');
-  assert.equal(player.job, 'thief');
-  assert.deepEqual(player.gear, ['compass', 'rope']);              // blanks dropped
+  // job is a persona member (the final-question offer) — Occupation line.
+  assert.equal(player.persona.occupation, 'thief');
+  // equipped rides the inventory sibling seed; legacy gear folds to stored.
+  assert.deepEqual(player.inventory.equipped, ['Notched Iron Broadsword']);
+  assert.deepEqual(player.inventory.stored, ['compass', 'rope']);
   assert.deepEqual(player.custom_tags, { starting_currency: '200 gold', guard_reputation: '-20' }); // blank value dropped
 });
 
 test('serializePlayer: new optional fields omitted when absent', () => {
   const { player } = serializePlayer({ name: 'A' });
-  for (const k of ['horn', 'job', 'weakness', 'distinguishing_marks', 'gear', 'tools', 'weapons', 'custom_tags']) {
+  for (const k of ['horn', 'job', 'weakness', 'distinguishing_marks', 'gear', 'tools', 'weapons', 'custom_tags', 'persona', 'inventory']) {
     assert.ok(!(k in player), `${k} should be omitted when absent`);
   }
+});
+
+test('serializePlayer: the opt-in persona block (final wizard question)', () => {
+  const { player } = serializePlayer({
+    name: 'Mira',
+    persona: { personality: 'Quiet.', likes: 'Maps, rain.' },
+    backstory: 'Raised by cartographers.',
+  });
+  assert.equal(player.persona.personality, 'Quiet.');
+  assert.equal(player.persona.likes, 'Maps, rain.');
+  assert.ok(!('occupation' in player.persona), 'unanswered persona fields stay absent');
+  assert.equal(player.backstory, 'Raised by cartographers.');
+  // No persona + no backstory → the block is omitted ENTIRELY (file + cache).
+  const bare = serializePlayer({ name: 'Bare' }).player;
+  assert.ok(!('persona' in bare));
 });
 
 test('serializePlayer: wealth/reputation/fame are NEVER serialized (transient)', () => {
@@ -142,42 +163,43 @@ test('serializePlayer: empty name → fallback id + Unnamed', () => {
   assert.equal(player.name, 'Unnamed');
 });
 
-// ── serializeSimCard ───────────────────────────────────────────────────────
-test('serializeSimCard: emits anchors + locations + cast + intro', () => {
+// ── serializeSimCard (v2: 2026-08-19 Chloe format) ─────────────────────────
+test('serializeSimCard: emits metadata + world sibling + location + intro', () => {
   const { xml, intro } = serializeSimCard({
-    name: 'Aldermoor', directive: 'survive the bog', setting: 'a dying village',
+    card_type: 'world', name: 'Aldermoor', directive: 'survive the bog', setting: 'a dying village',
     tone: 'grim folk horror', start_time: 'Day 1, 09:00', start_weather: 'fog',
-    locations: [{ name: 'Village Square', neighbors: ['Marsh Edge'] }],
-    cast: [{ name: 'Mara', identity: 'the innkeep' }],
+    location: 'Village Square',
     intro: 'You arrive at dusk.',
   });
-  // Roleplay metadata so fable_cards_list surfaces it.
-  assert.ok(xml.includes('<type>roleplay</type>'));
-  // Anchors.
-  assert.ok(xml.includes('<start>'));
-  assert.ok(xml.includes('<time>Day 1, 09:00</time>'));
-  assert.ok(xml.includes('<weather>'));
-  // Travel graph: neighbor ref is the SLUG of the neighbor's name.
-  assert.ok(xml.includes('<node id="village-square">'));
-  assert.ok(xml.includes('<name>Village Square</name>'));
-  assert.ok(xml.includes('<neighbor>marsh-edge</neighbor>'));
-  // Cast: npc id is the slug.
-  assert.ok(xml.includes('<npc id="mara">'));
-  assert.ok(xml.includes('<role>'));
+  // Simulation metadata (the 2026-08-19 rename of "roleplay").
+  assert.ok(xml.includes('<type>simulation</type>'));
+  assert.ok(xml.includes('<subtype>world</subtype>'));
+  assert.ok(xml.includes('<id>aldermoor</id>'));
+  // The anchors are the <world> SIBLING (outside the cached root), never a
+  // <start> block inside it.
+  assert.ok(!xml.includes('<start>'));
+  assert.ok(xml.includes('<world><![CDATA['));
+  assert.ok(xml.includes('Time: Day 1, 09:00'));
+  assert.ok(xml.includes('Weather: fog'));
+  assert.ok(xml.includes('Tone: grim folk horror'));
+  assert.ok(xml.includes('<location><![CDATA[\nVillage Square\n]]></location>'));
+  // v2: no cast, no locations graph.
+  assert.ok(!xml.includes('<cast>'));
+  assert.ok(!xml.includes('<locations>'));
+  assert.ok(!xml.includes('<node '));
   assert.equal(intro, 'You arrive at dusk.');
 });
 
-test('serializeSimCard: omits <start> when no time/weather', () => {
-  const { xml } = serializeSimCard({ name: 'X', directive: 'd', setting: 's', tone: 't' });
-  assert.ok(!xml.includes('<start>'));
-  assert.ok(!xml.includes('<locations>'));
+test('serializeSimCard: omits <world>/<location> when no anchors', () => {
+  const { xml } = serializeSimCard({ name: 'X', card_type: 'world', directive: 'd', setting: 's' });
+  assert.ok(!xml.includes('<world>'));
+  assert.ok(!xml.includes('<location>'));
   assert.ok(!xml.includes('<cast>'));
 });
 
 // (2026-08-16 yellow J6) GLM drift: the draft may carry `clothing` as a
-// comma STRING — the NPC appearance path used to drop the field silently
-// (serializePlayer's chipList already handled the same drift).
-test('serializeSimCard: NPC clothing as comma string is split into the appearance', () => {
+// comma STRING — the NPC inventory path splits it like the chip lists.
+test('serializeSimCard: NPC clothing as comma string is split into the inventory', () => {
   const { xml } = serializeSimCard({
     name: 'Mara', card_type: 'npc', directive: 'd',
     clothing: 'leather armor, traveling cloak,boots',
@@ -186,6 +208,7 @@ test('serializeSimCard: NPC clothing as comma string is split into the appearanc
     xml.includes('Clothing: leather armor, traveling cloak, boots'),
     `clothing line present: ${xml}`
   );
+  assert.ok(xml.includes('<inventory>'), 'the line rides the <inventory> sibling');
 });
 
 // (2026-08-16 yellow J9) The 64 cap counts CODE POINTS, matching Rust's
@@ -200,9 +223,11 @@ test('slugify: astral letters cap at 64 code points, pairs never split', () => {
   assert.equal(slugify('Café Örn'), 'café-örn');
 });
 
-test('serializeSimCard: CDATA-wraps prose (directive with special chars)', () => {
-  const { xml } = serializeSimCard({ name: 'X', directive: 'a < b & c' });
-  assert.ok(xml.includes('<![CDATA[a < b & c]]>'));
+test('serializeSimCard: CDATA-wraps prose (setting with special chars)', () => {
+  const { xml } = serializeSimCard({ name: 'X', card_type: 'world', setting: 'a < b & c' });
+  // The v2 wrap indents the body (the reference-card layout): CDATA opens,
+  // newline, the prose, then the indented close.
+  assert.ok(xml.includes('<![CDATA[\na < b & c\n  ]]>'), `setting CDATA-wrapped: ${xml}`);
 });
 
 test('serializeSimCard: embeds <intro> as a sibling AFTER </sim_card>', () => {
@@ -221,32 +246,51 @@ test('serializeSimCard: embeds <intro> as a sibling AFTER </sim_card>', () => {
   assert.ok(!xml2.includes('<intro>'));
 });
 
-test('serializeSimCard: world branch emits subtype + setting + date anchor', () => {
+test('serializeSimCard: world branch emits subtype + setting + world sibling', () => {
   const { xml } = serializeSimCard({
     card_type: 'world', name: 'Cinderfen', directive: 'a cursed fen', setting: 'a dying village',
     tone: 'grim', date: '3rd of Harvest, Year 1247', time: 'dusk', weather: 'fog', location: 'Cinderfen',
   });
-  assert.ok(xml.includes('<type>roleplay</type><subtype>world</subtype>'), 'subtype carried, type stays roleplay');
+  assert.ok(xml.includes('<type>simulation</type>'), 'type is simulation (the rename)');
+  assert.ok(xml.includes('<subtype>world</subtype>'), 'subtype carried');
   assert.ok(xml.includes('<setting>'), 'world → <setting>');
-  assert.ok(xml.includes('<date><![CDATA[3rd of Harvest, Year 1247]]></date>'), 'date anchor (CDATA-wrapped)');
-  // location synthesized as a single node (no locations graph supplied).
-  assert.ok(xml.includes('<node id="cinderfen">'));
+  // The date anchor rides the <world> sibling — NOT a <start> block.
+  assert.ok(xml.includes('Date: 3rd of Harvest, Year 1247'));
+  assert.ok(xml.includes('Tone: grim'));
+  // No locations graph — the single <location> sibling is the opening place.
+  assert.ok(xml.includes('<location><![CDATA[\nCinderfen\n]]></location>'));
+  assert.ok(!xml.includes('<node '));
 });
 
-test('serializeSimCard: npc branch emits appearance + conversational_style + single cast', () => {
+test('serializeSimCard: npc branch emits identity/persona line blocks + inventory sibling, NO cast', () => {
   const { xml } = serializeSimCard({
     card_type: 'npc', name: 'Mara', gender: 'female', race: 'human', hair_color: 'auburn',
-    clothing: ['apron'], personality: 'warm', flaws: 'curious', job: 'innkeep',
-    dialogue_style: 'cheery', tone: 'cozy', date: 'Day 1', time: '09:00', weather: 'clear', location: 'Tavern',
+    clothing: ['apron'], accessories: ['silver locket'], gear: ['compass'],
+    personality: 'warm', flaws: 'curious', likes: 'river songs',
+    dislikes: 'nobles', job: 'innkeep', backstory: 'exile', dialogue_style: 'cheery',
+    goal: 'buy the tavern', tone: 'cozy', date: 'Day 1', time: '09:00', weather: 'clear', location: 'Tavern',
   });
   assert.ok(xml.includes('<subtype>npc</subtype>'));
-  assert.ok(xml.includes('Gender: female'), 'identity → <appearance>');
+  // v2: identity + persona are CDATA LINE BLOCKS inside the cached root.
+  assert.ok(xml.includes('Name: Mara'));
+  assert.ok(xml.includes('Gender: female'));
+  assert.ok(xml.includes('Hair Color: auburn'));
+  assert.ok(xml.includes('Conversation Style: cheery'));
+  assert.ok(xml.includes('Likes: river songs'));
+  assert.ok(xml.includes('Dislikes: nobles'));
+  assert.ok(xml.includes('Occupation: innkeep'));
+  assert.ok(xml.includes('Goals: buy the tavern'), 'goal → the Goals persona line');
+  assert.ok(xml.includes('Backstory: exile'));
+  // The inventory sibling: clothing + accessories + stored (legacy gear).
   assert.ok(xml.includes('Clothing: apron'));
-  assert.ok(xml.includes('<conversational_style>'), 'dialogue_style → conversational_style');
-  assert.ok(xml.includes('cheery'));
-  // Single cast entry = the NPC, role = job.
-  assert.ok(xml.includes('<npc id="mara">'));
-  assert.ok(xml.includes('innkeep'));
+  assert.ok(xml.includes('Accessories: silver locket'));
+  assert.ok(xml.includes('Stored: compass'), 'legacy gear folds to Stored');
+  // Tone rides the <world> sibling (a world anchor, never card-level).
+  assert.ok(xml.includes('Tone: cozy'));
+  assert.ok(!xml.includes('<tone>'));
+  // NPC cards carry NO <cast> — the character IS the card.
+  assert.ok(!xml.includes('<cast>'), 'npc cards emit no cast roster');
+  assert.ok(!xml.includes('<npc id='), 'no synthesized cast entry');
 });
 
 test('serializeSimCard: scenario branch composes plot + custom_tags (all branches)', () => {
@@ -259,11 +303,24 @@ test('serializeSimCard: scenario branch composes plot + custom_tags (all branche
   });
   assert.ok(xml.includes('<subtype>scenario</subtype>'));
   assert.ok(xml.includes('<plot>'), 'scenario → <plot>');
+  assert.ok(xml.includes('Premise: bandits strike'));
   assert.ok(xml.includes('Trigger: leaving at night'));
   assert.ok(xml.includes('Objective: survive'));
   assert.ok(xml.includes('<custom_tags>'), 'custom_tags emitted');
   assert.ok(xml.includes('<entry key="bandit_count"><![CDATA[8]]></entry>'));
   assert.ok(xml.includes('<entry key="reward"><![CDATA[50 gold]]></entry>'));
+});
+
+// v2: the npc conditional traits (breast/ears/tail/horn) have no identity
+// line — they ride custom_tags (mirroring the Rust legacy mapping).
+test('serializeSimCard: npc conditional traits ride custom_tags', () => {
+  const { xml } = serializeSimCard({
+    card_type: 'npc', name: 'Nyx', race: 'tiefling', horn: 'curled red', tail: 'whip-thin',
+    custom_tags: { faction: 'guild' },
+  });
+  assert.ok(xml.includes('<entry key="horn">'), 'horn → custom tag');
+  assert.ok(xml.includes('<entry key="tail">'), 'tail → custom tag');
+  assert.ok(xml.includes('<entry key="faction">'), 'authored tags survive');
 });
 
 // ── codexEntriesToCompound ─────────────────────────────────────────────────
@@ -339,12 +396,12 @@ test('serializeSimCard: numbers/nulls/objects across every scalar field never th
   });
   assert.ok(xml.includes('<sim_card>'));
   assert.equal(intro, 'line one, line two');
-  // A bare-string cast/location entry is tolerated as {name}.
-  assert.ok(xml.includes('village-square'));
-  assert.ok(xml.includes('mara-the-innkeep'));
-  // Object custom-tag VALUE drops (never "[object Object]"); the clean one stays.
+  // v2: a hostile `name` coerces safely; cast/locations are IGNORED entirely
+  // (no graph, no roster in the format).
   assert.ok(!xml.includes('[object Object]'));
   assert.ok(xml.includes('yes'));
+  assert.ok(!xml.includes('<cast>'));
+  assert.ok(!xml.includes('<node '));
 });
 
 test('serializePlayer: hostile shapes (numeric age, null traits, object custom tag) never throw', () => {
@@ -356,7 +413,7 @@ test('serializePlayer: hostile shapes (numeric age, null traits, object custom t
   assert.equal(player.age, '28');
   assert.equal(player.race, 'human');
   assert.equal(player.body_type, null);        // null → JSON null (Rust Option::None)
-  assert.deepEqual(player.clothing, ['cloak', 'boots']);  // string → chip list
+  assert.deepEqual(player.inventory.clothing, ['cloak', 'boots']);  // string → chip list (v2 inventory seed)
   assert.deepEqual(player.custom_tags, { mood: 'grim' }); // object value dropped
 });
 

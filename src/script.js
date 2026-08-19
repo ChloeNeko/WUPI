@@ -2131,11 +2131,25 @@ const dropdownMenu = document.getElementById('dropdownMenu');
           <span>Checking…</span>
         </div>`;
     } else if (state === 'up-to-date') {
+      // A re-check affordance is mandatory here: this state used to be a dead
+      // end (no button + no auto-check on reopen), so one transiently-failed
+      // check — which the Rust side reported as "no update" — froze the panel
+      // on a fraudulent "up to date" until the app was restarted.
       updateStatusEl.innerHTML = `
         <div class="update-status-row">
           <span class="status-dot connected"></span>
           <span>WUPI is up to date</span>
-        </div>`;
+        </div>
+        <button class="dropdown-item update-action-btn" id="updateRecheckBtn">
+          <svg class="menu-svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <path d="M21 12a9 9 0 1 1-2.64-6.36M21 3v6h-6" stroke-linecap="round" stroke-linejoin="round"/>
+          </svg>
+          Check Again
+        </button>`;
+      document.getElementById('updateRecheckBtn')?.addEventListener('click', (e) => {
+        e.stopPropagation();
+        runUpdateCheck();
+      });
     } else if (state === 'available') {
       const notesHtml = payload.notes
         ? `<div class="update-notes">${escape(payload.notes)}</div>`
@@ -2242,9 +2256,16 @@ const dropdownMenu = document.getElementById('dropdownMenu');
     themePanel?.classList.remove('show');
     colorCodePanel?.classList.remove('show');
     const open = updatePanel?.classList.toggle('show');
-    if (open && updateStatusEl?.dataset.state === 'idle') {
-      // First-open auto-fire: save the user one click. Subsequent opens keep
-      // the last state visible.
+    // Auto-fire on open for every state that can go stale: 'idle' (never
+    // checked this session), 'up-to-date', and 'error'. Re-opening in those
+    // states used to keep the LAST result forever — one transiently-failed
+    // check (reported as "no update") stuck the panel on "up to date" for
+    // the whole session with no way to re-check except restarting the app.
+    // 'available' and 'installing' stay sticky so a pending update and its
+    // progress bar are never lost to a close/reopen; 'checking' is already
+    // in flight (the re-fire guard — never stack a second invoke on it).
+    const st = updateStatusEl?.dataset.state;
+    if (open && (st === 'idle' || st === 'up-to-date' || st === 'error')) {
       runUpdateCheck();
     }
   });

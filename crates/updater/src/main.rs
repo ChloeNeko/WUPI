@@ -29,10 +29,14 @@
 //! 4. **Purge legacy dead paths** (`purge.rs`) — the compile-time removal
 //!    list (dead pre-reorg state folders, retired engine files). Best-effort;
 //!    a locked path never fails the update.
-//! 5. Clean up the staging dir + the downloaded zip, RELAUNCH the new
-//!    `<target>/wupi.exe` (retried + alive-verified — see
-//!    `spawn_wupi_robust`), write a result marker carrying the relaunch
-//!    outcome, and exit.
+//! 5. Clean up + RELAUNCH the new `<target>/wupi.exe` (retried +
+//!    alive-verified — see `spawn_wupi_robust`), write a result marker
+//!    carrying the relaunch outcome, and exit. Cleanup owns both sides: the
+//!    `%TEMP%` staging dir (best-effort here; the next update's residue
+//!    sweep backstops it) and the download's `data/_update/` folder
+//!    (`purge::purge_update_staging` in main — COMPLETE removal, retried
+//!    across AV/indexer lock windows, on EVERY exit path so a failed
+//!    extract/copy can't strand the 2–4 GB zip).
 //!
 //! ## Why it runs from %TEMP% — and why it self-deletes
 //!
@@ -71,6 +75,14 @@
 //! silently: no boot log line, no panic file, no WER) leaves the update
 //! APPLIED and the marker reports `relaunched: false`, so the next manual
 //! boot tells the user exactly what happened instead of looking dead.
+//!
+//! The copy phase carries the SAME resilience (2026-08-18, second
+//! relaunch-killer — observed live on the 0.24.1 → 0.24.2 hop): a transient
+//! lock on ONE file (an AV/indexer pass over the fresh writes) used to fail
+//! the whole phase and skip the relaunch of an install that was actually
+//! complete. `copy_into_target` now retries locked files across ~30 s and,
+//! for files that stay locked, exempts any already byte-identical to the
+//! payload (an unchanged runtime DLL is not a version mix). See stage.rs.
 
 // Headless binary: no console is ever allocated for it, even if a future
 // spawn site drops the creation flag (belt-and-braces alongside the
@@ -109,6 +121,17 @@ fn main() {
     ));
 
     let result = run(&args);
+
+    // The download staging is consumed — remove `data/_update` COMPLETELY,
+    // on every exit path, retried across AV/indexer lock windows
+    // (`purge::purge_update_staging`). The old one-shot delete lived in
+    // run()'s success path only: extract/copy failures returned early and
+    // stranded the 2–4 GB zip forever, and even on success a lock race
+    // (observed live, 0.23.3→0.23.5) left the folder behind — nothing on
+    // the wupi.exe side ever sweeps it. Before the relaunch, so the new
+    // wupi.exe boots into a clean tree.
+    purge::purge_update_staging(&args.target_dir);
+
     let (ok, error, install_touched) = match &result {
         Ok(()) => {
             log("update applied successfully");
@@ -226,12 +249,12 @@ fn run(args: &Args) -> Result<(), RunError> {
         log(format!("purged {purged} legacy path(s)"));
     }
 
-    // 4. Clean up. Best-effort: a locked staging dir defers to Windows temp
-    // cleanup; the zip dir is the `data/_update/` the download created.
+    // 4. Clean up the %TEMP% staging dir. Best-effort: a locked dir defers
+    //    to Windows temp cleanup + the next update's residue sweep. The
+    //    download's `data/_update/` folder is NOT handled here — main purges
+    //    it on every exit path (a failure used to return before this step
+    //    and strand the zip forever).
     let _ = std::fs::remove_dir_all(&staging);
-    if let Some(update_dir) = args.zip.parent() {
-        let _ = std::fs::remove_dir_all(update_dir);
-    }
     Ok(())
 }
 
@@ -522,7 +545,7 @@ fn sweep_temp_residue() {
 /// Headless debug log: append a line to `%TEMP%/wupi_updater_<pid>.log`. There
 /// is no console (the launcher uses CREATE_NO_WINDOW), so this file is the only
 /// trail when diagnosing a failed update. Best-effort, never panics.
-fn log(msg: impl AsRef<str>) {
+pub(crate) fn log(msg: impl AsRef<str>) {
     use std::io::Write;
     if cfg!(test) {
         return; // in-process tests: don't litter %TEMP% with per-run logs

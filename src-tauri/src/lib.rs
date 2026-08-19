@@ -439,6 +439,12 @@ pub struct AppState {
     /// chat UI. Mirrors `active_fable_card` (short critical section, std
     /// mutex — never held across `.await`).
     pub active_player_id: Arc<std::sync::Mutex<Option<String>>>,
+    /// The active player's CACHE BLOCK (2026-08-19): the rendered `<player>`
+    /// payload (identity + persona + custom tags — everything within the
+    /// `.player` root) injected verbatim into the API narrator's system
+    /// prompt every turn. Rendered ONCE at attach (`render_player_cache_block`)
+    /// — no per-turn disk read. Cleared on `fable_end`.
+    pub active_player_cache: Arc<std::sync::Mutex<Option<String>>>,
     /// The card id BEFORE a game started, so `fable_end` can restore it. The
     /// system card (`__wupi__`) is the default; games swap to the
     /// roleplay card's id and restore on exit.
@@ -549,6 +555,7 @@ impl AppState {
             fable_session: Arc::new(tokio::sync::Mutex::new(session::Conversation::new())),
             active_fable_card: Arc::new(std::sync::Mutex::new(None)),
             active_player_id: Arc::new(std::sync::Mutex::new(None)),
+            active_player_cache: Arc::new(std::sync::Mutex::new(None)),
             pre_fable_card_id: Arc::new(std::sync::Mutex::new(memory::WUPI_CARD_ID.to_owned())),
             download_progress: Arc::new(std::sync::Mutex::new(
                 model_downloader::DownloadProgress::default(),
@@ -762,6 +769,10 @@ pub fn run() {
             // them long ago, their sessions/schemas destinations are dead
             // folders (§6B per-card layout replaced them), and the updater's
             // §8C purge now reaps the leftovers. See crates/updater/src/purge.rs.)
+            // (2026-08-19) The v2 card/player format migration — BEFORE any
+            // window exists, so no frontend IPC can race the rewrite. Runs
+            // every boot; idempotent (v2-shaped entries are only cached).
+            migrate_cards_v2(app.handle());
             tracing::info!("portable data dir: {}", data_dir.display());
 
             let state: tauri::State<AppState> = app.state();
@@ -1924,14 +1935,18 @@ fn cancel_download(state: tauri::State<'_, AppState>) {
 // ── Portable self-updater IPC ──────────────────────────────────────────────
 //
 // Two commands drive the file-level updater (src/updater.rs). The frontend
-// calls `updater_check` on boot; if a new version is available it surfaces a
-// toast + "Update & restart" button. `updater_apply` downloads + applies the
-// update (preserving everything under data/), then the frontend prompts the
-// user to restart. Updates never touch user data — see src/updater.rs for the
-// preserve rule.
+// calls `updater_check` on boot (auto-install) and from the paw-menu update
+// panel (Check Now / Retry). The check resolves `Ok(None)` ONLY when the
+// manifest was fetched and no newer version exists; a network/manifest
+// failure REJECTS so the panel shows an error + Retry instead of a
+// fraudulent "up to date" (which used to stick for the whole session —
+// the 2026-08-18 stuck-panel bug). `updater_apply` downloads + applies the
+// update (preserving everything under data/) and never returns on success.
 
 #[tauri::command]
-async fn updater_check(app: tauri::AppHandle) -> Option<updater::UpdateInfo> {
+async fn updater_check(
+    app: tauri::AppHandle,
+) -> Result<Option<updater::UpdateInfo>, String> {
     let current = app.package_info().version.to_string();
     updater::check_for_updates(&current).await
 }
@@ -7907,9 +7922,10 @@ struct FableCardMeta {
     /// Lets the launcher show Continue vs New Game intelligently. Best-effort:
     /// a directory-read error degrades to false (the user can still start).
     has_saves: bool,
-    /// Relative portrait filename within the card folder (e.g.
-    /// "portrait.png"). None when no portrait sibling exists. Kept for
-    /// debugging/identity; the frontend renders via `portrait_url` below.
+    /// Relative portrait filename within the card folder (e.g. "Liam.png",
+    /// the namesake stem — see `find_portrait_sibling`). None when no
+    /// portrait sibling exists. Kept for debugging/identity; the frontend
+    /// renders via `portrait_url` below.
     portrait: Option<String>,
     /// Whether a portrait file exists for this card (best-effort:
     /// a directory-read error degrades to false). Lets the launcher's mini-
@@ -7944,10 +7960,11 @@ fn fable_cards_list(app: tauri::AppHandle) -> Result<Vec<FableCardMeta>, String>
             tracing::warn!(path = %path.display(), "skipping malformed game card");
             continue;
         }
-        // Only list roleplay cards in this registry: the system card
+        // Only list simulation cards in this registry: the system card
         // (wupi.sim) lives in `data/`, not `apps/fable/cards/`, so this is
-        // belt-and-suspenders against a misplaced file.
-        if card.card_type != "roleplay" {
+        // belt-and-suspenders against a misplaced file. ("simulation" is the
+        // 2026-08-19 rename of "roleplay" — parse normalizes both.)
+        if card.card_type != "simulation" {
             continue;
         }
         // Best-effort: has the user got any saves for this card? A dir-read
@@ -7962,9 +7979,10 @@ fn fable_cards_list(app: tauri::AppHandle) -> Result<Vec<FableCardMeta>, String>
         // for cards authored before the in-file move. Capped to 240 chars.
         meta.opening_scene_preview = preview_from_intro(&card.intro)
             .or_else(|| intro_preview_for(&dir, &card.id));
-        // The portrait sibling (`portrait.png`/`.jpg`) drives the launcher's
-        // mini-card + modal portrait (2026-08-05). `portrait` is the relative
-        // name; `portrait_url` is the absolute path for convertFileSrc.
+        // The portrait sibling (`<Name>.png`/`.jpg`, namesake — see
+        // `find_portrait_sibling`) drives the launcher's mini-card + modal
+        // portrait (2026-08-05). `portrait` is the relative name;
+        // `portrait_url` is the absolute path for convertFileSrc.
         meta.portrait = portrait_path_for(&dir, &card.id);
         meta.has_portrait = meta.portrait.is_some();
         if let Some(ref fname) = meta.portrait {
@@ -8001,7 +8019,7 @@ fn card_to_meta(card: &sim_card::SimCard, has_saves: bool) -> FableCardMeta {
         card_type: card.card_type.clone(),
         subtype: card.subtype.clone(),
         setting_preview,
-        tone: card.tone.clone(),
+        tone: card.effective_tone().map(|s| s.to_owned()),
         opening_scene_preview: None,
         player_name: card.player_name.clone(),
         has_saves,
@@ -8046,23 +8064,40 @@ fn intro_preview_for(cards_root: &std::path::Path, card_id: &str) -> Option<Stri
     }
 }
 
-/// Detect a card's portrait sibling (`cards/<id>/portrait.png` or `.jpg`),
-/// returning the relative filename when one exists. None when no portrait
-/// sibling is present (the common case). Best-effort: a stat error degrades
-/// to None. Mirrors the player.rs portrait convention so the launcher's mini-
-/// card + modal render the portrait vs the placeholder without a second IPC.
-/// The portrait filename is fixed `portrait.<ext>` (NOT `<card_id>.<ext>` —
-/// see `fable_card_portrait_write`), so this builds the path directly rather
-/// than going through `resolve_card_file` (which appends `<card_id>.<ext>`).
-fn portrait_path_for(cards_root: &std::path::Path, card_id: &str) -> Option<String> {
-    let card_dir = resolve_card_dir(cards_root, card_id);
+/// The portrait naming convention (2026-08-19): a portrait is a NAMESAKE
+/// sibling of the identity file — `<Name>.png` / `<Name>.jpg` beside the
+/// `<Name>.sim` / `<Name>.player` (the folder's display stem + the real
+/// ext), exactly like every other per-entity file in the folder. Discovery
+/// order: png > jpg > jpeg, namesake first, then the legacy fixed
+/// `portrait.<ext>` name as a read-side fallback for folders the boot
+/// migration couldn't fold (unparseable identity files). Returns the
+/// RELATIVE filename within the folder; None when no portrait exists.
+/// Best-effort: a stat error degrades to None.
+fn find_portrait_sibling(dir: &std::path::Path) -> Option<String> {
+    if let Some(stem) = dir.file_name().and_then(|n| n.to_str()) {
+        if !stem.is_empty() {
+            for ext in ["png", "jpg", "jpeg"] {
+                let name = format!("{stem}.{ext}");
+                if dir.join(&name).is_file() {
+                    return Some(name);
+                }
+            }
+        }
+    }
     for ext in ["png", "jpg", "jpeg"] {
-        let path = card_dir.join(format!("portrait.{ext}"));
-        if path.is_file() {
-            return Some(format!("portrait.{ext}"));
+        let name = format!("portrait.{ext}");
+        if dir.join(&name).is_file() {
+            return Some(name);
         }
     }
     None
+}
+
+/// Detect a card's portrait (see `find_portrait_sibling`), returning the
+/// relative filename within the card folder. None when no portrait is
+/// present (the common case).
+fn portrait_path_for(cards_root: &std::path::Path, card_id: &str) -> Option<String> {
+    find_portrait_sibling(&resolve_card_dir(cards_root, card_id))
 }
 
 /// Read a card's full `.intro` text (the one-shot first narrator beat). None
@@ -8169,7 +8204,7 @@ fn fable_validate_card_xml(xml: String) -> Result<FableCardMeta, String> {
 /// authored card — same contract as the agent tool).
 #[tauri::command]
 async fn fable_write_card(
-    stem: String,
+    _stem: String,
     xml: String,
     app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
@@ -8187,41 +8222,44 @@ async fn fable_write_card(
     let validated = sim_card::parse_from_xml_str(&xml)
         .map_err(|e| format!("Invalid card format: {e}"))?;
 
-    // 2. Slugify the stem + resolve the cards dir.
-    let stem = slugify_card_stem(&stem)
-        .ok_or_else(|| "card filename empty after sanitization".to_string())?;
-    // (2026-08-16 yellow C18) The parsed embedded id MUST agree with the
-    // folder stem. A divergence (a hand-built XML whose <metadata><id>
-    // normalizes elsewhere, or a name/id pair the client slugified
-    // differently) split the card's state: codex/portrait/intro/saves
-    // resolve under the FOLDER stem while the listed/deleted-by id comes
-    // from the EMBEDDED id — phantom halves that never meet again. This
-    // check also closes the fresh-create purge's id-fresh gap: with id ≡
-    // stem enforced, the purge's two keys are always the same key, so a
-    // "fresh" create can never wipe a DIFFERENT live card's partition via a
-    // colliding embedded id. (The dead `.sim` suffix strip that lived here
-    // is gone — slugify maps `.` to `-`, so the suffix could never occur.)
-    if validated.id != stem {
-        return Err(format!(
-            "card id {:?} does not match its folder slug {:?}: make <name> and <metadata><id> normalize to the same slug (the folder, the memory partition, and the card id must stay one identity)",
-            validated.id, stem
-        ));
-    }
+    // 2. Resolve the cards dir. The FOLDER stem is the card's DISPLAY name
+    //    (spaces + capitals preserved — 2026-08-19); the partition id stays
+    //    the slug (validated.id). The display stem is collision-relieved
+    //    against existing folders unless we're re-writing our own.
     let dir = resolve_fable_cards_dir(&app)
         .ok_or_else(|| "no apps/fable/cards/ dir resolved".to_string())?;
-    // **2026-08-01 folder reorg:** the card lives in a per-card folder
-    // `cards/<stem>/<stem>.sim` (sibling to `<stem>.codex`, world.json, etc.).
-    let card_dir = resolve_card_dir(&dir, &stem);
-    let path = resolve_card_file(&dir, &stem, "sim");
+    // (C18-class guard) The parsed embedded id must be the slug of the card's
+    // own name — the id (memory partition) and the name (folder) derive from
+    // ONE source, so a hand-built XML whose <metadata><id> normalizes
+    // elsewhere can't split the card's state between two identities.
+    let name_slug = slugify_card_stem(&validated.name)
+        .ok_or_else(|| "card name produces no usable id".to_string())?;
+    if validated.id != name_slug {
+        return Err(format!(
+            "card id {:?} does not match its name {:?} (slug {:?}): the folder, the memory partition, and the card id must stay one identity",
+            validated.id, validated.name, name_slug
+        ));
+    }
+    // An EXISTING card with this id keeps its folder (an edit writing its
+    // own home); a fresh create derives the display folder from the name.
+    let existing_folder = resolve_card_folder(&dir, &validated.id);
+    let stem = match &existing_folder {
+        Some(folder) => folder
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or(&validated.name)
+            .to_owned(),
+        None => unique_display_stem(&dir, &validated.name, "Card", None),
+    };
+    let card_dir = dir.join(&stem);
+    let path = card_dir.join(format!("{stem}.sim"));
     // (2026-08-15 audit fix) Fresh-create ghost purge: a card FOLDER that
     // doesn't exist yet + memory rows under the same partition key = the
     // folder was deleted OUTSIDE the app (explorer) — every in-app delete
     // path purges the partition, but nothing catches the out-of-app one, and
     // a same-slug re-create silently inherited the dead run's memories.
     // Capture "fresh" BEFORE the mkdir; purge AFTER the write succeeds (a
-    // failed write must not destroy the old rows). Purges BOTH the stem and
-    // the parsed embedded id (the delete-path discipline); the purge itself
-    // refuses all sentinels.
+    // failed write must not destroy the old rows).
     let is_fresh_create = !card_dir.exists();
 
     // 3. Atomic write + re-read to confirm round-trip integrity (the on-disk
@@ -8240,6 +8278,16 @@ async fn fable_write_card(
         let _ = std::fs::remove_file(&path);
         return Err("card validated in memory but failed re-read after write".into());
     }
+    // The id→folder mapping is now live — record it so every by-id resolver
+    // (saves, codex, portraits, raw editors) hits the cache instead of walking.
+    cache_card_folder(&dir, &reloaded.id, &card_dir);
+    // A RENAME (the card's name changed → new display folder) migrates the
+    // rest of the old folder's files when the old folder still exists.
+    if let Some(old) = &existing_folder {
+        if *old != card_dir && old.is_dir() {
+            migrate_card_folder_contents(old, &card_dir);
+        }
+    }
     tracing::info!(path = %path.display(), card_id = %reloaded.id, "Creator card written");
     // Auto-create the card's in-folder `Launch <Name>.lnk` (best-effort: a
     // shortcut failure must NEVER fail the card write itself — the card is the
@@ -8257,7 +8305,7 @@ async fn fable_write_card(
     // new card's first session can retrieve them.
     if is_fresh_create {
         if let Some(engine) = state.memory.get() {
-            for key in [&stem, reloaded.id.as_str()] {
+            for key in [reloaded.id.as_str()] {
                 match engine.purge_card_partition(key).await {
                     Ok(0) => {}
                     Ok(n) => tracing::info!(
@@ -8664,180 +8712,60 @@ async fn enter_fable_session(
     // passed (the New Game flow's Pair 2), load it + override the card's
     // `player_name` anchor with the saved player's name. The narrator
     // reads `card.player_name` as the identity anchor (the `<active_
-    // reality>` block), so this is the load-bearing identity injection.
-    // The prose (description/appearance/personality/accessories) lands as
-    // `player.*` schema entities the narrator + retrieval can read —
-    // identity, not gameplay state (no body/wealth mutation). Runs for
-    // ALL three branches (fresh/resume/save) so attaching a player works
-    // regardless of which state-resolution path fired; a None player_id
-    // is a complete no-op (the card's own player_name stands).
+    // Player attach (2026-08-19 v2): the identity becomes the `<player>`
+    // KV-cache block (narrator system prompt, every turn) + the `<inventory>`
+    // sibling seeds the typed inventory on FRESH runs. Runs for ALL three
+    // branches (fresh/resume/save); a None player_id clears the cache (the
+    // card's own player_name stands + no <player> block renders).
+    *state.active_player_cache.lock().expect("active_player_cache mutex") = None;
     if let Some(pid) = player_id.as_deref() {
-        // (2026-08-16 audit LOW) Sanitize the player id through the same slug
-        // rules every player path uses — the raw join only ever traversed
-        // players/ (read-only), but a hostile id mangles to a nonexistent
-        // path either way; clean it for consistency with the portraiture/
-        // write IPCs' guard.
-        let clean = sanitize_player_slug(pid);
+        // (2026-08-19) Walker resolution — the player folder is display-named
+        // ("Alex"); the slug id can never be joined directly.
         let players_root = resolve_fable_players_dir(app);
-        let json_path = players_root.join(&clean).join(format!("{clean}.json"));
-        if let Some(sp) = load_player_at(&json_path) {
+        let player_file = resolve_player_folder(&players_root, pid)
+            .map(|folder| {
+                let stem = folder
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("Player")
+                    .to_owned();
+                folder.join(format!("{stem}.player"))
+            })
+            .and_then(|path| path.is_file().then_some(path));
+        if let Some(path) = player_file {
+            if let Some(sp) = load_player_at(&path) {
             // Override the card's player_name anchor (the load-bearing
             // identity swap). Only when the saved player has a real name.
             let name = sp.name.trim();
             if !name.is_empty() {
                 card.player_name = Some(name.to_owned());
             }
-            // Stash the prose as schema entities. These read as the
-            // player's authored identity — the narrator + retrieval see
-            // them as ground truth about WHO the player is, decoupled
-            // from the card's world/setting (which stays the card's).
-            // (Values are `Value::String` — these are flat prose fields, not
-            // structured data; the widened entity type keeps them as strings.)
-            if let Some(d) = sp.description.as_deref().filter(|s| !s.trim().is_empty()) {
-                prior_schema.entities.insert(
-                    "player.description".into(),
-                    serde_json::Value::String(d.trim().to_owned()),
-                );
-            }
-            if let Some(a) = sp.appearance.as_deref().filter(|s| !s.trim().is_empty()) {
-                prior_schema.entities.insert(
-                    "player.appearance".into(),
-                    serde_json::Value::String(a.trim().to_owned()),
-                );
-            }
-            if let Some(p) = sp.personality.as_deref().filter(|s| !s.trim().is_empty()) {
-                prior_schema.entities.insert(
-                    "player.personality".into(),
-                    serde_json::Value::String(p.trim().to_owned()),
-                );
-            }
-            if let Some(ac) = sp.accessories.as_deref().filter(|s| !s.trim().is_empty()) {
-                prior_schema.entities.insert(
-                    "player.accessories".into(),
-                    serde_json::Value::String(ac.trim().to_owned()),
-                );
-            }
-            // Backstory (2026-08-11): seed the authored history as a
-            // `player.backstory` entity so the narrator + retrieval see the
-            // character's history from turn 1. Same trust class as the legacy
-            // prose above — identity ground truth, not gameplay state.
-            if let Some(b) = sp.backstory.as_deref().filter(|s| !s.trim().is_empty()) {
-                prior_schema.entities.insert(
-                    "player.backstory".into(),
-                    serde_json::Value::String(b.trim().to_owned()),
-                );
-            }
-            // Optional descriptive identity fields (2026-08-13): each seeds a
-            // `player.*` entity (mirrors backstory) so the narrator reads them
-            // as identity ground truth from turn 1 — NOT gameplay state.
-            for (key, val) in [
-                ("player.job", sp.job.as_deref()),
-                ("player.weakness", sp.weakness.as_deref()),
-                ("player.distinguishing_marks", sp.distinguishing_marks.as_deref()),
-                ("player.gender", sp.gender.as_deref()),
-                // (P1 fix 2026-08-15) race/age/height/weight were dropped at
-                // attach — a "high elf, 32, 6'1"" player attached with the
-                // narrator blind to all four (gender seeded, race not, from
-                // the same trait set — an oversight, not a design choice).
-                ("player.race", sp.race.as_deref()),
-                ("player.age", sp.age.as_deref()),
-                ("player.height", sp.height.as_deref()),
-                ("player.weight", sp.weight.as_deref()),
-            ] {
-                if let Some(s) = val.map(|s| s.trim()).filter(|s| !s.is_empty()) {
-                    prior_schema.entities.insert(
-                        key.into(),
-                        serde_json::Value::String(s.to_owned()),
-                    );
-                }
-            }
-            // Chip-list identity fields → one joined narratable line each.
-            for (key, list) in [
-                ("player.gear", sp.gear.as_ref()),
-                ("player.tools", sp.tools.as_ref()),
-                ("player.weapons", sp.weapons.as_ref()),
-            ] {
-                if let Some(items) = list.filter(|v| !v.is_empty()) {
-                    let joined = items
-                        .iter()
-                        .map(|s| s.trim())
-                        .filter(|s| !s.is_empty())
-                        .collect::<Vec<_>>()
-                        .join(", ");
-                    if !joined.is_empty() {
-                        prior_schema
-                            .entities
-                            .insert(key.into(), serde_json::Value::String(joined));
-                    }
-                }
-            }
-            // Custom extensions (2026-08-13): seed the player's `custom_tags`
-            // into `WorldSchema.custom_tags` so they reach the narrator via the
-            // `custom:` render line (entities themselves are persisted but NOT
-            // prompted, so the old `player.<key>` entity seed was invisible).
-            // Merges with any card-authored custom_tags (card seed ran above).
-            if let Some(tags) = sp.custom_tags.as_ref() {
-                for (k, v) in tags {
-                    let kt = k.trim();
-                    let vt = v.trim();
-                    if !kt.is_empty() && !vt.is_empty() {
-                        prior_schema.custom_tags.insert(kt.to_owned(), vt.to_owned());
-                    }
-                }
-            }
-            // Seed the per-run live appearance layer (Phase 4 Component 5,
-            // 2026-08-04). The structured trait fields the Player Creator
-            // collected become the starting `current_appearance_deltas` so the
-            // narrator sees the character's authored look from turn 1. This is
-            // the ONE-TIME identity baseline; subsequent `[APPEARANCE]` brackets
-            // mutate this map (never the SavedPlayer). Keys mirror the
-            // `[APPEARANCE key=value]` allowlist (bracket_parser::APPEARANCE_KEYS)
-            // so a mid-session bracket + the seed speak the same vocabulary.
-            {
-                let deltas = &mut prior_schema.player_state.current_appearance_deltas;
-                let mut push = |k: &'static str, v: Option<&String>| {
-                    if let Some(v) = v.map(|s| s.trim()).filter(|s| !s.is_empty()) {
-                        deltas.insert(k.to_string(), v.to_string());
-                    }
-                };
-                push("hair_color", sp.hair_color.as_ref());
-                push("hair_length", sp.hair_length.as_ref());
-                push("hair_style", sp.hair_style.as_ref());
-                push("body_type", sp.body_type.as_ref());
-                push("skin_complexion", sp.skin_complexion.as_ref());
-                push("eye_color", sp.eye_color.as_ref());
-                push("breast_size", sp.breast_size.as_ref());
-                push("ears", sp.ears.as_ref());
-                push("tail", sp.tail.as_ref());
-                push("horn", sp.horn.as_ref());
-            }
-            // (2026-08-18 clothing-as-inventory ruling) Clothing is INVENTORY,
-            // not an appearance line: the authored chip list seeds typed items
-            // (garments route to their body slots — cloak/dress/robe → chest,
-            // trousers → legs, boots → feet; unroutable accessories land in
-            // the pack) so every change of clothes in play flows through
-            // [EQUIP]: the displaced garment returns to the pack, the Soul
-            // Gem panel shows it, and the `equipped:` world-state line is the
-            // narrator's clothing read. FRESH runs only — a resumed
-            // campaign's inventory is authoritative (re-seeding would
-            // resurrect garments the player already changed out of; the
-            // legacy `outfit` delta on old saves migrates at load_split).
+            // (2026-08-19 v2 ruling) The player's IDENTITY — traits, opt-in
+            // persona, custom tags — is the KV-cache payload: rendered ONCE
+            // here + injected verbatim into the API narrator's system prompt
+            // every turn (`<player>` block, before `<sim_card>`). It is NO
+            // LONGER seeded as schema entities / appearance deltas — the
+            // cached block is the single source; `player_state` carries only
+            // LIVE divergences from it (an `[APPEARANCE]` change lands in the
+            // deltas map; the card baseline never duplicates).
+            let cache_block = player::render_player_cache_block(&sp);
+            *state.active_player_cache.lock().expect("active_player_cache mutex") =
+                Some(cache_block);
+            // The `<inventory>` sibling is mutable state seed (NEVER cached):
+            // clothing → the garment router, Equipped → readied hands,
+            // Accessories/Stored → the pack. FRESH runs only — a resumed
+            // campaign's inventory is authoritative.
             if fresh {
-                if let Some(items) = sp.clothing.as_ref().filter(|v| !v.is_empty()) {
-                    let chips: Vec<String> = items
-                        .iter()
-                        .map(|s| s.trim().to_string())
-                        .filter(|s| !s.is_empty())
-                        .collect();
-                    let seeded = equipment::seed_clothing_items(
-                        &chips,
+                if let Some(inv) = sp.inventory.as_ref().filter(|i| !i.is_empty()) {
+                    let seeded = equipment::seed_player_inventory(
+                        inv,
                         &mut prior_schema.player_state.equipment,
                         &mut prior_schema.player_state.pack,
                     );
-                    tracing::info!(seeded, "clothing chips seeded into typed inventory");
+                    tracing::info!(seeded, "player inventory seeded into typed model");
                     crate::logs::log(
                         "INV",
-                        &format!("clothing seed: {} garment(s) -> typed inventory", seeded),
+                        &format!("player inventory seed: {} item(s) -> typed model", seeded),
                     );
                 }
             }
@@ -8856,6 +8784,9 @@ async fn enter_fable_session(
                 }
             }
             tracing::info!(player_id = pid, player_name = %card.player_name.as_deref().unwrap_or("?"), "attached saved player");
+            } else {
+                tracing::warn!(player_id = pid, "saved player unparseable at attach time; proceeding with card default");
+            }
         } else {
             tracing::warn!(player_id = pid, "saved player not found at attach time; proceeding with card default");
         }
@@ -8898,18 +8829,31 @@ async fn enter_fable_session(
             "fable_start: seeded travel_graph from card <locations>"
         );
     }
-    // Fable Phase 5A (2026-07-29): seed the named-NPC registry from the
-    // card's <cast> block. Mirrors the travel_graph seed above (same gate
-    // shape: only seed when the schema's registry is empty AND the card
-    // declares a cast — a resumed save with a populated registry is left
-    // alone, preserving the player's [PRESENCE] state). This is the
-    // load-bearing fix for the "teleporting NPC" bug: without it the
-    // [PRESENCE] bracket has no whitelist to validate against → every npc_id
-    // is "unknown" → every bracket is rejected → the anti-teleport whitelist
-    // (the `present:` line) never populates → the narrator is free to
-    // hallucinate absent NPCs back into the scene (the §11.48-shaped gap,
-    // recurring for Phase 5). The ids here are the Rust-authoritative keys;
-    // a card without <cast> stays dormant (pre-Phase-5 behavior).
+    // (2026-08-19 v2) The `<location>` SIBLING — the single authored starting
+    // location. The graph grows organically from it ([DISCOVER]/[TRAVEL]
+    // mint + auto-link). Seeds only when the graph is empty AND the card
+    // carries a location (an npc card with an empty <location> stays dormant
+    // for [DISCOVER]).
+    if prior_schema.travel_graph.nodes.is_empty() {
+        if let Some(loc) = card.location.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            let node_id = crate::slugify_card_stem(loc).unwrap_or_else(|| "start".into());
+            let node = schema::Node {
+                id: node_id.clone(),
+                name: loc.to_owned(),
+                neighbors: vec![],
+                setting: String::new(),
+            };
+            if prior_schema.travel_graph.upsert_node(node) {
+                prior_schema.travel_graph.current_node = Some(node_id.clone());
+                tracing::info!(node_id = %node_id, "fable_start: seeded travel_graph from card <location>");
+            }
+        }
+    }
+    // Fable Phase 5A (2026-07-29): seed the named-NPC registry from a LEGACY
+    // card's <cast> block (v2 cards carry no cast). Mirrors the travel_graph
+    // seed above (same gate shape: only seed when the schema's registry is
+    // empty AND the card declares a cast — a resumed save with a populated
+    // registry is left alone, preserving the player's [PRESENCE] state).
     if prior_schema.npc_registry.entries.is_empty() && !card.cast.is_empty() {
         prior_schema.npc_registry = schema::NpcRegistry {
             entries: card
@@ -8932,67 +8876,115 @@ async fn enter_fable_session(
         tracing::info!(
             npc_count = card.cast.len(),
             ids = ?card.cast.iter().map(|n| n.id.as_str()).collect::<Vec<_>>(),
-            "fable_start: seeded npc_registry from card <cast>"
+            "fable_start: seeded npc_registry from legacy card <cast>"
         );
     }
-    // Cold-start anchors (2026-08-10, Issue #2): seed the world clock + weather
-    // from the card's <start> block IF they're still dormant. The tracker
-    // renders no clock:/weather: line while these are unset → it has nothing to
-    // maintain → [TIME]/[WEATHER] never fire (the cold-start hole). Seeding
-    // them gives the tracker the anchors it needs from turn 1. Mirrors the
-    // travel_graph/npc_registry seeds' gate shape: only seed when dormant, so a
-    // resumed save that already advanced the clock (or set weather) is left
-    // alone (the player's [TIME]/[WEATHER] progress is preserved).
+    // (2026-08-19 v2) An npc-subtype card IS the character: self-register it
+    // in the npc_registry (Core prominence — the card author authored THEM
+    // deliberately) + seed its `<inventory>` sibling into the interior item
+    // rack so the [NPC_ITEM] theft/mutation loop works from turn 1. Runs on
+    // ALL branches (fresh/resume/save) but only claims a still-empty
+    // registry slot for its own id (a resumed save keeps its live entry).
+    if card.subtype.as_deref() == Some("npc") && card.name != "unknown" {
+        let already = prior_schema
+            .npc_registry
+            .entries
+            .iter()
+            .any(|e| e.id == card.id);
+        if !already {
+            prior_schema.npc_registry.entries.push(schema::NpcEntry {
+                id: card.id.clone(),
+                name: card.name.clone(),
+                role: String::new(),
+                tier: None,
+                aliases: vec![card.name.clone()],
+                prominence: schema::NpcProminence::Core,
+            });
+            tracing::info!(npc_id = %card.id, "fable_start: npc card self-registered (Core)");
+        }
+        if !card.inventory.is_empty() {
+            let rack = prior_schema
+                .npc_interior
+                .entry(card.id.clone())
+                .or_default();
+            for (name, equippable) in card
+                .inventory
+                .clothing
+                .iter()
+                .map(|n| (n, true))
+                .chain(card.inventory.equipped.iter().map(|n| (n, true)))
+                .chain(card.inventory.accessories.iter().map(|n| (n, false)))
+                .chain(card.inventory.stored.iter().map(|n| (n, false)))
+            {
+                let name = name.trim();
+                if name.is_empty() {
+                    continue;
+                }
+                equipment::stack_upsert(
+                    &mut rack.items,
+                    equipment::StackItem {
+                        name: name.to_string(),
+                        qty: 1,
+                        stats: None,
+                        tags: if equippable { vec![equipment::ItemTag::Equippable] } else { vec![] },
+                        ..equipment::StackItem::default()
+                    },
+                );
+            }
+            crate::logs::log(
+                "BRK",
+                &format!("npc card inventory seeded: {} item(s) on the rack", rack.items.len()),
+            );
+        }
+    }
+    // Cold-start anchors (2026-08-19 v2): seed clock / weather / calendar /
+    // TONE from the card's `<world>` sibling (the parser maps a legacy
+    // `<start>` + `<tone>` into the same model, so both generations flow
+    // through here). Dormancy-gated so a resumed save that advanced any
+    // anchor is preserved.
     //
     // Clock: write BOTH current_minutes AND last_tick_minutes so the seed
     // counts as the baseline — the World Progression tick's first-call rule
-    // (no fire on the first [TIME]) is honored (a campaign doesn't simulate a
-    // day it just established). Weather: stamp started_at_minutes to the seeded
-    // clock so the persistence curve has a sane origin (0 when the clock is
-    // also unseeded — harmless, the drift DC just starts from baseline).
-    if let Some(mins) = card.start.time_minutes {
+    // (no fire on the first [TIME]) is honored. Weather: stamp
+    // started_at_minutes to the seeded clock so the persistence curve has a
+    // sane origin (0 when the clock is also unseeded — harmless).
+    let world_time_minutes = card.world.time.as_deref().and_then(
+        crate::bracket_parser::parse_in_world_time,
+    );
+    if let Some(mins) = world_time_minutes {
         if !prior_schema.world_clock.is_set() {
             prior_schema.world_clock.current_minutes = mins;
             prior_schema.world_clock.last_tick_minutes = mins;
-            tracing::info!(
-                start_minutes = mins,
-                "fable_start: seeded world_clock from card <start><time>"
-            );
+            tracing::info!(start_minutes = mins, "fable_start: seeded world_clock from card <world>");
         }
     }
-    if let Some(condition) = card.start.weather.as_deref() {
+    if let Some(condition) = card.world.weather.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
         if !prior_schema.weather.is_set() {
             prior_schema.weather.condition = condition.to_string();
-            prior_schema.weather.started_at_minutes =
-                prior_schema.world_clock.current_minutes;
-            tracing::info!(
-                condition = %condition,
-                "fable_start: seeded weather from card <start><weather>"
-            );
+            prior_schema.weather.started_at_minutes = prior_schema.world_clock.current_minutes;
+            tracing::info!(condition = %condition, "fable_start: seeded weather from card <world>");
         }
     }
-    // Calendar (2026-08-13): seed the free-form date label from `<start><date>`.
-    // Dormancy-gated (mirrors clock/weather) so a resumed save that advanced the
-    // label via [DATE] is preserved. None on cards without a <date> → the legacy
-    // "Day N, HH:MM" clock render stands. No forced default (the wizard supplies
-    // it; non-wizard cards stay dormant).
-    if let Some(date) = card.start.date.as_deref().filter(|s| !s.is_empty()) {
+    if let Some(date) = card.world.date.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
         if prior_schema.calendar.as_deref().filter(|s| !s.is_empty()).is_none() {
             prior_schema.calendar = Some(date.to_string());
-            tracing::info!(calendar = %date, "fable_start: seeded calendar from card <start><date>");
+            tracing::info!(calendar = %date, "fable_start: seeded calendar from card <world>");
         }
     }
-    // Custom extensions (2026-08-13): seed the card's `<custom_tags>` into the
-    // schema so they reach the narrator via the `custom:` render line. Seed only
-    // when the schema's map is empty (idempotent on re-entry; preserves a resumed
-    // save's tags).
-    if prior_schema.custom_tags.is_empty() && !card.custom_tags.is_empty() {
-        prior_schema.custom_tags = card.custom_tags.clone();
-        tracing::info!(
-            count = prior_schema.custom_tags.len(),
-            "fable_start: seeded custom_tags from card <custom_tags>"
-        );
+    // TONE (2026-08-19 ruling): the simulation's tone is LIVE world state —
+    // seeded here, rendered per-turn beside the time + weather, owned by the
+    // tracker from turn 1 on.
+    if let Some(tone) = card.effective_tone().map(str::trim).filter(|s| !s.is_empty()) {
+        if prior_schema.tone.as_deref().filter(|s| !s.is_empty()).is_none() {
+            prior_schema.tone = Some(tone.to_string());
+            tracing::info!(tone = %tone, "fable_start: seeded tone into world state");
+        }
     }
+    // (2026-08-19) The card's `<custom_tags>` NO LONGER seed
+    // `WorldSchema.custom_tags` — in the v2 format they ride the `<sim_card>`
+    // KV-cache block verbatim (narrator flavor, identity-tier) and seeding
+    // them into the `custom:` line as well double-injected them every turn.
+    // The schema map remains for runtime-added tags.
     // Cold-start anchor bootstrap (2026-08-10): if the clock and/or weather are
     // STILL dormant after the <start> seed (no <start> block, or it seeded only
     // one of the two), derive them from the card's .intro via one schema-engine
@@ -9017,7 +9009,7 @@ async fn enter_fable_session(
                 state,
                 intro,
                 card.setting.as_deref(),
-                card.tone.as_deref(),
+                card.effective_tone(),
                 card.player_name.as_deref(),
             )
             .await
@@ -9075,8 +9067,7 @@ async fn enter_fable_session(
         if !prior_schema.weather.is_set() {
             // Derive from tone if it mentions weather; else "clear".
             let default_weather = card
-                .tone
-                .as_deref()
+                .effective_tone()
                 .map(|t| {
                     let tl = t.to_lowercase();
                     if tl.contains("fog") || tl.contains("mist") {
@@ -9536,64 +9527,82 @@ fn build_narrator_system_prompt(
     out
 }
 
-/// Prose-only narrator system prompt. The narrator reads the **narrator**
-/// section of the authored `.prompt` file (its voice), the card identity
-/// (name/setting/tone from the `.sim`), and the live per-turn state blocks.
-/// NO bracket-command list — the tracker (Local Stage-2) owns mechanics;
-/// this model only narrates what Rust says happened.
+/// Prose-only narrator system prompt (2026-08-19 Chloe cache-order ruling).
+/// The system message carries ONLY the stable, session-long cache payload —
+/// in this exact order:
+///
+///   1. [Narrative Prompt] — the authored `.prompt` narrator section (voice).
+///   2. [<player>] — everything within the attached player's `.player` root
+///      (identity + opt-in persona + custom tags), rendered once at attach.
+///   3. [<sim_card>] — everything within the card's `<sim_card>` root
+///      (identity + persona + custom tags; Setting/Plot for scenario/world).
+///
+/// The per-turn state (`<world_state>` incl. tone, `<scene_pacing>`,
+/// `<player_action>`) rides a TRAILING system message AFTER the history
+/// (see [`build_narrator_turn_tail`]); the memory block injects at DEPTH 2
+/// inside the history (see the Stage-2 assembly in `fable_send`). NO
+/// bracket-command list — the tracker owns mechanics.
 ///
 /// **Voice-authoring is gone from Rust.** No authored narrator voice/style/
 /// behavior prose lives here — that's `fable.prompt`'s narrator section. This
-/// function is a pure data-slotter: authored prose → card identity → live
-/// state tags. Nothing else.
+/// function is a pure data-slotter: authored prose → player block → card
+/// block. Nothing else.
 fn build_api_narrator_system_prompt(
     prompts: &prompts::FablePrompts,
     card: &sim_card::SimCard,
-    world_state: Option<&str>,
-    pacing: schema::ScenePacing,
-    player_action: Option<&str>,
-    memory_block: Option<&str>,
+    player_block: Option<&str>,
 ) -> String {
     let mut out = String::with_capacity(2048);
 
-    // (a) Authored narrator prose (from fable.prompt's NARRATOR section).
+    // (1) Authored narrator prose (from fable.prompt's NARRATOR section).
     let narrator = prompts.narrator.trim();
     if !narrator.is_empty() {
         out.push_str(narrator);
         out.push_str("\n\n");
     }
 
-    // (b) Card identity (from the active .sim scenario card).
-    out.push_str("Scenario: ");
-    out.push_str(card.name.trim());
-    out.push('\n');
-    if let Some(setting) = card.setting.as_deref().filter(|s| !s.trim().is_empty()) {
-        out.push_str("Setting: ");
-        out.push_str(setting.trim());
-        out.push('\n');
+    // (2) The attached player's cache block — identity is static per session;
+    // it belongs in the stable prefix, not in per-turn state.
+    if let Some(block) = player_block.map(str::trim).filter(|s| !s.is_empty()) {
+        out.push_str(block);
+        out.push_str("\n\n");
     }
-    if let Some(plot) = card.plot.as_deref().filter(|s| !s.trim().is_empty()) {
-        out.push_str("Plot: ");
-        out.push_str(plot.trim());
-        out.push('\n');
-    }
-    if let Some(tone) = card.tone.as_deref().filter(|s| !s.trim().is_empty()) {
-        out.push_str("Tone: ");
-        out.push_str(tone.trim());
-        out.push('\n');
-    }
-    let core = card.core_persona.trim();
-    if !core.is_empty() {
-        out.push_str(core);
-        out.push('\n');
-    }
-    out.push('\n');
 
-    // (c) Live per-turn state blocks. Zero authored prose.
-    out.push_str(&assemble_narrator_skeleton(
-        player_action, world_state, pacing, memory_block,
-    ));
+    // (3) The card's cache block — everything within <sim_card>, verbatim.
+    out.push_str(card.render_cache_block().trim());
+    out.push_str("\n");
 
+    out
+}
+
+/// The TRAILING per-turn state message for the API narrator (2026-08-19):
+/// `<world_state>` (clock/date/weather/**tone**/location + live state) →
+/// `<scene_pacing>`, with the manual `<player_action>` leading. Sits AFTER
+/// the history window as the final system message — closest to generation,
+/// reflecting the tracker's just-applied bracket mutations. ALWAYS non-empty
+/// (`<scene_pacing>` renders every turn, mirroring the tracker skeleton's
+/// contract).
+fn build_narrator_turn_tail(
+    player_action: Option<&str>,
+    world_state: Option<&str>,
+    pacing: schema::ScenePacing,
+) -> String {
+    let mut out = String::with_capacity(2048);
+    if let Some(pa) = player_action.map(str::trim).filter(|s| !s.is_empty()) {
+        out.push_str("<player_action type=\"manual_override\">\n");
+        out.push_str(pa);
+        out.push_str("\n</player_action>\n\n");
+    }
+    if let Some(ws) = world_state.map(str::trim).filter(|s| !s.is_empty()) {
+        out.push_str("<world_state>\n");
+        out.push_str(ws);
+        out.push_str("\n</world_state>\n\n");
+    }
+    out.push_str("<scene_pacing mode=\"");
+    out.push_str(pacing.mode.tag());
+    out.push_str("\">\n");
+    out.push_str(pacing.mode.prose_guidance());
+    out.push_str("\n</scene_pacing>\n");
     out
 }
 
@@ -9601,56 +9610,39 @@ fn build_api_narrator_system_prompt(
 /// player highlighted a span inside an existing assistant message and the API
 /// rewrites ONLY that span, splicing cleanly against the surrounding text.
 ///
-/// Mirrors `build_api_narrator_system_prompt`'s (a) authored narrator voice +
-/// (b) card identity blocks — voice continuity + scenario framing — then
-/// appends a terse splice-discipline section instead of the live-state
-/// skeleton. The slice job is narrower than a full narrator turn: it needs the
-/// voice + the scenario + the splice contract, NOT `<world_state>` /
-/// `<scene_pacing>` / `<retrieved_knowledge>` (Prime Mandate — only what 100%
-/// of these turns need; the prev/next beats + the pre/selection/post payload
-/// in the user message supply all the context the model requires). API-only,
-/// never thinks, never emits brackets (any accidental brackets in the regen
-/// are STRIPPED by the caller via `bracket_parser::parse`, never applied).
+/// Mirrors `build_api_narrator_system_prompt`'s cache blocks — voice
+/// continuity + player/card identity — then appends a terse splice-discipline
+/// section. The slice job is narrower than a full narrator turn: it needs the
+/// voice + the identities + the splice contract, NOT `<world_state>` /
+/// `<scene_pacing>` / memory (Prime Mandate — only what 100% of these turns
+/// need; the prev/next beats + the pre/selection/post payload in the user
+/// message supply all the context the model requires). API-only, never
+/// thinks, never emits brackets (any accidental brackets in the regen are
+/// STRIPPED by the caller via `bracket_parser::parse`, never applied).
 fn build_slice_regenerate_system_prompt(
     prompts: &prompts::FablePrompts,
     card: &sim_card::SimCard,
+    player_block: Option<&str>,
 ) -> String {
     let mut out = String::with_capacity(2048);
 
-    // (a) Authored narrator prose — same voice the original beat was written in.
+    // (1) Authored narrator prose — same voice the original beat was written in.
     let narrator = prompts.narrator.trim();
     if !narrator.is_empty() {
         out.push_str(narrator);
         out.push_str("\n\n");
     }
 
-    // (b) Card identity — identical to build_api_narrator_system_prompt (b).
-    out.push_str("Scenario: ");
-    out.push_str(card.name.trim());
-    out.push('\n');
-    if let Some(setting) = card.setting.as_deref().filter(|s| !s.trim().is_empty()) {
-        out.push_str("Setting: ");
-        out.push_str(setting.trim());
-        out.push('\n');
+    // (2)+(3) The player + card cache blocks — identical to
+    // build_api_narrator_system_prompt.
+    if let Some(block) = player_block.map(str::trim).filter(|s| !s.is_empty()) {
+        out.push_str(block);
+        out.push_str("\n\n");
     }
-    if let Some(plot) = card.plot.as_deref().filter(|s| !s.trim().is_empty()) {
-        out.push_str("Plot: ");
-        out.push_str(plot.trim());
-        out.push('\n');
-    }
-    if let Some(tone) = card.tone.as_deref().filter(|s| !s.trim().is_empty()) {
-        out.push_str("Tone: ");
-        out.push_str(tone.trim());
-        out.push('\n');
-    }
-    let core = card.core_persona.trim();
-    if !core.is_empty() {
-        out.push_str(core);
-        out.push('\n');
-    }
-    out.push('\n');
+    out.push_str(card.render_cache_block().trim());
+    out.push_str("\n\n");
 
-    // (c) Splice discipline — terse, mechanical, per-turn (Prime-Mandate
+    // (4) Splice discipline — terse, mechanical, per-turn (Prime-Mandate
     // compliant: this is the core job instruction, not bloat). Genericized,
     // no copyable concrete examples (anti-pattern #4).
     out.push_str(
@@ -9681,7 +9673,7 @@ fn build_creator_assistant_system_prompt(creator_kind: &str) -> String {
     out.push_str("You are WUPI's creation assistant. You help the user design ");
     match creator_kind {
         "player" => out.push_str("a player character"),
-        "sim" => out.push_str("a roleplay world (a Fable sim card)"),
+        "sim" => out.push_str("a simulation (a Fable sim card)"),
         "codex" => out.push_str("a lorebook (a codex of world rules and lore)"),
         _ => out.push_str("a creative element"),
     }
@@ -9700,16 +9692,25 @@ fn build_creator_assistant_system_prompt(creator_kind: &str) -> String {
              name (string), gender (free-form identity text, e.g. \"female\", \
              \"masculine\", \"nonbinary\" — NOT restricted to male/female), age, race, \
              skin_complexion, height, weight, body_type (build/frame), hair_color, \
-             hair_length, hair_style, eye_color (short string traits), clothing \
-             (array of garment strings).\n\
+             hair_length, hair_style, eye_color (short string traits).\n\
              CONTEXTUAL FIELDS — use context clues; ask only when they apply and omit \
              otherwise: breast_size (only if the character is female), ears, tail, horn \
              (only if the race is non-human).\n\
+             INVENTORY (optional — ask once, late): whether the player carries any \
+             starting items. If yes, fill any of clothing (worn garments), equipped \
+             (readied weapons/held items), accessories (worn extras), stored (packed \
+             items) as arrays of short item names; a \"no\" leaves inventory unset.\n\
+             THE PERSONA QUESTION (mandatory — the FINAL question before ready): ask \
+             whether the player would like any persona details on their card — \
+             personality, likes, dislikes, flaws, goals, occupation, backstory. NEVER \
+             offer or ask for a conversation style (players do not get one). If yes, \
+             fill draft.persona as an object with any of those fields (each short \
+             prose). If no, leave persona absent AND set draft.persona_answered to \
+             false (an absent persona with no marker means you never asked — an \
+             invalid draft).\n\
              OPTIONAL FIELDS — surface only if the player raises them or they fit \
-             naturally: accessories, gear (array), tools \
-             (array), weapons (array), distinguishing_marks, job, personality, weakness, \
-             backstory (prose), wealth (a starting amount), reputation or fame (a \
-             starting standing).\n\
+             naturally: distinguishing_marks, weakness, wealth (a starting amount), \
+             reputation or fame (a starting standing).\n\
              CUSTOM EXTENSIONS — if the player mentions any extra stat, currency, \
              faction standing, curse, or attribute that does not fit a field above \
              (e.g. \"start me with 200 gold and -20 rep with the guards\"), route it \
@@ -9728,25 +9729,30 @@ fn build_creator_assistant_system_prompt(creator_kind: &str) -> String {
              free-form calendar label — month/year/type-of-day, e.g. \"3rd of Harvest, \
              Year 1247, Market Day\"; NOT just \"Day 1\"), time (time-of-day, e.g. \
              \"09:00\" or \"late morning\"), weather (e.g. \"clear\", \"heavy rain\"), \
-             location (the opening place name — becomes the first locations entry).\n\
-             NPC BRANCH (card_type \"npc\"): copy the Player Wizard identity fields \
-             (name, gender, age, race, skin_complexion, height, weight, body_type, \
-             hair_color, hair_length, hair_style, eye_color, clothing, + contextual \
-             breast_size / ears / tail / horn when they apply) — all mandatory; PLUS \
-             personality, flaws, job, backstory, dialogue_style, tone — mandatory. \
-             The card's NPC is the single cast entry {name, identity=job}.\n\
+             tone (the STORY's narrative atmosphere of the whole card, e.g. \"grim low \
+             fantasy\", \"cozy slice-of-life\" — NEVER a character's personal speaking \
+             voice), location (the opening place name).\n\
+             NPC BRANCH (card_type \"npc\") — the character IS the card: the identity \
+             fields (gender, age, race, skin_complexion, height, weight, body_type, \
+             hair_color, hair_length, hair_style, eye_color, + contextual breast_size \
+             / ears / tail / horn when they apply) are all mandatory. The PERSONA set \
+             is mandatory too, every member: personality, dialogue_style (how this \
+             character speaks — the persona home for voice), likes, dislikes, flaws, \
+             goals (what the character is working toward — the story hook), job, \
+             backstory. THE NPC INVENTORY (mandatory block): clothing (what they wear \
+             — always fill from context) + optionally equipped (readied items), \
+             accessories (worn extras), stored (kept items) as arrays of short item \
+             names. Ask what they carry; never invent items.\n\
              SCENARIO BRANCH (card_type \"scenario\"): directive (the core event \
              premise), trigger_condition (what sets it off), primary_objective, \
-             participating_actors (NPC or faction names), tone — all mandatory; \
+             participating_actors (NPC or faction names) — all mandatory; \
              environmental_hazards + outcomes (success/failure hooks) — optional.\n\
              WORLD BRANCH (card_type \"world\"): directive (the world's purpose), setting \
-             (the world's identity), tone — all mandatory.\n\
-             SHARED (all branches): locations = array of {name, neighbors:[strings]} \
-             (the location anchor is the FIRST entry; the graph grows in play). cast = \
-             array of {name, identity} (npc: the one NPC; scenario/world: any starting \
-             NPCs, or omit). custom_tags = optional flat {key:value} string map for \
-             anything that doesn't fit a field above (currency, faction standing, \
-             curse, custom attribute).\n\
+             (the world's identity) — all mandatory.\n\
+             SHARED (all branches): custom_tags = optional flat {key:value} string map \
+             for anything that doesn't fit a field above (currency, faction standing, \
+             curse, custom attribute). Cards carry NO cast and NO locations graph — \
+             NPCs and places beyond the opening location emerge in play.\n\
              THE INTRO QUESTION (mandatory for EVERY card_type — the card cannot be \
              finalized without it): before emitting ready you MUST ask the player \
              whether they want an INTRO (the opening narrator beat that starts the \
@@ -9786,7 +9792,8 @@ fn build_creator_assistant_system_prompt(creator_kind: &str) -> String {
          - Array/chip fields (clothing, gear, tools, weapons): parse \
          conversational input into clean title-cased items. \"a worn-out iron \
          broadsword with a notched hilt\" becomes \"Notched Iron Broadsword\".\n\
-         - Prose fields (backstory, job, distinguishing_marks, personality): \
+         - Prose fields (backstory, job, goal, personality, likes, dislikes, \
+         distinguishing_marks): \
          synthesize the user's words into punchy, third-person narrative prose, \
          preserving every core lore fact — factions, names, hooks, ties. Target \
          ~150-300 words for backstory/description; if the user pastes a very long \
@@ -9810,8 +9817,8 @@ fn build_creator_assistant_system_prompt(creator_kind: &str) -> String {
          - To ask follow-ups: {\"action\":\"ask\", \"message\":\"<one short paragraph to the user>\", \"questions\":[\"<q1>\", ...], \"draft\":{<fields already decided>}}\n\
          - When ready to finalize: {\"action\":\"ready\", \"draft\":{<every required field filled>}}\n\
          The draft accumulates across turns — repeat the fields decided so far on every turn (or omit unchanged ones); never blank out a field already set. Ask at most three short questions per turn, one focused thread at a time — never a wall of questions. \
-         For the player schema: settle gender and race early, then ask only the contextual fields that actually apply (breast_size if the character is female; ears, tail, horn if the race is non-human). Do not emit ready until every core field, every applicable contextual field, and any optional or custom-tag thread the player raised are resolved. \
-         For the sim schema: do not emit ready until draft.card_type + name are set, every universal anchor (date, time, weather, location) is filled, the chosen branch's mandatory fields are complete (npc: the identity fields + personality/flaws/job/backstory/dialogue_style/tone; scenario: directive/trigger_condition/primary_objective/participating_actors/tone; world: directive/setting/tone), AND the INTRO question has been answered (an agreed draft.intro, or an explicit no — never assume either way). \
+         For the player schema: settle gender and race early, then ask only the contextual fields that actually apply (breast_size if the character is female; ears, tail, horn if the race is non-human), and end with the persona question. Do not emit ready until every core field, every applicable contextual field, the persona question, and any optional or custom-tag thread the player raised are resolved. \
+         For the sim schema: do not emit ready until draft.card_type + name are set, every universal anchor (date, time, weather, tone, location) is filled, the chosen branch's mandatory fields are complete (npc: the identity fields + the full persona set personality/dialogue_style/likes/dislikes/flaws/goals/job/backstory + the clothing inventory; scenario: directive/trigger_condition/primary_objective/participating_actors; world: directive/setting), AND the INTRO question has been answered (an agreed draft.intro, or an explicit no — never assume either way). \
          Keep every string value in plain prose (no JSON, no markup) except where the value is itself prose.\n",
     );
 
@@ -11631,20 +11638,30 @@ async fn fable_send(
             if rendered.trim().is_empty() { None } else { Some(rendered) }
         };
 
-        // Build the prose-only API narrator prompt (no BRACKET_PROTOCOL).
+        // Build the prose-only API narrator SYSTEM message (the stable cache
+        // payload: authored voice + <player> block + <sim_card> block — no
+        // per-turn state; that rides the trailing message below).
         // memory_block is shared with the tracker stage — same turn, same
         // player text, same active card, so the one retrieval query above
         // serves both Fable stages (the GM/Narrator unification principle
         // extended to the two-stage turn: one codex, one query).
+        let player_cache_block: Option<String> = state
+            .active_player_cache
+            .lock()
+            .expect("active_player_cache mutex")
+            .clone();
         let narrator_system_prompt = build_api_narrator_system_prompt(
             fable_prompts,
             &card,
+            player_cache_block.as_deref(),
+        );
+        // The per-turn state tail: <player_action> → <world_state> (incl.
+        // tone) → <scene_pacing>, AFTER the history (closest to generation).
+        let narrator_turn_tail = build_narrator_turn_tail(
+            player_action.as_deref(),
             narrator_world_state.as_deref(),
             pacing,
-            player_action.as_deref(),
-            memory_block.as_deref(),
         );
-
         // ---- Stage 2: NARRATOR (API, or LOCAL in dev with no API) ----
         // The launch gate + the top-of-fable_send guard guarantee an active
         // API profile here, so the `None` profile case is purely defensive.
@@ -11676,7 +11693,17 @@ async fn fable_send(
             tracing::info!(
                 "fable_send: DEV MODE — no API profile; narrating via local FableEngine (stat-spammy)"
             );
-            let narrator_prompt = build_narrator_prompt(&narrator_system_prompt, &window);
+            // Dev arm: fold the per-turn tail (+ the depth-2 memory block, as
+            // a plain section — the local <|turn> protocol has no message
+            // list to inject into) into the system prompt.
+            let mem_section = memory_block
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(|m| format!("<retrieved_memory>\n{m}\n</retrieved_memory>\n\n"))
+                .unwrap_or_default();
+            let dev_system = format!("{narrator_system_prompt}\n\n{mem_section}{narrator_turn_tail}");
+            let narrator_prompt = build_narrator_prompt(&dev_system, &window);
             // Re-take the turn lock for this decode (2026-08-15, #44): the
             // Stage-1 guard was dropped above, and a local decode outside the
             // lock could overlap a concurrent chat/schema decode in dev.
@@ -11754,34 +11781,72 @@ async fn fable_send(
             // (see the bug-10 block there). `engine_opt`/`lease_opt` are
             // already `None` in this arm; the Option wrappers keep the fn-end
             // drops in `fable_send`'s tail meaningful for the dev arm.
-            // Re-render the windowed history as flat ApiMessages for the HTTP path
-            // (system + windowed turns; the API folds memory + world_state into
-            // the system message itself).
+            // Re-render the windowed history as flat ApiMessages for the HTTP
+            // path, in the 2026-08-19 Chloe cache order:
+            //   [system: narrative prompt + <player> + <sim_card>]
+            //   [16-message history window]
+            //   [<retrieved_memory> injected at DEPTH 2 — exactly 2 messages
+            //    remain below it (the ST convention)]
+            //   [trailing system: <world_state> + <scene_pacing> (+action)]
             let mut api_msgs: Vec<session::ApiMessage> =
-            Vec::with_capacity(window.len() + 1);
-        api_msgs.push(session::ApiMessage {
-            role: "system".into(),
-            content: narrator_system_prompt.trim().to_string(),
-            raw_output: String::new(),
-        });
-        for m in &window {
-            let role = match m.role {
-                // **2026-07-27 Bug #4 fix:** the OpenAI /chat/completions
-                // standard role for assistant turns is `"assistant"`, NOT
-                // `"model"`. The prior `"model"` mapping (a Gemini/Google
-                // convention) was rejected by z.ai / GLM-5.2 with HTTP error
-                // code 1214 "Incorrect role information". Verified live:
-                // GLM accepts `"assistant"`, rejects `"model"`.
-                session::Role::Assistant => "assistant",
-                session::Role::User => "user",
-                session::Role::System => "system",
-            };
+                Vec::with_capacity(window.len() + 3);
             api_msgs.push(session::ApiMessage {
-                role: role.into(),
-                content: m.content.clone(),
+                role: "system".into(),
+                content: narrator_system_prompt.trim().to_string(),
                 raw_output: String::new(),
             });
-        }
+            for (i, m) in window.iter().enumerate() {
+                let role = match m.role {
+                    // **2026-07-27 Bug #4 fix:** the OpenAI /chat/completions
+                    // standard role for assistant turns is `"assistant"`, NOT
+                    // `"model"`. The prior `"model"` mapping (a Gemini/Google
+                    // convention) was rejected by z.ai / GLM-5.2 with HTTP error
+                    // code 1214 "Incorrect role information". Verified live:
+                    // GLM accepts `"assistant"`, rejects `"model"`.
+                    session::Role::Assistant => "assistant",
+                    session::Role::User => "user",
+                    session::Role::System => "system",
+                };
+                api_msgs.push(session::ApiMessage {
+                    role: role.into(),
+                    content: m.content.clone(),
+                    raw_output: String::new(),
+                });
+                // DEPTH-2 injection: insert the memory block so exactly TWO
+                // history messages remain below it. With the window ending
+                // [..., assistant_prev, user_current], that lands between
+                // messages [-3] and [-2] — above the final exchange, below
+                // everything older (recency without sitting at the very
+                // bottom). Short windows clamp to just-above-the-last-pair.
+                let msgs_below = window.len() - (i + 1);
+                if msgs_below == 2 {
+                    if let Some(mem) = memory_block.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+                        api_msgs.push(session::ApiMessage {
+                            role: "system".into(),
+                            content: format!("<retrieved_memory>\n{mem}\n</retrieved_memory>"),
+                            raw_output: String::new(),
+                        });
+                    }
+                }
+            }
+            // Fallback for short windows (<3 messages) that never hit the
+            // depth-2 boundary: the block still rides, directly above the
+            // tail.
+            if window.len() < 3 {
+                if let Some(mem) = memory_block.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+                    api_msgs.push(session::ApiMessage {
+                        role: "system".into(),
+                        content: format!("<retrieved_memory>\n{mem}\n</retrieved_memory>"),
+                        raw_output: String::new(),
+                    });
+                }
+            }
+        // The trailing per-turn state message (closest to generation).
+        api_msgs.push(session::ApiMessage {
+            role: "system".into(),
+            content: narrator_turn_tail.trim().to_string(),
+            raw_output: String::new(),
+        });
         crate::logs::log(
             "API",
             &format!(
@@ -12455,7 +12520,16 @@ async fn fable_regenerate_slice(
         .fable_prompts
         .get()
         .expect("fable_prompts is set in setup()");
-    let system_prompt = build_slice_regenerate_system_prompt(fable_prompts, &card);
+    let player_cache_block: Option<String> = state
+        .active_player_cache
+        .lock()
+        .expect("active_player_cache mutex")
+        .clone();
+    let system_prompt = build_slice_regenerate_system_prompt(
+        fable_prompts,
+        &card,
+        player_cache_block.as_deref(),
+    );
 
     // Assemble the API message list: system + windowed history (roles mapped
     // OpenAI-style: assistant → "assistant", NOT "model" — Bug #4) + a final
@@ -13014,6 +13088,7 @@ async fn fable_end(
     *state.fable_session.lock().await = session::Conversation::new();
     *state.active_fable_card.lock().expect("active_fable_card mutex") = None;
     *state.active_player_id.lock().expect("active_player_id mutex") = None;
+    *state.active_player_cache.lock().expect("active_player_cache mutex") = None;
 
     // 4. Clear any leftover game cancel token.
     // (2026-08-16 audit LOW) BOTH fable-side slots: the in-flight guard at
@@ -13486,10 +13561,11 @@ async fn player_state_get(
 ///   player_name → user beats). `player_name` is "" when the card omits
 ///   `<player_name>`.
 /// - `card_id` — the seated card's id (for resolving the card portrait
-///   sibling file `cards/<id>/portrait.*`).
+///   sibling file `cards/<Name>/<Name>.<ext>`).
 /// - `card_portrait_url` — absolute path to the card/narrator portrait, or
-///   null when no portrait sibling exists. Resolved via the same png/jpg/jpeg
-///   stat-walk as `fable_card_portrait_url`. The narrator + every NPC (NPC
+///   null when no portrait sibling exists. Resolved via the same
+///   namesake-first stat-walk as `fable_card_portrait_url`
+///   (`find_portrait_sibling`). The narrator + every NPC (NPC
 ///   portraits are deferred) fall back to this in the VN chat UI.
 /// - `player_portrait_url` — absolute path to the active saved player's
 ///   portrait, or null (playerless game / no portrait). Resolved
@@ -13515,18 +13591,11 @@ fn fable_active_card_get(
         // Resolve the card portrait sibling (png/jpg/jpeg stat-walk, mirrors
         // fable_card_portrait_url). Best-effort — a missing cards dir degrades
         // to null.
-        let card_portrait_url = resolve_fable_cards_dir(&app)
-            .map(|root| {
-                let card_dir = resolve_card_dir(&root, &c.id);
-                for ext in ["png", "jpg", "jpeg"] {
-                    let path = card_dir.join(format!("portrait.{ext}"));
-                    if path.is_file() {
-                        return Some(path.to_string_lossy().into_owned());
-                    }
-                }
-                None
-            })
-            .flatten();
+        let card_portrait_url = resolve_fable_cards_dir(&app).and_then(|root| {
+            let card_dir = resolve_card_dir(&root, &c.id);
+            find_portrait_sibling(&card_dir)
+                .map(|name| card_dir.join(name).to_string_lossy().into_owned())
+        });
         // Resolve the active player portrait (null when no player is attached).
         let player_portrait_url = state
             .active_player_id
@@ -13661,12 +13730,46 @@ fn fable_card_get(
     Ok(guard.as_ref().map(|c| {
         serde_json::json!({
             "name": c.name,
-            "core_persona": c.core_persona,
+            "subtype": c.subtype.clone().unwrap_or_default(),
+            "identity": {
+                "gender": c.identity.gender,
+                "race": c.identity.race,
+                "age": c.identity.age,
+                "height": c.identity.height,
+                "weight": c.identity.weight,
+                "body": c.identity.body,
+                "skin": c.identity.skin,
+                "eyes": c.identity.eyes,
+                "hair_color": c.identity.hair_color,
+                "hair_length": c.identity.hair_length,
+                "hair_style": c.identity.hair_style,
+            },
+            "persona": {
+                "personality": c.persona.personality,
+                "conversation_style": c.persona.conversation_style,
+                "likes": c.persona.likes,
+                "dislikes": c.persona.dislikes,
+                "flaws": c.persona.flaws,
+                "goals": c.persona.goals,
+                "occupation": c.persona.occupation,
+                "backstory": c.persona.backstory,
+            },
             "setting": c.setting.clone().unwrap_or_default(),
             "plot": c.plot.clone().unwrap_or_default(),
-            "tone": c.tone.clone().unwrap_or_default(),
-            // opening_scene removed 2026-08-05: the intro lives in a sibling
-            // .intro file, not on the cached card.
+            "world": {
+                "date": c.world.date,
+                "time": c.world.time,
+                "weather": c.world.weather,
+                "tone": c.world.tone.clone().or_else(|| c.tone.clone()),
+            },
+            "location": c.location.clone().unwrap_or_default(),
+            "inventory": {
+                "clothing": c.inventory.clothing,
+                "equipped": c.inventory.equipped,
+                "accessories": c.inventory.accessories,
+                "stored": c.inventory.stored,
+            },
+            "custom_tags": c.custom_tags,
             "player_name": c.player_name.clone().unwrap_or_default(),
         })
     }))
@@ -14092,17 +14195,13 @@ fn fable_card_sibling_write(
 
 /// Set/replace a card's `<intro>` block — the Fable opening narrator beat that
 /// lives as a SIBLING after `</sim_card>` in the `.sim` file (2026-08-13). Rust
-/// owns the XML edit so the two-root shape (`<sim_card>` + `<intro>`) stays
-/// well-formed under the parser's validation. Used by the Creator's dedicated
-/// intro step (which runs AFTER `fable_write_card` made the card) + by the
-/// import path that captures SillyTavern `first_mes`/`alternate_greetings`.
-/// `text` empty → strips any existing `<intro>`/`<introduction>` sibling (clears
+/// owns the XML edit so the two-root shape (`<sim_card>` + its siblings)
+/// stays well-formed under the parser's validation. Used by the Creator's
+/// dedicated intro step (which runs AFTER `fable_write_card` made the card) +
+/// by the import path that captures SillyTavern `first_mes`/
+/// `alternate_greetings`. `text` empty → strips any existing intro (clears
 /// the beat). Validates via `parse_from_xml_str` BEFORE the atomic write so a
 /// malformed edit never lands on disk.
-fn cdata_escape(s: &str) -> String {
-    s.replace("]]>", "]]]]><![CDATA[>")
-}
-
 #[tauri::command]
 fn fable_card_set_intro(card_id: String, text: String, app: tauri::AppHandle) -> Result<(), String> {
     let cards_root = resolve_fable_cards_dir(&app)
@@ -14110,29 +14209,20 @@ fn fable_card_set_intro(card_id: String, text: String, app: tauri::AppHandle) ->
     let path = resolve_card_file(&cards_root, &card_id, "sim");
     let existing = std::fs::read_to_string(&path)
         .map_err(|e| format!("read card for set_intro: {e}"))?;
-    // Slice up to + including the closing `</sim_card>` — this drops any prior
-    // sibling `<intro>`/`<introduction>` (the only elements that live after the
-    // card). The `.codex`/`.world.json` siblings are separate FILES, untouched.
-    // (2026-08-16 audit fix #22) Route through the parser's CDATA/comment-
-    // aware scanner: the naive `find("</sim_card>")` hit the literal string
-    // inside authored CDATA prose — the slice cut mid-CDATA, the rebuild
-    // failed validation, and such a card could never have its intro edited.
-    let end = sim_card::find_root_close(&existing)
-        .ok_or_else(|| "card XML missing </sim_card>".to_string())?;
-    let trimmed = text.trim();
-    let mut out = String::from(&existing[..end]);
-    if !trimmed.is_empty() {
-        out.push_str("\n\n<intro><![CDATA[");
-        out.push_str(&cdata_escape(trimmed));
-        out.push_str("]]></intro>\n");
-    } else {
-        out.push('\n');
-    }
-    // Validate the rebuilt file through the real parser BEFORE the disk touch
-    // (the same gate `fable_write_card` uses).
+    // (2026-08-19) Rebuild through the PARSED card: the tail now carries
+    // `<world>`/`<location>`/`<inventory>` siblings that the old
+    // slice-and-append destroyed on every intro edit. Parse → set the intro →
+    // `serialize_v2` reproduces the canonical layout with every sibling in
+    // place (and lazily converts a legacy card to v2 on its first intro
+    // edit). Validated through the real parser BEFORE the disk touch (the
+    // same gate `fable_write_card` uses).
+    let mut card = sim_card::parse_from_xml_str(&existing)
+        .map_err(|e| format!("existing card failed to parse for set_intro: {e}"))?;
+    card.intro = text.trim().to_owned();
+    let out = card.serialize_v2();
     sim_card::parse_from_xml_str(&out).map_err(|e| format!("set_intro rebuild invalid: {e}"))?;
     write_atomic(&path, out.as_bytes()).map_err(|e| format!("write card (set_intro): {e}"))?;
-    tracing::info!(card_id = %card_id, len = trimmed.len(), "fable_card_set_intro: <intro> sibling written");
+    tracing::info!(card_id = %card_id, len = text.trim().len(), "fable_card_set_intro: <intro> sibling written");
     Ok(())
 }
 
@@ -14141,7 +14231,9 @@ fn fable_card_set_intro(card_id: String, text: String, app: tauri::AppHandle) ->
 /// folder). Takes `bytes_b64: String` (base64-over-JSON — a bare `Vec<u8>` arg
 /// poisons Tauri v2 command registration at startup, see anti-pattern #5) +
 /// `ext` ("png"/"jpg", from the cropper's magic-byte detection). Validates the
-/// ext against an allowlist. The portrait filename is fixed `portrait.<ext>`.
+/// ext against an allowlist. The portrait filename is the namesake
+/// `<Name>.<ext>` — the card folder's display stem, the same derivation as
+/// `resolve_card_file` (see `find_portrait_sibling`).
 #[tauri::command]
 fn fable_card_portrait_write(
     card_id: String,
@@ -14156,7 +14248,7 @@ fn fable_card_portrait_write(
     let bytes = base64_decode(&bytes_b64)?;
     // (P3) Magic-byte validation — mirrors fable_player_portrait_upload_bytes
     // + the background import: a non-image payload must never land on disk
-    // as portrait.png (the ext allowlist alone doesn't check content).
+    // as a portrait file (the ext allowlist alone doesn't check content).
     // (#82) Full signatures, not prefixes: PNG is 8 bytes (89 50 4E 47 0D 0A
     // 1A 0A), JPEG is FF D8 FF — the old 4-byte PNG prefix also matched
     // payloads that merely start with the marker.
@@ -14172,36 +14264,67 @@ fn fable_card_portrait_write(
     std::fs::create_dir_all(&card_dir).map_err(|e| format!("mkdir card folder: {e}"))?;
     // Normalize jpeg → jpg for the filename.
     let file_ext = if ext_lower == "jpeg" { "jpg" } else { &ext_lower };
-    let path = card_dir.join(format!("portrait.{file_ext}"));
+    let stem = card_dir
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("Card")
+        .to_owned();
+    let path = card_dir.join(format!("{stem}.{file_ext}"));
     write_atomic(&path, &bytes).map_err(|e| format!("write portrait: {e}"))?;
-    // (#61) Reap other-ext siblings: discovery prefers png > jpg > jpeg, so
+    // (#61) Reap stale siblings: discovery prefers png > jpg > jpeg, so
     // uploading a new JPEG over an old PNG left the stale PNG winning
-    // forever. The just-written file is the only truth.
-    reap_other_portrait_exts(&card_dir, file_ext);
+    // forever. The just-written file is the only truth — and a fresh write
+    // also folds away any lingering legacy `portrait.<ext>` files.
+    reap_stale_portraits(&card_dir, file_ext);
+    // (2026-08-19) The .lnk/.ico derive from the portrait, but the CREATE
+    // flow writes the portrait AFTER the card — the shortcut built at
+    // card-write time saw no portrait, so its icon fell back to the F.
+    // Refresh it now: a PNG portrait regenerates the namesake `<Name>.ico`
+    // + repoints the .lnk; a JPEG re-points the .lnk at the F icon (ICO
+    // can't embed JPEG) + reaps the stale derived ico. Best-effort — a
+    // shortcut failure must never fail the portrait write.
+    if file_ext != "png" {
+        let _ = std::fs::remove_file(card_dir.join(format!("{stem}.ico")));
+        let _ = std::fs::remove_file(card_dir.join("portrait.ico"));
+    }
+    if let Err(e) = build_card_shortcut(&app, &card_id, false) {
+        tracing::warn!(card_id = %card_id, err = %e, "portrait write: shortcut refresh failed (non-fatal)");
+    }
     tracing::info!(card_id = %card_id, bytes = bytes.len(), "fable_card_portrait_write: portrait written");
     Ok(())
 }
 
-/// Remove `portrait.<ext>` siblings of every ext EXCEPT `keep_ext` in `dir`
-/// (#61). Best-effort: a failed removal is logged, never fatal — worst case
-/// the stale file lingers until the next portrait write.
-fn reap_other_portrait_exts(dir: &std::path::Path, keep_ext: &str) {
+/// Remove every stale portrait sibling in `dir` except the just-written
+/// `<stem>.<keep_ext>` (#61 + the 2026-08-19 namesake rename): other-ext
+/// namesake files AND every legacy `portrait.<ext>` (all exts — a fresh
+/// write folds the folder fully onto the namesake convention). The
+/// case-insensitive keep-guard covers a folder literally named "portrait",
+/// where the namesake + legacy names denote the SAME file on Windows.
+/// Best-effort: a failed removal is logged, never fatal — worst case the
+/// stale file lingers until the next portrait write.
+fn reap_stale_portraits(dir: &std::path::Path, keep_ext: &str) {
+    let Some(stem) = dir.file_name().and_then(|n| n.to_str()).map(|s| s.to_owned()) else {
+        return;
+    };
+    let keep_name = format!("{stem}.{keep_ext}");
     for ext in ["png", "jpg", "jpeg"] {
-        if ext == keep_ext {
-            continue;
-        }
-        let stale = dir.join(format!("portrait.{ext}"));
-        match std::fs::remove_file(&stale) {
-            Ok(()) => tracing::debug!(ext, "reaped stale portrait sibling"),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => tracing::warn!(ext, error = %e, "failed to reap stale portrait sibling"),
+        for name in [format!("{stem}.{ext}"), format!("portrait.{ext}")] {
+            if name.eq_ignore_ascii_case(&keep_name) {
+                continue;
+            }
+            let stale = dir.join(&name);
+            match std::fs::remove_file(&stale) {
+                Ok(()) => tracing::debug!(name, "reaped stale portrait sibling"),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => tracing::warn!(name, error = %e, "failed to reap stale portrait sibling"),
+            }
         }
     }
 }
 
-/// Resolve the absolute filesystem path to a card's portrait sibling (if one
+/// Resolve the absolute filesystem path to a card's portrait (if one
 /// exists), ready for the frontend's `convertFileSrc`. Returns None when no
-/// `portrait.png`/`.jpg` sibling is present. Used by the Load menu's modal to
+/// portrait sibling is present. Used by the Load menu's modal to
 /// refresh the portrait in place after a crop/re-save without re-fetching the
 /// whole card list. Best-effort: a stat error degrades to None.
 #[tauri::command]
@@ -14209,11 +14332,8 @@ fn fable_card_portrait_url(card_id: String, app: tauri::AppHandle) -> Result<Opt
     let cards_root = resolve_fable_cards_dir(&app)
         .ok_or_else(|| "no apps/fable/cards/ dir resolved".to_string())?;
     let card_dir = resolve_card_dir(&cards_root, &card_id);
-    for ext in ["png", "jpg", "jpeg"] {
-        let path = card_dir.join(format!("portrait.{ext}"));
-        if path.is_file() {
-            return Ok(Some(path.to_string_lossy().into_owned()));
-        }
+    if let Some(name) = find_portrait_sibling(&card_dir) {
+        return Ok(Some(card_dir.join(name).to_string_lossy().into_owned()));
     }
     Ok(None)
 }
@@ -14522,13 +14642,16 @@ fn card_shortcut_label(sim_path: &std::path::Path, card_slug: &str) -> String {
 /// reaps it automatically via `remove_dir_all`); when `export_to_desktop` is
 /// true, an additional copy is written to the user's Desktop.
 ///
-/// Icon: if the card has a `portrait.png`, it's wrapped into a sibling
-/// `portrait.ico` (Vista+ PNG-compressed icon) and used; otherwise the
+/// Icon: if the card has a PNG portrait, it's wrapped into a namesake
+/// `<Name>.ico` (Vista+ PNG-compressed icon) and used; otherwise the
 /// shortcut falls back to `fable.exe`'s embedded F icon (cards with no
 /// portrait, or a `.jpg` portrait which can't be embedded in ICO).
 ///
-/// Shared by the `create_card_shortcut` IPC (manual / desktop export) AND the
-/// auto-creation hook in `fable_write_card` (in-folder only, best-effort).
+/// Shared by the `create_card_shortcut` IPC (manual / desktop export), the
+/// auto-creation hook in `fable_write_card` (in-folder only, best-effort),
+/// the post-portrait refresh in `fable_card_portrait_write` (the CREATE flow
+/// lands the portrait AFTER the card — this is what mints the .ico), + the
+/// boot migration's self-heal (a PNG portrait without its namesake .ico).
 fn build_card_shortcut(
     app: &tauri::AppHandle,
     card_slug: &str,
@@ -14565,27 +14688,42 @@ fn build_card_shortcut(
             install_root.display()
         ));
     }
-    // QUOTE the slug: card folder names may contain spaces ("One Piece"), and
+    // QUOTE the card token: folder names contain spaces ("One Piece"), and
     // the .lnk Arguments string is re-split by CommandLineToArgvW on launch —
     // unquoted, `--card One Piece` parses as card="One" + a dropped "Piece"
     // (observed live: get_launch_context returned cardSlug "One"). Quoted,
-    // it round-trips as the single argv token the parser expects.
-    let args = format!("--card \"{card_slug}\"");
+    // it round-trips as the single argv token the parser expects. The token
+    // is the DISPLAY FOLDER NAME (the durable on-disk identity — survives
+    // name edits; `find_card_by_id` also matches it case-insensitively as a
+    // fallback, so legacy slug .lnks keep launching too).
+    let folder_name = card_dir
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(card_slug)
+        .to_string();
+    let args = format!("--card \"{folder_name}\"");
 
-    // Icon: wrap portrait.png → portrait.ico (only PNG — ICO can't embed a
-    // JPEG). Anything else (jpg / no portrait) → None → fable.exe's F icon.
+    // Icon: wrap the card's PNG portrait (namesake `<Name>.png`, legacy
+    // `portrait.png` fallback — whichever discovery found) into a namesake
+    // `<Name>.ico` (only PNG — ICO can't embed a JPEG). Anything else (jpg /
+    // no portrait) → None → fable.exe's F icon.
     let icon_path: Option<std::path::PathBuf> = {
-        let png_rel = portrait_path_for(&cards_root, card_slug);
-        if png_rel.as_deref() == Some("portrait.png") {
-            let png_abs = card_dir.join("portrait.png");
+        let png_rel = portrait_path_for(&cards_root, card_slug)
+            .filter(|name| name.to_lowercase().ends_with(".png"));
+        if let Some(png_name) = png_rel {
+            let png_abs = card_dir.join(&png_name);
             match std::fs::read(&png_abs)
                 .ok()
                 .and_then(|bytes| shortcut::png_to_ico(&bytes))
             {
                 Some(ico) => {
-                    let ico_path = card_dir.join("portrait.ico");
+                    let ico_stem = card_dir
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or(card_slug);
+                    let ico_path = card_dir.join(format!("{ico_stem}.ico"));
                     if let Err(e) = write_atomic(&ico_path, &ico) {
-                        tracing::warn!(card_id = %card_slug, err = %e, "portrait.ico write failed; shortcut falls back to F icon");
+                        tracing::warn!(card_id = %card_slug, err = %e, "icon write failed; shortcut falls back to F icon");
                         None
                     } else {
                         Some(ico_path)
@@ -14691,9 +14829,9 @@ async fn purge_deleted_card_memory(state: &AppState, card_id: &str) {
     }
 }
 
-/// Delete a card's entire per-card folder (`cards/<id>/` — the `.sim` + every
-/// sibling: `.intro`, `.codex`, `world.json`, `player.json`, `npc.json`,
-/// `portrait.*`, `portrait.ico`, the `saves/` tree, AND the in-folder `Launch
+/// Delete a card's entire per-card folder (`cards/<Name>/` — the `.sim` + every
+/// sibling: `.intro`, `.codex`, `world.json`, `player.json`, `npc.json`, the
+/// portrait + `.ico`, the `saves/` tree, AND the in-folder `Launch
 /// <Name>.lnk`). Added 2026-08-05 for the LOAD menu's DELETE action; the
 /// desktop `.lnk` (exported by `create_card_shortcut`) is reaped here too.
 /// Mirrors `fable_player_delete`'s discipline: path-traversal guard on the id
@@ -14752,7 +14890,11 @@ async fn fable_card_delete(
         // caller id sanitizes onto the real folder on Windows (case-
         // insensitive exists()) while the partition key stayed byte-exact.
         purge_deleted_card_memory(&state, &card_id).await;
-        purge_deleted_card_memory(&state, &sanitize_card_slug(&card_id)).await;
+        if let Some(slug) = slugify_card_stem(&card_id) {
+            if slug != card_id {
+                purge_deleted_card_memory(&state, &slug).await;
+            }
+        }
         return Ok(());
     }
     // Confirm the folder actually contains its namesake `<id>.sim` so a stray
@@ -14789,14 +14931,15 @@ async fn fable_card_delete(
     // Nuke the memory partition too: folder, .lnk, episodic rows, codex rows,
     // FTS/vec mirrors — all of it (§4: deleting ANYTHING leaves nothing in
     // memory.sqlite). Purge every key the rows could live under: the raw
-    // caller id, its sanitized form, and the parsed embedded id.
+    // caller id, its slug-normalized form, and the parsed embedded id (the
+    // partition keys are always slugify_card_stem outputs).
     purge_deleted_card_memory(&state, &card_id).await;
-    let sanitized_caller_id = sanitize_card_slug(&card_id);
-    if sanitized_caller_id != card_id {
-        purge_deleted_card_memory(&state, &sanitized_caller_id).await;
+    let normalized_caller_id = slugify_card_stem(&card_id).unwrap_or_default();
+    if !normalized_caller_id.is_empty() && normalized_caller_id != card_id {
+        purge_deleted_card_memory(&state, &normalized_caller_id).await;
     }
     if let Some(parsed) = parsed_card_id {
-        if parsed != card_id && parsed != sanitized_caller_id {
+        if parsed != card_id && Some(parsed.clone()) != Some(normalized_caller_id.clone()) {
             purge_deleted_card_memory(&state, &parsed).await;
         }
     }
@@ -16078,16 +16221,30 @@ fn resolve_fable_cards_dir(app: &tauri::AppHandle) -> Option<std::path::PathBuf>
 /// error string (not a panic) if no card with that id exists.
 ///
 /// **2026-08-01 folder layout:** cards live in per-card folders
-/// (`cards/<id>/<id>.sim`). `iter_card_sim_paths` is the single walker both
-/// enumerators share. First id match wins.
+/// (`cards/<Name>/<Name>.sim` — display-named since 2026-08-19).
+/// `iter_card_sim_paths` is the single walker both enumerators share. First
+/// parsed-id match wins; the folder-name fallback covers a `--card` arg
+/// carrying the display folder name (the .lnk form).
 fn find_card_by_id(dir: &std::path::Path, target_id: &str) -> Result<sim_card::SimCard, String> {
     for path in iter_card_sim_paths(dir) {
         let card = sim_card::load_or_fallback(&path);
-        if card.id == target_id && card.card_type == "roleplay" {
+        if card.id == target_id && card.card_type == "simulation" {
             return Ok(card);
         }
     }
-    Err(format!("no roleplay card with id '{target_id}' in {}", dir.display()))
+    // Folder-name fallback (case-insensitive): the launch shortcut carries
+    // the display folder name; a pre-2026-08-19 .lnk carries the old slug.
+    let want = target_id.to_lowercase();
+    for path in iter_card_sim_paths(dir) {
+        let folder = path.parent().and_then(|p| p.file_name()).and_then(|n| n.to_str());
+        if folder.is_some_and(|f| f.to_lowercase() == want) {
+            let card = sim_card::load_or_fallback(&path);
+            if card.card_type == "simulation" {
+                return Ok(card);
+            }
+        }
+    }
+    Err(format!("no simulation card with id '{target_id}' in {}", dir.display()))
 }
 
 /// Enumerate every `.sim` file under a cards root. Each card lives in a
@@ -16120,16 +16277,17 @@ fn iter_card_sim_paths(cards_root: &std::path::Path) -> Vec<std::path::PathBuf> 
 }
 
 /// Sanitize a card id to a bare slug segment (`[alnum_-]+`, dashes trimmed;
-/// Unicode alphanumerics kept — the card-side convention). Shared by the
-/// directory join AND the filename join so both halves of every card path
-/// derive from the SAME cleaned stem.
+/// Unicode alphanumerics kept — the card-side convention). Retained for the
+/// MEMORY PARTITION key + `[PRESENCE]`/npc ids; PATH resolution no longer
+/// uses it (2026-08-19 identity split: folders are display-named, resolved
+/// by the walker below).
 ///
 /// (2026-08-15 audit H2) `resolve_card_file` used to sanitize the DIRECTORY
 /// half but embed the RAW id in the `<card_id>.<ext>` filename — a caller-
 /// supplied `../../x` id resolved to `cards/x/../../x.sim`, escaping the
 /// cards tree (the by-id reader/writer/intro/sibling IPCs feed card_id
-/// straight through). One cleaned stem for both segments closes every
-/// card-side instance at once.
+/// straight through). The walker-based resolver closes the whole class
+/// harder: paths are only ever built from enumerated directories.
 /// (2026-08-15 audit fix) Slug length cap — the JS `slugify` (card-serialize.js)
 /// caps at 64 chars; the Rust side now mirrors it so a hostile/oversize id
 /// can't build absurd paths (<slug>/<slug>.sim must stay well under MAX_PATH).
@@ -16150,44 +16308,464 @@ fn cap_slug_chars(s: String) -> String {
         .to_string()
 }
 
-fn sanitize_card_slug(card_id: &str) -> String {
-    // (P2 hardening) with parse-time slug normalization every legitimate id
-    // is [alnum_-]+, so separators, parent refs, and drive prefixes are
-    // malformed or hostile - they can never escape the cards root from here
-    // on.
-    let safe: String = card_id
-        .chars()
-        .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '-' })
-        .collect();
-    // (2026-08-16 audit fix #3) Same dash-run collapse as `slugify_card_stem`
-    // — no-op on the already-normalized ids that are the only legitimate
-    // callers, but keeps malformed/hostile ids on the same reduction the
-    // slug derivation applies.
-    let safe = cap_slug_chars(collapse_dash_runs(&safe).trim_matches('-').to_string());
-    if safe.is_empty() {
-        "__unknown_card__".to_string()
-    } else {
-        safe
+/// The DISPLAY-name stem (2026-08-19 Chloe ruling): folder + file names
+/// derive from the card/player NAME with spaces + capitals PRESERVED
+/// ("One Piece" → folder `One Piece`, file `One Piece.sim`), sanitized only
+/// for filesystem safety — Windows-invalid chars (`<>:"/\|?*`) + C0 controls
+/// map to spaces, leading/trailing dots + spaces drop (Windows refuses them
+/// as folder names), 64-char cap, reserved base names get a `-card` suffix.
+/// Modeled on `safe_shortcut_name` (which has proven the approach for .lnk
+/// labels).
+pub(crate) fn safe_display_stem(name: &str, fallback: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    for ch in name.trim().chars() {
+        let code = ch as u32;
+        let invalid = matches!(ch, '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*')
+            || code <= 0x1F;
+        out.push(if invalid { ' ' } else { ch });
     }
+    // Collapse the whitespace runs the invalid-char map introduced + trim.
+    let mut collapsed = String::with_capacity(out.len());
+    let mut last_ws = false;
+    for ch in out.chars() {
+        if ch.is_whitespace() {
+            if !last_ws {
+                collapsed.push(' ');
+            }
+            last_ws = true;
+        } else {
+            collapsed.push(ch);
+            last_ws = false;
+        }
+    }
+    let stem = cap_slug_chars(collapsed.trim().trim_end_matches(['.', ' ']).to_string());
+    if stem.is_empty() {
+        return fallback.to_string();
+    }
+    if WINDOWS_RESERVED_STEMS.contains(&stem.to_lowercase().as_str()) {
+        return format!("{stem}-card");
+    }
+    stem
 }
 
-/// Resolve a card's per-card folder: `cards_root/<card_id>/`. Created on
-/// demand by the writers; readers treat NotFound as "no folder yet".
+/// `safe_display_stem` + collision relief: when `<root>/<stem>` already
+/// exists (Windows folders are case-insensitive — "aether" collides with
+/// "Aether"), append " 2", " 3", … until free. Used by card/player writes +
+/// the boot migration. `respect_existing` is the folder we're ALLOWED to
+/// keep (an edit/rename writing its own folder).
+pub(crate) fn unique_display_stem(
+    root: &std::path::Path,
+    name: &str,
+    fallback: &str,
+    keep: Option<&std::path::Path>,
+) -> String {
+    let base = safe_display_stem(name, fallback);
+    let taken = |stem: &str| {
+        let p = root.join(stem);
+        if let Some(k) = keep {
+            if k == p {
+                return false;
+            }
+        }
+        p.exists()
+    };
+    if !taken(&base) {
+        return base;
+    }
+    for n in 2..100 {
+        let candidate = format!("{base} {n}");
+        if !taken(&candidate) {
+            return candidate;
+        }
+    }
+    base // exhausted — the writer's exists() check surfaces the collision
+}
+
+/// Process-wide card-folder resolution cache: memory-partition slug → the
+/// ACTUAL on-disk folder (display-named since 2026-08-19). Populated by the
+/// walker + the writers; folders are stable within a boot (the migration
+/// runs before any IPC). Keyed by `<cards_root>|<slug>` so tests with
+/// tempdirs can't cross-pollute.
+static CARD_FOLDER_CACHE: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<String, std::path::PathBuf>>,
+> = std::sync::OnceLock::new();
+
+fn card_folder_cache(
+) -> &'static std::sync::Mutex<std::collections::HashMap<String, std::path::PathBuf>> {
+    CARD_FOLDER_CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Record a card folder under its partition slug (writers + migration call
+/// this so subsequent by-id resolutions skip the walk).
+pub(crate) fn cache_card_folder(cards_root: &std::path::Path, card_id: &str, folder: &std::path::Path) {
+    let key = format!("{}|{}", cards_root.display(), card_id);
+    card_folder_cache().lock().unwrap().insert(key, folder.to_path_buf());
+}
+
+/// Resolve a card's ACTUAL folder by walking `cards_root` + matching the
+/// parsed `<metadata><id>` slug — the folder NAME is display-derived and may
+/// contain spaces/capitals, so it can never be reconstructed from the id.
+/// Cache-first; the walk parses each namesake `.sim` (a handful of small
+/// files — sub-millisecond). `None` when no card with that id exists (the
+/// callers' create-fallback path derives a fresh display folder).
+fn resolve_card_folder(cards_root: &std::path::Path, card_id: &str) -> Option<std::path::PathBuf> {
+    let want = slugify_card_stem(card_id)?;
+    let key = format!("{}|{}", cards_root.display(), want);
+    if let Some(hit) = card_folder_cache().lock().unwrap().get(&key) {
+        if hit.is_dir() {
+            return Some(hit.clone());
+        }
+    }
+    for path in iter_card_sim_paths(cards_root) {
+        let card = sim_card::load_or_fallback(&path);
+        if card.id == want && card.card_type == "simulation" {
+            let folder = path.parent()?.to_path_buf();
+            cache_card_folder(cards_root, &want, &folder);
+            return Some(folder);
+        }
+    }
+    None
+}
+
+/// Resolve a card's per-card folder: the walker-resolved ACTUAL folder when
+/// the card exists, else a fresh display-stem folder under the cards root
+/// (the create path — the writer mkdirs it). Callers hand the card's parsed
+/// slug id; the display name inside the file is the folder authority.
 fn resolve_card_dir(cards_root: &std::path::Path, card_id: &str) -> std::path::PathBuf {
-    cards_root.join(sanitize_card_slug(card_id))
+    if let Some(folder) = resolve_card_folder(cards_root, card_id) {
+        return folder;
+    }
+    cards_root.join(safe_display_stem(card_id, "Card"))
 }
 
 /// Resolve a sibling file inside a card's per-card folder:
-/// `cards_root/<card_id>/<card_id>.<ext>` (e.g. `<id>.sim`, `<id>.codex`).
-/// BOTH segments are built from the same sanitized stem (see
-/// `sanitize_card_slug` — the filename half used to carry the raw id).
+/// `<folder>/<folder_name>.<ext>` (e.g. `Liam.sim`, `Liam.codex`). Both
+/// segments derive from the RESOLVED folder's own name — never from caller
+/// input — so traversal-style ids resolve to nonexistent paths (walk miss →
+/// display-stem fallback under the root, which simply doesn't exist).
 fn resolve_card_file(
     cards_root: &std::path::Path,
     card_id: &str,
     ext: &str,
 ) -> std::path::PathBuf {
-    let safe = sanitize_card_slug(card_id);
-    cards_root.join(&safe).join(format!("{safe}.{ext}"))
+    let dir = resolve_card_dir(cards_root, card_id);
+    let stem = dir
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("Card")
+        .to_owned();
+    dir.join(format!("{stem}.{ext}"))
+}
+
+/// Fold legacy fixed-name portraits (`portrait.<ext>`) onto the folder's
+/// namesake stem (`<Folder>.<ext>`) — the 2026-08-19 ruling that portraits
+/// ride the `<Name>.sim` / `<Name>.player` naming. Idempotent; returns true
+/// when anything moved (callers refresh the derived `.lnk`/`.ico`). A
+/// namesake file of the SAME ext wins (the legacy copy is reaped as a stale
+/// twin); the derived legacy `portrait.ico` goes too when any fold happened
+/// (`build_card_shortcut` regenerates it under the stem). Skipped outright
+/// for a folder literally named "portrait" — there the namesake + legacy
+/// names denote the SAME file on case-insensitive Windows.
+pub(crate) fn rename_legacy_portraits(dir: &std::path::Path) -> bool {
+    let Some(stem) = dir.file_name().and_then(|n| n.to_str()).map(|s| s.to_owned()) else {
+        return false;
+    };
+    if stem.eq_ignore_ascii_case("portrait") {
+        return false;
+    }
+    let mut moved = false;
+    for ext in ["png", "jpg", "jpeg"] {
+        let legacy = dir.join(format!("portrait.{ext}"));
+        if !legacy.is_file() {
+            continue;
+        }
+        let namesake = dir.join(format!("{stem}.{ext}"));
+        if namesake.is_file() {
+            // The namesake is canonical; the legacy copy is a stale twin.
+            let _ = std::fs::remove_file(&legacy);
+        } else if std::fs::rename(&legacy, &namesake).is_ok() {
+            moved = true;
+        }
+    }
+    if moved {
+        let _ = std::fs::remove_file(dir.join("portrait.ico"));
+    }
+    moved
+}
+
+/// Move every per-card file from `old` into `new` (a rename: the card's
+/// name changed → new display folder). Fixed-name files (`saves/`,
+/// `session.json`) ride as-is; stem-named files (`<stem>.codex`,
+/// `<stem>.world.json`, the namesake portrait `<stem>.<ext>` + `.ico`, …)
+/// re-stem onto the new folder name; a legacy `portrait.<ext>` rides as-is
+/// (the boot migration's `rename_legacy_portraits` pass folds it). The old
+/// `.sim` + `.lnk` are skipped (the caller writes the fresh `.sim`; the
+/// `.lnk` re-derives). Best-effort, logged, never fatal — a leftover old
+/// folder is inert (the walker only lists the new namesake).
+pub(crate) fn migrate_card_folder_contents(old: &std::path::Path, new: &std::path::Path) {
+    let old_stem = old
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or_default()
+        .to_owned();
+    let new_stem = new
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or_default()
+        .to_owned();
+    if old_stem.is_empty() || new_stem.is_empty() || old == new {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(old) else {
+        return;
+    };
+    if let Err(e) = std::fs::create_dir_all(new) {
+        tracing::warn!(from = %old.display(), to = %new.display(), err = %e, "card folder migration mkdir failed");
+        return;
+    }
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name_str) = name.to_str() else { continue };
+        let path = entry.path();
+        if name_str.ends_with(".lnk") || name_str.ends_with(".sim") {
+            continue;
+        }
+        let dest_name = if path.is_dir() {
+            name_str.to_owned()
+        } else if let Some(rest) = name_str.strip_prefix(&format!("{old_stem}.")) {
+            format!("{new_stem}.{rest}")
+        } else {
+            name_str.to_owned()
+        };
+        let dest = new.join(&dest_name);
+        if dest.exists() {
+            continue; // never clobber the new folder's own state
+        }
+        if let Err(e) = std::fs::rename(&path, &dest) {
+            tracing::warn!(file = %name_str, err = %e, "card folder migration: file move failed (continuing)");
+        }
+    }
+    // Everything movable has moved; drop the husk (its .sim/.lnk remain).
+    let _ = std::fs::remove_dir_all(old);
+    crate::logs::log(
+        "SYS",
+        &format!("card folder renamed: {} -> {}", old_stem, new_stem),
+    );
+}
+
+/// The ONE-SHOT boot migration to the v2 card/player format (Chloe ruling
+/// 2026-08-19). Runs in `setup()` BEFORE any window exists, so no IPC can
+/// race it. Idempotent per boot: a card/player already in the v2 shape +
+/// display-named folder is only cached; a legacy one is rewritten
+/// (`.sim` re-serialized v2 / `.json` converted to `.player`) + its folder
+/// renamed to the display name. Best-effort + logged under SYS — a failed
+/// entry is skipped, never fatal (the legacy back-compat parser keeps it
+/// loadable; the next boot retries).
+pub(crate) fn migrate_cards_v2(app: &tauri::AppHandle) {
+    let fable_dir = resolve_apps_dir(app).join("fable");
+    migrate_sim_cards_v2(&fable_dir.join("cards"), app);
+    migrate_players_v2(&fable_dir.join("players"));
+}
+
+fn migrate_sim_cards_v2(cards_root: &std::path::Path, app: &tauri::AppHandle) {
+    let Ok(entries) = std::fs::read_dir(cards_root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+            continue;
+        }
+        let Some(folder_name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        let sim_path = path.join(format!("{folder_name}.sim"));
+        if !sim_path.is_file() {
+            continue;
+        }
+        let Ok(xml) = std::fs::read_to_string(&sim_path) else {
+            continue;
+        };
+        let Ok(card) = sim_card::parse_from_xml_str(&xml) else {
+            crate::logs::log(
+                "SYS",
+                &format!("v2 migration: unparseable card folder '{}' skipped", crate::logs::brief(folder_name)),
+            );
+            continue;
+        };
+        // System cards (wupi.sim never lives here, but belt-and-suspenders)
+        // keep the legacy shape forever.
+        if card.card_type != "simulation" {
+            continue;
+        }
+        // (2026-08-19 portrait namesake fold) Any legacy `portrait.<ext>` in
+        // the folder moves onto the stem BEFORE the rename branches below
+        // (`migrate_card_folder_contents` then re-stems it like every other
+        // namesake file). Runs for already-v2 folders too — idempotent.
+        let folded_portrait = rename_legacy_portraits(&path);
+        if folded_portrait {
+            crate::logs::log(
+                "SYS",
+                &format!(
+                    "v2 migration: portrait namesake rename in '{}'",
+                    crate::logs::brief(folder_name)
+                ),
+            );
+        }
+        let display = safe_display_stem(&card.name, folder_name);
+        let needs_rewrite = !card.format_v2;
+        let needs_rename = display != folder_name;
+        if !needs_rewrite && !needs_rename {
+            cache_card_folder(cards_root, &card.id, &path);
+            // The fold removed the legacy portrait.ico the .lnk pointed at —
+            // rebuild the shortcut (regenerates the namesake .ico + repoints
+            // the .lnk). The rewrite/rename branches below hit the shared
+            // tail refresh instead.
+            //
+            // Shortcut self-heal (2026-08-19): the .lnk/.ico derive from the
+            // portrait, but the CREATE flow writes the portrait AFTER the
+            // card — a shortcut built at card-write time saw no portrait and
+            // fell back to the F icon, and nothing regenerated it. When a
+            // PNG portrait exists without its namesake .ico, build it now.
+            // Converges: once the .ico exists, later boots no-op.
+            let png_portrait = portrait_path_for(cards_root, &card.id)
+                .map_or(false, |n| n.to_lowercase().ends_with(".png"));
+            let missing_icon = png_portrait
+                && !path.join(format!("{folder_name}.ico")).is_file();
+            if folded_portrait || missing_icon {
+                if let Err(e) = build_card_shortcut(app, &card.id, false) {
+                    tracing::warn!(card_id = %card.id, err = %e, "portrait fold: shortcut refresh failed (non-fatal)");
+                }
+            }
+            continue;
+        }
+        let target = if needs_rename {
+            cards_root.join(unique_display_stem(cards_root, &card.name, folder_name, Some(&path)))
+        } else {
+            path.clone()
+        };
+        // The .sim is written fresh into the TARGET folder (v2 layout when
+        // the card was legacy; verbatim when only the folder name changes).
+        let out_xml = if needs_rewrite { card.serialize_v2() } else { xml };
+        if needs_rename && target != path {
+            if let Err(e) = std::fs::create_dir_all(&target) {
+                crate::logs::log("SYS", &format!("v2 migration: mkdir {} failed: {}", crate::logs::brief(&target.display().to_string()), e));
+                continue;
+            }
+            let new_stem = target
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or(folder_name)
+                .to_owned();
+            if let Err(e) = write_atomic(&target.join(format!("{new_stem}.sim")), out_xml.as_bytes()) {
+                crate::logs::log("SYS", &format!("v2 migration: write {} failed: {}", crate::logs::brief(&new_stem), e));
+                continue;
+            }
+            // Carry saves/session/codex/schema-split/portrait; re-stem the
+            // id-keyed files onto the display stem; reap the husk + old .lnk.
+            migrate_card_folder_contents(&path, &target);
+            cache_card_folder(cards_root, &card.id, &target);
+        } else {
+            if let Err(e) = write_atomic(&sim_path, out_xml.as_bytes()) {
+                crate::logs::log("SYS", &format!("v2 migration: rewrite {} failed: {}", crate::logs::brief(folder_name), e));
+                continue;
+            }
+            cache_card_folder(cards_root, &card.id, &path);
+        }
+        // Refresh the in-folder .lnk (label + --card arg now display-named).
+        if let Err(e) = build_card_shortcut(app, &card.id, false) {
+            tracing::warn!(card_id = %card.id, err = %e, "v2 migration: shortcut refresh failed (non-fatal)");
+        }
+        crate::logs::log(
+            "SYS",
+            &format!(
+                "v2 migration: card '{}' -> {}{}",
+                crate::logs::brief(folder_name),
+                target.display(),
+                if needs_rewrite { " (format v2)" } else { "" }
+            ),
+        );
+    }
+}
+
+fn migrate_players_v2(players_root: &std::path::Path) {
+    let Ok(entries) = std::fs::read_dir(players_root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+            continue;
+        }
+        let Some(folder_name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        let player_file = path.join(format!("{folder_name}.player"));
+        let legacy_json = path.join(format!("{folder_name}.json"));
+        let Some(sp) = load_player_at(&player_file).or_else(|| load_player_at(&legacy_json)) else {
+            crate::logs::log(
+                "SYS",
+                &format!("v2 migration: unparseable player folder '{}' skipped", crate::logs::brief(folder_name)),
+            );
+            continue;
+        };
+        let sp = player::fold_legacy_lists(&sp);
+        // (2026-08-19 portrait namesake fold) legacy `portrait.<ext>` →
+        // `<folder>.<ext>` before the carry below (no-op once folded).
+        if rename_legacy_portraits(&path) {
+            crate::logs::log(
+                "SYS",
+                &format!(
+                    "v2 migration: portrait namesake rename in '{}'",
+                    crate::logs::brief(folder_name)
+                ),
+            );
+        }
+        let display = safe_display_stem(&sp.name, folder_name);
+        let needs_rename = display != folder_name;
+        let target = if needs_rename {
+            players_root.join(unique_display_stem(players_root, &sp.name, folder_name, Some(&path)))
+        } else {
+            path.clone()
+        };
+        if let Err(e) = std::fs::create_dir_all(&target) {
+            crate::logs::log("SYS", &format!("v2 migration: player mkdir failed: {e}"));
+            continue;
+        }
+        let new_stem = target
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or(folder_name)
+            .to_owned();
+        let xml = player::render_player_xml(&sp);
+        if let Err(e) = write_atomic(&target.join(format!("{new_stem}.player")), xml.as_bytes()) {
+            crate::logs::log("SYS", &format!("v2 migration: player write failed: {e}"));
+            continue;
+        }
+        // Carry the portrait (the namesake `<folder>.<ext>` — the fold above
+        // already moved any legacy `portrait.<ext>` onto it); drop the
+        // legacy .json (converted) + the husk.
+        for ext in ["png", "jpg", "jpeg"] {
+            let src = path.join(format!("{folder_name}.{ext}"));
+            let dest = target.join(format!("{new_stem}.{ext}"));
+            if src.is_file() && src != dest {
+                let _ = std::fs::rename(&src, &dest);
+            }
+        }
+        let _ = std::fs::remove_file(&legacy_json);
+        if target != path {
+            let _ = std::fs::remove_dir_all(&path);
+        }
+        cache_player_folder(players_root, &sp.id, &target);
+        crate::logs::log(
+            "SYS",
+            &format!(
+                "v2 migration: player '{}' -> {}",
+                crate::logs::brief(folder_name),
+                target.display()
+            ),
+        );
+    }
 }
 
 // === SAVED PLAYERS (2026-08-02) ===========================================
@@ -16205,17 +16783,9 @@ fn resolve_fable_players_dir(app: &tauri::AppHandle) -> std::path::PathBuf {
 }
 
 /// Sanitize a player id to a bare slug segment (`[alnum_-]+`, dashes trimmed;
-/// Unicode alphanumerics kept) — the player-side sibling of
-/// `sanitize_card_slug`.
-///
-/// (2026-08-15 audit H3) the read / rename / portrait IPCs used to join the
-/// RAW caller-supplied `id` into both the folder and the `<id>.json`
-/// filename — `../..` traversed out of the players root (the write path's
-/// rename branch could MOVE an arbitrary directory; the portrait uploads
-/// wrote `portrait.png` into any traversed existing dir).
-/// `fable_player_delete` already had the reject-style guard; these paths now
-/// share the same one-cleaned-stem discipline. A hostile id mangles to a
-/// nonexistent path → the callers' existing "not found" errors.
+/// Unicode alphanumerics kept) — the player-side id/partition discipline.
+/// PATH resolution no longer joins this directly (2026-08-19: folders are
+/// display-named + walker-resolved, mirroring the card side).
 fn sanitize_player_slug(id: &str) -> String {
     let safe: String = id
         .chars()
@@ -16241,40 +16811,66 @@ fn sanitize_player_slug(id: &str) -> String {
     }
 }
 
-/// Resolve a saved player's portrait to an absolute filesystem path (ready
-/// for the frontend's `convertFileSrc`), or `None` when the player has no
-/// portrait or the portrait file is missing/stale. Loads the player JSON,
-/// reads the relative `portrait` filename, and stat-checks the sibling file.
-/// Shared by `fable_player_get` (full player load) and `fable_active_card_get`
-/// (chat portrait bridge) so the resolution logic lives in one place.
-/// Best-effort: a missing player JSON or a stat error degrades to `None`.
-fn load_player_portrait(app: &tauri::AppHandle, id: &str) -> Option<String> {
-    let dir = resolve_fable_players_dir(app);
-    let safe = sanitize_player_slug(id);
-    let json_path = dir.join(&safe).join(format!("{safe}.json"));
-    let player = load_player_at(&json_path)?;
-    let fname = player.portrait?;
-    // The stored portrait filename is ours by construction (`portrait.png`/
-    // `portrait.jpg`), but a hand-edited JSON could carry a traversal path —
-    // refuse anything with separators or parent refs before joining.
-    if fname.contains('/') || fname.contains('\\') || fname.contains("..") {
-        return None;
-    }
-    let abs = dir.join(&safe).join(&fname);
-    if abs.is_file() {
-        Some(abs.to_string_lossy().into_owned())
-    } else {
-        None
-    }
+/// Process-wide player-folder resolution cache (slug id → actual display-
+/// named folder), mirroring the card side.
+static PLAYER_FOLDER_CACHE: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<String, std::path::PathBuf>>,
+> = std::sync::OnceLock::new();
+
+fn player_folder_cache(
+) -> &'static std::sync::Mutex<std::collections::HashMap<String, std::path::PathBuf>> {
+    PLAYER_FOLDER_CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
 }
 
-/// Enumerate every saved player's namesake JSON under a players root.
-/// Mirrors `iter_card_sim_paths`: each entry is a per-player folder
-/// `players/<name>/`, and only the namesake file `<name>/<name>.json`
-/// counts (a folder holding a differently-named `.json` is ignored —
-/// defensive against a hand-edited tree). Returns the JSON paths; callers
-/// parse + skip malformed entries.
-fn iter_player_json_paths(players_root: &std::path::Path) -> Vec<std::path::PathBuf> {
+pub(crate) fn cache_player_folder(
+    players_root: &std::path::Path,
+    player_id: &str,
+    folder: &std::path::Path,
+) {
+    let key = format!("{}|{}", players_root.display(), player_id);
+    player_folder_cache().lock().unwrap().insert(key, folder.to_path_buf());
+}
+
+/// Resolve a player's ACTUAL folder by walking + matching the parsed id
+/// (the folder is display-named — "Alex" — while the id is the slug).
+fn resolve_player_folder(players_root: &std::path::Path, player_id: &str) -> Option<std::path::PathBuf> {
+    let want = player::slugify_player_id(player_id)?;
+    let key = format!("{}|{}", players_root.display(), want);
+    if let Some(hit) = player_folder_cache().lock().unwrap().get(&key) {
+        if hit.is_dir() {
+            return Some(hit.clone());
+        }
+    }
+    for path in iter_player_paths(players_root) {
+        if let Some(p) = load_player_at(&path) {
+            if p.id == want {
+                let folder = path.parent()?.to_path_buf();
+                cache_player_folder(players_root, &want, &folder);
+                return Some(folder);
+            }
+        }
+    }
+    None
+}
+
+/// Resolve a saved player's portrait to an absolute filesystem path (ready
+/// for the frontend's `convertFileSrc`), or `None` when the player has no
+/// portrait sibling. Portrait presence is a STAT fact now (the `.player` XML
+/// carries no portrait field — the image is a sibling file, like cards):
+/// the namesake `<Name>.<ext>` via `find_portrait_sibling`.
+fn load_player_portrait(app: &tauri::AppHandle, id: &str) -> Option<String> {
+    let dir = resolve_fable_players_dir(app);
+    let folder = resolve_player_folder(&dir, id)?;
+    find_portrait_sibling(&folder)
+        .map(|name| folder.join(name).to_string_lossy().into_owned())
+}
+
+/// Enumerate every saved player's namesake identity file under a players
+/// root: `<folder>/<folder>.player` (canonical, 2026-08-19) with the legacy
+/// `<folder>/<folder>.json` as the migration-era fallback (the boot
+/// migration converts them; stray un-migrated ones still list). Returns the
+/// file paths; callers parse + skip malformed entries.
+fn iter_player_paths(players_root: &std::path::Path) -> Vec<std::path::PathBuf> {
     let mut out = Vec::new();
     let Ok(entries) = std::fs::read_dir(players_root) else {
         return out;
@@ -16287,22 +16883,32 @@ fn iter_player_json_paths(players_root: &std::path::Path) -> Vec<std::path::Path
         let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
             continue;
         };
-        let json = path.join(format!("{name}.json"));
-        if json.is_file() {
-            out.push(json);
+        let player_file = path.join(format!("{name}.player"));
+        if player_file.is_file() {
+            out.push(player_file);
+            continue;
+        }
+        let legacy = path.join(format!("{name}.json"));
+        if legacy.is_file() {
+            out.push(legacy);
         }
     }
     out
 }
 
-/// Load + parse a SavedPlayer from a namesake JSON path. Returns None on
-/// any read/parse error (malformed entries are skipped by the list IPC,
-// not fatal). Best-effort, mirroring `sim_card::load_or_fallback`'s
-// graceful-degradation intent (but without a fallback stub — a bad
-// player file simply isn't listed).
+/// Load + parse a SavedPlayer from a namesake path — `.player` XML
+/// (canonical) or legacy `.json`. Returns None on any read/parse error
+/// (malformed entries are skipped by the list IPC, not fatal).
 fn load_player_at(path: &std::path::Path) -> Option<player::SavedPlayer> {
     let bytes = std::fs::read(path).ok()?;
-    serde_json::from_slice::<player::SavedPlayer>(&bytes).ok()
+    if path.extension().and_then(|x| x.to_str()) == Some("player") {
+        let text = String::from_utf8(bytes).ok()?;
+        let p = player::parse_player_xml(&text).ok()?;
+        // Fold legacy JSON-era lists into the v2 inventory model.
+        return Some(player::fold_legacy_lists(&p));
+    }
+    let p: player::SavedPlayer = serde_json::from_slice(&bytes).ok()?;
+    Some(player::fold_legacy_lists(&p))
 }
 
 /// Enumerate every saved player + return lightweight metadata for the
@@ -16313,36 +16919,30 @@ fn load_player_at(path: &std::path::Path) -> Option<player::SavedPlayer> {
 fn fable_players_list(app: tauri::AppHandle) -> Result<Vec<player::PlayerMeta>, String> {
     let dir = resolve_fable_players_dir(&app);
     let mut out = Vec::new();
-    for path in iter_player_json_paths(&dir) {
-        let player = match load_player_at(&path) {
+    for path in iter_player_paths(&dir) {
+        let sp = match load_player_at(&path) {
             Some(p) => p,
             None => {
                 tracing::warn!(path = %path.display(), "skipping malformed saved player");
                 continue;
             }
         };
-        // Portrait exists? Best-effort: the portrait filename is stored
-        // relative; resolve against the player's folder.
-        let has_portrait = player
-            .portrait
-            .as_deref()
-            .and_then(|fname| path.parent().map(|d| d.join(fname)))
-            .map(|p| p.is_file())
+        // Portrait exists? A stat fact — the .player XML carries no portrait
+        // field; the namesake `<Name>.<ext>` sibling (legacy `portrait.<ext>`
+        // fallback) is the truth (`find_portrait_sibling`).
+        let has_portrait = path
+            .parent()
+            .map(|d| find_portrait_sibling(d).is_some())
             .unwrap_or(false);
         out.push(player::PlayerMeta {
-            id: player.id,
-            name: player.name,
+            id: sp.id,
+            name: sp.name,
             has_portrait,
-            // Surface gender + race on the mini-card so the picker grid can
-            // render the ♂/♀ glyph + race subtitle without a per-tile
-            // fable_player_get round-trip (Phase 4 Component 5, 2026-08-04).
-            gender: player.gender,
-            race: player.race,
-            // Identity strip fields (2026-08-04: show all identity info except
-            // gender at the bottom of each mini-card).
-            age: player.age,
-            height: player.height,
-            weight: player.weight,
+            gender: sp.gender,
+            race: sp.race,
+            age: sp.age,
+            height: sp.height,
+            weight: sp.weight,
         });
     }
     // Sort by name for stable picker ordering (mirrors fable_cards_list).
@@ -16352,20 +16952,29 @@ fn fable_players_list(app: tauri::AppHandle) -> Result<Vec<player::PlayerMeta>, 
 
 /// Load a single saved player by id, resolving the portrait to an
 /// absolute path string for the frontend's `convertFileSrc`. Returns an
-/// error string if the player folder/JSON is missing (the picker only
+/// error string if the player folder/file is missing (the picker only
 /// offers existing ids, so this is a stale-state edge case).
 #[tauri::command]
 fn fable_player_get(id: String, app: tauri::AppHandle) -> Result<player::SavedPlayer, String> {
     let dir = resolve_fable_players_dir(&app);
-    // (2026-08-15 H3) both joins from the sanitized stem — the raw IPC id
-    // used to reach `dir.join(&id)` + `format!("{id}.json")` unsanitized.
-    let safe = sanitize_player_slug(&id);
-    let json_path = dir.join(&safe).join(format!("{safe}.json"));
-    let mut player = load_player_at(&json_path)
+    // Walker resolution: the folder is display-named; the raw IPC id (a
+    // slug) can never be joined directly. A hostile id resolves to no
+    // folder → the "not found" error.
+    let Some(folder) = resolve_player_folder(&dir, &id) else {
+        return Err(format!("no saved player with id '{id}'"));
+    };
+    let stem = folder
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("Player")
+        .to_owned();
+    let player_file = folder.join(format!("{stem}.player"));
+    let legacy_json = folder.join(format!("{stem}.json"));
+    let mut player = load_player_at(&player_file)
+        .or_else(|| load_player_at(&legacy_json))
         .ok_or_else(|| format!("no saved player with id '{id}'"))?;
-    // Resolve the portrait filename to an absolute path via the shared
-    // helper (same logic the chat portrait bridge uses).
-    player.portrait = load_player_portrait(&app, &safe);
+    // Resolve the portrait to an absolute path via the shared helper.
+    player.portrait = load_player_portrait(&app, &id);
     Ok(player)
 }
 
@@ -16391,13 +17000,21 @@ fn fable_active_player_get(
         Some(id) => id,
     };
     let dir = resolve_fable_players_dir(&app);
-    // (2026-08-15 H3) sanitized joins — the id is server-fed here, but the
-    // discipline is shared with every other player IPC.
-    let safe = sanitize_player_slug(&id);
-    let json_path = dir.join(&safe).join(format!("{safe}.json"));
-    let mut player = load_player_at(&json_path)
+    // Walker resolution (display-named folders); the id is server-fed here.
+    let Some(folder) = resolve_player_folder(&dir, &id) else {
+        return Err(format!("attached player '{id}' not found on disk"));
+    };
+    let stem = folder
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("Player")
+        .to_owned();
+    let player_file = folder.join(format!("{stem}.player"));
+    let legacy_json = folder.join(format!("{stem}.json"));
+    let mut player = load_player_at(&player_file)
+        .or_else(|| load_player_at(&legacy_json))
         .ok_or_else(|| format!("attached player '{id}' not found on disk"))?;
-    player.portrait = load_player_portrait(&app, &safe);
+    player.portrait = load_player_portrait(&app, &id);
     Ok(Some(player))
 }
 
@@ -16427,38 +17044,78 @@ fn fable_player_write(
         .or_else(|| player::slugify_player_id(&id))
         .ok_or_else(|| "could not derive a valid player id".to_string())?;
     let dir = resolve_fable_players_dir(&app);
-    let player_dir = dir.join(&slug);
-    let json_path = player_dir.join(format!("{slug}.json"));
-    // 3. If the slug changed (rename), move the existing folder so the
-    //    portrait + JSON stay together. No-op when the slug is unchanged.
-    //    (2026-08-15 H3) the OLD dir comes from the sanitized stem — the
-    //    raw `id` used to reach `dir.join(&id)`, so a hostile id could
-    //    `fs::rename` an arbitrary directory INTO the players tree. A
-    //    hostile id now mangles to a nonexistent path → rename skipped.
-    if slug != id {
-        let old_dir = dir.join(sanitize_player_slug(&id));
-        if old_dir.is_dir() && !player_dir.exists() {
-            let _ = std::fs::rename(&old_dir, &player_dir);
+    // 3. (2026-08-19) The FOLDER is display-named ("Alex"); the id stays the
+    //    slug. An EXISTING player with this id keeps its folder (an edit);
+    //    a fresh create derives the display folder from the name. A rename
+    //    (name changed → new display folder) migrates the portrait + kills
+    //    the legacy .json.
+    let existing = resolve_player_folder(&dir, &slug);
+    let stem = match &existing {
+        Some(folder) => folder
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or(&player.name)
+            .to_owned(),
+        None => unique_display_stem(&dir, &player.name, "Player", None),
+    };
+    let player_dir = dir.join(&stem);
+    let player_path = player_dir.join(format!("{stem}.player"));
+    if let Some(old) = &existing {
+        if *old != player_dir && old.is_dir() {
+            // Rename: carry the portrait (any ext) to the new folder under
+            // the NEW stem — namesake first, then a legacy `portrait.<ext>`
+            // folded onto it — then drop the husk. The legacy .json (if
+            // any) converts below.
+            if let Err(e) = std::fs::create_dir_all(&player_dir) {
+                return Err(format!("could not create player folder: {e}"));
+            }
+            let old_stem = old
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or(&player.name)
+                .to_owned();
+            for ext in ["png", "jpg", "jpeg"] {
+                let dest = player_dir.join(format!("{stem}.{ext}"));
+                let namesake = old.join(format!("{old_stem}.{ext}"));
+                if namesake.is_file() {
+                    let _ = std::fs::rename(&namesake, &dest);
+                } else {
+                    let legacy = old.join(format!("portrait.{ext}"));
+                    if legacy.is_file() {
+                        let _ = std::fs::rename(&legacy, &dest);
+                    }
+                }
+            }
+            let _ = std::fs::remove_dir_all(old);
         }
     }
     std::fs::create_dir_all(&player_dir)
         .map_err(|e| format!("could not create player folder: {e}"))?;
-    // 4. Serialize with the resolved slug + timestamp.
-    let mut to_write = player.clone();
+    // 4. Serialize as the v2 `.player` XML (Rust owns the rendering — the
+    //    DTO over IPC, XML on disk), preserving a prior created_at when the
+    //    file already exists.
+    let mut to_write = player::fold_legacy_lists(&player);
     to_write.id = slug.clone();
     if to_write.created_at_ms == 0 {
-        to_write.created_at_ms = current_unix_ms_i64();
+        let old_json = player_dir.join(format!("{stem}.json"));
+        to_write.created_at_ms = load_player_at(&player_path)
+            .or_else(|| load_player_at(&old_json))
+            .map(|p| p.created_at_ms)
+            .filter(|ms| *ms > 0)
+            .unwrap_or_else(current_unix_ms_i64);
     }
-    let bytes = serde_json::to_vec_pretty(&to_write)
-        .map_err(|e| format!("could not serialize player: {e}"))?;
-    write_atomic(&json_path, &bytes)
+    let xml = player::render_player_xml(&to_write);
+    write_atomic(&player_path, xml.as_bytes())
         .map_err(|e| format!("could not write player: {e}"))?;
-    // 5. Best-effort portrait flag for the returned meta.
-    let has_portrait = to_write
-        .portrait
-        .as_deref()
-        .map(|fname| player_dir.join(fname).is_file())
-        .unwrap_or(false);
+    // The legacy .json is dead once the .player exists — remove it so the
+    // walker never sees two identities for one player.
+    let legacy_json = player_dir.join(format!("{stem}.json"));
+    if legacy_json.is_file() {
+        let _ = std::fs::remove_file(&legacy_json);
+    }
+    cache_player_folder(&dir, &slug, &player_dir);
+    // 5. Best-effort portrait flag for the returned meta (a stat fact).
+    let has_portrait = find_portrait_sibling(&player_dir).is_some();
     Ok(player::PlayerMeta {
         id: slug,
         name: to_write.name.clone(),
@@ -16485,39 +17142,36 @@ fn fable_player_portrait_upload(
     app: tauri::AppHandle,
 ) -> Result<String, String> {
     let dir = resolve_fable_players_dir(&app);
-    // (2026-08-15 H3) sanitized stem for both the folder and the JSON name —
-    // the raw id used to write `portrait.png` into any traversed directory.
-    let safe = sanitize_player_slug(&id);
-    let player_dir = dir.join(&safe);
-    if !player_dir.is_dir() {
+    // (2026-08-19) Walker resolution — the folder is display-named; the raw
+    // IPC id can never be joined into a path.
+    let Some(player_dir) = resolve_player_folder(&dir, &id) else {
         return Err(format!("no player folder for id '{id}'"));
-    }
+    };
     // 1. Read the picked file's bytes server-side (no plugin-fs).
     let bytes = std::fs::read(&src_path)
         .map_err(|e| format!("could not read portrait: {e}"))?;
     // 2. Validate magic bytes BEFORE disk touch (the load-bearing gate).
     let ext = player::validate_image_magic(&bytes)?;
-    let fname = format!("portrait.{ext}");
-    let dest = player_dir.join(&fname);
+    // Namesake destination: `<Name>.<ext>` beside the `<Name>.player`.
+    let stem = player_dir
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("Player")
+        .to_owned();
+    let dest = player_dir.join(format!("{stem}.{ext}"));
     write_atomic(&dest, &bytes)
         .map_err(|e| format!("could not write portrait: {e}"))?;
-    // (#61 hygiene, 2026-08-15 audit fix) Reap other-ext siblings — the
-    // bytes-variant IPC already did; a lingering portrait.png next to a new
-    // portrait.jpg is dead weight any ext-order scan would still see.
-    reap_other_portrait_exts(&player_dir, &ext);
-    // 3. Update the JSON's portrait field so get/list reflect the truth.
-    let json_path = player_dir.join(format!("{safe}.json"));
-    if let Some(mut p) = load_player_at(&json_path) {
-        p.portrait = Some(fname.clone());
-        if let Ok(b) = serde_json::to_vec_pretty(&p) {
-            let _ = write_atomic(&json_path, &b);
-        }
-    }
+    // (#61 hygiene, 2026-08-15 audit fix) Reap stale siblings — a lingering
+    // other-ext file next to the new one is dead weight any ext-order scan
+    // would still see, and a fresh write folds away legacy `portrait.<ext>`
+    // files too. (No JSON patch: portrait presence is a stat fact — the
+    // `.player` XML carries no portrait field.)
+    reap_stale_portraits(&player_dir, &ext);
     Ok(dest.to_string_lossy().into_owned())
 }
 
 /// Upload pre-cropped portrait BYTES (from the Player Creator's in-browser
-/// cropper) into a player's folder. The cropper produces a JPEG whose content
+/// cropper) into a player's folder. The cropper produces a PNG whose content
 /// is exactly the crop the user selected; this IPC writes those bytes directly
 /// — no uncropped-original mismatch. Mirrors `fable_player_portrait_upload`
 /// but takes bytes instead of a src path. Still validates the magic bytes
@@ -16539,13 +17193,10 @@ fn fable_player_portrait_upload_bytes(
     app: tauri::AppHandle,
 ) -> Result<String, String> {
     let dir = resolve_fable_players_dir(&app);
-    // (2026-08-15 H3) sanitized stem for both the folder and the JSON name —
-    // mirrors the path-based upload's hardening.
-    let safe = sanitize_player_slug(&id);
-    let player_dir = dir.join(&safe);
-    if !player_dir.is_dir() {
+    // (2026-08-19) Walker resolution — mirrors the path-based upload.
+    let Some(player_dir) = resolve_player_folder(&dir, &id) else {
         return Err(format!("no player folder for id '{id}'"));
-    }
+    };
     // 0. Decode base64. Strip an optional data-URL prefix
     //    ("data:image/jpeg;base64,...") so the JS side may pass either form.
     let b64 = bytes_b64
@@ -16558,23 +17209,19 @@ fn fable_player_portrait_upload_bytes(
     // 1. Validate magic bytes BEFORE disk touch (same gate as the path IPC).
     let detected = player::validate_image_magic(&bytes)?;
     // Use the detected ext for the filename (the magic bytes are
-    // authoritative). Keep "jpg"/"png" only.
-    let fname = format!("portrait.{detected}");
-    let dest = player_dir.join(&fname);
+    // authoritative). Keep "jpg"/"png" only. Namesake destination:
+    // `<Name>.<ext>` beside the `<Name>.player`.
+    let stem = player_dir
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("Player")
+        .to_owned();
+    let dest = player_dir.join(format!("{stem}.{detected}"));
     write_atomic(&dest, &bytes)
         .map_err(|e| format!("could not write portrait: {e}"))?;
-    // (#61 hygiene) Reap other-ext siblings here too: `p.portrait` below
-    // points at the new file, but a lingering other-ext copy is dead weight
-    // (and any ext-order scan would still see it).
-    reap_other_portrait_exts(&player_dir, &detected);
-    // 2. Update the JSON's portrait field so get/list reflect the truth.
-    let json_path = player_dir.join(format!("{safe}.json"));
-    if let Some(mut p) = load_player_at(&json_path) {
-        p.portrait = Some(fname.clone());
-        if let Ok(b) = serde_json::to_vec_pretty(&p) {
-            let _ = write_atomic(&json_path, &b);
-        }
-    }
+    // (#61 hygiene) Reap stale siblings (other-ext + legacy names). No JSON
+    // patch — portrait presence is a stat fact (see the path-based variant).
+    reap_stale_portraits(&player_dir, &detected);
     Ok(dest.to_string_lossy().into_owned())
 }
 
@@ -16720,14 +17367,29 @@ async fn fable_player_delete(id: String, app: tauri::AppHandle) -> Result<(), St
         return Err("invalid player id".into());
     }
     let dir = resolve_fable_players_dir(&app);
-    let player_dir = dir.join(&id);
+    // (2026-08-19) Walker resolution — the folder is display-named; the
+    // reject-style guard above has already filtered hostile ids.
+    let player_dir = resolve_player_folder(&dir, &id)
+        .or_else(|| {
+            // Legacy pre-migration slug folder (no .player yet, folder == slug).
+            let fallback = dir.join(sanitize_player_slug(&id));
+            fallback.is_dir().then_some(fallback)
+        })
+        .ok_or_else(|| format!("no saved player with id '{id}'"))?;
     if !player_dir.exists() {
         return Ok(()); // idempotent
     }
-    // Best-effort: confirm the folder actually contains a `<id>.json` so a
-    // stray id can't nuke an unrelated sibling directory. A missing JSON
-    // means the folder isn't a valid player dir — refuse rather than guess.
-    if !player_dir.join(format!("{id}.json")).exists() {
+    // Best-effort: confirm the folder actually contains a namesake identity
+    // file (.player or legacy .json) so a stray id can't nuke an unrelated
+    // sibling directory.
+    let stem = player_dir
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(&id)
+        .to_owned();
+    let has_identity = player_dir.join(format!("{stem}.player")).is_file()
+        || player_dir.join(format!("{stem}.json")).is_file();
+    if !has_identity {
         return Err(format!("no saved player with id '{id}'"));
     }
     std::fs::remove_dir_all(&player_dir)
@@ -16890,20 +17552,52 @@ mod tests {
     use super::*;
 
     // ─────────────────────────────────────────────────────────────────────
-    // Path-traversal regression tests (2026-08-15 audit H2/H3). The card
-    // filename half + every raw-id player join must stay under their roots.
+    // v2 display-naming + migration tests (2026-08-19).
     // ─────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn safe_display_stem_preserves_spaces_and_capitals() {
+        // The Chloe ruling: folders/files derive from the NAME — "One Piece"
+        // stays "One Piece" (spaces + capitals survive the sanitization).
+        assert_eq!(safe_display_stem("One Piece", "Card"), "One Piece");
+        assert_eq!(safe_display_stem("Liam", "Card"), "Liam");
+        assert_eq!(safe_display_stem("Alex", "Player"), "Alex");
+        // Windows-invalid chars map to (collapsed) spaces; trailing dots
+        // drop; empty degrades to the fallback.
+        assert_eq!(safe_display_stem("A<B:C\"D/E\\F|G?H*I", "Card"), "A B C D E F G H I");
+        assert_eq!(safe_display_stem("Conan.", "Card"), "Conan");
+        assert_eq!(safe_display_stem("  ", "Card"), "Card");
+        // Reserved base names get the -card suffix (case-insensitive).
+        assert_eq!(safe_display_stem("Con", "Card"), "Con-card");
+        assert_eq!(safe_display_stem("NUL", "Card"), "NUL-card");
+        // 64-char cap, char-boundary safe.
+        let long = "é".repeat(80);
+        assert_eq!(safe_display_stem(&long, "Card").chars().count(), 64);
+    }
+
+    #[test]
+    fn unique_display_stem_relieves_collisions() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("Aether")).unwrap();
+        // A same-named newcomer gets " 2"; the folder itself is keep-exempt.
+        assert_eq!(unique_display_stem(tmp.path(), "Aether", "Card", None), "Aether 2");
+        assert_eq!(
+            unique_display_stem(tmp.path(), "Aether", "Card", Some(&tmp.path().join("Aether"))),
+            "Aether"
+        );
+        // A fresh name passes through.
+        assert_eq!(unique_display_stem(tmp.path(), "One Piece", "Card", None), "One Piece");
+    }
 
     #[test]
     fn resolve_card_file_sanitizes_both_segments() {
         let root = std::path::Path::new("/wupi/apps/fable/cards");
-        // Hostile id: the DIRECTORY half was already cleaned, but the old
-        // filename half carried the raw id → `cards/x/../../x.sim` escaped
-        // the tree. Both segments now share one sanitized stem.
+        // Hostile id: with no matching card folder on disk, the resolver
+        // falls back to a display-stem join UNDER the root — a traversal id
+        // resolves to a nonexistent (but in-tree) path.
         let p = resolve_card_file(root, "../../x", "sim");
         assert!(p.starts_with(root), "card path must stay under the cards root: {p:?}");
-        assert_eq!(p, root.join("x").join("x.sim"));
-        // Drive prefixes + separators collapse the same way.
+        // Drive prefixes + separators stay inside too.
         let p2 = resolve_card_file(root, "..\\..\\C:", "codex");
         assert!(p2.starts_with(root), "card path must stay under the cards root: {p2:?}");
         // Legit slugs (incl. Unicode) pass through untouched.
@@ -16915,7 +17609,165 @@ mod tests {
             resolve_card_file(root, "甲乙", "sim"),
             root.join("甲乙").join("甲乙.sim")
         );
-        // Fully-hostile id degrades to the unknown-card sentinel, still inside.
+    }
+
+    #[test]
+    fn card_folder_resolver_matches_parsed_id_in_display_folder() {
+        // A v2 card lives in a DISPLAY-named folder; resolving by its slug id
+        // must find it via the walker (the load-bearing identity split).
+        let tmp = tempfile::tempdir().unwrap();
+        let cards = tmp.path().join("cards");
+        let folder = cards.join("One Piece");
+        std::fs::create_dir_all(&folder).unwrap();
+        let xml = "<sim_card>\n  <metadata>\n  <type>simulation</type>\n  <subtype>world</subtype>\n  <id>one-piece</id>\n  </metadata>\n  <identity><![CDATA[\nName: One Piece\n  ]]></identity>\n</sim_card>\n";
+        std::fs::write(folder.join("One Piece.sim"), xml).unwrap();
+        let resolved = resolve_card_folder(&cards, "one-piece")
+            .expect("display folder resolves by parsed slug id");
+        assert_eq!(resolved, folder);
+        // The file resolver derives the namesake filename from the FOLDER's
+        // own name, never from the caller id.
+        assert_eq!(
+            resolve_card_file(&cards, "one-piece", "codex"),
+            folder.join("One Piece.codex")
+        );
+        // Unknown ids resolve to nothing.
+        assert!(resolve_card_folder(&cards, "no-such").is_none());
+    }
+
+    #[test]
+    fn player_migration_converts_json_to_player_xml() {
+        // The one-shot boot migration: `<slug>/<slug>.json` →
+        // `<Name>/<Name>.player` (folder renamed to the display name, the
+        // legacy JSON converted + removed, the portrait carried + folded
+        // onto the namesake stem).
+        let tmp = tempfile::tempdir().unwrap();
+        let players = tmp.path().join("players");
+        let old = players.join("kael-brightwood");
+        std::fs::create_dir_all(&old).unwrap();
+        let json = r#"{"id":"kael-brightwood","name":"Kael Brightwood","gender":"Nonbinary","clothing":["cloak","boots"],"gear":["rope"],"created_at_ms":123}"#;
+        std::fs::write(old.join("kael-brightwood.json"), json).unwrap();
+        std::fs::write(old.join("portrait.png"), [0x89u8, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]).unwrap();
+
+        migrate_players_v2(&players);
+
+        let new = players.join("Kael Brightwood");
+        assert!(new.is_dir(), "folder renamed to the display name");
+        let player_file = new.join("Kael Brightwood.player");
+        assert!(player_file.is_file(), "the .player file exists");
+        assert!(!old.exists(), "the legacy folder is gone");
+        assert!(new.join("Kael Brightwood.png").is_file(), "the portrait rode the rename onto the namesake stem");
+        assert!(!new.join("portrait.png").exists(), "no legacy portrait name lingers");
+        let sp = crate::player::parse_player_xml(
+            &std::fs::read_to_string(&player_file).unwrap(),
+        )
+        .expect("migrated .player parses");
+        assert_eq!(sp.id, "kael-brightwood");
+        assert_eq!(sp.name, "Kael Brightwood");
+        assert_eq!(sp.gender.as_deref(), Some("Nonbinary"));
+        let inv = sp.inventory.expect("legacy lists folded into the inventory");
+        assert_eq!(inv.clothing, vec!["cloak".to_string(), "boots".to_string()]);
+        assert_eq!(inv.stored, vec!["rope".to_string()]);
+        // Idempotent: a second run is a no-op.
+        migrate_players_v2(&players);
+        assert!(new.join("Kael Brightwood.player").is_file());
+        assert!(!new.join("Kael Brightwood.json").exists());
+        assert!(new.join("Kael Brightwood.png").is_file());
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Namesake portraits (2026-08-19): `<Name>.<ext>` beside the
+    // `<Name>.sim` / `<Name>.player`, legacy `portrait.<ext>` folded at
+    // boot + tolerated at discovery.
+    // ─────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn find_portrait_sibling_prefers_namesake_then_ext_order() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("Liam");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Nothing → None.
+        assert_eq!(find_portrait_sibling(&dir), None);
+
+        // Legacy-only folder → the legacy name (read-side fallback).
+        std::fs::write(dir.join("portrait.jpg"), b"x").unwrap();
+        assert_eq!(find_portrait_sibling(&dir), Some("portrait.jpg".to_string()));
+
+        // A namesake of a LOWER-preference ext still beats the legacy name.
+        std::fs::write(dir.join("Liam.jpeg"), b"x").unwrap();
+        assert_eq!(find_portrait_sibling(&dir), Some("Liam.jpeg".to_string()));
+
+        // Ext order among namesakes: png > jpg > jpeg.
+        std::fs::write(dir.join("Liam.jpg"), b"x").unwrap();
+        assert_eq!(find_portrait_sibling(&dir), Some("Liam.jpg".to_string()));
+        std::fs::write(dir.join("Liam.png"), b"x").unwrap();
+        assert_eq!(find_portrait_sibling(&dir), Some("Liam.png".to_string()));
+
+        // Spaces + capitals in the stem ride along verbatim.
+        let dir2 = tmp.path().join("One Piece");
+        std::fs::create_dir_all(&dir2).unwrap();
+        std::fs::write(dir2.join("One Piece.png"), b"x").unwrap();
+        assert_eq!(find_portrait_sibling(&dir2), Some("One Piece.png".to_string()));
+    }
+
+    #[test]
+    fn rename_legacy_portraits_folds_and_is_idempotent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("Mara");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("portrait.png"), b"png").unwrap();
+        std::fs::write(dir.join("portrait.jpg"), b"jpg").unwrap();
+        std::fs::write(dir.join("portrait.ico"), b"ico").unwrap();
+
+        assert!(rename_legacy_portraits(&dir), "the fold reports action");
+        assert!(dir.join("Mara.png").is_file(), "png folded onto the stem");
+        assert!(dir.join("Mara.jpg").is_file(), "jpg folded onto the stem");
+        assert!(!dir.join("portrait.png").exists());
+        assert!(!dir.join("portrait.jpg").exists());
+        assert!(!dir.join("portrait.ico").exists(), "the derived legacy icon goes with the fold");
+        assert!(!rename_legacy_portraits(&dir), "second run is a no-op");
+
+        // Namesake of the same ext WINS: the legacy twin is reaped, not
+        // allowed to clobber the canonical file.
+        std::fs::write(dir.join("portrait.png"), b"stale").unwrap();
+        std::fs::write(dir.join("portrait.ico"), b"ico").unwrap();
+        assert!(rename_legacy_portraits(&dir));
+        let kept = std::fs::read(dir.join("Mara.png")).unwrap();
+        assert_eq!(kept, b"png", "the namesake content survives");
+        assert!(!dir.join("portrait.png").exists());
+    }
+
+    #[test]
+    fn card_folder_rename_restems_the_namesake_portrait() {
+        // `fable_write_card`'s rename path: the namesake portrait re-stems
+        // with the folder (it's a stem-named file now), a legacy
+        // `portrait.<ext>` rides as-is for the boot fold.
+        let tmp = tempfile::tempdir().unwrap();
+        let old = tmp.path().join("Old Name");
+        let new = tmp.path().join("New Name");
+        std::fs::create_dir_all(&old).unwrap();
+        std::fs::write(old.join("Old Name.png"), b"png").unwrap();
+        std::fs::write(old.join("Old Name.codex"), b"codex").unwrap();
+
+        migrate_card_folder_contents(&old, &new);
+
+        assert!(new.join("New Name.png").is_file(), "the portrait re-stemmed");
+        assert!(new.join("New Name.codex").is_file());
+        assert!(!old.exists(), "the husk is gone");
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Path-traversal regression tests (2026-08-15 audit H2/H3). The card
+    // filename half + every raw-id player join must stay under their roots.
+    // ─────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn resolve_card_file_sanitizes_both_segments_legacy() {
+        let root = std::path::Path::new("/wupi/apps/fable/cards");
+        let p = resolve_card_file(root, "../../x", "sim");
+        assert!(p.starts_with(root), "card path must stay under the cards root: {p:?}");
+        let p2 = resolve_card_file(root, "..\\..\\C:", "codex");
+        assert!(p2.starts_with(root), "card path must stay under the cards root: {p2:?}");
         let p3 = resolve_card_file(root, "../../..", "sim");
         assert!(p3.starts_with(root), "card path must stay under the cards root: {p3:?}");
     }
@@ -17136,8 +17988,14 @@ mod tests {
         sim_card::SimCard {
             id: id.into(),
             name: id.into(),
-            card_type: "roleplay".into(),
+            card_type: "simulation".into(),
             subtype: None,
+            format_v2: false,
+            identity: Default::default(),
+            persona: Default::default(),
+            world: Default::default(),
+            location: None,
+            inventory: Default::default(),
             core_persona: String::new(),
             traits: String::new(),
             appearance: String::new(),
@@ -17227,25 +18085,36 @@ mod tests {
         );
     }
 
-    /// §7 sibling (2026-07-29, amended 2026-08-16 retrieval diet): the API
-    /// NARRATOR prompt builder MUST render a `memory_block` (the retrieved
-    /// fable.codex knowledge) as a `<retrieved_knowledge>` block — the core
-    /// fix that makes the prompt distillation safe. The TRACKER builder, by
-    /// contrast, takes NO memory block AT ALL (structurally: the param was
-    /// removed): the tracker's memory is the schema, and episodic
-    /// `<retrieved_knowledge>` growth is what made its 3072-token overflow
-    /// progressive (5 → 687 dropped tokens over 16 turns in the playtest).
-    /// Pin BOTH directions so a future refactor fails loudly either way.
+    /// §7 sibling (2026-07-29, amended 2026-08-16 retrieval diet + 2026-08-19
+    /// cache-order ruling): the API NARRATOR system prompt is the STABLE CACHE
+    /// PAYLOAD ONLY — authored narrator prose + the `<player>` block + the
+    /// `<sim_card>` block. The memory block + `<world_state>` +
+    /// `<scene_pacing>` NEVER ride the system message (they inject at depth 2
+    /// + as the trailing system message in the Stage-2 assembly). The TRACKER
+    /// builder still takes NO memory block AT ALL (structurally). Pin BOTH
+    /// directions so a future refactor fails loudly either way.
     #[test]
-    fn narrator_prompt_renders_retrieved_knowledge_block() {
+    fn narrator_prompt_cache_order_blocks() {
         use crate::schema::{SceneMode, ScenePacing};
         use crate::sim_card::SimCard;
 
         let card = SimCard {
             id: "test".to_owned(),
             name: "Test Scenario".to_owned(),
-            card_type: "roleplay".to_owned(),
-            subtype: None,
+            card_type: "simulation".to_owned(),
+            subtype: Some("world".to_owned()),
+            format_v2: true,
+            identity: crate::sim_card::CardIdentity {
+                gender: Some("Female".to_owned()),
+                ..Default::default()
+            },
+            persona: crate::sim_card::CardPersona {
+                personality: Some("Watchful.".to_owned()),
+                ..Default::default()
+            },
+            world: crate::sim_card::CardWorld::default(),
+            location: None,
+            inventory: crate::sim_card::CardInventory::default(),
             core_persona: String::new(),
             traits: String::new(),
             appearance: String::new(),
@@ -17272,7 +18141,6 @@ mod tests {
             emotional: 0,
             kinetic: 0,
         };
-        let block = "Reference knowledge\n<c title=\"Bracket Commands Reference\">the full per-command detail</c>";
 
         // Tracker path: NO memory block — the builder has no param for one
         // (compile-level enforcement), and the render must contain no
@@ -17297,41 +18165,50 @@ mod tests {
         assert!(tracker_prompt.contains("<world_state>"));
         assert!(tracker_prompt.contains("<scene_pacing"));
 
-        // API narrator path: the block must render between <world_state> and
-        // <scene_pacing>.
+        // API narrator system message: authored prose → <player> →
+        // <sim_card>, and NOTHING per-turn.
         let api_prompt = build_api_narrator_system_prompt(
             &prompts::FablePrompts::test_default(),
             &card,
-            Some("gold: 100"),
-            pacing,
-            None,
-            Some(block),
+            Some("<player>\nName: Kaelen\nGender: Male\n</player>"),
+        );
+        let narrator = prompts::FablePrompts::test_default().narrator.trim().to_string();
+        if !narrator.is_empty() {
+            let np = api_prompt.find(narrator.as_str()).expect("narrator prose");
+            let pp = api_prompt.find("<player>").expect("player block");
+            let cp = api_prompt.find("<sim_card>").expect("card block");
+            assert!(np < pp, "narrator prose leads the system message");
+            assert!(pp < cp, "the player block precedes the card block");
+        }
+        assert!(api_prompt.contains("Gender: Male"));
+        assert!(api_prompt.contains("Name: Test Scenario"));
+        assert!(api_prompt.contains("Personality: Watchful."));
+        assert!(api_prompt.contains("Setting:\nA test."));
+        // The mutable/world-state payload never rides the system message.
+        assert!(
+            !api_prompt.contains("<retrieved_knowledge>"),
+            "memory injects at depth 2, never in the system message"
         );
         assert!(
-            api_prompt.contains("<retrieved_knowledge>"),
-            "API narrator prompt must render the <retrieved_knowledge> block"
+            !api_prompt.contains("<world_state>"),
+            "world_state rides the trailing message, never the system message"
         );
-        let ws = api_prompt.find("<world_state>").expect("world_state tag");
-        let rk = api_prompt
-            .find("<retrieved_knowledge>")
-            .expect("retrieved_knowledge tag");
-        let sp = api_prompt.find("<scene_pacing").expect("scene_pacing tag");
-        assert!(ws < rk, "retrieved_knowledge must come after world_state");
-        assert!(rk < sp, "retrieved_knowledge must come before scene_pacing");
+        assert!(!api_prompt.contains("<scene_pacing"));
 
-        // None memory_block → no block emitted (zero baseline cost).
-        let no_block_prompt = build_api_narrator_system_prompt(
-            &prompts::FablePrompts::test_default(),
-            &card,
-            None,
-            pacing,
-            None,
-            None,
-        );
-        assert!(
-            !no_block_prompt.contains("<retrieved_knowledge>"),
-            "API narrator prompt must NOT render the block when memory_block is None"
-        );
+        // The trailing turn tail: player_action → world_state → scene_pacing
+        // (the old skeleton order, after the history now). ALWAYS non-empty
+        // (scene_pacing renders every turn).
+        let tail = build_narrator_turn_tail(Some("opened the chest"), Some("gold: 100"), pacing);
+        let pa = tail.find("<player_action").expect("player_action");
+        let ws = tail.find("<world_state>").expect("world_state tag");
+        let sp = tail.find("<scene_pacing").expect("scene_pacing tag");
+        assert!(pa < ws, "player_action leads the tail");
+        assert!(ws < sp, "world_state precedes scene_pacing");
+        assert!(!tail.contains("<retrieved_knowledge>"));
+        // Even with no action + no world state, the pacing block renders.
+        let bare = build_narrator_turn_tail(None, None, pacing);
+        assert!(bare.contains("<scene_pacing"));
+        assert!(!bare.contains("<world_state>"));
     }
 
     /// (2026-08-16 tracker-budget fix, P1.4) THE WORST-CASE BUDGET TEST.
@@ -17761,8 +18638,14 @@ mod tests {
         crate::sim_card::SimCard {
             id: "budget-test".to_owned(),
             name: "Budget Test Scenario".to_owned(),
-            card_type: "roleplay".to_owned(),
+            card_type: "simulation".to_owned(),
             subtype: None,
+            format_v2: false,
+            identity: Default::default(),
+            persona: Default::default(),
+            world: Default::default(),
+            location: None,
+            inventory: Default::default(),
             core_persona: "x".repeat(2_000),
             traits: String::new(),
             appearance: String::new(),
@@ -18347,22 +19230,30 @@ mod tests {
             agent: String::new(),
         };
         // SimCard has no Default; start from fallback() (all roleplay fields
-        // empty) + override the identity fields the prompt builder reads.
+        // empty) + override the identity fields the cache block renders.
         let mut card = sim_card::fallback();
         card.name = "The Rusty Tavern".into();
         card.setting = Some("A foggy port town.".into());
         card.plot = Some("A missing sailor.".into());
-        card.tone = Some("Gritty low fantasy.".into());
-        card.core_persona = "The narrator is terse and sensory.".into();
-        let s = build_slice_regenerate_system_prompt(&prompts, &card);
+        card.world.tone = Some("Gritty low fantasy.".into());
+        card.persona.personality = Some("The narrator is terse and sensory.".into());
+        let s = build_slice_regenerate_system_prompt(
+            &prompts,
+            &card,
+            Some("<player>\nName: Kaelen\n</player>"),
+        );
         // (a) authored narrator voice.
         assert!(s.contains("the voice"), "missing narrator voice: {s}");
-        // (b) card identity.
-        assert!(s.contains("Scenario: The Rusty Tavern"), "missing scenario: {s}");
-        assert!(s.contains("Setting: A foggy port town."), "missing setting: {s}");
-        assert!(s.contains("Plot: A missing sailor."), "missing plot: {s}");
-        assert!(s.contains("Tone: Gritty low fantasy."), "missing tone: {s}");
-        assert!(s.contains("The narrator is terse"), "missing core_persona: {s}");
+        // (b) the player + card cache blocks (the old Scenario:/Tone: lines
+        // are gone — the 2026-08-19 cache-order ruling).
+        assert!(s.contains("<player>\nName: Kaelen"), "missing player block: {s}");
+        assert!(s.contains("Name: The Rusty Tavern"), "missing card name: {s}");
+        assert!(s.contains("Setting:\nA foggy port town."), "missing setting: {s}");
+        assert!(s.contains("Plot:\nA missing sailor."), "missing plot: {s}");
+        assert!(
+            s.contains("Personality: The narrator is terse"),
+            "missing persona: {s}"
+        );
         // (c) splice discipline markers.
         assert!(s.contains("ONLY the rewritten passage"), "missing splice rule: {s}");
         assert!(s.contains("Splice cleanly"), "missing splice rule: {s}");
@@ -18375,25 +19266,29 @@ mod tests {
         // field (the §7 bracket-verbs-omitted incident's lesson, applied here).
         let player = build_creator_assistant_system_prompt("player");
         // Core (mandatory) set pinned so a "lean prompt" distillation can't
-        // silently drop one of the 12.
+        // silently drop one of the identity fields.
         assert!(player.contains("CORE FIELDS"));
         assert!(player.contains("name (string)"));
         assert!(player.contains("gender"));
         assert!(player.contains("skin_complexion"));
-        assert!(player.contains("clothing (array"));
         // Contextual (context-clues) + custom routing pinned.
         assert!(player.contains("CONTEXTUAL FIELDS"));
         assert!(player.contains("horn"));
         assert!(player.contains("custom_tags"));
-        // Optional + the player completion gate + the null/clobber rule.
-        assert!(player.contains("backstory"));
+        // The v2 inventory group + the mandatory persona question (Chloe's
+        // final-question ruling — Conversation Style NEVER offered).
+        assert!(player.contains("INVENTORY (optional"));
+        assert!(player.contains("THE PERSONA QUESTION"));
+        assert!(player.contains("NEVER offer or ask for a conversation style"));
+        assert!(player.contains("persona_answered"));
         assert!(player.contains("Do not emit ready until every core field"));
         assert!(player.contains("never blank out a field already set"));
         assert!(player.contains("\"action\":\"ready\""));
 
         let sim = build_creator_assistant_system_prompt("sim");
-        // Type Router + the 3 branches + universal anchors + the per-branch
-        // completion gate. Pinned so a "lean prompt" pass can't drop one.
+        // Type Router + the 3 branches + universal anchors (incl. tone) + the
+        // per-branch completion gate. Pinned so a "lean prompt" pass can't
+        // drop one.
         assert!(sim.contains("TYPE ROUTER"));
         assert!(sim.contains("card_type"));
         assert!(sim.contains("npc"));
@@ -18404,6 +19299,9 @@ mod tests {
         assert!(sim.contains("primary_objective"));
         assert!(sim.contains("date"));
         assert!(sim.contains("custom_tags"));
+        assert!(sim.contains("tone (the STORY's narrative atmosphere"));
+        // v2: NO cast, NO locations graph — NPCs/places emerge in play.
+        assert!(sim.contains("NO cast and NO locations graph"));
         assert!(sim.contains("do not emit ready until draft.card_type"));
         // The mandatory INTRO question (2026-08-15, Chloe: the SIM Wizard —
         // not a post-card step — asks it; a card can't finalize without an

@@ -47,7 +47,8 @@ test('buildIdCard: player = NAME header + license rows (race/gender, age/skin/bo
   const e = byTitle(m);
   assert.ok(!('Hair' in e));
   assert.ok(!('Physique' in e));
-  assert.deepEqual(e.Clothing, [['Outfit', 'tunic, boots']]);
+  // v2: clothing rides the Inventory extra (the mutable sibling seed).
+  assert.deepEqual(e.Inventory, [['Clothing', 'tunic, boots']]);
   assert.deepEqual(e['Starting conditions'], [['Wealth', '50 gold']]);
 });
 
@@ -66,16 +67,22 @@ test('buildIdCard: player drops empty cells + empty extra sections', () => {
   assert.deepEqual(m.extra, []);
 });
 
-test('buildIdCard: player surfaces distinctive, inventory, accessories, custom tags', () => {
+test('buildIdCard: player surfaces distinctive, inventory, custom tags', () => {
   const m = buildIdCard('player', {
     name: 'Nyx', race: 'tiefling', horn: 'curled', ears: 'pointed',
-    gear: ['compass', 'rope'], weapons: ['dagger'], accessories: 'silver locket',
+    gear: ['compass', 'rope'], equipped: ['dagger'], accessories: 'silver locket',
     custom_tags: { curse: 'moon-bound', faction: 'thieves guild' },
   });
   const e = byTitle(m);
   assert.deepEqual(e.Distinctive, [['Ears', 'pointed'], ['Horn', 'curled']]);
-  assert.deepEqual(e.Inventory, [['Gear', 'compass, rope'], ['Weapons', 'dagger']]);
-  assert.deepEqual(e.Accessories, [['Items', 'silver locket']]);
+  // v2: one Inventory extra — Equipped/Accessories/Stored rows (legacy gear
+  // folds to Stored).
+  assert.deepEqual(e.Inventory, [
+    ['Equipped', 'dagger'],
+    ['Accessories', 'silver locket'],
+    ['Stored', 'compass, rope'],
+  ]);
+  assert.ok(!('Accessories' in e), 'no separate Accessories extra in v2');
   const ct = Object.fromEntries(e['Custom tags']);
   assert.deepEqual(ct, { curse: 'moon-bound', faction: 'thieves guild' });
 });
@@ -85,7 +92,10 @@ test('buildIdCard: sim npc = player layout (NAME header) + subtle NPC CARD tag',
   const m = buildIdCard('sim', {
     card_type: 'npc', name: 'Mara', gender: 'female', race: 'human', age: '40',
     hair_color: 'auburn', eye_color: 'brown', height: "5'6\"", weight: '130 lb',
-    personality: 'warm', flaws: 'curious', dialogue_style: 'cheery', tone: 'cozy',
+    personality: 'warm', flaws: 'curious', likes: 'songs', dislikes: 'nobles',
+    dialogue_style: 'cheery', backstory: 'exile', goal: 'buy the tavern', tone: 'cozy',
+    gear: ['compass'], accessories: ['silver locket'],
+    date: 'Day 1', time: '09:00', weather: 'clear', location: 'Tavern',
   });
   assert.equal(m.variant, 'player');
   assert.equal(m.title, 'Mara');
@@ -93,8 +103,23 @@ test('buildIdCard: sim npc = player layout (NAME header) + subtle NPC CARD tag',
   assert.equal(m.banner, null);
   assert.ok(m.core.find((c) => c.label === 'Race'));
   const e = byTitle(m);
-  // NPC-only persona fields surface.
+  // v2: the FULL persona set surfaces (Goals + Backstory are persona
+  // members now; the story tone is a world anchor, never persona).
   assert.ok(e.Persona && e.Persona.find(([l]) => l === 'Dialogue style'));
+  assert.ok(e.Persona.find(([l]) => l === 'Likes'));
+  assert.ok(e.Persona.find(([l]) => l === 'Dislikes'));
+  assert.ok(e.Persona.find(([l]) => l === 'Goals'));
+  assert.ok(e.Persona.find(([l]) => l === 'Backstory'));
+  assert.ok(!e.Persona.find(([l]) => l === 'Tone'));
+  assert.ok(!('Background' in e), 'the Background group is gone in v2');
+  // The mandatory SIM anchors (incl. tone) surface in the details.
+  assert.ok(e['World anchors'] && e['World anchors'].find(([l]) => l === 'Weather'));
+  assert.ok(e['World anchors'].find(([l]) => l === 'Location'));
+  assert.ok(e['World anchors'].find(([l]) => l === 'Tone'));
+  // The inventory answers surface as the Inventory extra (legacy gear →
+  // Stored, accessories their own row).
+  assert.ok(e.Inventory && e.Inventory.find(([l]) => l === 'Stored'));
+  assert.ok(e.Inventory.find(([l]) => l === 'Accessories'));
 });
 
 // ── world ──────────────────────────────────────────────────────────────────

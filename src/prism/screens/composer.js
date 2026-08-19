@@ -92,7 +92,8 @@ const MIN_ALIAS_QUERY = 3;
 // recommended ~1.0 MP set). Ordered tall → square → wide; the default is
 // the portrait 832×1216 (characters are the primary use).
 const BUCKETS = [
-  [768, 1344], [832, 1216], [1024, 1024], [1216, 832], [1344, 768],
+  [768, 1344], [832, 1216], [896, 1152], [1024, 1024], [1152, 896],
+  [1216, 832], [1344, 768],
 ];
 
 // localStorage keys for the steering toggles (persist across composer
@@ -310,8 +311,9 @@ function settingsRailHtml() {
       <select id="prism-dim" class="prism-select" data-setting="dim">
         <option value="768x1344">768 × 1344 (tall portrait)</option>
         <option value="832x1216" selected>832 × 1216 (portrait)</option>
+        <option value="896x1152">896 × 1152 (portrait)</option>
         <option value="1024x1024">1024 × 1024 (square)</option>
-        <option value="1216x832">1216 × 832 (landscape)</option>
+        <option value="1152x896">1152 × 896 (landscape)</option>
         <option value="1216x832">1216 × 832 (landscape)</option>
         <option value="1344x768">1344 × 768 (wide landscape)</option>
       </select>

@@ -877,22 +877,10 @@ impl Tool for CreateSimCard {
         }
     }
     fn validate_args(&self, args: &serde_json::Value) -> Result<(), ToolError> {
-        let filename = req_str_nonempty(args, "filename")?;
+        let _filename = req_str_nonempty(args, "filename")?;
         let xml = req_str(args, "xml")?;
-        // apps/fable/cards/<stem>/<stem>.sim is on the allow-list, but verify
-        // the computed path itself (defensive: a filename like ../escape would
-        // have been caught by sandbox_path, but be explicit).
-        let stem = sanitize_stem(&filename)
-            .ok_or_else(|| ToolError::new("filename empty after sanitization"))?;
-        let rel = format!("apps/fable/cards/{stem}/{stem}.sim");
-        let safe = sandbox_path(&rel)
-            .ok_or_else(|| ToolError::new(format!("unsafe card path: {rel}")))?;
-        if !is_writable(&safe) {
-            return Err(ToolError::new(format!(
-                "card path {rel} is not writable"
-            )));
-        }
-        // Smoke-test the XML parses (roxmltree is strict enough for this).
+        // The concrete path is derived in execute from the card's PARSED name
+        // (display stem); validate the XML shape + size here.
         roxmltree::Document::parse(&xml)
             .map_err(|e| ToolError::new(format!("XML parse error: {e}")))?;
         if xml.len() > 100_000 {
@@ -901,24 +889,25 @@ impl Tool for CreateSimCard {
         Ok(())
     }
     fn execute(&self, args: &serde_json::Value, ctx: &ToolCtx) -> Result<String, ToolError> {
-        let filename = req_str(args, "filename")?;
+        // `filename` is accepted for API compatibility; the folder derives
+        // from the card's parsed name.
+        let _filename = req_str(args, "filename")?;
         let xml = req_str(args, "xml")?;
-        // (2026-08-15 audit fix) The folder stem is the card's PARSED id,
-        // not the raw filename stem. The parsed <metadata><id> (or the
-        // name-derived slug when omitted) is the memory-partition key; a
-        // filename/id mismatch meant the folder and the partition key
-        // diverged at creation, so BOTH delete paths (IPC + tool purge
-        // hook, which re-derive from their own strings) could hit the
-        // wrong key and leave permanent ghost rows. Creating under the
-        // parsed id makes folder == partition key by construction. The
-        // filename stem remains the fallback when the XML carries no
-        // usable id (parse failure was already rejected in validate_args).
-        let stem = crate::sim_card::parse_from_xml_str(&xml)
-            .ok()
-            .map(|c| c.id)
-            .filter(|id| sanitize_stem(id).is_some())
-            .or_else(|| sanitize_stem(&filename))
-            .ok_or_else(|| ToolError::new("filename empty after sanitization"))?;
+        // (2026-08-19) The folder stem is the card's DISPLAY name (spaces +
+        // capitals preserved); the parsed id stays the slug (memory key).
+        // An EXISTING card with this id keeps its folder (an edit).
+        let card = crate::sim_card::parse_from_xml_str(&xml)
+            .map_err(|e| ToolError::new(format!("card XML failed to parse: {e}")))?;
+        let cards_root = ctx.resolve("apps/fable/cards")?;
+        let existing = crate::resolve_card_folder(&cards_root, &card.id);
+        let stem = match &existing {
+            Some(folder) => folder
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or(&card.name)
+                .to_owned(),
+            None => crate::unique_display_stem(&cards_root, &card.name, "Card", None),
+        };
         let rel = format!("apps/fable/cards/{stem}/{stem}.sim");
         let path = ctx.resolve(&rel)?;
         let parent = path.parent().ok_or_else(|| ToolError::new("no parent"))?;
@@ -949,8 +938,10 @@ impl Tool for CreateSimCard {
                 )));
             }
         }
+        crate::cache_card_folder(&cards_root, &card.id, parent);
         Ok(format!(
-            "created {rel} (the card id '{stem}' is its folder + memory key — reference it in future delete/edit calls)"
+            "created {rel} (the card id '{}' is its memory key, '{}' its folder — reference the id in future delete/edit calls)",
+            card.id, stem
         ))
     }
 }
@@ -984,16 +975,24 @@ impl Tool for DeleteSimCard {
     }
     fn execute(&self, args: &serde_json::Value, ctx: &ToolCtx) -> Result<String, ToolError> {
         let filename = req_str(args, "filename")?;
-        let stem = sanitize_stem(&filename)
+        let slug = sanitize_stem(&filename)
             .ok_or_else(|| ToolError::new("filename empty after sanitization"))?;
-        let rel = format!("apps/fable/cards/{stem}");
-        let path = ctx.resolve(&rel)?;
+        // (2026-08-19) Resolve the ACTUAL folder by parsed id (folders are
+        // display-named); fall back to the legacy slug-named folder for
+        // pre-migration strays.
+        let cards_root = ctx.resolve("apps/fable/cards")?;
+        let path = crate::resolve_card_folder(&cards_root, &slug)
+            .or_else(|| {
+                let fallback = cards_root.join(&slug);
+                fallback.is_dir().then_some(fallback)
+            })
+            .ok_or_else(|| ToolError::new(format!("no card folder for '{slug}'")))?;
         match std::fs::remove_dir_all(&path) {
-            Ok(()) => Ok(format!("deleted {rel}")),
+            Ok(()) => Ok(format!("deleted {}", path.display())),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                Ok(format!("already absent: {rel}"))
+                Ok(format!("already absent: {}", path.display()))
             }
-            Err(e) => Err(ToolError::new(format!("delete {rel}: {e}"))),
+            Err(e) => Err(ToolError::new(format!("delete {}: {e}", path.display()))),
         }
     }
 }

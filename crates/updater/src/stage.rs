@@ -70,8 +70,35 @@ pub fn extract_to_staging(zip_path: &Path, staging: &Path) -> Result<usize, Stri
 /// (which REPLACES the destination atomically on Windows) only runs after
 /// the temp file is complete. A mid-sequence failure now leaves every file
 /// EITHER fully-old OR fully-new, never truncated.
+///
+/// (2026-08-18 relaunch-killer fix) A single-attempt copy is NOT enough:
+/// transient lockers (AV/indexer scanning the freshly-written ~1.2 GB of
+/// executable content) can hold one file for a few seconds, and ONE
+/// `Access is denied` used to fail the whole phase → `install_touched` →
+/// relaunch skipped → WUPI silently never came back (observed live on the
+/// 0.24.1 → 0.24.2 hop: `bin/VCRUNTIME140.dll` lost one rename race). Two
+/// resilience layers, both confined to the failure path:
+///
+/// 1. **Retry with backoff** — failed files are re-attempted across ~30 s
+///    (same schedule shape as `spawn_wupi_robust`); a transient lock
+///    converts into a wait.
+/// 2. **Byte-identity exemption** — a file that is STILL locked after all
+///    retries but already byte-identical to the payload (runtime DLLs
+///    rarely change between releases — the 0.24.2 case: the "unreplaced"
+///    May-dated VCRUNTIME140.dll hashed EQUAL to the payload copy) leaves
+///    the install at the target content. It is not version-mixed, so it
+///    neither fails the update nor justifies skipping the relaunch.
 pub fn copy_into_target(staging: &Path, target: &Path) -> Result<(), String> {
+    /// Backoff seconds between copy retry rounds. Five rounds spanning
+    /// ~30 s: long enough to outlast a realistic AV/indexer scan window,
+    /// short enough that a genuinely-broken copy doesn't hang the headless
+    /// updater for minutes.
+    const COPY_RETRY_BACKOFF_SECS: [u64; 5] = [2, 4, 6, 8, 10];
+
     let files = walk_files(staging)?;
+    // (src, rel, last error) for files that could not be replaced — yet.
+    let mut failed: Vec<(PathBuf, PathBuf, String)> = Vec::new();
+    // Non-retryable structural failures (mkdir) go straight to the report.
     let mut errors: Vec<String> = Vec::new();
     for src in &files {
         let rel = match src.strip_prefix(staging) {
@@ -89,9 +116,52 @@ pub fn copy_into_target(staging: &Path, target: &Path) -> Result<(), String> {
             }
         }
         if let Err(e) = copy_atomic(src, &dst) {
-            errors.push(format!("copy {}: {e}", rel.display()));
+            failed.push((src.clone(), rel.to_path_buf(), e));
         }
     }
+
+    if !failed.is_empty() {
+        crate::log(format!(
+            "{} file(s) failed the first copy pass (first: {}) — retrying with backoff",
+            failed.len(),
+            failed[0].2
+        ));
+    }
+    for backoff in COPY_RETRY_BACKOFF_SECS {
+        if failed.is_empty() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_secs(backoff));
+        let mut still: Vec<(PathBuf, PathBuf, String)> = Vec::new();
+        for (src, rel, _err) in failed {
+            match copy_atomic(&src, &target.join(&rel)) {
+                Ok(()) => {
+                    crate::log(format!("copy of {} recovered on retry", rel.display()))
+                }
+                Err(e) => still.push((src, rel, e)),
+            }
+        }
+        failed = still;
+    }
+
+    if !failed.is_empty() {
+        failed.retain(|(src, rel, _err)| {
+            let identical = files_identical(src, &target.join(rel));
+            if identical {
+                crate::log(format!(
+                    "{} still locked but byte-identical to the payload — install not version-mixed",
+                    rel.display()
+                ));
+            }
+            !identical
+        });
+    }
+
+    errors.extend(
+        failed
+            .iter()
+            .map(|(_src, rel, e)| format!("copy {}: {e}", rel.display())),
+    );
     if errors.is_empty() {
         Ok(())
     } else {
@@ -100,6 +170,38 @@ pub fn copy_into_target(staging: &Path, target: &Path) -> Result<(), String> {
             errors.len(),
             errors[0]
         ))
+    }
+}
+
+/// Byte-compare two files, chunked + length-gated. A missing/unreadable
+/// file is never identical. Only called on the retry-exhausted failure
+/// path, so the read cost is confined to files that could not be replaced.
+fn files_identical(a: &Path, b: &Path) -> bool {
+    use std::io::Read;
+    let (ma, mb) = match (std::fs::metadata(a), std::fs::metadata(b)) {
+        (Ok(ma), Ok(mb)) => (ma, mb),
+        _ => return false,
+    };
+    if ma.len() != mb.len() {
+        return false;
+    }
+    let (mut fa, mut fb) = match (std::fs::File::open(a), std::fs::File::open(b)) {
+        (Ok(fa), Ok(fb)) => (fa, fb),
+        _ => return false,
+    };
+    let mut buf_a = vec![0u8; 64 * 1024];
+    let mut buf_b = vec![0u8; 64 * 1024];
+    loop {
+        let (na, nb) = match (fa.read(&mut buf_a), fb.read(&mut buf_b)) {
+            (Ok(na), Ok(nb)) => (na, nb),
+            _ => return false,
+        };
+        if na == 0 && nb == 0 {
+            return true;
+        }
+        if na != nb || buf_a[..na] != buf_b[..nb] {
+            return false;
+        }
     }
 }
 

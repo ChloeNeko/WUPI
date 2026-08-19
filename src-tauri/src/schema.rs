@@ -1558,6 +1558,15 @@ pub struct WorldSchema {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub calendar_synced_minutes: Option<i64>,
 
+    /// The simulation's tone (2026-08-19 Chloe ruling): seeded from the
+    /// card's `<world>` sibling (or legacy card-level `<tone>`), rendered
+    /// per-turn as the `tone:` line right after `weather:` — tone is LIVE
+    /// world state owned by the tracker, never static prompt text (the card
+    /// cache block carries identity only). `None` = dormant (no line; legacy
+    /// saves + cards without a tone).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tone: Option<String>,
+
     /// Custom extensions (2026-08-13): a flat key→value string map seeded from
     /// the card's `<custom_tags>` (sim) + the SavedPlayer's `custom_tags`
     /// (player attach) — any extra stat / faction standing / curse / currency /
@@ -2212,6 +2221,15 @@ impl WorldSchema {
                 out.push('\n');
             }
         }
+        // Tone (2026-08-19): the simulation's tone rides WITH the time +
+        // weather — live world state the tracker owns, seeded from the card's
+        // `<world>` sibling, not static prompt text (the card cache block
+        // carries identity only). None → no line (dormant).
+        if let Some(tone) = self.tone.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            out.push_str("tone: ");
+            out.push_str(&tone.chars().take(120).collect::<String>());
+            out.push('\n');
+        }
         // Location renders alongside clock + weather (Component 3, 2026-07-28):
         // the third top-of-mind anchor. The narrator needs the current location
         // + its exits to write coherent movement prose + emit valid `[TRAVEL]`
@@ -2325,6 +2343,52 @@ impl WorldSchema {
                     parts.push(format!("(+{hidden} more)"));
                 }
                 out.push_str("minds: ");
+                out.push_str(&Self::flatten_inline(&parts.join(", ")));
+                out.push('\n');
+            }
+        }
+        // (2026-08-19 v2 cards) The `holding:` line — the item racks of
+        // PRESENT NPCs (seeded from an npc card's `<inventory>` sibling +
+        // mutated by `[NPC_ITEM]` in play). Same scene-scoped whitelist as
+        // `present:`/`minds:`: an off-camera NPC's items never render. Capped
+        // at 6 present rack-holders + `(+N more)`; flattened at the join.
+        // Dormant when no present NPC carries items (zero tokens, always) —
+        // the narrator sees clothing/held items turn 1 without re-reading the
+        // card.
+        if !self.presences.is_empty() && !self.npc_interior.is_empty() {
+            const HOLDING_PROMPT_CAP: usize = 6;
+            let mut parts: Vec<String> = Vec::new();
+            let mut hidden = 0usize;
+            for p in &self.presences {
+                let Some(interior) = self.npc_interior.get(&p.npc_id) else {
+                    continue;
+                };
+                if interior.items.is_empty() {
+                    continue;
+                }
+                let names: Vec<String> = interior
+                    .items
+                    .iter()
+                    .map(|it| {
+                        if it.qty > 1 {
+                            format!("{} ×{}", it.name, it.qty)
+                        } else {
+                            it.name.clone()
+                        }
+                    })
+                    .collect();
+                let entry = format!("{}({})", p.name, names.join(", "));
+                if parts.len() < HOLDING_PROMPT_CAP {
+                    parts.push(entry);
+                } else {
+                    hidden += 1;
+                }
+            }
+            if !parts.is_empty() {
+                if hidden > 0 {
+                    parts.push(format!("(+{hidden} more)"));
+                }
+                out.push_str("holding: ");
                 out.push_str(&Self::flatten_inline(&parts.join(", ")));
                 out.push('\n');
             }

@@ -313,11 +313,47 @@ async function renderCard(body) {
   }
   const parts = [];
   if (nonEmpty(card.name)) parts.push(row('Name', card.name));
+  if (nonEmpty(card.subtype)) parts.push(row('Type', card.subtype));
   if (nonEmpty(card.player_name)) parts.push(row('Playing as', card.player_name));
+  // The v2 <identity> line block (present for every card — the KV-cache
+  // payload; missing traits are simply absent).
+  const id = card.identity || {};
+  const idRows = [
+    ['Gender', id.gender], ['Race', id.race], ['Age', id.age],
+    ['Height', id.height], ['Weight', id.weight], ['Body', id.body],
+    ['Skin', id.skin], ['Eyes', id.eyes],
+    ['Hair Color', id.hair_color], ['Hair Length', id.hair_length],
+    ['Hair Style', id.hair_style],
+  ].filter(([, v]) => nonEmpty(v)).map(([l, v]) => row(l, v)).join('');
+  if (idRows) parts.push(section('Identity', idRows));
+  // The <persona> line block (npc cards carry every label; absent otherwise).
+  const p = card.persona || {};
+  const personaRows = [
+    ['Personality', p.personality], ['Conversation Style', p.conversation_style],
+    ['Likes', p.likes], ['Dislikes', p.dislikes], ['Flaws', p.flaws],
+    ['Goals', p.goals], ['Occupation', p.occupation], ['Backstory', p.backstory],
+  ].filter(([, v]) => nonEmpty(v)).map(([l, v]) => row(l, v)).join('');
+  if (personaRows) parts.push(section('Persona', personaRows));
   if (nonEmpty(card.setting)) parts.push(proseBlock('Setting', card.setting));
   if (nonEmpty(card.plot)) parts.push(proseBlock('Plot', card.plot));
-  if (nonEmpty(card.tone)) parts.push(row('Tone', card.tone));
-  if (nonEmpty(card.core_persona)) parts.push(proseBlock('Persona', card.core_persona));
+  // The <world> sibling anchors (the mutable seeds — the live values live in
+  // the World tab; this shows what the card shipped).
+  const w = card.world || {};
+  const worldRows = [
+    ['Date', w.date], ['Time', w.time], ['Weather', w.weather], ['Tone', w.tone],
+    ['Location', card.location],
+  ].filter(([, v]) => nonEmpty(v)).map(([l, v]) => row(l, v)).join('');
+  if (worldRows) parts.push(section('World Anchors', worldRows));
+  // The <inventory> sibling (npc cards).
+  const inv = card.inventory || {};
+  const invRows = [
+    ['Clothing', inv.clothing], ['Equipped', inv.equipped],
+    ['Accessories', inv.accessories], ['Stored', inv.stored],
+  ].filter(([, v]) => Array.isArray(v) && v.length).map(([l, v]) => row(l, v.join(', '))).join('');
+  if (invRows) parts.push(section('Inventory', invRows));
+  const tags = card.custom_tags || {};
+  const tagRows = Object.entries(tags).filter(([, v]) => nonEmpty(v)).map(([k, v]) => row(k, v)).join('');
+  if (tagRows) parts.push(section('Custom Tags', tagRows));
   body.innerHTML = parts.length ? parts.join('') : emptyBox('No active card.');
 }
 

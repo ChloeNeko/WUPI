@@ -45,6 +45,18 @@ const { readFileSync, existsSync, mkdirSync, rmSync, readdirSync, copyFileSync, 
 const { join, basename } = require('path');
 const { spawnSync } = require('child_process');
 
+// DEP0190: Node deprecates passing an args ARRAY alongside shell:true — the
+// args get concatenated unescaped. The build steps below need the shell (npx
+// is a .cmd shim on Windows), so they go through this helper instead: one
+// pre-quoted command STRING, the only safe shape with shell:true.
+const shCommand = (cmd, args) => {
+  const quote = (a) => {
+    const s = String(a);
+    return /[\s"^&|<>]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+  };
+  return [cmd, ...args].map(quote).join(' ');
+};
+
 // Windows-tolerant recursive delete. Node's `fs.rmSync` returns EPERM when
 // Defender (MsMpEng.exe) or Search Indexer (SearchIndexer.exe) briefly holds
 // a handle on a freshly-written .exe or its containing dir — even an EMPTY
@@ -332,7 +344,7 @@ console.log(`[release] running: npx tauri build`);
 if (dryRun) {
   console.log('[release] (dry-run) skipping actual build');
 } else {
-  const buildResult = spawnSync('npx', [
+  const buildResult = spawnSync(shCommand('npx', [
     'tauri', 'build',
     // v0.22.0: PRISM ships to end users — the release build MUST compile the
     // real Stable Diffusion backend. Without this flag the exe builds with
@@ -342,7 +354,7 @@ if (dryRun) {
     // of the SD stack (docs/phase5b-diffusion-rs-cargo-procedure.md).
     // fable.exe below mirrors this feature set EXACTLY.
     '--features', 'diffusion-rs',
-  ], {
+  ]), {
     env: childEnv,
     stdio: 'inherit',
     shell: true,  // npx is a .cmd on Windows; shell:true to invoke
@@ -367,10 +379,10 @@ if (dryRun) {
 const updaterExe = join(repoRoot, 'crates', 'updater', 'target', 'release', 'updater.exe');
 console.log('[release] building updater crate (crates/updater)…');
 if (!dryRun) {
-  const updaterBuild = spawnSync('cargo', [
+  const updaterBuild = spawnSync(shCommand('cargo', [
     'build', '--release',
     '--manifest-path', join(repoRoot, 'crates', 'updater', 'Cargo.toml'),
-  ], { stdio: 'inherit', shell: true });
+  ]), { stdio: 'inherit', shell: true });
   if (updaterBuild.status !== 0) {
     console.error(`[release] updater crate build failed (exit ${updaterBuild.status}).`);
     process.exit(updaterBuild.status ?? 1);
@@ -398,7 +410,7 @@ if (!dryRun) {
 const builtFableExe = join(cargoTargetDir, 'release', 'fable.exe');
 console.log('[release] building fable.exe (src/bin/fable.rs)…');
 if (!dryRun) {
-  const fableBuild = spawnSync('cargo', [
+  const fableBuild = spawnSync(shCommand('cargo', [
     'build', '--release', '--bin', 'fable',
     // CRITICAL — mirror `npx tauri build`'s feature set EXACTLY. The tauri
     // CLI compiles with `--features tauri/custom-protocol`; without it,
@@ -414,7 +426,7 @@ if (!dryRun) {
     // it while wupi.exe has it is a split-backend install (PRISM works in
     // one launcher and silently no-ops in the other).
     '--features', 'tauri/custom-protocol,diffusion-rs',
-  ], { stdio: 'inherit', cwd: join(repoRoot, 'src-tauri'), shell: true });
+  ]), { stdio: 'inherit', cwd: join(repoRoot, 'src-tauri'), shell: true });
   if (fableBuild.status !== 0) {
     console.error(`[release] fable build failed (exit ${fableBuild.status}).`);
     process.exit(fableBuild.status ?? 1);

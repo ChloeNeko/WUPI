@@ -76,7 +76,7 @@ pub struct GalleryImage {
     pub width: i32,
     pub height: i32,
     /// The sampler discriminant (mirrors `SceneImageRequest.sampling_method`'s
-    /// i32 contract — see `scene_art::EULER_A_DISCRIMINANT` + `sampler_from_i32`).
+    /// i32 contract — see `scene_art::DPMPP2M_DISCRIMINANT` + `sampler_from_i32`).
     pub sampler: i32,
     /// The model file name (not full path — just the leaf, e.g.
     /// "Image.safetensors"). The full path is reconstructable from

@@ -227,9 +227,11 @@ async function openModal(root, meta) {
         // returns a RAW absolute filesystem path — it MUST go through
         // convertFileSrc before it's a loadable web URL (the old code
         // assigned it raw → the slot went blank until a re-open; 2026-08-15).
-        meta.portrait = `portrait.${ext}`;
         meta.has_portrait = true;
         const absPath = await invoke('fable_card_portrait_url', { cardId: meta.id }).catch(() => null);
+        // Relative filename straight from the resolver (namesake
+        // `<Name>.<ext>` since 2026-08-19 — never guess it client-side).
+        meta.portrait = absPath ? absPath.split(/[\\/]/).pop() : null;
         if (absPath) {
           const freshSrc = `${convertFileSrc(absPath)}?t=${Date.now()}`;
           const img = portraitSlot.querySelector('img');
@@ -360,17 +362,23 @@ function findRootClose(text) {
 // Parse the card's raw .sim XML into a creator-engine draft so the modal can
 // render through buildIdCard — the SAME license face the Creator review uses
 // (2026-08-15 Chloe: the load menu must match the review exactly). The .sim is
-// TWO-ROOT (<sim_card> + the <intro> sibling), so slice at </sim_card> first —
-// the same trick sim_card.rs::parse uses; DOMParser rejects two-root documents.
+// TWO-ROOT (<sim_card> + its siblings), so slice at </sim_card> first — the
+// same trick sim_card.rs::parse uses; DOMParser rejects two-root documents.
+// Handles BOTH generations: v2 line-block identity/persona + the
+// world/location/inventory siblings, and the legacy element format.
 // Best-effort: any failure returns {} and the caller falls back to list-meta.
 function parseSimDraft(xmlText, subtype) {
   const out = { card_type: subtype || '' };
   try {
     const end = findRootClose(xmlText);
     let head = xmlText;
+    let tail = '';
     if (end !== -1) {
       const gt = xmlText.indexOf('>', end); // tolerate `</sim_card >`
-      head = gt === -1 ? xmlText : xmlText.slice(0, gt + 1);
+      if (gt !== -1) {
+        head = xmlText.slice(0, gt + 1);
+        tail = xmlText.slice(gt + 1);
+      }
     }
     const doc = new DOMParser().parseFromString(head, 'text/xml');
     if (doc.querySelector('parsererror')) return out;
@@ -378,6 +386,87 @@ function parseSimDraft(xmlText, subtype) {
       const el = doc.querySelector(sel);
       return el ? el.textContent.trim() : '';
     };
+    // ── v2 detection: the direct <identity> child is a text LINE BLOCK (no
+    // <name> element child) — the legacy shape nests <name>/<persona> inside.
+    const identityEl = doc.querySelector('sim_card > identity');
+    const isV2 = !!identityEl && !identityEl.querySelector('name');
+    // Split a CDATA line block into {label → value} pairs.
+    const labeled = (block) => {
+      const map = {};
+      if (!block) return map;
+      for (const line of block.split(/\r?\n/)) {
+        const m = line.match(/^\s*([^:]+?)\s*:\s*(.+?)\s*$/);
+        if (m) map[m[1].trim().toLowerCase().replace(/[\s_-]+/g, '_')] = m[2].trim();
+      }
+      return map;
+    };
+    const listVal = (v) => (v ? v.split(',').map((s) => s.trim()).filter(Boolean) : []);
+
+    if (isV2) {
+      const idm = labeled(identityEl.textContent);
+      out.name = idm.name || '';
+      const ID_MAP = {
+        gender: 'gender', race: 'race', age: 'age', height: 'height', weight: 'weight',
+        body: 'body_type', skin: 'skin_complexion', eyes: 'eye_color',
+        hair_color: 'hair_color', hair_length: 'hair_length', hair_style: 'hair_style',
+        breast: 'breast_size', ears: 'ears', tail: 'tail', horn: 'horn',
+      };
+      for (const [k, key] of Object.entries(ID_MAP)) {
+        if (idm[k]) out[key] = idm[k];
+      }
+      // The v2 <persona> line block (direct child).
+      const personaEl = doc.querySelector('sim_card > persona');
+      if (personaEl) {
+        const pm = labeled(personaEl.textContent);
+        if (pm.personality) out.personality = pm.personality;
+        if (pm.conversation_style) out.dialogue_style = pm.conversation_style;
+        if (pm.likes) out.likes = pm.likes;
+        if (pm.dislikes) out.dislikes = pm.dislikes;
+        if (pm.flaws) out.flaws = pm.flaws;
+        if (pm.goals) out.goal = pm.goals;
+        if (pm.occupation) out.job = pm.occupation;
+        if (pm.backstory) out.backstory = pm.backstory;
+      }
+      // scenario/world dedicated prose.
+      out.setting = q('sim_card > setting');
+      const plot = q('sim_card > plot');
+      if (plot) {
+        const plm = labeled(plot);
+        out.directive = plm.premise || '';
+        if (plm.trigger) out.trigger_condition = plm.trigger;
+        if (plm.objective) out.primary_objective = plm.objective;
+        if (plm.actors) out.participating_actors = plm.actors;
+        if (plm.hazards) out.environmental_hazards = plm.hazards;
+        if (plm.outcomes) out.outcomes = plm.outcomes;
+        // Legacy npc goal form.
+        const gm = plot.match(/^Goal:\s*([\s\S]*)$/);
+        if (gm && gm[1].trim()) out.goal = gm[1].trim();
+      }
+      // The tail siblings: world anchors + location + inventory.
+      if (tail.trim()) {
+        const tdoc = new DOMParser().parseFromString(`<wupi_siblings>${tail}</wupi_siblings>`, 'text/xml');
+        if (!tdoc.querySelector('parsererror')) {
+          const tq = (sel) => {
+            const el = tdoc.querySelector(sel);
+            return el ? el.textContent.trim() : '';
+          };
+          const wm = labeled(tq('world'));
+          if (wm.date) out.date = wm.date;
+          if (wm.time) out.time = wm.time;
+          if (wm.weather) out.weather = wm.weather;
+          if (wm.tone) out.tone = wm.tone;
+          out.location = tq('location');
+          const im = labeled(tq('inventory'));
+          if (im.clothing) out.clothing = listVal(im.clothing);
+          if (im.equipped) out.equipped = listVal(im.equipped);
+          if (im.accessories) out.accessories = listVal(im.accessories);
+          if (im.stored) out.stored = listVal(im.stored);
+        }
+      }
+      return out;
+    }
+
+    // ── legacy format ──
     out.name = q('identity > name') || q('name');
     out.setting = q('setting');
     out.tone = q('tone');
@@ -388,9 +477,7 @@ function parseSimDraft(xmlText, subtype) {
     out.date = q('start > date');
     out.time = q('start > time');
     out.weather = q('start > weather');
-    // The NPC <appearance> block: `Tag: value` lines in the exact vocabulary
-    // buildNpcAppearance writes (card-serialize.js) — reverse-mapped onto the
-    // wizard's draft keys so playerIdCard renders the full license grid.
+    // The legacy NPC <appearance> block: `Tag: value` lines.
     const appearance = q('appearance');
     if (appearance) {
       const MAP = {
@@ -404,16 +491,42 @@ function parseSimDraft(xmlText, subtype) {
         if (!m) continue;
         if (m[1] === 'Clothing') {
           out.clothing = m[2].split(',').map((s) => s.trim()).filter(Boolean);
+        } else if (m[1] === 'Accessories') {
+          out.accessories = m[2].split(',').map((s) => s.trim()).filter(Boolean);
         } else if (MAP[m[1]]) {
           out[MAP[m[1]]] = m[2];
         }
       }
     }
     // persona reads as the world/scenario Purpose (the serializer wrote the
-    // directive there); on an NPC it's labeled persona prose → backstory.
+    // directive there); on an NPC it's the serializer's labeled composition —
+    // split the labels back into draft keys. Unlabeled prose falls to
+    // backstory.
     if (persona) {
-      if ((subtype || '').toLowerCase() === 'npc') out.backstory = persona;
-      else out.directive = persona;
+      if ((subtype || '').toLowerCase() === 'npc') {
+        const LABELS = { Personality: 'personality', Flaws: 'flaws', Likes: 'likes', Dislikes: 'dislikes', Occupation: 'job', Backstory: 'backstory', Gear: 'gear', Tools: 'tools', Weapons: 'weapons' };
+        const parts = persona.split(/\r?\n\r?\n(?=(?:Personality|Flaws|Likes|Dislikes|Occupation|Backstory|Gear|Tools|Weapons):)/);
+        const leftovers = [];
+        for (const part of parts) {
+          const m = part.match(/^(Personality|Flaws|Likes|Dislikes|Occupation|Backstory|Gear|Tools|Weapons):\s*([\s\S]*)$/);
+          if (!m) { if (part.trim()) leftovers.push(part.trim()); continue; }
+          const val = m[2].trim();
+          if (!val) continue;
+          const key = LABELS[m[1]];
+          out[key] = ['gear', 'tools', 'weapons'].includes(key)
+            ? val.split(',').map((s) => s.trim()).filter(Boolean)
+            : val;
+        }
+        if (leftovers.length) out.backstory = [out.backstory, ...leftovers].filter(Boolean).join('\n\n');
+      } else {
+        out.directive = persona;
+      }
+    }
+    // NPC: the card-level <plot> carries the goal (the serializer wrote
+    // "Goal: …"). Scenario <plot> stays a scenario-only concern.
+    if ((subtype || '').toLowerCase() === 'npc') {
+      const gm = q('plot').match(/^Goal:\s*([\s\S]*)$/);
+      if (gm && gm[1].trim()) out.goal = gm[1].trim();
     }
   } catch (_) { /* best-effort — meta fallback */ }
   return out;

@@ -103,24 +103,30 @@ test('buildReviewSections: player drops empty rows', () => {
   assert.deepEqual(identity[1], [['Name', 'Kael'], ['Gender', 'male']]);
 });
 
-test('buildReviewSections: player surfaces horn, inventory, custom tags, starting conditions', () => {
+test('buildReviewSections: player surfaces horn, inventory, persona, custom tags, starting conditions', () => {
   const secs = buildReviewSections('player', {
     name: 'Nyx', race: 'tiefling', horn: 'curled',
-    gear: ['compass', 'rope'], weapons: ['dagger'],
+    gear: ['compass', 'rope'], equipped: ['dagger'],
     job: 'thief', backstory: 'orphan',
     wealth: '200 gold', reputation: '-20',
     custom_tags: { curse: 'moon-bound' },
   });
   const byName = Object.fromEntries(secs);
   assert.deepEqual(byName.Distinctive, [['Horn', 'curled']]);
-  assert.ok(byName.Inventory.find(([l]) => l === 'Gear'));      // chip list joined
+  // v2: legacy gear folds to the Stored row; equipped is its own line.
+  assert.ok(byName.Inventory.find(([l]) => l === 'Stored'));    // chip list joined
+  assert.ok(byName.Inventory.find(([l]) => l === 'Equipped'));
+  // job + backstory surface under the opt-in Persona group.
+  assert.ok(byName.Persona.find(([l]) => l === 'Occupation'));
+  assert.ok(byName.Persona.find(([l]) => l === 'History'));
   assert.ok(byName['Custom tags'].find(([l]) => l === 'curse'));
   assert.deepEqual(byName['Starting conditions'], [['Wealth', '200 gold'], ['Reputation', '-20']]);
 });
 
-test('buildReviewSections: sim (no card_type) includes world anchors + locations + cast', () => {
-  // Pre-router / world-style draft: anchors section renamed to 'World anchors'
-  // (2026-08-13 Type Router), but Locations/Cast still surface.
+test('buildReviewSections: sim (no card_type) includes world anchors (incl. tone), never locations/cast', () => {
+  // v2 (2026-08-19): cast + the locations graph are GONE from the format —
+  // they never surface. The anchors section carries the tone (a world
+  // anchor, rendered beside date/time/weather).
   const secs = buildReviewSections('sim', {
     name: 'Aldermoor', directive: 'survive', setting: 'a bog', tone: 'grim',
     date: '3rd of Harvest, Year 1247', time: '09:00', weather: 'fog', location: 'Village',
@@ -129,19 +135,30 @@ test('buildReviewSections: sim (no card_type) includes world anchors + locations
   });
   const titles = secs.map(([t]) => t);
   assert.ok(titles.includes('World anchors'));
-  assert.ok(titles.includes('Locations'));
-  assert.ok(titles.includes('Cast'));
-  const loc = secs.find(([t]) => t === 'Locations');
-  assert.deepEqual(loc[1], [['Village', 'Marsh']]);
+  assert.ok(!titles.includes('Locations'), 'no locations graph in v2');
+  assert.ok(!titles.includes('Cast'), 'no cast in v2');
+  const anchors = secs.find(([t]) => t === 'World anchors');
+  assert.ok(anchors[1].find(([l]) => l === 'Tone'));
 });
 
 test('buildReviewSections: sim npc/scenario/world branch sections', () => {
   const npc = Object.fromEntries(buildReviewSections('sim', {
     card_type: 'npc', name: 'Mara', gender: 'female', race: 'human', hair_color: 'auburn',
-    personality: 'warm', flaws: 'curious', job: 'innkeep', backstory: 'exile', dialogue_style: 'cheery', tone: 'cozy',
+    personality: 'warm', flaws: 'curious', likes: 'river songs', dislikes: 'nobles',
+    job: 'innkeep', backstory: 'exile', dialogue_style: 'cheery', goal: 'buy the tavern', tone: 'cozy',
   }));
   assert.ok(npc.Identity && npc.Identity.find(([l]) => l === 'Gender'));
   assert.ok(npc.Persona && npc.Persona.find(([l]) => l === 'Dialogue style'));
+  // 2026-08-19 v2: the FULL persona set — likes/dislikes/goals/backstory are
+  // persona members; the story tone is a world anchor, never persona.
+  assert.ok(npc.Persona.find(([l]) => l === 'Likes'));
+  assert.ok(npc.Persona.find(([l]) => l === 'Dislikes'));
+  assert.ok(npc.Persona.find(([l]) => l === 'Goals'));
+  assert.ok(npc.Persona.find(([l]) => l === 'Backstory'));
+  assert.ok(!npc.Persona.find(([l]) => l === 'Tone'));
+  assert.ok(!npc.Background, 'the Background group is gone (all persona now)');
+  const anchors = Object.fromEntries(npc['World anchors'] || []);
+  assert.ok(anchors.Tone === 'cozy', 'tone renders as a world anchor');
 
   const sce = Object.fromEntries(buildReviewSections('sim', {
     card_type: 'scenario', name: 'Ambush', directive: 'bandits strike',
@@ -368,6 +385,9 @@ const FULL_PLAYER = {
   skin_complexion: 'tan', height: "6'1\"", weight: '180 lb', body_type: 'lean',
   hair_color: 'black', hair_length: 'short', hair_style: 'messy',
   eye_color: 'green', clothing: ['tunic'],
+  // v2 (2026-08-19): clothing is no longer a mandatory identity field, but
+  // the FINAL persona question must be answered — this fixture answered it.
+  persona: { personality: 'Steady.' },
 };
 const SIM_BASE = { date: '3rd of Harvest', time: '09:00', weather: 'fog', location: 'Square' };
 
@@ -388,17 +408,48 @@ test('missingMandatoryFields: numbers count as filled; booleans/objects do not',
   assert.deepEqual(missingMandatoryFields('player', { ...FULL_PLAYER, age: 28 }), []);
   assert.deepEqual(missingMandatoryFields('player', { ...FULL_PLAYER, gender: true }), ['gender']);
   assert.deepEqual(missingMandatoryFields('player', { ...FULL_PLAYER, race: { bad: true } }), ['race']);
-  assert.deepEqual(missingMandatoryFields('player', { ...FULL_PLAYER, clothing: [] }), ['clothing']);
+  // clothing is OPTIONAL in v2 — an empty list no longer blocks.
+  assert.deepEqual(missingMandatoryFields('player', { ...FULL_PLAYER, clothing: [] }), []);
+  // The persona question: absent with no marker blocks; the explicit decline
+  // marker passes; a declined-then-declined run re-checking stays clean.
+  const declined = { ...FULL_PLAYER, persona: undefined, persona_answered: false };
+  assert.deepEqual(missingMandatoryFields('player', declined), []);
+  const neverAsked = { ...FULL_PLAYER, persona: undefined, personality: undefined };
+  delete neverAsked.personality;
+  assert.deepEqual(missingMandatoryFields('player', neverAsked), ['persona_answer']);
 });
 
-test('missingMandatoryFields: sim npc requires the full identity set + persona + anchors', () => {
+test('missingMandatoryFields: sim npc requires the full identity set + persona + background + anchors', () => {
   const npc = { ...FULL_PLAYER, card_type: 'npc', personality: 'warm', flaws: 'curious',
-    job: 'smith', backstory: 'b', dialogue_style: 'gruff', tone: 'cozy',
+    likes: 'songs', dislikes: 'nobles', job: 'smith', backstory: 'b', dialogue_style: 'gruff',
+    goal: 'reopen the forge', tone: 'cozy', items_answered: false,
     ...SIM_BASE, intro: 'You wake.' };
   assert.deepEqual(missingMandatoryFields('sim', npc), []);
-  const incomplete = { ...npc, body_type: null, personality: '' };
+  const incomplete = { ...npc, body_type: null, personality: '', goal: '' };
   delete incomplete.body_type;
-  assert.deepEqual(missingMandatoryFields('sim', incomplete), ['body_type', 'personality']);
+  assert.deepEqual(missingMandatoryFields('sim', incomplete), ['body_type', 'personality', 'goal']);
+  // The 2026-08-19 additions are each independently gated.
+  const noLikes = { ...npc, likes: ' ' };
+  assert.deepEqual(missingMandatoryFields('sim', noLikes), ['likes']);
+  const noDislikes = { ...npc, dislikes: [] };
+  assert.deepEqual(missingMandatoryFields('sim', noDislikes), ['dislikes']);
+});
+
+test('missingMandatoryFields: npc items questions — must be asked, may be declined', () => {
+  const base = { ...FULL_PLAYER, card_type: 'npc', personality: 'warm', flaws: 'curious',
+    likes: 'songs', dislikes: 'nobles', job: 'smith', backstory: 'b', dialogue_style: 'gruff',
+    goal: 'reopen the forge', tone: 'cozy', ...SIM_BASE, intro: 'You wake.' };
+  // All-empty item fields with NO marker → the wizard never asked.
+  assert.deepEqual(missingMandatoryFields('sim', base), ['items_answer']);
+  // The explicit decline marker completes the draft.
+  assert.deepEqual(missingMandatoryFields('sim', { ...base, items_answered: false }), []);
+  // ANY filled item field counts as asked — no marker needed.
+  assert.deepEqual(missingMandatoryFields('sim', { ...base, accessories: ['silver locket'] }), []);
+  assert.deepEqual(missingMandatoryFields('sim', { ...base, gear: ['compass'] }), []);
+  // The gate is npc-only: scenario/world drafts never carry it.
+  const scen = { card_type: 'scenario', name: 'A', directive: 'd', trigger_condition: 't',
+    primary_objective: 'o', participating_actors: ['b'], tone: 't', ...SIM_BASE, intro_answered: false };
+  assert.deepEqual(missingMandatoryFields('sim', scen), []);
 });
 
 test('missingMandatoryFields: sim scenario/world branch sets + the router itself', () => {

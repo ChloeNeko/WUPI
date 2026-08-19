@@ -22,6 +22,14 @@
 
 use std::path::Path;
 
+/// Backoff seconds between `purge_update_staging` removal attempts — the
+/// same ~30 s shape as `stage::copy_into_target`'s retry schedule, because it
+/// outlives the same enemy: the AV/indexer pass over freshly-written content.
+/// The documented 0.23.3→0.23.5 live failure was this exact race — the one-
+/// shot `data/_update` delete lost to a lock on the downloaded zip, the error
+/// was swallowed, and nothing ever retried.
+const UPDATE_STAGING_BACKOFF_SECS: [u64; 5] = [2, 4, 6, 8, 10];
+
 /// Dead paths (forward-slash, relative to the install root) purged from the
 /// live install on apply. Compile-time constants — no parsing, no traversal
 /// surface (unlike the old delete.json, which needed canonicalize +
@@ -88,6 +96,68 @@ pub fn purge_legacy(target: &Path) -> usize {
     removed
 }
 
+/// Completely remove `data/_update` — the download-staging folder wupi.exe's
+/// `perform_update` creates (`portable.zip` / `portable.zip.part` + anything
+/// else inside). Returns `true` when the folder is gone (or never existed).
+///
+/// NOT a [`LEGACY_PATHS`] entry: that list is one-shot best-effort for dead
+/// paths, while this is LIVE staging the current run just consumed and must
+/// actually remove — so it retries across the AV/indexer lock windows that
+/// kill one-shot deletes. Called from `main` on EVERY exit path (success,
+/// extract failure, copy failure): the old cleanup lived in `run()`'s success
+/// path only, so a failed run returned early and stranded the 2–4 GB zip
+/// forever — nothing on the wupi.exe side ever sweeps this folder.
+///
+/// Fixed to `<target>/data/_update` rather than the zip's parent dir: the old
+/// `remove_dir_all(args.zip.parent())` trusted the caller's path shape — this
+/// can only ever touch the one canonical staging folder.
+pub fn purge_update_staging(target: &Path) -> bool {
+    let path = target.join("data").join("_update");
+    let attempts = UPDATE_STAGING_BACKOFF_SECS.len() + 1;
+    for attempt in 1..=attempts {
+        match remove_dir_or_file(&path) {
+            Ok(()) => {
+                if attempt > 1 {
+                    crate::log(format!(
+                        "update staging {} removed on attempt {attempt}/{attempts}",
+                        path.display()
+                    ));
+                }
+                return true;
+            }
+            // Absent is the clean steady state — every update from a fixed
+            // updater lands here first try.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return true,
+            Err(e) => crate::log(format!(
+                "update staging {} not removable yet (attempt {attempt}/{attempts}: {e})",
+                path.display()
+            )),
+        }
+        if let Some(&secs) = UPDATE_STAGING_BACKOFF_SECS.get(attempt - 1) {
+            std::thread::sleep(std::time::Duration::from_secs(secs));
+        }
+    }
+    crate::log(format!(
+        "update staging {} survived {attempts} removal attempts — leaving it (the next update re-attempts)",
+        path.display()
+    ));
+    false
+}
+
+/// Remove `path` whether it is a directory (the normal staging folder) or a
+/// stray plain file at that path. `NotFound` propagates unchanged so the
+/// caller can treat an absent path as already-clean; any other error from
+/// either arm propagates for retry.
+fn remove_dir_or_file(path: &Path) -> std::io::Result<()> {
+    match std::fs::remove_dir_all(path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(e),
+        // A plain file errors NotADirectory out of remove_dir_all → the
+        // remove_file arm; a locked child propagates for retry.
+        Err(_) => std::fs::remove_file(path),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -121,5 +191,37 @@ mod tests {
         assert_eq!(purge_legacy(tmp.path()), 1);
         // Second run on the now-clean tree: zero removals, no error.
         assert_eq!(purge_legacy(tmp.path()), 0);
+    }
+
+    #[test]
+    fn update_staging_purge_removes_folder_completely_and_spares_siblings() {
+        let tmp = TempDir::new().unwrap();
+        let target = tmp.path();
+        std::fs::create_dir_all(target.join("data/_update")).unwrap();
+        std::fs::write(target.join("data/_update/portable.zip"), b"ZIP").unwrap();
+        std::fs::write(target.join("data/_update/portable.zip.part"), b"PART").unwrap();
+        // `data/` siblings that must survive: the result marker wupi.exe
+        // reads on boot, and user data under the preserve rule.
+        std::fs::write(target.join("data/_update_result.json"), b"{}").unwrap();
+        std::fs::write(target.join("data/user.xml"), b"<user/>").unwrap();
+
+        assert!(purge_update_staging(target));
+        assert!(!target.join("data/_update").exists());
+        assert!(target.join("data/_update_result.json").exists());
+        assert!(target.join("data/user.xml").exists());
+    }
+
+    #[test]
+    fn update_staging_purge_is_idempotent_and_handles_stray_file() {
+        let tmp = TempDir::new().unwrap();
+        // Absent folder = clean (NotFound short-circuits before any sleep).
+        assert!(purge_update_staging(tmp.path()));
+        // A stray plain FILE at the folder's path is removed too, and a
+        // second call on the clean tree stays a no-op.
+        std::fs::create_dir_all(tmp.path().join("data")).unwrap();
+        std::fs::write(tmp.path().join("data/_update"), b"stray").unwrap();
+        assert!(purge_update_staging(tmp.path()));
+        assert!(!tmp.path().join("data/_update").exists());
+        assert!(purge_update_staging(tmp.path()));
     }
 }

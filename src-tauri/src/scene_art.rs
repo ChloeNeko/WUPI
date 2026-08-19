@@ -133,13 +133,10 @@ impl Default for SceneImageRequest {
 /// feature-gated tests.
 pub const DPMPP2M_DISCRIMINANT: i32 = 5;
 
-/// The `i32` discriminant of `SampleMethod::EULER_A_SAMPLE_METHOD` —
-/// variant 1 in the C `enum sample_method_t` ordering. Retired as the
-/// locked sampler by recipe v2 (2026-08-18: DPM++ 2M + the mandatory hires
-/// refine pass replaced the single-pass Euler-a recipe); the value stays a
-/// named const because `sampler_from_i32` still maps it for stale gallery
-/// rows + the discriminant table stays self-documenting.
-pub const EULER_A_DISCRIMINANT: i32 = 1;
+// (Euler a's discriminant 1 is deliberately NOT a named const: recipe v2
+// retired the sampler entirely — Chloe ruling, 2026-08-19 — and
+// `sampler_from_i32` routes the bare value to the DPM++ 2M fallback with
+// the unknown ids, so the retired sampler is unreachable from any path.)
 
 // ────────────────────────────────────────────────────────────────────────────
 // The LOCKED NoobAI recipe v2 (Chloe ruling, 2026-08-18 — the two-stage era)
@@ -512,10 +509,10 @@ pub fn default_sd_backend() -> Box<dyn SceneImageGenerator> {
 /// `SampleMethod` enum. The discriminant ordering mirrors the C
 /// `enum sample_method_t` in `stable-diffusion.cpp/include/stable-diffusion.h`
 /// (variants 0-18; 19 is the `SAMPLE_METHOD_COUNT` sentinel — treated as the
-/// DPM++ 2M fallback). An unknown value falls back to DPM++ 2M (the SDXL
-/// clean-baseline sampler) rather than erroring: a stale gallery DB row that
-/// references a sampler removed in a future crate version should still
-/// generate, not block the user. Feature-gated because `SampleMethod` is only
+/// DPM++ 2M fallback). An unknown or retired value falls back to DPM++ 2M
+/// (the SDXL clean-baseline sampler) rather than erroring: a stale gallery
+/// DB row that references a sampler removed in a future crate version
+/// should still generate, not block the user. Feature-gated because `SampleMethod` is only
 /// in scope behind the `diffusion-rs` feature; the i32 side of the contract
 /// (the `SceneImageRequest.sampling_method` field + the `DPMPP2M_DISCRIMINANT`
 /// const) lives outside the gate so the struct is constructible everywhere.
@@ -524,10 +521,12 @@ fn sampler_from_i32(discriminant: i32) -> diffusion_rs::api::SampleMethod {
     use diffusion_rs::api::SampleMethod::*;
     // NOTE: match arms ordered to mirror the C enum declaration exactly so a
     // future variant insertion is an obvious diff. The discriminant values are
-    // stable (the C enum is part of stable-diffusion.cpp's FFI ABI).
+    // stable (the C enum is part of stable-diffusion.cpp's FFI ABI). ONE
+    // deliberate omission: arm 1 (Euler a) — retired by recipe v2 (Chloe
+    // ruling, 2026-08-19), it drops to the DPM++ 2M fallback below with the
+    // unknown ids so the retired sampler can't be selected even at this layer.
     match discriminant {
         0 => EULER_SAMPLE_METHOD,
-        1 => EULER_A_SAMPLE_METHOD,
         2 => HEUN_SAMPLE_METHOD,
         3 => DPM2_SAMPLE_METHOD,
         4 => DPMPP2S_A_SAMPLE_METHOD,
@@ -1359,27 +1358,30 @@ mod prism_sampler_tests {
         );
     }
 
-    /// Every known discriminant 0..=17 maps to a distinct variant (no two
-    /// discriminants collapse to the same enum value — a typo'd match arm
-    /// would break this). The sentinel (18) + out-of-range values fall back
-    /// to DPMPP2M (asserted separately).
+    /// Every known discriminant 0..=17 EXCEPT the retired Euler a (1) maps
+    /// to a distinct variant (no two discriminants collapse to the same
+    /// enum value — a typo'd match arm would break this). Euler a's 1 is
+    /// deliberately unmapped (recipe v2, 2026-08-19 ruling) and joins the
+    /// unknown ids on the DPM++ 2M fallback (asserted separately). The
+    /// sentinel (18) + out-of-range values also fall back (asserted below).
     #[test]
     fn sampler_from_i32_covers_all_variants() {
         use std::collections::HashSet;
         let mut seen: HashSet<String> = HashSet::new();
-        for d in 0..=17i32 {
+        for d in (0..=17i32).filter(|d| *d != 1) {
             let m = format!("{:?}", sampler_from_i32(d));
             assert!(seen.insert(m), "discriminant {d} collided with an earlier variant (duplicate match arm?)");
         }
-        assert_eq!(seen.len(), 18, "expected 18 distinct samplers for discriminants 0..=17");
+        assert_eq!(seen.len(), 17, "expected 17 distinct samplers for discriminants 0..=17 minus retired Euler a (1)");
     }
 
-    /// Out-of-range discriminants (the COUNT sentinel 18/19, negatives, future
-    /// variants) fall back to DPM++ 2M — never panic, never error.
+    /// Out-of-range + retired discriminants (Euler a's 1, the COUNT sentinel
+    /// 18/19, negatives, future variants) fall back to DPM++ 2M — never
+    /// panic, never error.
     #[test]
     fn sampler_from_i32_falls_back_for_unknown() {
         use diffusion_rs::api::SampleMethod;
-        for d in [18, 19, -1, 99, i32::MAX, i32::MIN] {
+        for d in [1, 18, 19, -1, 99, i32::MAX, i32::MIN] {
             let mapped = sampler_from_i32(d);
             assert_eq!(
                 format!("{:?}", mapped),

@@ -25,6 +25,13 @@
 //!    treats it as fire-and-forget, and the relaunched wupi.exe reads
 //!    `data/_update_result.json` on next boot to surface success/failure.
 //!
+//! The `data/_update/` staging folder is DELETED COMPLETELY by the updater
+//! binary when it finishes (`purge::purge_update_staging`, retried across
+//! AV/indexer lock windows, every exit path) — wupi.exe never sweeps it
+//! itself. Note the one-hop lag: the updater that applies a hop is the OLD
+//! install's `bin/updater.exe`, so a purge fix first fires on the hop AFTER
+//! the release that ships it.
+//!
 //! ## Why NO rename-dance (the §8C "Temp-Staged Update Pipeline" rule)
 //!
 //! Earlier versions overwrote wupi.exe in place via a `wupi.exe → wupi.exe.old`
@@ -79,40 +86,60 @@ struct PlatformEntry {
     // `signature` ignored — we don't verify minisig (deferred).
 }
 
-/// Poll the manifest; return `Some(UpdateInfo)` if `remote_version > current`.
-/// Returns `None` when the manifest is unreachable, malformed, or already
-/// up-to-date. Errors are logged-and-swallowed: the updater never blocks boot
-/// and never surfaces fetch failures as user-visible errors (best-effort).
-pub async fn check_for_updates(current_version: &str) -> Option<UpdateInfo> {
+/// Poll the manifest; return `Ok(Some(UpdateInfo))` if `remote_version >
+/// current`, `Ok(None)` when the manifest was fetched and no newer version
+/// exists, and `Err` when the check could not complete (network/manifest
+/// failure).
+///
+/// The Ok(None)/Err split is load-bearing for the paw-menu panel: a FAILED
+/// check must never render as "up to date" (the 2026-08-18 stuck-panel bug —
+/// a transient boot-time fetch failure returned None, the panel showed
+/// "WUPI is up to date", and with no re-check affordance the only recovery
+/// was an app restart). The boot gate still swallows the Err (JS proceeds to
+/// the desktop); the panel surfaces it with a Retry button instead.
+pub async fn check_for_updates(
+    current_version: &str,
+) -> Result<Option<UpdateInfo>, String> {
+    // One immediate retry: boot-time checks race NIC/VPN/DNS bring-up, and
+    // re-fetching a ~1 KB manifest is free. A hard-down network fails in
+    // milliseconds, so the retry adds ~nothing to the offline boot path; it
+    // only pays the per-attempt timeout when a connection genuinely hangs.
     let bytes = match fetch_manifest().await {
         Ok(b) => b,
-        Err(e) => {
-            tracing::info!(?e, "updater: manifest fetch failed (offline?)");
-            return None;
-        }
+        Err(first) => match fetch_manifest().await {
+            Ok(b) => b,
+            Err(second) => {
+                tracing::info!(?first, ?second, "updater: manifest fetch failed");
+                return Err(format!("{first}; retry: {second}"));
+            }
+        },
     };
-    let manifest: Manifest = match serde_json::from_slice(&bytes) {
-        Ok(m) => m,
-        Err(e) => {
-            tracing::warn!(?e, "updater: manifest malformed");
-            return None;
-        }
-    };
+    let manifest: Manifest = serde_json::from_slice(&bytes)
+        .map_err(|e| format!("manifest malformed: {e}"))?;
     if !is_newer(&manifest.version, current_version) {
         tracing::info!(
             new = %manifest.version,
             current = %current_version,
             "updater: on latest"
         );
-        return None;
+        return Ok(None);
     }
-    let entry = manifest.platforms.get("windows-x86_64")?;
-    let url = entry.url.clone()?;
-    Some(UpdateInfo {
+    // A manifest that omits our platform entry (or its URL) is broken, not
+    // "up to date" — a publish-side mistake must surface as an error, not
+    // silently pin the user on the old version.
+    let entry = manifest
+        .platforms
+        .get("windows-x86_64")
+        .ok_or("manifest has no windows-x86_64 entry")?;
+    let url = entry
+        .url
+        .clone()
+        .ok_or("manifest windows-x86_64 entry has no url")?;
+    Ok(Some(UpdateInfo {
         version: manifest.version,
         url,
         notes: manifest.notes.unwrap_or_default(),
-    })
+    }))
 }
 
 /// Apply a pending update: download the zip → stage the updater binary to
@@ -253,10 +280,20 @@ fn updater_basename() -> String {
 async fn fetch_manifest() -> Result<Vec<u8>, String> {
     let client = reqwest::Client::builder()
         .user_agent("wupi-updater")
+        // Total-request cap: a 1 KB manifest over a hung connection must not
+        // hold the boot gate (or a panel check) dark indefinitely — reqwest's
+        // default is NO timeout.
+        .timeout(std::time::Duration::from_secs(10))
         .build()
         .map_err(|e| format!("build client: {e}"))?;
     let resp = client
         .get(MANIFEST_URL)
+        // Best-effort cache bust: gh-pages serves the manifest with a
+        // ~10-minute Cache-Control, and a stale cached copy reads as "on
+        // latest" for checks run shortly after a publish (another flavor of
+        // the phantom up-to-date).
+        .header("Cache-Control", "no-cache")
+        .header("Pragma", "no-cache")
         .send()
         .await
         .map_err(|e| format!("manifest GET: {e}"))?;

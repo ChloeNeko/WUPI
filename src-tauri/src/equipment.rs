@@ -841,6 +841,74 @@ pub fn seed_clothing_items(
     seeded
 }
 
+/// Seed a player card's `<inventory>` sibling (2026-08-19 v2 format):
+/// Clothing routes through the shared garment router, weapon-ish Equipped
+/// items claim the readied-hand slots (`main_hand` first, `off_hand` next),
+/// and Accessories/Stored land in the pack. FRESH runs only — a resumed
+/// campaign's inventory is authoritative. Returns the number of items seeded.
+pub fn seed_player_inventory(
+    inv: &crate::player::PlayerInventory,
+    equipment: &mut Equipment,
+    pack: &mut Vec<StackItem>,
+) -> usize {
+    let mut seeded = seed_clothing_items(&inv.clothing, equipment, pack);
+    // Readied weapons: the Equipped line is for READIED items (the [EQUIP]
+    // contract reserves main_hand/off_hand for weapons).
+    const WEAPON_TERMS: [&str; 14] = [
+        "sword", "blade", "axe", "bow", "dagger", "staff", "spear", "hammer", "knife",
+        "wand", "mace", "lance", "rapier", "scythe",
+    ];
+    for item in inv.equipped.iter().map(|s| s.trim()).filter(|s| !s.is_empty()) {
+        let key = item.to_lowercase();
+        let weaponish = WEAPON_TERMS.iter().any(|t| key.contains(t));
+        let tags = vec![ItemTag::Equippable];
+        if weaponish {
+            let main_held = equipment
+                .get(&EquipSlot::MainHand)
+                .map(|l| l.visible().is_some())
+                .unwrap_or(false);
+            let slot = if main_held { EquipSlot::OffHand } else { EquipSlot::MainHand };
+            let layers = equipment.entry(slot).or_default();
+            if layers.outer.is_none() {
+                layers.outer = Some(EquippedItem {
+                    name: item.to_string(),
+                    stats: None,
+                    tags,
+                });
+                seeded += 1;
+                continue;
+            }
+        }
+        // Not a readied weapon (or both hands full) → the pack (never
+        // vaporized).
+        stack_upsert(
+            pack,
+            StackItem {
+                name: item.to_string(),
+                qty: 1,
+                stats: None,
+                tags,
+                ..StackItem::default()
+            },
+        );
+        seeded += 1;
+    }
+    for item in inv.accessories.iter().chain(inv.stored.iter()).map(|s| s.trim()).filter(|s| !s.is_empty()) {
+        stack_upsert(
+            pack,
+            StackItem {
+                name: item.to_string(),
+                qty: 1,
+                stats: None,
+                tags: Vec::new(),
+                ..StackItem::default()
+            },
+        );
+        seeded += 1;
+    }
+    seeded
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

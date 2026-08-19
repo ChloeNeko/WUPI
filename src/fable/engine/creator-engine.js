@@ -81,21 +81,39 @@ function toText(v) {
 // empty sections are filtered out. `row` returns null for absent values so the
 // filter chain drops them.
 export function buildReviewSections(kind, d) {
-  const row = (label, v) => toText(v) ? [label, toText(v)] : null;
+  const row = (label, v) => (toText(v) ? [label, toText(v)] : null);
   if (kind === 'player') {
     const customRows = d.custom_tags && typeof d.custom_tags === 'object' && !Array.isArray(d.custom_tags)
       ? Object.entries(d.custom_tags)
           .map(([k, v]) => row(String(k), v))
           .filter(Boolean)
       : [];
+    // The v2 inventory seed (the optional sibling) — accepts either the
+    // structured inventory object or the legacy flat fields.
+    const inv = d.inventory && typeof d.inventory === 'object' && !Array.isArray(d.inventory) ? d.inventory : {};
+    const persona = d.persona && typeof d.persona === 'object' && !Array.isArray(d.persona) ? d.persona : {};
     return [
       ['Identity', [row('Name', d.name), row('Gender', d.gender), row('Race', d.race), row('Age', d.age)].filter(Boolean)],
       ['Appearance', [row('Height', d.height), row('Weight', d.weight), row('Build', d.body_type), row('Skin', d.skin_complexion), row('Eyes', d.eye_color)].filter(Boolean)],
       ['Hair', [row('Color', d.hair_color), row('Length', d.hair_length), row('Style', d.hair_style)].filter(Boolean)],
       ['Distinctive', [row('Breast', d.breast_size), row('Ears', d.ears), row('Tail', d.tail), row('Horn', d.horn)].filter(Boolean)],
-      ['Clothing', [row('Outfit', d.clothing)].filter(Boolean)],
-      ['Inventory', [row('Gear', d.gear), row('Tools', d.tools), row('Weapons', d.weapons)].filter(Boolean)],
-      ['Background', [row('Job', d.job), row('Personality', d.personality), row('Weakness', d.weakness), row('Distinguishing marks', d.distinguishing_marks), row('History', d.backstory)].filter(Boolean)],
+      ['Inventory', [
+        row('Clothing', inv.clothing != null ? inv.clothing : d.clothing),
+        row('Equipped', inv.equipped != null ? inv.equipped : d.equipped),
+        row('Accessories', inv.accessories != null ? inv.accessories : d.accessories),
+        row('Stored', inv.stored != null ? inv.stored : d.gear),
+      ].filter(Boolean)],
+      // The OPT-IN persona block (2026-08-19: the wizard's final question —
+      // absent entirely when the player declined).
+      ['Persona', [
+        row('Personality', persona.personality != null ? persona.personality : d.personality),
+        row('Likes', persona.likes != null ? persona.likes : d.likes),
+        row('Dislikes', persona.dislikes != null ? persona.dislikes : d.dislikes),
+        row('Flaws', persona.flaws != null ? persona.flaws : d.flaws),
+        row('Goals', persona.goals != null ? persona.goals : d.goal),
+        row('Occupation', persona.occupation != null ? persona.occupation : d.job),
+        row('History', d.backstory),
+      ].filter(Boolean)],
       // Starting conditions are TRANSIENT (seed PlayerState at attach, never
       // persisted on the SavedPlayer) but surface here so the player sees
       // what was captured. Absent on edited/loaded players → section dropped.
@@ -108,34 +126,33 @@ export function buildReviewSections(kind, d) {
     const customRows = d.custom_tags && typeof d.custom_tags === 'object' && !Array.isArray(d.custom_tags)
       ? Object.entries(d.custom_tags).map(([k, v]) => row(String(k), v)).filter(Boolean)
       : [];
-    const locSrc = Array.isArray(d.locations) && d.locations.length
-      ? d.locations
-      : (d.location ? [{ name: d.location }] : []);
-    const locRows = locSrc
-      .map((l) => row(l.name || l.id, Array.isArray(l.neighbors) ? l.neighbors.join(', ') : ''))
-      .filter(Boolean);
-    const castRows = (Array.isArray(d.cast) ? d.cast : [])
-      .map((c) => row(c.name || c.id, c.identity || c.role))
-      .filter(Boolean);
     const sections = [
       ['Card', [row('Type', subtype), row('Name', d.name)].filter(Boolean)],
-      ['World anchors', [row('Date', d.date), row('Time', d.time || d.start_time), row('Weather', d.weather || d.start_weather), row('Location', d.location)].filter(Boolean)],
+      // Tone is the story's tone — a world anchor like the date/weather (it
+      // seeds the tracker, rendered beside them every turn).
+      ['World anchors', [row('Date', d.date), row('Time', d.time || d.start_time), row('Weather', d.weather || d.start_weather), row('Tone', d.tone), row('Location', d.location)].filter(Boolean)],
     ];
     // Branch-specific sections (per the SIM Wizard Type Router spec).
     if (subtype === 'npc') {
       sections.push(['Identity', [row('Gender', d.gender), row('Race', d.race), row('Age', d.age), row('Height', d.height), row('Weight', d.weight), row('Build', d.body_type), row('Skin', d.skin_complexion), row('Eyes', d.eye_color)].filter(Boolean)]);
       sections.push(['Hair', [row('Color', d.hair_color), row('Length', d.hair_length), row('Style', d.hair_style)].filter(Boolean)]);
       sections.push(['Distinctive', [row('Breast', d.breast_size), row('Ears', d.ears), row('Tail', d.tail), row('Horn', d.horn)].filter(Boolean)]);
-      sections.push(['Clothing', [row('Outfit', d.clothing)].filter(Boolean)]);
-      sections.push(['Persona', [row('Personality', d.personality), row('Flaws', d.flaws), row('Job', d.job), row('Backstory', d.backstory), row('Dialogue style', d.dialogue_style), row('Tone', d.tone)].filter(Boolean)]);
+      // The full persona set (every label mandatory for npc cards — the
+      // character IS the card).
+      sections.push(['Persona', [row('Personality', d.personality), row('Dialogue style', d.dialogue_style), row('Likes', d.likes), row('Dislikes', d.dislikes), row('Flaws', d.flaws), row('Goals', d.goal), row('Occupation', d.job), row('Backstory', d.backstory)].filter(Boolean)]);
+      // The npc `<inventory>` sibling (Clothing mandatory, the rest optional).
+      sections.push(['Inventory', [
+        row('Clothing', d.clothing),
+        row('Equipped', d.equipped),
+        row('Accessories', d.accessories),
+        row('Stored', d.stored != null ? d.stored : d.gear),
+      ].filter(Boolean)]);
     } else if (subtype === 'scenario') {
-      sections.push(['Scenario', [row('Directive', d.directive), row('Trigger', d.trigger_condition), row('Objective', d.primary_objective), row('Actors', d.participating_actors), row('Hazards', d.environmental_hazards), row('Outcomes', d.outcomes), row('Tone', d.tone)].filter(Boolean)]);
+      sections.push(['Scenario', [row('Premise', d.directive), row('Trigger', d.trigger_condition), row('Objective', d.primary_objective), row('Actors', d.participating_actors), row('Hazards', d.environmental_hazards), row('Outcomes', d.outcomes)].filter(Boolean)]);
     } else {
       // world, or pre-router/unknown: show the world-style fields that exist.
-      sections.push(['World', [row('Directive', d.directive), row('Setting', d.setting), row('Tone', d.tone)].filter(Boolean)]);
+      sections.push(['World', [row('Purpose', d.directive), row('Setting', d.setting)].filter(Boolean)]);
     }
-    if (locRows.length) sections.push(['Locations', locRows]);
-    if (castRows.length) sections.push(['Cast', castRows]);
     if (customRows.length) sections.push(['Custom tags', customRows]);
     // The intro the SIM Wizard gathered (its mandatory question — 2026-08-15
     // the intro is the wizard's job, not a post-card step). Absent → dropped.
@@ -225,9 +242,9 @@ export function buildIdCard(kind, d) {
 // Player + NPC share the license face. The only difference is the subtle
 // 'NPC CARD' corner tag (isNpc). Hair length/style + body/skin live ON the
 // face now (the HAIR stack + the AGE/SKIN/BODY row), so the extra disclosure
-// carries only the remaining groups: Distinctive, Clothing, Accessories,
-// Inventory, Persona, Background, transient Starting conditions, Custom tags,
-// and (NPC) the intro.
+// carries only the remaining groups: Distinctive, the v2 Inventory seed, the
+// opt-in Persona block, transient Starting conditions, Custom tags, and
+// (NPC) the world anchors + intro.
 function playerIdCard(d, isNpc) {
   const title = toText(d.name);
   // The AGE|SKIN|BODY row packs three narrow cells when complete; a card
@@ -244,13 +261,35 @@ function playerIdCard(d, isNpc) {
     hairCell(d),
     idCell('Eye Color', d.eye_color),
   ].filter(Boolean);
+  const inv = d.inventory && typeof d.inventory === 'object' && !Array.isArray(d.inventory) ? d.inventory : {};
+  const persona = d.persona && typeof d.persona === 'object' && !Array.isArray(d.persona) ? d.persona : {};
+  const pGet = (k, fallback) => (persona[k] != null ? persona[k] : d[fallback]);
   const extra = [
     ['Distinctive', [idRow('Breast', d.breast_size), idRow('Ears', d.ears), idRow('Tail', d.tail), idRow('Horn', d.horn)].filter(Boolean)],
-    ['Clothing', [idRow('Outfit', d.clothing)].filter(Boolean)],
-    ['Accessories', [idRow('Items', d.accessories)].filter(Boolean)],
-    ['Inventory', [idRow('Gear', d.gear), idRow('Tools', d.tools), idRow('Weapons', d.weapons)].filter(Boolean)],
-    ['Persona', [idRow('Personality', d.personality), idRow('Flaws', d.flaws), idRow('Dialogue style', d.dialogue_style), idRow('Tone', d.tone)].filter(Boolean)],
-    ['Background', [idRow('Job', d.job), idRow('Weakness', d.weakness), idRow('Distinguishing marks', d.distinguishing_marks), idRow('Description', d.description), idRow('Appearance', d.appearance), idRow('History', d.backstory)].filter(Boolean)],
+    ['Inventory', [
+      idRow('Clothing', inv.clothing != null ? inv.clothing : d.clothing),
+      idRow('Equipped', inv.equipped != null ? inv.equipped : d.equipped),
+      idRow('Accessories', inv.accessories != null ? inv.accessories : d.accessories),
+      idRow('Stored', inv.stored != null ? inv.stored : d.gear),
+    ].filter(Boolean)],
+    // The OPT-IN persona block (2026-08-19) — absent entirely when the
+    // player declined the final wizard question.
+    ['Persona', [
+      idRow('Personality', pGet('personality', 'personality')),
+      // NPC cards carry a Conversation Style persona line; players never get
+      // the field, so the row self-omits for them.
+      idRow('Dialogue style', d.dialogue_style),
+      idRow('Likes', pGet('likes', 'likes')),
+      idRow('Dislikes', pGet('dislikes', 'dislikes')),
+      idRow('Flaws', pGet('flaws', 'flaws')),
+      idRow('Goals', pGet('goals', 'goal')),
+      idRow('Occupation', pGet('occupation', 'job')),
+      idRow('Backstory', d.backstory),
+    ].filter(Boolean)],
+    // The SIM anchors are mandatory for EVERY branch (npc included) — they
+    // must surface in the details popup, not just on the world/scenario
+    // face (2026-08-19). Absent on plain players → section drops.
+    ['World anchors', [idRow('Date', d.date), idRow('Time', d.time || d.start_time), idRow('Weather', d.weather || d.start_weather), idRow('Tone', d.tone), idRow('Location', d.location)].filter(Boolean)],
     // Starting conditions are TRANSIENT (seed PlayerState at attach, never
     // persisted on the SavedPlayer) but surface here so the player sees what
     // was captured. Absent on edited/loaded players → section dropped.
@@ -264,9 +303,9 @@ function playerIdCard(d, isNpc) {
 }
 
 // World + Scenario share a TYPE banner header + a 1-column core
-// (Name/Setting/Purpose/Tone). directive is shown as "Purpose".
-// Scenario-specific fields, world anchors, locations, cast, custom tags, and
-// the intro all live in the disclosure.
+// (Name/Setting/Purpose/Tone). directive is shown as "Purpose". The scenario
+// specifics, world anchors, custom tags, and the intro live in the
+// disclosure (no cast/locations in the v2 format — they emerge in play).
 function worldIdCard(d, banner) {
   const core = [
     idCell('Name', d.name),
@@ -274,23 +313,12 @@ function worldIdCard(d, banner) {
     idCell('Purpose', d.directive),   // directive shown as "Purpose"
     idCell('Tone', d.tone),
   ].filter(Boolean);
-  const locSrc = Array.isArray(d.locations) && d.locations.length
-    ? d.locations
-    : (d.location ? [{ name: d.location }] : []);
-  const locRows = locSrc
-    .map((l) => idRow(toText(l && (l.name || l.id)) || 'Location', Array.isArray(l && l.neighbors) ? l.neighbors : ''))
-    .filter(Boolean);
-  const castRows = (Array.isArray(d.cast) ? d.cast : [])
-    .map((c) => idRow(toText(c && (c.name || c.id)), c && (c.identity || c.role)))
-    .filter(Boolean);
   const extra = [
-    ['World anchors', [idRow('Date', d.date), idRow('Time', d.time || d.start_time), idRow('Weather', d.weather || d.start_weather), idRow('Location', d.location)].filter(Boolean)],
+    ['World anchors', [idRow('Date', d.date), idRow('Time', d.time || d.start_time), idRow('Weather', d.weather || d.start_weather), idRow('Tone', d.tone), idRow('Location', d.location)].filter(Boolean)],
   ];
   if (banner === 'SCENARIO CARD') {
-    extra.push(['Scenario', [idRow('Trigger', d.trigger_condition), idRow('Objective', d.primary_objective), idRow('Actors', d.participating_actors), idRow('Hazards', d.environmental_hazards), idRow('Outcomes', d.outcomes)].filter(Boolean)]);
+    extra.push(['Scenario', [idRow('Premise', d.directive), idRow('Trigger', d.trigger_condition), idRow('Objective', d.primary_objective), idRow('Actors', d.participating_actors), idRow('Hazards', d.environmental_hazards), idRow('Outcomes', d.outcomes)].filter(Boolean)]);
   }
-  if (locRows.length) extra.push(['Locations', locRows]);
-  if (castRows.length) extra.push(['Cast', castRows]);
   extra.push(['Custom tags', customTagRows(d)]);
   // The intro the SIM Wizard gathered (mandatory question). Absent → dropped.
   if (toText(d.intro)) extra.push(['Intro', [['Text', toText(d.intro)]]]);
@@ -312,23 +340,32 @@ export const MANDATORY_LABELS = {
   body_type: 'body (build)', hair_color: 'hair color',
   hair_length: 'hair length', hair_style: 'hair style', eye_color: 'eye color',
   clothing: 'clothing',
-  card_type: 'card type', directive: 'directive', setting: 'setting', tone: 'tone',
+  card_type: 'card type', directive: 'directive', setting: 'setting',
   trigger_condition: 'trigger', primary_objective: 'objective',
   participating_actors: 'actors',
   personality: 'personality', flaws: 'flaws', job: 'job/occupation',
   backstory: 'backstory', dialogue_style: 'dialogue style',
+  likes: 'likes', dislikes: 'dislikes', goal: 'goal',
   date: 'date anchor', time: 'time anchor', weather: 'weather anchor',
-  location: 'location anchor', intro_answer: 'the intro question',
+  tone: 'tone anchor', location: 'location anchor',
+  intro_answer: 'the intro question',
+  items_answer: 'the inventory question',
+  persona_answer: 'the persona question',
   entries: 'at least one lore entry (title + body)',
 };
 
-// The player identity set shared by the Player Wizard + the SIM npc branch.
+// The player identity set (2026-08-19 v2): the 11 `<identity>` trait lines —
+// clothing is NOT mandatory for players (their whole `<inventory>` sibling is
+// optional). The SIM npc branch adds it back (an npc card's inventory block
+// always carries a Clothing line).
 const MANDATORY_IDENTITY = [
   'name', 'gender', 'age', 'race', 'skin_complexion', 'height', 'weight',
   'body_type', 'hair_color', 'hair_length', 'hair_style', 'eye_color',
-  'clothing',
 ];
-const SIM_ANCHORS = ['date', 'time', 'weather', 'location'];
+// The universal world anchors — every sim branch, ALL mandatory. tone joined
+// the set 2026-08-19 (it seeds the world tracker + renders beside the
+// time/weather every turn).
+const SIM_ANCHORS = ['date', 'time', 'weather', 'tone', 'location'];
 
 function mandatoryKeys(kind, d) {
   if (kind === 'player') return MANDATORY_IDENTITY;
@@ -337,18 +374,24 @@ function mandatoryKeys(kind, d) {
     if (subtype === 'npc') {
       return [
         ...MANDATORY_IDENTITY,
-        'personality', 'flaws', 'job', 'backstory', 'dialogue_style', 'tone',
+        'clothing',
+        // The FULL persona set — every label mandatory for npc cards (the
+        // character IS the card; 2026-08-19 v2: goals/dialogue_style are
+        // persona members, tone is a world anchor above). The draft key for
+        // the Goals line is `goal`.
+        'personality', 'dialogue_style', 'likes', 'dislikes', 'flaws',
+        'goal', 'job', 'backstory',
         ...SIM_ANCHORS,
       ];
     }
     if (subtype === 'scenario') {
       return [
         'card_type', 'name', 'directive', 'trigger_condition',
-        'primary_objective', 'participating_actors', 'tone', ...SIM_ANCHORS,
+        'primary_objective', 'participating_actors', ...SIM_ANCHORS,
       ];
     }
     // world, pre-router, or unknown — the router itself must complete first.
-    return ['card_type', 'name', 'directive', 'setting', 'tone', ...SIM_ANCHORS];
+    return ['card_type', 'name', 'directive', 'setting', ...SIM_ANCHORS];
   }
   return []; // codex's only mandatory is the entries array (checked below)
 }
@@ -387,9 +430,15 @@ export function shouldRejectDuplicateName(target, seededId, existingIds) {
 }
 
 // Returns the list of MISSING mandatory field keys for kind/draft ([] = the
-// draft may finalize). The sim intro is special: an ABSENCE is incomplete —
-// the wizard must have an explicit answer (agreed text or a confirmed "no",
-// marked intro_answered:false). Codex requires ≥1 entry with a body.
+// draft may finalize). Three questions share the explicit-answer shape (an
+// absence is incomplete — the wizard must have asked):
+//   - the sim INTRO question (agreed text or intro_answered:false),
+//   - the npc INVENTORY question (clothing is mandatory-fill; the optional
+//     equipped/accessories/stored lines may be empty but only with the
+//     items_answered:false marker),
+//   - the PLAYER PERSONA question (2026-08-19, the final wizard question —
+//     persona fields may be absent only with persona_answered:false).
+// Codex requires ≥1 entry with a body.
 export function missingMandatoryFields(kind, d) {
   const draft = d || {};
   const missing = mandatoryKeys(kind, draft).filter((k) => !mandatoryFilled(draft[k]));
@@ -397,6 +446,26 @@ export function missingMandatoryFields(kind, d) {
     // The mandatory INTRO question: either a non-empty intro or an explicit
     // no-intro marker (intro_answered === false, set when the player declines).
     if (!toText(draft.intro) && draft.intro_answered !== false) missing.push('intro_answer');
+    // The npc INVENTORY question: clothing is already mandatory-filled above;
+    // the optional lines may all be empty ONLY with the explicit decline
+    // marker (an absence with no marker means the wizard never asked).
+    const subtype = toText(draft.card_type).toLowerCase();
+    if (subtype === 'npc'
+      && !['equipped', 'accessories', 'stored', 'gear'].some((k) => mandatoryFilled(draft[k]))
+      && draft.items_answered !== false) {
+      missing.push('items_answer');
+    }
+  }
+  if (kind === 'player' && missing.length === 0) {
+    // The mandatory FINAL persona question: any persona content counts as
+    // answered; an absent persona needs the explicit decline marker.
+    const hasPersona = ['personality', 'likes', 'dislikes', 'flaws', 'goals', 'goal', 'job', 'backstory']
+      .some((k) => mandatoryFilled(
+        draft.persona && typeof draft.persona === 'object' && draft.persona[k] != null
+          ? draft.persona[k]
+          : draft[k],
+      ));
+    if (!hasPersona && draft.persona_answered !== false) missing.push('persona_answer');
   }
   if (kind === 'codex') {
     const entries = Array.isArray(draft.entries) ? draft.entries : [];

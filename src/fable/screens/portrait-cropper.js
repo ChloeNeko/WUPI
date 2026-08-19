@@ -5,7 +5,7 @@
 // FLOW: openPortraitCropper(parentEl, imageSrc) → loads the image into a
 // fixed-aspect 2:3 stage, overlays a draggable + resizable crop rectangle
 // (corner handles), + on Confirm draws the cropped region to an offscreen
-// canvas + returns { dataUrl, bytes, ext } (JPEG). On Cancel resolves null.
+// canvas + returns { dataUrl, bytes, ext } (PNG). On Cancel resolves null.
 //
 // GEOMETRY: the .fable-crop-stage is a fixed 2:3 box. The image fills it via
 // object-fit: cover (so it always fills the stage regardless of source
@@ -15,8 +15,11 @@
 // (scaled up from stage px → natural px), so the saved portrait keeps full
 // fidelity (not the downscaled stage preview).
 //
-// OUTPUT: JPEG (smaller than PNG for photos; portraits are photographic).
-// ext = "jpg". bytes = Uint8Array — callers send it over IPC as BASE64
+// OUTPUT: PNG (2026-08-19 — was JPEG 0.92). The launcher's `<Name>.ico`
+// wraps the portrait's PNG bytes verbatim (ICO can't embed a JPEG — a JPG
+// portrait meant the shortcut silently fell back to the F icon forever),
+// and PNG is lossless. The fixed 480×720 output keeps the size modest.
+// ext = "png". bytes = Uint8Array — callers send it over IPC as BASE64
 // (bytesB64 over JSON, e.g. fable_player_portrait_upload_bytes). A bare
 // byte-array IPC arg does NOT deserialize through Tauri v2's invoke and
 // poisons command registration (AGENTS.md anti-pattern #5).
@@ -295,15 +298,15 @@ export function openPortraitCropper(parentEl, imageSrc) {
         const ctx = canvas.getContext('2d');
         ctx.imageSmoothingQuality = 'high';
         ctx.drawImage(loadedImg, sx, sy, sw2, sh2, 0, 0, OUTPUT_W, OUTPUT_H);
-        const dataUrl = canvas.toDataURL('image/jpeg', 0.92);
+        const dataUrl = canvas.toDataURL('image/png');
         // bytes for the caller — shipped over IPC as base64-over-JSON
         // (bytesB64), never as a bare byte-array arg (anti-pattern #5).
         canvas.toBlob((blob) => {
           if (!blob) { done(null); return; }
           blob.arrayBuffer().then((buf) => {
-            done({ dataUrl, bytes: new Uint8Array(buf), ext: 'jpg' });
+            done({ dataUrl, bytes: new Uint8Array(buf), ext: 'png' });
           }, () => done(null));
-        }, 'image/jpeg', 0.92);
+        }, 'image/png');
       } catch (err) {
         // Never hang: surface + cancel so the slot keeps its prior state.
         console.error('[portrait-cropper] confirm failed:', err);

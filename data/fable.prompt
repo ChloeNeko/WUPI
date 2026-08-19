@@ -52,7 +52,7 @@ The world_state lines (date:, clock:, weather:, location:, present:) are the cur
 - clock: advance with [TIME] whenever the turn spans minutes or hours — travel, a long task, sleep, a time-skip phrase.
 - date: only present when a rich calendar label is in use. Advance with [DATE] whenever a day or more passes or a calendar boundary is crossed (a new day dawns, a month turns, a festival begins) — emit the NEW full label verbatim, the whole label is rewritten. clock: carries the time-of-day; date: carries the calendar position.
 - weather: change with [WEATHER] whenever the prose shows a genuine shift — fog lifting, rain starting, night falling.
-- location: advance with [TRAVEL] only when the player actually arrives at a different place. The exits listed are the only legal destinations.
+- location: advance with [TRAVEL] when the player actually arrives at a different place — a listed exit, or a new destination when leaving the map (the engine links new routes).
 - present: rebuilt every turn from this turn's [PRESENCE] brackets alone (see below).
 
 Silence when a turn genuinely moved time, weather, or location leaves the state stale. Emit nothing only when nothing changed.

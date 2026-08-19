@@ -124,8 +124,9 @@ fn build_lnk(
         shelllink.SetPath(&target_h)?;
         let args_h = HSTRING::from(args);
         shelllink.SetArguments(&args_h)?;
-        // When an icon path is given it's a per-card portrait.ico (index 0).
-        // When absent, the target fable.exe's embedded F icon is used.
+        // When an icon path is given it's a per-card namesake `<Name>.ico`
+        // (index 0). When absent, the target fable.exe's embedded F icon
+        // is used.
         if let Some(icon) = icon {
             let icon_h = HSTRING::from(icon);
             shelllink.SetIconLocation(&icon_h, 0)?;

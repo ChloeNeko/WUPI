@@ -15,29 +15,28 @@ function test(name, fn) {
 }
 
 // A realistic GLM envelope — fenced, with a leading acknowledgement line (the
-// exact messy shape the parseEnvelope defensive path must handle).
-const GLM_REPLY_SIM = `Sure! Here's the world:\n\`\`\`json\n${JSON.stringify({
+// exact messy shape the parseEnvelope defensive path must handle). v2
+// (2026-08-19): no locations graph, no cast — the world anchors (incl. tone)
+// ride the <world> sibling.
+const GLM_REPLY_SIM = `Sure! Here's the world:
+\`\`\`json
+${JSON.stringify({
   action: 'ready',
   draft: {
+    card_type: 'world',
     name: 'Aldermoor',
     directive: 'Survive the encroaching bog and find out why the village is sinking.',
     setting: 'A dying moorland village slowly being swallowed by a sentient marsh.',
     tone: 'grim folk horror with flashes of warmth',
+    date: '3rd of Peatfall, Year 1247',
     start_time: 'Day 1, 07:30',
     start_weather: 'low fog rolling off the marsh',
-    locations: [
-      { name: 'Village Square', neighbors: ['Marsh Edge', 'Old Chapel'] },
-      { name: 'Marsh Edge', neighbors: ['Village Square'] },
-      { name: 'Old Chapel', neighbors: ['Village Square'] },
-    ],
-    cast: [
-      { name: 'Mara', identity: 'the village innkeep, knows everyone' },
-      { name: 'Old Perrin', identity: 'the half-blind sexton' },
-    ],
+    location: 'Village Square',
   },
-})}\n\`\`\``;
+})}
+\`\`\``;
 
-test('pipeline: sim envelope → valid XML with anchors + graph + cast', () => {
+test('pipeline: sim envelope → valid v2 XML with world sibling + location', () => {
   // 1. Parse the envelope (defensive: fence + leading prose).
   const env = parseEnvelope(GLM_REPLY_SIM);
   assert.ok(env, 'envelope parsed');
@@ -47,38 +46,27 @@ test('pipeline: sim envelope → valid XML with anchors + graph + cast', () => {
   const draft = {};
   mergeDraft(draft, env.draft);
   assert.equal(draft.name, 'Aldermoor');
-  assert.equal(draft.locations.length, 3);
 
   // 3. Serialize.
   const { xml, intro } = serializeSimCard(draft);
 
   // 4. Structural validation of the emitted XML.
-  //    a. roleplay metadata (so fable_cards_list surfaces it). The embedded
-  //       <id> (2026-08-16 audit fix #3: the client slug rides in-metadata so
-  //       the parsed id == the created folder by construction) is asserted
-  //       too — the name "Aldermoor" slugs to "aldermoor". This draft carries
-  //       no card_type, so no <subtype> appears.
-  assert.ok(xml.includes('<metadata><type>roleplay</type>'));
+  //    a. simulation metadata (the 2026-08-19 rename) + the embedded slug id.
+  assert.ok(xml.includes('<type>simulation</type>'));
   assert.ok(/<id>aldermoor<\/id>/.test(xml));
-  //    b. anchors block with both children (weather prose is CDATA-wrapped).
-  assert.ok(/<start>\s*<time>/.test(xml));
-  assert.ok(/<weather>/.test(xml) && xml.includes('low fog rolling off the marsh'));
-  //    c. the travel graph is internally consistent: every <neighbor> ref is a
-  //       known node id. (serializeSimCard slugs both, so this should hold.)
-  const nodeIds = [...xml.matchAll(/<node id="([^"]+)">/g)].map((m) => m[1]);
-  const neighborIds = [...xml.matchAll(/<neighbor>([^<]+)<\/neighbor>/g)].map((m) => m[1]);
-  assert.ok(nodeIds.includes('village-square'));
-  assert.ok(nodeIds.includes('marsh-edge'));
-  assert.ok(nodeIds.includes('old-chapel'));
-  for (const nb of neighborIds) {
-    assert.ok(nodeIds.includes(nb), `neighbor "${nb}" has no matching <node id>`);
-  }
-  //    d. cast: every npc has an id + a <name>.
-  const npcIds = [...xml.matchAll(/<npc id="([^"]+)">/g)].map((m) => m[1]);
-  assert.ok(npcIds.includes('mara'));
-  assert.ok(npcIds.includes('old-perrin'));
-  //    e. well-formed-ish: balanced tag pairs we care about.
-  for (const tag of ['sim_card', 'metadata', 'identity', 'start', 'locations', 'cast']) {
+  assert.ok(xml.includes('<subtype>world</subtype>'));
+  //    b. the anchors ride the <world> SIBLING (outside the cached root) +
+  //       the single <location> sibling — never <start>/<locations>/<cast>.
+  assert.ok(xml.includes('<world><![CDATA['));
+  assert.ok(xml.includes('Time: Day 1, 07:30'));
+  assert.ok(xml.includes('Weather: low fog rolling off the marsh'));
+  assert.ok(xml.includes('Tone: grim folk horror with flashes of warmth'));
+  assert.ok(xml.includes('<location><![CDATA[\nVillage Square\n]]></location>'));
+  assert.ok(!xml.includes('<start>'));
+  assert.ok(!xml.includes('<locations>'));
+  assert.ok(!xml.includes('<cast>'));
+  //    c. well-formed-ish: balanced tag pairs we care about.
+  for (const tag of ['sim_card', 'metadata', 'identity', 'world']) {
     const open = xml.split(`<${tag}`).length - 1;
     const close = xml.split(`</${tag}>`).length - 1;
     assert.equal(open, close, `<${tag}> tags balanced (${open} open / ${close} close)`);
@@ -104,7 +92,7 @@ test('pipeline: a two-turn ask→ready accumulation', () => {
   assert.equal(draft.name, 'X');
   assert.equal(draft.directive, 'd');
   const { xml } = serializeSimCard(draft);
-  assert.ok(xml.includes('<name>X</name>'));
+  assert.ok(xml.includes('Name: X\n'), 'the v2 identity line block carries the name');
   assert.ok(xml.includes('<setting>'));
 });
 
@@ -119,7 +107,7 @@ test('pipeline: player envelope → SavedPlayer shape + gender preserved as-type
   const { id, player } = serializePlayer(draft);
   assert.equal(id, 'kael');
   assert.equal(player.gender, 'Nonbinary');   // preserved, not lowercased
-  assert.deepEqual(player.clothing, ['cloak', 'boots']);
+  assert.deepEqual(player.inventory.clothing, ['cloak', 'boots']);
   assert.equal(player.tail, 'long');
   assert.ok(!('breast_size' in player));
 });
@@ -156,7 +144,7 @@ test('pipeline: hostile-shape ready envelope (arrays/numbers) serializes without
   const draft = {};
   mergeDraft(draft, env.draft);
   const { xml, intro } = serializeSimCard(draft);
-  assert.ok(xml.includes('<name>7</name>'));
+  assert.ok(xml.includes('Name: 7\n'));
   assert.ok(xml.includes('Bandits, Toll Guards'));
   assert.equal(intro, 'You walk the road.');
 });
@@ -187,7 +175,7 @@ test('pipeline: ready missing body_type is gated, then the corrective turn fills
   // The corrective turn (the alert GLM receives) produces the fill.
   const fix = parseEnvelope(JSON.stringify({
     action: 'ready',
-    draft: { body_type: 'lean' },
+    draft: { body_type: 'lean', persona_answered: false },
   }));
   mergeDraft(draft, fix.draft);
   assert.deepEqual(missingMandatoryFields('player', draft), []);

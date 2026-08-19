@@ -13,9 +13,10 @@
 // that sits ABOVE cards. Decoupled deliberately: identity is reusable,
 // state is per-run.
 //
-// PERSISTENCE: one folder per player under `apps/fable/players/<id>/`:
-//   <id>.json     — this struct, serialized
-//   portrait.png  — optional uploaded portrait (referenced by `portrait`)
+// PERSISTENCE: one folder per player under `apps/fable/players/<Name>/`
+// (display-named): `<Name>.player` (this struct, XML) + an optional
+//   <Name>.png / <Name>.jpg  — uploaded portrait (namesake sibling,
+//   discovered by `find_portrait_sibling` in lib.rs)
 // Mirrors the per-card folder discipline (AGENTS.md §6B) at a sibling
 // root. Atomic writes via `write_atomic` (lib.rs) — temp + fsync + rename.
 //
@@ -31,9 +32,9 @@
 /// `apps/fable/players/<id>/<id>.json`. `id` is derived from `name`
 /// (slugified) on write; the field is round-tripped for read paths.
 ///
-/// `portrait` stores the relative filename ("portrait.png") so the
-/// player folder can be moved without breaking the link. The read-side
-/// IPC resolves it to an absolute path for `convertFileSrc`.
+/// `portrait` carries the ABSOLUTE portrait path on the wire (resolved at
+/// load by `load_player_portrait` — the file is the namesake
+/// `<Name>.<ext>` sibling; presence is a stat fact, no XML field).
 #[derive(Clone, serde::Serialize, serde::Deserialize, Debug)]
 pub struct SavedPlayer {
     /// Slug identifier (also the folder name). Slugified from `name` on
@@ -199,15 +200,96 @@ pub struct SavedPlayer {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub custom_tags: Option<std::collections::BTreeMap<String, String>>,
 
-    /// Relative portrait filename within the player folder (e.g.
-    /// "portrait.png"). None when no portrait was uploaded. The read
-    /// IPC resolves this to an absolute path for convertFileSrc.
+    // --- v2 format fields (2026-08-19 Chloe ruling) ----------------------
+    // The `.player` disk format is now XML (`<player>` root + an optional
+    // `<inventory>` sibling). Everything inside `<player>` is the KV-cache
+    // payload (always read by the narrator); the sibling is mutable state
+    // seed. The DTO below stays the IPC shape — the XML is a
+    // serialization-boundary adapter, exactly like the card side.
+
+    /// The OPT-IN persona block (players only; NPC personas are mandatory,
+    /// player personas exist solely when the user answers the wizard's final
+    /// question with content — Chloe 2026-08-19). Omitted entirely (file +
+    /// cache) when absent. `Conversation Style` is parsed if hand-authored
+    /// but NEVER offered by the player wizard.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub persona: Option<PlayerPersona>,
+
+    /// The `<inventory>` sibling: clothing (garments), equipped (readied),
+    /// accessories, stored. Optional in full — a player with no items
+    /// carries no inventory block at all.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inventory: Option<PlayerInventory>,
+
+    /// Absolute portrait path, resolved at load (the file is the namesake
+    /// `<Name>.<ext>` sibling in the player folder — presence is a stat
+    /// fact). None when no portrait was uploaded.
     #[serde(default)]
     pub portrait: Option<String>,
 
     /// Creation timestamp (epoch-ms). Decorative; set on write.
     #[serde(default)]
     pub created_at_ms: i64,
+}
+
+/// The player's opt-in persona block — mirrors the NPC card's `<persona>`
+/// labels minus the mandatory-for-NPCs framing. Every field optional; the
+/// whole struct absent when the player declined (rendered NOWHERE — not in
+/// the file, not in the cache block).
+#[derive(Clone, Default, serde::Serialize, serde::Deserialize, Debug)]
+pub struct PlayerPersona {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub personality: Option<String>,
+    /// Parsed when hand-authored; never offered by the wizard.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conversation_style: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub likes: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dislikes: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub flaws: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub goals: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub occupation: Option<String>,
+}
+
+impl PlayerPersona {
+    pub fn is_empty(&self) -> bool {
+        self.personality.is_none()
+            && self.conversation_style.is_none()
+            && self.likes.is_none()
+            && self.dislikes.is_none()
+            && self.flaws.is_none()
+            && self.goals.is_none()
+            && self.occupation.is_none()
+    }
+}
+
+/// The player's `<inventory>` sibling — comma-separated item lines. The
+/// attach seam routes these into the typed equipment/pack model (clothing
+/// via `seed_clothing_items`, weapons-ish equipped items to hand slots,
+/// accessories/stored to the pack).
+#[derive(Clone, Default, serde::Serialize, serde::Deserialize, Debug)]
+pub struct PlayerInventory {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub clothing: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub equipped: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub accessories: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub stored: Vec<String>,
+}
+
+impl PlayerInventory {
+    pub fn is_empty(&self) -> bool {
+        self.clothing.is_empty()
+            && self.equipped.is_empty()
+            && self.accessories.is_empty()
+            && self.stored.is_empty()
+    }
 }
 
 /// Lightweight metadata for the player-picker list. Carries enough for
@@ -471,6 +553,413 @@ pub fn validate_image_magic(bytes: &[u8]) -> Result<&'static str, String> {
     Err("Portrait must be a PNG or JPEG image.".into())
 }
 
+// =============================================================
+// THE .player XML FORMAT (2026-08-19 Chloe ruling)
+//
+// `<player>` root holding metadata/identity/persona?/custom_tags, plus an
+// optional `<inventory>` SIBLING after `</player>` (mutable state seed —
+// never part of the cached root). Everything inside `<player>` is the
+// KV-cache payload the narrator reads every turn. The line-block grammar
+// (Label: value per line) + label normalization are shared with sim_card.
+//
+//   <player>
+//     <metadata>
+//     <id>alex</id>
+//     </metadata>
+//
+//     <identity><![CDATA[
+//   Name: Alex
+//   Gender: Male
+//   ...
+//     ]]></identity>
+//
+//     <persona><![CDATA[...optional, omitted entirely when empty...]]></persona>
+//
+//     <custom_tags>
+//       <entry key="penis_size"><![CDATA[5 inches]]></entry>
+//     </custom_tags>
+//   </player>
+//
+//   <inventory><![CDATA[
+//   Clothing: White Cropped Tee, Gray Denim Shorts
+//   ]]></inventory>
+// =============================================================
+
+/// Parse a `.player` XML document into a `SavedPlayer`. The struct-level
+/// validator (`validate_player`) still gates writes; this fn is purely
+/// structural. Unknown identity/persona labels beyond the known set are
+/// dropped (the wizard authors fixed labels); conditional traits
+/// (Breast/Ears/Tail/Horn) parse back into their dedicated fields.
+pub fn parse_player_xml(xml: &str) -> anyhow::Result<SavedPlayer> {
+    use crate::sim_card::{find_tag_close, labeled_get, parse_labeled_lines, split_csv};
+
+    let (head, tail) = match find_tag_close(xml, "player") {
+        Some(end) => xml.split_at(end),
+        None => (xml, ""),
+    };
+    let doc = roxmltree::Document::parse(head)
+        .map_err(|e| anyhow::anyhow!("parsing player XML: {e}"))?;
+    let root = doc
+        .root_element()
+        .has_tag_name("player")
+        .then_some(doc.root_element())
+        .ok_or_else(|| anyhow::anyhow!("root element must be <player>"))?;
+
+    let mut p = SavedPlayer {
+        id: String::new(),
+        name: String::new(),
+        description: None,
+        appearance: None,
+        personality: None,
+        accessories: None,
+        backstory: None,
+        gender: None,
+        race: None,
+        age: None,
+        height: None,
+        weight: None,
+        hair_color: None,
+        hair_length: None,
+        hair_style: None,
+        body_type: None,
+        skin_complexion: None,
+        eye_color: None,
+        breast_size: None,
+        ears: None,
+        tail: None,
+        horn: None,
+        clothing: None,
+        job: None,
+        weakness: None,
+        distinguishing_marks: None,
+        gear: None,
+        tools: None,
+        weapons: None,
+        custom_tags: None,
+        persona: None,
+        inventory: None,
+        portrait: None,
+        created_at_ms: 0,
+    };
+
+    // metadata/id — slugified through the same discipline as the write path.
+    let id = root
+        .children()
+        .find(|c| c.is_element() && c.has_tag_name("metadata"))
+        .and_then(|m| {
+            m.children()
+                .find(|c| c.is_element() && c.has_tag_name("id"))
+                .map(|n| crate::sim_card::node_text(n))
+        })
+        .and_then(|s| slugify_player_id(&s))
+        .unwrap_or_default();
+    p.id = id;
+
+    // identity line block.
+    let identity_text = root
+        .children()
+        .find(|c| c.is_element() && c.has_tag_name("identity"))
+        .map(crate::sim_card::node_text)
+        .unwrap_or_default();
+    let lines = parse_labeled_lines(&identity_text);
+    p.name = labeled_get(&lines, &["name"]).unwrap_or_default();
+    let get = |k: &str| labeled_get(&lines, &[k]).filter(|v| !v.is_empty());
+    p.gender = get("gender");
+    p.race = get("race");
+    p.age = get("age");
+    p.height = get("height");
+    p.weight = get("weight");
+    p.body_type = get("body");
+    p.skin_complexion = get("skin");
+    p.eye_color = get("eyes");
+    p.hair_color = get("hair_color");
+    p.hair_length = get("hair_length");
+    p.hair_style = get("hair_style");
+    p.breast_size = get("breast");
+    p.ears = get("ears");
+    p.tail = get("tail");
+    p.horn = get("horn");
+
+    // persona line block — optional; Backstory rides as a persona label but
+    // lands on the top-level field (the DTO's existing home).
+    let persona_text = root
+        .children()
+        .find(|c| c.is_element() && c.has_tag_name("persona"))
+        .map(crate::sim_card::node_text)
+        .unwrap_or_default();
+    if !persona_text.trim().is_empty() {
+        let plines = parse_labeled_lines(&persona_text);
+        let pget = |k: &str| labeled_get(&plines, &[k]).filter(|v| !v.is_empty());
+        let persona = PlayerPersona {
+            personality: pget("personality"),
+            conversation_style: pget("conversation_style"),
+            likes: pget("likes"),
+            dislikes: pget("dislikes"),
+            flaws: pget("flaws"),
+            goals: pget("goals"),
+            occupation: pget("occupation"),
+        };
+        p.backstory = pget("backstory");
+        if !persona.is_empty() || p.backstory.is_some() {
+            p.persona = Some(persona);
+        }
+    }
+
+    // custom_tags.
+    if let Some(ct) = root
+        .children()
+        .find(|c| c.is_element() && c.has_tag_name("custom_tags"))
+    {
+        let mut tags = std::collections::BTreeMap::new();
+        for entry in ct.children().filter(|c| c.is_element() && c.has_tag_name("entry")) {
+            let key = entry.attribute("key").unwrap_or("").trim().to_owned();
+            if key.is_empty() {
+                continue;
+            }
+            let value = crate::sim_card::node_text(entry).trim().to_owned();
+            if value.is_empty() {
+                continue;
+            }
+            tags.insert(key, value);
+        }
+        if !tags.is_empty() {
+            p.custom_tags = Some(tags);
+        }
+    }
+
+    // <inventory> sibling (outside </player>).
+    let inv_text = crate::sim_card::sibling_text(tail, &["inventory"]).unwrap_or_default();
+    if !inv_text.trim().is_empty() {
+        let ilines = parse_labeled_lines(&inv_text);
+        let iget = |k: &str| {
+            labeled_get(&ilines, &[k])
+                .map(|v| split_csv(&v))
+                .unwrap_or_default()
+        };
+        let inv = PlayerInventory {
+            clothing: iget("clothing"),
+            equipped: iget("equipped"),
+            accessories: iget("accessories"),
+            stored: iget("stored"),
+        };
+        if !inv.is_empty() {
+            p.inventory = Some(inv);
+        }
+    }
+
+    Ok(p)
+}
+
+/// Render a `SavedPlayer` to the canonical `.player` XML layout
+/// (byte-matches the Chloe-authored `alex.player` reference). Empty blocks
+/// are omitted entirely: no persona lines → no `<persona>` element; no
+/// items → no `<inventory>` sibling.
+pub fn render_player_xml(p: &SavedPlayer) -> String {
+    let mut xml = String::with_capacity(1024);
+    xml.push_str("<player>\n");
+    xml.push_str("  <metadata>\n");
+    let id = if p.id.trim().is_empty() {
+        slugify_player_id(&p.name).unwrap_or_else(|| "player".into())
+    } else {
+        p.id.trim().to_owned()
+    };
+    xml.push_str(&format!("  <id>{}</id>\n", xml_escape(&id)));
+    xml.push_str("  </metadata>\n");
+
+    // <identity> — Name leads; trait lines (incl. conditionals) follow.
+    let mut body = String::new();
+    let name = p.name.trim();
+    if !name.is_empty() {
+        body.push_str(&format!("Name: {name}\n"));
+    }
+    for (label, value) in player_identity_lines(p) {
+        body.push_str(&format!("{label}: {value}\n"));
+    }
+    xml.push_str(&format!("  <identity><![CDATA[\n{}  ]]></identity>\n", cdata_body(&body)));
+
+    // <persona> — the opt-in block. Legacy top-level backstory rides as the
+    // Backstory line; the block appears only when SOMETHING is present.
+    let persona = p.persona.as_ref();
+    let mut persona_body = String::new();
+    let mut push = |label: &str, v: Option<&str>| {
+        if let Some(s) = v.map(str::trim).filter(|s| !s.is_empty()) {
+            persona_body.push_str(&format!("{label}: {s}\n"));
+        }
+    };
+    push("Personality", persona.and_then(|x| x.personality.as_deref()));
+    push("Conversation Style", persona.and_then(|x| x.conversation_style.as_deref()));
+    push("Likes", persona.and_then(|x| x.likes.as_deref()));
+    push("Dislikes", persona.and_then(|x| x.dislikes.as_deref()));
+    push("Flaws", persona.and_then(|x| x.flaws.as_deref()));
+    push("Goals", persona.and_then(|x| x.goals.as_deref()));
+    push("Occupation", persona.and_then(|x| x.occupation.as_deref()));
+    push("Backstory", p.backstory.as_deref());
+    if !persona_body.is_empty() {
+        xml.push_str(&format!(
+            "  <persona><![CDATA[\n{}  ]]></persona>\n",
+            cdata_body(&persona_body)
+        ));
+    }
+
+    if let Some(tags) = &p.custom_tags {
+        if !tags.is_empty() {
+            xml.push_str("  <custom_tags>\n");
+            for (k, v) in tags {
+                xml.push_str(&format!(
+                    "    <entry key=\"{}\"><![CDATA[{}]]></entry>\n",
+                    xml_escape(k),
+                    cdata_body(v.trim())
+                ));
+            }
+            xml.push_str("  </custom_tags>\n");
+        }
+    }
+    xml.push_str("</player>\n");
+
+    if let Some(inv) = p.inventory.as_ref().filter(|i| !i.is_empty()) {
+        let mut body = String::new();
+        if !inv.clothing.is_empty() {
+            body.push_str(&format!("Clothing: {}\n", inv.clothing.join(", ")));
+        }
+        if !inv.equipped.is_empty() {
+            body.push_str(&format!("Equipped: {}\n", inv.equipped.join(", ")));
+        }
+        if !inv.accessories.is_empty() {
+            body.push_str(&format!("Accessories: {}\n", inv.accessories.join(", ")));
+        }
+        if !inv.stored.is_empty() {
+            body.push_str(&format!("Stored: {}\n", inv.stored.join(", ")));
+        }
+        xml.push_str(&format!("\n<inventory><![CDATA[\n{}]]></inventory>\n", cdata_body(&body)));
+    }
+
+    xml
+}
+
+/// Render the `<player>` cache block — the payload injected verbatim into
+/// the API narrator's system prompt every turn. Identity lines, persona
+/// lines, custom tags. NEVER the inventory sibling (mutable state).
+pub fn render_player_cache_block(p: &SavedPlayer) -> String {
+    let mut out = String::with_capacity(512);
+    out.push_str("<player>\n");
+    let name = p.name.trim();
+    if !name.is_empty() {
+        out.push_str(&format!("Name: {name}\n"));
+    }
+    for (label, value) in player_identity_lines(p) {
+        out.push_str(&format!("{label}: {value}\n"));
+    }
+    let persona = p.persona.as_ref();
+    let mut persona_rows: Vec<(&'static str, String)> = Vec::new();
+    let mut push = |label: &'static str, v: Option<&str>| {
+        if let Some(s) = v.map(str::trim).filter(|s| !s.is_empty()) {
+            persona_rows.push((label, s.to_owned()));
+        }
+    };
+    push("Personality", persona.and_then(|x| x.personality.as_deref()));
+    push("Conversation Style", persona.and_then(|x| x.conversation_style.as_deref()));
+    push("Likes", persona.and_then(|x| x.likes.as_deref()));
+    push("Dislikes", persona.and_then(|x| x.dislikes.as_deref()));
+    push("Flaws", persona.and_then(|x| x.flaws.as_deref()));
+    push("Goals", persona.and_then(|x| x.goals.as_deref()));
+    push("Occupation", persona.and_then(|x| x.occupation.as_deref()));
+    push("Backstory", p.backstory.as_deref());
+    if !persona_rows.is_empty() {
+        out.push('\n');
+        for (label, value) in persona_rows {
+            out.push_str(&format!("{label}: {value}\n"));
+        }
+    }
+    if let Some(tags) = &p.custom_tags {
+        if !tags.is_empty() {
+            out.push('\n');
+            for (k, v) in tags {
+                out.push_str(&format!("{k}: {}\n", v.trim()));
+            }
+        }
+    }
+    out.push_str("</player>");
+    out
+}
+
+/// The ordered identity-line view of a player (label order matches the sim
+/// identity block; the conditional traits ride as trailing lines).
+fn player_identity_lines(p: &SavedPlayer) -> Vec<(&'static str, String)> {
+    let mut out = Vec::new();
+    let mut push = |label: &'static str, v: &Option<String>| {
+        if let Some(s) = v.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            out.push((label, s.to_owned()));
+        }
+    };
+    push("Gender", &p.gender);
+    push("Race", &p.race);
+    push("Age", &p.age);
+    push("Height", &p.height);
+    push("Weight", &p.weight);
+    push("Body", &p.body_type);
+    push("Skin", &p.skin_complexion);
+    push("Eyes", &p.eye_color);
+    push("Hair Color", &p.hair_color);
+    push("Hair Length", &p.hair_length);
+    push("Hair Style", &p.hair_style);
+    push("Breast", &p.breast_size);
+    push("Ears", &p.ears);
+    push("Tail", &p.tail);
+    push("Horn", &p.horn);
+    out
+}
+
+fn xml_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+}
+
+fn cdata_body(s: &str) -> String {
+    s.replace("]]>", "]]]]><![CDATA[>")
+}
+
+/// Fold the LEGACY JSON chip lists (clothing/gear/tools/weapons) into the v2
+/// `inventory` model when no explicit inventory exists — the boot migration
+/// + read paths call this so one model serves the attach seam. Returns a
+/// clone; the original is untouched.
+pub fn fold_legacy_lists(p: &SavedPlayer) -> SavedPlayer {
+    let mut out = p.clone();
+    if out.inventory.is_none() {
+        let mut inv = PlayerInventory::default();
+        if let Some(c) = &out.clothing {
+            inv.clothing = c.iter().map(|s| s.trim().to_owned()).filter(|s| !s.is_empty()).collect();
+        }
+        let mut stored: Vec<String> = Vec::new();
+        for list in [&out.gear, &out.tools, &out.weapons] {
+            if let Some(items) = list {
+                for s in items {
+                    let s = s.trim();
+                    if !s.is_empty() {
+                        stored.push(s.to_owned());
+                    }
+                }
+            }
+        }
+        inv.stored = stored;
+        if !inv.is_empty() {
+            out.inventory = Some(inv);
+        }
+    }
+    // Legacy top-level personality (pre-overhaul JSON) folds into the
+    // opt-in persona block so it survives the XML rewrite.
+    if out.persona.is_none() {
+        if let Some(per) = out.personality.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            out.persona = Some(PlayerPersona {
+                personality: Some(per.to_owned()),
+                ..Default::default()
+            });
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -507,6 +996,8 @@ mod tests {
             tools: None,
             weapons: None,
             custom_tags: None,
+            persona: None,
+            inventory: None,
             portrait: None,
             created_at_ms: 0,
         }
@@ -769,5 +1260,156 @@ mod tests {
     fn magic_rejects_unknown() {
         assert!(validate_image_magic(b"not an image").is_err());
         assert!(validate_image_magic(&[]).is_err());
+    }
+
+    // ── .player XML format tests ──────────────────────────────────────────
+
+    /// The Chloe-authored reference layout (alex.player).
+    const ALEX_XML: &str = r#"<player>
+  <metadata>
+  <id>alex</id>
+  </metadata>
+
+  <identity><![CDATA[
+Name: Alex
+Gender: Male
+Race: Human
+Age: 18
+Height: 5'6"
+Weight: 130 lbs
+Body: Petite
+Skin: Pale with freckles around nose
+Eyes: Bright blue
+Hair Color: Blonde
+Hair Length: Shoulder-Length
+Hair Style: Messy
+  ]]></identity>
+
+  <custom_tags>
+    <entry key="penis_size"><![CDATA[5 inches]]></entry>
+  </custom_tags>
+</player>
+
+<inventory><![CDATA[
+Clothing: White Cropped Tee, Gray Denim Shorts, White Knee-High Socks, White Sneakers
+]]></inventory>"#;
+
+    #[test]
+    fn player_xml_parses_reference_layout() {
+        let sp = parse_player_xml(ALEX_XML).expect("alex.player parses");
+        assert_eq!(sp.id, "alex");
+        assert_eq!(sp.name, "Alex");
+        assert_eq!(sp.gender.as_deref(), Some("Male"));
+        assert_eq!(sp.race.as_deref(), Some("Human"));
+        assert_eq!(sp.height.as_deref(), Some("5'6\""));
+        assert_eq!(sp.body_type.as_deref(), Some("Petite"));
+        assert_eq!(sp.skin_complexion.as_deref(), Some("Pale with freckles around nose"));
+        assert_eq!(sp.hair_color.as_deref(), Some("Blonde"));
+        assert_eq!(sp.hair_style.as_deref(), Some("Messy"));
+        assert!(sp.persona.is_none(), "alex carries no persona");
+        assert_eq!(
+            sp.custom_tags.as_ref().unwrap().get("penis_size").map(|s| s.as_str()),
+            Some("5 inches")
+        );
+        let inv = sp.inventory.as_ref().expect("inventory sibling parses");
+        assert_eq!(inv.clothing.len(), 4);
+        assert_eq!(inv.clothing[0], "White Cropped Tee");
+        assert!(validate_player(&sp).is_ok());
+    }
+
+    #[test]
+    fn player_xml_round_trips() {
+        let sp = parse_player_xml(ALEX_XML).expect("parses");
+        let xml = render_player_xml(&sp);
+        let back = parse_player_xml(&xml).expect("round-trip parses");
+        assert_eq!(back.id, sp.id);
+        assert_eq!(back.name, sp.name);
+        assert_eq!(back.gender, sp.gender);
+        assert_eq!(back.body_type, sp.body_type);
+        assert_eq!(back.hair_color, sp.hair_color);
+        assert_eq!(back.custom_tags, sp.custom_tags);
+        assert_eq!(
+            back.inventory.as_ref().unwrap().clothing,
+            sp.inventory.as_ref().unwrap().clothing
+        );
+    }
+
+    #[test]
+    fn player_xml_persona_round_trips_and_omits_when_empty() {
+        let mut sp = p("Mira");
+        sp.persona = Some(PlayerPersona {
+            personality: Some("Quiet and watchful.".into()),
+            likes: Some("Maps, rain.".into()),
+            ..Default::default()
+        });
+        sp.backstory = Some("Raised by cartographers.".into());
+        let xml = render_player_xml(&sp);
+        assert!(xml.contains("Personality: Quiet and watchful."));
+        assert!(xml.contains("Likes: Maps, rain."));
+        assert!(xml.contains("Backstory: Raised by cartographers."));
+        let back = parse_player_xml(&xml).expect("parses");
+        assert_eq!(
+            back.persona.as_ref().unwrap().personality.as_deref(),
+            Some("Quiet and watchful.")
+        );
+        assert_eq!(back.persona.as_ref().unwrap().likes.as_deref(), Some("Maps, rain."));
+        assert_eq!(back.backstory.as_deref(), Some("Raised by cartographers."));
+
+        // No persona → the element is omitted ENTIRELY (file + cache).
+        let bare = render_player_xml(&p("Naked"));
+        assert!(!bare.contains("<persona>"));
+        let cache = render_player_cache_block(&p("Naked"));
+        assert!(!cache.contains("Personality"));
+    }
+
+    #[test]
+    fn player_cache_block_excludes_inventory() {
+        let sp = parse_player_xml(ALEX_XML).expect("parses");
+        let block = render_player_cache_block(&sp);
+        assert!(block.starts_with("<player>\nName: Alex\n"));
+        assert!(block.contains("Hair Color: Blonde\n"));
+        assert!(block.contains("penis_size: 5 inches\n"));
+        assert!(!block.contains("White Cropped Tee"), "inventory never rides the cache");
+        assert!(block.ends_with("</player>"));
+    }
+
+    #[test]
+    fn player_xml_conditional_traits_round_trip() {
+        let mut sp = p("Kitsune");
+        sp.ears = Some("fox".into());
+        sp.tail = Some("nine tails".into());
+        sp.horn = Some("small".into());
+        sp.breast_size = Some("modest".into());
+        let back = parse_player_xml(&render_player_xml(&sp)).expect("parses");
+        assert_eq!(back.ears.as_deref(), Some("fox"));
+        assert_eq!(back.tail.as_deref(), Some("nine tails"));
+        assert_eq!(back.horn.as_deref(), Some("small"));
+        assert_eq!(back.breast_size.as_deref(), Some("modest"));
+    }
+
+    #[test]
+    fn fold_legacy_lists_into_inventory() {
+        let mut sp = p("Legacy");
+        sp.clothing = Some(vec!["travel cloak".into(), "boots".into()]);
+        sp.gear = Some(vec!["rope".into()]);
+        sp.weapons = Some(vec!["shortsword".into()]);
+        sp.personality = Some("Old-school prose.".into());
+        let folded = fold_legacy_lists(&sp);
+        let inv = folded.inventory.expect("legacy lists folded");
+        assert_eq!(inv.clothing, vec!["travel cloak".to_string(), "boots".to_string()]);
+        assert!(inv.stored.contains(&"rope".to_string()));
+        assert!(inv.stored.contains(&"shortsword".to_string()));
+        assert_eq!(
+            folded.persona.as_ref().unwrap().personality.as_deref(),
+            Some("Old-school prose.")
+        );
+        // XML round-trip preserves the folded shape.
+        let back = parse_player_xml(&render_player_xml(&folded)).expect("parses");
+        assert_eq!(back.inventory.unwrap().clothing.len(), 2);
+    }
+
+    #[test]
+    fn player_xml_rejects_wrong_root() {
+        assert!(parse_player_xml("<sim_card><id>x</id></sim_card>").is_err());
     }
 }

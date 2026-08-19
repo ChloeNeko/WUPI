@@ -92,24 +92,31 @@ struct SaveHeader {
     turn_count: usize,
 }
 
-/// Resolve `<cards_root>/<card_id>/saves/` — the per-card saves subdir inside
+/// Resolve `<cards>/<card folder>/saves/` — the per-card saves subdir inside
 /// the card's own folder (2026-08-01 layout: each card owns its `.sim`,
 /// `.codex`, world/player/npc JSON, AND its save slots as siblings). The
 /// subdir isolates each scenario's saves so the Load Game list shows only the
 /// relevant ones.
 ///
-/// Takes `fable_root` (= `apps/fable/`) for signature continuity with the many
-/// call sites; the cards tree is `fable_root/cards/`.
+/// (2026-08-19) The card folder is DISPLAY-named ("One Piece"), so it can
+/// never be joined from the slug id — resolve via the crate's folder
+/// resolver (walker + cache), falling back to a display-stem join under the
+/// cards root (covers un-migrated slug folders too: a slug passes through
+/// `safe_display_stem` unchanged). Takes `fable_root` (= `apps/fable/`) for
+/// signature continuity with the many call sites.
 pub fn resolve_saves_dir(fable_root: &Path, card_id: &str) -> PathBuf {
-    fable_root.join("cards").join(card_id).join("saves")
+    let cards_root = fable_root.join("cards");
+    if let Some(folder) = crate::resolve_card_folder(&cards_root, card_id) {
+        return folder.join("saves");
+    }
+    cards_root.join(crate::safe_display_stem(card_id, "Card")).join("saves")
 }
 
 /// Bare slug-segment sanitizer (separators / parent refs / drive prefixes
-/// → `-`, trimmed, empty → `__unknown__`). Shared by `resolve_save_path`
-/// AND the `create_dir_all` in `write_save` — the mkdir must target the
-/// SAME directory the write does (2026-08-15 audit fix: the mkdir used the
-/// raw id, so an id needing cleaning created a junk directory while the
-/// cleaned write path had no parent).
+/// → `-`, trimmed, empty → `__unknown__`). SAVE-SLOT ids only (2026-08-19:
+/// the card half resolves through the folder resolver above, which builds
+/// paths exclusively from enumerated directories — the destructive-consumer
+/// traversal guard for the card half is structural now).
 fn clean_save_segment(id: &str) -> String {
     let s: String = id
         .chars()
@@ -121,10 +128,11 @@ fn clean_save_segment(id: &str) -> String {
 
 /// Resolve a single save file's path.
 pub fn resolve_save_path(fable_root: &Path, card_id: &str, save_id: &str) -> PathBuf {
-    // (P2 hardening) Sanitize BOTH ids to bare slug segments: separators,
-    // parent refs, or drive prefixes in a caller-supplied id can never
-    // escape the saves tree (fable_delete_save is a destructive consumer).
-    resolve_saves_dir(fable_root, &clean_save_segment(card_id))
+    // (P2 hardening) The save-id half is slug-sanitized: separators, parent
+    // refs, or drive prefixes in a caller-supplied slot id can never escape
+    // the saves tree (fable_delete_save is a destructive consumer). The card
+    // half resolves through the walker (see `resolve_saves_dir`).
+    resolve_saves_dir(fable_root, card_id)
         .join(format!("{}.json", clean_save_segment(save_id)))
 }
 
@@ -138,11 +146,10 @@ pub fn write_save(
     session: &Conversation,
     schema: &WorldSchema,
 ) -> std::io::Result<SaveFile> {
-    // (2026-08-15 audit fix) mkdir from the SANITIZED card id — the write
-    // below goes through `resolve_save_path` (which cleans), so an unclean
-    // mkdir created a junk directory AND missed the real one (File::create
-    // then failed on a missing parent).
-    let dir = resolve_saves_dir(fable_root, &clean_save_segment(&card.id));
+    // (2026-08-19) The mkdir targets the SAME directory the write does —
+    // both halves go through `resolve_saves_dir` (the folder resolver), so
+    // they cannot disagree.
+    let dir = resolve_saves_dir(fable_root, &card.id);
     std::fs::create_dir_all(&dir)?;
 
     let is_autosave = save_id == AUTOSAVE_ID;
@@ -444,8 +451,14 @@ mod tests {
         SimCard {
             id: "test_card".into(),
             name: "Test Scenario".into(),
-            card_type: "roleplay".into(),
+            card_type: "simulation".into(),
             subtype: None,
+            format_v2: false,
+            identity: Default::default(),
+            persona: Default::default(),
+            world: Default::default(),
+            location: None,
+            inventory: Default::default(),
             core_persona: String::new(),
             traits: String::new(),
             appearance: String::new(),
