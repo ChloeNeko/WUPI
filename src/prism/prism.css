@@ -327,6 +327,51 @@
   box-shadow: inset 0 0 0 1px var(--prism-border-glow);
 }
 .prism-suggest-tag { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* ── Example prompt library (below the search bar) ─────────────────── */
+.prism-examples {
+  margin-top: 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.prism-examples-label {
+  font-size: 0.75em;
+  text-transform: uppercase;
+  letter-spacing: 1px;
+  color: var(--prism-text-faint);
+  margin-bottom: 4px;
+}
+.prism-example {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  text-align: left;
+  font-family: inherit;
+  background: rgba(0,0,0,0.20);
+  border: 1px solid var(--prism-border);
+  border-radius: var(--prism-radius-sm);
+  color: var(--prism-text);
+  padding: 7px 10px;
+  cursor: pointer;
+}
+.prism-example:hover {
+  border-color: var(--prism-border-glow);
+  background: rgba(255,255,255,0.05);
+}
+.prism-example-title {
+  font-size: 0.8em;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  color: var(--prism-text-dim);
+}
+.prism-example-prompt {
+  font-size: 0.82em;
+  color: var(--prism-text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 /* The settings-rail note explaining the locked recipe (no sliders to see). */
 .prism-recipe-note {
   font-size: 0.75em;

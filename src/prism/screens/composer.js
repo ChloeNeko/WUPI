@@ -1,43 +1,39 @@
 // =============================================================
-// PRISM COMPOSER — the Guided Slot Pipeline (Chloe ruling, 2026-08-18).
+// PRISM COMPOSER — the flat prompt builder (2026-08-18 rework, replacing
+// the guided slot pipeline).
 //
-// THE SLOT PIPELINE (replaces the flat tag bar): CLIP reads prompts
-// sequentially — the first ~15-20 tokens carry the heaviest weight for
-// composition, subject count, and core structure. The composer therefore
-// presents pre-defined category slots that build the prompt in expert
-// order no matter what order the user clicks:
+// LAYOUT: the ordered pill box on top, the Danbooru tag search bar below
+// it, and a static EXAMPLE LIBRARY of 10 expert-ordered prompts under the
+// input (scenic cinematic backgrounds → anime portraits → groups/multiple
+// characters — click one to load it into the pill box). No mandatory-slot
+// gating: any non-empty prompt generates.
 //
-//   1. Subject & Count  (MANDATORY) — quick-pick chips (1girl, 1boy, 2girls,
-//      no humans…; auto-solo is engine-side, prism.rs crowd gate).
-//   2. Framing & Pose   (MANDATORY) — framing single-select + pose
-//      multi-select chips; satisfied when either has a pick.
-//   3. Environment      (recommended) — chips; does not gate anything.
-//   4. Freeform         (UNLOCKED by 1+2) — the Danbooru tag search below
-//      (src/prism/data/danbooru-tags.json, ~140K tags; general + series +
-//      character rows, artist + meta excluded; ranked most→least popular;
-//      click/Enter adds a pill; typed text NEVER becomes a pill — users can
-//      only add tags the model knows; focusing the empty search greets with
-//      the TOP 100 tags).
+// PROMPT ORDER: CLIP reads prompts sequentially — subject count first,
+// then framing/pose, then environment, then free detail. The compile is
+// still slot-ordered via engine/slots.js (compilePrompt), and the example
+// library teaches the same ordering by demonstration; loaded examples +
+// Send-to-Composer rows run through splitIntoSlots to regroup into that
+// order.
 //
-// Mandatory slots can never be left EMPTY once filled — you can SWAP a
-// choice (pick another chip), but only Clear prompt empties everything.
-// The freeform search stays disabled until slots 1+2 are satisfied.
+// TAG SEARCH (src/prism/data/danbooru-tags.json, ~140K tags; general +
+// series + character rows, artist + meta excluded; ranked most→least
+// popular; click/Enter adds a pill; typed text NEVER becomes a pill —
+// users only add tags the model knows; focusing the empty search greets
+// with the TOP 100 tags). The ONLY search-side filter is the
+// furry/NSFW/solo family exclusion (SEARCH_EXCLUDE below) — nothing else
+// is removed from results.
 //
-// THE TOGGLES (2026-08-18, replacing tag-detection steering): NSFW and
-// Furry switches in the settings rail. They route danbooru rating/furry
-// tags server-side (prism.rs): NSFW on → `nsfw, explicit` positive +
-// `safe` negative; off → the reverse. Furry on → `furry, anthro`
-// positive; off → they ride the negative (the checkpoint's training mix
-// is furry-heavy — leakage suppression). Persisted in localStorage.
+// THE TOGGLES (2026-08-18): NSFW and Furry switches in the settings rail
+// route danbooru rating/furry tags server-side (prism.rs). Persisted in
+// localStorage.
 //
 // THE LOCKED RECIPE v2 (server-side, invisible): base DPM++ 2M + Karras at
 // 20 steps + the MANDATORY ESRGAN hires refine (1.5×, 12 effective steps,
 // 0.45 denoise) + the quality prefix + negative block are enforced in
-// prism::build_request / scene_art (Rust). The engine-injected meta
-// families are excluded from search here — they never surface. The
-// user-facing knobs: the slot pills, the size presets (the 7 NoobAI
-// buckets), the seed (always -1/random here — seed iteration is Fork &
-// Edit's primitive), + the two toggles.
+// prism::build_request / scene_art (Rust). The user-facing knobs: the
+// pills, the size presets (the 7 NoobAI buckets), the seed (always -1/
+// random here — seed iteration is Fork & Edit's primitive), + the two
+// toggles.
 //
 // Build/wire/teardown triplet (FABLE convention): buildEl() constructs the
 // DOM + returns it; wire() attaches listeners + subscribes to events;
@@ -48,7 +44,7 @@
 import { GEN_DEFAULTS, generate } from '../engine/api.js';
 import CATALOG from '../data/danbooru-tags.json';
 import {
-  SLOT_SETS, createSlots, slotsSatisfied, compilePrompt, splitIntoSlots,
+  createSlots, compilePrompt, splitIntoSlots,
 } from '../engine/slots.js';
 
 // ── The search index (built once per process, lazily on first use) ───────
@@ -70,18 +66,14 @@ import {
 // (Keep in sync with scene_art.rs PRISM_QUALITY_PREFIX /
 // PRISM_NEGATIVE_BLOCK, prism.rs's subject/rating constants + scripts/
 // build-danbooru-catalog.cjs.)
-const META_EXCLUDED = new Set([
-  // positive prefix
-  'masterpiece', 'best_quality', 'newest', 'absurdres', 'highres',
-  // negative block (v2 — the retired hand tags stay excluded: negative-block
-  // vocabulary is never a positive pill)
-  'worst_quality', 'old', 'early', 'low_quality', 'lowres', 'signature',
-  'username', 'logo', 'bad_hands', 'mutated_hands',
-  // crowd-logic subject gate (prism.rs)
-  'solo', 'no_humans',
-  // toggle steering (prism.rs — the NSFW/Furry toggles route these)
-  'safe', 'nsfw', 'explicit', 'furry', 'anthro',
-]);
+// Search-side exclusion (2026-08-18 rework): the ONLY families filtered
+// out of search results are furry, NSFW, and solo (the crowd-gate subject
+// tag + its focus variants) — everything else the catalog holds is
+// searchable. Word-boundary matched on the underscore key form so e.g.
+// "solo_focus" is excluded but unrelated tags containing the letters
+// aren't. The toggle-routed tags (nsfw/explicit/furry/anthro) are steering
+// vocabulary, not user pills.
+const SEARCH_EXCLUDE = /(^|_)(nsfw|explicit|questionable|furry|anthro|solo)(_|$)/;
 
 // The searchable Danbooru categories: 0 general, 3 copyright/series,
 // 4 character (2026-08-17 re-ruling — character/series names returned to
@@ -100,8 +92,7 @@ const MIN_ALIAS_QUERY = 3;
 // recommended ~1.0 MP set). Ordered tall → square → wide; the default is
 // the portrait 832×1216 (characters are the primary use).
 const BUCKETS = [
-  [768, 1344], [832, 1216], [896, 1152], [1024, 1024],
-  [1152, 896], [1216, 832], [1344, 768],
+  [768, 1344], [832, 1216], [1024, 1024], [1216, 832], [1344, 768],
 ];
 
 // localStorage keys for the steering toggles (persist across composer
@@ -119,7 +110,7 @@ function buildIndex() {
   for (const row of CATALOG.tags) {
     if (!SEARCHABLE_CATEGORY.has(row[1])) continue;
     const tag = String(row[0] || '').toLowerCase();
-    if (!tag || META_EXCLUDED.has(tag)) continue;
+    if (!tag || SEARCH_EXCLUDE.test(tag)) continue;
     keys.push(matchKey(tag));
     display.push(String(row[0]).replace(/_/g, ' '));
     count.push(row[2]);
@@ -252,7 +243,6 @@ export function buildEl(routerHooks = {}) {
         <h2 class="prism-section-title">Compose</h2>
         <div class="prism-lane" data-lane="positive">
           <div class="prism-lane-label">Prompt</div>
-          ${slotsHtml()}
           <div class="prism-pill-box" data-pillbox="positive"></div>
           <div class="prism-tagsearch">
             <input class="prism-tagsearch-input" data-input="search" type="text"
@@ -260,6 +250,7 @@ export function buildEl(routerHooks = {}) {
                    autocomplete="off" spellcheck="false" />
             <div class="prism-suggest" data-suggest hidden></div>
           </div>
+          ${examplesHtml()}
         </div>
         <div class="prism-compose-actions">
           <button class="prism-btn prism-btn-ghost" data-action="clear-positive">Clear prompt</button>
@@ -278,40 +269,36 @@ export function buildEl(routerHooks = {}) {
   return el;
 }
 
-/** The guided slot rows (1 Subject · 2 Framing & Pose · 3 Environment). */
-function slotsHtml() {
-  const chip = (slot, tag) => `
-    <button type="button" class="prism-chip" data-chip="${escapeAttr(tag)}" data-slot="${slot}">${escapeHtml(tag)}</button>`;
+/**
+ * The example prompt library (2026-08-18 rework): ten expert-ordered
+ * showcases — subject count first, then framing/pose, environment, then
+ * free detail — spanning scenic cinematic backgrounds → anime portraits →
+ * groups. Clicking one loads it into the pill box (via splitIntoSlots) so
+ * the user sees + edits exactly the ordering discipline the examples teach.
+ */
+const EXAMPLES = [
+  ['Cinematic vista', 'no humans, wide shot, scenery, mountains, sunset, ocean, clouds, cinematic lighting, depth of field, landscape'],
+  ['Anime portrait', '1girl, portrait, long hair, blue eyes, school uniform, smile, outdoors, cherry blossoms, soft lighting, wind'],
+  ['Duo adventure', '2girls, cowboy shot, walking, forest, cloaks, backpacks, dappled sunlight, looking at each other'],
+  ['Party at the tavern', 'group, indoors, tavern, laughing, mugs, fireplace, warm lighting, wooden interior'],
+  ['Night city street', '1girl, full body, standing, cityscape, night, neon lights, rain, wet ground, reflection, umbrella'],
+  ['Solo warrior rest', '1boy, sitting, campfire, armor, sword, forest, night, starry sky, dramatic shadows'],
+  ['Multiple girls idol stage', 'multiple girls, stage, performance, idol costume, spotlights, confetti, dynamic poses, crowd'],
+  ['Cozy interior scene', '1girl, upper body, sitting, indoors, window light, teacup, book, cat, plants, warm colors'],
+  ['Epic battle stance', '1girl, full body, fighting stance, sword, dust, shattered ground, dramatic sky, action, motion lines'],
+  ['Misty mountain shrine', 'no humans, scenery, shrine, torii, stairs, mist, forest, mountain, sunrise, atmospheric'],
+];
+
+/** The clickable example list rendered below the search bar. */
+function examplesHtml() {
   return `
-    <div class="prism-slots">
-      <div class="prism-slot" data-slotrow="subject">
-        <div class="prism-slot-head">
-          <span class="prism-slot-name">1 · Subject</span>
-          <span class="prism-slot-rule">required</span>
-        </div>
-        <div class="prism-chip-row">${SLOT_SETS.subject.map((t) => chip('subject', t)).join('')}</div>
-      </div>
-      <div class="prism-slot" data-slotrow="framingpose">
-        <div class="prism-slot-head">
-          <span class="prism-slot-name">2 · Framing &amp; Pose</span>
-          <span class="prism-slot-rule">required</span>
-        </div>
-        <div class="prism-chip-group">
-          <span class="prism-chip-group-label">Framing</span>
-          <div class="prism-chip-row" data-chipgrp="framing">${SLOT_SETS.framing.map((t) => chip('framing', t)).join('')}</div>
-        </div>
-        <div class="prism-chip-group">
-          <span class="prism-chip-group-label">Pose</span>
-          <div class="prism-chip-row" data-chipgrp="pose">${SLOT_SETS.pose.map((t) => chip('pose', t)).join('')}</div>
-        </div>
-      </div>
-      <div class="prism-slot" data-slotrow="env">
-        <div class="prism-slot-head">
-          <span class="prism-slot-name">3 · Environment</span>
-          <span class="prism-slot-rule">recommended</span>
-        </div>
-        <div class="prism-chip-row" data-chipgrp="env">${SLOT_SETS.env.map((t) => chip('env', t)).join('')}</div>
-      </div>
+    <div class="prism-examples">
+      <div class="prism-examples-label">Example prompts — perfect tag ordering, click to load</div>
+      ${EXAMPLES.map(([title, prompt], n) => `
+        <button type="button" class="prism-example" data-example="${n}">
+          <span class="prism-example-title">${escapeHtml(title)}</span>
+          <span class="prism-example-prompt">${escapeHtml(prompt)}</span>
+        </button>`).join('')}
     </div>
   `;
 }
@@ -323,9 +310,8 @@ function settingsRailHtml() {
       <select id="prism-dim" class="prism-select" data-setting="dim">
         <option value="768x1344">768 × 1344 (tall portrait)</option>
         <option value="832x1216" selected>832 × 1216 (portrait)</option>
-        <option value="896x1152">896 × 1152 (portrait)</option>
         <option value="1024x1024">1024 × 1024 (square)</option>
-        <option value="1152x896">1152 × 896 (landscape)</option>
+        <option value="1216x832">1216 × 832 (landscape)</option>
         <option value="1216x832">1216 × 832 (landscape)</option>
         <option value="1344x768">1344 × 768 (wide landscape)</option>
       </select>
@@ -352,13 +338,7 @@ function settingsRailHtml() {
 // ── Wire ────────────────────────────────────────────────────────────────
 
 export function wire(rootEl) {
-  // Guided slot chips: delegated click on the slots container.
-  const slotsEl = rootEl.querySelector('.prism-slots');
-  if (slotsEl) slotsEl.addEventListener('click', (e) => onChipClick(rootEl, e));
-
-  // Tag search input: filter-as-you-type (debounced), keyboard nav. The
-  // input stays disabled until the mandatory slots are satisfied (the
-  // lock state is refreshed by commitState on every slot change).
+  // Tag search input: filter-as-you-type (debounced), keyboard nav.
   const search = rootEl.querySelector('[data-input="search"]');
   if (search) {
     let t = null;
@@ -380,6 +360,15 @@ export function wire(rootEl) {
     if (box && !box.contains(e.target)) hideSuggest(rootEl);
   };
   document.addEventListener('click', onDocClickBound);
+
+  // The example library: clicking a row loads its prompt into the pill box.
+  const exList = rootEl.querySelector('.prism-examples');
+  if (exList) exList.addEventListener('click', (e) => {
+    const row = e.target.closest('[data-example]');
+    if (!row) return;
+    slotState = splitIntoSlots(EXAMPLES[Number(row.dataset.example)][1]);
+    commitState(rootEl);
+  });
 
   // Settings rail: the size select + the two steering toggles.
   rootEl.querySelectorAll('[data-setting]').forEach((ctrl) => {
@@ -423,69 +412,7 @@ export function teardown() {
   onGenerateBound = null;
 }
 
-// ── The guided slot pipeline ─────────────────────────────────────────────
-
-/** Handle a quick-pick chip click (delegated from .prism-slots). */
-function onChipClick(rootEl, e) {
-  const chipEl = e.target.closest('[data-chip]');
-  if (!chipEl) return;
-  const slot = chipEl.dataset.slot;
-  const tag = chipEl.dataset.chip;
-  if (slot === 'subject') {
-    // Single-select REPLACE — the slot can never be left empty once filled
-    // (a different subject is a swap, not a removal).
-    slotState.subject = tag;
-    commitState(rootEl);
-    advanceFocus(rootEl, 'framing');
-    return;
-  }
-  if (slot === 'framing') {
-    // Single-select REPLACE (one framing at a time).
-    slotState.framing = tag;
-    commitState(rootEl);
-    advanceFocus(rootEl, 'env');
-    return;
-  }
-  if (slot === 'pose') {
-    // The mandatory slot-2 invariant: the LAST framing-or-pose pick can't
-    // be deselected while there's no framing (swap to another chip or
-    // Clear prompt instead) — the slot may never be left empty.
-    const removing = slotState.pose.some((t) => t.toLowerCase() === tag.toLowerCase());
-    if (removing && !slotState.framing && slotState.pose.length === 1) return;
-    toggleListTag(slotState.pose, tag);
-    commitState(rootEl);
-    advanceFocus(rootEl, 'env');
-    return;
-  }
-  if (slot === 'env') {
-    toggleListTag(slotState.env, tag);
-    commitState(rootEl);
-    // Picking an environment advances to the unlocked freeform search.
-    advanceFocus(rootEl, 'search');
-  }
-}
-
-/** Toggle a tag in a multi-select list (case-insensitive dedupe). */
-function toggleListTag(list, tag) {
-  const i = list.findIndex((t) => t.toLowerCase() === tag.toLowerCase());
-  if (i >= 0) list.splice(i, 1);
-  else list.push(tag);
-}
-
-/**
- * Move the focus ring to the next station after a pick: the next slot's
- * first chip, or the freeform search once everything before it is done.
- */
-function advanceFocus(rootEl, target) {
-  if (target === 'search') {
-    if (!slotsSatisfied(slotState)) return;
-    const search = rootEl.querySelector('[data-input="search"]');
-    if (search && !search.disabled) search.focus();
-    return;
-  }
-  const row = rootEl.querySelector(`[data-chipgrp="${target}"] .prism-chip`);
-  if (row) row.focus();
-}
+// ── The prompt pill state ───────────────────────────────────────────────
 
 /**
  * Re-render EVERYTHING derived from the slot state: chip selected-states,
@@ -494,69 +421,26 @@ function advanceFocus(rootEl, target) {
  * the state.
  */
 function commitState(rootEl) {
-  renderChips(rootEl);
   renderPills(rootEl);
-  refreshSearchLock(rootEl);
 }
 
-/** Reflect the slot state onto the chip rows (is-selected). */
-function renderChips(rootEl) {
-  const selected = {
-    subject: slotState.subject,
-    framing: slotState.framing,
-    pose: new Set(slotState.pose.map((t) => t.toLowerCase())),
-    env: new Set(slotState.env.map((t) => t.toLowerCase())),
-  };
-  rootEl.querySelectorAll('[data-chip]').forEach((chipEl) => {
-    const slot = chipEl.dataset.slot;
-    const tag = chipEl.dataset.chip;
-    const isSel = slot === 'subject' || slot === 'framing'
-      ? selected[slot] === tag
-      : selected[slot].has(tag.toLowerCase());
-    chipEl.classList.toggle('is-selected', isSel);
-    chipEl.setAttribute('aria-pressed', isSel ? 'true' : 'false');
-  });
-  // The mandatory slot rows glow when satisfied (visual gating feedback).
-  const subjectRow = rootEl.querySelector('[data-slotrow="subject"]');
-  if (subjectRow) subjectRow.classList.toggle('is-done', !!slotState.subject);
-  const fpRow = rootEl.querySelector('[data-slotrow="framingpose"]');
-  if (fpRow) fpRow.classList.toggle('is-done', !!slotState.framing || slotState.pose.length > 0);
-}
-
-/** Render the ordered pill box from the slot state (slot-badged pills). */
+/** Render the ordered pill box from the slot state. */
 function renderPills(rootEl) {
   const box = rootEl.querySelector('[data-pillbox="positive"]');
   if (!box) return;
-  const pill = (tag, slot, removable) => `
+  const pill = (tag, slot) => `
     <span class="prism-pill prism-pill-slot" data-pill="${escapeAttr(tag)}" data-slot="${slot}"${slot === 'free' ? ' draggable="true"' : ''}>
       <span class="prism-pill-text">${escapeHtml(tag)}</span>
-      ${removable ? `<button class="prism-pill-x" data-remove="1" data-rem-slot="${slot}" data-rem-tag="${escapeAttr(tag)}" aria-label="remove">×</button>` : ''}
+      <button class="prism-pill-x" data-remove="1" data-rem-slot="${slot}" data-rem-tag="${escapeAttr(tag)}" aria-label="remove">×</button>
     </span>`;
   const html = [
-    slotState.subject ? pill(slotState.subject, 'subject', false) : '',
-    slotState.framing ? pill(slotState.framing, 'framing', false) : '',
-    ...slotState.pose.map((t) => pill(t, 'pose', false)),
-    ...slotState.env.map((t) => pill(t, 'env', true)),
-    ...slotState.free.map((t) => pill(t, 'free', true)),
+    slotState.subject ? pill(slotState.subject, 'subject') : '',
+    slotState.framing ? pill(slotState.framing, 'framing') : '',
+    ...slotState.pose.map((t) => pill(t, 'pose')),
+    ...slotState.env.map((t) => pill(t, 'env')),
+    ...slotState.free.map((t) => pill(t, 'free')),
   ].join('');
-  box.innerHTML = html || '<span class="prism-pill-empty">Pick a subject + framing or pose to start…</span>';
-}
-
-/**
- * The freeform search lock: disabled with a hint until the two mandatory
- * slots are satisfied (the Guided Slot Pipeline's unlock rule).
- */
-function refreshSearchLock(rootEl) {
-  const search = rootEl.querySelector('[data-input="search"]');
-  if (!search) return;
-  const ok = slotsSatisfied(slotState);
-  search.disabled = !ok;
-  search.placeholder = ok
-    ? 'Search and select a variety of tags to create your image...'
-    : 'Pick a subject and a framing or pose to unlock the tag search…';
-  const wrap = rootEl.querySelector('.prism-tagsearch');
-  if (wrap) wrap.classList.toggle('is-locked', !ok);
-  if (!ok) hideSuggest(rootEl);
+  box.innerHTML = html || '<span class="prism-pill-empty">Search tags or click an example below…</span>';
 }
 
 // ── Tag search ──────────────────────────────────────────────────────────
@@ -670,13 +554,13 @@ function onPillBoxClick(rootEl, e) {
   if (!x) return;
   const slot = x.dataset.remSlot;
   const tag = x.dataset.remTag;
-  if (slot === 'env' || slot === 'free') {
-    const list = slot === 'env' ? slotState.env : slotState.free;
+  if (slot === 'subject' || slot === 'framing') {
+    if (slotState[slot].toLowerCase() === tag.toLowerCase()) slotState[slot] = null;
+  } else {
+    const list = slot === 'env' ? slotState.env : slot === 'pose' ? slotState.pose : slotState.free;
     const i = list.findIndex((t) => t.toLowerCase() === tag.toLowerCase());
     if (i >= 0) list.splice(i, 1);
   }
-  // subject / framing / pose pills carry no × — their slots are mandatory
-  // (swap via the chip rows, or Clear prompt for the full reset).
   commitState(rootEl);
 }
 
@@ -736,8 +620,8 @@ function onSettingChange(ctrl) {
 
 async function onGenerate(rootEl) {
   const prompt = compilePrompt(slotState).trim();
-  if (!slotsSatisfied(slotState) || !prompt) {
-    if (hooks.onToast) hooks.onToast('Pick a subject and a framing or pose first (the guided slots at the top).');
+  if (!prompt) {
+    if (hooks.onToast) hooks.onToast('Add at least one tag (search above, or click an example prompt).');
     return;
   }
 
@@ -817,6 +701,16 @@ export function loadFromImage(rootEl, img) {
 }
 
 function splitPrompt(s) {
+  // Engine-injected tags never re-enter the composer on load (they're
+  // Rust machinery, not user vocabulary) — this is the LOAD-side strip,
+  // distinct from the search-side exclusion above.
+  const META_EXCLUDED = new Set([
+    'masterpiece', 'best_quality', 'newest', 'absurdres', 'highres',
+    'worst_quality', 'old', 'early', 'low_quality', 'lowres', 'signature',
+    'username', 'logo', 'bad_hands', 'mutated_hands',
+    'solo', 'no_humans',
+    'safe', 'nsfw', 'explicit', 'furry', 'anthro',
+  ]);
   if (!s) return [];
   return s.split(',')
     .map((t) => t.trim())
