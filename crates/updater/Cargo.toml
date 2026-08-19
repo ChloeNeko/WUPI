@@ -1,6 +1,6 @@
 [package]
 name = "wupi-updater"
-version = "0.24.0"
+version = "0.24.1"
 edition = "2021"
 # Kept in lockstep with src-tauri/Cargo.toml + tauri.conf.json by release.cjs's
 # version-sync step. The updater's own version is not user-facing (wupi.exe's
