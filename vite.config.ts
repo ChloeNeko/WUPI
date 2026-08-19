@@ -122,6 +122,12 @@ export default defineConfig({
   build: {
     outDir: "../dist",
     emptyOutDir: true,
+    // One deliberate bundle: all three surfaces (WUPI shell + Fable + PRISM)
+    // load at boot from the exe's embedded assets over Tauri's asset protocol
+    // — no network, so code-splitting buys nothing. The raised limit only
+    // silences the >500 kB advisory to keep release logs clean; if it ever
+    // fires again the JS bundle crossed 5 MB and deserves a look.
+    chunkSizeWarningLimit: 5000,
     // The entry HTML is `wupi.html` (renamed from the Vite-default
     // index.html per AGENTS.md §8C). Vite picks up the entry via
     // rollupOptions.input; without this it would look for index.html in
