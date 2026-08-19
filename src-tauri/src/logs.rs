@@ -35,8 +35,11 @@
 //!
 //! Categories in use: SYS (boot/system) · ENG (local decode engines) ·
 //! MEM (memory + embedder) · SCHEMA (delta/repair/queues) · FABLE (turn
-//! flow/session ops) · BRK (bracket commands) · REF (referees/dice) ·
-//! TOOL (tool calls) · API (HTTP narrator/slice/creator).
+//! flow/session ops + the per-turn world digest) · BRK (bracket commands +
+//! world tracking: travel/map, weather, date, rumors, presence) · INV
+//! (inventory: equip/belt/pack appliers, fragment resolution, spills,
+//! soul-gem UI edits) · REF (referees/dice) · TOOL (tool calls) ·
+//! API (HTTP narrator/slice/creator).
 
 use std::collections::VecDeque;
 use std::fs::{File, OpenOptions};

@@ -5200,6 +5200,7 @@ async fn apply_phase3_bracket_commands(
             }
         });
         if let Some(condition) = last_weather {
+            let prev_condition = s.weather.condition.clone();
             if undo_snapshot.is_none() {
                 undo_snapshot = Some(s.clone());
             }
@@ -5209,6 +5210,14 @@ async fn apply_phase3_bracket_commands(
             };
             mutated = true;
             tracing::info!(condition = %condition, "[WEATHER] weather condition set");
+            crate::logs::log(
+                "BRK",
+                &format!(
+                    "[WEATHER] set -> {} (was \"{}\")",
+                    crate::logs::brief_with(&condition, 40),
+                    prev_condition
+                ),
+            );
         }
 
         // [DATE] — rewrite the free-form calendar label (2026-08-13). The
@@ -5243,7 +5252,16 @@ async fn apply_phase3_bracket_commands(
                     rejected = %value,
                     "[DATE] rejected a deletion-only rewrite (tracker echo-loss); keeping the current label"
                 );
+                crate::logs::log(
+                    "BRK",
+                    &format!(
+                        "[DATE] REJECTED deletion-only rewrite -> {} (kept {:?})",
+                        crate::logs::brief_with(value, 40),
+                        s.calendar
+                    ),
+                );
             } else {
+                let prev_label = s.calendar.clone();
                 if undo_snapshot.is_none() {
                     undo_snapshot = Some(s.clone());
                 }
@@ -5254,6 +5272,14 @@ async fn apply_phase3_bracket_commands(
                 s.calendar_synced_minutes = Some(s.world_clock.current_minutes);
                 mutated = true;
                 tracing::info!(calendar = %value, "[DATE] calendar label set");
+                crate::logs::log(
+                    "BRK",
+                    &format!(
+                        "[DATE] label -> {} (was {:?})",
+                        crate::logs::brief_with(value, 40),
+                        prev_label
+                    ),
+                );
             }
         }
 
@@ -5293,6 +5319,10 @@ async fn apply_phase3_bracket_commands(
                         emitted = %id,
                         resolved = %existing,
                         "[DISCOVER] shorthand resolves to an existing node — re-discovery no-op"
+                    );
+                    crate::logs::log(
+                        "BRK",
+                        &format!("[DISCOVER] ghost-guard no-op: '{id}' aliases existing '{existing}'"),
                     );
                     continue;
                 }
@@ -5337,6 +5367,15 @@ async fn apply_phase3_bracket_commands(
                         node_id = %id,
                         neighbor_count = neighbors.len(),
                         "[DISCOVER] travel-graph node registered"
+                    );
+                    crate::logs::log(
+                        "BRK",
+                        &format!(
+                            "[DISCOVER] node registered id={id} name={} neighbors={} seeded_current={}",
+                            crate::logs::brief_with(&label, 40),
+                            neighbors.len(),
+                            was_empty_graph
+                        ),
                     );
                 }
             }
@@ -5395,6 +5434,13 @@ async fn apply_phase3_bracket_commands(
                         Some(id) => {
                             if pre.travel_graph.find_node(&id).is_none() {
                                 undo_snapshot.get_or_insert(pre);
+                                crate::logs::log(
+                                    "BRK",
+                                    &format!(
+                                        "[TRAVEL] MINTED node id={id} from dest={}",
+                                        crate::logs::brief_with(&dest_raw, 40)
+                                    ),
+                                );
                             }
                             Some(id)
                         }
@@ -5409,6 +5455,14 @@ async fn apply_phase3_bracket_commands(
                     let known: Vec<&str> =
                         s.travel_graph.nodes.iter().map(|n| n.id.as_str()).collect();
                     tracing::warn!(dest = %dest_raw, known = ?known, "[TRAVEL] rejected — unresolvable + unmintable destination");
+                    crate::logs::log(
+                        "BRK",
+                        &format!(
+                            "[TRAVEL] REJECTED unmintable dest={} known_nodes={}",
+                            crate::logs::brief_with(&dest_raw, 40),
+                            known.len()
+                        ),
+                    );
                     reject_directives.push(format!(
                         "Travel to \"{dest_raw}\" is not possible — that location is not in the world. \
                          Known locations: {}. Stay where you are or travel to a known location.",
@@ -5452,6 +5506,10 @@ async fn apply_phase3_bracket_commands(
                         to = %dest,
                         "[TRAVEL] auto-linked edge + advanced (known non-adjacent)"
                     );
+                    crate::logs::log(
+                        "BRK",
+                        &format!("[TRAVEL] AUTO-LINK {from_id} <-> {dest} + moved"),
+                    );
                 }
                 Some(dest) => {
                     // Legal adjacent move (or the bootstrap first-move-from-None
@@ -5467,6 +5525,10 @@ async fn apply_phase3_bracket_commands(
                         from = ?prev,
                         to = %dest,
                         "[TRAVEL] current_node advanced"
+                    );
+                    crate::logs::log(
+                        "BRK",
+                        &format!("[TRAVEL] moved {:?} -> {dest}", prev),
                     );
                 }
             }
@@ -5502,6 +5564,13 @@ async fn apply_phase3_bracket_commands(
                     .any(|r| r.label == *label && r.origin_node == cur_id);
                 if dupe {
                     tracing::debug!(label = %label, "[RUMOR] duplicate suppressed");
+                    crate::logs::log(
+                        "BRK",
+                        &format!(
+                            "[RUMOR] duplicate suppressed at {cur_id}: {}",
+                            crate::logs::brief_with(label, 40)
+                        ),
+                    );
                     continue;
                 }
                 if undo_snapshot.is_none() {
@@ -5516,6 +5585,10 @@ async fn apply_phase3_bracket_commands(
                 let overflow = s.rumors.len().saturating_sub(crate::schema::MAX_STORED_RUMORS);
                 if overflow > 0 {
                     s.rumors.drain(..overflow);
+                    crate::logs::log(
+                        "BRK",
+                        &format!("[RUMOR] cap overflow — drained {overflow} oldest"),
+                    );
                 }
                 mutated = true;
                 tracing::info!(
@@ -5523,11 +5596,25 @@ async fn apply_phase3_bracket_commands(
                     origin = %cur_id,
                     "[RUMOR] rumor seeded at current node"
                 );
+                crate::logs::log(
+                    "BRK",
+                    &format!(
+                        "[RUMOR] seeded at {cur_id}: {}",
+                        crate::logs::brief_with(label, 40)
+                    ),
+                );
             } else {
                 // No current node → can't root the rumor. Warn-and-skip.
                 tracing::warn!(
                     label = %label,
                     "[RUMOR] dropped — no current node to root at"
+                );
+                crate::logs::log(
+                    "BRK",
+                    &format!(
+                        "[RUMOR] DROPPED (no current node): {}",
+                        crate::logs::brief_with(label, 40)
+                    ),
                 );
             }
         }
@@ -5712,6 +5799,10 @@ async fn apply_phase3_bracket_commands(
                             "[PRESENCE] dropped — grace expired (not re-asserted for {} turns",
                             schema::PRESENCE_GRACE_RESET
                         );
+                        crate::logs::log(
+                            "BRK",
+                            &format!("[PRESENCE] {} dropped — grace expired", p.npc_id),
+                        );
                     }
                 }
                 asserted.remove(&p.npc_id);
@@ -5826,6 +5917,14 @@ async fn apply_phase3_bracket_commands(
                         item_name.as_deref().unwrap_or(""),
                         r
                     );
+                    crate::logs::log(
+                        "INV",
+                        &format!(
+                            "[EQUIP] fragment resolved \"{}\" -> \"{}\"",
+                            crate::logs::brief_with(item_name.as_deref().unwrap_or(""), 30),
+                            crate::logs::brief_with(r, 40)
+                        ),
+                    );
                 }
                 let item_name: Option<&str> = match (&equip_resolved, item_name) {
                     (Some(r), _) => Some(r.as_str()),
@@ -5859,6 +5958,15 @@ async fn apply_phase3_bracket_commands(
                         .unwrap_or(false),
                 };
                 if is_noop {
+                    crate::logs::log(
+                        "INV",
+                        &format!(
+                            "[EQUIP] no-op skipped slot={:?} layer={:?} name={:?}",
+                            slot,
+                            layer,
+                            item_name
+                        ),
+                    );
                     continue;
                 }
                 if undo_snapshot.is_none() {
@@ -5899,6 +6007,16 @@ async fn apply_phase3_bracket_commands(
                                     layer = ?layer,
                                     name = %item.name,
                                     "[EQUIP] unequipped → pack"
+                                );
+                                crate::logs::log(
+                                    "INV",
+                                    &format!(
+                                        "[EQUIP] UNEQUIP {:?}/{:?} \"{}\" tags={:?} -> pack",
+                                        slot,
+                                        layer,
+                                        crate::logs::brief_with(&item.name, 40),
+                                        item.tags
+                                    ),
                                 );
                             }
                             if slot_now_empty {
@@ -5943,9 +6061,29 @@ async fn apply_phase3_bracket_commands(
                                 name = %d.name,
                                 "[EQUIP] displaced occupant → pack"
                             );
+                            crate::logs::log(
+                                "INV",
+                                &format!(
+                                    "[EQUIP] DISPLACED {:?}/{:?} \"{}\" -> pack",
+                                    slot,
+                                    layer,
+                                    crate::logs::brief_with(&d.name, 40)
+                                ),
+                            );
                         }
                         mutated = true;
                         tracing::info!(slot = ?slot, layer = ?layer, name = %name, "[EQUIP] equipped");
+                        crate::logs::log(
+                            "INV",
+                            &format!(
+                                "[EQUIP] EQUIPPED {:?}/{:?} \"{}\" stats={:?} tags={:?}",
+                                slot,
+                                layer,
+                                crate::logs::brief_with(name, 40),
+                                item_stats,
+                                item_tags
+                            ),
+                        );
                     }
                 }
             }
@@ -5980,6 +6118,14 @@ async fn apply_phase3_bracket_commands(
                         "[DEBUG] [INVENTORY] resolved fragment \"{}\" → \"{}\"",
                         item_name, r
                     );
+                    crate::logs::log(
+                        "INV",
+                        &format!(
+                            "[BELT] fragment resolved \"{}\" -> \"{}\"",
+                            crate::logs::brief_with(item_name, 30),
+                            crate::logs::brief_with(r, 40)
+                        ),
+                    );
                 }
                 let item_name: &str = belt_resolved.as_deref().unwrap_or(item_name);
                 let pre_list = s.player_state.belt.clone();
@@ -5990,6 +6136,14 @@ async fn apply_phase3_bracket_commands(
                         undo_snapshot.get_or_insert(pre_schema);
                         mutated = true;
                         tracing::info!(name = %item_name, "[BELT] removed");
+                        crate::logs::log(
+                            "INV",
+                            &format!(
+                                "[BELT] REMOVED \"{}\" (rack now {})",
+                                crate::logs::brief_with(item_name, 40),
+                                s.player_state.belt.len()
+                            ),
+                        );
                     }
                 } else {
                     equipment::stack_upsert(
@@ -6012,6 +6166,13 @@ async fn apply_phase3_bracket_commands(
                     while s.player_state.belt.len() > equipment::BELT_MAX {
                         let evicted = s.player_state.belt.remove(0);
                         tracing::info!(name = %evicted.name, "[BELT] rack full — spilling oldest to the pack");
+                        crate::logs::log(
+                            "INV",
+                            &format!(
+                                "[BELT] SPILL (rack full) \"{}\" -> pack",
+                                crate::logs::brief_with(&evicted.name, 40)
+                            ),
+                        );
                         let note = format!("stashed {} in the pack (belt full)", evicted.name);
                         let capped: String = if note.chars().count() > EVENT_NOTE_MAX {
                             note.chars().take(EVENT_NOTE_MAX).collect()
@@ -6027,6 +6188,17 @@ async fn apply_phase3_bracket_commands(
                         undo_snapshot.get_or_insert(pre_schema);
                         mutated = true;
                         tracing::info!(name = %item_name, qty, "[BELT] added");
+                        crate::logs::log(
+                            "INV",
+                            &format!(
+                                "[BELT] ADDED \"{}\" x{} stats={:?} tags={:?} (rack now {})",
+                                crate::logs::brief_with(item_name, 40),
+                                qty,
+                                item_stats,
+                                item_tags,
+                                s.player_state.belt.len()
+                            ),
+                        );
                     }
                 }
             }
@@ -6063,6 +6235,14 @@ async fn apply_phase3_bracket_commands(
                         "[DEBUG] [INVENTORY] resolved fragment \"{}\" → \"{}\"",
                         item_name, r
                     );
+                    crate::logs::log(
+                        "INV",
+                        &format!(
+                            "[PACK] fragment resolved \"{}\" -> \"{}\"",
+                            crate::logs::brief_with(item_name, 30),
+                            crate::logs::brief_with(r, 40)
+                        ),
+                    );
                 }
                 let item_name: &str = pack_resolved.as_deref().unwrap_or(item_name);
                 let pre_list = s.player_state.pack.clone();
@@ -6073,6 +6253,14 @@ async fn apply_phase3_bracket_commands(
                         undo_snapshot.get_or_insert(pre_schema);
                         mutated = true;
                         tracing::info!(name = %item_name, "[PACK] removed");
+                        crate::logs::log(
+                            "INV",
+                            &format!(
+                                "[PACK] REMOVED \"{}\" (pack now {} stack(s))",
+                                crate::logs::brief_with(item_name, 40),
+                                s.player_state.pack.len()
+                            ),
+                        );
                     }
                 } else {
                     equipment::stack_upsert(
@@ -6089,6 +6277,17 @@ async fn apply_phase3_bracket_commands(
                         undo_snapshot.get_or_insert(pre_schema);
                         mutated = true;
                         tracing::info!(name = %item_name, qty, weight, "[PACK] added");
+                        crate::logs::log(
+                            "INV",
+                            &format!(
+                                "[PACK] ADDED \"{}\" x{} stats={:?} tags={:?} (pack now {} stack(s))",
+                                crate::logs::brief_with(item_name, 40),
+                                qty,
+                                item_stats,
+                                item_tags,
+                                s.player_state.pack.len()
+                            ),
+                        );
                     }
                 }
             }
@@ -9636,6 +9835,71 @@ async fn restore_tick_directives(state: &AppState, snapshot: &[String]) {
 /// (left-drawer Consume/Equip) was consumed at turn start; every abort path
 /// re-arms it so the retry turn still honors the tactile UI action instead
 /// of silently eating it.
+/// One-line per-turn digest of the world state the narrator prompt carries —
+/// the "what the AI actually sees" verification line: location + its diegetic
+/// name, exit count, on-camera NPCs, equipped OUTER layer (the only layer the
+/// narrator ever sees), belt rack, pack stack count, clock, weather, rumors.
+/// Share-safe: ids + brief-capped names only (diaglog.rs contract).
+fn log_world_digest(s: &schema::WorldSchema) {
+    if !crate::logs::is_on() {
+        return;
+    }
+    let loc = s
+        .travel_graph
+        .current_node
+        .clone()
+        .unwrap_or_else(|| "(none)".into());
+    let (loc_name, exits) = s
+        .travel_graph
+        .nodes
+        .iter()
+        .find(|n| n.id == loc)
+        .map(|n| (n.name.clone(), n.neighbors.len()))
+        .unwrap_or_default();
+    let present: Vec<&str> = s.presences.iter().map(|p| p.npc_id.as_str()).collect();
+    let equipped: Vec<String> = s
+        .player_state
+        .equipment
+        .iter()
+        .filter_map(|(slot, layers)| {
+            layers.outer.as_ref().map(|it| {
+                format!("{slot:?}:{}", crate::logs::brief_with(&it.name, 24))
+            })
+        })
+        .collect();
+    let belt: Vec<String> = s
+        .player_state
+        .belt
+        .iter()
+        .map(|it| format!("{}x{}", crate::logs::brief_with(&it.name, 24), it.qty))
+        .collect();
+    let (day, hh, mm) = if s.world_clock.is_set() {
+        let m = s.world_clock.current_minutes;
+        ((m / 60) / 24, (m / 60) % 24, m % 60)
+    } else {
+        (-1, 0, 0)
+    };
+    crate::logs::log(
+        "FABLE",
+        &format!(
+            "world digest: loc={} (\"{}\") exits={} present=[{}] equipped=[{}] belt=[{}] pack_stacks={} clock=D{}/{}:{:02} weather=\"{}\" rumors={} entities={}",
+            loc,
+            crate::logs::brief_with(&loc_name, 24),
+            exits,
+            present.join(","),
+            equipped.join(","),
+            belt.join(","),
+            s.player_state.pack.len(),
+            day,
+            hh,
+            mm,
+            crate::logs::brief_with(&s.weather.condition, 24),
+            s.rumors.len(),
+            s.entities.len()
+        ),
+    );
+}
+
 async fn emit_fable_api_lost(
     on_event: &tauri::ipc::Channel<serde_json::Value>,
     app: &tauri::AppHandle,
@@ -10797,7 +11061,7 @@ async fn fable_send(
                             crate::logs::brief_with(
                                 &serde_json::to_string(cmd)
                                     .unwrap_or_else(|_| "<unserializable>".into()),
-                                110
+                                200
                             )
                         ),
                     );
@@ -10856,7 +11120,7 @@ async fn fable_send(
                     for rd in &travel_rejects {
                         crate::logs::log(
                             "BRK",
-                            &format!("reject {}", crate::logs::brief_with(rd, 110)),
+                            &format!("reject {}", crate::logs::brief_with(rd, 140)),
                         );
                     }
                     let reject_count = travel_rejects.len();
@@ -10931,6 +11195,7 @@ async fn fable_send(
         // sees one coherent block of hard facts.
         let narrator_world_state: Option<String> = {
             let s = state.fable_schema.lock().await;
+            log_world_digest(&s);
             let rendered = render_fable_world_state(&s, &turn_directives);
             if rendered.trim().is_empty() { None } else { Some(rendered) }
         };
@@ -12934,6 +13199,20 @@ async fn fable_schema_set(
     let schema_snapshot = state.fable_schema.lock().await.clone();
     save_schema(&app, &roleplay_card_id, &schema_snapshot).await;
     tracing::info!(card_id = %roleplay_card_id, "fable_schema_set: manual edit applied + persisted");
+    crate::logs::log(
+        "INV",
+        &format!(
+            "soul-gem UI edit applied (note={}) loc={:?} belt={} pack_stacks={} equipped_slots={}",
+            crate::logs::brief_with(
+                event_note.as_deref().unwrap_or(""),
+                60
+            ),
+            schema_snapshot.travel_graph.current_node,
+            schema_snapshot.player_state.belt.len(),
+            schema_snapshot.player_state.pack.len(),
+            schema_snapshot.player_state.equipment.len()
+        ),
+    );
     Ok(())
 }
 
