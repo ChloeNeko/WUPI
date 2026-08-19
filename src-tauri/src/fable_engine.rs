@@ -1127,7 +1127,7 @@ impl FableRuntime {
                     gen_count,
                     max_tokens,
                     elapsed_ms,
-                    if elapsed_ms > 0 { (gen_count as u128 * 1000 / elapsed_ms) } else { 0 },
+                    if elapsed_ms > 0 { gen_count as u128 * 1000 / elapsed_ms } else { 0 },
                     out.len(),
                     gen_count >= max_tokens
                 ),

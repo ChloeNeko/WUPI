@@ -3178,15 +3178,45 @@ fn strip_invalid_relationship_writes(
                 // (validate_llm_tier_write already checked it's Acquaintance).
                 let new_tier = relationship::parse_tier(attempted_str)
                     .unwrap_or(relationship::RelationshipTier::Acquaintance);
+                // (2026-08-18) Same growth cap as the [MILESTONE] applier: a
+                // KNOWN npc still advances; an UNKNOWN one at cap is stripped
+                // instead of minting entry #N+1 (this path fed
+                // enforce_typed_caps truncation otherwise). `accepted_upserts`
+                // counts into the budget — several unknown rel.* keys in ONE
+                // delta can't TOCTOU past the cap (re-assertions of KNOWN
+                // ids inflate the estimate at worst, a conservative refusal).
+                if !schema.relationships.contains_key(npc_id)
+                    && schema.relationships.len() + accepted_upserts.len()
+                        >= crate::schema::MAX_TRACKED_RELATIONSHIPS
+                {
+                    ents.remove(key);
+                    stripped.push(format!("{key} (relationships map at cap — new NPC not tracked)"));
+                    crate::logs::log(
+                        "SCHEMA",
+                        &format!(
+                            "[rel] {} NOT tracked — relationships at cap {}",
+                            crate::logs::brief_with(npc_id, 40),
+                            crate::schema::MAX_TRACKED_RELATIONSHIPS
+                        ),
+                    );
+                    continue;
+                }
                 accepted_upserts.push((npc_id.to_string(), new_tier));
-                // Remove from the delta — the canonical state is the source
-                // of truth, not the entity map. apply_delta must not also
+                // Remove from the delta — the canonical state is the source of
+                // truth, not the entity map. apply_delta must not also
                 // write rel.* into entities.
                 ents.remove(key);
                 tracing::info!(
                     npc_id = %npc_id,
                     new_tier = ?new_tier,
                     "[rel] LLM Stranger→Acquaintance auto-advance accepted"
+                );
+                crate::logs::log(
+                    "SCHEMA",
+                    &format!(
+                        "[rel] LLM Stranger→Acquaintance accepted {}",
+                        crate::logs::brief_with(npc_id, 40)
+                    ),
                 );
             }
             relationship::RelationshipValidation::Reject { actual_tier } => {
@@ -4944,6 +4974,28 @@ async fn apply_phase3_bracket_commands(
         .iter()
         .filter(|c| matches!(c, bracket_parser::BracketCommand::Pack { .. }))
         .collect();
+    // (2026-08-18 Dedicated-NPC interior state) The three NPC-interior
+    // verbs: [NPC_ITEM] (held items — the steal/receive/spend mutation),
+    // [MOOD] (emotional read), [INTENT] (distilled plan/suspicion). All
+    // three mutate `WorldSchema::npc_interior` under the schema lock
+    // (atomic with world-state, same discipline as the player inventory
+    // verbs). NPC ids resolve through `resolve_npc_surface` — unknown ids
+    // reject (anti-hallucination, the PRESENCE gate).
+    let npc_item_cmds: Vec<&bracket_parser::BracketCommand> = parsed
+        .commands
+        .iter()
+        .filter(|c| matches!(c, bracket_parser::BracketCommand::NpcItem { .. }))
+        .collect();
+    let mood_cmds: Vec<&bracket_parser::BracketCommand> = parsed
+        .commands
+        .iter()
+        .filter(|c| matches!(c, bracket_parser::BracketCommand::Mood { .. }))
+        .collect();
+    let intent_cmds: Vec<&bracket_parser::BracketCommand> = parsed
+        .commands
+        .iter()
+        .filter(|c| matches!(c, bracket_parser::BracketCommand::Intent { .. }))
+        .collect();
 
     if effects.is_empty()
         && milestones.is_empty()
@@ -4964,6 +5016,12 @@ async fn apply_phase3_bracket_commands(
         && equip_cmds.is_empty()
         && belt_cmds.is_empty()
         && pack_cmds.is_empty()
+        // (2026-08-18 Dedicated-NPC interior state) Same audit-fix-#6
+        // discipline: an interior-only turn (e.g. [MOOD] alone during a
+        // quiet scene) must reach the appliers below.
+        && npc_item_cmds.is_empty()
+        && mood_cmds.is_empty()
+        && intent_cmds.is_empty()
     {
         // Phase 5A: even with no bracket commands this turn, presence grace-
         // decay must run if there are existing presences (a turn with zero
@@ -5077,6 +5135,14 @@ async fn apply_phase3_bracket_commands(
                         cap = crate::schema::MAX_TRACKED_RELATIONSHIPS,
                         "[MILESTONE] relationships map at cap — not tracking a new NPC"
                     );
+                    crate::logs::log(
+                        "BRK",
+                        &format!(
+                            "[MILESTONE] {} NOT tracked — relationships at cap {} (mid-band truncation guard)",
+                            crate::logs::brief_with(npc_id, 40),
+                            crate::schema::MAX_TRACKED_RELATIONSHIPS
+                        ),
+                    );
                     continue;
                 }
                 // (2026-08-15 audit fix) Snapshot ONLY on a real change: a
@@ -5093,6 +5159,13 @@ async fn apply_phase3_bracket_commands(
                         npc_id = %npc_id,
                         event_id = %event_id,
                         "[MILESTONE] relationship event recorded"
+                    );
+                    crate::logs::log(
+                        "BRK",
+                        &format!(
+                            "[MILESTONE] {} +{event_id}",
+                            crate::logs::brief_with(npc_id, 40)
+                        ),
                     );
                 } else {
                     tracing::info!(
@@ -5338,7 +5411,7 @@ async fn apply_phase3_bracket_commands(
                 };
                 let node = schema::Node {
                     id: id.clone(),
-                    name: label,
+                    name: label.clone(),
                     neighbors: neighbors
                         .iter()
                         .map(|n| sanitize_slug(n))
@@ -5653,13 +5726,48 @@ async fn apply_phase3_bracket_commands(
                 role: role.trim().to_string(),
                 tier: tier.clone().filter(|t| !t.trim().is_empty()),
                 aliases: vec![id.clone()], // the id is its own alias so [PRESENCE id] resolves
+                // (2026-08-18) Discovered = Named prominence: full interior,
+                // reaper-archivable after the no-contact TTL, evictable from
+                // the registry once archived (§ the 3-tier ruling).
+                prominence: schema::NpcProminence::Named,
             };
-            if s.npc_registry.upsert_entry(entry) {
+            // (2026-08-18 registry-cap amendment — plan-approved) The dup
+            // forms (exact id, fragment-alias ghost guard) must stay no-ops;
+            // only the CAP refusal qualifies for relief. Check the dup
+            // conditions explicitly so the eviction below never fires for a
+            // re-registration.
+            let dup = {
+                let reg = &s.npc_registry;
+                reg.find(&id).is_some()
+                    || schema::resolve_npc_surface(&reg.entries, &id).is_some()
+            };
+            let mut inserted = !dup && s.npc_registry.upsert_entry(entry.clone());
+            if !dup && !inserted {
+                // Cap-refused: evict the least-recently-seen ARCHIVED
+                // discovered entry (authored core entries are pinned) and
+                // retry once — the fix for the 96-cap brick (discovery used
+                // to refuse permanently once 96 ids accumulated).
+                if let Some(evicted) = s.evict_archived_registry_entry() {
+                    crate::logs::log(
+                        "BRK",
+                        &format!(
+                            "[NPC_REGISTER] registry cap relief: evicted archived stale {evicted} (relationship kept — re-registration resumes the tier)",
+                        ),
+                    );
+                    inserted = s.npc_registry.upsert_entry(entry.clone());
+                }
+            }
+            if inserted {
                 if undo_snapshot.is_none() {
                     undo_snapshot = Some(s.clone());
                 }
                 mutated = true;
                 tracing::info!(npc_id = %id, "[NPC_REGISTER] npc_registry entry registered");
+            } else if !dup {
+                crate::logs::log(
+                    "BRK",
+                    &format!("[NPC_REGISTER] REJECTED registry full id={} len={}", id, s.npc_registry.entries.len()),
+                );
             }
         }
     }
@@ -5746,6 +5854,12 @@ async fn apply_phase3_bracket_commands(
             );
         }
 
+        // (2026-08-18 Dedicated-NPC interior state) The contacted set —
+        // every id the tracker freshly asserted this turn. Collected BEFORE
+        // the rebuild loop consumes `asserted`; used for the reaper stamp
+        // below.
+        let contacted: Vec<String> = asserted.keys().cloned().collect();
+
         // Rebuild the presences Vec: re-asserted (reset ttl) + carried-over
         // (decrement ttl, drop at 0) + newly-asserted (fresh ttl). This is the
         // grace-decay pass. Order: existing first (preserves stable ordering
@@ -5824,6 +5938,34 @@ async fn apply_phase3_bracket_commands(
             }
             s.presences = rebuilt;
             mutated = true;
+            // (2026-08-18 Dedicated-NPC interior state) Contact stamp: every
+            // freshly-asserted NPC gets last_seen refreshed + interactions
+            // bumped (lazy-minting the interior row) — this is the reaper
+            // key, so a shopkeeper the player keeps visiting never archives.
+            // Presence alone does NOT resurrect cleared fields (an archived
+            // stub renders as "recalls: …" until a dedicated verb writes
+            // live state again).
+            if s.world_clock.is_set() {
+                for npc_id in &contacted {
+                    let interior = s.npc_interior.entry(npc_id.clone()).or_default();
+                    interior.last_seen_minutes = now_minutes;
+                    interior.interactions = interior.interactions.saturating_add(1);
+                }
+                // BRK: the stamp is the reaper's key — one compact line so a
+                // diagnostics log shows the last_seen refresh cadence behind
+                // every later archive/hold decision.
+                if !contacted.is_empty() {
+                    const STAMPED_SHOWN: usize = 6;
+                    let mut list = contacted[..contacted.len().min(STAMPED_SHOWN)].join(", ");
+                    if contacted.len() > STAMPED_SHOWN {
+                        list.push_str(&format!(" (+{} more)", contacted.len() - STAMPED_SHOWN));
+                    }
+                    crate::logs::log(
+                        "BRK",
+                        &format!("[PRESENCE] contact stamp {list} (reaper key refreshed)"),
+                    );
+                }
+            }
         }
     }
 
@@ -5832,8 +5974,9 @@ async fn apply_phase3_bracket_commands(
         // empty value clears the key. Mutates ONLY the per-run live layer —
         // the SavedPlayer identity baseline is never touched (it's the reusable
         // cross-card anchor). Last-wins per key within a single turn (a narrator
-        // rarely emits two [APPEARANCE outfit=...] in one turn, but if it does
-        // the second wins — matches the natural "what's true now" reading).
+        // rarely emits two [APPEARANCE hair_color=...] in one turn, but if it
+        // does the second wins — matches the natural "what's true now" reading).
+        // Clothing is NOT here (2026-08-18): garments are [EQUIP] items.
         // One undo snapshot for the batch (coalesced — mirrors every other
         // applier's single-snapshot-per-turn discipline).
         for cmd in &appearance_cmds {
@@ -6292,6 +6435,214 @@ async fn apply_phase3_bracket_commands(
                 }
             }
         }
+        // (2026-08-18 Dedicated-NPC interior state) [NPC_ITEM] — an NPC's
+        // held-item mutation (steals, receives, spends): the theft loop's
+        // other half ([PACK -ring] + [NPC_ITEM mara +ring] genuinely moves
+        // the object between racks). Adds resolve fragments through the
+        // narrative window + that NPC's OWN rack (not the player inventory);
+        // removals match stored names only (you remove what's stored, not
+        // what's narrated — the rec-1 boundary). Items ride the interior row
+        // via the same stack helpers as the player pack, capped FIFO at
+        // NPC_INTERIOR_ITEMS_MAX. Unknown ids reject (the PRESENCE gate).
+        for cmd in &npc_item_cmds {
+            if let bracket_parser::BracketCommand::NpcItem {
+                npc_id,
+                item_name,
+                qty,
+                remove,
+                item_tags,
+            } = cmd
+            {
+                let Some(entry) = schema::resolve_npc_surface(&s.npc_registry.entries, npc_id)
+                else {
+                    reject_directives.push(format!(
+                        "NPC item change not recorded — \"{}\" is not a known NPC. Re-emit with a valid id or alias from the cast line.",
+                        crate::logs::brief_with(npc_id, 40)
+                    ));
+                    continue;
+                };
+                let id = entry.id.clone();
+                let npc_names: Vec<String> = s
+                    .npc_interior
+                    .get(&id)
+                    .map(|i| i.items.iter().map(|it| it.name.clone()).collect())
+                    .unwrap_or_default();
+                let item_corpus: &[&str] = if *remove { &[] } else { &narrative_corpus };
+                let resolved =
+                    equipment::resolve_item_fragment(item_name, item_corpus, &npc_names);
+                if let Some(r) = &resolved {
+                    crate::logs::log(
+                        "INV",
+                        &format!(
+                            "[NPC_ITEM] fragment resolved \"{}\" -> \"{}\"",
+                            crate::logs::brief_with(item_name, 30),
+                            crate::logs::brief_with(r, 40)
+                        ),
+                    );
+                }
+                let item_name: &str = resolved.as_deref().unwrap_or(item_name);
+                let pre_schema = s.clone();
+                let interior = s.npc_interior.entry(id.clone()).or_default();
+                let pre_items = interior.items.clone();
+                // Any accepted emission is live tracker attention: stamp the
+                // reaper key + leave archive state (fresh ground). Clearing
+                // an archived stub counts as a change even when the item op
+                // below no-ops (same un-archive gate as [MOOD]/[INTENT]).
+                let was_archived = interior.archived.is_some();
+                interior.archived = None;
+                if now_minutes > 0 {
+                    interior.last_seen_minutes = now_minutes;
+                    interior.interactions = interior.interactions.saturating_add(1);
+                }
+                let mut changed = was_archived;
+                if *remove {
+                    let existed = equipment::stack_remove(&mut interior.items, item_name, 0);
+                    if existed {
+                        changed = true;
+                        tracing::info!(npc_id = %id, name = %item_name, "[NPC_ITEM] removed");
+                        crate::logs::log(
+                            "INV",
+                            &format!(
+                                "[NPC_ITEM] {} REMOVED \"{}\" (rack now {} stack(s))",
+                                id,
+                                crate::logs::brief_with(item_name, 40),
+                                interior.items.len()
+                            ),
+                        );
+                    }
+                } else {
+                    equipment::stack_upsert(
+                        &mut interior.items,
+                        equipment::StackItem {
+                            name: item_name.to_string(),
+                            qty: *qty,
+                            weight: 1.0,
+                            stats: None,
+                            tags: item_tags.clone(),
+                        },
+                    );
+                    // Per-NPC FIFO cap (belt-style discipline — a hoarder's
+                    // oldest acquisition drops when the 17th lands).
+                    if interior.items.len() > schema::NPC_INTERIOR_ITEMS_MAX {
+                        let overflow =
+                            interior.items.len() - schema::NPC_INTERIOR_ITEMS_MAX;
+                        interior.items.drain(..overflow);
+                    }
+                    if interior.items != pre_items {
+                        changed = true;
+                        tracing::info!(npc_id = %id, name = %item_name, qty, "[NPC_ITEM] added");
+                        crate::logs::log(
+                            "INV",
+                            &format!(
+                                "[NPC_ITEM] {} ADDED \"{}\" x{} (rack now {} stack(s))",
+                                id,
+                                crate::logs::brief_with(item_name, 40),
+                                qty,
+                                interior.items.len()
+                            ),
+                        );
+                    }
+                }
+                if changed {
+                    undo_snapshot.get_or_insert(pre_schema);
+                    mutated = true;
+                    if was_archived {
+                        crate::logs::log(
+                            "INV",
+                            &format!("[NPC_ITEM] {id} un-archived (live state resumed)"),
+                        );
+                    }
+                }
+            }
+        }
+
+        // (2026-08-18 Dedicated-NPC interior state) [MOOD] — an on-camera
+        // NPC's emotional read. Last-wins per NPC (what's true now). Unknown
+        // ids reject like PRESENCE. Snapshot only on a real change.
+        for cmd in &mood_cmds {
+            if let bracket_parser::BracketCommand::Mood { npc_id, mood } = cmd {
+                let Some(entry) = schema::resolve_npc_surface(&s.npc_registry.entries, npc_id)
+                else {
+                    reject_directives.push(format!(
+                        "Mood not recorded — \"{}\" is not a known NPC. Re-emit with a valid id or alias from the cast line.",
+                        crate::logs::brief_with(npc_id, 40)
+                    ));
+                    continue;
+                };
+                let id = entry.id.clone();
+                let pre_schema = s.clone();
+                let interior = s.npc_interior.entry(id.clone()).or_default();
+                let changed = interior.mood.as_deref() != Some(mood.as_str());
+                let was_archived = interior.archived.is_some();
+                interior.mood = Some(mood.clone());
+                interior.archived = None;
+                if now_minutes > 0 {
+                    interior.last_seen_minutes = now_minutes;
+                    interior.interactions = interior.interactions.saturating_add(1);
+                }
+                // `was_archived` counts as a change even at an identical
+                // mood: clearing the stub IS a state mutation (and used to
+                // slip past the undo snapshot when the value matched).
+                if changed || was_archived {
+                    undo_snapshot.get_or_insert(pre_schema);
+                    mutated = true;
+                    tracing::info!(npc_id = %id, "[MOOD] interior mood set");
+                    crate::logs::log(
+                        "BRK",
+                        &format!(
+                            "[MOOD] {} -> {}{}",
+                            id,
+                            crate::logs::brief_with(mood, 40),
+                            if was_archived { " (un-archived)" } else { "" }
+                        ),
+                    );
+                }
+            }
+        }
+
+        // (2026-08-18 Dedicated-NPC interior state) [INTENT] — the distilled
+        // one-line plan/suspicion. Last-wins per NPC. This is the narrated
+        // lie's fuel: the narrator reads it in <world_state> and plays the
+        // scheme without the model ever re-reading its own reasoning.
+        for cmd in &intent_cmds {
+            if let bracket_parser::BracketCommand::Intent { npc_id, intent } = cmd {
+                let Some(entry) = schema::resolve_npc_surface(&s.npc_registry.entries, npc_id)
+                else {
+                    reject_directives.push(format!(
+                        "Intent not recorded — \"{}\" is not a known NPC. Re-emit with a valid id or alias from the cast line.",
+                        crate::logs::brief_with(npc_id, 40)
+                    ));
+                    continue;
+                };
+                let id = entry.id.clone();
+                let pre_schema = s.clone();
+                let interior = s.npc_interior.entry(id.clone()).or_default();
+                let changed = interior.intent.as_deref() != Some(intent.as_str());
+                let was_archived = interior.archived.is_some();
+                interior.intent = Some(intent.clone());
+                interior.archived = None;
+                if now_minutes > 0 {
+                    interior.last_seen_minutes = now_minutes;
+                    interior.interactions = interior.interactions.saturating_add(1);
+                }
+                // Same un-archive gate as [MOOD]: clearing the stub is a
+                // real mutation even when the distilled intent matches.
+                if changed || was_archived {
+                    undo_snapshot.get_or_insert(pre_schema);
+                    mutated = true;
+                    tracing::info!(npc_id = %id, "[INTENT] interior intent set");
+                    crate::logs::log(
+                        "BRK",
+                        &format!(
+                            "[INTENT] {} -> {}{}",
+                            id,
+                            crate::logs::brief_with(intent, 60),
+                            if was_archived { " (un-archived)" } else { "" }
+                        ),
+                    );
+                }
+            }
+        }
     } // end schema lock
 
     // Push one undo snapshot for the whole bracket-command batch (mirrors the
@@ -6631,6 +6982,29 @@ async fn apply_time_command_and_maybe_tick(
                 );
                 s.rumors = new_rumors;
             }
+        }
+        // (2026-08-18 Dedicated-NPC reaper — Chloe's Garbage-Collector
+        // ruling) Archive stale `named` NPCs' interior state (core entries +
+        // derived-protected NPCs — relationship extremes, pending tasks,
+        // held items — are skipped inside the fn). Snapshot BEFORE the
+        // mutation (the discipline the passes above follow); only cloned
+        // when no earlier tick pass already owns the snapshot. Deliberately
+        // emits NO directive (an archived shopkeeper is not narrator news —
+        // the stub renders as "recalls:" if the player ever meets them
+        // again).
+        let pre_reap_snapshot = if tick_snapshot.is_none() {
+            Some(s.clone())
+        } else {
+            None
+        };
+        let reaped_count = s.reap_stale_npc_interiors(now_minutes);
+        if reaped_count > 0 {
+            if let Some(pre) = pre_reap_snapshot {
+                tick_snapshot = Some(pre);
+            }
+            tick_mutated = true;
+            // Per-id archive + held-back lines are emitted inside the fn
+            // (BRK) — no duplicate count summary here.
         }
     }
 
@@ -8247,6 +8621,12 @@ async fn enter_fable_session(
             .map_err(|e| format!("card session file is corrupt (session.json): {e} — refusing to resume with an empty conversation; restore from a save slot or fix the file"))?;
         (s, c, None)
     };
+    // (2026-08-18 clothing-as-inventory ruling) The explicit-save branch
+    // installs a save slot's schema directly (bypassing load_split), so run
+    // the one-shot legacy `outfit` delta → typed inventory migration on
+    // whatever resolved. Idempotent — the resume branch already migrated
+    // through load_split.
+    prior_schema.migrate_legacy_outfit();
     // (2026-08-16, Chloe ruling + audit #2) Seed the card's `<intro>` as
     // session message 0 (an assistant beat) whenever we're entering a card
     // with an EMPTY conversation (fresh New Game, or a first entry with no
@@ -8413,8 +8793,6 @@ async fn enter_fable_session(
             // mutate this map (never the SavedPlayer). Keys mirror the
             // `[APPEARANCE key=value]` allowlist (bracket_parser::APPEARANCE_KEYS)
             // so a mid-session bracket + the seed speak the same vocabulary.
-            // The clothing chip list joins into a single `outfit` value (one
-            // narratable line, not N fragmented keys).
             {
                 let deltas = &mut prior_schema.player_state.current_appearance_deltas;
                 let mut push = |k: &'static str, v: Option<&String>| {
@@ -8432,16 +8810,35 @@ async fn enter_fable_session(
                 push("ears", sp.ears.as_ref());
                 push("tail", sp.tail.as_ref());
                 push("horn", sp.horn.as_ref());
+            }
+            // (2026-08-18 clothing-as-inventory ruling) Clothing is INVENTORY,
+            // not an appearance line: the authored chip list seeds typed items
+            // (garments route to their body slots — cloak/dress/robe → chest,
+            // trousers → legs, boots → feet; unroutable accessories land in
+            // the pack) so every change of clothes in play flows through
+            // [EQUIP]: the displaced garment returns to the pack, the Soul
+            // Gem panel shows it, and the `equipped:` world-state line is the
+            // narrator's clothing read. FRESH runs only — a resumed
+            // campaign's inventory is authoritative (re-seeding would
+            // resurrect garments the player already changed out of; the
+            // legacy `outfit` delta on old saves migrates at load_split).
+            if fresh {
                 if let Some(items) = sp.clothing.as_ref().filter(|v| !v.is_empty()) {
-                    let joined = items
+                    let chips: Vec<String> = items
                         .iter()
-                        .map(|s| s.trim())
+                        .map(|s| s.trim().to_string())
                         .filter(|s| !s.is_empty())
-                        .collect::<Vec<_>>()
-                        .join(", ");
-                    if !joined.is_empty() {
-                        deltas.insert("outfit".to_string(), joined);
-                    }
+                        .collect();
+                    let seeded = equipment::seed_clothing_items(
+                        &chips,
+                        &mut prior_schema.player_state.equipment,
+                        &mut prior_schema.player_state.pack,
+                    );
+                    tracing::info!(seeded, "clothing chips seeded into typed inventory");
+                    crate::logs::log(
+                        "INV",
+                        &format!("clothing seed: {} garment(s) -> typed inventory", seeded),
+                    );
                 }
             }
             // Transient starting gameplay conditions (2026-08-13): the Player
@@ -8524,6 +8921,11 @@ async fn enter_fable_session(
                     role: cn.role.clone(),
                     tier: cn.tier.clone(),
                     aliases: cn.aliases.clone(),
+                    // (2026-08-18) Authored cast = Core prominence: full
+                    // interior, reaper-immune, registry-pinned (§ the 3-tier
+                    // ruling — the card author put them in the world
+                    // deliberately).
+                    prominence: schema::NpcProminence::Core,
                 })
                 .collect(),
         };
@@ -9113,10 +9515,16 @@ fn build_narrator_system_prompt(
     out.push_str("- [EFFECT <label> buff|debuff <minutes>] — minutes (0 = permanent). Disguises add a trailing kind token: [EFFECT <label> buff <minutes> kind=disguise].\n");
     out.push_str("- [MILESTONE <npc_id> <event_id>] — a relationship meaningfully shifts.\n");
     out.push_str("- [TASK <npc_id> <description> | <difficulty> <suitability> <eta-minutes>] — all five fields; the pipe separates description from the three trailing fields.\n");
-    out.push_str("- [APPEARANCE key=value] — keys: hair_color, outfit, eye_color, scars, wounds, tattoos, disguise, body_type, skin_complexion, hair_length, hair_style, breast_size, ears, tail, horn. Bare [APPEARANCE key] clears.\n");
+    out.push_str("- [APPEARANCE key=value] — keys: hair_color, eye_color, scars, wounds, tattoos, disguise, body_type, skin_complexion, hair_length, hair_style, breast_size, ears, tail, horn. Bare [APPEARANCE key] clears.\n");
     out.push_str("- [EQUIP slot=<slot> name=<item> (layer=outer|inner) (stats=<note>) (tags=<tags>)] — slots: head, chest, main_hand, off_hand, legs, feet. main_hand/off_hand are READIED weapons only — belt-hung blades go in [BELT]. Bare [EQUIP slot=<slot>] unequips. Quote multi-word names.\n");
     out.push_str("- [BELT name=<item> (qty=N) (tags=<tags>)] / [BELT -<name>] — quick-access items (a belt knife, a potion, a pouch).\n");
     out.push_str("- [PACK name=<item> (qty=N) (tags=<tags>)] / [PACK -<name>] — deep storage add/remove; check the pack line first.\n");
+    // (2026-08-18 Dedicated-NPC interior state) The NPC-interior verbs —
+    // what an on-camera NPC holds, feels, and is about. Emit only for
+    // REGISTERED NPCs (the cast line); the applier rejects unknown ids.
+    out.push_str("- [NPC_ITEM <npc_id> +<item> (qty=N)] / [NPC_ITEM <npc_id> -<item>] — an NPC gains/loses a held item (steals, receives, spends). Quote multi-word names.\n");
+    out.push_str("- [MOOD <npc_id> <short mood>] — an on-camera NPC's emotional state shifted.\n");
+    out.push_str("- [INTENT <npc_id> <one-line plan or suspicion>] — what that NPC now intends or believes about the player.\n");
     out.push_str("Tags (EQUIP/BELT/PACK): consumable, equippable, pocketable — see <item_rules> above.\n");
     // NOTE (#26c, 2026-08-15): `CharacterTurn` / `Object` / `Fx` are
     // LEGACY-RECOGNIZED only — the parser + streaming filter still accept +
@@ -9505,6 +9913,10 @@ fn render_fable_world_state(
 #[derive(Clone, Copy)]
 struct LeanCaps {
     present: usize,
+    /// (2026-08-18 Dedicated-NPC interior state) The `minds:` line cap —
+    /// per-NPC interior for present NPCs only, so a crowded tavern of
+    /// schemers clips before it eats the events/summary budget.
+    minds: usize,
     rumors: usize,
     summary: usize,
     events_shown: usize,
@@ -9516,45 +9928,52 @@ struct LeanCaps {
     cast: Option<usize>,
 }
 
-fn render_tracker_world_state(s: &schema::WorldSchema) -> String {
-    // Stage 0 — normal play. Sized for a busy-but-real scene.
-    const STAGE0: LeanCaps = LeanCaps {
-        present: 640,
-        rumors: 240,
-        summary: 270,
-        events_shown: 3,
-        event_chars: 170,
-        pack: 240,
-        custom: 260,
-        cast: None,
-    };
-    // Stage 1 — long-campaign bloat: narrative context shrinks first.
-    const STAGE1: LeanCaps = LeanCaps {
-        present: 640,
-        rumors: 160,
-        summary: 150,
-        events_shown: 2,
-        event_chars: 170,
-        pack: 200,
-        custom: 260,
-        cast: None,
-    };
-    // Stage 2 — pathological composition: everything clipped, cast included.
-    const STAGE2: LeanCaps = LeanCaps {
-        present: 480,
-        rumors: 120,
-        summary: 100,
-        events_shown: 1,
-        event_chars: 170,
-        pack: 160,
-        custom: 160,
-        cast: Some(520),
-    };
-    // The world-state's share of TRACKER_PROMPT_CHAR_BUDGET: fixed overhead
-    // (AGENT prose ~3380 + bracket list ~2260 + wrappers ~180) + a realistic
-    // worst window (~700) leaves ~3.2k. Derived + measured 2026-08-16.
-    const WS_BUDGET: usize = 3_200;
+// Stage consts at module scope (not inside `render_tracker_world_state`)
+// so the test module can drive `lean_world_state_surgery` with a specific
+// stage's caps directly — the ranked-minds pin needs STAGE2's trailing
+// `, `-boundary cut in isolation.
+// Stage 0 — normal play. Sized for a busy-but-real scene.
+const STAGE0: LeanCaps = LeanCaps {
+    present: 640,
+    minds: 400,
+    rumors: 240,
+    summary: 270,
+    events_shown: 3,
+    event_chars: 170,
+    pack: 240,
+    custom: 260,
+    cast: None,
+};
+// Stage 1 — long-campaign bloat: narrative context shrinks first.
+const STAGE1: LeanCaps = LeanCaps {
+    present: 640,
+    minds: 260,
+    rumors: 160,
+    summary: 150,
+    events_shown: 2,
+    event_chars: 170,
+    pack: 200,
+    custom: 260,
+    cast: None,
+};
+// Stage 2 — pathological composition: everything clipped, cast included.
+const STAGE2: LeanCaps = LeanCaps {
+    present: 480,
+    minds: 180,
+    rumors: 120,
+    summary: 100,
+    events_shown: 1,
+    event_chars: 170,
+    pack: 160,
+    custom: 160,
+    cast: Some(520),
+};
+// The world-state's share of TRACKER_PROMPT_CHAR_BUDGET: fixed overhead
+// (AGENT prose ~3380 + bracket list ~2260 + wrappers ~180) + a realistic
+// worst window (~700) leaves ~3.2k. Derived + measured 2026-08-16.
+const WS_BUDGET: usize = 3_200;
 
+fn render_tracker_world_state(s: &schema::WorldSchema) -> String {
     let rich = render_fable_world_state(s, &[]);
     let mut lean = lean_world_state_surgery(&rich, &STAGE0);
     if lean.chars().count() > WS_BUDGET {
@@ -9613,6 +10032,8 @@ fn lean_world_state_surgery(rich: &str, caps: &LeanCaps) -> String {
         }
         let capped = if let Some(v) = line.strip_prefix("present: ") {
             Some(format!("present: {}", lean_truncate_line(v, caps.present)))
+        } else if let Some(v) = line.strip_prefix("minds: ") {
+            Some(format!("minds: {}", lean_truncate_line(v, caps.minds)))
         } else if let Some(v) = line.strip_prefix("rumors: ") {
             Some(format!("rumors: {}", lean_truncate_line(v, caps.rumors)))
         } else if let Some(v) = line.strip_prefix("summary: ") {
@@ -10407,6 +10828,16 @@ async fn fable_send(
                 count = pending_rel_transitions.len(),
                 transitions = ?rel_transitions_logged,
                 "[rel] relationship transitions applied on render"
+            );
+            // Diagnostics (REF): the relation-to-player ladder moving is a
+            // referee outcome — ids + tiers + reasons are mechanical tokens,
+            // share-safe by construction.
+            crate::logs::log(
+                "REF",
+                &format!(
+                    "[rel] transition(s): {}",
+                    rel_transitions_logged.join(", ")
+                ),
             );
         }
 
@@ -13170,7 +13601,7 @@ async fn fable_schema_set(
     // If a UI-action trace was supplied, append it to recent_events so the next
     // narrator turn sees the physical action in <world_state>. Trim + cap; drop
     // empty. This runs BEFORE install so the persisted schema carries the trace.
-    if let Some(note) = event_note {
+    if let Some(note) = event_note.as_ref() {
         let trimmed = note.trim();
         if !trimmed.is_empty() {
             let capped = if trimmed.chars().count() > EVENT_NOTE_MAX {
@@ -13457,7 +13888,7 @@ async fn fable_json_raw_set(
                 } else if !matches!(
                     k.as_str(),
                     "player_state" | "npc_registry" | "relationships" | "presences"
-                        | "offscreen_tasks"
+                        | "offscreen_tasks" | "npc_interior"
                 ) {
                     // A world-slice key: overwrite the live value.
                     full_obj.insert(k.clone(), v.clone());
@@ -13478,7 +13909,13 @@ async fn fable_json_raw_set(
             let edited = parsed
                 .as_object()
                 .ok_or_else(|| "npc JSON must be an object".to_string())?;
-            for key in ["npc_registry", "relationships", "presences", "offscreen_tasks"] {
+            for key in [
+                "npc_registry",
+                "relationships",
+                "presences",
+                "offscreen_tasks",
+                "npc_interior",
+            ] {
                 if let Some(v) = edited.get(key) {
                     full_obj.insert(key.to_string(), v.clone());
                 }
@@ -14653,7 +15090,13 @@ async fn fable_load_save(
         })
         .collect();
     *state.fable_session.lock().await = loaded_session;
-    *state.fable_schema.lock().await = save.schema;
+    // (2026-08-18 clothing-as-inventory ruling) A save slot installs its
+    // schema directly (bypassing load_split), so run the one-shot legacy
+    // `outfit` delta → typed inventory migration here too — an old save's
+    // clothing line becomes items the moment it's loaded.
+    let mut loaded_schema = save.schema;
+    loaded_schema.migrate_legacy_outfit();
+    *state.fable_schema.lock().await = loaded_schema;
     clear_fable_history(&state).await;
     // (2026-08-15 audit fix) Drain the game-scoped directive/failed queues:
     // they are one-shot facts of the PREVIOUS timeline (a rewind to an older
@@ -17019,6 +17462,20 @@ mod tests {
         // The id anchors survive verbatim — the bracket whitelist.
         assert!(lean.contains("cast:"));
         assert!(lean.contains("location:"));
+        // (2026-08-18) The minds: line renders for present NPCs only and
+        // caps under the staged budgets (12 present NPCs with maxed
+        // interiors → 6 shown + marker in the rich render, then char-capped
+        // in lean — the marker itself may fall to the truncation, the cap
+        // is what matters here).
+        assert!(rich.contains("minds:"), "the rich render carries the interior line");
+        assert!(rich.contains("(+6 more)"), "interior overflow renders the marker in the rich render");
+        let minds_len = lean
+            .lines()
+            .find(|l| l.starts_with("minds: "))
+            .map(|l| l.chars().count())
+            .unwrap_or(0);
+        assert!(minds_len > 0 && minds_len <= 400 + 40,
+            "minds line capped in the lean render, got {minds_len}");
         // Newest events kept, oldest dropped (5 authored, 3 shown).
         assert!(lean.contains("event-newest"), "newest event survives");
         assert!(!lean.contains("event-oldest"), "oldest event is dropped");
@@ -17029,6 +17486,82 @@ mod tests {
             .map(|l| l.chars().count())
             .unwrap_or(0);
         assert!(summary_len < 400, "summary capped in the lean render, got {summary_len}");
+    }
+
+    /// (2026-08-18 audit) STAGE2's 180-char `minds:` cut drops TRAILING
+    /// entries at `, ` boundaries — with the importance-ranked render the
+    /// casualties are ambient NPCs: the core principal leads the line and
+    /// survives (at worst the tail of their entry clips; the character
+    /// never drops out), while ambient entries fall off entirely.
+    #[test]
+    fn lean_minds_truncation_keeps_core_entries() {
+        use crate::schema::{
+            NpcEntry, NpcInterior, NpcProminence, NpcRegistry, Presence, PRESENCE_GRACE_RESET,
+        };
+
+        let mut s = schema::WorldSchema::default();
+        let mut entries: Vec<NpcEntry> = (0..7)
+            .map(|i| NpcEntry {
+                id: format!("amb{i}"),
+                name: format!("Amb{i}"),
+                role: String::new(),
+                tier: None,
+                aliases: vec![],
+                prominence: NpcProminence::Named,
+            })
+            .collect();
+        entries.push(NpcEntry {
+            id: "corekeep".into(),
+            name: "Corekeep".into(),
+            role: String::new(),
+            tier: None,
+            aliases: vec![],
+            prominence: NpcProminence::Core,
+        });
+        s.npc_registry = NpcRegistry { entries };
+        let mut presences: Vec<Presence> = (0..7)
+            .map(|i| Presence {
+                npc_id: format!("amb{i}"),
+                name: format!("Amb{i}"),
+                stance: String::new(),
+                ttl: PRESENCE_GRACE_RESET,
+            })
+            .collect();
+        presences.push(Presence {
+            npc_id: "corekeep".into(),
+            name: "Corekeep".into(),
+            stance: String::new(),
+            ttl: PRESENCE_GRACE_RESET,
+        });
+        s.presences = presences;
+        // Maxed intents: every entry renders near the 200-char entry cap,
+        // so STAGE2's 180-char line budget can hold only the leading entry.
+        for id in [
+            "amb0", "amb1", "amb2", "amb3", "amb4", "amb5", "amb6", "corekeep",
+        ] {
+            s.npc_interior.insert(
+                id.into(),
+                NpcInterior {
+                    intent: Some("i".repeat(160)),
+                    ..NpcInterior::default()
+                },
+            );
+        }
+        let rich = render_fable_world_state(&s, &[]);
+        let stage2 = lean_world_state_surgery(&rich, &STAGE2);
+        let minds = stage2
+            .lines()
+            .find(|l| l.starts_with("minds: "))
+            .expect("minds line survives stage 2");
+        assert!(
+            minds.contains("Corekeep"),
+            "the core principal leads and survives: {minds}"
+        );
+        assert!(!minds.contains("Amb0"), "ambient entries take the cut: {minds}");
+        assert!(
+            minds.chars().count() <= 180 + 40,
+            "stage-2 minds cap holds: {minds}"
+        );
     }
 
     /// Helper for the budget tests: a world schema with every rendered
@@ -17055,7 +17588,7 @@ mod tests {
         use crate::player_state::{BodyPart, BodyPartState, PlayerState, Stamina};
         use crate::rumor::Rumor;
         use crate::schema::{
-            Node, NpcEntry, NpcRegistry, Presence, TravelGraph, Weather, WorldClock,
+            Node, NpcEntry, NpcProminence, NpcRegistry, Presence, TravelGraph, Weather, WorldClock,
         };
 
         let mut s = schema::WorldSchema::default();
@@ -17105,6 +17638,7 @@ mod tests {
                     role: "merchant of the western stalls".to_owned(),
                     tier: Some("elite".to_owned()),
                     aliases: vec![format!("char{i}")],
+                    prominence: NpcProminence::Core,
                 })
                 .collect(),
         };
@@ -17115,6 +17649,28 @@ mod tests {
                 name: format!("Character {i} Longname"),
                 stance: "s".repeat(120),
                 ttl: 4,
+            })
+            .collect();
+        // (2026-08-18 Dedicated-NPC interior state) 12 present NPCs with
+        // maxed interiors — mood at cap, intent at cap, full item racks —
+        // the honest worst case for the `minds:` render line (6 entries
+        // shown + marker at the prompt cap).
+        s.npc_interior = (0..12)
+            .map(|i| {
+                let id = format!("npc_{i}_with_a_long_slug");
+                let interior = schema::NpcInterior {
+                    mood: Some("m".repeat(60)),
+                    intent: Some("i".repeat(160)),
+                    items: (0..schema::NPC_INTERIOR_ITEMS_MAX)
+                        .map(|j| crate::equipment::StackItem {
+                            name: format!("Held Item {j} of the hoard"),
+                            ..crate::equipment::StackItem::default()
+                        })
+                        .collect(),
+                    last_seen_minutes: 14_000,
+                    ..schema::NpcInterior::default()
+                };
+                (id, interior)
             })
             .collect();
         // 6 rumors heard at the current node.
@@ -17162,7 +17718,7 @@ mod tests {
         }
         // Appearance deltas at the full key set.
         for (i, key) in [
-            "hair_color", "outfit", "eye_color", "scars", "wounds", "tattoos", "disguise",
+            "hair_color", "tail", "eye_color", "scars", "wounds", "tattoos", "disguise",
             "body_type", "skin_complexion", "hair_length", "hair_style", "breast_size", "ears",
         ]
         .iter()

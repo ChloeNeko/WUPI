@@ -35,9 +35,10 @@ use std::path::Path;
 // `player_state` field + render can reference them unqualified. Sibling
 // module (declared in lib.rs); the structs themselves are pure data.
 use crate::consequence::StatusTag;
+use crate::equipment; // (2026-08-18) NpcInterior.items: the shared typed item rack.
 use crate::offscreen_task::OffScreenTask;
 use crate::player_state::PlayerState;
-use crate::relationship::RelationshipState;
+use crate::relationship::{RelationshipState, RelationshipTier};
 use crate::rumor; // Component 4 (2026-07-28): WorldSchema.rumors field references rumor::Rumor.
 
 /// The in-world clock (Fable Seam #4, 2026-07-27). Pure data: two `i64`
@@ -722,6 +723,34 @@ pub fn proper_noun_phrase_for(fragment: &str, narrative: &[&str]) -> Option<Stri
     proper_noun_phrase(&words, narrative)
 }
 
+/// (2026-08-18 Dedicated-NPC interior state) The NPC prominence axis —
+/// Chloe's 3-tier ruling, expressed as two tracked states plus one untracked
+/// one. `Core` = authored `<cast>` NPCs (companions, villains, faction
+/// leaders): full interior, reaper-immune, registry-pinned forever. `Named` =
+/// `[NPC_REGISTER]` discoveries (shopkeepers, recurring quest givers): full
+/// interior, archived by the reaper after
+/// `settings::NPC_REAP_NAMED_AFTER_DAYS` in-world days without contact —
+/// UNLESS `npc_is_reaper_protected` derives importance from live world state
+/// at reap time (relationship extremes, pending tasks, held items — the
+/// left-behind-family guard). Ambient throwaways (guards, pedestrians,
+/// thugs) are the third tier BY ABSENCE — they never register, carry zero
+/// state, and the API narrator's prose interiority is their whole existence
+/// (the per-ambient local decode was rejected as the wall-clock death the
+/// 12B thought-channel already taught us).
+///
+/// Name discipline: NEVER call this concept "tier" — `npc.<id>.tier` is the
+/// COMBAT axis (`select_attacker_tier_from_entities`) and a collision would
+/// entangle two unrelated validators. The STORED axis is only the
+/// authored-vs-discovered distinction; everything else about "importance" is
+/// derived, never stamped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum NpcProminence {
+    Core,
+    #[default]
+    Named,
+}
+
 /// One named NPC in the Rust-authoritative registry (Fable Phase 5A,
 /// 2026-07-29). Seeded once from the scenario card's `<cast>` block by
 /// `enter_fable_session`; grows only via `[NPC_REGISTER]` thereafter.
@@ -740,6 +769,19 @@ pub struct NpcEntry {
     /// bracket's first token is validated against.
     #[serde(default)]
     pub id: String,
+
+    /// (2026-08-18 Dedicated-NPC interior state) Cognitive prominence — the
+    /// reaper axis, deliberately a separate WORD and separate HOME from the
+    /// combat `tier` above (`core`/`named` never collide with
+    /// minion/soldier/elite/boss/legendary in any parser or entity key).
+    /// `core` = authored `<cast>` (the card author put them in the world
+    /// deliberately — full interior, reaper-immune, registry-pinned). `named`
+    /// = `[NPC_REGISTER]` discoveries (full interior, archived by the reaper
+    /// after `settings::NPC_REAP_NAMED_AFTER_DAYS` of no contact, evictable
+    /// from the registry once archived). Ambient throwaways never enter the
+    /// registry at all — the narrator's prose is their whole existence.
+    #[serde(default)]
+    pub prominence: NpcProminence,
 
     /// Diegetic prose label shown to the narrator + the image-gen prompt
     /// composer ("Mara"). The prose label only; personality/appearance prose
@@ -1036,6 +1078,155 @@ pub struct Presence {
 /// prompt-side fix (the `<per_turn_presence>` maintainer discipline) is the
 /// real cure; this TTL is the defensive net beneath it.
 pub const PRESENCE_GRACE_RESET: u32 = 4;
+
+/// (2026-08-18 Dedicated-NPC interior state) Render + growth caps for the
+/// per-NPC interior. The `minds:` line is PRESENT-only and HARD-CAPPED like
+/// `present:` — a crowded tavern full of schemers must not blow the
+/// always-on prompt budget (Prime Mandate: state is unbounded, prompt
+/// lines never are). The cap-6 selection is importance-ranked (core →
+/// reaper-protected → ambient) — see the render block in
+/// `render_for_prompt`.
+pub const NPC_MINDS_PROMPT_CAP: usize = 6;
+/// Total char cap for one `minds:` entry (name + body) — the render-side
+/// backstop for hand-edited saves that bypass the parse-time caps.
+pub const NPC_MINDS_ENTRY_CHAR_CAP: usize = 200;
+/// Per-NPC held-item cap (FIFO drain — a hoarder NPC's oldest acquisition
+/// drops when the 17th lands; same belt-style discipline).
+pub const NPC_INTERIOR_ITEMS_MAX: usize = 16;
+/// Char cap for the reaper's compressed archive stub.
+pub const NPC_ARCHIVE_STUB_CHAR_CAP: usize = 160;
+
+/// (2026-08-18 Dedicated-NPC interior state) Per-NPC tracked interior: what
+/// an NPC HOLDS, FEELS, and is currently ABOUT — the machinery behind NPCs
+/// that steal from the player, lie to their face, and nurse grudges. Keyed
+/// by canonical registry id (same key space as `relationships`).
+///
+/// Rust is the SOLE authority — `apply_delta` does NOT touch this field and
+/// `merge_patch` has NO arm for it (same structural immunity as
+/// `player_state.equipment`, pinned by test). The only writers: the
+/// `[NPC_ITEM]` / `[MOOD]` / `[INTENT]` bracket appliers, the `[PRESENCE]`
+/// interaction stamp, and the world-tick reaper.
+///
+/// The intent field is DISTILLED state, never verbatim model thought (§3.4
+/// invariant: the model never re-reads its own reasoning) — the tracker
+/// deliberately emitted it as a one-line declarative, and the narrator reads
+/// it as world state to play the lie/scheme accordingly. Scene-scoped
+/// injection: `render_for_prompt` emits a `minds:` line for PRESENT NPCs
+/// only; off-screen scheming never leaks and never costs prompt tokens.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, Default)]
+pub struct NpcInterior {
+    /// Current emotional read ("suspicious", "warming") — a flattened,
+    /// parse-time-capped label from `[MOOD]`. `None` = unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mood: Option<String>,
+
+    /// Distilled one-line plan/suspicion from `[INTENT]` ("get her out
+    /// before she checks the display case"). `None` = unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub intent: Option<String>,
+
+    /// Items the NPC holds — stolen goods, received gifts, spent stock.
+    /// Typed + merge-on-add via the same `equipment::stack_*` helpers as the
+    /// player pack, capped FIFO at `NPC_INTERIOR_ITEMS_MAX`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub items: Vec<equipment::StackItem>,
+
+    /// Interaction counter — incremented on every `[PRESENCE]` assert and
+    /// interior mutation. Diagnostics/reaper signal.
+    #[serde(default)]
+    pub interactions: u32,
+
+    /// In-world epoch-minutes of last contact (the reaper key; 0 = unknown —
+    /// dormant clock or pre-interior save, which the reaper treats as "do
+    /// not measure", never "instantly stale").
+    #[serde(default)]
+    pub last_seen_minutes: i64,
+
+    /// Compressed archive stub set by the reaper when a `named` NPC passes
+    /// the no-contact TTL — mood/intent/items are cleared, this one-line
+    /// summary survives so a return visit still recalls the shape of the
+    /// relationship. `None` = live. The next `[MOOD]`/`[INTENT]`/`[NPC_ITEM]`
+    /// emission overwrites it with fresh live state (the applier treats an
+    /// archived interior as fresh ground — no mechanical un-archive needed).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub archived: Option<String>,
+}
+
+/// Char-boundary-safe truncation for prompt-facing free text (counts
+/// CHARACTERS, not bytes — the player-field cap ruling). Render-side
+/// backstop: parse-time caps already gate the bracket path; this catches
+/// hand-edited saves.
+fn cap_chars(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        s.to_string()
+    } else {
+        s.chars().take(max).collect()
+    }
+}
+
+impl NpcInterior {
+    /// One `minds:` prompt entry for a PRESENT NPC:
+    /// `Mara [suspicious; intends "get her out"; carries Worn Ring, Ale]`.
+    /// An archived interior renders its recall stub instead
+    /// (`Mara [recalls: suspicious; …]`). Empty string = nothing to show
+    /// (caller skips). All free text flattened + capped — a hand-edited save
+    /// can't inject a forged prompt line (audit M2 discipline).
+    pub fn render_minds_entry(&self, name: &str) -> String {
+        let body = if let Some(stub) = self.archived.as_deref().filter(|s| !s.trim().is_empty()) {
+            format!("recalls: {}", stub.trim())
+        } else {
+            let mut segs: Vec<String> = Vec::new();
+            if let Some(m) = self.mood.as_deref().filter(|m| !m.trim().is_empty()) {
+                segs.push(m.trim().to_string());
+            }
+            if let Some(i) = self.intent.as_deref().filter(|i| !i.trim().is_empty()) {
+                segs.push(format!("intends \"{}\"", i.trim()));
+            }
+            if !self.items.is_empty() {
+                const NAMES_SHOWN: usize = 4;
+                let mut names: Vec<String> = self
+                    .items
+                    .iter()
+                    .take(NAMES_SHOWN)
+                    .map(|it| it.name.clone())
+                    .collect();
+                let hidden = self.items.len().saturating_sub(NAMES_SHOWN);
+                if hidden > 0 {
+                    names.push(format!("+{hidden}"));
+                }
+                segs.push(format!("carries {}", names.join(", ")));
+            }
+            segs.join("; ")
+        };
+        if body.is_empty() {
+            return String::new();
+        }
+        cap_chars(
+            &format!("{} [{}]", name.trim(), body),
+            NPC_MINDS_ENTRY_CHAR_CAP,
+        )
+    }
+
+    /// Compose the reaper's compressed stub from the live fields (pre-clear).
+    /// Deterministic order: mood; intent; item count. Capped at
+    /// `NPC_ARCHIVE_STUB_CHAR_CAP`.
+    fn compose_archive_stub(&self) -> String {
+        let mut segs: Vec<String> = Vec::new();
+        if let Some(m) = self.mood.as_deref().filter(|m| !m.trim().is_empty()) {
+            segs.push(m.trim().to_string());
+        }
+        if let Some(i) = self.intent.as_deref().filter(|i| !i.trim().is_empty()) {
+            segs.push(i.trim().to_string());
+        }
+        if !self.items.is_empty() {
+            segs.push(format!("held {} item(s)", self.items.len()));
+        }
+        if segs.is_empty() {
+            segs.push("no recorded state".to_string());
+        }
+        cap_chars(&segs.join("; "), NPC_ARCHIVE_STUB_CHAR_CAP)
+    }
+}
 
 /// (2026-08-16 audit LOW) Shared growth caps for the typed referee-owned
 /// collections — the bracket appliers (lib.rs) + `merge_patch`'s
@@ -1510,6 +1701,20 @@ pub struct WorldSchema {
     /// pass). `#[serde(default)]` keeps pre-Phase-5 saves loadable as empty.
     #[serde(default)]
     pub presences: Vec<Presence>,
+
+    /// (2026-08-18 Dedicated-NPC interior state): per-NPC held items, mood,
+    /// and distilled intent — keyed by canonical registry id (the same key
+    /// space as `relationships`). The machinery behind NPCs that steal, lie,
+    /// and hold grudges: the `[NPC_ITEM]`/`[MOOD]`/`[INTENT]` appliers write
+    /// it, the reaper (world tick) archives it, `render_for_prompt` surfaces
+    /// it as the PRESENT-only `minds:` line. Rust is the SOLE authority —
+    /// `apply_delta` does NOT touch it and `merge_patch` has no arm for it
+    /// (same structural immunity as `player_state.equipment`). Rides the
+    /// npc.json split + every save/undo snapshot for free as part of
+    /// `WorldSchema`. `#[serde(default)]` keeps pre-interior saves loadable
+    /// as an empty map (dormant — no `minds:` line, zero prompt cost).
+    #[serde(default)]
+    pub npc_interior: HashMap<String, NpcInterior>,
 
     /// Active stage background for this world (2026-08-11 Background Library):
     /// the FILENAME of the selected image in the shared library at
@@ -2053,6 +2258,77 @@ impl WorldSchema {
             out.push_str(&parts.join(", "));
             out.push('\n');
         }
+        // (2026-08-18 Dedicated-NPC interior state) The `minds:` line —
+        // per-NPC interior for PRESENT NPCs only (scene-scoped injection:
+        // the FIELD is unbounded, the prompt line never is). Same
+        // anti-teleport whitelist as `present:` — an NPC not on-camera this
+        // turn (or within grace) gets no interior line, so off-screen
+        // scheming never leaks into the scene. This is what lets the API
+        // narrator play the lie: it reads that Mara is suspicious, intends
+        // to get the player out, and carries the stolen ring, and writes
+        // prose that conceals exactly that. HARD-CAPPED at the 6
+        // highest-priority interior-bearing present NPCs + `(+N more)`
+        // (crowded-tavern guard, mirrors `present:`'s #48 cap); flattened
+        // at the join so a hand-edited save can't forge extra prompt
+        // lines. Dormant when no present NPC has interior state (zero
+        // tokens, always).
+        //
+        // (2026-08-18 audit) The cap-6 selection is IMPORTANCE-RANKED,
+        // never positional: `core` cast first, then reaper-protected
+        // interiors (the Bonded/Nemesis relationship bands, open tasks,
+        // item-holders — the same derived signals `npc_is_reaper_protected`
+        // reads), then ambient discovery order. A crowded scene clips
+        // throwaways, never the scene's principals — the identical
+        // tier-aware-truncation discipline as the relationships cap. The
+        // ranking also orders the joined line core-first, so the LEAN
+        // render's trailing `, `-boundary cut (lib.rs
+        // `lean_truncate_line`) drops ambient entries before it can touch
+        // a principal's. Same cap, same flatten — only the selection
+        // order, so the token cost is unchanged.
+        if !self.presences.is_empty() && !self.npc_interior.is_empty() {
+            let mut ranked: Vec<(u8, String)> = Vec::new();
+            for p in &self.presences {
+                let Some(interior) = self.npc_interior.get(&p.npc_id) else {
+                    continue;
+                };
+                let entry = interior.render_minds_entry(&p.name);
+                if entry.is_empty() {
+                    continue;
+                }
+                let is_core = self
+                    .npc_registry
+                    .entries
+                    .iter()
+                    .any(|e| e.id == p.npc_id && e.prominence == NpcProminence::Core);
+                let rank: u8 = if is_core {
+                    0
+                } else if self.reaper_protection_reason(&p.npc_id).is_some() {
+                    1
+                } else {
+                    2
+                };
+                ranked.push((rank, entry));
+            }
+            // Stable sort: presences order survives within a rank.
+            ranked.sort_by_key(|(rank, _)| *rank);
+            let mut parts: Vec<String> = Vec::new();
+            let mut hidden = 0usize;
+            for (_, entry) in ranked {
+                if parts.len() < NPC_MINDS_PROMPT_CAP {
+                    parts.push(entry);
+                } else {
+                    hidden += 1;
+                }
+            }
+            if !parts.is_empty() {
+                if hidden > 0 {
+                    parts.push(format!("(+{hidden} more)"));
+                }
+                out.push_str("minds: ");
+                out.push_str(&Self::flatten_inline(&parts.join(", ")));
+                out.push('\n');
+            }
+        }
         // Rumors at the current node (Component 4, 2026-07-28): the fourth
         // "where/when" anchor + the node-based knowledge model. The narrator
         // sees ONLY the rumors the current node has heard — "the tavern has
@@ -2339,7 +2615,9 @@ impl WorldSchema {
     /// fields), but the mutation fn itself must not install what the bracket
     /// appliers would refuse — the raw-editor JSON tab + any future caller
     /// route through here too. Vec fields truncate FIFO (oldest dropped);
-    /// the relationships map keeps the first 48 keys in sorted order
+    /// the relationships map pins the tier extremes (Trusted/Bonded/
+    /// Nemesis/Hostile — the same bands `npc_is_reaper_protected` holds)
+    /// and only drops mid-band entries, in sorted-key order
     /// (deterministic); a travel graph over the node cap is a hard error
     /// (refusing an authored hub beats silently dropping it — checked at
     /// the install arm, not here).
@@ -2358,14 +2636,284 @@ impl WorldSchema {
             self.rumors.drain(..overflow);
         }
         if self.relationships.len() > MAX_TRACKED_RELATIONSHIPS {
-            let keep: std::collections::HashSet<String> =
-                std::collections::BTreeSet::from_iter(self.relationships.keys().cloned())
-                    .into_iter()
-                    .take(MAX_TRACKED_RELATIONSHIPS)
-                    .collect();
+            // (2026-08-18 relation-to-player ruling) Cap truncation is
+            // TIER-AWARE, never arbitrary: the extremes (Trusted/Bonded on
+            // the affinity track, Nemesis/Hostile on the grudge track — the
+            // same bands the reaper protection pins) are NEVER dropped; only
+            // mid-band entries fall, sorted-key first for determinism. A
+            // pathological save whose extremes alone exceed the cap keeps
+            // them all — the cap is a bloat guard, not a family-separation
+            // law. Dropped ids surface under SCHEMA so the truncation is
+            // auditable in diagnostics.log.
+            let pinned: std::collections::HashSet<String> = self
+                .relationships
+                .iter()
+                .filter(|(_, rel)| {
+                    rel.tier >= RelationshipTier::Trusted
+                        || rel.tier <= RelationshipTier::Hostile
+                })
+                .map(|(k, _)| k.clone())
+                .collect();
+            let pinned_count = pinned.len();
+            let mut keep = pinned.clone();
+            for k in std::collections::BTreeSet::from_iter(self.relationships.keys().cloned()) {
+                if keep.len() >= MAX_TRACKED_RELATIONSHIPS {
+                    break;
+                }
+                if !pinned.contains(&k) {
+                    keep.insert(k);
+                }
+            }
+            let dropped: Vec<String> = self
+                .relationships
+                .keys()
+                .filter(|k| !keep.contains(*k))
+                .cloned()
+                .collect();
+            if !dropped.is_empty() {
+                const DROPPED_SHOWN: usize = 8;
+                let mut list = dropped[..dropped.len().min(DROPPED_SHOWN)].join(", ");
+                if dropped.len() > DROPPED_SHOWN {
+                    list.push_str(&format!(" (+{} more)", dropped.len() - DROPPED_SHOWN));
+                }
+                crate::logs::log(
+                    "SCHEMA",
+                    &format!(
+                        "relationships cap {MAX_TRACKED_RELATIONSHIPS}: kept {pinned_count} pinned extreme(s), dropped {} mid-band: {list}",
+                        dropped.len()
+                    ),
+                );
+            }
             self.relationships.retain(|k, _| keep.contains(k));
         }
+        // (2026-08-18 Dedicated-NPC interior state) Orphan sweep + item cap:
+        // interiors for ids no longer in the registry (hand-edited registry
+        // installs, evicted entries) are grime — drop them; each surviving
+        // interior's item rack caps FIFO like the belt. The map itself needs
+        // no separate cap — it is bounded by the registry's own 96.
+        let registry_ids: std::collections::HashSet<String> = self
+            .npc_registry
+            .entries
+            .iter()
+            .map(|e| e.id.clone())
+            .collect();
+        self.npc_interior.retain(|id, _| registry_ids.contains(id));
+        for interior in self.npc_interior.values_mut() {
+            if interior.items.len() > NPC_INTERIOR_ITEMS_MAX {
+                let overflow = interior.items.len() - NPC_INTERIOR_ITEMS_MAX;
+                interior.items.drain(..overflow);
+            }
+        }
         self.cap_recent_events();
+    }
+
+    /// (2026-08-18 reaper follow-up — Chloe's left-behind-family catch)
+    /// DERIVED reaper protection: is this NPC load-bearing in the live
+    /// world state RIGHT NOW? Evaluated fresh at every reap/evict — never
+    /// stored, so it can never go stale the way a static tag would (the
+    /// discovered shopkeeper's daughter you MARRIED mid-campaign stays
+    /// full-state while you're away, because the marriage milestone put her
+    /// at `Bonded`, not because anyone remembered to flip a flag). Signals:
+    ///
+    /// 1. Relationship tier EXTREMES — `Trusted`/`Bonded` are the
+    ///    mentor/lover/companion bands (unreachable without recorded
+    ///    `[MILESTONE]` events — the promotion IS the milestone ladder),
+    ///    `Nemesis`/`Hostile` are the grudge band (a villain whose revenge
+    ///    archives after 30 days is the feature eating itself). The mid
+    ///    bands (Stranger→Friendly, Rival) stay archivable — a merchant you
+    ///    liked is allowed to become a memory.
+    /// 2. An unresolved off-screen `[TASK]` — the world is waiting on them.
+    /// 3. A non-empty item rack — quest-item holders, and the NPC who
+    ///    STOLE something and left town (you return weeks later to reclaim
+    ///    it; the goods must still be there).
+    ///
+    /// Deliberately NOT a signal: home-node ownership (no per-NPC residence
+    /// structure exists in the schema; the tier ladder already covers the
+    /// family case). Bounded: relationships cap at 48 + tasks at 20, so the
+    /// protected set can't outgrow those caps plus item-holders.
+    pub fn npc_is_reaper_protected(&self, id: &str) -> bool {
+        self.reaper_protection_reason(id).is_some()
+    }
+
+    /// The WHY behind [`npc_is_reaper_protected`], surfaced for the
+    /// diagnostics log (BRK): which live-world signal held the NPC out of
+    /// the reaper's hands — `rel:<tier>` (the relationship-to-player
+    /// extremes), `open-task`, or `holds-items`. One source of truth with
+    /// the bool; the reap/evict paths log it so a playtest log can verify
+    /// the relation-to-player band actually fired.
+    pub fn reaper_protection_reason(&self, id: &str) -> Option<String> {
+        if let Some(rel) = self.relationships.get(id) {
+            // Ord runs worst→best: Nemesis < Hostile < ... < Trusted < Bonded.
+            // Protect both extremes, archive the mid-band.
+            if rel.tier >= RelationshipTier::Trusted || rel.tier <= RelationshipTier::Hostile {
+                return Some(format!("rel:{}", rel.tier.tag()));
+            }
+        }
+        if self
+            .offscreen_tasks
+            .iter()
+            .any(|t| t.npc_id == id && !t.resolved)
+        {
+            return Some("open-task".into());
+        }
+        if self
+            .npc_interior
+            .get(id)
+            .map(|i| !i.items.is_empty())
+            .unwrap_or(false)
+        {
+            return Some("holds-items".into());
+        }
+        None
+    }
+
+    /// (2026-08-18 Dedicated-NPC reaper — Chloe's Garbage-Collector ruling)
+    /// Archive stale `named` NPCs' interior state on the world tick. `core`
+    /// (authored cast) is NEVER reaped, and neither is any NPC passing
+    /// `npc_is_reaper_protected` (the derived left-behind-family guard —
+    /// relationship extremes, pending tasks, held items). A `named` NPC
+    /// with no contact for `settings::NPC_REAP_NAMED_AFTER_DAYS` in-world
+    /// days has its rich fields (mood/intent/items) compressed into a
+    /// one-line `archived` stub — the registry entry survives
+    /// (`[PRESENCE]` still resolves, `cast:` still lists them), the interior
+    /// weight drops to the stub. A returning NPC's next
+    /// `[MOOD]`/`[INTENT]`/`[NPC_ITEM]` emission simply overwrites the stub
+    /// with live state. Present NPCs are skipped (on-camera = contacted —
+    /// never reap the scene you're in), and a `last_seen_minutes` of 0
+    /// (dormant clock / pre-interior save) is "do not measure", never
+    /// "instantly stale". Logs each archive + the past-TTL held-back set
+    /// under BRK (id + protection reason — a `rel:` hold is the visible
+    /// proof the relation-to-player band fired). Returns the reap count;
+    /// otherwise pure, runs under the schema lock inside the tick's
+    /// one-snapshot discipline.
+    pub fn reap_stale_npc_interiors(&mut self, now_minutes: i64) -> usize {
+        if now_minutes <= 0 {
+            return 0;
+        }
+        let ttl_minutes: i64 = crate::settings::NPC_REAP_NAMED_AFTER_DAYS as i64 * 1440;
+        let present: std::collections::HashSet<String> =
+            self.presences.iter().map(|p| p.npc_id.clone()).collect();
+        let named_ids: Vec<String> = self
+            .npc_registry
+            .entries
+            .iter()
+            .filter(|e| e.prominence == NpcProminence::Named)
+            .map(|e| e.id.clone())
+            .collect();
+        let mut reaped = 0usize;
+        let mut held: Vec<String> = Vec::new();
+        for id in named_ids {
+            if present.contains(&id) {
+                continue;
+            }
+            // TTL-first eligibility: only an interior the reaper could
+            // actually act on this tick (past the no-contact TTL, still
+            // live) reaches the protection check below — so the held-back
+            // log fires only when truncation was genuinely on the table,
+            // never as per-tick noise from healthy NPCs.
+            let eligible = {
+                let Some(interior) = self.npc_interior.get(&id) else {
+                    continue;
+                };
+                interior.archived.is_none()
+                    && interior.last_seen_minutes > 0
+                    && now_minutes - interior.last_seen_minutes >= ttl_minutes
+            };
+            if !eligible {
+                continue;
+            }
+            // Derived protection (the mutable world-state prominence): a
+            // Bonded spouse, a Nemesis, a pending-task holder, or an NPC
+            // still holding items is never truncated. Checked fresh at reap
+            // time — before the mutable borrow, since the predicate reads
+            // across schema fields.
+            if let Some(reason) = self.reaper_protection_reason(&id) {
+                held.push(format!("{id}: {reason}"));
+                continue;
+            }
+            let Some(interior) = self.npc_interior.get_mut(&id) else {
+                continue;
+            };
+            let stub = interior.compose_archive_stub();
+            interior.mood = None;
+            interior.intent = None;
+            interior.items.clear();
+            interior.archived = Some(stub.clone());
+            reaped += 1;
+            crate::logs::log(
+                "BRK",
+                &format!(
+                    "[tick] npc reaper archived {id} stub={}",
+                    crate::logs::brief_with(&stub, 40)
+                ),
+            );
+        }
+        if !held.is_empty() {
+            const HELD_SHOWN: usize = 8;
+            let mut list = held[..held.len().min(HELD_SHOWN)].join(", ");
+            if held.len() > HELD_SHOWN {
+                list.push_str(&format!(" (+{} more)", held.len() - HELD_SHOWN));
+            }
+            crate::logs::log(
+                "BRK",
+                &format!("[tick] npc reaper held {} past-TTL protected: {list}", held.len()),
+            );
+        }
+        reaped
+    }
+
+    /// (2026-08-18 registry-cap amendment — plan-approved) Relieve
+    /// `MAX_NPC_REGISTRY` pressure by evicting the single
+    /// least-recently-seen ARCHIVED, DISCOVERED (`named`), non-present
+    /// registry entry — plus its interior row and any lingering presence.
+    /// Authored `core` entries are pinned forever (the §5 ruling's fear —
+    /// losing an authored hub — is structurally preserved); live `named`
+    /// NPCs are safe too (only reaper-archived stales qualify). This is the
+    /// fix for the 96-cap brick: a long campaign that met too many people
+    /// used to have discovery refuse permanently once 96 ids accumulated.
+    /// Relationships are deliberately KEPT for the evicted id (capped
+    /// independently at 48) — a re-registered returning NPC picks its old
+    /// tier back up. Returns the evicted id, if any; the caller
+    /// (`[NPC_REGISTER]` applier at cap) retries the upsert once on Some.
+    pub fn evict_archived_registry_entry(&mut self) -> Option<String> {
+        let present: std::collections::HashSet<String> =
+            self.presences.iter().map(|p| p.npc_id.clone()).collect();
+        // (2026-08-18 reaper follow-up) Protected ids are collected FIRST —
+        // `npc_is_reaper_protected` needs &self, the eviction pass below
+        // mutates. Belt-and-braces: the reaper never archives a protected
+        // NPC, so this only matters for hand-edited saves that pre-set an
+        // `archived` stub on someone who is now load-bearing.
+        let protected: std::collections::HashSet<String> = self
+            .npc_registry
+            .entries
+            .iter()
+            .map(|e| e.id.clone())
+            .filter(|id| self.npc_is_reaper_protected(id))
+            .collect();
+        let mut candidate: Option<(String, i64)> = None;
+        for e in &self.npc_registry.entries {
+            if e.prominence != NpcProminence::Named {
+                continue;
+            }
+            if present.contains(&e.id) || protected.contains(&e.id) {
+                continue;
+            }
+            let Some(interior) = self.npc_interior.get(&e.id) else {
+                continue;
+            };
+            if interior.archived.is_none() {
+                continue; // live NPC — not evictable
+            }
+            let last = interior.last_seen_minutes;
+            if candidate.as_ref().map_or(true, |(_, l)| last < *l) {
+                candidate = Some((e.id.clone(), last));
+            }
+        }
+        let (id, _) = candidate?;
+        self.npc_registry.entries.retain(|e| e.id != id);
+        self.npc_interior.remove(&id);
+        self.presences.retain(|p| p.npc_id != id);
+        Some(id)
     }
 
     /// Atomic save to `world_schema.json` (temp + fsync + rename, same pattern
@@ -2437,7 +2985,13 @@ impl WorldSchema {
         }
 
         // NPC-grouped fields → npc.json
-        for key in ["npc_registry", "relationships", "presences", "offscreen_tasks"] {
+        for key in [
+            "npc_registry",
+            "relationships",
+            "presences",
+            "offscreen_tasks",
+            "npc_interior",
+        ] {
             if let Some(v) = world.remove(key) {
                 npc.insert(key.to_string(), v);
             }
@@ -2669,8 +3223,38 @@ fn type_name_of_value(v: &serde_json::Value) -> &'static str {
                 &mut schema.player_state.pack,
             );
         }
+        schema.migrate_legacy_outfit();
 
         Ok(schema)
+    }
+
+    /// (2026-08-18 clothing-as-inventory ruling) Legacy `outfit` appearance
+    /// delta → typed inventory items, one-shot. Pre-ruling saves (and every
+    /// prior SavedPlayer attach) stored the authored clothing chip list as ONE
+    /// comma-joined `current_appearance_deltas["outfit"]` line; that key is
+    /// retired — the chips become real items via the same seed a fresh attach
+    /// uses (garments route to body slots, deduped against items the campaign
+    /// already tracks). The delta is removed either way, so a second run is a
+    /// no-op and the next persist writes the migrated inventory.
+    ///
+    /// Called at BOTH schema install seams: `load_split` (the resume path)
+    /// AND `fable_load_save` (a save slot installs its schema directly,
+    /// bypassing load_split).
+    pub fn migrate_legacy_outfit(&mut self) {
+        if let Some(line) = self
+            .player_state
+            .current_appearance_deltas
+            .remove("outfit")
+            .filter(|s| !s.trim().is_empty())
+        {
+            let chips = crate::equipment::split_outfit_line(&line);
+            let seeded = crate::equipment::seed_clothing_items(
+                &chips,
+                &mut self.player_state.equipment,
+                &mut self.player_state.pack,
+            );
+            tracing::info!(seeded, "legacy outfit delta migrated into typed inventory");
+        }
     }
 }
 
@@ -3648,6 +4232,72 @@ mod tests {
         }
     }
 
+    /// (2026-08-18 clothing-as-inventory ruling) A pre-ruling player.json
+    /// carries the comma-joined `outfit` appearance delta; load_split
+    /// converts it into typed inventory items (garments routed to their body
+    /// slots) and REMOVES the delta — one-shot, so a second load is a no-op
+    /// and a mid-save already-tracked garment never mints a twin.
+    #[test]
+    fn load_split_migrates_outfit_delta_to_inventory() {
+        use crate::equipment::{EquipSlot, ItemTag};
+        let dir = std::env::temp_dir();
+        let world = dir.join("wupi_outfit_mig_world.json");
+        let player = dir.join("wupi_outfit_mig_player.json");
+        let npc = dir.join("wupi_outfit_mig_npc.json");
+        for p in [&world, &player, &npc] {
+            let _ = std::fs::remove_file(p);
+        }
+        // Mixed-era save: the cloak is ALREADY a tracked chest item while the
+        // legacy outfit line still names it (plus two untracked garments).
+        let legacy_player = r#"{
+            "player_state": {
+                "current_appearance_deltas": {
+                    "outfit": "travel cloak, linen dress, leather boots",
+                    "hair_color": "raven black"
+                },
+                "equipment": {
+                    "chest": {
+                        "outer": { "name": "Travel Cloak", "tags": ["equippable"] }
+                    }
+                }
+            }
+        }"#;
+        std::fs::write(&player, legacy_player).unwrap();
+        std::fs::write(&world, "{}").unwrap();
+        std::fs::write(&npc, "{}").unwrap();
+
+        let schema = WorldSchema::load_split(&world, &player, &npc).unwrap();
+        let ps = &schema.player_state;
+        // The delta is gone (other appearance keys survive)...
+        assert!(!ps.current_appearance_deltas.contains_key("outfit"));
+        assert_eq!(
+            ps.current_appearance_deltas.get("hair_color").map(String::as_str),
+            Some("raven black")
+        );
+        // ...the already-tracked cloak did not twin...
+        let chest = ps.equipment.get(&EquipSlot::Chest).expect("chest present");
+        assert_eq!(chest.outer.as_ref().unwrap().name, "Travel Cloak");
+        // ...the dress layers Inner under the existing cloak, boots take Feet.
+        assert_eq!(chest.inner.as_ref().unwrap().name, "Linen Dress");
+        assert_eq!(
+            ps.equipment.get(&EquipSlot::Feet).and_then(|l| l.outer.as_ref()).map(|i| i.name.clone()),
+            Some("Leather Boots".to_string())
+        );
+        assert!(chest.inner.as_ref().unwrap().tags.contains(&ItemTag::Equippable));
+        // Nothing spilled to the pack in this fixture.
+        assert!(ps.pack.is_empty());
+
+        // Round-trip: the migrated state persists (no outfit delta to re-migrate).
+        schema.save_split(&world, &player, &npc).unwrap();
+        let reloaded = WorldSchema::load_split(&world, &player, &npc).unwrap();
+        assert!(!reloaded.player_state.current_appearance_deltas.contains_key("outfit"));
+        assert!(reloaded.player_state.equipment.contains_key(&EquipSlot::Feet));
+
+        for p in [&world, &player, &npc] {
+            let _ = std::fs::remove_file(p);
+        }
+    }
+
     /// (2026-08-16 deferred-3) The split trio's generation stamps: all three
     /// files carry the SAME stamp, the counter advances monotonically across
     /// saves, a mixed-generation trio is REFUSED (the crash-between-renames
@@ -4257,6 +4907,7 @@ mod tests {
     fn harsk_registry() -> NpcRegistry {
         NpcRegistry {
             entries: vec![NpcEntry {
+                prominence: NpcProminence::Named,
                 id: "captain-harsk".to_string(),
                 name: "Captain Harsk".to_string(),
                 role: "watch captain".to_string(),
@@ -4281,6 +4932,7 @@ mod tests {
         // Ambiguity declines: two entries contain "captain".
         let mut amb = harsk_registry();
         amb.entries.push(NpcEntry {
+            prominence: NpcProminence::Named,
             id: "captain-brann".to_string(),
             name: "Captain Brann".to_string(),
             role: String::new(),
@@ -4295,6 +4947,7 @@ mod tests {
     fn npc_register_shorthand_never_mints_a_ghost_twin() {
         let mut reg = harsk_registry();
         let inserted = reg.upsert_entry(NpcEntry {
+            prominence: NpcProminence::Named,
             id: "harsk".to_string(),
             name: "Harsk".to_string(),
             role: String::new(),
@@ -4306,6 +4959,7 @@ mod tests {
         assert_eq!(reg.entries[0].id, "captain-harsk", "the canonical entry stands");
         // A genuinely new NPC still registers.
         let inserted2 = reg.upsert_entry(NpcEntry {
+            prominence: NpcProminence::Named,
             id: "mara".to_string(),
             name: "Mara".to_string(),
             role: String::new(),
@@ -4894,6 +5548,7 @@ mod tests {
         let mut schema = WorldSchema::default();
         schema.npc_registry = NpcRegistry {
             entries: vec![NpcEntry {
+                prominence: NpcProminence::Named,
                 id: "mara".into(),
                 name: "Mara".into(),
                 role: "innkeep".into(),
@@ -4916,6 +5571,638 @@ mod tests {
             Some("injected"),
             "the injected key lands in entities (legacy), NOT the typed field"
         );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // (2026-08-18 Dedicated-NPC interior state) immunity, render, reaper,
+    // derived protection, eviction, and typed-cap pins.
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// Architectural invariant: npc_interior is outside the LLM delta path
+    /// (mirrors the registry/presences pins). The only writers are the
+    /// bracket appliers, the PRESENCE stamp, and the tick reaper.
+    #[test]
+    fn apply_delta_does_not_touch_npc_interior() {
+        let mut schema = WorldSchema::default();
+        schema.npc_interior.insert(
+            "mara".into(),
+            NpcInterior {
+                mood: Some("suspicious".into()),
+                intent: Some("hide the ring".into()),
+                ..NpcInterior::default()
+            },
+        );
+        let original = schema.npc_interior.clone();
+        let mut ents = HashMap::new();
+        ents.insert(
+            "npc_interior".to_string(),
+            Some(serde_json::Value::String("injected".into())),
+        );
+        let delta = SchemaDelta {
+            summary: None,
+            recent_events: None,
+            entities: Some(ents),
+        };
+        schema.apply_delta(delta);
+        assert_eq!(schema.npc_interior, original, "interior must be LLM-immutable");
+    }
+
+    /// merge_patch has NO npc_interior arm — a full-replace attempt hits the
+    /// unknown-top-level-field error (the structural immunity).
+    #[test]
+    fn merge_patch_refuses_npc_interior() {
+        let mut schema = WorldSchema::default();
+        let patch = serde_json::json!({ "npc_interior": { "mara": { "mood": "forged" } } });
+        let err = schema.merge_patch(patch).expect_err("must refuse");
+        assert!(err.contains("unknown top-level field"), "error should explain: {err}");
+    }
+
+    #[test]
+    fn minds_render_present_only_capped_and_flattened() {
+        let mut s = WorldSchema::default();
+        s.npc_registry = NpcRegistry {
+            entries: vec![NpcEntry {
+                id: "mara".into(),
+                name: "Mara".into(),
+                role: "innkeep".into(),
+                tier: None,
+                aliases: vec![],
+                prominence: NpcProminence::Named,
+            }],
+        };
+        // On-camera Mara with a full interior.
+        s.presences = vec![Presence {
+            npc_id: "mara".into(),
+            name: "Mara".into(),
+            stance: "behind the bar".into(),
+            ttl: PRESENCE_GRACE_RESET,
+        }];
+        s.npc_interior.insert(
+            "mara".into(),
+            NpcInterior {
+                mood: Some("suspicious".into()),
+                intent: Some("get her out".into()),
+                items: vec![equipment::StackItem {
+                    name: "Worn Ring".into(),
+                    ..equipment::StackItem::default()
+                }],
+                ..NpcInterior::default()
+            },
+        );
+        // Off-camera Corin with a full interior — must NOT render.
+        s.npc_interior.insert(
+            "corin".into(),
+            NpcInterior {
+                mood: Some("cheerful".into()),
+                ..NpcInterior::default()
+            },
+        );
+        let rendered = s.render_for_prompt();
+        let minds_line = rendered
+            .lines()
+            .find(|l| l.starts_with("minds: "))
+            .expect("minds line renders for the present NPC");
+        assert!(minds_line.contains("Mara [suspicious"), "mood renders: {minds_line}");
+        assert!(minds_line.contains("intends \"get her out\""), "intent renders: {minds_line}");
+        assert!(minds_line.contains("carries Worn Ring"), "items render: {minds_line}");
+        assert!(!rendered.contains("cheerful"), "off-camera interior never renders");
+        // Archived interiors render the recall stub instead.
+        s.npc_interior.insert(
+            "mara".into(),
+            NpcInterior {
+                archived: Some("suspicious; get her out; held 1 item(s)".into()),
+                ..NpcInterior::default()
+            },
+        );
+        let rendered = s.render_for_prompt();
+        assert!(
+            rendered.lines().any(|l| l.starts_with("minds: ") && l.contains("recalls:")),
+            "archived interior renders the stub"
+        );
+        // Prompt cap: 8 present interior-bearing NPCs → 6 shown + marker.
+        s.presences = (0..8)
+            .map(|i| Presence {
+                npc_id: format!("npc_{i}"),
+                name: format!("N{i}"),
+                stance: String::new(),
+                ttl: PRESENCE_GRACE_RESET,
+            })
+            .collect();
+        s.npc_interior.clear();
+        for i in 0..8 {
+            s.npc_interior.insert(
+                format!("npc_{i}"),
+                NpcInterior {
+                    mood: Some("m".to_string()),
+                    ..NpcInterior::default()
+                },
+            );
+        }
+        let rendered = s.render_for_prompt();
+        let minds_line = rendered
+            .lines()
+            .find(|l| l.starts_with("minds: "))
+            .expect("minds line renders");
+        assert!(minds_line.contains("(+2 more)"), "overflow marker: {minds_line}");
+        assert_eq!(
+            minds_line.matches('[').count(),
+            NPC_MINDS_PROMPT_CAP,
+            "exactly the cap entries shown"
+        );
+    }
+
+    /// (2026-08-18 audit) The cap-6 `minds:` selection is IMPORTANCE-RANKED,
+    /// never positional: a `core` cast member and a reaper-protected NPC
+    /// (here: a Bonded relationship) positioned LAST in a crowded scene
+    /// still render their interior — ambient discovered NPCs take the
+    /// `(+N more)` cut instead. Pins the render's rank order too: core
+    /// leads, protected next, ambient after (the order the lean render's
+    /// trailing cut relies on).
+    #[test]
+    fn minds_cap_ranks_core_and_protected_first() {
+        use crate::relationship::{RelationshipState, RelationshipTier};
+
+        let mut s = WorldSchema::default();
+        // 7 ambient named + 1 core + 1 bonded — the two principals LAST in
+        // presences order (the adversarial arrangement: a positional
+        // first-6 selection would drop exactly them).
+        let mut entries: Vec<NpcEntry> = (0..7)
+            .map(|i| NpcEntry {
+                id: format!("amb{i}"),
+                name: format!("Amb{i}"),
+                role: String::new(),
+                tier: None,
+                aliases: vec![],
+                prominence: NpcProminence::Named,
+            })
+            .collect();
+        for (id, name, prominence) in [
+            ("villain_mara", "Mara", NpcProminence::Core),
+            ("spouse", "Spouse", NpcProminence::Named),
+        ] {
+            entries.push(NpcEntry {
+                id: id.into(),
+                name: name.into(),
+                role: String::new(),
+                tier: None,
+                aliases: vec![],
+                prominence,
+            });
+        }
+        s.npc_registry = NpcRegistry { entries };
+        s.relationships.insert(
+            "spouse".into(),
+            RelationshipState {
+                tier: RelationshipTier::Bonded,
+                tier_entered_at_minutes: 0,
+                events: Vec::new(),
+                volatility: 1.0,
+            },
+        );
+        let mut presences: Vec<Presence> = (0..7)
+            .map(|i| Presence {
+                npc_id: format!("amb{i}"),
+                name: format!("Amb{i}"),
+                stance: String::new(),
+                ttl: PRESENCE_GRACE_RESET,
+            })
+            .collect();
+        for (id, name) in [("villain_mara", "Mara"), ("spouse", "Spouse")] {
+            presences.push(Presence {
+                npc_id: id.into(),
+                name: name.into(),
+                stance: String::new(),
+                ttl: PRESENCE_GRACE_RESET,
+            });
+        }
+        s.presences = presences;
+        for id in [
+            "amb0", "amb1", "amb2", "amb3", "amb4", "amb5", "amb6", "villain_mara", "spouse",
+        ] {
+            s.npc_interior.insert(
+                id.into(),
+                NpcInterior {
+                    mood: Some("wary".into()),
+                    ..NpcInterior::default()
+                },
+            );
+        }
+        let rendered = s.render_for_prompt();
+        let minds_line = rendered
+            .lines()
+            .find(|l| l.starts_with("minds: "))
+            .expect("minds renders for a present-interior scene");
+        assert!(minds_line.contains("Mara ["), "core principal survives the cap: {minds_line}");
+        assert!(
+            minds_line.contains("Spouse ["),
+            "Bonded principal survives the cap: {minds_line}"
+        );
+        assert_eq!(
+            minds_line.matches('[').count(),
+            NPC_MINDS_PROMPT_CAP,
+            "exactly the cap entries shown: {minds_line}"
+        );
+        assert!(
+            minds_line.contains("(+3 more)"),
+            "the 3 overflow slots are ambient: {minds_line}"
+        );
+        assert!(!minds_line.contains("Amb4"), "an ambient NPC took the cut: {minds_line}");
+        let core_pos = minds_line.find("Mara [").expect("core entry present");
+        let prot_pos = minds_line.find("Spouse [").expect("protected entry present");
+        let amb_pos = minds_line.find("Amb0").expect("ambient entry present");
+        assert!(
+            core_pos < prot_pos && prot_pos < amb_pos,
+            "rank order: core leads, protected next, ambient after: {minds_line}"
+        );
+    }
+
+    /// Prime-Mandate pin: the schema-engine prompt serializer carries ONLY
+    /// the diff-relevant fields — `npc_interior` (like every referee-owned
+    /// collection) must never ride the 2048-token delta/translation/
+    /// progression prompts. A future "serialize the whole struct" regression
+    /// reintroduces the 5-10× prompt bloat the 2026-08-16 audit H2 killed.
+    #[test]
+    fn to_json_prompt_excludes_npc_interior() {
+        let mut s = WorldSchema::default();
+        s.npc_interior.insert(
+            "mara".into(),
+            NpcInterior {
+                mood: Some("suspicious".into()),
+                intent: Some("hide the ring before she looks".into()),
+                items: vec![equipment::StackItem {
+                    name: "Worn Ring".into(),
+                    ..equipment::StackItem::default()
+                }],
+                ..NpcInterior::default()
+            },
+        );
+        let text = s.to_json_prompt();
+        assert!(!text.contains("npc_interior"), "field key never serializes: {text}");
+        assert!(
+            !text.contains("hide the ring"),
+            "interior free text never serializes: {text}"
+        );
+        let v: serde_json::Value = serde_json::from_str(&text).expect("valid prompt json");
+        for k in v.as_object().expect("object").keys() {
+            assert!(
+                matches!(k.as_str(), "summary" | "recent_events" | "entities" | "entities_trimmed"),
+                "unexpected prompt field {k}: {text}"
+            );
+        }
+    }
+
+    /// Absolute ceiling for the `minds:` line: cap × entry-cap entries + the
+    /// joiner + overflow marker — even a hand-edited save full of maxed-out
+    /// interiors can't push the always-on prompt line past it.
+    #[test]
+    fn minds_line_absolute_char_bound() {
+        let mut s = WorldSchema::default();
+        // 8 present NPCs, each interior rendering at the full 200-char
+        // entry cap (40-char name + 60-char mood + 160-char intent).
+        s.presences = (0..8)
+            .map(|i| Presence {
+                npc_id: format!("npc{i}"),
+                name: "N".repeat(40),
+                stance: String::new(),
+                ttl: PRESENCE_GRACE_RESET,
+            })
+            .collect();
+        for i in 0..8 {
+            s.npc_interior.insert(
+                format!("npc{i}"),
+                NpcInterior {
+                    mood: Some("m".repeat(60)),
+                    intent: Some("i".repeat(160)),
+                    ..NpcInterior::default()
+                },
+            );
+        }
+        let rendered = s.render_for_prompt();
+        let minds_len = rendered
+            .lines()
+            .find(|l| l.starts_with("minds: "))
+            .map(|l| l.chars().count())
+            .expect("minds renders");
+        assert!(
+            minds_len <= NPC_MINDS_PROMPT_CAP * NPC_MINDS_ENTRY_CHAR_CAP + 40,
+            "minds line {minds_len} chars exceeds the crowded-tavern ceiling"
+        );
+    }
+
+    #[test]
+    fn reaper_archives_stale_named_only() {
+        let mut s = WorldSchema::default();
+        s.npc_registry = NpcRegistry {
+            entries: vec![
+                NpcEntry {
+                    id: "core_elder".into(),
+                    name: "Elder".into(),
+                    role: String::new(),
+                    tier: None,
+                    aliases: vec![],
+                    prominence: NpcProminence::Core,
+                },
+                NpcEntry {
+                    id: "stale_merchant".into(),
+                    name: "Merchant".into(),
+                    role: String::new(),
+                    tier: None,
+                    aliases: vec![],
+                    prominence: NpcProminence::Named,
+                },
+            ],
+        };
+        let ttl_minutes = crate::settings::NPC_REAP_NAMED_AFTER_DAYS * 1440;
+        let now = 100_000;
+        for id in ["core_elder", "stale_merchant"] {
+            s.npc_interior.insert(
+                id.into(),
+                NpcInterior {
+                    mood: Some("m".into()),
+                    intent: Some("i".into()),
+                    items: vec![], // empty rack: no derived protection
+                    last_seen_minutes: now - ttl_minutes - 1,
+                    ..NpcInterior::default()
+                },
+            );
+        }
+        let reaped = s.reap_stale_npc_interiors(now);
+        assert_eq!(reaped, 1, "only the stale named NPC archives");
+        let core = s.npc_interior.get("core_elder").unwrap();
+        assert!(core.archived.is_none() && core.mood.is_some(), "core is reaper-immune");
+        let stale = s.npc_interior.get("stale_merchant").unwrap();
+        assert!(stale.archived.is_some(), "stale named archives");
+        assert!(stale.mood.is_none() && stale.intent.is_none() && stale.items.is_empty());
+        // Just-inside-TTL does NOT reap.
+        s.npc_interior.get_mut("stale_merchant").unwrap().archived = None;
+        s.npc_interior.get_mut("stale_merchant").unwrap().mood = Some("m".into());
+        s.npc_interior.get_mut("stale_merchant").unwrap().last_seen_minutes = now - ttl_minutes + 10;
+        assert_eq!(s.reap_stale_npc_interiors(now), 0, "inside the TTL: no reap");
+        // Dormant clock (0) never measures.
+        assert_eq!(s.reap_stale_npc_interiors(0), 0);
+        // last_seen 0 = unknown, never instantly stale.
+        s.npc_interior.get_mut("stale_merchant").unwrap().last_seen_minutes = 0;
+        assert_eq!(s.reap_stale_npc_interiors(now), 0);
+    }
+
+    /// (2026-08-18 reaper follow-up — the left-behind-family guard) Derived
+    /// protection: relationship extremes, pending tasks, and held items each
+    /// independently block the archive — the discovered spouse stays
+    /// full-state while you're away.
+    #[test]
+    fn reaper_derived_protection_blocks_archive() {
+        let mut s = WorldSchema::default();
+        let ttl_minutes = crate::settings::NPC_REAP_NAMED_AFTER_DAYS * 1440;
+        let now = 100_000;
+        let stale = now - ttl_minutes - 1;
+        let ids = ["spouse", "nemesis", "task_holder", "item_holder", "stranger"];
+        s.npc_registry = NpcRegistry {
+            entries: ids
+                .iter()
+                .map(|id| NpcEntry {
+                    id: id.to_string(),
+                    name: id.to_string(),
+                    role: String::new(),
+                    tier: None,
+                    aliases: vec![],
+                    prominence: NpcProminence::Named,
+                })
+                .collect(),
+        };
+        for id in ids {
+            s.npc_interior.insert(
+                id.into(),
+                NpcInterior {
+                    mood: Some("m".into()),
+                    last_seen_minutes: stale,
+                    ..NpcInterior::default()
+                },
+            );
+        }
+        use crate::relationship::{RelationshipState, RelationshipTier};
+        s.relationships.insert(
+            "spouse".into(),
+            RelationshipState {
+                tier: RelationshipTier::Bonded,
+                tier_entered_at_minutes: 0,
+                events: Vec::new(),
+                volatility: 1.0,
+            },
+        );
+        s.relationships.insert(
+            "nemesis".into(),
+            RelationshipState {
+                tier: RelationshipTier::Nemesis,
+                tier_entered_at_minutes: 0,
+                events: Vec::new(),
+                volatility: 1.0,
+            },
+        );
+        s.offscreen_tasks.push(crate::offscreen_task::OffScreenTask {
+            npc_id: "task_holder".into(),
+            description: "scout the ridge".into(),
+            difficulty: crate::offscreen_task::TaskDifficulty::Routine,
+            suitability: crate::offscreen_task::Suitability::Adequate,
+            resolves_at_minutes: now + 5_000,
+            resolved: false,
+        });
+        s.npc_interior.get_mut("item_holder").unwrap().items = vec![equipment::StackItem {
+            name: "Player's Stolen Ring".into(),
+            ..equipment::StackItem::default()
+        }];
+        // A resolved task does NOT protect.
+        s.offscreen_tasks.push(crate::offscreen_task::OffScreenTask {
+            npc_id: "stranger".into(),
+            description: "fetch water".into(),
+            difficulty: crate::offscreen_task::TaskDifficulty::Trivial,
+            suitability: crate::offscreen_task::Suitability::Adequate,
+            resolves_at_minutes: now - 1,
+            resolved: true,
+        });
+
+        let reaped = s.reap_stale_npc_interiors(now);
+        assert_eq!(reaped, 1, "only the unprotected stranger archives");
+        for id in ["spouse", "nemesis", "task_holder", "item_holder"] {
+            assert!(
+                s.npc_interior.get(id).unwrap().archived.is_none(),
+                "{id} is derived-protected"
+            );
+        }
+        assert!(s.npc_interior.get("stranger").unwrap().archived.is_some());
+    }
+
+    #[test]
+    fn evict_archived_registry_entry_lru_and_pins() {
+        let mut s = WorldSchema::default();
+        s.npc_registry = NpcRegistry {
+            entries: vec![
+                NpcEntry {
+                    id: "pinned_core".into(),
+                    name: "Core".into(),
+                    role: String::new(),
+                    tier: None,
+                    aliases: vec![],
+                    prominence: NpcProminence::Core,
+                },
+                NpcEntry {
+                    id: "live_named".into(),
+                    name: "Live".into(),
+                    role: String::new(),
+                    tier: None,
+                    aliases: vec![],
+                    prominence: NpcProminence::Named,
+                },
+                NpcEntry {
+                    id: "arch_fresh".into(),
+                    name: "Fresh".into(),
+                    role: String::new(),
+                    tier: None,
+                    aliases: vec![],
+                    prominence: NpcProminence::Named,
+                },
+                NpcEntry {
+                    id: "arch_stale".into(),
+                    name: "Stale".into(),
+                    role: String::new(),
+                    tier: None,
+                    aliases: vec![],
+                    prominence: NpcProminence::Named,
+                },
+            ],
+        };
+        // pinned_core: archived but CORE → pinned.
+        s.npc_interior.insert(
+            "pinned_core".into(),
+            NpcInterior {
+                archived: Some("stub".into()),
+                last_seen_minutes: 1,
+                ..NpcInterior::default()
+            },
+        );
+        // live_named: no archive → not evictable.
+        s.npc_interior.insert(
+            "live_named".into(),
+            NpcInterior {
+                last_seen_minutes: 1,
+                ..NpcInterior::default()
+            },
+        );
+        // arch_fresh: archived recently.
+        s.npc_interior.insert(
+            "arch_fresh".into(),
+            NpcInterior {
+                archived: Some("stub".into()),
+                last_seen_minutes: 9_000,
+                ..NpcInterior::default()
+            },
+        );
+        // arch_stale: archived, oldest last_seen → the LRU victim.
+        s.npc_interior.insert(
+            "arch_stale".into(),
+            NpcInterior {
+                archived: Some("stub".into()),
+                last_seen_minutes: 2_000,
+                ..NpcInterior::default()
+            },
+        );
+        // A presence for arch_stale would pin it — ensure it's absent.
+        assert_eq!(
+            s.evict_archived_registry_entry().as_deref(),
+            Some("arch_stale"),
+            "the least-recently-seen archived discovered entry evicts"
+        );
+        assert!(s.npc_registry.find("arch_stale").is_none());
+        assert!(s.npc_interior.get("arch_stale").is_none());
+        assert!(s.npc_registry.find("pinned_core").is_some(), "core stays");
+        assert!(s.npc_registry.find("live_named").is_some(), "live stays");
+        assert!(s.npc_registry.find("arch_fresh").is_some(), "fresher archive stays");
+        // Present NPCs are pinned from eviction too.
+        s.presences = vec![Presence {
+            npc_id: "arch_fresh".into(),
+            name: "Fresh".into(),
+            stance: String::new(),
+            ttl: PRESENCE_GRACE_RESET,
+        }];
+        assert_eq!(
+            s.evict_archived_registry_entry(),
+            None,
+            "the only remaining archived entry is on-camera — nothing evicts"
+        );
+    }
+
+    #[test]
+    fn enforce_typed_caps_sweeps_orphan_interiors_and_caps_items() {
+        let mut s = WorldSchema::default();
+        s.npc_registry = NpcRegistry {
+            entries: vec![NpcEntry {
+                id: "mara".into(),
+                name: "Mara".into(),
+                role: String::new(),
+                tier: None,
+                aliases: vec![],
+                prominence: NpcProminence::Named,
+            }],
+        };
+        s.npc_interior.insert(
+            "ghost_npc".into(),
+            NpcInterior {
+                mood: Some("orphan".into()),
+                ..NpcInterior::default()
+            },
+        );
+        let mut hoarder = NpcInterior::default();
+        hoarder.items = (0..NPC_INTERIOR_ITEMS_MAX + 5)
+            .map(|i| equipment::StackItem {
+                name: format!("Item {i}"),
+                ..equipment::StackItem::default()
+            })
+            .collect();
+        s.npc_interior.insert("mara".into(), hoarder);
+        s.enforce_typed_caps();
+        assert!(!s.npc_interior.contains_key("ghost_npc"), "orphan interior swept");
+        assert_eq!(
+            s.npc_interior.get("mara").unwrap().items.len(),
+            NPC_INTERIOR_ITEMS_MAX,
+            "item rack caps FIFO"
+        );
+    }
+
+    /// The 3-file split routes npc_interior to the NPC slice (round-trips
+    /// through save_split + load_split via a temp dir).
+    #[test]
+    fn save_split_routes_npc_interior_to_npc_slice() {
+        let dir = std::env::temp_dir().join(format!("wupi-split-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let world_p = dir.join("world.json");
+        let player_p = dir.join("player.json");
+        let npc_p = dir.join("npc.json");
+        let mut s = WorldSchema::default();
+        s.npc_interior.insert(
+            "mara".into(),
+            NpcInterior {
+                mood: Some("suspicious".into()),
+                ..NpcInterior::default()
+            },
+        );
+        s.save_split(&world_p, &player_p, &npc_p).expect("save_split");
+        let npc_json: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&npc_p).expect("npc file"))
+                .expect("npc json");
+        assert!(
+            npc_json.get("npc_interior").is_some(),
+            "interior rides the npc slice: {npc_json}"
+        );
+        let world_json: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&world_p).expect("world file"))
+                .expect("world json");
+        assert!(world_json.get("npc_interior").is_none(), "not in the world slice");
+        let loaded = WorldSchema::load_split(&world_p, &player_p, &npc_p).expect("load_split");
+        assert_eq!(
+            loaded.npc_interior.get("mara").and_then(|i| i.mood.as_deref()),
+            Some("suspicious"),
+            "round-trips through the split"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Architectural invariant: presences is outside the LLM delta path
@@ -4959,6 +6246,7 @@ mod tests {
     fn npc_registry_resolve_matches_id_or_alias_case_insensitive() {
         let reg = NpcRegistry {
             entries: vec![NpcEntry {
+                prominence: NpcProminence::Named,
                 id: "mara_the_innkeep".into(),
                 name: "Mara".into(),
                 role: String::new(),
@@ -4979,6 +6267,7 @@ mod tests {
         let reg = NpcRegistry {
             entries: vec![
                 NpcEntry {
+                    prominence: NpcProminence::Named,
                     id: "mara_the_innkeep".into(),
                     name: "Mara".into(),
                     role: String::new(),
@@ -4986,6 +6275,7 @@ mod tests {
                     aliases: vec![],
                 },
                 NpcEntry {
+                    prominence: NpcProminence::Named,
                     id: "anon".into(),
                     name: String::new(),
                     role: String::new(),
@@ -5003,6 +6293,7 @@ mod tests {
     fn upsert_entry_inserts_new_npc() {
         let mut reg = NpcRegistry::default();
         let inserted = reg.upsert_entry(NpcEntry {
+            prominence: NpcProminence::Named,
             id: "coby".into(),
             name: "Coby".into(),
             role: "timid Marine recruit".into(),
@@ -5018,8 +6309,8 @@ mod tests {
     fn upsert_entry_is_idempotent_on_duplicate_id() {
         // Re-registering an existing id is a no-op (first writer wins).
         let mut reg = NpcRegistry::default();
-        reg.upsert_entry(NpcEntry { id: "coby".into(), name: "Coby".into(), role: String::new(), tier: None, aliases: vec![] });
-        let inserted = reg.upsert_entry(NpcEntry { id: "coby".into(), name: "DIFFERENT".into(), role: String::new(), tier: None, aliases: vec!["newalias".into()] });
+        reg.upsert_entry(NpcEntry { id: "coby".into(), name: "Coby".into(), role: String::new(), tier: None, aliases: vec![], prominence: NpcProminence::Named });
+        let inserted = reg.upsert_entry(NpcEntry { id: "coby".into(), name: "DIFFERENT".into(), role: String::new(), tier: None, aliases: vec!["newalias".into()], prominence: NpcProminence::Named });
         assert!(!inserted, "duplicate id returns false");
         assert_eq!(reg.entries.len(), 1);
         // Original entry preserved; new alias NOT merged (stable registry).
@@ -5030,7 +6321,7 @@ mod tests {
     #[test]
     fn upsert_entry_empty_id_returns_false() {
         let mut reg = NpcRegistry::default();
-        let inserted = reg.upsert_entry(NpcEntry { id: String::new(), name: "X".into(), role: String::new(), tier: None, aliases: vec![] });
+        let inserted = reg.upsert_entry(NpcEntry { id: String::new(), name: "X".into(), role: String::new(), tier: None, aliases: vec![], prominence: NpcProminence::Named });
         assert!(!inserted);
         assert!(reg.entries.is_empty());
     }

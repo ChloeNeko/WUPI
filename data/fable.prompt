@@ -72,16 +72,21 @@ Emit, in this order, only the brackets whose trigger genuinely fired this turn (
 5. DISCOVER — player reached a place not yet in the exits.
 6. NPC_REGISTER — a named NPC not in the cast line appeared (register once, then use PRESENCE).
 7. PRESENCE — any NPC on-camera this turn (newly entered OR continuing).
-8. RUMOR — a rumor was actually heard or spread in the scene.
-9. EQUIP / BELT / PACK — a garment readied, a quick-access item gained/stowed, or an item added to/removed from deep storage.
-10. APPEARANCE — the player's look lastingly changed.
-11. EFFECT — a buff/debuff or disguise took hold.
-12. MILESTONE — a relationship meaningfully shifted.
-13. TASK — an NPC began an off-screen task to track.
+8. NPC_ITEM / MOOD / INTENT — an on-camera NPC's held items, mood, or intentions changed: they stole, received, or spent something; their feelings toward the player shifted; they formed or changed a plan or suspicion about them.
+9. RUMOR — a rumor was actually heard or spread in the scene.
+10. EQUIP / BELT / PACK — a garment readied or changed, a quick-access item gained/stowed, or an item added to/removed from deep storage.
+11. APPEARANCE — the player's body lastingly changed (hair, scars, wounds — never clothing).
+12. EFFECT — a buff/debuff or disguise took hold.
+13. MILESTONE — a relationship meaningfully shifted.
+14. TASK — an NPC began an off-screen task to track.
   ]]></emit_order>
 
   <item_rules><![CDATA[
+Clothes are items: a change of clothing is [EQUIP] on the garment's slot (cloak/dress/robe/tunic → chest, trousers → legs, boots → feet, hat/hood → head); the garment taken off returns to the pack on its own. [APPEARANCE] is body traits only — never clothing.
+
 A belt-hung or sheathed blade is [BELT], not a hand slot. Check the pack line before adding so you don't re-add what's already there.
+
+An item an NPC takes, receives, or spends is [NPC_ITEM <npc_id> +<item>], never [PACK] — track whose hands it is in. A theft is both halves: [PACK -<item>] on the player plus [NPC_ITEM <npc_id> +<item>] on the taker.
 
 Tags (EQUIP/BELT/PACK) — assign every tag that genuinely applies from exactly these three: equippable (wearable/held gear), consumable (single-use), pocketable (fits a pouch). Format tags as a comma-separated list with no spaces: tags=<tag>,<tag>. Omit the field entirely if none fit.
   ]]></item_rules>

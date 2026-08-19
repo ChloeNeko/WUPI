@@ -18,8 +18,9 @@
 //!   the LLM). Drives the World Progression tick gate in `fable_send`.
 //! - `[APPEARANCE key=value]`: a dynamic change to the player's appearance
 //!   mid-session (Phase 4 Component 5, 2026-08-04). `key` ∈ a small
-//!   allowlist (hair_color / outfit / eye_color / scars / disguise / ...);
-//!   empty value clears. Rust writes ONLY into
+//!   allowlist (hair_color / eye_color / scars / disguise / ...); empty
+//!   value clears. Clothing is NOT here (2026-08-18 ruling) — garments are
+//!   inventory, tracked via `[EQUIP]`. Rust writes ONLY into
 //!   `PlayerState::current_appearance_deltas` — the SavedPlayer identity
 //!   baseline is never touched.
 //!
@@ -206,7 +207,7 @@ pub enum BracketCommand {
     },
     /// A dynamic change to the player's appearance mid-session (Phase 4
     /// Component 5, 2026-08-04). `key` is a stable trait id
-    /// ("hair_color", "outfit", "eye_color", "scars", "wounds", "tattoos",
+    /// ("hair_color", "eye_color", "scars", "wounds", "tattoos",
     /// "disguise", "breast_size", "ears", "tail", ...) and `value` is the
     /// diegetic new state the narrator just established in prose. Empty
     /// `value` is the clear sentinel for that key.
@@ -261,6 +262,39 @@ pub enum BracketCommand {
         remove: bool,
         item_tags: Vec<equipment::ItemTag>,
     },
+
+    /// (2026-08-18 Dedicated-NPC interior state) Add to (or remove from) a
+    /// named NPC's held items — the steal/receive/spend verb.
+    /// `[NPC_ITEM mara +"Worn Ring" qty=1]` adds; `[NPC_ITEM mara -ring]`
+    /// removes; a bare body (no `+`/`-`) adds. The npc_id is the bare first
+    /// token (a surface form — the applier resolves it via
+    /// `resolve_npc_surface`, same as PRESENCE). The item name runs the same
+    /// `clean_item_name` gate as BELT/PACK. Named `item_name`/`qty`/`remove`/
+    /// `item_tags` to avoid the `kind` discriminator (see the enum-level
+    /// note).
+    NpcItem {
+        npc_id: String,
+        item_name: String,
+        qty: u32,
+        remove: bool,
+        item_tags: Vec<equipment::ItemTag>,
+    },
+
+    /// (2026-08-18) `[MOOD <npc_id> <label>]` — an on-camera NPC's emotional
+    /// state shifted ("suspicious", "warming"). Quoted or bare label (the
+    /// PRESENCE stance convention), flattened + capped at
+    /// `MOOD_LABEL_MAX`. The payload field is named `mood` (not `label`)
+    /// so the JSON-dual inference can tell a mood body from a rumor body.
+    Mood { npc_id: String, mood: String },
+
+    /// (2026-08-18) `[INTENT <npc_id> <one-line plan or suspicion>]` — what
+    /// that NPC now intends or believes about the player ("get her out
+    /// before she checks the display case"). This is DISTILLED state the
+    /// tracker deliberately emits as a declarative — never verbatim model
+    /// thought (§3.4: the model never re-reads its own reasoning); the
+    /// narrator consumes it as world state and plays the lie/scheme
+    /// accordingly. Flattened + capped at `INTENT_MAX`.
+    Intent { npc_id: String, intent: String },
 }
 
 /// The result of parsing narrator output: the bracket commands found + the
@@ -706,6 +740,11 @@ const NPC_TIER_MAX: usize = 20;
 /// discipline as the stance/name gates.
 const EFFECT_LABEL_MAX: usize = 80;
 const TASK_DESC_MAX: usize = 160;
+/// (2026-08-18 Dedicated-NPC interior state) Free-text caps for the
+/// MOOD/INTENT labels — same discipline as the stance/label gates: short
+/// diegetic reads, not paragraphs.
+const MOOD_LABEL_MAX: usize = 60;
+const INTENT_MAX: usize = 160;
 
 /// Parse the optional `key=value` tail of a `[DISCOVER node_id ...]` bracket.
 /// Recognized keys: `name` (diegetic label — may contain spaces when quoted),
@@ -766,6 +805,13 @@ fn parse_npc_register_kv(tail: &str) -> (String, String, Option<String>) {
 /// is the rejection authority: it stops the narrator from injecting
 /// arbitrary keys (e.g. "name", "wealth") that would collide with other
 /// state. The Player Creator's slide ids mirror these exactly.
+///
+/// (2026-08-18 ruling) `outfit` is RETIRED — clothing is inventory now, not
+/// an appearance trait: garment changes flow through `[EQUIP]` (the displaced
+/// garment returns to the pack) and the `equipped:` world-state line is the
+/// narrator's clothing read. A legacy `[APPEARANCE outfit=…]` emission is
+/// rejected like any unknown key (the prompt no longer teaches it; old saves
+/// migrate the stored delta at `load_split`).
 const APPEARANCE_KEYS: &[&str] = &[
     "body_type",
     "breast_size",
@@ -776,7 +822,6 @@ const APPEARANCE_KEYS: &[&str] = &[
     "hair_length",
     "hair_style",
     "horn",
-    "outfit",
     "scars",
     "skin_complexion",
     "tail",
@@ -786,8 +831,8 @@ const APPEARANCE_KEYS: &[&str] = &[
 
 /// Per-value cap for `[APPEARANCE key=value]`. Tighter than the schema
 /// prose cap — these are trait labels, not paragraphs. Generous enough for
-/// a multi-garment outfit line ("bloodstained leather, travel cloak,
-/// muddy boots").
+/// a rich wound/scar description ("three parallel claw marks, still
+/// weeping").
 const APPEARANCE_VALUE_MAX: usize = 200;
 
 /// Per-value cap for `[DATE value]` (2026-08-13). A rich calendar label
@@ -1267,6 +1312,90 @@ fn parse_pack(rest: &str) -> Option<BracketCommand> {
     })
 }
 
+/// `[NPC_ITEM <npc_id> +<item> (qty=N) (tags=<tags>)]` (add) or
+/// `[NPC_ITEM <npc_id> -<item>]` (remove) — (2026-08-18 Dedicated-NPC
+/// interior state) an NPC's held-item mutation (steals, receives, spends).
+/// The npc_id is the bare first token (the PRESENCE convention — the
+/// applier resolves the surface form); the remainder is a BELT-style body
+/// where a leading `+` marks add (also the default when bare) and `-`
+/// marks remove. Returns `None` for an empty id, an empty body, or a name
+/// the `clean_item_name` gate drops.
+fn parse_npc_item(rest: &str) -> Option<BracketCommand> {
+    let rest = rest.trim();
+    let mut iter = rest.splitn(2, char::is_whitespace);
+    let npc_id = iter.next().unwrap_or("").trim().to_string();
+    if npc_id.is_empty() {
+        return None;
+    }
+    let body = iter.next().unwrap_or("").trim();
+    // `+`/`-` add/remove markers (both optional in spirit — bare = add, the
+    // ergonomic default; `-` is the only explicit remove signal).
+    let (remove, body) = if let Some(stripped) = body.strip_prefix('-') {
+        (true, stripped.trim())
+    } else if let Some(stripped) = body.strip_prefix('+') {
+        (false, stripped.trim())
+    } else {
+        (false, body)
+    };
+    if body.is_empty() {
+        return None;
+    }
+    if remove {
+        // No kv tail on the remove form — the body is the bare name (the
+        // BELT/PACK remove rule).
+        let n = clean_item_name(&remove_form_name(body))?;
+        return Some(BracketCommand::NpcItem {
+            npc_id,
+            item_name: n,
+            qty: 0,
+            remove: true,
+            item_tags: Vec::new(),
+        });
+    }
+    // Add form: kv tail (name=/qty=/tags=), bare body = the whole name (the
+    // BELT/PACK multi-word bare rule — `[NPC_ITEM mara +Worn Ring]`).
+    let kvs = tokenize_kv(body);
+    let mut name = String::new();
+    let mut qty: u32 = 1;
+    let mut qty_zero_remove = false;
+    let mut tags_str = String::new();
+    for (k, v) in kvs {
+        match k.as_str() {
+            "name" | "item" => name = v,
+            "qty" | "count" | "n" => {
+                qty = v
+                    .parse::<u64>()
+                    .map(|n| n.min(u32::MAX as u64) as u32)
+                    .unwrap_or(1);
+                if qty == 0 {
+                    qty_zero_remove = true;
+                    qty = 1;
+                }
+            }
+            "tags" | "tag" => tags_str = v,
+            _ => {}
+        }
+    }
+    if name.is_empty() {
+        if !body.contains('=') {
+            name = body.to_string();
+        } else {
+            let first_token = body.split_whitespace().next().unwrap_or("");
+            if !first_token.is_empty() && !first_token.contains('=') {
+                name = first_token.to_string();
+            }
+        }
+    }
+    let n = clean_item_name(&name)?;
+    Some(BracketCommand::NpcItem {
+        npc_id,
+        item_name: n,
+        qty,
+        remove: qty_zero_remove,
+        item_tags: equipment::parse_tag_list(&tags_str),
+    })
+}
+
 
 // The two-path-sync contract (stream_filter::with_brackets regex MUST mirror
 // parse_one's recognized prefixes — the documented 2026-07-28 drift-leak
@@ -1461,6 +1590,9 @@ fn json_value_to_command(obj: &serde_json::Map<String, serde_json::Value>) -> Op
         "presence" | "onscreen" | "onstage" | "present" => json_to_presence(obj),
         "discover" | "discover_location" | "new_location" | "establish" => json_to_discover(obj),
         "npc_register" | "register_npc" | "register" | "introduce_npc" => json_to_npc_register(obj),
+        "npc_item" | "npc_inventory" | "npc_holding" => json_to_npc_item(obj),
+        "mood" | "npc_mood" | "emotion" => json_to_mood(obj),
+        "intent" | "npc_intent" | "intention" => json_to_intent(obj),
         "appearance" | "look" | "outfit_change" => json_to_appearance(obj),
         "equip" | "equipment" | "wear" => json_to_equip(obj),
         "belt" | "quick" | "quick_slot" => json_to_belt(obj),
@@ -1540,6 +1672,30 @@ fn infer_kind_from_fields(obj: &serde_json::Map<String, serde_json::Value>) -> O
         .any(|k| matches!(*k, "node_id" | "place" | "neighbors" | "exits"))
     {
         return Some("discover".to_string());
+    }
+    // (2026-08-18 Dedicated-NPC interior state) MOOD/INTENT/NPC_ITEM:
+    // npc_id + a distinguishing field (`mood`, `intent`, `item_name`).
+    // MUST run BEFORE the rumor `label|text` claim below — a mood/intent
+    // body may carry a generic `text` alias, and rumor's claim is otherwise
+    // unconditional. The mood/intent/item_name keys appear in NO other
+    // variant's grammar (npc_register wants role/tier, presence wants
+    // stance/location — both handled below/above without overlap).
+    if keys.iter().any(|k| matches!(*k, "npc_id" | "npc")) {
+        if keys
+            .iter()
+            .any(|k| matches!(*k, "mood" | "emotion" | "feeling"))
+        {
+            return Some("mood".to_string());
+        }
+        if keys
+            .iter()
+            .any(|k| matches!(*k, "intent" | "intention" | "plan" | "goal"))
+        {
+            return Some("intent".to_string());
+        }
+        if keys.iter().any(|k| matches!(*k, "item_name" | "item")) {
+            return Some("npc_item".to_string());
+        }
     }
     // Rumor: label / text / gossip / hearsay (Component 4, 2026-07-28). Placed
     // before the weather single-`condition` rule so a `{"label": ...}` body
@@ -2234,6 +2390,109 @@ fn json_to_presence(obj: &serde_json::Map<String, serde_json::Value>) -> Option<
     Some(BracketCommand::Presence { npc_id, stance })
 }
 
+/// Parse a `{"kind": "npc_item", ...}` JSON body — (2026-08-18
+/// Dedicated-NPC interior state) the JSON dual of `[NPC_ITEM]`. npc_id from
+/// `npc_id`/`npc`; item name from `item_name`/`item`/`name` through the
+/// same `clean_item_name` gate as the text form; `qty` clamped u32 (0 =
+/// remove, the BELT rule); `remove` as an explicit bool; tags via the
+/// shared `parse_json_tags`. Empty npc_id or a dropped name → None.
+fn json_to_npc_item(obj: &serde_json::Map<String, serde_json::Value>) -> Option<BracketCommand> {
+    let npc_id = obj
+        .get("npc_id")
+        .or_else(|| obj.get("npc"))
+        .and_then(|v| v.as_str())?
+        .trim()
+        .to_string();
+    if npc_id.is_empty() {
+        return None;
+    }
+    let name_raw = obj
+        .get("item_name")
+        .or_else(|| obj.get("item"))
+        .or_else(|| obj.get("name"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let item_name = clean_item_name(name_raw)?;
+    let mut qty = obj
+        .get("qty")
+        .or_else(|| obj.get("count"))
+        .and_then(|v| v.as_u64())
+        .map(|n| n.min(u32::MAX as u64) as u32)
+        .unwrap_or(1);
+    let mut remove = obj
+        .get("remove")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    if qty == 0 {
+        remove = true;
+        qty = 1;
+    }
+    Some(BracketCommand::NpcItem {
+        npc_id,
+        item_name,
+        qty,
+        remove,
+        item_tags: parse_json_tags(obj),
+    })
+}
+
+/// Parse a `{"kind": "mood", ...}` JSON body — (2026-08-18) the JSON dual
+/// of `[MOOD]`. npc_id from `npc_id`/`npc`; the label from `mood`/
+/// `emotion`/`feeling` through the same `clean_free_text` gate as the text
+/// form. Empty npc_id or label → None.
+fn json_to_mood(obj: &serde_json::Map<String, serde_json::Value>) -> Option<BracketCommand> {
+    let npc_id = obj
+        .get("npc_id")
+        .or_else(|| obj.get("npc"))
+        .and_then(|v| v.as_str())?
+        .trim()
+        .to_string();
+    if npc_id.is_empty() {
+        return None;
+    }
+    let mood = clean_free_text(
+        obj.get("mood")
+            .or_else(|| obj.get("emotion"))
+            .or_else(|| obj.get("feeling"))
+            .and_then(|v| v.as_str())
+            .unwrap_or(""),
+        MOOD_LABEL_MAX,
+    );
+    if mood.is_empty() {
+        return None;
+    }
+    Some(BracketCommand::Mood { npc_id, mood })
+}
+
+/// Parse a `{"kind": "intent", ...}` JSON body — (2026-08-18) the JSON dual
+/// of `[INTENT]`. npc_id from `npc_id`/`npc`; the text from `intent`/
+/// `intention`/`plan`/`goal` through the same `clean_free_text` gate as the
+/// text form. Empty npc_id or text → None.
+fn json_to_intent(obj: &serde_json::Map<String, serde_json::Value>) -> Option<BracketCommand> {
+    let npc_id = obj
+        .get("npc_id")
+        .or_else(|| obj.get("npc"))
+        .and_then(|v| v.as_str())?
+        .trim()
+        .to_string();
+    if npc_id.is_empty() {
+        return None;
+    }
+    let intent = clean_free_text(
+        obj.get("intent")
+            .or_else(|| obj.get("intention"))
+            .or_else(|| obj.get("plan"))
+            .or_else(|| obj.get("goal"))
+            .and_then(|v| v.as_str())
+            .unwrap_or(""),
+        INTENT_MAX,
+    );
+    if intent.is_empty() {
+        return None;
+    }
+    Some(BracketCommand::Intent { npc_id, intent })
+}
+
 /// Parse a `{"kind": "discover", ...}` JSON body (dynamic world-seeding).
 /// `node_id` from `node_id`/`location`/`place` (model flexibility); `name`
 /// from `name`/`label`; `setting` from `setting`/`type`; `neighbors` from a
@@ -2432,10 +2691,13 @@ fn parse_one(bracket: &str, text_after: &str) -> Option<(BracketCommand, usize)>
 
     // [APPEARANCE key=value] / [APPEARANCE key] — Phase 4 Component 5
     // (2026-08-04). Single-region. `key` is a stable trait id drawn from a
-    // small allowlist (hair_color / hair_length / hair_style / outfit /
-    // eye_color / body_type / skin_complexion / scars / wounds / tattoos /
+    // small allowlist (hair_color / hair_length / hair_style / eye_color /
+    // body_type / skin_complexion / scars / wounds / tattoos /
     // disguise / breast_size / ears / tail); `value` is the diegetic new
     // state. The bare form `[APPEARANCE key]` (no `=`) clears that key.
+    // `outfit` is retired (2026-08-18): clothing is inventory — garments
+    // arrive via `[EQUIP]`, and a legacy `outfit` emission rejects like any
+    // unknown key.
     // Unknown keys + oversize/contaminated values drop silently (same
     // leniency as every other parser — the narrator is a compact local
     // model, we tolerate noise). Case-insensitive verb via `strip_prefix_ci`; the
@@ -2662,6 +2924,65 @@ fn parse_one(bracket: &str, text_after: &str) -> Option<(BracketCommand, usize)>
             },
             0,
         ));
+    }
+
+    // [NPC_ITEM <npc_id> +<item> (qty=N)] / [NPC_ITEM <npc_id> -<item>] —
+    // (2026-08-18 Dedicated-NPC interior state) an NPC's held-item mutation:
+    // steals, receives, spends. First token = npc_id surface form (the
+    // applier resolves it via `resolve_npc_surface`); remainder = BELT-style
+    // body with `+`/`-` add/remove markers (bare = add). See
+    // `parse_npc_item`. Prefix-safe vs NPC_REGISTER (they diverge at the 4th
+    // char — neither is a prefix of the other). The JSON form
+    // `{"kind":"npc_item",...}` is handled by the manual dispatch in
+    // `parse_json_command` (`json_to_npc_item`).
+    if let Some(rest) = strip_prefix_ci(bracket, "NPC_ITEM") {
+        if let Some(cmd) = parse_npc_item(rest) {
+            return Some((cmd, 0));
+        }
+        return None;
+    }
+
+    // [MOOD <npc_id> <label>] — (2026-08-18 Dedicated-NPC interior state) an
+    // on-camera NPC's emotional state shifted ("suspicious", "warming").
+    // First token = npc_id surface form; remainder = quoted-or-bare label
+    // (the PRESENCE stance convention), flattened + capped via
+    // `clean_free_text`. Empty npc_id or empty label → None (literal prose).
+    // The JSON form `{"kind":"mood","npc_id":"...","mood":"..."}` is
+    // handled by the manual dispatch (`json_to_mood`).
+    if let Some(rest) = strip_prefix_ci(bracket, "MOOD") {
+        let rest = rest.trim();
+        let mut iter = rest.splitn(2, char::is_whitespace);
+        let npc_id = iter.next().unwrap_or("").trim().to_string();
+        let label_raw = iter.next().unwrap_or("").trim();
+        if npc_id.is_empty() {
+            return None;
+        }
+        let mood = clean_free_text(&strip_one_quote_pair(label_raw), MOOD_LABEL_MAX);
+        if mood.is_empty() {
+            return None;
+        }
+        return Some((BracketCommand::Mood { npc_id, mood }, 0));
+    }
+
+    // [INTENT <npc_id> <one-line plan or suspicion>] — (2026-08-18
+    // Dedicated-NPC interior state) what that NPC now intends or believes
+    // about the player. Same shape as MOOD with the larger `INTENT_MAX`
+    // budget (a full clause, not a label). The JSON form
+    // `{"kind":"intent",...}` is handled by the manual dispatch
+    // (`json_to_intent`).
+    if let Some(rest) = strip_prefix_ci(bracket, "INTENT") {
+        let rest = rest.trim();
+        let mut iter = rest.splitn(2, char::is_whitespace);
+        let npc_id = iter.next().unwrap_or("").trim().to_string();
+        let text_raw = iter.next().unwrap_or("").trim();
+        if npc_id.is_empty() {
+            return None;
+        }
+        let intent = clean_free_text(&strip_one_quote_pair(text_raw), INTENT_MAX);
+        if intent.is_empty() {
+            return None;
+        }
+        return Some((BracketCommand::Intent { npc_id, intent }, 0));
     }
 
     // [TIME <in-world timestamp>] — Seam #4 clock advance. Single-region like
@@ -4713,6 +5034,151 @@ mod tests {
         assert!(parsed.prose.contains("[PRESENCE]"));
     }
 
+    // ─────────────────────────────────────────────────────────────────────
+    // (2026-08-18 Dedicated-NPC interior state) NPC_ITEM / MOOD / INTENT —
+    // the NPC-interior verbs. Same pin discipline as the families above.
+    // ─────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn npc_item_add_remove_and_bare_forms() {
+        // `+` add with a quoted multi-word name.
+        let parsed = parse("[NPC_ITEM mara +\"Worn Ring\" qty=1]");
+        assert_eq!(parsed.commands.len(), 1);
+        assert_eq!(
+            parsed.commands[0],
+            BracketCommand::NpcItem {
+                npc_id: "mara".into(),
+                item_name: "Worn Ring".into(),
+                qty: 1,
+                remove: false,
+                item_tags: Vec::new(),
+            }
+        );
+        // `-` remove: the body is the whole bare name.
+        let parsed = parse("[NPC_ITEM mara -Worn Ring]");
+        assert_eq!(
+            parsed.commands[0],
+            BracketCommand::NpcItem {
+                npc_id: "mara".into(),
+                item_name: "Worn Ring".into(),
+                qty: 0,
+                remove: true,
+                item_tags: Vec::new(),
+            }
+        );
+        // Bare body (no marker) = add — the ergonomic default.
+        let parsed = parse("[NPC_ITEM captain-harsk Ale]");
+        assert!(matches!(
+            &parsed.commands[0],
+            BracketCommand::NpcItem { remove: false, item_name, .. } if item_name == "Ale"
+        ));
+        // name= kv form with qty.
+        let parsed = parse("[NPC_ITEM mara +name=\"Silver Locket\" qty=2]");
+        assert!(matches!(
+            &parsed.commands[0],
+            BracketCommand::NpcItem { item_name, qty: 2, remove: false, .. } if item_name == "Silver Locket"
+        ));
+    }
+
+    #[test]
+    fn npc_item_case_insensitive_and_prefix_safe() {
+        // Case-insensitive verb; NPC_ITEM never collides with NPC_REGISTER
+        // (they diverge at the 4th char — neither is a prefix of the other).
+        let parsed = parse("[npc_item mara +Ring]");
+        assert!(matches!(&parsed.commands[0], BracketCommand::NpcItem { .. }));
+        let parsed = parse("[NPC_REGISTER coby name=Coby]");
+        assert!(matches!(&parsed.commands[0], BracketCommand::NpcRegister { .. }));
+        // And the reverse order in the same turn — both parse.
+        let parsed = parse("[NPC_REGISTER coby name=Coby] [NPC_ITEM coby +Bread]");
+        assert_eq!(parsed.commands.len(), 2);
+    }
+
+    #[test]
+    fn npc_item_malformed_emitted_as_literal_prose() {
+        // Empty body after the id → literal prose (mirrors PRESENCE).
+        let parsed = parse("Odd text [NPC_ITEM mara] trailing.");
+        assert_eq!(parsed.commands.len(), 0);
+        assert!(parsed.prose.contains("[NPC_ITEM mara]"));
+        // A name the clean_item_name gate drops (1-char fragment) → literal.
+        let parsed = parse("[NPC_ITEM mara +\" ]");
+        assert_eq!(parsed.commands.len(), 0);
+    }
+
+    #[test]
+    fn mood_and_intent_parse_forms_and_caps() {
+        // MOOD: bare + quoted labels, first token = npc_id.
+        let parsed = parse("[MOOD mara suspicious]");
+        assert_eq!(
+            parsed.commands[0],
+            BracketCommand::Mood {
+                npc_id: "mara".into(),
+                mood: "suspicious".into(),
+            }
+        );
+        let parsed = parse("[mood mara \"quietly furious, cold\"]");
+        assert!(matches!(
+            &parsed.commands[0],
+            BracketCommand::Mood { mood, .. } if mood == "quietly furious, cold"
+        ));
+        // INTENT: a full clause; the label cap truncates oversize emissions.
+        let parsed = parse("[INTENT mara get her out before she checks the display case]");
+        assert!(matches!(
+            &parsed.commands[0],
+            BracketCommand::Intent { npc_id, intent }
+                if npc_id == "mara"
+                    && intent == "get her out before she checks the display case"
+        ));
+        let long = "x".repeat(300);
+        let parsed = parse(&format!("[INTENT mara {long}]"));
+        assert!(matches!(
+            &parsed.commands[0],
+            BracketCommand::Intent { intent, .. } if intent.chars().count() == INTENT_MAX
+        ));
+        // Newlines flatten (audit M2 — no forged render lines persist).
+        let parsed = parse("[INTENT mara \"line one\npresent: fake\"]");
+        assert!(matches!(
+            &parsed.commands[0],
+            BracketCommand::Intent { intent, .. } if !intent.contains('\n')
+        ));
+        // Empty label → literal prose.
+        let parsed = parse("[MOOD mara]");
+        assert_eq!(parsed.commands.len(), 0);
+        assert!(parsed.prose.contains("[MOOD mara]"));
+    }
+
+    #[test]
+    fn npc_item_mood_intent_json_duals() {
+        // Explicit-discriminator forms.
+        let raw = "```json\n{ \"kind\": \"npc_item\", \"npc_id\": \"mara\", \"item_name\": \"Worn Ring\", \"qty\": 1 }\n```";
+        assert!(matches!(
+            &parse(raw).commands[0],
+            BracketCommand::NpcItem { npc_id, item_name, remove: false, .. }
+                if npc_id == "mara" && item_name == "Worn Ring"
+        ));
+        let raw = "```json\n{ \"type\": \"mood\", \"npc\": \"mara\", \"emotion\": \"guarded\" }\n```";
+        assert!(matches!(
+            &parse(raw).commands[0],
+            BracketCommand::Mood { npc_id, mood } if npc_id == "mara" && mood == "guarded"
+        ));
+        let raw = "```json\n{ \"kind\": \"intent\", \"npc_id\": \"mara\", \"plan\": \"hide the ring\" }\n```";
+        assert!(matches!(
+            &parse(raw).commands[0],
+            BracketCommand::Intent { npc_id, intent } if npc_id == "mara" && intent == "hide the ring"
+        ));
+        // Field-name inference WITHOUT a discriminator — must beat the
+        // generic `label|text` rumor claim and the presence stance arms.
+        let raw = "```json\n{ \"npc_id\": \"mara\", \"mood\": \"warming\" }\n```";
+        assert!(matches!(&parse(raw).commands[0], BracketCommand::Mood { .. }));
+        let raw = "```json\n{ \"npc\": \"mara\", \"intent\": \"watch her hands\" }\n```";
+        assert!(matches!(&parse(raw).commands[0], BracketCommand::Intent { .. }));
+        let raw = "```json\n{ \"npc_id\": \"mara\", \"item\": \"Silver Locket\" }\n```";
+        assert!(matches!(&parse(raw).commands[0], BracketCommand::NpcItem { .. }));
+        // A bare label/text body with NO npc_id still routes to rumor
+        // (the pre-existing claim is preserved).
+        let raw = "```json\n{ \"label\": \"the captain is looking for someone\" }\n```";
+        assert!(matches!(&parse(raw).commands[0], BracketCommand::Rumor { .. }));
+    }
+
     #[test]
     fn json_presence_kind_dispatches() {
         // The JSON form `{"kind": "presence", "npc_id": "...", "stance": "..."}`.
@@ -5018,14 +5484,30 @@ mod tests {
     #[test]
     fn appearance_bracket_oversize_value_dropped() {
         let huge = "x".repeat(201);
-        let raw = format!("[APPEARANCE outfit={}]", huge);
+        let raw = format!("[APPEARANCE scars={}]", huge);
         assert!(parse(&raw).commands.is_empty());
     }
 
     #[test]
     fn appearance_bracket_control_char_value_dropped() {
-        let raw = "[APPEARANCE outfit=leather\0cloak]";
+        let raw = "[APPEARANCE scars=brand\0marked]";
         assert!(parse(raw).commands.is_empty());
+    }
+
+    /// (2026-08-18 clothing-as-inventory ruling) `outfit` is retired from
+    /// the allowlist — a legacy tracker emission rejects like any unknown
+    /// key (text form, JSON form, and any `look`-style alias attempt) so
+    /// clothing state can only ever enter through `[EQUIP]`.
+    #[test]
+    fn appearance_outfit_key_retired() {
+        let parsed = parse("[APPEARANCE outfit=silk gown]");
+        assert!(parsed.commands.is_empty(), "text form retired");
+        let parsed = parse("[APPEARANCE look=silk gown]");
+        assert!(parsed.commands.is_empty(), "unknown key stays rejected");
+        let body = r#"```json
+{"kind":"appearance","key":"outfit","value":"silk gown"}
+```"#;
+        assert!(parse(body).commands.is_empty(), "JSON form retired");
     }
 
     #[test]
@@ -5044,14 +5526,14 @@ mod tests {
     #[test]
     fn appearance_json_explicit_kind_dispatches() {
         let body = r#"```json
-{"kind":"appearance","key":"outfit","value":"bloodstained leather, travel cloak"}
+{"kind":"appearance","key":"hair_color","value":"wind-tangled auburn"}
 ```"#;
         let parsed = parse(body);
         assert_eq!(parsed.commands.len(), 1);
         match &parsed.commands[0] {
             BracketCommand::Appearance { key, value } => {
-                assert_eq!(key, "outfit");
-                assert_eq!(value, "bloodstained leather, travel cloak");
+                assert_eq!(key, "hair_color");
+                assert_eq!(value, "wind-tangled auburn");
             }
             other => panic!("expected Appearance, got {:?}", other),
         }

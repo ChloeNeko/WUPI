@@ -237,3 +237,16 @@ pub const FABLE_ACTION_CHAR_CAP: usize = 4000;
 /// (2026-08-09, 2026-08-10 T52, 2026-08-16 playtest: 5→687 tokens dropped
 /// over 16 turns), which is why overflow is now a hard error in tracker mode.
 pub const TRACKER_PROMPT_CHAR_BUDGET: usize = 9_800;
+
+/// (2026-08-18 Dedicated-NPC reaper — Chloe's 3-tier / Garbage-Collector
+/// ruling) In-world days a `named` (discovered, non-authored) NPC's interior
+/// state survives without contact before the world-tick reaper archives it
+/// (mood/intent/items compressed into a one-line stub; the registry entry +
+/// relationship survive). Authored `core` NPCs are reaper-immune forever.
+/// Measured on the WORLD CLOCK (`WorldSchema::world_clock.current_minutes`),
+/// not wall-clock; `last_seen_minutes` is stamped by every `[PRESENCE]`
+/// assert + interior mutation. 30 days = the "shopkeeper you stopped
+/// visiting" horizon — long enough that an active recurring cast never
+/// archives (any contact refreshes the stamp), short enough that a long
+/// campaign's tail of one-meeting NPCs compresses instead of accumulating.
+pub const NPC_REAP_NAMED_AFTER_DAYS: i64 = 30;

@@ -81,7 +81,6 @@ const DEV_SCHEMA = {
     reputation: -2,
     current_appearance_deltas: {
       hair_color: 'greasy black, tied back',
-      outfit: 'dented leather cuirass, road-worn cloak',
       scars: 'jagged line across the right cheek',
       wounds: 'limping badly; right arm strapped',
     },

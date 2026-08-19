@@ -19,17 +19,18 @@ use std::collections::{BTreeMap, HashMap};
 // The six equipment slots — map 1:1 to body-part anchors on the paperdoll.
 // ---------------------------------------------------------------------------
 
-/// An equipment slot. Each maps to a body-part bbox anchor the frontend renders
-/// a dashed-brass node against (see `equipment-overlay.js`):
+/// An equipment slot. Each maps to a Soul Gem inspection-panel category
+/// (see `inventory-panel.js` `CATEGORY_MAP` — Head/TOP/HAND/BOTTOM/Feet gems;
+/// the hands share one gem, the BOTTOM gem also carries the belt):
 ///
-/// | Slot      | Body-part anchor (frontend `getHitbox` id) |
-/// |-----------|--------------------------------------------|
-/// | `Head`    | `head`                                     |
-/// | `Chest`   | `upper_torso`                              |
-/// | `MainHand`| `right_hand`                               |
-/// | `OffHand` | `left_hand`                                |
-/// | `Legs`    | `lower_torso`                              |
-/// | `Feet`    | midpoint of `left_foot` / `right_foot`     |
+/// | Slot      | Panel category (`CATEGORY_MAP` key)          |
+/// |-----------|----------------------------------------------|
+/// | `Head`    | `head`                                       |
+/// | `Chest`   | `chest` (TOP gem)                            |
+/// | `MainHand`| `hand` (shared with OffHand)                 |
+/// | `OffHand` | `hand` (shared with MainHand)                |
+/// | `Legs`    | `leg` (BOTTOM gem, shared with the belt)     |
+/// | `Feet`    | `foot`                                       |
 ///
 /// Serialization is snake_case (`"main_hand"`) so it round-trips cleanly through
 /// JSON; the bracket parser lowercases + matches against the canonical form.
@@ -530,11 +531,13 @@ fn noun_phrase_windows(text: &str) -> Vec<(String, Vec<String>)> {
 // Legacy migration: item_*/inv_* entity keys → typed inventory (one-shot).
 // ---------------------------------------------------------------------------
 
-/// Keyword→slot routing for the legacy `item_*`/`inv_*` entity migration. Pure
-/// heuristic on the lowercased name: a sword/axe/mace routes to MainHand, a
-/// shield to OffHand, etc. Anything that doesn't match returns `None` → the
-/// item lands in the pack instead. Mirrors the (deleted) `panels/inventory.js`
-/// glyph-picker heuristic, adapted to slot routing.
+/// Keyword→slot routing for the legacy `item_*`/`inv_*` entity migration AND
+/// the Player Creator's clothing chips (2026-08-18 clothing-as-inventory
+/// ruling — one router, one vocabulary). Pure heuristic on the lowercased
+/// name: a sword/axe/mace routes to MainHand, a shield to OffHand, etc.
+/// Anything that doesn't match returns `None` → the item lands in the pack
+/// instead. Mirrors the (deleted) `panels/inventory.js` glyph-picker
+/// heuristic, adapted to slot routing.
 fn route_legacy_to_slot(name_lower: &str) -> Option<EquipSlot> {
     // Cheap substring scan (no regex). Order matters: the first match wins,
     // mirroring the deleted panel's glyph-picker heuristic.
@@ -547,19 +550,35 @@ fn route_legacy_to_slot(name_lower: &str) -> Option<EquipSlot> {
     if contains_any(name_lower, &["shield", "buckler", "targe"]) {
         return Some(EquipSlot::OffHand);
     }
-    if contains_any(name_lower, &["helm", "helmet", "hat", "hood", "cap", "crown"]) {
-        return Some(EquipSlot::Head);
-    }
+    // Chest runs BEFORE Head (2026-08-18): "cape" contains the Head needle
+    // "cap", and a "hooded cloak" is a garment — body coverage outranks the
+    // head mention in a compound name.
     if contains_any(
         name_lower,
-        &["armor", "armour", "chestplate", "breastplate", "cuirass", "vest"],
+        &[
+            // Armor family.
+            "armor", "armour", "chestplate", "breastplate", "cuirass", "vest",
+            // Everyday garments (2026-08-18): clothing is inventory — a
+            // cloak/tunic/dress/robe routes like any other worn thing. One-
+            // piece garments (dress/robe/gown) anchor Chest: they dominate
+            // the torso read + layer under a cloak exactly like the
+            // "Heavy Cloak over Linen Shirt" example.
+            "cloak", "cape", "mantle", "tunic", "shirt", "blouse", "dress", "robe",
+            "gown", "bodice", "surcoat", "doublet", "jerkin", "tabard", "corset",
+        ],
     ) {
         return Some(EquipSlot::Chest);
     }
-    if contains_any(name_lower, &["legging", "pants", "trouser", "greave", "skirt"]) {
+    if contains_any(name_lower, &["helm", "helmet", "hat", "hood", "cap", "crown"]) {
+        return Some(EquipSlot::Head);
+    }
+    if contains_any(name_lower, &["legging", "pants", "trouser", "greave", "skirt", "kilt", "breeches"]) {
         return Some(EquipSlot::Legs);
     }
-    if contains_any(name_lower, &["boot", "sabaton", "shoe", "sandal"]) {
+    if contains_any(
+        name_lower,
+        &["boot", "sabaton", "shoe", "sandal", "slipper", "stocking", "sock"],
+    ) {
         return Some(EquipSlot::Feet);
     }
     None
@@ -707,6 +726,119 @@ fn prettify(slug: &str) -> String {
         .filter(|s| !s.is_empty())
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+// ---------------------------------------------------------------------------
+// (2026-08-18 clothing-as-inventory ruling) Clothing seeds / migrates into
+// the typed inventory — it is NOT an identity or appearance line.
+// ---------------------------------------------------------------------------
+
+/// Split a legacy `outfit` appearance-delta line ("bloodstained leather,
+/// travel cloak, muddy boots") into per-garment chips. The historical seed
+/// comma-joined the Player Creator's chip list into one delta value, so the
+/// comma split is exact for authored data and a fine heuristic for tracker
+/// output. Each chip is trimmed + capped at
+/// `crate::bracket_parser::INV_NAME_MAX` (the same discipline
+/// `clean_item_name` applies to bracket emissions — a 256-char TRAIT_MAX
+/// chip must not become a paragraph-named inventory item). Empty chips drop.
+pub fn split_outfit_line(line: &str) -> Vec<String> {
+    line.split(',')
+        .map(|c| {
+            let capped: String = c.trim().chars().take(crate::bracket_parser::INV_NAME_MAX).collect();
+            capped.trim().to_string()
+        })
+        .filter(|c| !c.is_empty())
+        .collect()
+}
+
+/// Seed authored clothing chips into the typed inventory. Used at BOTH
+/// chokepoints: `enter_fable_session` (a fresh New Game's SavedPlayer chip
+/// list — the one-time starting kit) and `WorldSchema::load_split` (the
+/// legacy `outfit` appearance-delta migration). Garments route to their body
+/// slots via [`route_legacy_to_slot`] (cloak/dress/robe → Chest, trousers →
+/// Legs, boots → Feet…); chips with no body-slot vocabulary (gloves, a
+/// necklace, a sash) land in the pack — carried, still visible in the Soul
+/// Gem panel. Contention preserves everything: outer free → outer, else
+/// inner free → inner, else the pack.
+///
+/// Deduped by normalized name (trim + lowercase) against the equipment
+/// layers, the pack, AND earlier chips in the same batch — a mixed-era save
+/// that already tracks "Travel Cloak" as an item while still carrying the
+/// legacy outfit line must not mint a twin. Returns the number of chips
+/// seeded (for the INV log line). Pure fn over the typed model.
+pub fn seed_clothing_items(
+    chips: &[String],
+    equipment: &mut Equipment,
+    pack: &mut Vec<StackItem>,
+) -> usize {
+    let mut known: Vec<String> = Vec::new();
+    for layers in equipment.values() {
+        for layer in [&layers.outer, &layers.inner] {
+            if let Some(item) = layer {
+                known.push(item.name.trim().to_lowercase());
+            }
+        }
+    }
+    for item in pack.iter() {
+        known.push(item.name.trim().to_lowercase());
+    }
+
+    let mut seeded = 0;
+    for chip in chips {
+        let name = chip.trim();
+        if name.is_empty() {
+            continue;
+        }
+        let key = name.to_lowercase();
+        if known.contains(&key) {
+            continue; // already tracked — never mint a twin
+        }
+        // Garments are wearable: the equippable tag drives the Soul Gem
+        // popup's EQUIP action once the item is in the pack.
+        let tags = vec![ItemTag::Equippable];
+        match route_legacy_to_slot(&key) {
+            Some(slot) => {
+                let item = EquippedItem {
+                    name: name.to_string(),
+                    stats: None,
+                    tags: tags.clone(),
+                };
+                let layers = equipment.entry(slot).or_default();
+                if layers.outer.is_none() {
+                    layers.outer = Some(item);
+                } else if layers.inner.is_none() {
+                    layers.inner = Some(item);
+                } else {
+                    // Both layers held → pack (nothing is ever vaporized).
+                    stack_upsert(
+                        pack,
+                        StackItem {
+                            name: name.to_string(),
+                            qty: 1,
+                            stats: None,
+                            tags,
+                            ..StackItem::default()
+                        },
+                    );
+                }
+            }
+            None => {
+                stack_upsert(
+                    pack,
+                    StackItem {
+                        name: name.to_string(),
+                        qty: 1,
+                        stats: None,
+                        tags,
+                        ..StackItem::default()
+                    },
+                );
+            }
+        }
+        known.push(key);
+        seeded += 1;
+    }
+    seeded
 }
 
 #[cfg(test)]
@@ -966,6 +1098,145 @@ mod tests {
             entities.contains_key("item_strange"),
             "structured value left in entity map"
         );
+    }
+
+    // ── Clothing seeds (2026-08-18 clothing-as-inventory ruling) ─────────
+
+    #[test]
+    fn seed_clothing_routes_garments_to_body_slots() {
+        let chips = vec![
+            "Travel Cloak".to_string(),
+            "Wool Trousers".to_string(),
+            "Leather Boots".to_string(),
+        ];
+        let mut equipment = Equipment::new();
+        let mut pack = Vec::new();
+        let seeded = seed_clothing_items(&chips, &mut equipment, &mut pack);
+        assert_eq!(seeded, 3);
+        assert!(pack.is_empty(), "routable garments never hit the pack");
+        assert_eq!(
+            equipment.get(&EquipSlot::Chest).and_then(|l| l.outer.as_ref()).map(|i| i.name.as_str()),
+            Some("Travel Cloak"),
+            "cloak routes to chest outer"
+        );
+        assert_eq!(
+            equipment.get(&EquipSlot::Legs).and_then(|l| l.outer.as_ref()).map(|i| i.name.as_str()),
+            Some("Wool Trousers")
+        );
+        assert_eq!(
+            equipment.get(&EquipSlot::Feet).and_then(|l| l.outer.as_ref()).map(|i| i.name.as_str()),
+            Some("Leather Boots")
+        );
+        // Seeded garments carry the equippable tag so the Soul Gem popup
+        // offers EQUIP once they're in the pack.
+        assert_eq!(
+            equipment.get(&EquipSlot::Chest).and_then(|l| l.outer.as_ref()).map(|i| i.tags.clone()),
+            Some(vec![ItemTag::Equippable])
+        );
+    }
+
+    #[test]
+    fn seed_clothing_one_piece_garments_route_chest() {
+        let chips = vec!["Silk Gown".to_string(), "Wool Robe".to_string()];
+        let mut equipment = Equipment::new();
+        let mut pack = Vec::new();
+        seed_clothing_items(&chips, &mut equipment, &mut pack);
+        let chest = equipment.get(&EquipSlot::Chest).expect("gown on chest");
+        assert_eq!(chest.outer.as_ref().unwrap().name, "Silk Gown");
+        // Contention: the robe layers Inner rather than displacing the gown.
+        assert_eq!(chest.inner.as_ref().unwrap().name, "Wool Robe");
+        assert!(pack.is_empty());
+    }
+
+    #[test]
+    fn seed_clothing_unroutable_chip_lands_in_pack() {
+        // Gloves/a necklace have no body-slot vocabulary (hands are READIED
+        // weapons only) — carried, not vaporized.
+        let chips = vec!["Silk Gloves".to_string()];
+        let mut equipment = Equipment::new();
+        let mut pack = Vec::new();
+        let seeded = seed_clothing_items(&chips, &mut equipment, &mut pack);
+        assert_eq!(seeded, 1);
+        assert!(equipment.is_empty());
+        assert_eq!(pack.len(), 1);
+        assert_eq!(pack[0].name, "Silk Gloves");
+        assert!(pack[0].tags.contains(&ItemTag::Equippable));
+    }
+
+    #[test]
+    fn seed_clothing_dedupes_against_existing_items_and_batch() {
+        // Mixed-era save: the cloak is already tracked as an item while the
+        // legacy outfit line still names it — no twin. Same-batch dupes
+        // collapse too.
+        let mut equipment = Equipment::new();
+        equipment.insert(
+            EquipSlot::Chest,
+            SlotLayers {
+                outer: Some(EquippedItem { name: "Travel Cloak".into(), stats: None, ..Default::default() }),
+                inner: None,
+            },
+        );
+        let mut pack = Vec::new();
+        let chips = vec![
+            "travel cloak".to_string(),
+            "Linen Dress".to_string(),
+            "Linen Dress".to_string(),
+        ];
+        let seeded = seed_clothing_items(&chips, &mut equipment, &mut pack);
+        assert_eq!(seeded, 1, "existing cloak + same-batch dupe both skip");
+        let chest = equipment.get(&EquipSlot::Chest).expect("chest held the cloak");
+        assert_eq!(chest.outer.as_ref().unwrap().name, "Travel Cloak");
+        assert_eq!(chest.inner.as_ref().unwrap().name, "Linen Dress");
+        assert!(pack.is_empty());
+    }
+
+    #[test]
+    fn seed_clothing_both_layers_full_spills_to_pack() {
+        let mut equipment = Equipment::new();
+        equipment.insert(
+            EquipSlot::Chest,
+            SlotLayers {
+                outer: Some(EquippedItem { name: "Travel Cloak".into(), stats: None, ..Default::default() }),
+                inner: Some(EquippedItem { name: "Padded Vest".into(), stats: None, ..Default::default() }),
+            },
+        );
+        let mut pack = Vec::new();
+        let seeded = seed_clothing_items(&["Silk Gown".to_string()], &mut equipment, &mut pack);
+        assert_eq!(seeded, 1);
+        assert_eq!(pack.len(), 1, "both layers held → pack (preserve, never vaporize)");
+        assert_eq!(pack[0].name, "Silk Gown");
+    }
+
+    #[test]
+    fn seed_cape_routes_chest_not_head() {
+        // "cape" contains the Head needle "cap" — the chest block runs first,
+        // so a cape (and a "hooded cloak") routes to Chest, never Head.
+        let mut equipment = Equipment::new();
+        let mut pack = Vec::new();
+        seed_clothing_items(
+            &["Velvet Cape".to_string(), "Leather Cap".to_string()],
+            &mut equipment,
+            &mut pack,
+        );
+        assert!(equipment.contains_key(&EquipSlot::Chest), "cape → chest");
+        assert_eq!(
+            equipment.get(&EquipSlot::Chest).and_then(|l| l.outer.as_ref()).map(|i| i.name.as_str()),
+            Some("Velvet Cape")
+        );
+        assert!(equipment.contains_key(&EquipSlot::Head), "a plain cap still routes to head");
+    }
+
+    #[test]
+    fn split_outfit_line_splits_trims_and_caps() {
+        let chips = split_outfit_line("bloodstained leather, travel cloak , muddy boots");
+        assert_eq!(chips, vec!["bloodstained leather", "travel cloak", "muddy boots"]);
+        // Oversize chip clamps to the INV_NAME_MAX discipline.
+        let long = "x".repeat(crate::bracket_parser::INV_NAME_MAX + 50);
+        let capped = split_outfit_line(&long);
+        assert_eq!(capped.len(), 1);
+        assert_eq!(capped[0].chars().count(), crate::bracket_parser::INV_NAME_MAX);
+        // Empty segments drop entirely.
+        assert!(split_outfit_line("  ,, ").is_empty());
     }
 
     // ── Narrative phrase resolution (2026-08-17 E4B follow-up) ───────────

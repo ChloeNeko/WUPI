@@ -34,7 +34,7 @@ use regex::Regex;
 /// rejected brackets from FINALIZED prose, so the live stream and the stored
 /// beat can't diverge). Body alternation is quote-aware, mirroring the
 /// parser's `find_bracket_close` (see `with_brackets` for the full rationale).
-const BRACKET_STRIP_PATTERN: &str = r#"(?i)\[(?:CHARACTER_TURN:(?:end|[^\]\s]+)|OBJECT\s*(?:[^"\]]+|"[^"]*"?)+|FX\s*(?:[^"\]]+|"[^"]*"?)+|TIME\s*(?:[^"\]]+|"[^"]*"?)+|DATE\s*(?:[^"\]]+|"[^"]*"?)+|WEATHER\s*(?:[^"\]]+|"[^"]*"?)+|TRAVEL\s*(?:[^"\]]+|"[^"]*"?)+|EFFECT\s*(?:[^"\]]+|"[^"]*"?)+|MILESTONE\s*(?:[^"\]]+|"[^"]*"?)+|TASK\s*(?:[^"\]]+|"[^"]*"?)+|RUMOR\s*(?:[^"\]]+|"[^"]*"?)+|PRESENCE\s*(?:[^"\]]+|"[^"]*"?)+|DISCOVER\s*(?:[^"\]]+|"[^"]*"?)+|NPC_REGISTER\s*(?:[^"\]]+|"[^"]*"?)+|APPEARANCE\s*(?:[^"\]]+|"[^"]*"?)+|EQUIP\s*(?:[^"\]]+|"[^"]*"?)+|BELT\s*(?:[^"\]]+|"[^"]*"?)+|PACK\s*(?:[^"\]]+|"[^"]*"?)+)\]"#;
+const BRACKET_STRIP_PATTERN: &str = r#"(?i)\[(?:CHARACTER_TURN:(?:end|[^\]\s]+)|OBJECT\s*(?:[^"\]]+|"[^"]*"?)+|FX\s*(?:[^"\]]+|"[^"]*"?)+|TIME\s*(?:[^"\]]+|"[^"]*"?)+|DATE\s*(?:[^"\]]+|"[^"]*"?)+|WEATHER\s*(?:[^"\]]+|"[^"]*"?)+|TRAVEL\s*(?:[^"\]]+|"[^"]*"?)+|EFFECT\s*(?:[^"\]]+|"[^"]*"?)+|MILESTONE\s*(?:[^"\]]+|"[^"]*"?)+|TASK\s*(?:[^"\]]+|"[^"]*"?)+|RUMOR\s*(?:[^"\]]+|"[^"]*"?)+|PRESENCE\s*(?:[^"\]]+|"[^"]*"?)+|DISCOVER\s*(?:[^"\]]+|"[^"]*"?)+|NPC_REGISTER\s*(?:[^"\]]+|"[^"]*"?)+|NPC_ITEM\s*(?:[^"\]]+|"[^"]*"?)+|MOOD\s*(?:[^"\]]+|"[^"]*"?)+|INTENT\s*(?:[^"\]]+|"[^"]*"?)+|APPEARANCE\s*(?:[^"\]]+|"[^"]*"?)+|EQUIP\s*(?:[^"\]]+|"[^"]*"?)+|BELT\s*(?:[^"\]]+|"[^"]*"?)+|PACK\s*(?:[^"\]]+|"[^"]*"?)+)\]"#;
 
 /// (2026-08-16 yellow B10) Whole-text strip of verb-shaped brackets. The
 /// streaming filter strips these live, but `bracket_parser::parse` only
@@ -182,6 +182,9 @@ impl StreamFilter {
         //   [BELT name=...]                (inventory, 2026-08-07)
         //   [PACK name=...]                (inventory, 2026-08-07)
         //   [DATE <new calendar label>]   (calendar, 2026-08-13)
+        //   [NPC_ITEM npc_id +item]       (NPC interior, 2026-08-18)
+        //   [MOOD npc_id label]           (NPC interior, 2026-08-18)
+        //   [INTENT npc_id plan]          (NPC interior, 2026-08-18)
         // (P2 fix) (?i): the parser accepts every verb case-insensitively (live-
         // observed [CHARACTER_Turn:end] variants), so the streaming strip must
         // too — a mixed-case bracket used to leak raw into the live stream.

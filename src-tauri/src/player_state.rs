@@ -409,8 +409,10 @@ pub struct PlayerState {
     /// Live appearance deltas applied ON TOP of the SavedPlayer's authored
     /// identity during play (2026-08-04 overhaul). A stable-keyed map so the
     /// `[APPEARANCE key=value]` bracket pipeline can mutate individual traits
-    /// on the fly — outfit changes, cut hair, fresh scars, a disguise donned.
-    /// Empty value (`""`) is the clear sentinel for that key.
+    /// on the fly — cut hair, fresh scars, a disguise donned. Empty value
+    /// (`""`) is the clear sentinel for that key. Clothing is NOT here
+    /// (2026-08-18): garments are typed inventory items (`equipment` below) —
+    /// the `outfit` key is retired.
     ///
     /// Seeded once from the SavedPlayer's structured traits at game attach
     /// (lib.rs `enter_fable_session`); every subsequent `[APPEARANCE]` bracket
@@ -423,8 +425,11 @@ pub struct PlayerState {
 
     /// Worn equipment — six slots (Head/Chest/MainHand/OffHand/Legs/Feet),
     /// each a two-layer stack (Outer narrator-visible, Inner hidden). Mutated
-    /// by the `[EQUIP]` bracket; only present slots are keyed. Empty by
-    /// default. See `equipment.rs`. Rides `save_split` → `<card_id>.player.json`.
+    /// by the `[EQUIP]` bracket; only present slots are keyed. Clothing lives
+    /// HERE (2026-08-18): garments are items, and a change of clothes is an
+    /// equip that displaces the prior garment into the pack. Empty by
+    /// default. See `equipment.rs`. Rides `save_split` →
+    /// `<card_id>.player.json`.
     #[serde(default)]
     pub equipment: equipment::Equipment,
 
@@ -500,7 +505,7 @@ impl PlayerState {
     /// reputation: -3
     /// appearance:
     ///   hair_color: raven black
-    ///   outfit: bloodstained leather, travel cloak
+    ///   scars: brand on the shoulder
     /// equipped:
     ///   Main Hand: Iron Sword (+2 ATK)
     ///   Chest: Heavy Cloak
@@ -511,7 +516,8 @@ impl PlayerState {
     /// that must stay consistent turn to turn. This is the fact block the
     /// narrator reads as hard truth. The `equipped:` block (Outer-layer items
     /// only — Inner layers are hidden from the narrator) follows appearance so
-    /// the visible garments + readied weapons read as one cohesive look.
+    /// the visible garments + readied weapons read as one cohesive look
+    /// (2026-08-18: clothing IS this block — garments are equipped items).
     pub fn render_for_prompt(&self) -> Option<String> {
         if self.is_default() {
             return None;

@@ -196,7 +196,7 @@ fn emit(w: &mut DiagWriter, cat: &str, msg: &str) {
         cat,
         one_line_capped(msg)
     );
-    w.ring.push_back(body);
+    w.ring.push_back(body.clone());
     while w.ring.len() > DIAG_RING_LINES {
         w.ring.pop_front();
     }

@@ -16,6 +16,8 @@
 //   'character_turn' → { npc_id, line }
 //   'object'         → { id, state }    → rendered as a system beat
 //   'fx'             → { effect }       → playFX(effect)
+// Every other kind ('weather', 'time', 'npc_item', 'mood', 'intent', …)
+// is world-sim machinery with no live UI — silently ignored below.
 // =============================================================
 
 import { invoke, Channel } from '@tauri-apps/api/core';

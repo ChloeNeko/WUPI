@@ -214,8 +214,10 @@ function renderIdentity(player) {
 }
 
 // Appearance: the live `current_appearance_deltas` (hair/body/skin/eyes/
-// outfit/scars/wounds/etc.) — what the character currently looks like in
-// this game. Hidden entirely when no deltas are tracked.
+// scars/wounds/etc.) — what the character's BODY currently looks like in
+// this game. Clothing is NOT here (2026-08-18): garments are equipped
+// items, rendered by the Equipment section. Hidden entirely when no deltas
+// are tracked.
 function renderAppearance(ps) {
   const deltas = ps.current_appearance_deltas || {};
   const rows = Object.entries(deltas)
