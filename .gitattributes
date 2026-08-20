@@ -1,0 +1,41 @@
+# (2026-08-20) Deterministic line endings — one rule set for every clone.
+#
+# Windows `core.autocrlf=true` plans a LF→CRLF conversion for every text
+# file it touches, which prints "warning: LF will be replaced by CRLF" for
+# every LF working file (the Cargo/tauri/npm manifests are regenerated
+# with LF by their tools). Pinning `eol=lf` for text makes the repo AND
+# the working tree LF on every platform: no conversions, no warnings,
+# byte-stable diffs. Existing checkouts stay clean (git compares both
+# sides normalized); only future checkouts come out LF.
+#
+# Binaries are pinned explicitly so no attribute mistake can ever route
+# them through the text filters.
+* text=auto eol=lf
+
+# ── Binaries ───────────────────────────────────────────────────────────────
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.webp binary
+*.bmp binary
+*.ico binary
+*.icns binary
+*.exe binary
+*.dll binary
+*.lib binary
+*.bin binary
+*.gguf binary
+*.safetensors binary
+*.pth binary
+*.onnx binary
+*.woff binary
+*.woff2 binary
+*.ttf binary
+*.otf binary
+*.mp3 binary
+*.wav binary
+*.ogg binary
+*.mp4 binary
+*.lnk binary
+*.zip binary

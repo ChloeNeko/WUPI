@@ -1,35 +1,32 @@
-//! Crash reports + the per-session full-detail log mirror (`logs/`).
+//! Crash reports ONLY — session logging is disabled (2026-08-20 Chloe
+//! ruling).
 //!
-//! (2026-08-19 Chloe ruling — temporary debugging posture) The share-safe
-//! rotating `diagnostics.log` system is RETIRED: nothing is redacted
-//! anymore, the brief/preview privacy contract is gone with it. The verbose
-//! tracing log still lives at `%TEMP%\wupi.log` exactly as before, and
-//! every formatted line is ALSO teed live into `logs/wupi-YYYYMMDD-HHMMSS`
-//! `.log` (stamped at boot) by [`MirrorWriter`]. The tee — not an exit-time
-//! copy — is the mechanism: a `TerminateProcess` task-kill cannot run any
-//! Rust code, so only a writer that has been on disk for the whole session
-//! guarantees the full log survives ANY death (graceful quit, panic,
-//! C-level ggml abort, hard kill). [`shutdown_flush`] tops the file up on
-//! the paths that DO run code before exiting.
+//! History: the 2026-08-19 posture teed every formatted line into
+//! `%TEMP%\wupi.log` + a per-boot `logs/wupi-YYYYMMDD-HHMMSS.log` mirror
+//! (stamped at launch, one file per process — restarts and updater
+//! relaunches each minted another, which read as "multiple logs for one
+//! session"). 2026-08-20: Chloe ruled launch-time logging OFF entirely —
+//! the app creates NO log file when it boots. The surviving surface is the
+//! crash-report system:
 //!
-//! CRASH REPORTS (kept from the old system, same shape): the last
-//! [`RING_LINES`] verbose lines live in a fixed-size RAM `VecDeque` fed by
-//! the tee. [`dump_crash`] — wired to the global panic hook in lib.rs and
-//! the SD-abort callback in scene_art.rs — writes
-//! `logs/crash-YYYYMMDD-HHMMSS.log` containing the panic message plus that
-//! ring tail. C-level aborts (CUDA / ggml) are not Rust panics — the
-//! SD-abort callback covers the image-gen path; the raw backtrace stays in
-//! `%TEMP%\wupi_panic.txt` (the pre-existing hook output).
+//! - The last [`RING_LINES`] verbose tracing lines live in a fixed-size RAM
+//!   `VecDeque` fed by [`RingWriter`] (the tracing subscriber's only sink).
+//!   RAM-only — nothing touches disk during normal operation.
+//! - [`dump_crash`] — wired to the global panic hook in lib.rs and the
+//!   SD-abort callback in scene_art.rs — writes
+//!   `logs/crash-YYYYMMDD-HHMMSS.log` containing the panic message plus
+//!   that ring tail, ONLY on an actual crash. C-level aborts (CUDA / ggml)
+//!   are not Rust panics — the SD-abort callback covers the image-gen
+//!   path; the raw backtrace stays in `%TEMP%\wupi_panic.txt` (the
+//!   pre-existing hook output).
 //!
-//! Retention at boot: `crash-*.log` newest [`KEEP_CRASH_FILES`] kept,
-//! `wupi-*.log` newest [`KEEP_MIRROR_FILES`] kept (full-detail logs are
-//! large — the cap keeps the portable folder bounded; raise the constant
-//! if a bug hunt needs more history). The prune matches ONLY this
-//! module's own MINTED names (`<prefix>-YYYYMMDD-HHMMSS(-N).log` — see
-//! [`is_minted_log_name`]) — anything else a user keeps in `logs/`,
-//! including their own `wupi-notes.log`, is untouchable. The retired
-//! diagnostics system's `README.txt` is removed only when its content
-//! carries our generated header — a user-authored README survives.
+//! Retention at boot: `crash-*.log` newest [`KEEP_CRASH_FILES`] kept. The
+//! retired mirror system's own minted `wupi-*.log` files are swept to ZERO
+//! (they are this module's artifacts, identified by the exact minted-name
+//! shape — see [`is_minted_log_name`]); anything else a user keeps in
+//! `logs/`, including their own `wupi-notes.log`, is untouchable. The
+//! retired diagnostics system's `README.txt` is removed only when its
+//! content carries our generated header — a user-authored README survives.
 //! No README is ever written into `logs/`.
 //!
 //! Fail-silent discipline throughout: every write path swallows errors (a
@@ -42,12 +39,9 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
 use chrono::Local;
-use tracing_appender::non_blocking::{NonBlocking, WorkerGuard};
 
 /// Crash reports to retain (newest kept, oldest pruned).
 const KEEP_CRASH_FILES: usize = 10;
-/// Full-detail mirror logs to retain (newest kept, oldest pruned).
-const KEEP_MIRROR_FILES: usize = 10;
 /// RAM ring buffer size — the crash-report tail.
 const RING_LINES: usize = 100;
 /// Hard cap for the panic line in a crash report (one line, no prose wall).
@@ -59,17 +53,11 @@ const RING_PARTIAL_MAX_BYTES: usize = 16 * 1024;
 struct CrashLog {
     dir: PathBuf,
     /// The last [`RING_LINES`] formatted verbose lines, RAM-only, fed by
-    /// [`MirrorWriter`]. Updated even when the mirror file itself refuses
-    /// writes, so a crash dump still carries the tail context.
+    /// [`RingWriter`]. The single crash-report source.
     ring: VecDeque<String>,
 }
 
 static CRASH: OnceLock<Mutex<CrashLog>> = OnceLock::new();
-
-/// Worker guards for the non-blocking appenders (temp + mirror), parked
-/// for the process lifetime. [`shutdown_flush`] takes and drops them on a
-/// graceful exit so the workers flush + join before the process ends.
-static WRITER_GUARDS: Mutex<Vec<WorkerGuard>> = Mutex::new(Vec::new());
 
 /// Arm the crash ring + prune old files. Call once at boot, before the
 /// Tauri builder — `install_root` is the exe's parent dir (the same root
@@ -90,7 +78,10 @@ pub fn init(install_root: &Path) {
         return;
     }
     prune_minted(&dir, "crash-", KEEP_CRASH_FILES);
-    prune_minted(&dir, "wupi-", KEEP_MIRROR_FILES);
+    // One-time sweep of the retired mirror system's own minted files (keep
+    // 0 — session logging is off; the folder should hold only crash
+    // reports). Minted-shape-matched, so user-kept files never match.
+    prune_minted(&dir, "wupi-", 0);
     // Remove the README.txt the retired diagnostics system used to write —
     // CONTENT-VERIFIED against our generated header so a user's own
     // README.txt survives (an unconditional delete could eat a user file).
@@ -106,82 +97,67 @@ pub fn init(install_root: &Path) {
 /// user-authored file of the same name.
 const README_MARKER: &str = "WUPI diagnostic logs";
 
-/// Open this session's full-detail mirror appender:
-/// `logs/wupi-YYYYMMDD-HHMMSS.log` (unique-suffixed within the second).
-/// Its WorkerGuard is parked in [`WRITER_GUARDS`]; the file itself is
-/// written live for the whole session (that is the task-kill guarantee).
-pub fn open_wupi_mirror(install_root: &Path) -> Option<NonBlocking> {
-    let dir = install_root.join("logs");
-    std::fs::create_dir_all(&dir).ok()?;
-    let stamp = Local::now().format("%Y%m%d-%H%M%S").to_string();
-    let name = unique_prefixed_name(&dir, "wupi", &stamp);
-    let appender = tracing_appender::rolling::never(&dir, name);
-    let (nb, guard) = tracing_appender::non_blocking(appender);
-    hold_guard(guard);
-    Some(nb)
-}
-
-/// Park a non-blocking writer guard for the process lifetime.
-pub fn hold_guard(guard: WorkerGuard) {
-    if let Ok(mut guards) = WRITER_GUARDS.lock() {
-        guards.push(guard);
-    }
-}
-
-/// Graceful-exit flush (RunEvent::Exit): dropping the guards flushes +
-/// joins the writer workers so the tail of both `%TEMP%\wupi.log` and the
-/// mirror lands on disk. Idempotent. After a hard kill nothing can run —
-/// the live tee is the guarantee there, this just tops up the polite path.
-pub fn shutdown_flush() {
-    if let Ok(mut guards) = WRITER_GUARDS.lock() {
-        guards.clear(); // drops the guards
-    }
-}
-
-/// The tee: every formatted tracing line goes to BOTH `%TEMP%\wupi.log`
-/// (unchanged primary) and this session's `logs/wupi-*.log` mirror, and
-/// complete lines feed the crash RAM ring. Fail-silent per side — one
-/// dead sink must never take the other down, and a panic in here while
+/// The tracing subscriber's ONLY sink (2026-08-20): complete lines feed the
+/// crash RAM ring; no file, no console. Fail-silent — a panic in here while
 /// unwinding a panic would abort the process.
-pub struct MirrorWriter {
-    temp: NonBlocking,
-    mirror: Option<NonBlocking>,
-    /// Partial-line accumulator for the ring feed. One writer is built per
-    /// tracing event and fmt events end with `\n`, so lines complete per
-    /// event; the buffer only ever holds a transient partial.
+pub struct RingWriter {
+    /// Partial-line accumulator. One writer is built per tracing event and
+    /// fmt events end with `\n`, so lines complete per event; the buffer
+    /// only ever holds a transient partial.
     line: String,
 }
 
-impl MirrorWriter {
-    pub fn new(
-        temp: NonBlocking,
-        mirror: Option<NonBlocking>,
-    ) -> Self {
+impl RingWriter {
+    pub fn new() -> Self {
         Self {
-            temp,
-            mirror,
             line: String::new(),
         }
     }
 }
 
-impl Write for MirrorWriter {
+impl Default for RingWriter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Write for RingWriter {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        if let Some(m) = self.mirror.as_mut() {
-            let _ = m.write(buf);
-        }
-        let _ = self.temp.write(buf);
         ring_extend(absorb_complete_lines(&mut self.line, buf));
         Ok(buf.len())
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
-        if let Some(m) = self.mirror.as_mut() {
-            let _ = m.flush();
-        }
-        let _ = self.temp.flush();
         Ok(())
     }
+}
+
+/// Install the (ring-only) global tracing subscriber — the single logging
+/// start point (2026-08-20 Chloe ruling). NOTHING logs during early boot:
+/// no subscriber exists at process start, so every tracing event before
+/// this call is dropped — the LOADING OS screen, the boot updater gate,
+/// and the model load all run silent (and file-less: no `%TEMP%\wupi.log`
+/// is ever created). The frontend invokes the `logs_begin` IPC the moment
+/// the first real screen is reached — the OS home reveal
+/// (`endLoadingScreen` in script.js) for wupi.exe, the Fable-entry boot
+/// teardown for fable.exe — and that lands here. Once-only: a second call
+/// is a no-op (`.init()` panics on a second global default). From this
+/// point the RAM ring accumulates the tail that `dump_crash` writes ONLY
+/// on an actual crash.
+pub fn begin_session_logging() {
+    static BEGUN: OnceLock<()> = OnceLock::new();
+    if BEGUN.set(()).is_err() {
+        return;
+    }
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("debug")),
+        )
+        .with_target(false)
+        .with_writer(|| RingWriter::new())
+        .init();
+    tracing::info!("=== WUPI session logging begun (post-boot) ===");
 }
 
 /// Push complete lines into the RAM ring, evicting past [`RING_LINES`].
@@ -216,10 +192,11 @@ fn absorb_complete_lines(buf: &mut String, bytes: &[u8]) -> Vec<String> {
 }
 
 /// Crash-report dump: write `logs/crash-YYYYMMDD-HHMMSS.log` containing
-/// the panic message + the RAM ring tail (the last verbose log lines), so
-/// a crash is readable without opening the full session log. Best-effort:
-/// failures are swallowed (`%TEMP%\wupi_panic.txt`, written by lib.rs's
-/// hook, is the independent backstop with the full backtrace).
+/// the panic message + the RAM ring tail (the last verbose log lines).
+/// The ONLY file this module ever writes (2026-08-20: session logging is
+/// disabled — no per-boot log exists). Best-effort: failures are swallowed
+/// (`%TEMP%\wupi_panic.txt`, written by lib.rs's hook, is the independent
+/// backstop with the full backtrace).
 pub fn dump_crash(panic_info: &str) {
     let Some(guard) = CRASH.get() else { return };
     let w = match guard.lock() {
@@ -229,7 +206,7 @@ pub fn dump_crash(panic_info: &str) {
     let stamp = Local::now().format("%Y%m%d-%H%M%S").to_string();
     let name = unique_prefixed_name(&w.dir, "crash", &stamp);
     let mut body = format!(
-        "==== WUPI v{} CRASH {} ====\npanic: {}\nfull backtrace: %TEMP%\\wupi_panic.txt\nfull session log: logs\\wupi-*.log (this boot) + %TEMP%\\wupi.log\n\n---- last {} verbose log lines (RAM ring buffer) ----\n",
+        "==== WUPI v{} CRASH {} ====\npanic: {}\nfull backtrace: %TEMP%\\wupi_panic.txt\nsession logging is OFF (2026-08-20) — this ring tail is the only log\n\n---- last {} verbose log lines (RAM ring buffer) ----\n",
         env!("CARGO_PKG_VERSION"),
         Local::now().format("%Y-%m-%d %H:%M:%S%.3f"),
         one_line_capped(panic_info),

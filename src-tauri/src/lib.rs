@@ -580,15 +580,28 @@ pub fn run() {
         logs::dump_crash(&info.to_string());
     }));
 
-    // Crash-report ring + log retention (logs.rs). Arm it BEFORE anything
-    // else so the panic hook above has a ring to dump. Same install root
-    // as memory/ and apps/ (exe parent).
+    // Crash-report ring + retention (logs.rs). Arm it BEFORE anything else
+    // so the panic hook above has a ring to dump. Same install root as
+    // memory/ and apps/ (exe parent).
     let install_root = std::env::current_exe()
         .ok()
         .and_then(|exe| exe.parent().map(|p| p.to_path_buf()));
     if let Some(root) = &install_root {
         logs::init(root);
     }
+
+    // (2026-08-20 Chloe ruling) SESSION LOGGING IS DISABLED AT LAUNCH — no
+    // log file is created and no tracing subscriber exists during early
+    // boot: the LOADING OS screen, the boot updater gate, and the model
+    // load all run silent (the old %TEMP%\wupi.log appender + the
+    // per-boot logs/wupi-*.log mirror are RETIRED — one file per process
+    // read as "multiple logs per session", and the updater relaunch minted
+    // another). Logging begins ONLY when the frontend confirms the first
+    // real screen is up: script.js invokes `logs_begin` at the OS home
+    // reveal (endLoadingScreen) / the Fable-entry boot teardown, which
+    // installs logs.rs's ring-only subscriber. The RAM ring feeds
+    // `dump_crash` — crash-*.log stays the ONLY disk artifact (panic hook
+    // + SD-abort callback), which is the crash protection that remains.
 
     // §11.59 SD abort capture. Installed as early as possible (before any
     // gen_img call can fire) so a crash at any point in the SD pipeline lands
@@ -606,27 +619,6 @@ pub fn run() {
     // scene_art::install_sd_log_bridge.
     #[cfg(feature = "diffusion-rs")]
     scene_art::install_sd_log_bridge();
-
-    let log_dir = std::env::temp_dir();
-    let file_appender = tracing_appender::rolling::never(&log_dir, "wupi.log");
-    let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
-    logs::hold_guard(guard);
-    // Full-detail mirror (2026-08-19 Chloe ruling, temporary): every
-    // formatted line is teed live into logs/wupi-YYYYMMDD-HHMMSS.log —
-    // %TEMP%\wupi.log keeps flowing unchanged. The tee, not an exit-time
-    // copy, is the guarantee: a task-kill runs no code on the way out, so
-    // the mirror must already be on disk for the whole session. Graceful
-    // exits top it up via logs::shutdown_flush (post-event-loop here, plus
-    // before the updater's hard process::exit). See logs.rs (MirrorWriter).
-    let wupi_mirror = install_root.as_deref().and_then(logs::open_wupi_mirror);
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("debug")),
-        )
-        .with_target(false)
-        .with_writer(move || logs::MirrorWriter::new(non_blocking.clone(), wupi_mirror.clone()))
-        .init();
 
     tracing::info!("=== WUPI starting ===");
     // Single-instance lock: a second launch of wupi.exe focuses the existing
@@ -1301,6 +1293,7 @@ pub fn run() {
             updater_apply,
             updater_consume_result,
             boot_load_model,
+            logs_begin,
             system_menu::set_always_on_top,
         ])
         // Build the app, then run the event loop with a callback. Splitting
@@ -1322,11 +1315,23 @@ pub fn run() {
             }
         });
     tracing::info!("=== WUPI event loop exited ===");
-    // Graceful-exit flush: drop the writer guards so the non-blocking
-    // workers flush + join before the process ends (tops up the tail of
-    // both %TEMP%\wupi.log and the logs/wupi-*.log mirror). Hard kills
-    // never get here — the live tee already has everything on disk.
-    logs::shutdown_flush();
+    // No shutdown flush (2026-08-20): session logging is ring-only RAM —
+    // nothing to flush. Crash files are written synchronously at crash
+    // time; a hard kill loses nothing that ever existed on disk.
+}
+
+/// Begin session logging (2026-08-20 Chloe ruling): installs logs.rs's
+/// ring-only tracing subscriber. The frontend calls this exactly once, the
+/// moment the first real screen is reached — the OS home reveal
+/// (endLoadingScreen in script.js) for wupi.exe, the Fable-entry boot
+/// teardown for fable.exe — so NOTHING logs (and no file is created)
+/// during the LOADING OS screen, the boot updater gate, or the model
+/// load. Later calls are no-ops. Crash protection is unaffected: the
+/// panic hook + SD-abort callback write crash-*.log from the RAM ring
+/// whenever a crash actually happens.
+#[tauri::command]
+fn logs_begin() {
+    logs::begin_session_logging();
 }
 
 #[tauri::command]
@@ -11554,8 +11559,19 @@ async fn fable_send(
         // (3) Skill-check Referee. Turn-scoped — NOT persisted (no schema
         // mutation, no undo push). The directives append to the rendered
         // world_state so they ride inside the existing `<world_state>` tag
-        // the narrator already treats as hard fact.
-        let skills = player_state::referee_evaluate_skill_checks(&text, pacing.mode.dc_modifier());
+        // the narrator already treats as hard fact. (2026-08-20) The DC now
+        // also carries the derived overall health tier — a Fair-or-worse
+        // body or an active illness hardens every skilled attempt.
+        let health_tier = consequence::derive_health_tier(
+            &s.player_state.body,
+            &s.status_tags,
+            s.world_clock.current_minutes,
+        );
+        let skills = player_state::referee_evaluate_skill_checks(
+            &text,
+            pacing.mode.dc_modifier(),
+            consequence::HealthTier::skill_dc_mod(health_tier),
+        );
 
         // (3a) Phase 4 §11.44 (Component 1): Disguise Referee — the Rust-side
         // gate. Pure fn, no mutation (mirrors the skill-check Referee's
@@ -14034,9 +14050,13 @@ fn fable_list_saves(
 /// Read the canonical PlayerState for the active Fable game (Seam #7).
 /// Returns it as a JSON value the frontend's mannequin/stats panel renders
 /// directly: `{ body: { head: "Transparent", left_bicep: "Orange", ... },
-/// stamina: "Winded", wealth: 12, reputation: -3 }`. Body part keys are the
-/// 16 stable `id()` strings ("head", "left_bicep", …); values are the
-/// `BodyPartState` variants serialized as their PascalCase names.
+/// stamina: "Winded", health: "Fair", wealth: 12, reputation: -3 }`. Body
+/// part keys are the 16 stable `id()` strings ("head", "left_bicep", …);
+/// values are the `BodyPartState` variants serialized as their PascalCase
+/// names. `health` (2026-08-20) is the DERIVED overall tier
+/// (`consequence::derive_health_tier` over body wounds + active illness
+/// tags) — "Excellent" | "Good" | "Fair" | "Poor" | "Critical" | "Sick" |
+/// "Infected" — never stored on PlayerState, injected here only.
 ///
 /// Returns an error if no Fable game is active (the left stats panel only
 /// exists inside a running session). The lock is held briefly under
@@ -14057,8 +14077,20 @@ async fn player_state_get(
         return Err("no fable game active: call fable_start first".to_string());
     }
     let s = state.fable_schema.lock().await;
-    Ok(serde_json::to_value(&s.player_state)
-        .map_err(|e| format!("serialize player state: {e}"))?)
+    let health = consequence::derive_health_tier(
+        &s.player_state.body,
+        &s.status_tags,
+        s.world_clock.current_minutes,
+    );
+    let mut value = serde_json::to_value(&s.player_state)
+        .map_err(|e| format!("serialize player state: {e}"))?;
+    if let Some(obj) = value.as_object_mut() {
+        obj.insert(
+            "health".to_string(),
+            serde_json::Value::String(health.semantic().to_string()),
+        );
+    }
+    Ok(value)
 }
 
 /// Return the identity of the currently-seated fable card plus the chat-UI

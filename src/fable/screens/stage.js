@@ -409,29 +409,13 @@ export async function wireStage(root, hooks) {
   // a raw addEventListener double-binds, making every ✎/🗑/‹› click fire N
   // times (a doubled ✎ opened-then-saved instantly, breaking inline editing
   // from session 2 onward; on a user beat that fired rewind+regen).
-  // (#78) Two-click inline delete confirm — helpers. Native window.confirm
-  // is DEAD in the webview (wry disables default script dialogs: confirm()
-  // always returns false → the delete button was a silent NO-OP). First
-  // click ARMS the button (red heat + 5s auto-disarm); the second click
-  // deletes. The armed state lives on the button node itself, so any feed
-  // rebuild (which replaces the node) disarms for free. One armed button at
-  // a time.
-  const DELETE_ARM_TIMEOUT_MS = 5000;
-  function armDeleteButton(btn) {
-    disarmDeleteButton(btn);
-    btn.dataset.armed = '1';
-    btn.dataset.origTitle = btn.title || '';
-    btn.title = 'Click again to delete';
-    btn._disarmTimer = setTimeout(() => disarmDeleteButton(btn), DELETE_ARM_TIMEOUT_MS);
-  }
-  function disarmDeleteButton(btn) {
-    if (btn._disarmTimer) { clearTimeout(btn._disarmTimer); btn._disarmTimer = null; }
-    if (btn.dataset.armed === '1') {
-      btn.dataset.armed = '';
-      if (btn.dataset.origTitle !== undefined) btn.title = btn.dataset.origTitle;
-      delete btn.dataset.origTitle;
-    }
-  }
+  // (#78 history) Delete used to be a two-click inline confirm (native
+  // window.confirm is DEAD in the webview — wry disables default script
+  // dialogs). (2026-08-20 Chloe ruling) It is now SINGLE-CLICK: the
+  // count-first confirm modal for a doomed run of 2+ messages IS the
+  // warning ("You are going to delete N messages, are you sure?"), and the
+  // sole trailing beat deletes outright — an everyday action that had
+  // grown a needless double-click tax.
 
   on(feedEl, 'click', async (e) => {
     // Both control surfaces route here: the .vn-recent hover toolrail AND
@@ -503,22 +487,12 @@ export async function wireStage(root, hooks) {
         },
       });
     } else if (act === 'delete') {
-      // (#78) Two-click inline confirm (the #24 API-profile-delete pattern —
-      // see the helpers above): first click arms, second click deletes.
-      // (2026-08-19 cascade, Chloe) A delete now takes every message BELOW
-      // the target too — a transcript gap between surviving beats is
-      // meaningless. The arm stays the first gate; the second click either
-      // deletes the SOLE trailing beat outright (no further warning — the
-      // arm WAS the confirmation) or opens the count-first confirm modal
-      // for a doomed run of 2+ ("You are going to delete N messages, are
-      // you sure?"). The minimum the modal ever shows is therefore 2.
-      if (btn.dataset.armed !== '1') {
-        feedEl.querySelectorAll('[data-drawer-act="delete"][data-armed="1"]')
-          .forEach(disarmDeleteButton);
-        armDeleteButton(btn);
-        return;
-      }
-      disarmDeleteButton(btn);
+      // (2026-08-20) Single click. (2026-08-19 cascade, Chloe) A delete takes
+      // every message BELOW the target too — a transcript gap between
+      // surviving beats is meaningless. The SOLE trailing beat deletes
+      // outright; a doomed run of 2+ opens the count-first confirm modal
+      // ("You are going to delete N messages, are you sure?") — the modal is
+      // the warning, no arm-click precedes it.
       const doomed = beats.sessionMessageCount() - index;
       if (doomed > 1) {
         openDeleteConfirm(index, doomed);

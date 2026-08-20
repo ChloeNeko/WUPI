@@ -2175,16 +2175,17 @@ html[data-colorcode="Vibrant"] .boot-loading-text span.lit {
 }
 
 /* ── Boot update bar (2026-08-19) ── mounted UNDER the LOADING OS title
-   when the boot gate finds an update. The label reads "UPDATING FROM x TO
-   y" — Fredoka 700 at half the title's 184px (clamped by viewport width so
-   narrow windows shrink it instead of clipping), lit with the same
-   accent-bright glow language as the title's .lit spans so it reads as part
-   of the same composition. The track + fill reuse the paw-menu update
-   panel's pill-bar shape, recolored to the theme accents. The [hidden]
-   guard is REQUIRED: the author display:flex below would otherwise beat
-   the UA's [hidden] display:none. The fade-in keyframe composes the
-   centering translate (reusing bootTerminalFadeIn's bare translateY would
-   animate AWAY the translateX(-50%) and slam the block off-center). */
+   when the boot gate finds an update. The block is a tight stack: "UPDATE"
+   in Fredoka 700 (a quarter of the title's 184px, clamped by viewport
+   width so narrow windows shrink it instead of clipping) lit with the same
+   accent-bright glow language as the title's .lit spans, then a smaller
+   WHITE "from > to" version line, then the bar. The track + fill reuse the
+   paw-menu update panel's pill-bar shape, recolored to the theme accents.
+   The [hidden] guard is REQUIRED: the author display:flex below would
+   otherwise beat the UA's [hidden] display:none. The fade-in keyframe
+   composes the centering translate (reusing bootTerminalFadeIn's bare
+   translateY would animate AWAY the translateX(-50%) and slam the block
+   off-center). */
 .boot-update {
     position: absolute;
     top: 68%;
@@ -2193,8 +2194,8 @@ html[data-colorcode="Vibrant"] .boot-loading-text span.lit {
     display: flex;
     flex-direction: column;
     align-items: center;
-    gap: 26px;
-    width: min(620px, 76vw);
+    gap: 14px;
+    width: min(340px, 64vw);
     text-align: center;
     pointer-events: none;
     animation: bootUpdateFadeIn 0.35s ease-out forwards;
@@ -2203,14 +2204,39 @@ html[data-colorcode="Vibrant"] .boot-loading-text span.lit {
 .boot-update-label {
     font-family: 'Fredoka', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
     font-weight: 700;
-    /* 50% of the 184px LOADING OS title, shrinking gracefully on narrow
-       windows instead of clipping the one-line label. */
-    font-size: min(92px, 6vw);
-    letter-spacing: 5px;
+    /* Half the old 92px label (a quarter of the 184px LOADING OS title),
+       shrinking gracefully on narrow windows instead of clipping. */
+    font-size: min(46px, 3vw);
+    letter-spacing: 0.04em;
     line-height: 1;
     text-transform: uppercase;
     white-space: nowrap;
     user-select: none;
+    color: var(--ui-accent-bright);
+    text-shadow:
+        0 0 8px color-mix(in srgb, var(--ui-accent-bright) 95%, transparent),
+        0 0 18px color-mix(in srgb, var(--ui-accent-bright) 65%, transparent),
+        0 0 34px color-mix(in srgb, var(--ui-accent) 55%, transparent);
+}
+.boot-update-versions {
+    font-family: 'Fredoka', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    font-weight: 500;
+    /* A step smaller than the UPDATE label, plain white — the accent glow
+       stays on the headline; this line reads as quiet metadata. */
+    font-size: min(32px, 2.1vw);
+    letter-spacing: 0.04em;
+    line-height: 1.1;
+    white-space: nowrap;
+    user-select: none;
+    color: #ffffff;
+    text-shadow: 0 0 10px rgba(255, 255, 255, 0.25);
+}
+.boot-update-arrow {
+    /* The ">" separator: bold + the same accent-bright glow stack as the
+       UPDATE headline (and the LOADING OS lit spans), so the theme accent
+       threads through all three lines. Inherits size/family/spacing from
+       .boot-update-versions. */
+    font-weight: 700;
     color: var(--ui-accent-bright);
     text-shadow:
         0 0 8px color-mix(in srgb, var(--ui-accent-bright) 95%, transparent),
@@ -2238,7 +2264,8 @@ html[data-colorcode="Vibrant"] .boot-loading-text span.lit {
 /* Vibrant-only override, mirroring the LOADING OS title rule above: keep the
    boot update surfaces magenta (#f036d6) under [data-colorcode="Vibrant"]
    without repointing the shared accent vars every other surface reads. */
-html[data-colorcode="Vibrant"] .boot-update-label {
+html[data-colorcode="Vibrant"] .boot-update-label,
+html[data-colorcode="Vibrant"] .boot-update-arrow {
     color: #f036d6;
     text-shadow:
         0 0 8px color-mix(in srgb, #f036d6 95%, transparent),

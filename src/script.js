@@ -1117,6 +1117,10 @@ function spawnLaunchSparkles(parent, count = 18) {
     // Remove the boot DOM so it can't sit on top of Fable.
     document.getElementById('boot-paw')?.remove();
     document.getElementById('boot-loading')?.remove();
+    // (2026-08-20) The Fable entry's "boot ceremony bypassed" moment — the
+    // equivalent of endLoadingScreen's logs_begin on the OS path: session
+    // logging starts now that the entry splash/first-run gate is behind us.
+    invoke('logs_begin').catch(() => { /* logging start is best-effort */ });
     // Drop the boot body classes: .booting keeps the top-bar/dock hidden + body
     // transparent; .loading (if present) holds the dock back. Clearing both
     // mirrors what revealAfterLand() + endLoadingScreen() leave behind.
@@ -1737,9 +1741,9 @@ function spawnLaunchSparkles(parent, count = 18) {
   }
 
   // ── Boot update bar (2026-08-19, Chloe): when the boot gate finds an
-  //    update, the news leaves the terminal entirely — a bold label +
-  //    progress bar mount directly UNDER the LOADING OS title
-  //    ("UPDATING FROM x TO y", Fredoka 700 at half the title's size, theme
+  //    update, the news leaves the terminal entirely — a stacked label
+  //    ("UPDATE" + a smaller white "from > to" version line) + progress
+  //    bar mount directly UNDER the LOADING OS title (Fredoka 700, theme
   //    accent colors via the same --ui-accent* vars + Vibrant override in
   //    styles.css). The bar is fed by the SAME update-progress event the
   //    paw-menu panel listens to — that listener only acts in its own
@@ -1747,12 +1751,24 @@ function spawnLaunchSparkles(parent, count = 18) {
   //    over one event stream.
   const bootUpdateEl = document.getElementById('bootUpdate');
   const bootUpdateLabelEl = document.getElementById('bootUpdateLabel');
+  const bootUpdateVersionsEl = document.getElementById('bootUpdateVersions');
   const bootUpdateBarEl = document.getElementById('bootUpdateBar');
 
   function showBootUpdateBar(fromVer, toVer) {
     if (!bootUpdateEl) return;
     if (bootUpdateLabelEl) {
-      bootUpdateLabelEl.textContent = `UPDATING FROM ${fromVer} TO ${toVer}`;
+      bootUpdateLabelEl.textContent = 'UPDATE';
+    }
+    if (bootUpdateVersionsEl) {
+      // The ">" rides in its own span so CSS can light it with the theme
+      // accent glow (same treatment as the UPDATE headline / LOADING OS
+      // title) while the version numbers stay plain white.
+      bootUpdateVersionsEl.textContent = `${fromVer} `;
+      const arrow = document.createElement('span');
+      arrow.className = 'boot-update-arrow';
+      arrow.textContent = '>';
+      bootUpdateVersionsEl.appendChild(arrow);
+      bootUpdateVersionsEl.appendChild(document.createTextNode(` ${toVer}`));
     }
     if (bootUpdateBarEl) bootUpdateBarEl.style.width = '0%';
     bootUpdateEl.hidden = false;
@@ -1843,7 +1859,7 @@ function spawnLaunchSparkles(parent, count = 18) {
     } catch (err) {
       console.error('[Wupi] updater_apply failed during boot gate', err);
       // Staging/spawn failure — the update isn't happening after all: drop
-      // the bar (its "UPDATING…" claim is now false) + surface the failure
+      // the bar (its "UPDATE" claim is now false) + surface the failure
       // in the terminal instead, then proceed with the current binary.
       hideBootUpdateBar();
       appendTerminalLine(`› update failed: ${String(err?.message || err).slice(0, 80)}`, false);
@@ -1890,6 +1906,12 @@ function spawnLaunchSparkles(parent, count = 18) {
     if (loadingEnded) return;
     loadingEnded = true;
     stopTerminalStream();
+    // (2026-08-20 Chloe ruling) Session logging starts HERE — the loading OS
+    // screen + boot updater gate are over, the OS home is revealing. Until
+    // this fires the backend writes nothing (no %TEMP%\wupi.log, no logs/
+    // files); from here the RAM ring accumulates the tail that ONLY a crash
+    // dumps. Fire-and-forget: logging must never gate the reveal.
+    invoke('logs_begin').catch(() => { /* logging start is best-effort */ });
     if (bootLoading) {
       bootLoading.classList.add('fade-out');
       // Remove from DOM after the crossfade completes so it can't intercept

@@ -602,10 +602,12 @@ pub fn route_legacy_to_slot(name_lower: &str) -> Option<EquipSlot> {
             // cardigan/sweater/garb/attire/outfit/shawl/chemise — the
             // Creator's GLM-authored chip lists routinely used these +
             // hit NO needle, dumping the whole wardrobe into the pack.
+            // (2026-08-20) "crop top" joins here; bare "tee" is a WORD-route
+            // below (a "Canteen" substring must never equip to Chest).
             "cloak", "cape", "mantle", "tunic", "shirt", "blouse", "dress", "robe",
             "gown", "bodice", "surcoat", "doublet", "jerkin", "tabard", "corset",
             "coat", "jacket", "frock", "poncho", "cardigan", "sweater", "garb",
-            "attire", "outfit", "shawl", "chemise",
+            "attire", "outfit", "shawl", "chemise", "crop top",
         ],
     ) {
         return Some(EquipSlot::Chest);
@@ -646,7 +648,7 @@ pub fn route_legacy_to_slot(name_lower: &str) -> Option<EquipSlot> {
     }
     if contains_any(
         name_lower,
-        &["boot", "sabaton", "shoe", "sandal", "slipper", "stocking", "sock", "hosiery", "heels", "gaiter"],
+        &["boot", "sabaton", "shoe", "sandal", "slipper", "stocking", "sock", "hosiery", "heels", "gaiter", "sneaker", "loafer"],
     ) {
         return Some(EquipSlot::Feet);
     }
@@ -679,6 +681,13 @@ fn word_routed_slot(name_lower: &str) -> Option<EquipSlot> {
         ("spat", EquipSlot::Feet),
         ("spats", EquipSlot::Feet),
         ("mail", EquipSlot::Chest),
+        // (2026-08-20) "Cropped Tee" / "White Sneakers" packed instead of
+        // equipping — single-word garment names route as WORDS so their
+        // substrings can't catch unrelated items ("Canteen" ≠ "tee").
+        ("tee", EquipSlot::Chest),
+        ("tees", EquipSlot::Chest),
+        ("trainer", EquipSlot::Feet),
+        ("trainers", EquipSlot::Feet),
     ];
     for w in phrase_words(name_lower) {
         for (word, slot) in WORD_ROUTES {
@@ -2519,6 +2528,15 @@ mod tests {
         assert_eq!(route_legacy_to_slot("oiled briefcase"), None, "'briefs' never catches 'briefcase'");
         assert_eq!(route_legacy_to_slot("silk slippers"), Some(EquipSlot::Feet), "slippers stay footwear");
         assert_eq!(route_legacy_to_slot("slip of paper"), None, "a slip of paper is stationery");
+        // (2026-08-20) The GLM clothing-chip gaps: everyday modern garments
+        // must EQUIP, not pack; the collision pins must not misroute.
+        assert_eq!(route_legacy_to_slot("cropped tee"), Some(EquipSlot::Chest), "'tee' word-route claims the chest");
+        assert_eq!(route_legacy_to_slot("graphic tee"), Some(EquipSlot::Chest));
+        assert_eq!(route_legacy_to_slot("crop top"), Some(EquipSlot::Chest), "'crop top' phrase needle");
+        assert_eq!(route_legacy_to_slot("sneakers"), Some(EquipSlot::Feet), "'sneaker' claims the feet");
+        assert_eq!(route_legacy_to_slot("white trainers"), Some(EquipSlot::Feet), "'trainer' word-route claims the feet");
+        assert_eq!(route_legacy_to_slot("leather canteen"), None, "'tee' never catches 'canteen'");
+        assert_eq!(route_legacy_to_slot("leather loafer"), Some(EquipSlot::Feet));
         // Underwear claims the Inner layer under a worn skirt (the
         // under-garment preference agrees with the router).
         let mut equipment = Equipment::new();

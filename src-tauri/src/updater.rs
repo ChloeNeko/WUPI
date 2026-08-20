@@ -216,9 +216,9 @@ pub async fn perform_update(
 
     let _ = app_handle.emit("update-relaunching", &update);
 
-    // Flush both log sinks (%TEMP%\wupi.log + the logs/ mirror) before the
-    // hard exit — process::exit skips the post-event-loop flush in run().
-    crate::logs::shutdown_flush();
+    // (2026-08-20) No log flush before the hard exit: session logging is
+    // ring-only RAM (logs.rs) — there is no file sink to top up, and crash
+    // files are written synchronously at crash time.
 
     // Exit immediately — releases every OS file lock on the install so the
     // updater's overwrite succeeds. The updater waits on our PID (passed above)

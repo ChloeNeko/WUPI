@@ -825,10 +825,13 @@ export function setScrubberMinutes(minutes) {
 // in; all three tooltips share the exact same dark, gold-bordered badge style.
 //
 // Data sources (verified against schema.rs + lib.rs):
-//   • Calendar → world_clock.current_minutes (epoch minutes). The "Day N" +
-//     "h:mm AM/PM" lines are DERIVED (no day field exists on WorldClock). The
-//     backend has NO calendar/season concept — "Autumn Equinox" etc. is NOT a
-//     real field, so the tooltip shows the derived day + time-of-day only.
+//   • Calendar → schema.calendar (the authored [DATE]-rewritten free-form
+//     label — seeded from the card's <world> Date sibling at fresh start)
+//     rendered as the headline, with the DERIVED day/season as the sub-line.
+//     (2026-08-20: the card used to ignore schema.calendar entirely — the
+//     authored date NEVER showed here. The day number under the dock icon
+//     stays derived from world_clock epoch-minutes; no season field exists,
+//     so the sub-line's season stays the 120-day quarter heuristic.)
 //   • Weather  → weather.condition (a free-form diegetic phrase). The backend
 //     has NO forecast/next/later fields — the spec's "Current › Next › Later"
 //     sequence can't be sourced, so the tooltip shows the single live
@@ -875,9 +878,10 @@ function deriveClockLines(clock) {
 
 // Render the 3-icon status row from a normalized snapshot. Pure DOM writes;
 // safe to call repeatedly. The snapshot shape:
-//   { playerName, cardName, clock, weather, node }
+//   { playerName, cardName, clock, weather, node, calendar }
 //   clock: the raw world_clock object (epoch minutes) — may be null (dormant)
 //   weather: the condition string ('' = dormant)
+//   calendar: the authored schema.calendar label ('' = derived Day N only)
 //   node: { name, setting } or null (no current location)
 //
 // Caches the snapshot in `lastSnap` so the slide-up info cards (§3) can render
@@ -925,15 +929,28 @@ function escapeHtml(s) {
 }
 
 // ─── Season derivation (Calendar card subtext) ──────────────────────────
-// The backend has NO calendar/season field — WorldClock is pure epoch-minutes.
-// A quarter heuristic on the derived day index gives a stable, sensible season
-// label so the Calendar headline reads "Day 14 • Spring" (per spec) instead of
-// just a bare number. 120-day seasons; Day 1–120 Spring, 121–240 Summer, etc.
+// No season field exists — a quarter heuristic on the derived day index
+// gives a stable, sensible sub-line so the Calendar card reads "Day 14 •
+// Spring" (per spec) instead of just a bare number. 120-day seasons; Day
+// 1–120 Spring, 121–240 Summer, etc.
 function seasonForDay(day) {
   const d = Number(day);
   if (!Number.isFinite(d) || d <= 0) return '';
   const q = Math.floor((d - 1) / 120) % 4;
   return ['Spring', 'Summer', 'Autumn', 'Winter'][q];
+}
+
+// Slug → display text (2026-08-20, mirrors tab-rail.js's prettySlug): the
+// "-s-" a name's apostrophe minted restores as a possessive ("Liam-s-House"
+// → "Liam's House"), remaining -/_ separators become spaces, words
+// capitalize at start/after-space only (never after the apostrophe).
+function prettySlug(k) {
+  const spaced = String(k)
+    .replace(/-s-(?=\S)/gi, "'s ")
+    .replace(/[-_]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  return spaced.replace(/(^|\s)([a-z])/g, (m, a, b) => a + b.toUpperCase());
 }
 
 // ===========================================================================
@@ -952,6 +969,17 @@ function buildInfoCardHTML(dock) {
   if (!snap) return '';
   if (dock === 'calendar') {
     const { day } = deriveClockLines(snap.clock);
+    const cal = String(snap.calendar || '').trim();
+    // (2026-08-20) The authored calendar label (card <world> date seed /
+    // [DATE] rewrites) is the HEADLINE; the derived day + heuristic season
+    // ride as the sub-line. Without a label the old derived headline stands.
+    if (cal) {
+      const season = seasonForDay(day);
+      const sub = day
+        ? `<div class="info-card-sub">Day ${escapeHtml(day)}${season ? ` <span class="info-card-sep">•</span> ${escapeHtml(season)}` : ''}</div>`
+        : '';
+      return `<div class="info-card-headline">${escapeHtml(titleCase(cal))}</div>${sub}`;
+    }
     if (!day) {
       return `<div class="info-card-headline info-card-dim">Time Unset</div>`;
     }
@@ -1080,6 +1108,7 @@ export async function refreshAll() {
   let cardName = '';
   let clock = null;
   let weather = '';
+  let calendar = '';                       // schema.calendar (authored [DATE] label)
   let node = null;
   let bodyMap = null;                 // player_state.body (PascalCase→PascalCase) or null
   let detailsMap = null;              // player_state.injury_details (wire key → string[]) or null
@@ -1104,12 +1133,15 @@ export async function refreshAll() {
     if (schema && typeof schema === 'object') {
       clock = schema.world_clock || null;
       weather = (schema.weather && schema.weather.condition) || '';
+      if (typeof schema.calendar === 'string') calendar = schema.calendar.trim();
       const tg = schema.travel_graph;
       const cur = tg && tg.current_node;
       if (cur && Array.isArray(tg.nodes)) {
         const found = tg.nodes.find((n) => n && n.id === cur);
         if (found) {
-          node = { name: found.name || cur, setting: found.setting || '' };
+          // A nameless node falls back to the slug — prettified, so the
+          // card never shows a raw "Liam-s-House"-style id.
+          node = { name: found.name || prettySlug(cur), setting: found.setting || '' };
         }
       }
       // player_state.body is the per-part injury map (PascalCase wire keys
@@ -1141,7 +1173,7 @@ export async function refreshAll() {
   setScrubberMinutes(clock ? (Number(clock.current_minutes) || DEFAULT_CLOCK_MINUTES) : DEFAULT_CLOCK_MINUTES);
 
   // The 3-icon row.
-  renderStatusRow({ playerName, cardName, clock, weather, node });
+  renderStatusRow({ playerName, cardName, clock, weather, node, calendar });
 
   // The injury heatmap: paint over the paperdoll from the live body map.
   // Best-effort — a paint failure is logged + dropped (never blocks the UI

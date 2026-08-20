@@ -1687,6 +1687,11 @@ pub(crate) fn roll_d20(roller: &mut Roller) -> u32 {
 /// (Combat: +2, Exploration: +0, Downtime: −2). Pass 0 when ScenePacing is
 /// not yet computed (the Phase 2 default; Phase 3 threads the real value).
 ///
+/// `health_dc_mod`: additive DC modifier from the derived overall health
+/// tier (2026-08-20 — `consequence::derive_health_tier` /
+/// `HealthTier::skill_dc_mod`). A Fair-or-worse body, or an active
+/// illness, makes every skilled attempt harder. Pass 0 for a neutral body.
+///
 /// Combat keywords are EXCLUDED here — `referee_evaluate` owns those. The
 /// two Referees are disjoint by keyword set; the same turn may fire one
 /// combat roll AND multiple skill rolls (e.g. "I attack the guard then
@@ -1696,7 +1701,11 @@ pub(crate) fn roll_d20(roller: &mut Roller) -> u32 {
 /// (`hash_text(text) + skill_index`), so back-to-back identical turns produce
 /// different rolls (the skill_index offset + the text hash compound). Same
 /// text + same pacing → same outcome (testable).
-pub fn referee_evaluate_skill_checks(text: &str, pacing_dc_mod: i32) -> Vec<SkillCheckOutcome> {
+pub fn referee_evaluate_skill_checks(
+    text: &str,
+    pacing_dc_mod: i32,
+    health_dc_mod: i32,
+) -> Vec<SkillCheckOutcome> {
     // (P1e) Dialogue-stripped matching: spoken words don't attempt checks.
     let lower = strip_dialogue(text).to_lowercase();
     let text_hash = hash_text(text);
@@ -1716,10 +1725,11 @@ pub fn referee_evaluate_skill_checks(text: &str, pacing_dc_mod: i32) -> Vec<Skil
         let seed = text_hash.wrapping_add(idx as u64);
         let mut roller = Roller::new(seed);
         let roll = roll_d20(&mut roller);
-        // Effective DC = base + pacing modifier, clamped to [1, 30]. A d20
-        // roll is 1..=20, so DC ≤ 1 is always-success and DC ≥ 21 is
-        // always-fail; the clamp keeps the math honest without panicking.
-        let dc = (spec.base_dc as i32 + pacing_dc_mod)
+        // Effective DC = base + pacing modifier + health modifier, clamped
+        // to [1, 30]. A d20 roll is 1..=20, so DC ≤ 1 is always-success and
+        // DC ≥ 21 is always-fail; the clamp keeps the math honest without
+        // panicking.
+        let dc = (spec.base_dc as i32 + pacing_dc_mod + health_dc_mod)
             .clamp(1, 30) as u32;
         let success = roll >= dc;
         let seed_text = if success { spec.success_seed } else { spec.fail_seed };
@@ -2718,7 +2728,7 @@ mod tests {
 
     #[test]
     fn skill_check_lockpick_triggers_on_keyword() {
-        let outcomes = referee_evaluate_skill_checks("I pick the lock on the chest.", 0);
+        let outcomes = referee_evaluate_skill_checks("I pick the lock on the chest.", 0, 0);
         assert_eq!(outcomes.len(), 1, "lockpick keyword must fire exactly one check");
         assert_eq!(outcomes[0].skill, "lockpick");
         assert_eq!(outcomes[0].dc, 12, "base DC for lockpick with no pacing mod");
@@ -2738,15 +2748,15 @@ mod tests {
         // The canonical false-positive guard: walking/chatting/looking never
         // triggers a skill check (mirrors referee_combat_keyword behavior).
         assert!(
-            referee_evaluate_skill_checks("I walk to the bar and order an ale.", 0).is_empty(),
+            referee_evaluate_skill_checks("I walk to the bar and order an ale.", 0, 0).is_empty(),
             "neutral text must not trigger any skill check"
         );
         assert!(
-            referee_evaluate_skill_checks("Hello, nice weather today.", 0).is_empty(),
+            referee_evaluate_skill_checks("Hello, nice weather today.", 0, 0).is_empty(),
             "smalltalk must not trigger any skill check"
         );
         assert!(
-            referee_evaluate_skill_checks("I look at the painting.", 0).is_empty(),
+            referee_evaluate_skill_checks("I look at the painting.", 0, 0).is_empty(),
             "looking must not trigger any skill check"
         );
     }
@@ -2754,8 +2764,8 @@ mod tests {
     #[test]
     fn skill_check_keyword_match_is_case_insensitive() {
         // Mixed case must still trigger (the evaluator lowercases the text).
-        let upper = referee_evaluate_skill_checks("I PICK THE LOCK.", 0);
-        let mixed = referee_evaluate_skill_checks("I Persuade the guard.", 0);
+        let upper = referee_evaluate_skill_checks("I PICK THE LOCK.", 0, 0);
+        let mixed = referee_evaluate_skill_checks("I Persuade the guard.", 0, 0);
         assert_eq!(upper.len(), 1);
         assert_eq!(mixed.len(), 1);
     }
@@ -2765,11 +2775,11 @@ mod tests {
         // Same text + same pacing modifier → same outcomes (RNG is seeded
         // from the text + skill index, so the result is reproducible). This
         // is what makes the Referee testable AND what makes replays stable.
-        let a = referee_evaluate_skill_checks("I try to pick the lock.", 0);
-        let b = referee_evaluate_skill_checks("I try to pick the lock.", 0);
+        let a = referee_evaluate_skill_checks("I try to pick the lock.", 0, 0);
+        let b = referee_evaluate_skill_checks("I try to pick the lock.", 0, 0);
         assert_eq!(a, b, "same text + pacing must produce identical outcomes");
         // Different text → different roll (almost certainly; the hash shifts).
-        let c = referee_evaluate_skill_checks("I try to pick the lock again.", 0);
+        let c = referee_evaluate_skill_checks("I try to pick the lock again.", 0, 0);
         assert_ne!(a[0].roll, c[0].roll, "different text must produce different rolls");
     }
 
@@ -2778,6 +2788,7 @@ mod tests {
         // A turn can attempt multiple skills in one breath: each must fire.
         let outcomes = referee_evaluate_skill_checks(
             "I pick the lock, then sneak past the guard.",
+            0,
             0,
         );
         let skills: Vec<&str> = outcomes.iter().map(|o| o.skill).collect();
@@ -2794,9 +2805,9 @@ mod tests {
     #[test]
     fn skill_check_pacing_dc_mod_applies() {
         // +2 pacing mod raises the effective DC by 2; -2 lowers it by 2.
-        let neutral = referee_evaluate_skill_checks("I intimidate the thug.", 0);
-        let combat = referee_evaluate_skill_checks("I intimidate the thug.", 2);
-        let downtime = referee_evaluate_skill_checks("I intimidate the thug.", -2);
+        let neutral = referee_evaluate_skill_checks("I intimidate the thug.", 0, 0);
+        let combat = referee_evaluate_skill_checks("I intimidate the thug.", 2, 0);
+        let downtime = referee_evaluate_skill_checks("I intimidate the thug.", -2, 0);
         assert_eq!(neutral.len(), 1);
         assert_eq!(combat.len(), 1);
         assert_eq!(downtime.len(), 1);
@@ -2813,10 +2824,22 @@ mod tests {
     }
 
     #[test]
+    fn skill_check_health_dc_mod_applies() {
+        // (2026-08-20) The derived health tier feeds an additive DC modifier
+        // exactly like pacing: a Poor body (+2) hardens every attempt, and
+        // the modifier must not reseed the dice.
+        let neutral = referee_evaluate_skill_checks("I intimidate the thug.", 0, 0);
+        let hurt = referee_evaluate_skill_checks("I intimidate the thug.", 0, 2);
+        assert_eq!(neutral[0].dc, 13, "intimidate base DC");
+        assert_eq!(hurt[0].dc, 15, "health +2 raises DC like pacing +2");
+        assert_eq!(neutral[0].roll, hurt[0].roll, "modifier must not reseed the dice");
+    }
+
+    #[test]
     fn skill_check_dc_clamps_at_1_and_30() {
         // A pathological pacing modifier can't push DC out of [1, 30].
-        let low = referee_evaluate_skill_checks("I pick the lock.", -100);
-        let high = referee_evaluate_skill_checks("I pick the lock.", 100);
+        let low = referee_evaluate_skill_checks("I pick the lock.", -100, 0);
+        let high = referee_evaluate_skill_checks("I pick the lock.", 100, 0);
         assert_eq!(low[0].dc, 1, "DC must clamp at 1");
         assert_eq!(high[0].dc, 30, "DC must clamp at 30");
         // DC 1 with d20 (1..=20) → only a natural 1 fails. Almost always succeeds.
@@ -2828,7 +2851,7 @@ mod tests {
     fn skill_check_excludes_combat_keywords() {
         // "I attack" is a combat keyword — the skill Referee must NOT fire on it.
         // The combat Referee (referee_evaluate) owns that action.
-        let skill_outcomes = referee_evaluate_skill_checks("I attack the goblin with my sword.", 0);
+        let skill_outcomes = referee_evaluate_skill_checks("I attack the goblin with my sword.", 0, 0);
         assert!(
             skill_outcomes.is_empty(),
             "skill Referee must not fire on combat keywords (combat Referee owns them): {skill_outcomes:?}"

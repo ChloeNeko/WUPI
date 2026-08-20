@@ -640,6 +640,132 @@ fn nudge_condition_down(c: Condition) -> Condition {
 }
 
 // ===========================================================================
+// (2026-08-20) Overall HEALTH tier — the player-facing vitals line + the
+// skill-check health modifier. Distinct from `Condition` on purpose:
+// `Condition` is the narrator-prompt read (wounds folded with buff/debuff
+// counts into six prose labels); the health tier is the discrete UI line
+// ("HEALTH: POOR") and a mechanical modifier, so it keeps the user-specified
+// grade ladder (Sick / Infected / Excellent / Good / Fair / Poor / Critical)
+// instead of Condition's vocabulary.
+// ===========================================================================
+
+/// The overall health grade. The two illness states (Sick / Infected) are
+/// CONDITIONS, not rungs on the wound ladder — an active illness tag shows
+/// instead of a grade whenever the body's wounds are no worse than minor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HealthTier {
+    Critical,
+    Poor,
+    Fair,
+    Good,
+    Excellent,
+    Infected,
+    Sick,
+}
+
+impl HealthTier {
+    /// Single-word label for the vitals line (the drawer CSS uppercases it).
+    pub fn semantic(self) -> &'static str {
+        match self {
+            HealthTier::Critical => "Critical",
+            HealthTier::Poor => "Poor",
+            HealthTier::Fair => "Fair",
+            HealthTier::Good => "Good",
+            HealthTier::Excellent => "Excellent",
+            HealthTier::Infected => "Infected",
+            HealthTier::Sick => "Sick",
+        }
+    }
+
+    /// Additive skill-check DC modifier (positive = harder): a battered or
+    /// feverish body fumbles lockpicks and stumbles through sneaks. Fed to
+    /// `referee_evaluate_skill_checks` alongside the pacing modifier.
+    pub fn skill_dc_mod(self) -> i32 {
+        match self {
+            HealthTier::Excellent | HealthTier::Good => 0,
+            HealthTier::Sick => 2,
+            HealthTier::Infected => 3,
+            HealthTier::Fair => 1,
+            HealthTier::Poor => 2,
+            HealthTier::Critical => 4,
+        }
+    }
+}
+
+/// Label stems that mark an ACTIVE tag as illness. Substring contains-match
+/// against the lowercased label; each stem is unambiguous inside a tag label
+/// (no "skill"-vs-"ill" class of collision — "ill" is handled as a whole
+/// word below because it IS ambiguous: "thrill", "chill").
+const SICK_STEMS: &[&str] = &[
+    "sick", "nausea", "nauseous", "queas", "vomit", "fever", "dizzy",
+    "migraine", "poison", "toxic", "toxin", "venom", "diseas", "plague",
+    "pestilence", "unwell", "ailing", "ailment", "malaise", "lethargic",
+];
+const INFECTED_STEMS: &[&str] = &[
+    "infect", "sepsis", "septic", "fester", "gangren", "abscess",
+];
+/// Ambiguous short illness words — matched as WHOLE label words only
+/// ("ill" is a substring of "thrill"/"skill"; "flu" of "influx"/"flute").
+const ILLNESS_WORDS: &[&str] = &["ill", "flu"];
+
+/// Derive the overall health tier from the wound map + active status tags.
+/// PURE FN — never stored, never written by the LLM.
+///
+/// - Wound ladder (dominant): worst `BodyPartState` rank maps 1:1 —
+///   all-Healthy → Excellent, any Yellow → Good, any Orange → Fair,
+///   any Red → Poor, any Purple/Black → Critical.
+/// - Illness override: an ACTIVE (unexpired) tag whose label reads as
+///   infection/illness replaces the grade with Infected/Sick, but only
+///   while wounds are no worse than minor (Yellow). Fair-or-worse wounds
+///   describe the body better than an illness label does.
+/// - Infected beats Sick when both are somehow active.
+pub fn derive_health_tier(
+    wounds: &HashMap<BodyPart, BodyPartState>,
+    tags: &[StatusTag],
+    now_minutes: i64,
+) -> HealthTier {
+    let worst = wounds.values().map(|s| *s as u8).max().unwrap_or(0);
+    let grade = match worst {
+        0 => HealthTier::Excellent,
+        1 => HealthTier::Good,
+        2 => HealthTier::Fair,
+        3 => HealthTier::Poor,
+        _ => HealthTier::Critical,
+    };
+    if grade == HealthTier::Excellent || grade == HealthTier::Good {
+        // Illness may override only the two healthy rungs — Fair-or-worse
+        // wounds describe the body better than an illness label does.
+        let mut sick = false;
+        let mut infected = false;
+        for t in tags {
+            if t.is_expired(now_minutes) {
+                continue;
+            }
+            let label = t.label.to_lowercase();
+            if INFECTED_STEMS.iter().any(|s| label.contains(s)) {
+                infected = true;
+            }
+            if SICK_STEMS.iter().any(|s| label.contains(s))
+                || label
+                    .split(|c: char| !c.is_alphanumeric())
+                    .any(|w| ILLNESS_WORDS.contains(&w))
+            {
+                sick = true;
+            }
+        }
+        if infected {
+            return HealthTier::Infected;
+        }
+        if sick {
+            return HealthTier::Sick;
+        }
+    }
+    grade
+}
+
+
+// ===========================================================================
 // Slice 4: Qualitative Buff/Debuff tags with expiry (DriverTime consumer #1)
 // ===========================================================================
 
@@ -1369,6 +1495,78 @@ mod tests {
         wounds.insert(BodyPart::LeftHand, BodyPartState::Black);
         wounds.insert(BodyPart::Head, BodyPartState::Purple);
         assert_eq!(derive_condition(&wounds, 0, 0), Condition::Downed);
+    }
+
+    // ---- Overall health tier (2026-08-20) ----
+
+    #[test]
+    fn health_tier_wound_ladder_maps_one_to_one() {
+        assert_eq!(derive_health_tier(&HashMap::new(), &[], 0), HealthTier::Excellent);
+        let mut w = HashMap::new();
+        w.insert(BodyPart::LeftHand, BodyPartState::Yellow);
+        assert_eq!(derive_health_tier(&w, &[], 0), HealthTier::Good);
+        w.insert(BodyPart::LeftUpperArm, BodyPartState::Orange);
+        assert_eq!(derive_health_tier(&w, &[], 0), HealthTier::Fair);
+        w.insert(BodyPart::UpperTorso, BodyPartState::Red);
+        assert_eq!(derive_health_tier(&w, &[], 0), HealthTier::Poor);
+        w.insert(BodyPart::Head, BodyPartState::Purple);
+        assert_eq!(derive_health_tier(&w, &[], 0), HealthTier::Critical);
+    }
+
+    #[test]
+    fn health_tier_illness_overrides_healthy_grades_only() {
+        // Sick / Infected replace Excellent / Good; wounds win at Fair+.
+        assert_eq!(
+            derive_health_tier(&HashMap::new(), &[tag("Feverish", "", 500)], 100),
+            HealthTier::Sick
+        );
+        assert_eq!(
+            derive_health_tier(&HashMap::new(), &[tag("Wound Infection", "", 0)], 100),
+            HealthTier::Infected
+        );
+        let mut w = HashMap::new();
+        w.insert(BodyPart::LeftHand, BodyPartState::Yellow);
+        assert_eq!(
+            derive_health_tier(&w, &[tag("Poisoned", "", 500)], 100),
+            HealthTier::Sick
+        );
+        w.insert(BodyPart::LeftUpperArm, BodyPartState::Orange);
+        assert_eq!(
+            derive_health_tier(&w, &[tag("Poisoned", "", 500)], 100),
+            HealthTier::Fair
+        );
+    }
+
+    #[test]
+    fn health_tier_ignores_expired_and_ambiguous_labels() {
+        // Expired illness no longer shows.
+        assert_eq!(
+            derive_health_tier(&HashMap::new(), &[tag("Feverish", "", 100)], 100),
+            HealthTier::Excellent
+        );
+        // "ill"/"flu" match only as whole words: "Thrilling Performance" (a
+        // buff) and "Flute Melody" must not read as sick.
+        assert_eq!(
+            derive_health_tier(&HashMap::new(), &[tag("Thrilling Performance", "", 500)], 100),
+            HealthTier::Excellent
+        );
+        assert_eq!(
+            derive_health_tier(&HashMap::new(), &[tag("Flute Melody", "", 500)], 100),
+            HealthTier::Excellent
+        );
+    }
+
+    #[test]
+    fn health_tier_infected_beats_sick_and_feeds_skill_dc() {
+        let tags = vec![tag("Feverish", "", 500), tag("Festering Wound", "", 500)];
+        assert_eq!(derive_health_tier(&HashMap::new(), &tags, 100), HealthTier::Infected);
+        assert_eq!(HealthTier::Excellent.skill_dc_mod(), 0);
+        assert_eq!(HealthTier::Good.skill_dc_mod(), 0);
+        assert_eq!(HealthTier::Fair.skill_dc_mod(), 1);
+        assert_eq!(HealthTier::Poor.skill_dc_mod(), 2);
+        assert_eq!(HealthTier::Critical.skill_dc_mod(), 4);
+        assert_eq!(HealthTier::Sick.skill_dc_mod(), 2);
+        assert_eq!(HealthTier::Infected.skill_dc_mod(), 3);
     }
 
     #[test]

@@ -104,8 +104,11 @@ function subtypeLabel(subtype) {
 export async function renderWorlds(root, handlers) {
   root._handlers = handlers || {};
   // pickMode: a plain "pick a card" grid (no NEW/LOAD/EDIT/DELETE modal). A
-  // card click calls handlers.onSelect(card) instead of openModal. Used by the
-  // New Game flow's LOAD SIM CARD step.
+  // card click calls handlers.onSelect(card) instead of openModal.
+  // (2026-08-20) No current caller — the New Game flow's LOAD SIM CARD step
+  // now shows the SAME review-card modal as the Load menu (Chloe ruling: a
+  // card click must never auto-launch); the option stays as the grid's
+  // select-only capability.
   const pickMode = !!(handlers && handlers.pickMode && handlers.onSelect);
   const host = root.querySelector('[data-host]');
   host.innerHTML = '';

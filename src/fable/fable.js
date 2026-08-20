@@ -821,7 +821,9 @@ function exitLoadToTitle() {
 //     (Load-menu per-card NEW entry: the card is preset, so every player
 //      resolution routes through flowAfterPlayer → launchGame — slides 2 + 3
 //      never show)
-//   Slide 2: SIM pair (NEW / LOAD / IMPORT SIM CARD) → establish card →
+//   Slide 2: SIM pair (NEW / LOAD / IMPORT SIM CARD) → establish card (the
+//            LOAD step shows the same review-card modal as the Load menu —
+//            NEW on the modal selects the card; 2026-08-20) →
 //            advanceFromSim (skips the Codex picker when a codex exists)
 //   Slide 3: Codex pair (CREATE / CONTINUE-WITHOUT / IMPORT) — skipped if codex
 //   → launchGame
@@ -1151,9 +1153,15 @@ function flowLoadSim(selectedBtn) {
 function renderSimPickerStep() {
   showScreen('worlds');
   setFlowStep('sim-picker');
+  // (2026-08-20 Chloe ruling) The sim picker shows the SAME review-card
+  // modal the Load menu does — clicking a card must NEVER auto-launch
+  // straight into the game (the old pickMode grid bypassed the review
+  // card, so the EDIT/DELETE buttons were unreachable from this step).
+  // The modal's NEW continues THIS flow (the player was already chosen at
+  // slide 1 — no player re-pick, no double-ask): select the card +
+  // advance. LOAD / EDIT / DELETE behave exactly as on the Load menu.
   renderWorlds(screens['worlds'], {
-    pickMode: true,
-    onSelect: (card) => {
+    onNewGame: (card) => {
       flowState.selectedCardId = card.id;
       flowState.simDraft = {
         name: card.name,
@@ -1162,6 +1170,8 @@ function renderSimPickerStep() {
       };
       advanceFromSim(card.id);
     },
+    onResume: (card) => openWorldSaves(card),
+    onEdit: (card) => openCardRawEditor(card),
   });
 }
 
