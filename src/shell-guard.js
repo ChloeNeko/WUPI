@@ -105,9 +105,33 @@ export function withShellBusy(task) {
 // keyboard activation, so Esc could dismiss the home grid mid-Fable-fog
 // and Enter could double-send. Same capture + swallow discipline; the
 // 12s safety timeout bounds any swallowed-key window.
+//
+// (2026-08-20, Chloe ruling) The WebView's native right-click menu
+// (Refresh / Save As / Print / Send tab to your device) + the reload keys
+// (Ctrl+R / Cmd+R / F5, incl. the Shift hard-reload variant) are disabled
+// APP-WIDE, unconditionally — WUPI is a kiosk-style shell whose whole
+// state lives in the SPA + the Rust core; a manual refresh drops the
+// frontend state out from under a live engine. There is ONE document
+// (wupi.html bundles all three surfaces — shell, Fable, PRISM), so one
+// document-level listener covers everything. These run BEFORE the
+// shellBusy gate: they block in every state, busy or not.
+function isReloadKey(e) {
+  if (e.key === 'F5') return true;
+  return (e.ctrlKey || e.metaKey) && !e.altKey && (e.key === 'r' || e.key === 'R');
+}
+
 export function initShellGuard() {
+  document.addEventListener('contextmenu', (e) => {
+    e.preventDefault();
+    e.stopImmediatePropagation();
+  }, { capture: true });
   ['click', 'pointerdown', 'keydown'].forEach((evt) => {
     document.addEventListener(evt, (e) => {
+      if (evt === 'keydown' && isReloadKey(e)) {
+        e.preventDefault();
+        e.stopImmediatePropagation();
+        return;
+      }
       if (!shellBusy) return;
       e.stopImmediatePropagation();
       e.preventDefault();

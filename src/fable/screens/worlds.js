@@ -141,7 +141,6 @@ export async function renderWorlds(root, handlers) {
     tile.className = 'fable-player-mini-card';
     tile.type = 'button';
     tile.dataset.cardId = card.id;
-    tile.title = card.name;
     tile.setAttribute('aria-label', `View card ${card.name}`);
     const portraitHTML = card.has_portrait && card.portrait_url
       ? `<div class="fable-player-mini-portrait"><img class="fable-player-mini-portrait-img" src="${esc(convertFileSrc(card.portrait_url))}" alt="" onerror="this.parentNode.classList.add('fable-player-mini-portrait--placeholder')"></div>`
@@ -214,7 +213,6 @@ async function openModal(root, meta) {
   const portraitSlot = card.querySelector('[data-modal-portrait]');
   if (portraitSlot) {
     portraitSlot.style.cursor = 'pointer';
-    portraitSlot.title = 'Change portrait';
     portraitSlot.addEventListener('click', async () => {
       try {
         const picked = await openDialog({

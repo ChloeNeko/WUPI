@@ -67,9 +67,9 @@ export function buildRawEditor() {
       <div class="fable-raw-editor-head">
         <span class="fable-raw-editor-title" data-raw-title></span>
         <div class="fable-raw-editor-controls">
-          <button class="fable-raw-btn save"  data-raw-save   title="Save"   aria-label="Save">✓</button>
-          <button class="fable-raw-btn revert" data-raw-revert title="Revert" aria-label="Revert to last saved">↻</button>
-          <button class="fable-raw-btn close" data-raw-close  title="Close"  aria-label="Close without saving">✕</button>
+          <button class="fable-raw-btn save"  data-raw-save     aria-label="Save">✓</button>
+          <button class="fable-raw-btn revert" data-raw-revert aria-label="Revert to last saved">↻</button>
+          <button class="fable-raw-btn close" data-raw-close   aria-label="Close without saving">✕</button>
         </div>
       </div>
       <textarea class="fable-raw-editor-text" data-raw-text spellcheck="false"></textarea>

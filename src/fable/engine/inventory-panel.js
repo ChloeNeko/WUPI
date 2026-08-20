@@ -362,8 +362,6 @@ function buildItemButton(item) {
   btn.type = 'button';
   btn.className = 'inv-item-btn';
   btn.setAttribute('data-inv-item-id', item.id);
-  // Title attribute = full name on hover (accessibility + a tooltip hint).
-  btn.title = item.name + (item.qty > 1 ? ` ×${item.qty}` : '');
 
   const label = document.createElement('span');
   label.className = 'inv-item-label';

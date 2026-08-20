@@ -1404,14 +1404,13 @@
     background:
         linear-gradient(rgba(197, 179, 88, 0.28), rgba(197, 179, 88, 0.28)) bottom center / 880px 1px no-repeat;
 }
-/* Two-column trait grid — the dl renders as a 2-col grid so the trait pairs
-   pack side-by-side instead of one tall column. 2026-08-15 Chloe: bigger text
-   (labels 0.8 → 0.95rem, values 1.05 → 1.3rem) + more vertical air (row gap
-   9 → 16px) — the review card's information was too small + cramped. */
+/* Trait grid — STACKED single column (2026-08-20 Chloe: pairs must never
+   sit side-by-side; the 2-col grid aligned short rows like Goals/Occupation
+   and left ragged gaps). One label-above-value pair per row, full width. */
 .fable-player-review-section dl {
     margin: 0;
     display: grid;
-    grid-template-columns: 1fr 1fr;
+    grid-template-columns: 1fr;
     gap: 16px 56px;
     font-size: 1.3rem;
 }
@@ -1498,7 +1497,7 @@
                  Tone). Every remaining tag lives behind the brass CARD-ICON
    button → the centered .fable-id-details-* popup (the card never expands).
    The card markup comes from screens/id-card.js; the model from buildIdCard. */
-.fable-id-card { position: relative; }
+.fable-id-card { position: relative; container-type: inline-size; }
 
 /* The info body: content anchors to the TOP (2026-08-15 Chloe: "so much
    space on top of the header — move it up") — the header sits high against
@@ -1512,31 +1511,29 @@
     align-self: stretch;
 }
 
-/* HEADROW — [invisible spacer | centered header | corner buttons]. The
-   spacer mirrors the corner cluster's width so the header is TRULY centered
-   in the information space; the corner cluster is in-flow (top-right of the
-   card visually) so the buttons can never overlap the header text. */
+/* HEADROW — the header block LEFT-ALIGNED against the portrait (2026-08-20
+   Chloe), flush with the info body's left edge. Right padding still clears
+   the absolutely-pinned corner cluster so a long header cannot run under
+   the buttons. */
 .fable-id-card-headrow {
     display: flex;
     flex-direction: row;
     align-items: flex-start;
-    justify-content: center;
+    justify-content: flex-start;
     gap: 14px;
     width: 100%;
+    box-sizing: border-box;
+    padding: 0 120px 0 0;         /* clears the corner cluster on the right only */
+    margin: -12px 0 0 -50px;      /* 2026-08-20 Chloe: nudged further left (into the portrait gap) + up (toward the card's top edge) */
 }
-.fable-id-card-head-spacer {
-    flex: 0 0 auto;
-    width: 102px;                 /* mirrors .fable-id-card-corner's footprint */
-    margin-right: auto;         /* auto-margin sandwich: pins LEFT edge... */
-    align-self: flex-start;
-}
-/* The header wrapper shrink-wraps its text so the gold rule can size to it. */
+/* The header wrapper shrink-wraps its text so the gold rule can size to it;
+   the whole block (text, rule, type subheader) anchors LEFT. */
 .fable-id-card-headwrap {
     flex: 0 1 auto;
     min-width: 0;
     display: flex;
     flex-direction: column;
-    align-items: center;
+    align-items: flex-start;
 }
 .fable-id-card-head-text {
     display: block;
@@ -1549,57 +1546,65 @@
     color: var(--fable-brass);
     text-transform: uppercase;
     letter-spacing: 0.16em;
-    text-align: center;
-    text-shadow: 0 0 12px var(--fable-brass-glow);
+    /* Optical alignment (2026-08-20 Chloe): letter-spacing adds a trailing
+       gap after the last glyph, so the text BOX is wider on the right — a
+       matching leading padding keeps the glyph run flush with the rule's
+       left edge. */
+    padding-left: 0.16em;
+    text-align: left;
+    text-shadow: 0 0 6px rgba(230, 213, 138, 0.22);   /* 2026-08-20 Chloe: subtler glow */
 }
-/* The bold gold rule: fitted to the HEADER TEXT width plus extra space each
-   side (NOT the card width). 100% resolves against the shrink-wrapped
-   headwrap = the text; the +60px overhang splits evenly via the centered
-   flex (2026-08-15 Chloe: "a bit more bold and gold"). */
+/* The gold rule: THINNER (2026-08-20 Chloe) + a FIXED width of 40% of the
+   CARD's width — cqw resolves against the card root (the container-type
+   above), not the shrink-wrapped header text. Anchored to the header's LEFT
+   edge. */
 .fable-id-card-head-rule {
     display: block;
-    width: calc(100% + 60px);
+    width: calc(40cqw + 28px);   /* 40% of the card's BORDER-box width (cqw is content-box: +2×(34 padding + 1 border)×40%) */
+    max-width: 100%;
     margin-top: 10px;
-    height: 3px;
+    height: 1px;
     border-radius: 2px;
     background: linear-gradient(90deg,
-        rgba(230, 213, 138, 0.15) 0%,
-        var(--fable-brass) 22%,
-        #F7EAAD 50%,
-        var(--fable-brass) 78%,
-        rgba(230, 213, 138, 0.15) 100%);
-    box-shadow: 0 0 10px rgba(230, 213, 138, 0.55), 0 1px 3px rgba(0, 0, 0, 0.6);
+        var(--fable-brass) 0%,
+        #F7EAAD 28%,
+        var(--fable-brass) 52%,
+        rgba(230, 213, 138, 0.35) 78%,
+        rgba(230, 213, 138, 0) 100%);   /* 2026-08-20 Chloe: solid at the left, fades out subtly to the right only */
+    box-shadow: 0 0 4px rgba(230, 213, 138, 0.16), 0 1px 2px rgba(0, 0, 0, 0.5);   /* 2026-08-20 Chloe: a lot more subtle */
 }
 
 /* The corner cluster — the brass card-icon (details) + pencil (Creator
-   review edit), in-flow at the headrow's right = the card's top-right corner.
-   NO auto margins: the head-spacer mirrors this cluster's exact width so the
-   header stays truly centered between them. */
+   review edit), ABSOLUTELY pinned to the CARD's true top-right corner
+   (2026-08-20 Chloe: the in-flow headrow seat left dead space above + right
+   of the buttons). Anchors against the card root (.fable-id-card /
+   .fable-codex-review-card are position:relative). */
 .fable-id-card-corner {
-    flex: 0 0 auto;
+    position: absolute;
+    top: 14px;
+    right: 14px;
+    z-index: 3;
     display: flex;
     align-items: center;
     gap: 10px;
-    margin-left: auto;            /* ...and pins the corner flush into the top-right (2026-08-15 Chloe) */
 }
 
-/* License grid — a 6-column track: plain cells span 3 (halves), the
-   AGE|SKIN|BODY trio spans 2 (thirds). Bigger text + generous vertical
-   spacing (2026-08-15 Chloe). */
+/* License grid — PAIRED rows (2026-08-20 Chloe): RACE|GENDER, then
+   AGE|EYE COLOR, then HEIGHT|WEIGHT — two half cells per row (span 3 of the
+   6-track grid), spread a touch wider than the old paired halves. */
 .fable-id-card-core {
     margin: 0;
     display: grid;
     grid-template-columns: repeat(6, 1fr);
-    gap: 16px 36px;               /* minimum spacing — space-evenly adds the rest */
-    align-content: space-evenly; /* rows spread through the portrait height */
+    gap: 16px 48px;                /* 2026-08-20 Chloe: a tiny bit more spread */
+    align-content: space-evenly;  /* the three rows spread through the portrait height */
     flex: 1 1 auto;
     width: 100%;
     font-size: 1.25rem;
 }
-/* Cells CENTER their content on BOTH axes: horizontally under the label, and
-   vertically within the grid row — a one-line AGE next to a wrapped SKIN
-   centers in place instead of stranding a void underneath (2026-08-15 Chloe:
-   "empty space around age… texts all over the place"). */
+/* Cells CENTER their content on BOTH axes: horizontally under the label,
+   vertically within the row — a wrapped value centers in place instead of
+   stranding a void underneath. */
 .fable-id-card-cell {
     grid-column: span 3;
     display: flex;
@@ -1610,51 +1615,8 @@
     gap: 3px;
     min-width: 0;
 }
-.fable-id-card-cell--third { grid-column: span 2; }
-/* HALF cells pull INWARD (2026-08-15 Chloe: "the age/skin/body row is
-   perfectly divided into 3s but not the others — move race/height/hair a
-   bit right, gender/weight/eye a bit left"). The renderer tracks the grid
-   flow and tags each half with its column side; padding on the cell's
-   OUTER edge shrinks the content box from that side, moving the centered
-   content toward the middle (LEFT cell = padding-LEFT, RIGHT cell =
-   padding-RIGHT — inward, never outward). The HAIR|EYE COLOR pairing
-   stays untouched (last row). */
-.fable-id-card-cell--half-l { padding-left: 92px; }
-.fable-id-card-cell--half-r { padding-right: 92px; }
-/* OUTWARD halves — the last row (HAIR | EYE COLOR) breaks the inward pull
-   (2026-08-15 Chloe: "remove eye color and hair from the alignment — hair
-   under age, eye color under body"): padding on the INNER edge pushes the
-   centered content OUT to the outer thirds' centers, mirroring the trio
-   row above and opening the middle. Only emitted when the trio exists. */
-.fable-id-card-cell--half-out-l { padding-right: 100px; }
-.fable-id-card-cell--half-out-r { padding-left: 100px; }
 .fable-id-card-core dt { color: var(--fable-text-faint); font-size: 0.95rem; text-transform: uppercase; letter-spacing: 0.06em; }
 .fable-id-card-core dd { margin: 0; color: var(--fable-text); font-size: 1.25rem; text-transform: uppercase; line-height: 1.25; overflow-wrap: anywhere; }
-
-/* The HAIR cell — stacked Color/Length/Style sub-lines under the one HAIR
-   label (2026-08-15 Chloe: "different colored and smaller text"). Each line:
-   the sub-label (with its colon) in brass, the answer in the same white as
-   the main values — 2026-08-15 follow-up: labels NOT italicized. */
-.fable-id-card-cell--hair { gap: 5px; }
-.fable-id-card-cell--hair dd {
-    display: flex;
-    flex-direction: column;
-    align-items: center;           /* each sub-line centers under the HAIR label */
-    gap: 3px;
-    font-size: 1.05rem;
-}
-.fable-id-card-hair-line {
-    display: block;
-    color: var(--fable-text);      /* the answers stay white (parchment ivory) */
-    line-height: 1.25;
-    text-transform: uppercase;
-    letter-spacing: 0.03em;
-}
-.fable-id-card-hair-line i {
-    font-style: normal;            /* no italics on Color/Length/Style */
-    color: var(--fable-brass-bright);
-    margin-right: 7px;
-}
 
 /* World/Scenario: the TYPE banner is the headrow header; a 1-col core (the
    setting/purpose values are prose-y, so a single full-width column reads
@@ -1663,19 +1625,23 @@
 .fable-id-card--world .fable-id-card-core { grid-template-columns: 1fr; gap: 20px; }
 .fable-id-card--world .fable-id-card-core .fable-id-card-cell { grid-column: 1 / -1; align-items: center; }
 
-/* NPC: a subtle brass corner chip (so an NPC reads distinct from a player,
-   but otherwise shares the player layout). Sits at the top of the body. */
+/* NPC: a small darker-bronze 'NPC CARD' subheader centered UNDER the name
+   rule (2026-08-20 Chloe) — inside the headwrap so it tracks the header's
+   center. Players/worlds never render it. */
+/* NPC: a small darker-bronze type subheader. 2026-08-20 Chloe: centered on
+   the INFO BODY's midline — directly between RACE and GENDER (the paired
+   row's seam) — the same horizontal position on every card type. It is a
+   full-width row of its own under the header block, so it centers on the
+   body regardless of name length or the header's left nudge. */
 .fable-id-card-tag {
-    align-self: flex-start;
-    margin: 0 0 6px;
-    padding: 3px 12px;
-    border: 1px solid rgba(197, 179, 88, 0.4);
-    border-radius: 999px;
-    background: rgba(197, 179, 88, 0.08);
-    color: var(--fable-brass-bright);
-    font-size: 0.72rem;
-    letter-spacing: 0.18em;
+    width: 100%;
+    margin: -11px 0 -18px;         /* -11 + the body's 20px column gap = 9px under the rule; -18 pulls the grid up tight under the tag */
+    color: #8f7a3d;                /* darker bronze — quieter than the brass rule */
+    font-weight: 600;              /* 2026-08-20 Chloe: a bit bolder — was thin at default weight */
+    font-size: 0.78rem;
+    letter-spacing: 0.22em;
     text-transform: uppercase;
+    text-align: center;
 }
 
 /* The brass card-icon trigger — small circular brass button in the corner
@@ -1791,6 +1757,9 @@
     overflow-y: auto;
     padding: 18px 26px 22px;
 }
+/* Values keep their newlines — the stacked HAIR lines (2026-08-20) arrive
+   newline-joined from the model; pre-line renders each as its own row. */
+.fable-id-details-body dd { white-space: pre-line; }
 .fable-id-details-body .fable-player-review-section { margin-bottom: 18px; }
 .fable-id-details-body .fable-player-review-section:last-child { margin-bottom: 0; }
 
@@ -1992,9 +1961,73 @@
     background: rgba(197, 179, 88, 0.22);
     box-shadow: 0 0 16px rgba(230, 213, 138, 0.45);
 }
-/* The codex review grid opens with the same headrow the ID cards use (the
-   pencil rides its corner cluster in-flow — no absolute anchor needed). */
-.fable-codex-review-card .fable-id-card-headrow { margin-bottom: 4px; }
+/* --- The codex review (2026-08-20 Chloe redesign) -------------------------
+   Entries use the WHOLE card: a centered Title carrying its own gold divider
+   underneath (the titles ARE the dividers), small gray tags beneath, then
+   the FULL description — no Tags/Body labels, no dt/dd grid. The entry list
+   itself is the scroller (the card stays fixed) so the corner pencil never
+   scrolls away and long bodies are never silently cut (visible thin brass
+   scrollbar). */
+.fable-codex-review-card { position: relative; container-type: inline-size; }
+.fable-codex-entries {
+    display: flex;
+    flex-direction: column;
+    gap: 30px;
+    width: 100%;
+    min-height: 0;
+}
+.fable-codex-entry {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    text-align: center;
+}
+.fable-codex-entry-title {
+    margin: 0 0 10px;
+    padding: 0 0 9px;
+    width: 100%;                   /* full row so the divider width isn't tied to the word */
+    overflow-wrap: anywhere;
+    font-family: 'Almendra', var(--fable-font-serif);
+    font-weight: 700;
+    font-size: 26px;
+    color: var(--fable-brass);
+    text-transform: uppercase;
+    letter-spacing: 0.12em;
+    text-align: center;
+    /* FIXED divider width: 100% of the CARD's border-box width (cqw is
+       content-box, so +70px compensates padding+border), centered under
+       the title — 2026-08-20 Chloe (100%, was 99%). */
+    background:
+        linear-gradient(rgba(197, 179, 88, 0.28), rgba(197, 179, 88, 0.28)) bottom center / calc(100cqw + 70px) 1px no-repeat;
+}
+.fable-codex-entry-tags {
+    margin: 0 0 10px;
+    color: var(--fable-text-faint);
+    font-size: calc(0.92rem - 2px); /* 2026-08-20 Chloe: exactly 2px smaller */
+    letter-spacing: 0.09em;
+    text-transform: uppercase;      /* 2026-08-20 Chloe: tags render all-caps */
+    margin-bottom: 24px;            /* 2026-08-20 Chloe: extra space between tags and body (10 → 14 → 20 → 24px) */
+}
+.fable-codex-entry-body {
+    margin: 0;
+    max-width: 92%;
+    color: var(--fable-text);
+    font-size: 1.12rem;
+    line-height: 1.6;
+}
+.fable-creator-chat.is-review-mode .fable-codex-review-card {
+    /* Taller cap than the ID cards (entries own the space) + the ENTRIES
+       scroll, not the card — the pinned corner pencil stays put. */
+    max-height: calc(100vh - 300px);
+    overflow: hidden;
+}
+.fable-codex-review-card .fable-codex-entries {
+    flex: 1 1 auto;
+    overflow-y: auto;
+    scrollbar-width: none;         /* 2026-08-20 Chloe: the scrollbar stays invisible */
+    padding-right: 6px;
+}
+.fable-codex-review-card .fable-codex-entries::-webkit-scrollbar { display: none; }
 
 /* A failure surfaced ON the review card (CREATE rejections etc. — the prompt
    block is hidden in review mode, so this is the only visible surface). */

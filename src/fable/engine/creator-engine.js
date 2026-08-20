@@ -74,6 +74,18 @@ function toText(v) {
   return String(v).trim();
 }
 
+// prettyTagKey: custom-tag KEYS render as spaced, capitalized words on every
+// visual surface (2026-08-20, Chloe — "custom tags still shows up with an
+// underscore for the visual aspect"). DISPLAY ONLY: the draft/map keeps the
+// raw snake_case key (it round-trips into the XML `entry key="…"`).
+function prettyTagKey(k) {
+  return String(k)
+    .replace(/[-_]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .replace(/(^|\s)([a-z])/g, (m, a, b) => a + b.toUpperCase());
+}
+
 // --- Review-section model -------------------------------------------------
 
 // Build the review card's [title, [[label, value], ...]] section list for a
@@ -85,7 +97,7 @@ export function buildReviewSections(kind, d) {
   if (kind === 'player') {
     const customRows = d.custom_tags && typeof d.custom_tags === 'object' && !Array.isArray(d.custom_tags)
       ? Object.entries(d.custom_tags)
-          .map(([k, v]) => row(String(k), v))
+          .map(([k, v]) => row(prettyTagKey(k), v))
           .filter(Boolean)
       : [];
     // The v2 inventory seed (the optional sibling) — accepts either the
@@ -124,7 +136,7 @@ export function buildReviewSections(kind, d) {
   if (kind === 'sim') {
     const subtype = toText(d.card_type).trim();
     const customRows = d.custom_tags && typeof d.custom_tags === 'object' && !Array.isArray(d.custom_tags)
-      ? Object.entries(d.custom_tags).map(([k, v]) => row(String(k), v)).filter(Boolean)
+      ? Object.entries(d.custom_tags).map(([k, v]) => row(prettyTagKey(k), v)).filter(Boolean)
       : [];
     const sections = [
       ['Card', [row('Type', subtype), row('Name', d.name)].filter(Boolean)],
@@ -177,20 +189,19 @@ export function buildReviewSections(kind, d) {
 // and an "extra" disclosure of every remaining tag held in an inert
 // <template> + revealed by the corner card-icon button.
 //
-// Core layout (player/NPC, 2026-08-15 Chloe):
+// Core layout (player/NPC, 2026-08-20 Chloe):
 //   RACE | GENDER
-//   AGE  | SKIN | BODY      ← 3 narrow cells when all three exist (Body sits
-//                             alongside Skin; old cards missing one fall back
-//                             to tidy half-width cells)
+//   AGE  | EYE COLOR
 //   HEIGHT | WEIGHT
-//   HAIR (stacked Color/Length/Style sub-lines) | EYE COLOR
-// World/Scenario keep a 1-column core (Name/Setting/Purpose/Tone) under the
-// TYPE banner. codex is NOT an ID card → returns null (it keeps the generic
-// review-section rendering, so buildReviewSections + its tests stay intact).
+// The face carries ONLY those six license rows — skin, body, and hair moved
+// behind the details button (the Appearance extra; hair renders as bare
+// stacked lines, no Color/Length/Style labels). World/Scenario keep a
+// 1-column core (Name/Setting/Purpose/Tone) under the TYPE banner. codex is
+// NOT an ID card → returns null (it keeps the generic review-section
+// rendering, so buildReviewSections + its tests stay intact).
 //
-// Core cells: { label, value } | { label, value, third:true } |
-// { label, sub:[[sublabel, value], ...] } (the HAIR stack). Values are RAW
-// (escaping is the renderer's job).
+// Core cells: { label, value }. Values are RAW (escaping is the renderer's
+// job).
 
 function idRow(label, v) {
   const s = toText(v);
@@ -199,32 +210,30 @@ function idRow(label, v) {
 
 function customTagRows(d) {
   return d.custom_tags && typeof d.custom_tags === 'object' && !Array.isArray(d.custom_tags)
-    ? Object.entries(d.custom_tags).map(([k, v]) => idRow(String(k), v)).filter(Boolean)
+    ? Object.entries(d.custom_tags).map(([k, v]) => idRow(prettyTagKey(k), v)).filter(Boolean)
     : [];
 }
 
 // A plain core cell (dropped when the value is empty).
-function idCell(label, v, third) {
+function idCell(label, v) {
   const s = toText(v);
-  return s ? { label, value: s, ...(third ? { third: true } : {}) } : null;
+  return s ? { label, value: s } : null;
 }
 
-// The HAIR cell: label "Hair" + stacked Color/Length/Style sub-lines (smaller,
-// differently colored in the renderer). Null when no hair trait exists.
-function hairCell(d) {
-  const sub = [
-    idRow('Color', d.hair_color),
-    idRow('Length', d.hair_length),
-    idRow('Style', d.hair_style),
-  ].filter(Boolean);
-  return sub.length ? { label: 'Hair', sub } : null;
+// The HAIR row (2026-08-20 Chloe): the three values stacked WITHOUT their
+// Color/Length/Style sub-labels — newline-joined; the details popup's dd
+// renders pre-line so each value is its own line.
+function hairValueRow(d) {
+  const vals = [toText(d.hair_color), toText(d.hair_length), toText(d.hair_style)].filter(Boolean);
+  return vals.length ? ['Hair', vals.join('\n')] : null;
 }
 
-// Returns { variant, title, banner, tag, core, extra } or null for non-ID kinds.
+// Returns { variant, title, banner, core, extra } or null for non-ID kinds.
 //   variant: 'player' | 'world'
 //   title:   the NAME header (player/NPC only — uppercase is a renderer concern)
-//   banner:  'WORLD CARD' | 'SCENARIO CARD' | null  (world/scenario only)
-//   tag:     'NPC CARD' | null                        (npc only — subtle corner tag)
+//   banner:  null (retired — the TYPE banner is now the small subheader `tag`)
+//   tag:     'PLAYER CARD' | 'NPC CARD' | 'WORLD CARD' | 'SCENARIO CARD'
+//            (small darker-bronze subheader under the name rule, 2026-08-20)
 //   core:    cell objects (above) in render order
 //   extra:   [[title, [[label, value], ...]], ...]   revealed by the card-icon
 export function buildIdCard(kind, d) {
@@ -239,32 +248,38 @@ export function buildIdCard(kind, d) {
   return null; // codex is not an ID card
 }
 
-// Player + NPC share the license face. The only difference is the subtle
-// 'NPC CARD' corner tag (isNpc). Hair length/style + body/skin live ON the
-// face now (the HAIR stack + the AGE/SKIN/BODY row), so the extra disclosure
-// carries only the remaining groups: Distinctive, the v2 Inventory seed, the
-// opt-in Persona block, transient Starting conditions, Custom tags, and
-// (NPC) the world anchors + intro.
+// Player + NPC share the license face; the only difference is the subheader
+// tag (PLAYER CARD / NPC CARD) under the name rule. The face is the six
+// license rows in paired rows; skin/body/hair moved into the extra
+// disclosure as the leading Appearance section, so the popup carries:
+// Appearance, Distinctive, the v2 Inventory seed, the opt-in Persona block,
+// transient Starting conditions, Custom tags, and (NPC) the world anchors +
+// intro.
 function playerIdCard(d, isNpc) {
   const title = toText(d.name);
-  // The AGE|SKIN|BODY row packs three narrow cells when complete; a card
-  // missing any of the three degrades to half-width cells (no ragged gap).
-  const thirds = !!(toText(d.age) && toText(d.skin_complexion) && toText(d.body_type));
   const core = [
     idCell('Race', d.race),
     idCell('Gender', d.gender),
-    idCell('Age', d.age, thirds),
-    idCell('Skin', d.skin_complexion, thirds),
-    idCell('Body', d.body_type, thirds),
+    idCell('Age', d.age),
+    idCell('Eye Color', d.eye_color),
     idCell('Height', d.height),
     idCell('Weight', d.weight),
-    hairCell(d),
-    idCell('Eye Color', d.eye_color),
   ].filter(Boolean);
   const inv = d.inventory && typeof d.inventory === 'object' && !Array.isArray(d.inventory) ? d.inventory : {};
   const persona = d.persona && typeof d.persona === 'object' && !Array.isArray(d.persona) ? d.persona : {};
   const pGet = (k, fallback) => (persona[k] != null ? persona[k] : d[fallback]);
   const extra = [
+    // The SIM anchors are mandatory for EVERY branch — and on sim cards the
+    // World section leads the details popup (2026-08-20 Chloe). Absent on
+    // plain players (no anchors) → section drops.
+    // 2026-08-20 Chloe: titled "World" (was "World anchors") + the Intro row
+    // carries NO label (was "Text") — bare paragraph rows.
+    ['World', [idRow('Date', d.date), idRow('Time', d.time || d.start_time), idRow('Weather', d.weather || d.start_weather), idRow('Tone', d.tone), idRow('Location', d.location)].filter(Boolean)],
+    ['Appearance', [
+      idRow('Skin', d.skin_complexion),
+      idRow('Body', d.body_type),
+      hairValueRow(d),
+    ].filter(Boolean)],
     ['Distinctive', [idRow('Breast', d.breast_size), idRow('Ears', d.ears), idRow('Tail', d.tail), idRow('Horn', d.horn)].filter(Boolean)],
     ['Inventory', [
       idRow('Clothing', inv.clothing != null ? inv.clothing : d.clothing),
@@ -286,10 +301,6 @@ function playerIdCard(d, isNpc) {
       idRow('Occupation', pGet('occupation', 'job')),
       idRow('Backstory', d.backstory),
     ].filter(Boolean)],
-    // The SIM anchors are mandatory for EVERY branch (npc included) — they
-    // must surface in the details popup, not just on the world/scenario
-    // face (2026-08-19). Absent on plain players → section drops.
-    ['World anchors', [idRow('Date', d.date), idRow('Time', d.time || d.start_time), idRow('Weather', d.weather || d.start_weather), idRow('Tone', d.tone), idRow('Location', d.location)].filter(Boolean)],
     // Starting conditions are TRANSIENT (seed PlayerState at attach, never
     // persisted on the SavedPlayer) but surface here so the player sees what
     // was captured. Absent on edited/loaded players → section dropped.
@@ -297,32 +308,34 @@ function playerIdCard(d, isNpc) {
     ['Custom tags', customTagRows(d)],
     // The intro the SIM Wizard gathered for an NPC card (mandatory question —
     // 2026-08-15). Player cards never carry one → dropped.
-    ...(toText(d.intro) ? [['Intro', [['Text', toText(d.intro)]]]] : []),
+    ...(toText(d.intro) ? [['Intro', [['', toText(d.intro)]]]] : []),
   ].filter(([, rows]) => rows.length);
-  return { variant: 'player', title, banner: null, tag: isNpc ? 'NPC CARD' : null, core, extra };
+  return { variant: 'player', title, banner: null, tag: isNpc ? 'NPC CARD' : 'PLAYER CARD', core, extra };
 }
 
-// World + Scenario share a TYPE banner header + a 1-column core
-// (Name/Setting/Purpose/Tone). directive is shown as "Purpose". The scenario
-// specifics, world anchors, custom tags, and the intro live in the
-// disclosure (no cast/locations in the v2 format — they emerge in play).
-function worldIdCard(d, banner) {
+// World + Scenario share the face: the NAME is the header (2026-08-20 Chloe —
+// was the TYPE banner) with the card type as the small subheader tag beneath,
+// over a 1-column core (Setting/Purpose/Tone — the Name cell moved into the
+// header). directive is shown as "Purpose". The scenario specifics, world
+// anchors, custom tags, and the intro live in the disclosure (no
+// cast/locations in the v2 format — they emerge in play).
+function worldIdCard(d, tag) {
   const core = [
-    idCell('Name', d.name),
     idCell('Setting', d.setting),
     idCell('Purpose', d.directive),   // directive shown as "Purpose"
     idCell('Tone', d.tone),
   ].filter(Boolean);
   const extra = [
-    ['World anchors', [idRow('Date', d.date), idRow('Time', d.time || d.start_time), idRow('Weather', d.weather || d.start_weather), idRow('Tone', d.tone), idRow('Location', d.location)].filter(Boolean)],
+    ['World', [idRow('Date', d.date), idRow('Time', d.time || d.start_time), idRow('Weather', d.weather || d.start_weather), idRow('Tone', d.tone), idRow('Location', d.location)].filter(Boolean)],
   ];
-  if (banner === 'SCENARIO CARD') {
+  if (tag === 'SCENARIO CARD') {
     extra.push(['Scenario', [idRow('Premise', d.directive), idRow('Trigger', d.trigger_condition), idRow('Objective', d.primary_objective), idRow('Actors', d.participating_actors), idRow('Hazards', d.environmental_hazards), idRow('Outcomes', d.outcomes)].filter(Boolean)]);
   }
   extra.push(['Custom tags', customTagRows(d)]);
   // The intro the SIM Wizard gathered (mandatory question). Absent → dropped.
-  if (toText(d.intro)) extra.push(['Intro', [['Text', toText(d.intro)]]]);
-  return { variant: 'world', title: null, banner, tag: null, core, extra: extra.filter(([, rows]) => rows.length) };
+  // 2026-08-20 Chloe: bare paragraph row (no "Text" label).
+  if (toText(d.intro)) extra.push(['Intro', [['', toText(d.intro)]]]);
+  return { variant: 'world', title: toText(d.name) || tag, banner: null, tag, core, extra: extra.filter(([, rows]) => rows.length) };
 }
 
 // --- Mandatory-field gate (2026-08-15 Chloe) --------------------------------

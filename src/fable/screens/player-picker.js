@@ -98,7 +98,6 @@ export async function renderPlayerPicker(root, handlers) {
     tile.className = 'fable-player-mini-card';
     tile.type = 'button';
     tile.dataset.playerId = p.id;
-    tile.title = p.name;
     tile.setAttribute('aria-label', `View player ${p.name}`);
     const portraitHTML = p.has_portrait
       ? `<div class="fable-player-mini-portrait" data-lazy-portrait="${esc(p.id)}"></div>`
@@ -203,7 +202,6 @@ async function openModal(root, meta) {
   const portraitSlot = card.querySelector('[data-modal-portrait]');
   if (portraitSlot) {
     portraitSlot.style.cursor = 'pointer';
-    portraitSlot.title = 'Change portrait';
     portraitSlot.addEventListener('click', async () => {
       try {
         const picked = await openDialog({
@@ -325,10 +323,10 @@ const SILHOUETTE_SVG = `<svg class="fable-portrait-silhouette" viewBox="0 0 120 
   <path fill="currentColor" d="M60 16c-13 0-23 11-23 25 0 9 4 16 11 21-15 6-27 19-30 36-1 6 4 12 11 12h62c7 0 12-6 11-12-3-17-15-30-30-36 7-5 11-12 11-21 0-14-10-25-23-25z"/>
 </svg>`;
 
-// 2026-08-13 (Chloe): the modal renders the compact ID card (8 core fields,
-// portrait left) shared with the Creator review — via buildIdCard +
-// renderIdCard. Everything else (hair length/style, build, distinctive
-// features, clothing, accessories, inventory, background, …) lives behind the
+// 2026-08-13 (Chloe): the modal renders the compact ID card (six license
+// rows, portrait left) shared with the Creator review — via buildIdCard +
+// renderIdCard. Everything else (skin, build, hair, distinctive features,
+// clothing, accessories, inventory, background, …) lives behind the
 // card-icon details popup. The portrait stays clickable (data-modal-portrait)
 // to re-pick; the three action buttons live in a centered wrapper BELOW the
 // card.

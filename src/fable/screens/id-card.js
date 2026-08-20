@@ -53,12 +53,12 @@ export const PENCIL_SVG = `<svg viewBox="0 0 24 24" fill="none" stroke="currentC
 //                                    button (data-review-pencil → the creator's
 //                                    edit popup). The pickers never pass it.
 //
-// LAYOUT (2026-08-15 Chloe): the header (player/NPC NAME, world/scenario TYPE
-// banner) lives in a HEADROW — [invisible spacer | centered header + gold rule
-// | corner buttons] — so the header is centered over the card's INFORMATION
-// space (right of the portrait) and the details/pencil buttons physically
-// cannot push or overlap it. The rule is fitted to the header text width plus
-// a little breathing room on each side, not the card width.
+// LAYOUT (2026-08-20 Chloe): the header (player/NPC NAME, world/scenario TYPE
+// banner) lives in a HEADROW centered over the card's INFORMATION space (right
+// of the portrait); the rule is fitted to the header text width plus a little
+// breathing room on each side, not the card width. The details/pencil corner
+// cluster is absolutely pinned to the CARD's top-right corner (the headrow
+// carries symmetric padding so a long header still cannot run under it).
 export function renderIdCard(model, opts = {}) {
   const esc = escapeXml;
   const m = model || {};
@@ -74,80 +74,44 @@ export function renderIdCard(model, opts = {}) {
         ? `<img src="${esc(opts.portraitPreview)}" alt="" onerror="this.style.display='none'">`
         : `<span class="fable-player-review-portrait-fallback" aria-hidden="true">${SILHOUETTE_SVG}</span>`);
   const slotAttr = opts.portraitClickable
-    ? 'data-portrait-slot title="Click to choose or crop a portrait"'
+    ? 'data-portrait-slot'
     : 'data-modal-portrait';
 
-  // The header: the NAME (player/NPC) or the TYPE banner (world/scenario).
-  const headText = m.title || m.banner;
+  // The header: the NAME (every card — 2026-08-20 Chloe). The type subheader
+  // ('NPC CARD' etc.) is NOT part of the header block — it renders as its own
+  // full-width row under the headrow, centered on the info body's midline
+  // (directly between RACE and GENDER).
+  const headText = m.title;
+  const tagHTML = m.tag ? `<div class="fable-id-card-tag">${esc(m.tag)}</div>` : '';
   const headHTML = headText
     ? `<div class="fable-id-card-headwrap">
           <span class="fable-id-card-head-text">${esc(headText)}</span>
           <span class="fable-id-card-head-rule" aria-hidden="true"></span>
         </div>`
     : '';
-  // NPC's subtle corner chip sits ABOVE the headrow (world cards have neither).
-  const tagHTML = m.tag
-    ? `<div class="fable-id-card-tag">${esc(m.tag)}</div>` : '';
-
-  // Core cells — plain pairs, narrow thirds (the AGE/SKIN/BODY row), and the
-  // stacked HAIR cell (Color/Length/Style sub-lines, smaller + differently
-  // colored via .fable-id-card-hair-line). The renderer simulates the CSS
-  // grid's row flow (halves span 3 of 6 tracks, thirds span 2) to tag each
-  // HALF cell with its column side — the --half-l/--half-r padding pulls the
-  // left column's content right + the right column's left so every row reads
-  // as a tight divided cluster, matching the thirds row (2026-08-15 Chloe).
-  const cellSideClass = (cells) => {
-    let col = 0;
-    const cls = cells.map((c) => {
-      const span = c && c.third ? 2 : 3;
-      if (col + span > 6) col = 0;
-      let side = '';
-      if (!c || !c.third) side = col === 0 ? ' fable-id-card-cell--half-l' : ' fable-id-card-cell--half-r';
-      col += span;
-      if (col >= 6) col = 0;
-      return side;
-    });
-    // The HAIR pair breaks the inward pull (2026-08-15 Chloe): HAIR centers
-    // under AGE and EYE COLOR under BODY — the outer thirds' centers —
-    // widening the last row out of the 31/69 column rhythm. Only when the
-    // age/skin/body trio exists (its thirds define the 15/85 targets); on a
-    // trio-less card the pair keeps the normal inward halves.
-    const hasTrio = cells.some((c) => c && c.third);
-    if (hasTrio) {
-      const hairIdx = cells.findIndex((c) => c && Array.isArray(c.sub));
-      if (hairIdx !== -1) {
-        cls[hairIdx] = ' fable-id-card-cell--half-out-l';
-        if (hairIdx + 1 < cls.length) cls[hairIdx + 1] = ' fable-id-card-cell--half-out-r';
-      }
-    }
-    return cls;
-  };
-  const cellHTML = (c, sideCls) => {
+  // Core cells — plain label/value pairs (2026-08-20 Chloe: the six license
+  // rows all sit in ONE horizontal row; no halves/thirds pairing).
+  const cellHTML = (c) => {
     if (!c) return '';
-    if (Array.isArray(c.sub)) {
-      const lines = c.sub
-        .map(([l, v]) => `<span class="fable-id-card-hair-line"><i>${esc(l)}:</i>${esc(v)}</span>`)
-        .join('');
-      return `<div class="fable-id-card-cell fable-id-card-cell--hair${sideCls}"><dt>${esc(c.label)}</dt><dd>${lines}</dd></div>`;
-    }
-    const third = c.third ? ' fable-id-card-cell--third' : '';
-    return `<div class="fable-id-card-cell${third}${sideCls}"><dt>${esc(c.label)}</dt><dd>${esc(c.value)}</dd></div>`;
+    return `<div class="fable-id-card-cell"><dt>${esc(c.label)}</dt><dd>${esc(c.value)}</dd></div>`;
   };
-  const sides = cellSideClass(m.core || []);
   const coreHTML = (m.core || []).length
-    ? `<dl class="fable-id-card-core">${(m.core || []).map((c, i) => cellHTML(c, sides[i])).join('')}</dl>`
+    ? `<dl class="fable-id-card-core">${(m.core || []).map((c) => cellHTML(c)).join('')}</dl>`
     : '';
 
   // Extra disclosure content — the full section/h3/dl grid reused from the
   // review card (clean, easy to parse), held in an inert <template>. The
   // centered details popup consumes it on demand.
   const extraInner = (m.extra || []).map(([title, rows]) => {
+    // A row with an EMPTY label (the Intro paragraph, 2026-08-20 Chloe) skips
+    // the dt entirely — a bare value line.
     const pairHtml = rows.map(([l, v]) => {
+      const dt = l ? `<dt>${esc(l)}</dt>` : '';
       if (Array.isArray(v)) {
         const chips = v.map((c) => `<span class="fable-wizard-chip">${esc(c)}</span>`).join('');
-        return `<div><dt>${esc(l)}</dt><dd><div class="fable-player-review-chips">${chips}</div></dd></div>`;
+        return `<div>${dt}<dd><div class="fable-player-review-chips">${chips}</div></dd></div>`;
       }
-      return `<div><dt>${esc(l)}</dt><dd>${esc(v)}</dd></div>`;
+      return `<div>${dt}<dd>${esc(v)}</dd></div>`;
     }).join('');
     return `<section class="fable-player-review-section"><h3>${esc(title)}</h3><dl>${pairHtml}</dl></section>`;
   }).join('');
@@ -155,33 +119,28 @@ export function renderIdCard(model, opts = {}) {
   const extraHTML = hasExtra
     ? `<template data-id-extra>${extraInner}</template>` : '';
 
-  // The corner cluster rides INSIDE the headrow (in-flow, right-aligned) so it
-  // can never overlap the centered header — the brass card-icon trigger opens
-  // the details popup (wireIdCard), the pencil (Creator review only) sits to
-  // its right.
+  // The corner cluster is absolutely pinned to the CARD's top-right corner
+  // (2026-08-20 Chloe — the in-flow headrow seat left dead space above it):
+  // the brass card-icon trigger opens the details popup (wireIdCard), the
+  // pencil (Creator review only) sits to its right.
   const expandHTML = hasExtra
-    ? `<button type="button" class="fable-id-card-expand" data-id-expand aria-label="Show all details" aria-haspopup="dialog" aria-expanded="false" title="Show all details">${CARD_SVG}</button>` : '';
+    ? `<button type="button" class="fable-id-card-expand" data-id-expand aria-label="Show all details" aria-haspopup="dialog" aria-expanded="false">${CARD_SVG}</button>` : '';
   const editHTML = opts.editable
-    ? `<button type="button" class="fable-id-card-edit" data-review-pencil title="Edit" aria-label="Edit card">${PENCIL_SVG}</button>` : '';
+    ? `<button type="button" class="fable-id-card-edit" data-review-pencil aria-label="Edit card">${PENCIL_SVG}</button>` : '';
   const cornerHTML = (expandHTML || editHTML)
     ? `<div class="fable-id-card-corner">${expandHTML}${editHTML}</div>` : '';
-  // The spacer mirrors the corner cluster's EXACT footprint (46px per button
-  // + 10px gap) so the header between them is truly centered — the pickers
-  // show one button, the Creator review two.
-  const btnW = (expandHTML ? 46 : 0) + (editHTML ? 46 : 0) + ((expandHTML && editHTML) ? 10 : 0);
-  const spacerHTML = cornerHTML
-    ? `<span class="fable-id-card-head-spacer" style="width:${btnW}px" aria-hidden="true"></span>` : '';
-  const headrowHTML = (headText || cornerHTML)
-    ? `<div class="fable-id-card-headrow">${spacerHTML}${headHTML}${cornerHTML}</div>`
+  const headrowHTML = headText
+    ? `<div class="fable-id-card-headrow">${headHTML}</div>`
     : '';
 
   return `
     <div class="${cardClass}">
+      ${cornerHTML}
       <div class="fable-player-review-top">
         <div class="fable-player-review-portrait" ${slotAttr}>${portraitInner}</div>
         <div class="fable-player-review-body">
-          ${tagHTML}
           ${headrowHTML}
+          ${tagHTML}
           ${coreHTML}
         </div>
       </div>
@@ -195,10 +154,71 @@ export function renderIdCard(model, opts = {}) {
 export function wireIdCard(root) {
   const card = root && root.querySelector('.fable-id-card');
   if (!card) return;
+  balanceHeadText(card.querySelector('.fable-id-card-head-text'));
   const btn = card.querySelector('[data-id-expand]');
   const tpl = card.querySelector('template[data-id-extra]');
   if (!btn || !tpl) return;
   btn.addEventListener('click', () => openIdDetails(card, btn, tpl.innerHTML));
+}
+
+// Balance a wrapped header so the FIRST line is always shorter than the
+// second (2026-08-20 Chloe — natural wrapping left "THE NIGHT MARKET" over
+// an orphan "HEIST"). REACTIVE: a ResizeObserver re-balances whenever the
+// element's width changes (window resizes re-wrap naturally otherwise); the
+// original text is kept in a data attribute and the element is re-evaluated
+// from scratch each pass (idempotent). Measures with a canvas in the
+// element's computed font (+ its letter-spacing, which canvas ignores).
+function balanceHeadText(el) {
+  if (!el) return;
+  const original = el.dataset.headText || (el.dataset.headText = (el.textContent || '').trim());
+  const words = original.split(/\s+/);
+  if (!el.dataset.headObserved) {
+    el.dataset.headObserved = '1';
+    // Observe the HEADROW (not the element): a wrapped head-text's own width
+    // doesn't change when the container widens, so its observer would never
+    // fire to unwrap it. The row tracks the container.
+    const row = el.closest('.fable-id-card-headrow');
+    new ResizeObserver(() => balanceHeadText(el)).observe(row || el);
+  }
+  if (words.length < 2) return;
+  const cs = getComputedStyle(el);
+  const canvas = balanceHeadText._canvas || (balanceHeadText._canvas = document.createElement('canvas'));
+  const ctx = canvas.getContext('2d');
+  ctx.font = `${cs.fontStyle} ${cs.fontWeight} ${cs.fontSize} ${cs.fontFamily}`;
+  const spacing = parseFloat(cs.letterSpacing) || 0;
+  // Measure the UPPERCASED string — the header renders text-transform:
+  // uppercase, and canvas has no text-transform (uppercase glyphs run ~10%
+  // wider; measuring as-written made the fit-check pass while the real line
+  // wrapped — the "THE NIGHT MARKET / HEIST" bug).
+  const w = (s) => {
+    const t = s.toUpperCase();
+    return ctx.measureText(t).width + t.length * spacing;
+  };
+  const fullW = w(original);
+  // Measure available width against the HEADROW's content box — the head-text
+  // shrink-wraps once wrapped, so measuring the element itself would poison
+  // the check (it could never unwrap again).
+  const row = el.closest('.fable-id-card-headrow');
+  const rowCS = row ? getComputedStyle(row) : null;
+  const avail = rowCS
+    ? row.clientWidth - parseFloat(rowCS.paddingLeft) - parseFloat(rowCS.paddingRight)
+    : el.getBoundingClientRect().width;
+  if (fullW <= avail + 1) {                   // fits one line — no forced wrap
+    if (el.innerHTML !== escapeXml(original)) el.innerHTML = escapeXml(original);
+    return;
+  }
+  // Longest prefix under 45% of the single-line width → line1 is always the
+  // shorter line (and never wider than the box).
+  let count = 0;
+  for (let i = 1; i <= words.length; i++) {
+    const prefix = words.slice(0, i).join(' ');
+    if (w(prefix) > fullW * 0.45 || w(prefix) > avail) break;
+    count = i;
+  }
+  const target = (count >= 1 && count < words.length)
+    ? `${escapeXml(words.slice(0, count).join(' '))}<br>${escapeXml(words.slice(count).join(' '))}`
+    : escapeXml(original);
+  if (el.innerHTML !== target) el.innerHTML = target;
 }
 
 // Open the centered details popup — a standard Fable modal (dimmed blur
@@ -226,7 +246,7 @@ function openIdDetails(card, btn, sectionsHtml) {
     <div class="fable-id-details-modal" role="dialog" aria-modal="true" aria-label="Full card details">
       <div class="fable-id-details-head">
         <span class="fable-id-details-title">${escapeXml(title)}</span>
-        <button type="button" class="fable-id-details-close" data-id-details-close title="Close" aria-label="Close details">✕</button>
+        <button type="button" class="fable-id-details-close" data-id-details-close aria-label="Close details">✕</button>
       </div>
       <div class="fable-id-details-body">${sectionsHtml}</div>
     </div>`;

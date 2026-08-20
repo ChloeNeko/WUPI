@@ -417,7 +417,6 @@ export function buildOnlinePanel({ onChanged } = {}) {
     clearTimeout(deleteArmTimer);
     deleteBtn.dataset.armed = '';
     deleteBtn.textContent = 'Delete';
-    deleteBtn.title = 'Delete selected profile';
   };
   deleteBtn.addEventListener('click', async () => {
     const id = profileSelect.value;
@@ -426,7 +425,6 @@ export function buildOnlinePanel({ onChanged } = {}) {
     if (deleteBtn.dataset.armed !== '1') {
       deleteBtn.dataset.armed = '1';
       deleteBtn.textContent = 'Sure?';
-      deleteBtn.title = `Really delete "${p.name || p.id}"? Click again.`;
       setStatus(`Click delete again to remove "${p.name || p.id}" (URL + key).`, 'err');
       clearTimeout(deleteArmTimer);
       deleteArmTimer = setTimeout(disarmDeleteBtn, 5000);

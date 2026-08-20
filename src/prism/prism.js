@@ -358,7 +358,7 @@ export function initPrism(extHooks = {}) {
       <button class="prism-nav-btn" data-nav="gallery">Gallery</button>
       <button class="prism-nav-btn" data-nav="fork">Fork</button>
     </nav>
-    <button class="prism-exit" data-nav="exit" title="Exit to desktop">✕</button>
+    <button class="prism-exit" data-nav="exit">✕</button>
   `;
   prismRoot.appendChild(topbar);
 

@@ -38,9 +38,9 @@ export function mountFlowChrome(root) {
   chrome.setAttribute('aria-hidden', 'true');
   chrome.innerHTML = `
     <button class="fable-flow-chrome__btn fable-flow-chrome__btn--back is-hidden"
-            type="button" aria-label="Back" title="Back">${BACK_SVG}</button>
+            type="button" aria-label="Back">${BACK_SVG}</button>
     <button class="fable-flow-chrome__btn fable-flow-chrome__btn--home"
-            type="button" aria-label="Back to title" title="Back to title">${HOME_SVG}</button>
+            type="button" aria-label="Back to title">${HOME_SVG}</button>
   `;
   root.appendChild(chrome);
   return bindController(chrome);

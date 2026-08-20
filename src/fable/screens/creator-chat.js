@@ -810,7 +810,7 @@ export function renderCreatorChat(root, config) {
       <div class="fable-creator-edit-modal" role="dialog" aria-modal="true" aria-label="Edit card">
         <div class="fable-creator-edit-head">
           <span class="fable-creator-edit-title">Edit</span>
-          <button type="button" class="fable-creator-edit-close" data-edit-close title="Close" aria-label="Close editor">✕</button>
+          <button type="button" class="fable-creator-edit-close" data-edit-close aria-label="Close editor">✕</button>
         </div>
         <textarea class="fable-creator-edit-input" data-edit-input rows="4"
           placeholder="Tell me what to change…"></textarea>
@@ -1245,12 +1245,12 @@ function fadeSwap(el, newText) {
 
 // Render the review card HTML. Player + sim (npc/scenario/world) render as
 // the compact ID card (header + license grid + card-icon extra disclosure) via
-// the shared id-card renderer; codex keeps the generic section grid (no
-// portrait). CREATE/‹ live in the .fable-player-review-create-wrap row
-// appended under whichever card shape was produced. The edit affordance is
-// the CORNER PENCIL in the headrow (2026-08-15 Chloe): beside the card-icon
-// details button on ID cards, alone in the headrow's corner on the codex
-// grid — in-flow, so it can never overlap content.
+// the shared id-card renderer; codex renders the title-as-divider entry stack
+// (2026-08-20 Chloe redesign — centered Title, small gray tags, full
+// description; no Tags/Body labels). CREATE/‹ live in the
+// .fable-player-review-create-wrap row appended under whichever card shape was
+// produced. The edit affordance is the CORNER PENCIL pinned to the card's
+// top-right (beside the card-icon details button on ID cards).
 function renderReviewCard(kind, d, portraitPreview, sections) {
   const esc = escapeXml;
   const createWrap = `
@@ -1263,30 +1263,25 @@ function renderReviewCard(kind, d, portraitPreview, sections) {
   if (idModel) {
     return renderIdCard(idModel, { portraitClickable: true, portraitPreview, editable: true }) + createWrap;
   }
-  // codex: generic section grid, no portrait slot. The pencil rides the same
-  // headrow corner the ID cards use (in-flow top-right, no overlap).
+  // codex: the entries use the WHOLE card — each a centered Title carrying
+  // its own gold divider, small gray tags beneath, then the full description.
   const pencil = `
-      <button type="button" class="fable-id-card-edit" data-review-pencil title="Edit" aria-label="Edit card">${PENCIL_SVG}</button>`;
-  const headrow = `
-    <div class="fable-id-card-headrow">
-      <span class="fable-id-card-head-spacer" style="width:46px" aria-hidden="true"></span>
-      <div class="fable-id-card-headwrap"></div>
-      <div class="fable-id-card-corner">${pencil}</div>
-    </div>`;
-  const sectionsHtml = sections.map(([title, rows]) => {
-    const pairHtml = rows.map(([label, val]) => {
-      if (Array.isArray(val)) {
-        const chips = val.map((c) => `<span class="fable-wizard-chip">${esc(c)}</span>`).join('');
-        return `<div><dt>${esc(label)}</dt><dd><div class="fable-player-review-chips">${chips}</div></dd></div>`;
-      }
-      return `<div><dt>${esc(label)}</dt><dd>${esc(val)}</dd></div>`;
-    }).join('');
-    return `<section class="fable-player-review-section"><h3>${esc(title)}</h3><dl>${pairHtml}</dl></section>`;
+      <button type="button" class="fable-id-card-edit" data-review-pencil aria-label="Edit card">${PENCIL_SVG}</button>`;
+  const entryRow = (label, rows) => {
+    const r = rows.find(([l]) => l === label);
+    return r ? String(r[1] ?? '') : '';
+  };
+  const entriesHtml = sections.map(([title, rows]) => {
+    const tags = entryRow('Tags', rows).split(',').map((t) => t.trim()).filter(Boolean).join(' · ');
+    return `<section class="fable-codex-entry">
+        <h3 class="fable-codex-entry-title">${esc(title)}</h3>
+        ${tags ? `<div class="fable-codex-entry-tags">${esc(tags)}</div>` : ''}
+        <p class="fable-codex-entry-body">${esc(entryRow('Body', rows))}</p>
+      </section>`;
   }).join('');
   return `
     <div class="fable-player-review-card fable-codex-review-card">
-      <div class="fable-player-review-top">
-        <div class="fable-player-review-body">${headrow}${sectionsHtml}</div>
-      </div>
+      <div class="fable-id-card-corner">${pencil}</div>
+      <div class="fable-codex-entries">${entriesHtml}</div>
     </div>` + createWrap;
 }

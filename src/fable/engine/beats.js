@@ -545,8 +545,8 @@ const ICO_HIST_EDIT  = `<svg viewBox="0 0 24 24" aria-hidden="true" focusable="f
 function buildHistoolsHTML() {
   return `<div class="fable-mes-histools" aria-hidden="true">
       <div class="fable-mes-histools-inner">
-        <button type="button" class="fable-mes-histool-btn" data-drawer-act="delete" aria-label="Delete message" title="Delete">${ICO_HIST_TRASH}</button>
-        <button type="button" class="fable-mes-histool-btn" data-drawer-act="edit" aria-label="Edit message" title="Edit">${ICO_HIST_EDIT}</button>
+        <button type="button" class="fable-mes-histool-btn" data-drawer-act="delete" aria-label="Delete message">${ICO_HIST_TRASH}</button>
+        <button type="button" class="fable-mes-histool-btn" data-drawer-act="edit" aria-label="Edit message">${ICO_HIST_EDIT}</button>
       </div>
     </div>`;
 }
@@ -575,22 +575,22 @@ function buildDrawerHTML(role) {
   const variantNav = role === 'user'
     ? `<div class="fable-mes-drawer-stepper-grp">
         <div class="fable-mes-drawer-stepper">
-          <button type="button" class="fable-mes-drawer-btn" data-drawer-act="prev" aria-label="Previous variant" title="Previous variant" disabled>${ICO_CHEV_UP}</button>
+          <button type="button" class="fable-mes-drawer-btn" data-drawer-act="prev" aria-label="Previous variant" disabled>${ICO_CHEV_UP}</button>
           <span class="fable-mes-drawer-count" data-drawer-count>1/1</span>
-          <button type="button" class="fable-mes-drawer-btn" data-drawer-act="next" aria-label="Next variant" title="Next variant">${ICO_CHEV_DOWN}</button>
+          <button type="button" class="fable-mes-drawer-btn" data-drawer-act="next" aria-label="Next variant">${ICO_CHEV_DOWN}</button>
         </div>
       </div>`
     : `<div class="fable-mes-drawer-variantbar">
-        <button type="button" class="fable-mes-variant-chev" data-drawer-act="prev" aria-label="Previous variant" title="Previous variant" disabled>${ICO_VAR_PREV}</button>
+        <button type="button" class="fable-mes-variant-chev" data-drawer-act="prev" aria-label="Previous variant" disabled>${ICO_VAR_PREV}</button>
         <span class="fable-mes-variant-count" data-drawer-count>1 / 1</span>
-        <button type="button" class="fable-mes-variant-chev" data-drawer-act="next" aria-label="Next variant" title="Next variant">${ICO_VAR_NEXT}</button>
+        <button type="button" class="fable-mes-variant-chev" data-drawer-act="next" aria-label="Next variant">${ICO_VAR_NEXT}</button>
       </div>`;
   return `<div class="fable-mes-drawer" aria-hidden="true">
     <div class="fable-mes-drawer-inner">
       <div class="fable-mes-drawer-gold">
-        <button type="button" class="fable-mes-gold-btn fable-mes-gold-btn--delete" data-drawer-act="delete" aria-label="Delete message" title="Delete">${ICO_TRASH}</button>
+        <button type="button" class="fable-mes-gold-btn fable-mes-gold-btn--delete" data-drawer-act="delete" aria-label="Delete message">${ICO_TRASH}</button>
         <span class="fable-mes-gold-div" aria-hidden="true"></span>
-        <button type="button" class="fable-mes-gold-btn fable-mes-gold-btn--edit" data-drawer-act="edit" aria-label="Edit message" title="Edit">${ICO_EDIT}</button>
+        <button type="button" class="fable-mes-gold-btn fable-mes-gold-btn--edit" data-drawer-act="edit" aria-label="Edit message">${ICO_EDIT}</button>
       </div>
       ${variantNav}
     </div>
@@ -652,8 +652,6 @@ export function refreshDrawer(beat) {
     // enabled in that case; disabled only when neither a next variant
     // nor a reroll is possible.
     nextBtn.disabled = !canNext;
-    nextBtn.title = (!canNext) ? 'Next variant'
-      : (active >= count - 1 ? 'Regenerate' : 'Next variant');
   }
 }
 

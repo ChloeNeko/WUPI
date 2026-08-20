@@ -57,7 +57,6 @@ function disarmDelete() {
   if (armedDelete) {
     armedDelete.classList.remove('is-armed');
     armedDelete.textContent = '🗑';
-    armedDelete.title = 'Delete';
     armedDelete = null;
   }
 }
@@ -66,7 +65,6 @@ function armDelete(btn) {
   disarmDelete();
   btn.classList.add('is-armed');
   btn.textContent = 'Sure?';
-  btn.title = 'Click again to permanently delete';
   armedDelete = btn;
   armTimer = setTimeout(disarmDelete, ARM_DISARM_MS);
 }
@@ -209,10 +207,10 @@ function tileHtml(img) {
       <img class="prism-tile-img" loading="lazy" src="${escapeAttr(url)}" alt="" />
       <div class="prism-tile-overlay">
         <div class="prism-tile-actions">
-          <button class="prism-tile-btn" data-act="favorite" title="Favorite">${img.favorite ? '★' : '☆'}</button>
-          <button class="prism-tile-btn" data-act="compose" title="Send to Composer">✎</button>
-          <button class="prism-tile-btn" data-act="fork" title="Fork & Edit">⇄</button>
-          <button class="prism-tile-btn prism-tile-btn-danger" data-act="delete" title="Delete">🗑</button>
+          <button class="prism-tile-btn" data-act="favorite">${img.favorite ? '★' : '☆'}</button>
+          <button class="prism-tile-btn" data-act="compose">✎</button>
+          <button class="prism-tile-btn" data-act="fork">⇄</button>
+          <button class="prism-tile-btn prism-tile-btn-danger" data-act="delete">🗑</button>
         </div>
       </div>
     </div>

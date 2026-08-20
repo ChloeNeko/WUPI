@@ -3542,7 +3542,6 @@ const dropdownMenu = document.getElementById('dropdownMenu');
       clearTimeout(deleteArmTimer);
       if (!deleteProfileBtn) return;
       deleteProfileBtn.dataset.armed = '';
-      deleteProfileBtn.title = 'Delete selected profile';
     };
     deleteProfileBtn?.addEventListener('click', async () => {
       const id = profileSelect.value;
@@ -3550,7 +3549,6 @@ const dropdownMenu = document.getElementById('dropdownMenu');
       if (!p) { disarmDeleteBtn(); setStatus('Pick a profile to delete first.', 'err'); return; }
       if (deleteProfileBtn.dataset.armed !== '1') {
         deleteProfileBtn.dataset.armed = '1';
-        deleteProfileBtn.title = `Really delete "${p.name || p.id}"? Click again.`;
         setStatus(`Click delete again to remove "${p.name || p.id}" (URL + key).`, 'err');
         clearTimeout(deleteArmTimer);
         deleteArmTimer = setTimeout(disarmDeleteBtn, 5000);

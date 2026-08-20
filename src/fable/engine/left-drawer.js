@@ -321,24 +321,23 @@ export function buildLeftDrawer() {
       <img class="hud-paperdoll-base" data-paperdoll-img alt="" aria-hidden="true">
     </div>
     <button type="button" class="hud-backpack" data-backpack-btn
-            aria-label="Inventory" title="Inventory">
+            aria-label="Inventory">
       <img class="hud-backpack-img" src="${BACKPACK_URL}" alt="" draggable="false">
     </button>
     <div class="hud-dock" data-hud-dock>
       <button type="button" class="hud-dock-btn" data-gender-btn
               data-gender="${normGender(gender)}" aria-label="Toggle silhouette gender"
-              title="Toggle silhouette gender"></button>
+             ></button>
       <button type="button" class="hud-dock-btn" data-dock="calendar"
-              aria-label="Calendar" title="Calendar">
+              aria-label="Calendar">
         <span class="hud-dock-icon">${CALENDAR_SVG}</span>
-        <span class="hud-dock-day" data-dock-day aria-hidden="true"></span>
       </button>
       <button type="button" class="hud-dock-btn" data-dock="weather"
-              aria-label="Weather" title="Weather">
+              aria-label="Weather">
         <span class="hud-dock-icon" data-weather-icon>${WEATHER_SVGS.default}</span>
       </button>
       <button type="button" class="hud-dock-btn" data-dock="location"
-              aria-label="Location" title="Location">
+              aria-label="Location">
         <span class="hud-dock-icon" data-location-icon>${LOCATION_SVGS.default}</span>
       </button>
     </div>
@@ -862,18 +861,16 @@ function classifyWeather(condition) {
   return 'default';
 }
 
-// Derives the display label for a calendar tooltip from a clock object.
-// Returns { day, time } where day = floor(m/1440)+1 (mirrors schema.rs
-// render_clock_line) and time = the 12-hour AM/PM readout of m mod 1440.
-// Returns nulls when the clock is dormant (current_minutes = 0 / missing).
-function deriveClockLines(clock) {
+// Derives the 12-hour AM/PM time-of-day readout from a clock object.
+// (2026-08-20, Chloe) The derived DAY counter is GONE — "don't have time
+// show 'day 1' ever; we have date for that" (the calendar label carries
+// the date). Returns null when the clock is dormant (current_minutes =
+// 0 / missing).
+function clockTime12h(clock) {
   const raw = clock && Number(clock.current_minutes);
-  if (!Number.isFinite(raw) || raw <= 0) {
-    return { day: null, time: null };
-  }
-  const day = Math.floor(raw / 1440) + 1;
+  if (!Number.isFinite(raw) || raw <= 0) return null;
   const tod = ((raw % 1440) + 1440) % 1440;
-  return { day, time: formatTime12h(tod) };
+  return formatTime12h(tod);
 }
 
 // Render the 3-icon status row from a normalized snapshot. Pure DOM writes;
@@ -891,15 +888,12 @@ function deriveClockLines(clock) {
 function renderStatusRow(snap) {
   if (!drawerEl) return;
   lastSnap = snap;                       // cache for the info-card renderers
-  const { clock, weather, node } = snap;
+  const { weather, node } = snap;
 
-  // ── Calendar (day-number overlay on the icon) ─────────────────────
-  const calLines = deriveClockLines(clock);
-  const dayEl = drawerEl.querySelector('[data-dock-day]');
-  if (dayEl) {
-    dayEl.textContent = calLines.day ? String(calLines.day) : '';
-    dayEl.classList.toggle('is-empty', !calLines.day);
-  }
+  // ── Calendar ──────────────────────────────────────────────────────
+  // (2026-08-20) The day-number badge on the icon is GONE (the derived
+  // "Day N" counter is retired app-wide — the calendar date label carries
+  // the day). The icon swaps nothing; the click card renders the label.
 
   // ── Weather (condition → icon swap) ───────────────────────────────
   const wKey = classifyWeather(weather);
@@ -928,18 +922,6 @@ function escapeHtml(s) {
     .replace(/"/g, '&quot;');
 }
 
-// ─── Season derivation (Calendar card subtext) ──────────────────────────
-// No season field exists — a quarter heuristic on the derived day index
-// gives a stable, sensible sub-line so the Calendar card reads "Day 14 •
-// Spring" (per spec) instead of just a bare number. 120-day seasons; Day
-// 1–120 Spring, 121–240 Summer, etc.
-function seasonForDay(day) {
-  const d = Number(day);
-  if (!Number.isFinite(d) || d <= 0) return '';
-  const q = Math.floor((d - 1) / 120) % 4;
-  return ['Spring', 'Summer', 'Autumn', 'Winter'][q];
-}
-
 // Slug → display text (2026-08-20, mirrors tab-rail.js's prettySlug): the
 // "-s-" a name's apostrophe minted restores as a possessive ("Liam-s-House"
 // → "Liam's House"), remaining -/_ separators become spaces, words
@@ -964,29 +946,23 @@ function prettySlug(k) {
 
 // Build the HTML body for the given dock from `lastSnap`. Returns '' if no
 // snapshot yet. Each body is a headline (Cinzel brass) + optional sub/tag.
+// (2026-08-20, Chloe) The Calendar card shows the authored calendar label
+// ALONE — the derived "Day N • Season" sub-line is GONE ("don't have time
+// show 'day 1' ever; we have date for that" — and the season was a 120-day
+// quarter heuristic, invented anyway). Without a label the time-of-day
+// stands in so the card is never empty.
 function buildInfoCardHTML(dock) {
   const snap = lastSnap;
   if (!snap) return '';
   if (dock === 'calendar') {
-    const { day } = deriveClockLines(snap.clock);
     const cal = String(snap.calendar || '').trim();
-    // (2026-08-20) The authored calendar label (card <world> date seed /
-    // [DATE] rewrites) is the HEADLINE; the derived day + heuristic season
-    // ride as the sub-line. Without a label the old derived headline stands.
     if (cal) {
-      const season = seasonForDay(day);
-      const sub = day
-        ? `<div class="info-card-sub">Day ${escapeHtml(day)}${season ? ` <span class="info-card-sep">•</span> ${escapeHtml(season)}` : ''}</div>`
-        : '';
-      return `<div class="info-card-headline">${escapeHtml(titleCase(cal))}</div>${sub}`;
+      return `<div class="info-card-headline">${escapeHtml(titleCase(cal))}</div>`;
     }
-    if (!day) {
-      return `<div class="info-card-headline info-card-dim">Time Unset</div>`;
-    }
-    const season = seasonForDay(day);
-    return `<div class="info-card-headline">Day ${escapeHtml(day)}${
-      season ? ` <span class="info-card-sep">•</span> ${escapeHtml(season)}` : ''
-    }</div>`;
+    const time = clockTime12h(snap.clock);
+    return time
+      ? `<div class="info-card-headline">${escapeHtml(time)}</div>`
+      : `<div class="info-card-headline info-card-dim">Time Unset</div>`;
   }
   if (dock === 'weather') {
     const cond = String(snap.weather || '').trim();

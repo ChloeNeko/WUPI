@@ -113,7 +113,7 @@ test('buildReviewSections: player surfaces horn, inventory, persona, custom tags
     gear: ['compass', 'rope'], equipped: ['dagger'],
     job: 'thief', backstory: 'orphan',
     wealth: '200 gold', reputation: '-20',
-    custom_tags: { curse: 'moon-bound' },
+    custom_tags: { curse: 'moon-bound', guard_reputation: '-20' },
   });
   const byName = Object.fromEntries(secs);
   assert.deepEqual(byName.Distinctive, [['Horn', 'curled']]);
@@ -123,7 +123,9 @@ test('buildReviewSections: player surfaces horn, inventory, persona, custom tags
   // job + backstory surface under the opt-in Persona group.
   assert.ok(byName.Persona.find(([l]) => l === 'Occupation'));
   assert.ok(byName.Persona.find(([l]) => l === 'History'));
-  assert.ok(byName['Custom tags'].find(([l]) => l === 'curse'));
+  // (2026-08-20) Custom-tag KEYS render prettified — no underscores.
+  assert.ok(byName['Custom tags'].find(([l]) => l === 'Curse'));
+  assert.ok(byName['Custom tags'].find(([l]) => l === 'Guard Reputation'));
   assert.deepEqual(byName['Starting conditions'], [['Wealth', '200 gold'], ['Reputation', '-20']]);
 });
 

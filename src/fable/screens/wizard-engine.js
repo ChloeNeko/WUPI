@@ -261,8 +261,8 @@ export function renderGenderSlide(_slide, stashed, _onChange, ctx) {
   const cur = normalizeGender(stashed.fields.gender).toLowerCase();
   return {
     html: `<div class="fable-wizard-toggle fable-wizard-toggle--gender" role="group" aria-label="Silhouette base">
-      <button type="button" data-gender-pick="male" data-glyph="male" aria-pressed="${cur === 'male'}" title="Male silhouette">${MARS_SVG}</button>
-      <button type="button" data-gender-pick="female" data-glyph="female" aria-pressed="${cur === 'female'}" title="Female silhouette">${VENUS_SVG}</button>
+      <button type="button" data-gender-pick="male" data-glyph="male" aria-pressed="${cur === 'male'}">${MARS_SVG}</button>
+      <button type="button" data-gender-pick="female" data-glyph="female" aria-pressed="${cur === 'female'}">${VENUS_SVG}</button>
     </div>`,
     wire(stage, onChange) {
       stage.querySelectorAll('[data-gender-pick]').forEach((btn) => {

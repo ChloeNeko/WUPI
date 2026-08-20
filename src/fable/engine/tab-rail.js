@@ -72,7 +72,7 @@ export function buildTabRail() {
     <div class="fable-tab-rail" role="tablist" aria-label="Tracked stats">
       ${TABS.map((t) => `
         <button class="fable-tab-rail__btn" data-tab="${t.key}" role="tab"
-                aria-selected="false" title="${t.label}" aria-label="${t.label}">
+                aria-selected="false" aria-label="${t.label}">
           ${ICONS[t.key] || ''}
         </button>
       `).join('')}
@@ -142,7 +142,7 @@ async function renderTab(key, el) {
       <span class="fable-tab-drop__title" data-drop-title>${esc(meta.label)}</span>
       <span class="fable-tab-drop__name" data-drop-name></span>
       <button class="fable-tab-drop__edit" data-raw-edit="${meta.file.kind}"
-              title="Edit raw file" aria-label="Edit raw file">✎</button>
+              aria-label="Edit raw file">✎</button>
     </div>
     <div class="fable-tab-drop__body" data-drop-body></div>
   `;
@@ -152,9 +152,11 @@ async function renderTab(key, el) {
     openRawEditor(meta.file.kind, renderActive);
   });
   const body = el.querySelector('[data-drop-body]');
-  // Renderer hooks into the head: `setTitle` (the card tab relabels itself
-  // "NPC Card" / "World Card" / "Scenario Card") and `setName` (the center
-  // bold-white name). Both no-op on a missing/blank value.
+  // Renderer hooks into the head: `setTitle` (a fallback label when the tab
+  // has NO character name — the World/Codex/NPC tabs keep theirs) and
+  // `setName` (the center bold-white name). (2026-08-20) When a NAME is set
+  // the head carries it ALONE — the "Player" / "NPC Card" label hides (the
+  // name IS the header); without a name the label stands as the fallback.
   const head = {
     setTitle(t) {
       const node = el.querySelector('[data-drop-title]');
@@ -162,7 +164,10 @@ async function renderTab(key, el) {
     },
     setName(n) {
       const node = el.querySelector('[data-drop-name]');
-      if (node) node.textContent = nonEmpty(n) ? String(n) : '';
+      const headEl = el.querySelector('.fable-tab-drop__head');
+      const has = nonEmpty(n);
+      if (node) node.textContent = has ? String(n) : '';
+      if (headEl) headEl.classList.toggle('has-name', has);
     },
   };
   try {
@@ -176,14 +181,20 @@ async function renderTab(key, el) {
   }
 }
 
-// ── Player tab (character sheet, READ-ONLY) ─────────────────────────────
+// ── Player tab (character sheet, READ-ONLY except the World-tab style
+// date/time rows — none here) ────────────────────────────────────────────
 // Pulls from THREE sources + renders each section only when it has content:
-//   • fable_active_player_get → identity (name/race/gender/age/height/weight)
-//     + backstory. None for a playerless game → section hidden.
+//   • fable_active_player_get → the attached SavedPlayer CARD: full identity
+//     trait set, opt-in persona, custom tags. None for a playerless game.
 //   • player_state_get        → appearance deltas, vitals, injuries, inventory.
 //   • fable_schema_get        → relationships (keyed by npc id). Best-effort.
-// Editing happens via the ✎ raw editor or by talking to WUPI; nothing here
-// is editable inline.
+// (2026-08-20 rebuild, Chloe) The tab MIRRORS the SIM card tab: the header
+// carries the NAME alone (the old in-body name row was the duplicate),
+// VITALS lead (live state above identity), then Identity → Persona →
+// Appearance → Injuries → Effects → custom tags (NO divider, directly above
+// inventory) → Inventory → Relationships. The slot-row "Equipped" section
+// is GONE — worn/held items render as stacked lists ("Clothing / Weapons /
+// Belt / Pack") like the card tab.
 async function renderPlayer(bodyEl, head) {
   let ps;
   try {
@@ -192,27 +203,29 @@ async function renderPlayer(bodyEl, head) {
     bodyEl.innerHTML = emptyBox('No active game.');
     return;
   }
-  // Identity + relationships schema are best-effort: a playerless game has no
-  // attached player (identity stays hidden) + a schema read failure just hides
-  // relationships/effects. Vitals/injuries/inventory always come from player_state.
   const [player, schema] = await Promise.all([
     invoke('fable_active_player_get').then((p) => p || null).catch(() => null),
     invoke('fable_schema_get').catch(() => null),
   ]);
 
-  // (2026-08-20) The center header names the character being played.
+  // The header names the character being played — NAME ONLY (the tab label
+  // hides while a name is set).
   head.setName(player && player.name);
 
   const parts = [];
+  parts.push(renderVitals(ps));
   const identity = renderIdentity(player);
   if (identity) parts.push(identity);
+  const persona = renderPlayerPersona(player);
+  if (persona) parts.push(persona);
   const appearance = renderAppearance(ps);
   if (appearance) parts.push(appearance);
-  parts.push(renderVitals(ps));
   const injuries = renderInjuries(ps);
   if (injuries) parts.push(injuries);
   const effects = renderEffects(schema);
   if (effects) parts.push(effects);
+  const tags = renderCustomTags(player && player.custom_tags);
+  if (tags) parts.push(tags);
   const inventory = renderInventory(ps);
   if (inventory) parts.push(inventory);
   const relationships = renderRelationships(schema);
@@ -220,26 +233,52 @@ async function renderPlayer(bodyEl, head) {
   bodyEl.innerHTML = parts.join('');
 }
 
-// Identity: name (bold header) + stable trait rows + optional backstory.
-// Omitted entirely when there's no attached player.
+// Identity: the attached player CARD's full stable trait set — the same
+// field family the SIM tab renders for a card (plus the player-only
+// conditional + flavor lines). NO name row: the header owns the name (the
+// old in-body name was the duplicate Chloe flagged). Omitted entirely when
+// there's no attached player.
 function renderIdentity(player) {
   if (!player) return '';
-  const out = [];
-  if (nonEmpty(player.name)) out.push(`<div class="fable-drop-name">${esc(player.name)}</div>`);
   const traitRows = [
-    ['Race', player.race], ['Gender', player.gender], ['Age', player.age],
+    ['Gender', player.gender], ['Race', player.race], ['Age', player.age],
     ['Height', player.height], ['Weight', player.weight],
+    ['Body', player.body_type], ['Skin', player.skin_complexion],
+    ['Eyes', player.eye_color],
+    ['Hair Color', player.hair_color], ['Hair Length', player.hair_length],
+    ['Hair Style', player.hair_style],
+    ['Breast Size', player.breast_size], ['Ears', player.ears],
+    ['Tail', player.tail], ['Horn', player.horn],
+    ['Weakness', player.weakness],
+    ['Distinguishing Marks', player.distinguishing_marks],
   ].filter(([, v]) => nonEmpty(v));
-  if (traitRows.length) out.push(traitRows.map(([k, v]) => row(k, v)).join(''));
-  if (nonEmpty(player.backstory)) out.push(proseBlock('Backstory', player.backstory));
-  return out.length ? out.join('') : '';
+  if (!traitRows.length) return '';
+  return section('Identity', traitRows.map(([k, v]) => row(k, v)).join(''));
+}
+
+// Persona: the player card's OPT-IN persona block (players never carry a
+// conversation style) + the top-level backstory. STACKED (long-prose
+// fields), mirroring the SIM tab's Persona section. Hidden when empty.
+function renderPlayerPersona(player) {
+  if (!player) return '';
+  const p = (player.persona && typeof player.persona === 'object') ? player.persona : {};
+  const rows = [
+    ['Personality', p.personality != null ? p.personality : player.personality],
+    ['Likes', p.likes != null ? p.likes : player.likes],
+    ['Dislikes', p.dislikes != null ? p.dislikes : player.dislikes],
+    ['Flaws', p.flaws != null ? p.flaws : player.flaws],
+    ['Goals', p.goals != null ? p.goals : player.goal],
+    ['Occupation', p.occupation != null ? p.occupation : null],
+    ['Backstory', player.backstory],
+  ].filter(([, v]) => nonEmpty(v)).map(([l, v]) => stackRow(l, v)).join('');
+  return rows ? section('Persona', rows) : '';
 }
 
 // Appearance: the live `current_appearance_deltas` (hair/body/skin/eyes/
 // scars/wounds/etc.) — what the character's BODY currently looks like in
-// this game. Clothing is NOT here (2026-08-18): garments are equipped
-// items, rendered by the Equipment section. Hidden entirely when no deltas
-// are tracked.
+// this game. Clothing is NOT here (2026-08-18): garments are typed
+// inventory, rendered by the Inventory section's Clothing list. Hidden
+// entirely when no deltas are tracked.
 function renderAppearance(ps) {
   const deltas = ps.current_appearance_deltas || {};
   const rows = Object.entries(deltas)
@@ -298,33 +337,52 @@ function renderInjuries(ps) {
   return rows.length ? section('Injuries', rows.join('')) : '';
 }
 
-// Inventory: equipped (6 slots, outer + inner layers) + belt (≤4) + pack
-// (unbounded). Each subsection hidden when empty. Item tags render as chips.
+// Inventory: stacked lists, NO slot rows (2026-08-20, Chloe — "completely
+// removed equipped, it should just show clothing and stuff"). Clothing =
+// everything WORN live (all equipment slots except the readied hands,
+// outer + under layers folded together); Weapons = the main/off hands;
+// Belt + Pack = the live stacks with quantities. Each subsection hidden
+// when empty.
 function renderInventory(ps) {
-  const out = [];
-  // Equipped — slot keys are the snake_case EquipSlot wire ids.
   const eq = ps.equipment || {};
-  const slotRows = Object.keys(eq)
-    .map((slot) => {
-      const layers = eq[slot] || {};
-      const items = [];
-      if (layers.outer && nonEmpty(layers.outer.name)) {
-        items.push(`<span class="fable-inv-item">${esc(layers.outer.name)}${tagChips(layers.outer.tags)}</span>`);
-      }
-      if (layers.inner && nonEmpty(layers.inner.name)) {
-        items.push(`<span class="fable-inv-item"><span class="fable-inv-layer">under:</span> ${esc(layers.inner.name)}${tagChips(layers.inner.tags)}</span>`);
-      }
-      if (!items.length) return '';
-      return `<div class="fable-inv-slot"><span class="fable-inv-slot-label">${esc(EQUIP_SLOT_LABELS[slot] || prettify(slot))}</span><span class="fable-inv-slot-items">${items.join('')}</span></div>`;
-    })
-    .filter(Boolean);
-  if (slotRows.length) out.push(section('Equipped', slotRows.join('')));
-
+  const worn = [];
+  const weapons = [];
+  for (const [slot, layers] of Object.entries(eq)) {
+    const bucket = (slot === 'main_hand' || slot === 'off_hand') ? weapons : worn;
+    for (const layerKey of ['outer', 'inner']) {
+      const it = layers && layers[layerKey];
+      if (it && nonEmpty(it.name) && !bucket.includes(it.name)) bucket.push(it.name);
+    }
+  }
   const belt = Array.isArray(ps.belt) ? ps.belt : [];
-  if (belt.length) out.push(section('Belt', stackList(belt)));
   const pack = Array.isArray(ps.pack) ? ps.pack : [];
-  if (pack.length) out.push(section('Pack', stackList(pack)));
-  return out.join('');
+  const rows = [];
+  if (worn.length) rows.push(stackRow('Clothing', worn.join(', ')));
+  if (weapons.length) rows.push(stackRow('Weapons', weapons.join(', ')));
+  if (belt.length) rows.push(stackRow('Belt', stackNames(belt)));
+  if (pack.length) rows.push(stackRow('Pack', stackNames(pack)));
+  return rows.length ? section('Inventory', rows.join('')) : '';
+}
+
+// A belt/pack stack rendered as one comma-joined line: name (+ ×qty).
+function stackNames(items) {
+  return items.map((it) => {
+    const name = nonEmpty(it.name) ? String(it.name) : 'Unknown';
+    const qty = (typeof it.qty === 'number' && it.qty > 1) ? ` ×${it.qty}` : '';
+    return `${name}${qty}`;
+  }).join(', ');
+}
+
+// Custom tags (shared by the Player + SIM card tabs): the authored
+// {key:value} map. (2026-08-20, Chloe) NO section divider — the rows flow
+// directly ABOVE Inventory — and KEYS render prettified (snake_case →
+// spaced, capitalized words) instead of showing raw underscores.
+function renderCustomTags(tags) {
+  if (!tags || typeof tags !== 'object') return '';
+  return Object.entries(tags)
+    .filter(([, v]) => nonEmpty(v))
+    .map(([k, v]) => stackRow(prettify(k), v))
+    .join('');
 }
 
 // Relationships: per-NPC tier (nemesis → bonded). Keyed by npc id on the
@@ -343,13 +401,14 @@ function renderRelationships(schema) {
 // each field hidden when empty so the dropdown shows only what's authored.
 // Editing happens via the ✎ raw editor (writes the .sim) or by talking to
 // WUPI; there is no inline form.
-// (2026-08-20 rework) The dropdown header IS the card: the label relabels to
-// the subtype ("NPC Card" / "World Card" / "Scenario Card" — the old "Type"
-// row is gone) and the center slot carries the card NAME in bold white (the
-// old "Name" row is gone). "Playing as" is deleted — the bound player is the
-// PLAYER tab's business, never the card's. The <world> anchor seeds (date/
-// time/weather/tone/location) no longer render here: they're consumed into
-// the live World tab on start, so the card section carries persona only.
+// (2026-08-20 rework) The dropdown header IS the card: the NAME alone in the
+// center (bold white). The subtype label only stands as a fallback when the
+// card carries no name — the "Player" / "NPC Card" style headers are gone
+// (Chloe: "just have it show NAME only"). "Playing as" is deleted — the
+// bound player is the PLAYER tab's business, never the card's. The <world>
+// anchor seeds (date/time/weather/tone/location) no longer render here:
+// they're consumed into the live World tab on start, so the card section
+// carries persona only.
 async function renderCard(body, head) {
   let card;
   try {
@@ -362,7 +421,7 @@ async function renderCard(body, head) {
     body.innerHTML = emptyBox('No active card.');
     return;
   }
-  head.setTitle(cardTabTitle(card.subtype));
+  if (!nonEmpty(card.name)) head.setTitle(cardTabTitle(card.subtype));
   head.setName(card.name);
   const parts = [];
   // The v2 <identity> line block (present for every card — the KV-cache
@@ -388,6 +447,10 @@ async function renderCard(body, head) {
   if (personaRows) parts.push(section('Persona', personaRows));
   if (nonEmpty(card.setting)) parts.push(proseBlock('Setting', card.setting));
   if (nonEmpty(card.plot)) parts.push(proseBlock('Plot', card.plot));
+  // Custom tags FIRST (2026-08-20, Chloe): NO "Custom Tags" divider — the
+  // prettified rows flow directly ABOVE the Inventory section.
+  const tags = renderCustomTags(card.custom_tags);
+  if (tags) parts.push(tags);
   // The <inventory> sibling (npc cards). STACKED — the clothing list runs long.
   const inv = card.inventory || {};
   const invRows = [
@@ -395,9 +458,6 @@ async function renderCard(body, head) {
     ['Accessories', inv.accessories], ['Stored', inv.stored],
   ].filter(([, v]) => Array.isArray(v) && v.length).map(([l, v]) => stackRow(l, v.join(', '))).join('');
   if (invRows) parts.push(section('Inventory', invRows));
-  const tags = card.custom_tags || {};
-  const tagRows = Object.entries(tags).filter(([, v]) => nonEmpty(v)).map(([k, v]) => stackRow(k, v)).join('');
-  if (tagRows) parts.push(section('Custom Tags', tagRows));
   body.innerHTML = parts.length ? parts.join('') : emptyBox('No active card.');
 }
 
@@ -449,7 +509,9 @@ function codexReadCard(e) {
 // block shown ONLY when populated: dormant clock/weather/location are hidden
 // (zero tracked state → zero rows), so a fresh game shows nothing misleading.
 // Editing happens via the ✎ raw editor (writes world.json) or by talking to
-// WUPI; there is no inline form.
+// WUPI; there is no inline form — EXCEPT the Date + Time rows (2026-08-20,
+// Chloe): those two are click-to-edit inline (the calendar label + the
+// time-of-day were previously impossible to change from the drawer).
 async function renderWorld(body) {
   let schema;
   try {
@@ -479,9 +541,13 @@ async function renderWorld(body) {
   // (2026-08-20) DATE first (the authored/[DATE]-rewritten calendar label —
   // seeded from the card's <world> sibling on a fresh start), then the clock,
   // then TONE (world state since 2026-08-19 — it lives HERE, not on the card
-  // section, which no longer renders the anchor seeds at all).
-  if (nonEmpty(schema.calendar)) parts.push(row('Date', String(schema.calendar).trim()));
-  if (mins > 0) parts.push(row('Time', clockLabel(mins)));
+  // section, which no longer renders the anchor seeds at all). Date + Time
+  // are the two INLINE-EDITABLE rows: click the value to edit (Enter saves,
+  // Esc cancels). Time renders as a 12-hour AM/PM readout — NEVER "Day N"
+  // (the date label carries the day).
+  const calLabel = nonEmpty(schema.calendar) ? String(schema.calendar).trim() : '';
+  parts.push(rowEditable('Date', calLabel || '—'));
+  parts.push(rowEditable('Time', mins > 0 ? clockLabel(mins) : '—'));
   if (weather.trim()) parts.push(row('Weather', weather.trim()));
   if (nonEmpty(schema.tone)) parts.push(row('Tone', String(schema.tone).trim()));
   if (node.trim()) parts.push(row('Location', prettify(node)));
@@ -490,6 +556,105 @@ async function renderWorld(body) {
   if (events.length) parts.push(listBlock('Recent events', events.slice(-5)));
   if (worldEnts.length) parts.push(listBlock('Tracked details', worldEnts.map(([k, v]) => `${prettify(k)}: ${v}`)));
   body.innerHTML = parts.length ? parts.join('') : '<div class="fable-drop-empty">World state not yet established.</div>';
+  wireWorldEdits(body, schema);
+}
+
+// ── World-tab inline date/time editing ───────────────────────────────────
+// The sanctioned write path is `fable_json_raw_set` (kind=world) — the same
+// recompose-into-live-schema gate the ✎ raw editor uses. The patch is built
+// from the LIVE schema snapshot (never a stale disk read) and touches ONLY
+// the edited keys; every other world-slice key passes through untouched.
+
+// An editable row: same stacked centered layout as `row()`, but the value
+// swaps to a text input on click.
+function rowEditable(label, val) {
+  return `<div class="fable-drop-row fable-drop-row--edit" data-edit-row="${esc(label)}"><span>${esc(label)}</span><span class="fable-drop-val fable-drop-val--edit" data-edit-val>${esc(val)}</span></div>`;
+}
+
+function wireWorldEdits(bodyEl, schema) {
+  const clock = schema.world_clock || {};
+  const base = Number(clock.current_minutes) || 0;
+  const handlers = {
+    Date: (v) => {
+      const label = String(v || '').replace(/\s+/g, ' ').trim().slice(0, 80);
+      if (!label) return;
+      // Re-stamp the sync marker so the label isn't "stale" against the clock.
+      saveWorldSlice({ calendar: label, calendar_synced_minutes: base });
+    },
+    Time: (v) => {
+      const tod = parseTimeInput(v);
+      if (tod === null) return;
+      // Keep the epoch DAY; replace the time-of-day. minute 0 is the dormant
+      // sentinel, so a midnight set on day 0 nudges to 00:01 (is_set() gate).
+      let next = Math.floor(base / 1440) * 1440 + tod;
+      if (next <= 0) next = 1;
+      const lastTick = Math.min(Number(clock.last_tick_minutes) || 0, next);
+      saveWorldSlice({ world_clock: { current_minutes: next, last_tick_minutes: lastTick } });
+    },
+  };
+  for (const valEl of bodyEl.querySelectorAll('[data-edit-val]')) {
+    const rowEl = valEl.closest('[data-edit-row]');
+    const commit = rowEl && handlers[rowEl.dataset.editRow];
+    if (commit) valEl.addEventListener('click', () => beginInlineEdit(valEl, commit));
+  }
+}
+
+// Swap a value span for a focused text input. Enter commits (calls back with
+// the raw text), Esc/blur cancels. stopPropagation keeps Enter/Esc off the
+// stage-level key handlers while the input is live.
+function beginInlineEdit(valEl, commit) {
+  if (valEl.parentNode.querySelector('.fable-drop-edit-input')) return;
+  const input = document.createElement('input');
+  input.type = 'text';
+  input.className = 'fable-drop-edit-input';
+  input.value = valEl.textContent === '—' ? '' : valEl.textContent;
+  valEl.hidden = true;
+  valEl.parentNode.appendChild(input);
+  input.focus();
+  input.select();
+  let done = false;
+  const finish = (save) => {
+    if (done) return;
+    done = true;
+    const v = input.value;
+    input.remove();
+    valEl.hidden = false;
+    if (save) commit(v);
+  };
+  input.addEventListener('keydown', (e) => {
+    e.stopPropagation();
+    if (e.key === 'Enter') { e.preventDefault(); finish(true); }
+    else if (e.key === 'Escape') { e.preventDefault(); finish(false); }
+  });
+  input.addEventListener('blur', () => finish(false));
+}
+
+// "10:30", "10:30 AM", "10:30pm", "22:05", "9am" → minute-of-day. Null when
+// unparseable (the edit silently no-ops — the row keeps its current value).
+function parseTimeInput(v) {
+  const m = String(v || '').trim().match(/^(\d{1,2})(?::(\d{2}))?\s*(am|pm)?$/i);
+  if (!m) return null;
+  let h = parseInt(m[1], 10);
+  const min = m[2] ? parseInt(m[2], 10) : 0;
+  if (min > 59) return null;
+  const mer = m[3] ? m[3].toLowerCase() : null;
+  if (mer) {
+    if (h < 1 || h > 12) return null;
+    h = (h % 12) + (mer === 'pm' ? 12 : 0);
+  } else if (h > 23) {
+    return null;
+  }
+  return h * 60 + min;
+}
+
+async function saveWorldSlice(patch) {
+  try {
+    await invoke('fable_json_raw_set', { kind: 'world', json: JSON.stringify(patch) });
+  } catch (err) {
+    console.warn('[tab-rail] world slice save failed', err);
+    return;
+  }
+  renderActive();
 }
 
 // ── NPC tab (READ-ONLY) ─────────────────────────────────────────────────
@@ -654,39 +819,22 @@ function tierInfo(t) {
   const key = String(t || 'stranger').toLowerCase();
   return { label: key, cls: (TIER_INFO[key] || {}).cls || '' };
 }
-// EquipSlot wire ids → friendly slot labels. (2026-08-20) neck/arms/hands
-// joined the set — the 2026-08-19 zone sweep added the slots; the drawer
-// fell back to the raw slug for them.
-const EQUIP_SLOT_LABELS = {
-  head: 'Head', chest: 'Chest', main_hand: 'Main Hand',
-  off_hand: 'Off Hand', legs: 'Legs', feet: 'Feet',
-  neck: 'Neck', arms: 'Arms', hands: 'Hands',
-};
-// Behavior-tag chips (consumable/equippable/pocketable) for inventory items.
-function tagChips(tags) {
-  if (!Array.isArray(tags) || !tags.length) return '';
-  return `<span class="fable-drop-chips">${tags
-    .map((t) => `<span class="fable-drop-chip">${esc(String(t))}</span>`).join('')}</span>`;
-}
-// A belt/pack entry: name + optional ×qty + tag chips.
-function stackItemRow(it) {
-  const name = nonEmpty(it.name) ? String(it.name) : 'Unknown';
-  const qty = (typeof it.qty === 'number' && it.qty > 1) ? `<span class="fable-drop-qty">×${it.qty}</span>` : '';
-  return `<div class="fable-drop-list-item">${esc(name)}${qty}${tagChips(it.tags)}</div>`;
-}
-function stackList(items) {
-  return `<div class="fable-drop-list">${items.map(stackItemRow).join('')}</div>`;
-}
-// Format epoch-minutes as the narrator's "Day N, HH:MM" clock line. Mirrors
-// Rust's WorldClock::render_clock_line exactly (schema.rs): 1 day = 1440 min,
-// day index = minutes/1440 + 1, time-of-day = minutes % 1440.
+// (2026-08-20) EQUIP_SLOT_LABELS + the belt/pack chip/list builders are
+// RETIRED with the slot-row "Equipped" section — inventory renders as
+// stacked name lists now (renderInventory / stackNames).
+// Format epoch-minutes as a 12-hour AM/PM readout of the minute-of-day.
+// (2026-08-20, Chloe) NEVER "Day N" — the calendar DATE carries the day; a
+// day counter next to a real date label is noise. Mirrors the left drawer's
+// formatTime12h.
 function clockLabel(minutes) {
   const m = Number(minutes) || 0;
-  const day = Math.floor(m / 1440) + 1;
-  const rem = m % 1440;
-  const h = Math.floor(rem / 60);
-  const min = rem % 60;
-  return `Day ${day}, ${String(h).padStart(2, '0')}:${String(min).padStart(2, '0')}`;
+  const tod = ((m % 1440) + 1440) % 1440;
+  let h = Math.floor(tod / 60);
+  const min = tod % 60;
+  const mer = h >= 12 ? 'PM' : 'AM';
+  h = h % 12;
+  if (h === 0) h = 12;
+  return `${h}:${String(min).padStart(2, '0')} ${mer}`;
 }
 // ─ read-only block builders (reused by Card / World / Codex / NPC / Player) ─
 // `cls` (optional) adds a severity class to the value (bad/warn/good/hp-*).

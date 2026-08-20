@@ -756,30 +756,9 @@ body:not(.booting):not(.loading) .dock-trigger-area {
     box-shadow: 0 10px 20px rgba(0, 0, 0, 0.3);
 }
 
-.dock-item::after {
-    content: attr(aria-label);
-    position: absolute;
-    top: -45px;
-    background: rgba(15, 15, 20, 0.85);
-    color: #fff;
-    padding: 6px 10px;
-    border-radius: 8px;
-    font-size: 13px;
-    font-weight: 500;
-    white-space: nowrap;
-    opacity: 0;
-    pointer-events: none;
-    transition: opacity 0.2s, transform 0.2s;
-    backdrop-filter: blur(10px);
-    border: 1px solid rgba(255, 255, 255, 0.1);
-    box-shadow: 0 4px 10px rgba(0, 0, 0, 0.4);
-    transform: translateY(5px);
-}
-
-.dock-item:hover::after {
-    opacity: 1;
-    transform: translateY(0);
-}
+/* (2026-08-20) The hover label badge (::after rendering attr(aria-label)) is
+   RETIRED — hover tooltips are banned app-wide. The aria-labels stay on the
+   elements for screen readers; they just never render as hover text. */
 
 .dock-separator {
     width: 1px;

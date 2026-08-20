@@ -1239,6 +1239,8 @@ pub fn run() {
             fable_card_portrait_url,
             fable_card_raw_get_by_id,
             fable_card_raw_set_by_id,
+            fable_player_raw_get,
+            fable_player_raw_set,
             fable_card_delete,
             // Windows .lnk shortcut generator (shortcut.rs) — fable.exe --card.
             create_card_shortcut,
@@ -9704,6 +9706,62 @@ async fn enter_fable_session(
     // player_action from the previous game never fires in this one's first
     // turn. fable_load_save + fable_end run the same clear.
     *state.pending_player_action.lock().await = None;
+    // (2026-08-20) The SAME session-boundary drains fable_end runs —
+    // entering a game is ALSO a boundary. A previous session that ended
+    // while a turn was still unwinding (fable_end refused, the app moved on)
+    // can leave one-shot tick directives + failed delta/translation queues
+    // behind; a new game — fresh OR resumed — must never inherit another
+    // timeline's world facts. fable_end normally drains these; this is the
+    // belt-and-braces twin.
+    {
+        let mut td = state.pending_tick_directives.lock().await;
+        let dropped = td.len();
+        td.clear();
+        if dropped > 0 {
+            tracing::warn!(dropped, "enter_fable_session: dropped stale tick directives from a prior session");
+        }
+    }
+    state.failed_progression_queue.lock().await.clear();
+    state.failed_translation_queue.lock().await.clear();
+    // (2026-08-20, Chloe — the recent_events carryover) FRESH resets the
+    // DISK tracking too, not just memory. The old fresh branch installed a
+    // default schema but left the prior campaign's split files (world.json /
+    // npc.json / player.json / session.json) + the reserved `autosave` slot
+    // untouched — until the next persist, the OLD campaign's recent_events /
+    // entities lived on disk, and Continue (which resumes the freshest slot,
+    // autosaves included) resurrected the previous run's tracking under a
+    // "new" session. A fresh start now rewrites the split files + the
+    // autosave slot with the just-seeded state IMMEDIATELY, so a new session
+    // resets the world/npc/player tracking on disk from the first instant.
+    // Manual save slots are deliberately untouched (user checkpoints).
+    if fresh {
+        let schema_snapshot = state.fable_schema.lock().await.clone();
+        let session_snapshot = state.fable_session.lock().await.clone();
+        save_schema(app, &card.id, &schema_snapshot).await;
+        save_session(app, &card.id, &session_snapshot).await;
+        let fable_root = resolve_apps_dir(app).join("fable");
+        let card_for_save = card.clone();
+        let session_clone = session_snapshot;
+        let schema_clone = schema_snapshot;
+        tokio::spawn(async move {
+            let result = tokio::task::spawn_blocking(move || {
+                fable_save::write_save(
+                    &fable_root,
+                    &card_for_save,
+                    fable_save::AUTOSAVE_ID,
+                    "Autosave",
+                    &session_clone,
+                    &schema_clone,
+                )
+            })
+            .await;
+            match result {
+                Ok(Ok(_)) => tracing::info!("fresh start: split files + autosave slot reset to the seeded state"),
+                Ok(Err(e)) => tracing::warn!(error = %format!("{e:#}"), "fresh start: autosave slot reset failed (non-fatal)"),
+                Err(e) => tracing::warn!(error = %e, "fresh start: autosave slot reset join failed (non-fatal)"),
+            }
+        });
+    }
     // Read the one-shot opening beat BEFORE the card is moved into
     // active_fable_card. (2026-08-16, Chloe ruling) The intro is NO LONGER
     // surfaced here: it is seeded into the fresh session as message 0 (see
@@ -10318,9 +10376,11 @@ fn build_creator_assistant_system_prompt(creator_kind: &str) -> String {
              plus the name. Set draft.card_type + draft.name, then gather ONLY that \
              branch's fields. Never switch types mid-card.\n\
              UNIVERSAL WORLD ANCHORS (required for EVERY card_type; if the player is \
-             vague, supply a sensible default — never leave any empty): date (a rich \
-             free-form calendar label — month/year/type-of-day, e.g. \"3rd of Harvest, \
-             Year 1247, Market Day\"; NOT just \"Day 1\"), time (time-of-day, e.g. \
+             vague, supply a sensible default — never leave any empty): date (a clean \
+             calendar date label — month/day, optionally the year: \"March 15\" or \
+             \"March 15, 2026\" (fantasy settings: \"3rd of Harvest, Year 1247\"); NEVER \
+             a bare \"Day 1\" and NEVER era qualifiers like \"present day\" or \"modern \
+             era\" — the label is the date itself, nothing more), time (time-of-day, e.g. \
              \"09:00\" or \"late morning\"), weather (e.g. \"clear\", \"heavy rain\"), \
              tone (the STORY's narrative atmosphere of the whole card, e.g. \"grim low \
              fantasy\", \"cozy slice-of-life\" — NEVER a character's personal speaking \
@@ -14454,6 +14514,64 @@ fn fable_card_raw_set_by_id(card_id: String, xml: String, app: tauri::AppHandle)
     let path = resolve_card_file(&cards_root, &card_id, "sim");
     write_atomic(&path, xml.as_bytes()).map_err(|e| format!("write card: {e}"))?;
     tracing::info!(card_id = %card_id, "fable_card_raw_set_by_id: .sim written to disk");
+    Ok(())
+}
+
+/// Read the raw `.player` XML of an EXPLICIT saved player by id (no
+/// active-game requirement). The Player Picker's EDIT action (2026-08-20,
+/// Chloe — editing a loaded player card uses the SAME raw-XML editor the
+/// Load menu uses for `.sim` cards, replacing the wizard-chat edit run).
+/// Walker-resolves the display-named folder via `resolve_player_folder`
+/// (the slug id is never joined directly); NotFound → Err (the picker only
+/// offers existing ids).
+#[tauri::command]
+fn fable_player_raw_get(id: String, app: tauri::AppHandle) -> Result<String, String> {
+    let dir = resolve_fable_players_dir(&app);
+    let folder = resolve_player_folder(&dir, &id)
+        .ok_or_else(|| format!("player '{id}' not found"))?;
+    let stem = folder
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("Player")
+        .to_owned();
+    let path = folder.join(format!("{stem}.player"));
+    std::fs::read_to_string(&path).map_err(|e| format!("read player: {e}"))
+}
+
+/// Validate + atomically write an EXPLICIT saved player's `.player` XML by
+/// id. The Player Picker's EDIT save path (2026-08-20). Mirrors the card
+/// raw-set discipline: parse through the REAL parser
+/// (`player::parse_player_xml`) BEFORE any disk touch, 100 KB cap, and the
+/// embedded id must keep matching the player it's saved under (a drifting
+/// id splits folder resolution — same C18 class as the card writers). The
+/// bytes are written VERBATIM (user formatting is preserved); the next
+/// `fable_player_get` / attach re-parses the edit.
+#[tauri::command]
+fn fable_player_raw_set(id: String, xml: String, app: tauri::AppHandle) -> Result<(), String> {
+    if xml.len() > 100_000 {
+        return Err("Player exceeds 100 KB cap".into());
+    }
+    let parsed = player::parse_player_xml(&xml)
+        .map_err(|e| format!("Invalid player format: {e}"))?;
+    let want = player::slugify_player_id(&id)
+        .ok_or_else(|| "could not derive a valid player id".to_string())?;
+    if parsed.id != want {
+        return Err(format!(
+            "the edited player's id {:?} no longer matches its folder {:?}: keep <metadata><id> (and <name>) normalizing to the same slug",
+            parsed.id, want
+        ));
+    }
+    let dir = resolve_fable_players_dir(&app);
+    let folder = resolve_player_folder(&dir, &id)
+        .ok_or_else(|| format!("player '{id}' not found"))?;
+    let stem = folder
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("Player")
+        .to_owned();
+    let path = folder.join(format!("{stem}.player"));
+    write_atomic(&path, xml.as_bytes()).map_err(|e| format!("write player: {e}"))?;
+    tracing::info!(player_id = %want, "fable_player_raw_set: .player written to disk");
     Ok(())
 }
 

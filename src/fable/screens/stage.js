@@ -177,21 +177,13 @@ export function buildStage() {
          edge) + a name header + the prose body. engine/beats.js owns the
          DOM; this is its mount point. Sits above the bg/FX, below the input
          row + drawers.
-         (2026-08-19) FEED VIEWPORT WRAPPER: the feed + the top blur strip
-         share this wrapper. The wrapper's opacity (0.9999 — visually a
-         no-op) establishes a BACKDROP ROOT, which is the load-bearing fence
-         for the strip: its backdrop-filter can only sample content painted
-         INSIDE this wrapper (the chat bubbles) — never the stage
-         background, the FX layer, or the OS top bar (which also sits z
-         9999 above the whole stage). The strip itself is pointer-events:
-         none, so nothing here can ever intercept the chrome-peek top bar
-         or a bubble click. -->
+         (2026-08-20, Chloe) The 12px TOP BLUR STRIP that rode this wrapper
+         is REMOVED — no frosted band at the top of the stage. The wrapper
+         stays (it owns the feed's absolute inset:0 positioning slot in the
+         stage stacking order); the backdrop-root opacity hack is retired
+         with the strip. -->
     <div class="fable-feed-viewport">
       <div class="fable-feed" data-feed></div>
-      <!-- 12px bubbles-only frosted band at the screen's top edge: the
-           transcript reads as always a tiny bit faded at the very top, so
-           bubbles appear to fade in as they scroll up under it. -->
-      <div class="fable-feed-topblur" aria-hidden="true"></div>
     </div>
     <!-- Typing indicator (re-instated 2026-08-19, subtype-aware): a small
          label pinned just above the input row while a turn is in flight.
@@ -276,13 +268,13 @@ export function buildStage() {
                so it lands far-left (the flex row is DOM-ordered LTR, centered).
                Opens the gallery modal over the stage. Visible in ALL modes —
                backgrounds are global. -->
-          <button class="fable-foot-icon" data-foot-bg aria-label="Background" title="Background">
+          <button class="fable-foot-icon" data-foot-bg aria-label="Background">
             <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="5" width="18" height="14" rx="2" fill="none" stroke="currentColor" stroke-width="1.6"/><circle cx="8.5" cy="10" r="1.6" fill="currentColor"/><path d="M3 16l4.5-4 3.5 3 4-5 6 6" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round" stroke-linecap="round"/></svg>
           </button>
-          <button class="fable-foot-icon" data-foot-save aria-label="Save" title="Save">
+          <button class="fable-foot-icon" data-foot-save aria-label="Save">
             <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 3h11l3 3v15a0 0 0 0 1 0 0H5a0 0 0 0 1 0 0V3z" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/><rect x="8" y="3" width="7" height="5" rx="0.8" fill="none" stroke="currentColor" stroke-width="1.6"/><rect x="8" y="12" width="8" height="6" rx="0.6" fill="none" stroke="currentColor" stroke-width="1.4"/></svg>
           </button>
-          <button class="fable-foot-icon" data-foot-load aria-label="Load" title="Load">
+          <button class="fable-foot-icon" data-foot-load aria-label="Load">
             <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 7a2 2 0 0 1 2-2h5l2 2h7a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7z" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/><path d="M12 17V9M12 9l-3 3M12 9l3 3" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>
           </button>
           <!-- API (2026-08-14): the 5th foot tool, 2nd-to-last (between Load
@@ -290,10 +282,10 @@ export function buildStage() {
                buildOnlinePanel the title's ONLINE button opens) so the player
                can swap provider/model mid-roleplay without leaving the stage.
                Also the reconnect path after a mid-session api_lost. -->
-          <button class="fable-foot-icon" data-foot-api aria-label="API" title="API">
+          <button class="fable-foot-icon" data-foot-api aria-label="API">
             <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 8V3M15 8V3" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/><path d="M6 8h12v5a4 4 0 0 1-4 4h-4a4 4 0 0 1-4-4V8z" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/><path d="M12 17v4" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>
           </button>
-          <button class="fable-foot-icon" data-foot-home aria-label="Home" title="Home">
+          <button class="fable-foot-icon" data-foot-home aria-label="Home">
             <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 11l8-7 8 7" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/><path d="M6 10v9a1 1 0 0 0 1 1h10a1 1 0 0 0 1-1v-9" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/><path d="M10 20v-5h4v5" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/></svg>
           </button>
         </div>

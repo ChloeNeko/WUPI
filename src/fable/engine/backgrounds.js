@@ -96,7 +96,7 @@ function ensureOverlay(stageEl) {
     <div class="fable-bg-modal">
       <header class="fable-bg-head">
         <h2 class="fable-bg-title">Background</h2>
-        <button class="fable-bg-import" data-bg-import title="Import a background image (1440p 16:9 recommended)">
+        <button class="fable-bg-import" data-bg-import>
           <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 4v12M12 4l-4 4M12 4l4 4" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/><path d="M4 16v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-2" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg>
           <span>Import</span>
         </button>
@@ -190,7 +190,7 @@ async function renderGallery() {
 function renderNoneTile(isActive) {
   const activeCls = isActive ? ' is-active' : '';
   return `<div class="fable-bg-cell${activeCls}">
-    <button class="fable-bg-tile" data-bg-tile data-filename="" title="None (black void)">
+    <button class="fable-bg-tile" data-bg-tile data-filename="">
       <div class="fable-bg-thumb fable-bg-thumb--none">
         <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 5h14v14H5z" fill="none" stroke="currentColor" stroke-width="1.4"/><path d="M5 5l14 14M19 5L5 19" fill="none" stroke="currentColor" stroke-width="1.1" opacity="0.6"/></svg>
       </div>
@@ -206,11 +206,11 @@ function renderTile(meta, isActive) {
   const url = `${convertFileSrc(meta.path)}?t=${Date.now()}`;
   const activeCls = isActive ? ' is-active' : '';
   return `<div class="fable-bg-cell${activeCls}">
-    <button class="fable-bg-tile" data-bg-tile data-filename="${attr(meta.filename)}" title="${attr(meta.name)}">
+    <button class="fable-bg-tile" data-bg-tile data-filename="${attr(meta.filename)}">
       <div class="fable-bg-thumb" style="background-image:url('${cssUrl(url)}')"></div>
       <span class="fable-bg-name">${escapeHtml(meta.name)}</span>
     </button>
-    <button class="fable-bg-delete" data-bg-delete data-filename="${attr(meta.filename)}" title="Delete" aria-label="Delete ${attr(meta.name)}">
+    <button class="fable-bg-delete" data-bg-delete data-filename="${attr(meta.filename)}" aria-label="Delete ${attr(meta.name)}">
       <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6L6 18" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></svg>
     </button>
   </div>`;

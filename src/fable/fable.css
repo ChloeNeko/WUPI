@@ -75,14 +75,15 @@
 
 /* --- Body chrome state (auto-hide while a game runs) --- */
 /* Per §7B the quick menu is OS chrome ONLY — it never shows inside the
-   Fable app. The top bar is the sole chrome the peek re-reveals. The dock
-   is translated fully off-screen + pointer-events:none so it can't be
-   hovered or clicked even if its z:9998 would otherwise sit above the
-   fable app (z:4000). The peek rule deliberately does NOT restore the
-   dock — only .top-bar. */
-body.fable-active .top-bar { transform: translateY(-48px); transition: transform 320ms cubic-bezier(0.2,0.8,0.2,1); }
+   Fable app. (2026-08-20, Chloe) The top-edge chrome PEEK is RETIRED —
+   the blurred glass top bar is COMPLETELY removed from Fable: no hover
+   zone, no peek class, nothing can slide it back. The bar translates
+   fully off-screen + pointer-events:none (its z:9999 would otherwise sit
+   above the fable app, z:4000 — the hit-test guard matches the dock's).
+   The dock is translated fully off-screen + pointer-events:none the same
+   way. */
+body.fable-active .top-bar { transform: translateY(-48px); pointer-events: none; transition: transform 320ms cubic-bezier(0.2,0.8,0.2,1); }
 body.fable-active .dock-trigger-area { transform: translateY(112px); pointer-events: none; transition: transform 320ms cubic-bezier(0.2,0.8,0.2,1); }
-body.fable-active.fable-chrome-peek .top-bar { transform: translateY(0); }
 
 /* --- Window shell --- */
 .app-window.fable-app {
@@ -2721,43 +2722,9 @@ body.fable-active.fable-chrome-peek .top-bar { transform: translateY(0); }
 .hud-dock-btn[data-gender="female"] { color: #F04A6A; }
 .hud-dock-btn[data-gender="female"] .glyph-stroke { stroke: #F04A6A; }
 
-/* ── The shared tooltip badge (now flipped UPWARD — dock is at the bottom) ──
-   Same dark, gold-bordered spec styling as before, but positioned ABOVE its
-   button (the dock hugs the bottom edge, so a below-button tooltip would clip
-   off-screen). Fades in on hover/focus; pointer-events:none so it never
-   steals the hover. */
-.hud-tooltip {
-    position: absolute;
-    bottom: calc(100% + 8px);        /* 8px gap ABOVE the icon (was top, now bottom) */
-    left: 50%;
-    transform: translate(-50%, 2px); /* start 2px high, settle down on show */
-    background: #0d0d0d;
-    border: 1px solid rgba(212, 175, 55, 0.4);
-    padding: 4px 10px;
-    border-radius: 4px;
-    font-size: 0.8rem;
-    font-family: var(--fable-font-serif, 'Cinzel', serif);
-    color: var(--fable-brass-bright, #E6D58A);
-    white-space: nowrap;
-    text-align: center;
-    line-height: 1.35;
-    opacity: 0;
-    visibility: hidden;
-    pointer-events: none;
-    transition: opacity 180ms ease, transform 180ms ease, visibility 0s linear 180ms;
-    box-shadow: 0 4px 10px rgba(0, 0, 0, 0.55), 0 0 6px rgba(212, 175, 55, 0.08);
-    z-index: 8;
-}
-.hud-dock-btn:hover .hud-tooltip,
-.hud-dock-btn:focus-visible .hud-tooltip {
-    opacity: 1;
-    visibility: visible;
-    transform: translate(-50%, 0);
-    transition: opacity 180ms ease, transform 180ms ease, visibility 0s;
-}
-.hud-tooltip-line { display: block; }
-.hud-tooltip-line + .hud-tooltip-line { margin-top: 1px; }
-.hud-tooltip-dim { opacity: 0.62; font-style: italic; }
+/* (2026-08-20) The .hud-tooltip hover-badge rules are RETIRED — hover
+   tooltips are banned app-wide (the elements were never built anyway; the
+   click info-cards superseded them). */
 
 /* =============================================================
    LEFT DRAWER — INTERACTION WIRING (2026-08-06)
@@ -2846,26 +2813,10 @@ body.fable-active.fable-chrome-peek .top-bar { transform: translateY(0); }
     transform: translate(-50%, 0);
 }
 
-/* ── §B  CALENDAR DAY OVERLAY ────────────────────────────────────────────
-   A small bold brass number centered over the calendar icon's date area. Sits
-   inside the .hud-dock-btn (position:relative) on top of the SVG. Hidden
-   (.is-empty) when no live clock — renderStatusRow toggles the class. */
-.hud-dock-day {
-    position: absolute;
-    /* Centered on the calendar's lower body (the rect's date area). The icon
-       SVG fills the button; the day number lands just below center. */
-    top: 58%;
-    left: 50%;
-    transform: translate(-50%, -50%);
-    font-family: var(--fable-font-serif, 'Cinzel', serif);
-    font-size: 0.95rem;
-    font-weight: 700;
-    color: var(--fable-brass-bright, #E6D58A);
-    text-shadow: 0 1px 2px rgba(0, 0, 0, 0.8);
-    pointer-events: none;            /* never block the icon click */
-    z-index: 2;                      /* above the SVG icon (z:auto) */
-}
-.hud-dock-day.is-empty { display: none; }
+/* ── §B  CALENDAR DAY OVERLAY — RETIRED (2026-08-20) ─────────────────────
+   The .hud-dock-day number badge is GONE with the derived "Day N" counter
+   (Chloe: "don't have time show 'day 1' ever; we have date for that") — the
+   calendar click card carries the authored date label alone. */
 
 /* ── §C  SLIDE-UP INFO CARD ──────────────────────────────────────────────
    A single container above the dock holding one of three bodies (calendar /
@@ -3055,17 +3006,21 @@ body.fable-active.fable-chrome-peek .top-bar { transform: translateY(0); }
 .fable-tab-drop__head {
     /* (2026-08-20) Three zones: tab label (left) · character NAME (center,
        bold white) · ✎ edit (right). The name slot is filled by the player /
-       card renderers from their IPC reads; other tabs leave it empty. */
+       card renderers from their IPC reads; other tabs leave it empty.
+       (2026-08-20, Chloe) When a NAME is set the label HIDES — the name is
+       the whole header ("just have it show NAME only"). */
     display: grid; grid-template-columns: 1fr auto 1fr;
     align-items: center;
     margin-bottom: 10px;
 }
+.fable-tab-drop__head.has-name .fable-tab-drop__title { display: none; }
 .fable-tab-drop__title {
     font-size: 12px; font-weight: 600; letter-spacing: 0.08em;
     text-transform: uppercase; color: var(--fable-brass);
 }
 .fable-tab-drop__name {
-    font-size: 14px; font-weight: 700; color: var(--fable-text);
+    /* (2026-08-20, Chloe) +4px — the name is the whole header now. */
+    font-size: 18px; font-weight: 700; color: var(--fable-text);
     text-align: center; letter-spacing: 0.04em;
     overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
     max-width: 100%;
@@ -3080,8 +3035,12 @@ body.fable-active.fable-chrome-peek .top-bar { transform: translateY(0); }
 }
 .fable-tab-drop__edit:hover { color: var(--fable-text); border-color: var(--fable-brass); }
 .fable-tab-drop__body { display: flex; flex-direction: column; gap: 6px; }
+/* (2026-08-20, Chloe) Every dropdown row is CENTERED + INDIVIDUALLY LINED:
+   the label sits on its own centered line, the value directly beneath it
+   (same colors as before — label dim, value carries the severity class). */
 .fable-drop-row {
-    display: flex; justify-content: space-between; align-items: baseline;
+    display: flex; flex-direction: column; align-items: center;
+    gap: 1px; text-align: center;
     padding: 5px 0;
     border-bottom: 1px solid rgba(255,255,255,0.03);
     font-size: 13.5px; color: var(--fable-text-dim);
@@ -3106,10 +3065,11 @@ body.fable-active.fable-chrome-peek .top-bar { transform: translateY(0); }
 .fable-drop-muted { color: var(--fable-text-faint); font-style: italic; font-size: 13px; }
 /* (2026-08-20) STACKED row — label ABOVE value — for the long-prose fields
    (persona lines, clothing lists, custom tags): a side-by-side row put a
-   paragraph hard against its label. */
+   paragraph hard against its label. Centered with the plain rows. */
 .fable-drop-stack {
     padding: 5px 0;
     border-bottom: 1px solid rgba(255,255,255,0.03);
+    text-align: center;
 }
 .fable-drop-stack:last-child { border-bottom: none; }
 .fable-drop-stack-label {
@@ -3126,28 +3086,58 @@ body.fable-active.fable-chrome-peek .top-bar { transform: translateY(0); }
 .fable-drop-section {
     margin-top: 8px; font-size: 11px; text-transform: uppercase;
     letter-spacing: 0.08em; color: var(--fable-text-faint);
+    text-align: center;
 }
 .fable-drop-empty { padding: 16px 4px; color: var(--fable-text-faint); font-style: italic; text-align: center; }
-.fable-drop-error { color: #f4a0a0; padding: 8px 0; }
+.fable-drop-error { color: #f4a0a0; padding: 8px 0; text-align: center; }
+/* (2026-08-20) The World tab's two editable rows (Date / Time): the value
+   reads as editable — brass underline hint + pointer — and swaps to a
+   centered input on click (see tab-rail.js beginInlineEdit). */
+.fable-drop-val--edit {
+    color: var(--fable-brass-bright);
+    border-bottom: 1px dotted var(--fable-brass);
+    cursor: pointer;
+    padding: 0 4px;
+}
+.fable-drop-edit-input {
+    width: 90%; max-width: 220px;
+    background: rgba(0, 0, 0, 0.45);
+    border: 1px solid var(--fable-brass);
+    border-radius: 5px;
+    color: var(--fable-text);
+    font-size: 13px; font-weight: 500;
+    text-align: center;
+    padding: 3px 8px;
+    outline: none;
+}
 
 /* Read-only prose/list/title blocks (Card / World / Codex / NPC tabs).
    The dropdowns are visual-aid references — these render tracked state as
-   plain text (no inputs). Empty fields are omitted upstream in tab-rail.js. */
+   plain text (no inputs). Empty fields are omitted upstream in tab-rail.js.
+   (2026-08-20, Chloe) ALL tab text is centered. */
 .fable-drop-prose {
     padding: 1px 0 5px;
     color: var(--fable-text); font-size: 13px; line-height: 1.5;
     white-space: pre-wrap; overflow-wrap: break-word;
+    text-align: center;
 }
-.fable-drop-list { display: flex; flex-direction: column; gap: 3px; padding: 1px 0 5px; }
+.fable-drop-list {
+    display: flex; flex-direction: column; gap: 3px; padding: 1px 0 5px;
+    align-items: center;
+}
 .fable-drop-list-item {
-    position: relative; padding-left: 14px;
+    position: relative;
     color: var(--fable-text); font-size: 13px; line-height: 1.45;
+    text-align: center;
 }
 .fable-drop-list-item::before {
-    content: '•'; position: absolute; left: 2px; color: var(--fable-brass);
+    content: '•'; color: var(--fable-brass); margin-right: 5px;
 }
-.fable-drop-title { font-size: 13px; font-weight: 600; color: var(--fable-text); }
-.fable-drop-tags { font-size: 11px; color: var(--fable-text-faint); font-style: italic; }
+.fable-drop-title {
+    font-size: 13px; font-weight: 600; color: var(--fable-text);
+    text-align: center;
+}
+.fable-drop-tags { font-size: 11px; color: var(--fable-text-faint); font-style: italic; text-align: center; }
 
 /* Read-only card containers (Codex entries + NPC cards). The input-flavored
    rules that used to live here were retired with the read-only conversion
@@ -3157,6 +3147,7 @@ body.fable-active.fable-chrome-peek .top-bar { transform: translateY(0); }
     display: flex; flex-direction: column; gap: 5px;
     padding: 9px; background: rgba(255,255,255,0.03);
     border: 1px solid var(--fable-glass-line); border-radius: 7px;
+    text-align: center;
 }
 .fable-npc-list { display: flex; flex-direction: column; gap: 8px; margin-bottom: 8px; }
 .fable-npc-card {
@@ -3164,36 +3155,23 @@ body.fable-active.fable-chrome-peek .top-bar { transform: translateY(0); }
     padding: 8px; background: rgba(255,255,255,0.03);
     border: 1px solid var(--fable-glass-line); border-left: 3px solid var(--fable-brass);
     border-radius: 6px;
+    text-align: center;
 }
 
 /* Player tab — character-sheet blocks (identity, appearance, inventory,
    injuries, relationships). Read-only like the rest of the dropdown; each
    section is omitted upstream in tab-rail.js when empty. */
-.fable-drop-name { font-size: 15px; font-weight: 700; color: var(--fable-text); padding: 1px 0 3px; }
 .fable-drop-injury-detail {
     color: var(--fable-text-faint); font-size: 11.5px; font-style: italic;
-    padding: 0 0 4px 14px; line-height: 1.4;
+    padding: 0 0 4px; line-height: 1.4; text-align: center;
 }
-.fable-drop-qty { color: var(--fable-text-faint); font-size: 11.5px; margin-left: 5px; }
 .fable-drop-tier { font-weight: 600; font-size: 12px; text-transform: capitalize; color: var(--fable-brass-bright); }
 .fable-drop-tier.bad { color: #f4a0a0; }
 .fable-drop-tier.warn { color: #fbbf24; }
 .fable-drop-tier.good { color: #86efac; }
-/* Equipment slot row: slot label left, item(s) right. */
-.fable-inv-slot {
-    display: flex; justify-content: space-between; align-items: baseline; gap: 10px;
-    padding: 4px 0; border-bottom: 1px solid rgba(255,255,255,0.03);
-}
-.fable-inv-slot-label { color: var(--fable-text-faint); font-size: 12px; flex: 0 0 auto; }
-.fable-inv-slot-items { display: flex; flex-direction: column; gap: 1px; text-align: right; }
-.fable-inv-layer { color: var(--fable-text-faint); font-size: 10.5px; font-style: italic; }
-/* Behavior-tag chips (consumable/equippable/pocketable). */
-.fable-drop-chips { display: inline-flex; flex-wrap: wrap; gap: 4px; margin-left: 6px; vertical-align: middle; }
-.fable-drop-chip {
-    font-size: 9.5px; letter-spacing: 0.04em; text-transform: uppercase;
-    color: var(--fable-brass); border: 1px solid var(--fable-brass-dim);
-    border-radius: 10px; padding: 1px 7px; background: rgba(197,179,88,0.06);
-}
+/* (2026-08-20) The slot-row inventory rules (.fable-inv-*) + the behavior
+   tag chips are RETIRED with the "Equipped" slot section — inventory is
+   stacked name lists now (tab-rail.js renderInventory / stackNames). */
 /* =============================================================
    RAW EDITOR — the centered, immovable raw-file modal.
    Darkens the full stage; ✓ / ↻ / ✕ controls; validation lock on invalid.
@@ -4409,39 +4387,16 @@ body.fable-active.fable-chrome-peek .top-bar { transform: translateY(0); }
    margin soaks up the free space → the recent 2 park right above the
    input box. When it overflows, that margin collapses to 0 + the feed
    scrolls. Best of both.                                                  */
-/* ── Feed viewport wrapper + TOP BLUR STRIP (2026-08-19 per Chloe) ── */
-/* The wrapper owns the feed's old layer slot (absolute inset:0, z-index 5)
-   and holds TWO children: the scrollable feed + a 12px frosted band pinned
-   to the screen's top edge. The wrapper's opacity (0.9999 — visually a
-   no-op) establishes a BACKDROP ROOT: the strip's backdrop-filter can only
-   sample paint from INSIDE this wrapper (the chat bubbles), never the
-   stage background, the FX layer, the drawers, or the OS top bar (which
-   also sits z 9999 above the entire stage). The strip is pointer-events:
-   none, so it can never intercept the chrome-peek top bar or bubble
-   clicks. Width matches the bubbles' extremes — the capped column width
-   (the feed's side padding + the 1040px max) plus the ±48px recent-beat
-   stagger on both sides — so the frosted band spans exactly the leftmost
-   AI edge to the rightmost user edge. */
+/* ── Feed viewport wrapper ── */
+/* (2026-08-20, Chloe) The 12px TOP BLUR STRIP is REMOVED — no frosted band
+   at the stage's top edge. The wrapper stays as the feed's positioning
+   layer (the former stacking-order slot); the opacity:0.9999 backdrop-root
+   fence is retired with the strip (nothing here uses backdrop-filter
+   anymore). */
 .fable-feed-viewport {
     position: absolute;
     inset: 0;
     z-index: 5;          /* the feed's former slot in the stage stacking order */
-    opacity: 0.9999;     /* backdrop-root fence — do NOT clean this up to 1 */
-}
-.fable-feed-topblur {
-    position: absolute;
-    top: 0;              /* touches the screen's very top edge */
-    left: 50%;
-    transform: translateX(-50%);
-    width: calc(min(1040px, 100% - 2 * max(40px, 12vw)) + 96px);
-    height: 12px;
-    z-index: 10;         /* above the feed's paint INSIDE the wrapper only */
-    backdrop-filter: blur(5px);
-    -webkit-backdrop-filter: blur(5px);
-    /* a whisper of tint guarantees the band reads even over fast content */
-    background: linear-gradient(180deg, rgba(16, 13, 9, 0.10), rgba(16, 13, 9, 0));
-    border-radius: 0 0 8px 8px;
-    pointer-events: none;
 }
 
 .fable-feed {

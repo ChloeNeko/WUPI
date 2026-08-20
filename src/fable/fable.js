@@ -543,11 +543,49 @@ function openWorldSaves(card) {
 // uses: parse_from_xml_str before any disk touch). Self-contained (doesn't
 // touch the stage's raw-editor.js singleton, which is active-card-keyed) so
 // it works from the title with no game active.
+//
+// (2026-08-20, Chloe) The SAME editor now serves PLAYER cards: editing a
+// loaded player from the Player Picker opens the raw `.player` XML (Rust
+// owns the format — parse_player_xml / render_player_xml) instead of the
+// retired wizard-chat edit run. The modal core is shared via openXmlEditorModal.
 function openCardRawEditor(card) {
   const worlds = screens.worlds;
   if (!worlds) return;
+  openXmlEditorModal(worlds, {
+    title: `Edit ${card.name} — Sim Card (.sim)`,
+    rootTag: 'sim_card',
+    load: () => invoke('fable_card_raw_get_by_id', { cardId: card.id }),
+    save: (text) => invoke('fable_card_raw_set_by_id', { cardId: card.id, xml: text }),
+  });
+}
+
+// The PLAYER twin (2026-08-20): a centered raw-XML editor over the Player
+// Picker screen. Saves round-trip through the server-side parse gate
+// (parse_player_xml before any disk touch); on a successful save the picker
+// re-renders so a renamed player's tile reflects the edit.
+function openPlayerRawEditor(player) {
+  const picker = screens['player-picker'];
+  if (!picker) return;
+  openXmlEditorModal(picker, {
+    title: `Edit ${player.name} — Player Card (.player)`,
+    rootTag: 'player',
+    load: () => invoke('fable_player_raw_get', { id: player.id }),
+    save: (text) => invoke('fable_player_raw_set', { id: player.id, xml: text }),
+    onSaved: () => renderPlayerPickerStep(),
+  });
+}
+
+// The shared centered raw-XML editor modal (self-contained by design — it
+// never touches the stage's active-card-keyed raw-editor singleton, so it
+// works from the title with no game active). `opts`:
+//   title   — the header text (already plain; escaped here)
+//   rootTag — the expected root element ('sim_card' | 'player')
+//   load()  — Promise<string> of the current file text
+//   save(text) — Promise persisting it (server-side validation gate)
+//   onSaved() — optional post-save hook (e.g. re-render the picker)
+function openXmlEditorModal(host, opts) {
   // If one's already open, close it first (defensive against a double-open).
-  const existing = worlds.querySelector('.fable-world-raw-overlay');
+  const existing = host.querySelector('.fable-world-raw-overlay');
   if (existing) existing.remove();
 
   const overlay = document.createElement('div');
@@ -556,16 +594,16 @@ function openCardRawEditor(card) {
     <div class="fable-raw-editor-backdrop" aria-hidden="true"></div>
     <div class="fable-raw-editor-modal" role="dialog" aria-modal="true">
       <div class="fable-raw-editor-head">
-        <span class="fable-raw-editor-title">Edit ${escHtml(card.name)} — Sim Card (.sim)</span>
+        <span class="fable-raw-editor-title">${escHtml(opts.title)}</span>
         <div class="fable-raw-editor-controls">
-          <button type="button" class="fable-raw-btn save" data-raw-save title="Save (Ctrl+Enter)">✓</button>
-          <button type="button" class="fable-raw-btn revert" data-raw-revert title="Revert to last saved">↻</button>
-          <button type="button" class="fable-raw-btn close" data-raw-close title="Close (Esc)">✕</button>
+          <button type="button" class="fable-raw-btn save" data-raw-save>✓</button>
+          <button type="button" class="fable-raw-btn revert" data-raw-revert>↻</button>
+          <button type="button" class="fable-raw-btn close" data-raw-close>✕</button>
         </div>
       </div>
       <textarea class="fable-raw-editor-text" data-raw-text spellcheck="false"></textarea>
     </div>`;
-  worlds.appendChild(overlay);
+  host.appendChild(overlay);
 
   const textarea = overlay.querySelector('[data-raw-text]');
   const saveBtn = overlay.querySelector('[data-raw-save]');
@@ -575,16 +613,17 @@ function openCardRawEditor(card) {
   let isValid = true;
 
   // Load the current XML.
-  invoke('fable_card_raw_get_by_id', { cardId: card.id })
+  opts.load()
     .then((xml) => { lastGood = xml || ''; textarea.value = lastGood; validate(); })
-    .catch((err) => { console.warn('[fable] card raw load failed', err); });
+    .catch((err) => { console.warn('[fable] raw editor load failed', err); });
 
   // Client-side XML well-formedness sniff (mirrors raw-editor.js). Cheap
   // pre-check; the authoritative gate is the server-side parse on save.
   function sniffXmlWellFormed(s) {
     const trimmed = String(s || '').trim();
-    if (!trimmed) return 'Empty card';
-    if (!/^<\?xml|<sim_card[\s>]/i.test(trimmed)) return 'Missing <sim_card> root';
+    if (!trimmed) return 'Empty file';
+    const rootRe = new RegExp(`^<\\?xml|<${opts.rootTag}[\\s>]`, 'i');
+    if (!rootRe.test(trimmed)) return `Missing <${opts.rootTag}> root`;
     // Basic tag-balance sniff: walk a stack of opening/closing tags.
     const stack = [];
     const re = /<\/?([a-zA-Z_][\w.-]*)([^>]*?)(\/?)>|<!--[\s\S]*?-->|<!\[CDATA\[[\s\S]*?\]\]>/g;
@@ -615,12 +654,13 @@ function openCardRawEditor(card) {
   async function save() {
     if (!isValid) return;
     try {
-      await invoke('fable_card_raw_set_by_id', { cardId: card.id, xml: textarea.value });
+      await opts.save(textarea.value);
       lastGood = textarea.value;
       validate();
+      if (opts.onSaved) opts.onSaved();
     } catch (err) {
       // Status bar removed 2026-08-12 per Chloe — save failures log silently.
-      console.warn('[fable] sim editor save failed', err);
+      console.warn('[fable] raw editor save failed', err);
     }
   }
 
@@ -1038,22 +1078,12 @@ function renderPlayerPickerStep() {
   });
 }
 
-// Edit a saved player: open the Player Wizard seeded with the loaded player
-// (edit mode → straight to the review card). CREATE re-saves via
-// fable_player_write (same id overwrites if the name is unchanged).
+// Edit a saved player (2026-08-20, Chloe): open the SAME raw-XML editor the
+// SIM Load menu uses — the wizard-chat edit run is RETIRED. The `.player`
+// XML is Rust-owned (render_player_xml / parse_player_xml); the edit
+// round-trips through the server-side parse gate before any disk touch.
 function flowEditPlayer(player) {
-  showScreen('creator-chat');
-  setFlowStep('creator-chat');
-  renderCreatorChat(screens['creator-chat'], {
-    creatorKind: 'player',
-    seedDraft: player,
-    onCreated: ({ playerId, draft }) => {
-      flowState.selectedPlayerId = playerId;
-      flowState.playerDraft = draft;
-      flowAfterPlayer();
-    },
-    back: () => renderPlayerPickerStep(),
-  });
+  openPlayerRawEditor(player);
 }
 
 // Route after the player step resolves (CREATE / IMPORT / EDIT / LOAD). When
