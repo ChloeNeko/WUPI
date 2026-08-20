@@ -236,6 +236,21 @@ fn default_volatility() -> f64 {
     1.0
 }
 
+/// Clamp a volatility coefficient to the design band [0.1, 3.0] (invalid
+/// input — 0, negative, NaN, infinity — folds to the 1.0 default; the
+/// serde default only covers ABSENCE, not a hand-installed bad value).
+/// Shared by every consumer that scales time by volatility — the
+/// relationship time floor, the promise-frustration curve
+/// (`offscreen_task`), and the quest-frustration score (`consequence`) —
+/// so one authority owns the band (2026-08-20 audit M4).
+pub fn clamp_volatility(v: f64) -> f64 {
+    if v.is_finite() && v > 0.0 {
+        v.clamp(0.1, 3.0)
+    } else {
+        1.0
+    }
+}
+
 impl Default for RelationshipState {
     fn default() -> Self {
         RelationshipState {
@@ -530,12 +545,23 @@ pub fn evaluate_transition(
         };
     };
 
-    // Hostility-track target (from hostility → Stranger) skips affinity gates.
-    if target_tier.is_hostility() || !target_tier.is_affinity() {
-        // Transitions INTO neutral (Stranger) or back from hostility don't
-        // use affinity gates. For now, only Stranger → Acquaintance falls
-        // here, and that's automatic after a first positive interaction
-        // (no gate). We return GatesCleared.
+    // Neutral-target advance (Stranger → Acquaintance — the only neutral
+    // hop; (2) above already parked hostility-track states, so the target
+    // can never be a hostility tier). Gated on the documented "first
+    // positive interaction": at least one recorded non-hostility milestone
+    // (2026-08-20 audit M3: the gate was documented but never enforced, so
+    // a raw-editor relationship install auto-advanced with zero events).
+    if !target_tier.is_affinity() {
+        let has_positive = state
+            .events
+            .iter()
+            .filter_map(|eid| registry.get(eid))
+            .any(|spec| !spec.hostility_trigger);
+        if !has_positive {
+            return TransitionOutcome::NoTransition {
+                reason: TransitionReason::MilestoneThresholdNotMet,
+            };
+        }
         return TransitionOutcome::Transition {
             new_tier: target_tier,
             reason: TransitionReason::GatesCleared,
@@ -552,8 +578,11 @@ pub fn evaluate_transition(
 
     // Time floor: scaled by volatility. Volatile NPCs (volatility > 1.0)
     // have a SHORTER floor; patient ones (volatility < 1.0) a longer one.
-    // volatility can never be 0 (the struct enforces default 1.0).
-    let vol = if state.volatility > 0.0 { state.volatility } else { 1.0 };
+    // Clamped to the shared [0.1, 3.0] band — an unclamped hand-installed
+    // value (e.g. 1000) collapsed the 60-day Bonded floor to ~1.4 hours
+    // (2026-08-20 audit M4; the frustration-curve consumers already
+    // clamped — unified on one helper).
+    let vol = clamp_volatility(state.volatility);
     let floor_days = base_floor_days / vol;
     let floor_minutes = (floor_days * 1440.0) as i64;
     let elapsed = now_minutes - state.tier_entered_at_minutes;
@@ -943,6 +972,60 @@ mod tests {
         s.record_event("helped_with_task");
         // Day 10 (14400 min) — short of the 17.5-day floor.
         let outcome = evaluate_transition(&s, &r, 14400);
+        assert!(matches!(
+            outcome,
+            TransitionOutcome::NoTransition {
+                reason: TransitionReason::TimeFloorNotMet
+            }
+        ));
+    }
+
+    #[test]
+    fn stranger_to_acquaintance_requires_positive_event() {
+        // M3 (2026-08-20): the documented "first positive interaction" gate,
+        // now enforced — a raw-editor install with zero recorded events
+        // stays Stranger; any non-hostility milestone clears it.
+        let r = registry();
+        let s = state_at(RelationshipTier::Stranger, 0);
+        let outcome = evaluate_transition(&s, &r, 10_000);
+        assert!(matches!(
+            outcome,
+            TransitionOutcome::NoTransition {
+                reason: TransitionReason::MilestoneThresholdNotMet
+            }
+        ));
+        let mut with_event = state_at(RelationshipTier::Stranger, 0);
+        assert!(with_event.record_event("first_positive_interaction"));
+        assert!(matches!(
+            evaluate_transition(&with_event, &r, 10_000),
+            TransitionOutcome::Transition { reason: TransitionReason::GatesCleared, .. }
+        ));
+        // A hostility-only record does NOT clear the positive gate.
+        let mut betrayed = state_at(RelationshipTier::Stranger, 0);
+        assert!(betrayed.record_event("stole_from"));
+        assert!(matches!(
+            evaluate_transition(&betrayed, &r, 10_000),
+            TransitionOutcome::Transition { reason: TransitionReason::HostilityTriggered, .. }
+        ));
+    }
+
+    #[test]
+    fn volatility_is_clamped_to_design_band() {
+        // M4 (2026-08-20): an unclamped 1000 collapsed the 60-day Bonded
+        // floor to ~1.4 hours; the clamp caps it at 3.0 (~20 days).
+        assert_eq!(clamp_volatility(1000.0), 3.0);
+        assert_eq!(clamp_volatility(0.0), 1.0);
+        assert_eq!(clamp_volatility(-5.0), 1.0);
+        assert_eq!(clamp_volatility(f64::NAN), 1.0);
+        assert_eq!(clamp_volatility(0.4), 0.4);
+        let r = registry();
+        let mut s = state_at(RelationshipTier::Acquaintance, 0);
+        s.volatility = 1000.0;
+        s.record_event("shared_drink");
+        s.record_event("helped_with_task");
+        // Day 3 — past the unclamped 1000× floor (~10 min) but short of the
+        // clamped 3× floor (~2.3 days): still blocked.
+        let outcome = evaluate_transition(&s, &r, 4320);
         assert!(matches!(
             outcome,
             TransitionOutcome::NoTransition {

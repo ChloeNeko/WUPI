@@ -529,7 +529,7 @@ impl SimCard {
         }
         xml.push_str(&format!(
             "  <identity><![CDATA[\n{}  ]]></identity>\n",
-            identity_body
+            cdata_body(&identity_body)
         ));
 
         // <persona> — omitted ENTIRELY when empty (the player opt-in rule).
@@ -541,16 +541,16 @@ impl SimCard {
             }
             xml.push_str(&format!(
                 "  <persona><![CDATA[\n{}  ]]></persona>\n",
-                body
+                cdata_body(&body)
             ));
         }
 
         // scenario/world dedicated prose fields (Chloe's ruling: kept).
         if let Some(s) = self.setting.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-            xml.push_str(&format!("  <setting><![CDATA[\n{}\n  ]]></setting>\n", s));
+            xml.push_str(&format!("  <setting><![CDATA[\n{}\n  ]]></setting>\n", cdata_body(s)));
         }
         if let Some(p) = self.plot.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-            xml.push_str(&format!("  <plot><![CDATA[\n{}\n  ]]></plot>\n", p));
+            xml.push_str(&format!("  <plot><![CDATA[\n{}\n  ]]></plot>\n", cdata_body(p)));
         }
 
         if !self.custom_tags.is_empty() {
@@ -581,7 +581,7 @@ impl SimCard {
             if let Some(v) = self.world.tone.as_deref().filter(|s| !s.trim().is_empty()) {
                 body.push_str(&format!("Tone: {}\n", v.trim()));
             }
-            xml.push_str(&format!("\n<world><![CDATA[\n{}]]></world>\n", body));
+            xml.push_str(&format!("\n<world><![CDATA[\n{}]]></world>\n", cdata_body(&body)));
         }
 
         if let Some(loc) = self.location.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
@@ -609,7 +609,7 @@ impl SimCard {
             if !self.inventory.stored.is_empty() {
                 body.push_str(&format!("Stored: {}\n", self.inventory.stored.join(", ")));
             }
-            xml.push_str(&format!("\n<inventory><![CDATA[\n{}]]></inventory>\n", body));
+            xml.push_str(&format!("\n<inventory><![CDATA[\n{}]]></inventory>\n", cdata_body(&body)));
         }
 
         xml
@@ -635,8 +635,13 @@ impl SimCard {
 }
 
 /// The ordered `(label, value)` view of a [`CardIdentity`] — the single
-/// ordering authority for both the cache block and `serialize_v2`.
-fn identity_lines(id: &CardIdentity) -> Vec<(&'static str, &str)> {
+/// ordering authority for both the cache block and `serialize_v2`. Fixed
+/// labels first, then the parsed `extra` pairs verbatim: hand-authored
+/// lines like "Alignment: Chaotic Good" are identity payload — they ride
+/// the narrator cache AND survive re-serialization (2026-08-20 audit H1:
+/// the old `&'static str` return type could not carry them, so every
+/// cache render + rewrite silently dropped them).
+fn identity_lines(id: &CardIdentity) -> Vec<(String, String)> {
     let mut out = Vec::new();
     for (label, v) in [
         ("Gender", &id.gender),
@@ -652,14 +657,22 @@ fn identity_lines(id: &CardIdentity) -> Vec<(&'static str, &str)> {
         ("Hair Style", &id.hair_style),
     ] {
         if let Some(s) = v.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-            out.push((label, s));
+            out.push((label.to_owned(), s.to_owned()));
+        }
+    }
+    for (label, value) in &id.extra {
+        let label = label.trim();
+        let value = value.trim();
+        if !label.is_empty() && !value.is_empty() {
+            out.push((label.to_owned(), value.to_owned()));
         }
     }
     out
 }
 
-/// The ordered `(label, value)` view of a [`CardPersona`].
-fn persona_lines(p: &CardPersona) -> Vec<(&'static str, &str)> {
+/// The ordered `(label, value)` view of a [`CardPersona`] — fixed labels
+/// first, then the `extra` pairs (same discipline as `identity_lines`).
+fn persona_lines(p: &CardPersona) -> Vec<(String, String)> {
     let mut out = Vec::new();
     for (label, v) in [
         ("Personality", &p.personality),
@@ -672,7 +685,14 @@ fn persona_lines(p: &CardPersona) -> Vec<(&'static str, &str)> {
         ("Backstory", &p.backstory),
     ] {
         if let Some(s) = v.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-            out.push((label, s));
+            out.push((label.to_owned(), s.to_owned()));
+        }
+    }
+    for (label, value) in &p.extra {
+        let label = label.trim();
+        let value = value.trim();
+        if !label.is_empty() && !value.is_empty() {
+            out.push((label.to_owned(), value.to_owned()));
         }
     }
     out
@@ -2389,6 +2409,63 @@ Alignment: Chaotic Good
         assert!(card.render_cache_block().contains("Alignment: Chaotic Good"));
         let back = parse(&card.serialize_v2()).expect("round-trips");
         assert_eq!(back.persona.extra, card.persona.extra);
+    }
+
+    #[test]
+    fn v2_identity_extra_lines_ride_cache_and_roundtrip() {
+        // 2026-08-20 audit H1: identity extras (hand-authored lines like
+        // "Alignment:") must ride the cache block AND survive re-serialization.
+        let xml = r#"<sim_card>
+  <metadata>
+  <type>simulation</type>
+  <subtype>npc</subtype>
+  <id>ida</id>
+  </metadata>
+  <identity><![CDATA[
+Name: Ida
+Alignment: Chaotic Good
+  ]]></identity>
+</sim_card>"#;
+        let card = parse(xml).expect("parses");
+        assert_eq!(
+            card.identity.extra,
+            vec![("Alignment".to_string(), "Chaotic Good".to_string())]
+        );
+        assert!(card.render_cache_block().contains("Alignment: Chaotic Good"));
+        let back = parse(&card.serialize_v2()).expect("round-trips");
+        assert_eq!(back.identity.extra, card.identity.extra);
+        assert!(back.serialize_v2().contains("Alignment: Chaotic Good"));
+    }
+
+    #[test]
+    fn v2_serialize_splits_cdata_terminators_in_every_body() {
+        // 2026-08-20 audit M5: an authored `]]>` in ANY serialized body must
+        // not close the CDATA section early (identity/persona/setting/plot/
+        // world/inventory all ride the cdata_body wrap now).
+        let xml = r#"<sim_card>
+  <metadata>
+  <type>simulation</type>
+  <subtype>npc</subtype>
+  <id>cd</id>
+  </metadata>
+  <identity><![CDATA[
+Name: Cd
+  ]]></identity>
+  <persona><![CDATA[
+Personality: quiet
+  ]]></persona>
+</sim_card>"#;
+        let mut card = parse(xml).expect("parses");
+        card.persona.personality = Some("wears a ]]> grin".into());
+        card.identity.extra.push(("Motto".into(), "never say ]]>".into()));
+        let out = card.serialize_v2();
+        assert!(out.contains("]]]]><![CDATA[>"), "terminators must be split: {out}");
+        let back = parse(&out).expect("re-parses through the split");
+        assert_eq!(back.persona.personality.as_deref(), Some("wears a ]]> grin"));
+        assert_eq!(
+            back.identity.extra,
+            vec![("Motto".to_string(), "never say ]]>".to_string())]
+        );
     }
 
     #[test]

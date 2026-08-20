@@ -356,12 +356,9 @@ export function wire(rootEl) {
       else showTopTags(rootEl);
     });
   }
-  // Clicking outside the search box closes the dropdown.
-  onDocClickBound = (e) => {
-    const box = rootEl.querySelector('.prism-tagsearch');
-    if (box && !box.contains(e.target)) hideSuggest(rootEl);
-  };
-  document.addEventListener('click', onDocClickBound);
+  // Clicking outside the search box closes the dropdown (rewire owns the
+  // document-level attach so teardown/open cycles stay balanced).
+  rewire(rootEl);
 
   // The example library: clicking a row loads its prompt into the pill box.
   const exList = rootEl.querySelector('.prism-examples');
@@ -403,7 +400,12 @@ export function wire(rootEl) {
   commitState(rootEl);
 }
 
-export function teardown() {
+// teardown (closePrism): clear the ≤5min generate failsafe timer, remove
+// the document-level click-out listener, + unlock the Generate button — a
+// close mid-generation must not reopen into a permanently-disabled button
+// (the render's done event is dropped at close; the failsafe was its only
+// other rescuer). Idempotent.
+export function teardown(rootEl) {
   if (unlistenGenDone) { try { unlistenGenDone(); } catch (_) {} unlistenGenDone = null; }
   clearTimeout(genFailsafeTimer);
   genFailsafeTimer = null;
@@ -412,6 +414,19 @@ export function teardown() {
     onDocClickBound = null;
   }
   onGenerateBound = null;
+  // Also re-clears the failsafe timer; safe to call repeatedly.
+  if (rootEl) setGenerating(rootEl, false);
+}
+
+// Re-attach the document-level listener teardown removed (openPrism on
+// reopen). Idempotent — a no-op while already attached.
+export function rewire(rootEl) {
+  if (onDocClickBound) return;
+  onDocClickBound = (e) => {
+    const box = rootEl && rootEl.querySelector('.prism-tagsearch');
+    if (box && !box.contains(e.target)) hideSuggest(rootEl);
+  };
+  document.addEventListener('click', onDocClickBound);
 }
 
 // ── The prompt pill state ───────────────────────────────────────────────
@@ -641,20 +656,28 @@ async function onGenerate(rootEl) {
     furry: !!settings.furry,
   };
 
+  // Tag the render BEFORE the invoke fires (prism.js pairs the eventual
+  // prism-gen-done with THIS render by origin token, never with whichever
+  // screen is active when it lands — and a fast stub done can't beat the
+  // tag).
+  if (hooks.onRenderStart) hooks.onRenderStart('composer');
   // UI: disable the button + show a spinner.
   setGenerating(rootEl, true);
   try {
-    await generate(params);
+    const res = await generate(params);
+    if (hooks.onRenderPath) hooks.onRenderPath('composer', res && res.path);
     // The result arrives via prism-gen-done (handled in prism.js). The button
     // stays in its "generating" state until that event flips it back — with
     // the failsafe below as the net for an emit-less failure path.
-    if (hooks.onGenerateStarted) hooks.onGenerateStarted(params);
     clearTimeout(genFailsafeTimer);
     genFailsafeTimer = setTimeout(() => {
       setGenerating(rootEl, false);
       if (hooks.onToast) hooks.onToast('Generation timed out (no completion signal).');
     }, 5 * 60 * 1000);
   } catch (err) {
+    // The invoke itself rejected — the render never started server-side;
+    // drop its origin tag so the router can't accumulate ghosts.
+    if (hooks.onRenderFail) hooks.onRenderFail('composer');
     setGenerating(rootEl, false);
     if (hooks.onToast) hooks.onToast(String(err));
   }
@@ -668,7 +691,9 @@ function setGenerating(rootEl, on) {
   const label = btn.querySelector('.prism-generate-label');
   const spinner = btn.querySelector('.prism-generate-spinner');
   if (label) label.textContent = on ? 'Generating…' : 'Generate';
-  if (spinner) spinner.hidden = !!on;
+  // Spinner shows WHILE generating (hidden = !on — the 2026-08-20 audit
+  // LOW inversion: `hidden = !!on` hid it mid-generate + flashed it idle).
+  if (spinner) spinner.hidden = !on;
   if (!on) clearTimeout(genFailsafeTimer);
 }
 

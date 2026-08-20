@@ -260,11 +260,21 @@ function renderVitals(ps) {
     + row('Stamina', stam.label, stam.cls));
 }
 
-// Active status tags (schema.status_tags): every live effect with its
-// polarity. Hidden when none are tracked.
+// Active status tags (schema.status_tags): every LIVE effect with its
+// polarity. (2026-08-20) Expired tags are filtered read-time against the
+// same payload's world clock — the backend's expiry sweep only runs on the
+// world progression tick (suspended in Combat), so a just-expired
+// "Feverish" must not sit in this list while the derived Health line has
+// already dropped Sick. `expires_at: 0` is the permanent sentinel (never
+// expires); when the payload carries no clock the filter degrades to
+// show-all. Hidden when no live tags remain.
 function renderEffects(schema) {
+  const now = schema && schema.world_clock && Number.isFinite(schema.world_clock.current_minutes)
+    ? schema.world_clock.current_minutes
+    : null;
   const tags = (schema && Array.isArray(schema.status_tags) ? schema.status_tags : [])
-    .filter((t) => t && nonEmpty(t.label));
+    .filter((t) => t && nonEmpty(t.label))
+    .filter((t) => now === null || !t.expires_at || now < t.expires_at);
   if (!tags.length) return '';
   const rows = tags.map((t) =>
     row(t.label, t.polarity === 'buff' ? 'Buff' : 'Debuff', t.polarity === 'buff' ? 'good' : 'bad'));
@@ -587,10 +597,12 @@ function staminaInfo(s) {
 }
 // Overall Health tier wire → { label, cls }. The backend injects the derived
 // `health` string on player_state_get (Rust `consequence::derive_health_tier`
-// over wounds + active illness tags); when absent (stale payload) the worst
-// body-part state maps onto the same grade ladder client-side (no illness
-// detection in the fallback — wounds only).
+// over wounds + active illness tags); when absent (stale payload) the
+// client-side points-system mirror below computes the same grade (no illness
+// detection in the fallback — wounds only). (2026-08-20) Deceased — a Black
+// core part (Head/Neck/UpperTorso) — is death, above every illness label.
 const HEALTH_LABELS = {
+  deceased:    { label: 'Deceased',  cls: 'hp-deceased' },
   sick:      { label: 'Sick',      cls: 'hp-sick' },
   infected:  { label: 'Infected',  cls: 'hp-sick' },
   excellent: { label: 'Excellent', cls: 'hp-excellent' },
@@ -604,14 +616,32 @@ function healthInfo(ps) {
   const key = String(raw || '').toLowerCase();
   return HEALTH_LABELS[key] || { label: pascalToWords(raw) || 'Excellent', cls: 'hp-excellent' };
 }
+// Client-side mirror of the backend's 2026-08-20 points system (the stale-
+// payload fallback only): core floor from Head/Neck/UpperTorso worst color
+// (yellow→Good, orange→Fair, red→Poor, purple→Critical, black core =
+// Deceased — checked FIRST, death outranks everything), non-core points
+// Yellow=1/Orange=2/Red=4/Purple=8 (Black = 0), banded 0-7/8-11/12-17/
+// 18-23/24+ → Excellent/Good/Fair/Poor/Critical; the worse of the two
+// halves wins. Body keys are the PascalCase serde wire names.
 function derivedHealth(bodyMap) {
-  const ranks = { transparent: 0, yellow: 1, orange: 2, red: 3, purple: 4, black: 5 };
-  let worst = 0;
-  for (const v of Object.values(bodyMap || {})) {
-    const r = ranks[String(v || '').toLowerCase()] ?? 0;
-    if (r > worst) worst = r;
+  const pts = { yellow: 1, orange: 2, red: 4, purple: 8 };
+  const coreFloor = { yellow: 'Good', orange: 'Fair', red: 'Poor', purple: 'Critical' };
+  const order = ['Critical', 'Poor', 'Fair', 'Good', 'Excellent'];
+  const worse = (a, b) => (order.indexOf(a) <= order.indexOf(b) ? a : b);
+  let floor = 'Excellent';
+  let points = 0;
+  for (const [part, v] of Object.entries(bodyMap || {})) {
+    const key = String(v || '').toLowerCase();
+    if (part === 'Head' || part === 'Neck' || part === 'UpperTorso') {
+      if (key === 'black') return 'Deceased';
+      if (coreFloor[key]) floor = worse(floor, coreFloor[key]);
+    } else {
+      points += pts[key] || 0;
+    }
   }
-  return ['Excellent', 'Good', 'Fair', 'Poor', 'Critical', 'Critical'][worst];
+  const band = points >= 24 ? 'Critical' : points >= 18 ? 'Poor'
+    : points >= 12 ? 'Fair' : points >= 8 ? 'Good' : 'Excellent';
+  return worse(floor, band);
 }
 // RelationshipTier wire (snake_case) → { label, cls }. The label is left
 // lowercase; the .fable-drop-tier CSS capitalizes it for display.

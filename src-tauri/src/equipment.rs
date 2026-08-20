@@ -1542,14 +1542,21 @@ pub fn seed_player_inventory(
 ) -> usize {
     let mut seeded = seed_clothing_items(&inv.clothing, equipment, pack);
     // Readied weapons: the Equipped line is for READIED items (the [EQUIP]
-    // contract reserves main_hand/off_hand for weapons).
-    const WEAPON_TERMS: [&str; 14] = [
-        "sword", "blade", "axe", "bow", "dagger", "staff", "spear", "hammer", "knife",
-        "wand", "mace", "lance", "rapier", "scythe",
+    // contract reserves main_hand/off_hand for weapons). WORD-boundary
+    // matched (the `phrase_words` discipline the garment router uses):
+    // substring matching let "bow" claim "Elbow Pads"/"Rainbow Scarf",
+    // "wand" claim a "Wanderer's Cloak", "lance" a "Freelance Scribe"
+    // (2026-08-20 audit) — so the one-word compounds that substring used
+    // to catch ride as explicit terms.
+    const WEAPON_TERMS: [&str; 22] = [
+        "sword", "blade", "axe", "bow", "dagger", "staff", "spear", "hammer",
+        "knife", "wand", "mace", "lance", "rapier", "scythe", "shortsword",
+        "longsword", "broadsword", "greatsword", "longbow", "crossbow",
+        "warhammer", "battleaxe",
     ];
     for item in inv.equipped.iter().map(|s| s.trim()).filter(|s| !s.is_empty()) {
         let key = item.to_lowercase();
-        let weaponish = WEAPON_TERMS.iter().any(|t| key.contains(t));
+        let weaponish = WEAPON_TERMS.iter().any(|t| name_contains_word(&key, t));
         let tags = vec![ItemTag::Equippable];
         if weaponish {
             let main_held = equipment
@@ -1588,31 +1595,55 @@ pub fn seed_player_inventory(
     for item in inv.accessories.iter().map(|s| s.trim()).filter(|s| !s.is_empty()) {
         let key = item.to_lowercase();
         let tags = vec![ItemTag::Equippable];
-        let route = route_legacy_to_slot(&key);
-        let placed = route.is_some_and(|slot| {
-            // Dedup guard: an item the clothing pass already placed never
-            // mints a twin.
-            !slot_holds_name(equipment, slot, item)
-                && matches!(
-                    place_equipped(equipment, slot, EquippedItem {
-                        name: item.to_string(),
-                        stats: None,
-                        tags: tags.clone(),
-                    }, None, false),
-                    Placement::Worn { .. }
-                )
-        });
-        if !placed {
+        let Some(slot) = route_legacy_to_slot(&key) else {
+            // Non-specific trinket — the pack, no Equippable tag.
             stack_upsert(
                 pack,
                 StackItem {
                     name: item.to_string(),
                     qty: 1,
                     stats: None,
-                    tags: if route.is_some() { tags } else { Vec::new() },
+                    tags: Vec::new(),
                     ..StackItem::default()
                 },
             );
+            seeded += 1;
+            continue;
+        };
+        // Dedup guard: an item the clothing pass already WEARS never mints
+        // a twin (2026-08-20 audit M7: the old `!slot_holds_name`
+        // predicate only skipped the WEAR and fell through to the pack,
+        // duplicating the worn item).
+        if slot_holds_name(equipment, slot, item) {
+            continue;
+        }
+        match place_equipped(
+            equipment,
+            slot,
+            EquippedItem {
+                name: item.to_string(),
+                stats: None,
+                tags: tags.clone(),
+            },
+            None,
+            false,
+        ) {
+            // Worn on its zone — never also packed.
+            Placement::Worn { .. } => {}
+            // Routable but the zone couldn't take it — the pack keeps it
+            // (never vaporized).
+            _ => {
+                stack_upsert(
+                    pack,
+                    StackItem {
+                        name: item.to_string(),
+                        qty: 1,
+                        stats: None,
+                        tags,
+                        ..StackItem::default()
+                    },
+                );
+            }
         }
         seeded += 1;
     }
@@ -2868,6 +2899,50 @@ mod tests {
         let names: Vec<&str> = pack.iter().map(|i| i.name.as_str()).collect();
         assert!(names.contains(&"Lucky Trinket"), "non-specific accessory packs");
         assert!(names.contains(&"Bedroll"));
+    }
+
+    #[test]
+    fn player_seed_never_mints_pack_twins_of_worn_accessories() {
+        // M7 (2026-08-20): an accessory the clothing pass already WEARS is a
+        // no-op — the old path skipped the wear but still fell through to
+        // the pack, duplicating the worn item.
+        let inv = crate::player::PlayerInventory {
+            clothing: vec!["Leather Gloves".into()],
+            equipped: vec![],
+            accessories: vec!["Leather Gloves".into()],
+            stored: vec![],
+        };
+        let mut equipment = Equipment::new();
+        let mut pack = Vec::new();
+        let seeded = seed_player_inventory(&inv, &mut equipment, &mut pack);
+        assert!(pack.is_empty(), "the worn glove must not also pack, got {pack:?}");
+        assert_eq!(
+            equipment.get(&EquipSlot::Hands).and_then(|l| l.outer.as_ref()).map(|i| i.name.as_str()),
+            Some("Leather Gloves")
+        );
+        assert_eq!(seeded, 1, "only the clothing pass seeds the item");
+    }
+
+    #[test]
+    fn player_seed_weapon_terms_are_word_matched() {
+        // L6 (2026-08-20): substring "bow" claimed "Elbow Pads" (and
+        // "Rainbow Scarf") for the readied hands; word-boundary matching
+        // keeps clothing in the pack while real weapons still claim slots.
+        let inv = crate::player::PlayerInventory {
+            clothing: vec![],
+            equipped: vec!["Elbow Pads".into(), "Hunting Bow".into()],
+            accessories: vec![],
+            stored: vec![],
+        };
+        let mut equipment = Equipment::new();
+        let mut pack = Vec::new();
+        seed_player_inventory(&inv, &mut equipment, &mut pack);
+        assert_eq!(
+            equipment.get(&EquipSlot::MainHand).and_then(|l| l.outer.as_ref()).map(|i| i.name.as_str()),
+            Some("Hunting Bow")
+        );
+        let names: Vec<&str> = pack.iter().map(|i| i.name.as_str()).collect();
+        assert!(names.contains(&"Elbow Pads"), "pads are clothing, not a weapon: {names:?}");
     }
 
     /// Test helper: assert a `Worn` placement's layer + the NAMES of any

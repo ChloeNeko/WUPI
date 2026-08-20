@@ -3100,6 +3100,9 @@ body.fable-active.fable-chrome-peek .top-bar { transform: translateY(0); }
 .fable-drop-val.hp-fair      { color: #fb923c; }
 .fable-drop-val.hp-poor      { color: #f87171; }
 .fable-drop-val.hp-critical  { color: #c084fc; }
+/* (2026-08-20) Deceased — the black band (a destroyed core part). Pure #000
+   vanishes on the dark drawer, so a near-black zinc carries it. */
+.fable-drop-val.hp-deceased  { color: #52525b; }
 .fable-drop-muted { color: var(--fable-text-faint); font-style: italic; font-size: 13px; }
 /* (2026-08-20) STACKED row — label ABOVE value — for the long-prose fields
    (persona lines, clothing lists, custom tags): a side-by-side row put a

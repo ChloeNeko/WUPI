@@ -296,11 +296,12 @@ impl ContextSwap {
         s.teardown = Some(teardown);
     }
 
-    /// Drop-time release: marks the slot idle (no resident context). Called
-    /// by `LeaseGuard::drop`. Does NOT run teardown — the resident context
-    /// stays in VRAM until a cross-role acquire evicts it. This is the
-    /// load-bearing optimization: back-to-back same-role turns reuse the
-    /// resident engine without re-spawn churn.
+    /// Drop-time release: a deliberate no-OP — the slot keeps its role +
+    /// teardown marks. Called by `LeaseGuard::drop`. Does NOT run teardown
+    /// and does NOT mark the slot idle: the resident context stays in VRAM
+    /// until a cross-role acquire evicts it. This is the load-bearing
+    /// optimization: back-to-back same-role turns reuse the resident engine
+    /// without re-spawn churn.
     fn release(&self) {
         // Semantics (condensed from the original design deliberation):
         //

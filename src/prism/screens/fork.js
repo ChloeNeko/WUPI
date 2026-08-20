@@ -43,6 +43,12 @@ let splitPct = 50;
 let hooks = {};
 let unlistenGenDone = null;
 
+// The compare-slider's WINDOW-level follow listeners (kept as refs so
+// teardown can remove them + rewire re-attaches the SAME functions after a
+// reopen), + the shared drag flag they close over.
+let sliderWin = null;          // { mousemove, mouseup, touchmove, touchend }
+let sliderDragging = false;
+
 export function buildEl(routerHooks = {}) {
   hooks = routerHooks;
   source = null;
@@ -104,8 +110,28 @@ export function wire(rootEl) {
   wireSlider(rootEl);
 }
 
-export function teardown() {
+export function teardown(rootEl) {
   if (unlistenGenDone) { try { unlistenGenDone(); } catch (_) {} unlistenGenDone = null; }
+  // Drop the window-level drag listeners (the mousedown/touchstart starts
+  // live on the canvas/handle elements — element-level, fine to keep).
+  detachSliderWindow();
+  sliderDragging = false;
+  // Clear a stale B-rendering shimmer + re-enable the regen button: the
+  // render's done event is dropped at close, so nothing else would ever
+  // clear them.
+  if (rootEl) {
+    const bLayer = rootEl.querySelector('[data-layer="b"]');
+    if (bLayer) bLayer.classList.remove('is-rendering');
+    const btn = rootEl.querySelector('[data-act="regen"]');
+    if (btn) { btn.disabled = false; btn.textContent = 'Regenerate B'; }
+  }
+}
+
+// Re-attach the window-level listeners teardown removed (openPrism on
+// reopen). Idempotent — re-adding the same function refs never
+// double-binds.
+export function rewire() {
+  attachSliderWindow();
 }
 
 // ── Load a source image ────────────────────────────────────────────────
@@ -169,22 +195,32 @@ async function onRegenerate(rootEl) {
   if (!bParams) return;
   const btn = rootEl.querySelector('[data-act="regen"]');
   if (btn) { btn.disabled = true; btn.textContent = 'Generating…'; }
+  // Tag the render BEFORE the invoke fires (prism.js pairs the eventual
+  // prism-gen-done with THIS render by origin token, never with whichever
+  // screen is active when it lands — and a fast stub done can't beat the
+  // tag).
+  if (hooks.onRenderStart) hooks.onRenderStart('fork');
   try {
     const res = await generate(bParams);
-    // The result arrives via prism-gen-done; prism.js calls onGenDone with
-    // the path, which setLayerImage('b', path) swaps in. Until then, mark B
-    // as "rendering".
+    if (hooks.onRenderPath) hooks.onRenderPath('fork', res && res.path);
+    // The result arrives via prism-gen-done; the origin router calls
+    // onGenDone with the path, which setLayerImage('b', path) swaps in.
+    // Until then, mark B as "rendering".
     const bLayer = rootEl.querySelector('[data-layer="b"]');
     if (bLayer) bLayer.classList.add('is-rendering');
   } catch (err) {
+    // The invoke itself rejected — the render never started server-side;
+    // drop its origin tag so the router can't accumulate ghosts.
+    if (hooks.onRenderFail) hooks.onRenderFail('fork');
     if (hooks.onToast) hooks.onToast(String(err));
   } finally {
     if (btn) { btn.disabled = false; btn.textContent = 'Regenerate B'; }
   }
 }
 
-// Called by prism.js when a generation completes while Fork is the active
-// screen: swap B's image + clear the rendering flag.
+// Called by prism.js when a FORK-ORIGINATED generation completes (the
+// origin-token router — regardless of which screen is active when the
+// swap finishes): swap B's image + clear the rendering flag.
 export function onGenDone(rootEl, payload) {
   const bLayer = rootEl.querySelector('[data-layer="b"]');
   if (bLayer) bLayer.classList.remove('is-rendering');
@@ -204,27 +240,46 @@ function wireSlider(rootEl) {
   const canvas = rootEl.querySelector('[data-fork-canvas]');
   const handle = rootEl.querySelector('[data-fork-handle]');
   if (!canvas || !handle) return;
-  let dragging = false;
   const move = (clientX) => {
     const rect = canvas.getBoundingClientRect();
     const pct = ((clientX - rect.left) / rect.width) * 100;
     splitPct = Math.max(0, Math.min(100, pct));
     updateClip(rootEl);
   };
-  handle.addEventListener('mousedown', (e) => { dragging = true; e.preventDefault(); });
+  handle.addEventListener('mousedown', (e) => { sliderDragging = true; e.preventDefault(); });
   canvas.addEventListener('mousedown', (e) => {
     // Clicking anywhere on the canvas jumps the handle there + starts a drag.
-    dragging = true;
+    sliderDragging = true;
     move(e.clientX);
   });
-  window.addEventListener('mousemove', (e) => { if (dragging) move(e.clientX); });
-  window.addEventListener('mouseup', () => { dragging = false; });
-  // Touch support.
-  handle.addEventListener('touchstart', (e) => { dragging = true; }, { passive: true });
-  window.addEventListener('touchmove', (e) => {
-    if (dragging && e.touches[0]) move(e.touches[0].clientX);
-  }, { passive: true });
-  window.addEventListener('touchend', () => { dragging = false; });
+  handle.addEventListener('touchstart', () => { sliderDragging = true; }, { passive: true });
+  // The window-level follow listeners, created ONCE (module refs — teardown
+  // removes them at close, rewire re-attaches the same functions on reopen).
+  sliderWin = {
+    mousemove: (e) => { if (sliderDragging) move(e.clientX); },
+    mouseup: () => { sliderDragging = false; },
+    touchmove: (e) => {
+      if (sliderDragging && e.touches[0]) move(e.touches[0].clientX);
+    },
+    touchend: () => { sliderDragging = false; },
+  };
+  attachSliderWindow();
+}
+
+function attachSliderWindow() {
+  if (!sliderWin) return;
+  window.addEventListener('mousemove', sliderWin.mousemove);
+  window.addEventListener('mouseup', sliderWin.mouseup);
+  window.addEventListener('touchmove', sliderWin.touchmove, { passive: true });
+  window.addEventListener('touchend', sliderWin.touchend);
+}
+
+function detachSliderWindow() {
+  if (!sliderWin) return;
+  window.removeEventListener('mousemove', sliderWin.mousemove);
+  window.removeEventListener('mouseup', sliderWin.mouseup);
+  window.removeEventListener('touchmove', sliderWin.touchmove);
+  window.removeEventListener('touchend', sliderWin.touchend);
 }
 
 function updateClip(rootEl) {

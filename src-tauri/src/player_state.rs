@@ -666,11 +666,6 @@ impl PlayerState {
 /// text triggered a combat/exertion event; `None`-equivalent (via
 /// [`referee_evaluate`] returning `Option`) when no keyword matched.
 ///
-/// `narrative_hint` is a short prose-seed the caller MAY inject alongside
-/// the world-state block ("your left arm takes a heavy blow"). The narrator
-/// is NOT required to use it — the canonical fact is the body-state change
-/// itself; the hint is just a nudge.
-///
 /// `lethal` + `directive` (Slice 3, 2026-07-28): when the blow is judged
 /// lethal (the dice + attacker tier + defender condition crossed the
 /// threshold), `lethal` flips true and `directive` carries a hard
@@ -682,8 +677,6 @@ pub struct RefereeOutcome {
     pub part: BodyPart,
     pub new_state: BodyPartState,
     pub stamina_after: Stamina,
-    /// Short, second-person prose seed. Empty when the change was stamina-only.
-    pub narrative_hint: String,
     /// Terse noun-phrase descriptor for THIS wound, picked from a static table
     /// keyed by `(attacker_tier, new_state)` + rolled by the outcome's own
     /// Roller so back-to-back identical blows differ (e.g. "Deep gash",
@@ -743,24 +736,25 @@ impl Default for AttackerTier {
 }
 
 impl AttackerTier {
-    /// Severity-roll weights for the four-tier BodyPartState ladder
-    /// (Yellow / Orange / Red / Purple). Higher tiers weight toward severe
-    /// outcomes. Index 0 = Yellow (Minor), 3 = Purple (Critical).
-    fn severity_weights(self) -> [u32; 4] {
+    /// Severity-roll weights for the five-tier BodyPartState ladder
+    /// (Yellow / Orange / Red / Purple / Black — Black added 2026-08-20,
+    /// Chloe tuning). Higher tiers weight toward severe outcomes.
+    /// Index 0 = Yellow (Minor), 3 = Purple (Critical), 4 = Black
+    /// (Amputated / destroyed — on a core part, death).
+    fn severity_weights(self) -> [u32; 5] {
         match self {
-            // Minion: almost always Minor, occasionally Medium, rarely worse.
-            AttackerTier::Minion => [80, 18, 2, 0],
-            // Soldier: the v1 baseline (preserved exactly from the original
-            // SEVERITY_WEIGHTS const — the [50, 30, 15, 5] distribution that
-            // shipped before Slice 3). Default tier, so the default behavior
-            // is unchanged.
-            AttackerTier::Soldier => [50, 30, 15, 5],
+            // Minion: almost always Minor, occasionally Medium, rarely worse;
+            // a 1% amputation/kill ceiling.
+            AttackerTier::Minion => [75, 18, 4, 2, 1],
+            // Soldier: the v1 baseline shape (the pre-Black [50, 30, 15, 5]
+            // distribution, rescaled with a 2% Black tail).
+            AttackerTier::Soldier => [55, 30, 8, 5, 2],
             // Elite: weights shift toward Medium/Heavy.
-            AttackerTier::Elite => [25, 40, 30, 5],
-            // Boss: Heavy becomes the modal outcome.
-            AttackerTier::Boss => [10, 25, 45, 20],
-            // Legendary: Critical is common; lethality is the lived reality.
-            AttackerTier::Legendary => [5, 15, 35, 45],
+            AttackerTier::Elite => [32, 40, 15, 10, 3],
+            // Boss: Red becomes the modal outcome; Orange holds at 30.
+            AttackerTier::Boss => [20, 30, 26, 20, 4],
+            // Legendary: Red+Purple dominate; lethality is the lived reality.
+            AttackerTier::Legendary => [10, 15, 40, 30, 5],
         }
     }
 
@@ -932,6 +926,15 @@ pub fn referee_evaluate_recovery(
     state: &PlayerState,
     is_downtime: bool,
 ) -> Option<RecoveryOutcome> {
+    // (2026-08-20) The dead do not recuperate: a Black core part
+    // (HealthTier::Deceased) refuses recovery outright — no stamina tier,
+    // no healing.
+    if crate::consequence::CORE_PARTS
+        .iter()
+        .any(|p| state.body.get(p).copied() == Some(BodyPartState::Black))
+    {
+        return None;
+    }
     if !is_downtime {
         return None;
     }
@@ -1089,17 +1092,18 @@ fn hash_text(s: &str) -> u64 {
 fn roll_injury_descriptor(roller: &mut Roller, tier: AttackerTier, state: BodyPartState) -> String {
     // The base vocabulary per severity tier. Each row escalates: Minor is
     // surface damage, Medium cuts tissue, Heavy breaks structure, Critical
-    // ruins it. Amputated/Healthy never reach here (Black is off the
-    // injureable pool; Transparent never produces an outcome).
+    // ruins it. Healthy never reaches here (no outcome for Healthy); Black
+    // arrives from the severity roll's tuned tail (2026-08-20) and maps to
+    // the "Severed" marker below.
     let table: &[&str] = match state {
         BodyPartState::Yellow => &["Scratch", "Bruise", "Minor scrape", "Abrasion", "Splinter"],
         BodyPartState::Orange => &["Deep cut", "Gash", "Bad bruise", "Laceration", "Puncture"],
         BodyPartState::Red => &["Deep gash", "Fracture", "Torn muscle", "Shattered bone", "Severe wound"],
         BodyPartState::Purple => &["Mangled wound", "Shattered", "Ruptured tissue", "Crushed bone", "Gruesome gash"],
-        // Healthy/Amputated never produce a descriptor (no outcome for Healthy;
-        // Black is reached only via escalation, which still carries the
-        // escalator's severity word). Fall back to the semantic label so the
-        // field is never empty if an unexpected path reaches here.
+        // Healthy never produces a descriptor; Black carries the single
+        // amputation marker (apply_outcome REPLACES the zone's wound list
+        // with it). Fall back to the semantic label so the field is never
+        // empty if an unexpected path reaches here.
         BodyPartState::Transparent | BodyPartState::Black => &[],
     };
     if table.is_empty() {
@@ -1369,32 +1373,32 @@ pub fn referee_evaluate_with_tier(
     let part = candidates[roller.range(candidates.len())];
     let current_state = state.body.get(&part).copied().unwrap_or_default();
 
-    // Roll severity on a weighted table. Weights are now tier-driven (Slice 3):
-    // a Minion weights toward Minor; a Legendary weights toward Critical.
-    // Index maps to: 0=Yellow, 1=Orange, 2=Red, 3=Purple.
-    const SEVERITY_TABLE: [BodyPartState; 4] = [
+    // Roll severity on a weighted table. Weights are tier-driven (Slice 3):
+    // a Minion weights toward Minor; a Legendary weights toward Red/Purple.
+    // Index maps to: 0=Yellow, 1=Orange, 2=Red, 3=Purple, 4=Black.
+    const SEVERITY_TABLE: [BodyPartState; 5] = [
         BodyPartState::Yellow,
         BodyPartState::Orange,
         BodyPartState::Red,
         BodyPartState::Purple,
+        BodyPartState::Black,
     ];
     let roll_idx = roller.weighted(&attacker_tier.severity_weights());
     let mut new_state = SEVERITY_TABLE[roll_idx];
 
-    // The new state must be at least as severe as the current one — a Heavy
-    // blow to an already-Heavy part shouldn't randomly downgrade to Minor.
-    // If the roll is lighter than current, escalate by one tier instead
-    // (the blow still did *something*). This is the same-part repeat-hit
-    // rule (architect directive Slice 3): a second hit to an already-wounded
-    // part always escalates, never downgrades.
+    // (2026-08-20 Chloe ruling — replaces the Slice 3 same-part escalation
+    // rule) A re-hit never escalates AND never downgrades: wound tiers
+    // progress only when the severity roll actually lands there (or worse)
+    // — each tier is progressively harder to roll. A lighter roll on an
+    // already-wounded part leaves the part AT its current tier; the fresh
+    // blow still drains stamina and appends its (rolled-tier) descriptor to
+    // the zone's history. Black comes only from the roll itself (the tuned
+    // 1-5% tail) — never as a free escalation: a re-hit on a Purple part
+    // stays Purple unless the dice actually land Black. A Black CORE part
+    // (Head/Neck/UpperTorso) is death (see `apply_outcome`).
+    let rolled_state = new_state;
     if new_state.rank() < current_state.rank() {
-        new_state = match current_state {
-            BodyPartState::Transparent => BodyPartState::Yellow,
-            BodyPartState::Yellow => BodyPartState::Orange,
-            BodyPartState::Orange => BodyPartState::Red,
-            BodyPartState::Red => BodyPartState::Purple,
-            BodyPartState::Purple | BodyPartState::Black => BodyPartState::Black,
-        };
+        new_state = current_state;
     }
 
     // Stamina always drains on a combat turn. The caller applies this too.
@@ -1432,28 +1436,14 @@ pub fn referee_evaluate_with_tier(
     // unfinishable).
     let lethal = (lethality_roll as i32) >= lethality_dc;
 
-    // Narrative hint: a short second-person prose seed. The narrator reads the
-    // canonical body-state change as hard fact; this hint just nudges prose.
-    // Lethal outcomes get a stronger hint that flags the drop.
-    let narrative_hint = if lethal {
-        format!(
-            "the {} blow drops you — your {} goes limp, the fight leaves you",
-            new_state.semantic().to_lowercase(),
-            part.display().to_lowercase(),
-        )
-    } else {
-        format!(
-            "your {} takes a {}",
-            part.display().to_lowercase(),
-            new_state.semantic().to_lowercase(),
-        )
-    };
-
     // Wound descriptor: a terse noun-phrase rolled from the (tier, severity)
     // table via the outcome's own Roller (so identical blows still differ).
     // This is what `apply_outcome` appends to injury_details[part] — the
     // paperdoll tooltip lists it + the narrator's injuries: line carries it.
-    let injury_desc = roll_injury_descriptor(&mut roller, attacker_tier, new_state);
+    // Rolled from the ROLLED severity (the blow that actually landed), not
+    // the kept tier — a light graze on a shattered arm records a Bruise, not
+    // another "Shattered".
+    let injury_desc = roll_injury_descriptor(&mut roller, attacker_tier, rolled_state);
 
     // Directive: only populated when lethal. The caller wraps as
     // `[DIRECTIVE: {directive}]` in `<world_state>`.
@@ -1474,7 +1464,6 @@ pub fn referee_evaluate_with_tier(
         part,
         new_state,
         stamina_after,
-        narrative_hint,
         injury_desc,
         lethal,
         directive,
@@ -1488,6 +1477,16 @@ pub fn referee_evaluate_with_tier(
 pub fn apply_outcome(state: &mut PlayerState, outcome: &RefereeOutcome) {
     state.body.insert(outcome.part, outcome.new_state);
     state.stamina = outcome.stamina_after;
+    // (2026-08-20) A destroyed CORE part is death: the stamina well drops
+    // to the Depleted floor (Chloe ruling: no separate Empty variant —
+    // Depleted IS the empty-pips read) and `consequence::derive_health_tier`
+    // reports Deceased off the same wound. Limb amputations never touch
+    // this — Black limbs score zero points, that is all.
+    if outcome.new_state == BodyPartState::Black
+        && crate::consequence::CORE_PARTS.contains(&outcome.part)
+    {
+        state.stamina = Stamina::Depleted;
+    }
 
     // Record the wound descriptor. A non-empty `injury_desc` appends to the
     // zone's detail history (so a zone hit across turns accumulates a list).
@@ -1856,12 +1855,20 @@ const SUSPICIOUS_ACTIONS: &[&str] = &[
     "wrong badge", "no badge", "wrong uniform", "wrong color", "wrong rank",
 ];
 
-/// Find the active disguise tag, if any. Returns the first tag with
-/// `kind == "disguise"`. A player can technically hold multiple disguise
-/// tags (e.g. swapped mid-scene); we evaluate against the first — the
-/// others are stale and the gate cares about presence, not multiplicity.
-pub fn find_disguise_tag(tags: &[crate::consequence::StatusTag]) -> Option<&crate::consequence::StatusTag> {
-    tags.iter().find(|t| t.kind == "disguise")
+/// Find the active disguise tag, if any. Returns the first LIVE (unexpired)
+/// tag with `kind == "disguise"` — the gate's clock (2026-08-20) skips
+/// expired disguises at read time, the same filter the prompt renderer and
+/// the polarity counts run (the tick's expiry sweep is suspended in Combat,
+/// so an expired disguise must not keep auto-passing through a long fight).
+/// A player can technically hold multiple disguise tags (e.g. swapped
+/// mid-scene); we evaluate against the first live one — the others are
+/// stale and the gate cares about presence, not multiplicity.
+pub fn find_disguise_tag(
+    tags: &[crate::consequence::StatusTag],
+    now_minutes: i64,
+) -> Option<&crate::consequence::StatusTag> {
+    tags.iter()
+        .find(|t| t.kind == "disguise" && !t.is_expired(now_minutes))
 }
 
 /// True if the player's turn text contains any suspicious-action keyword.
@@ -1952,16 +1959,23 @@ const SCRUTINIZED_FAIL_SEED: &str = "the act cracks under scrutiny; the disguise
 ///
 /// `entities` + `present_npc_ids` scope the tier selection to the NPCs
 /// actually on-camera this turn. `pacing_dc_mod` is the ScenePacing DC
-/// modifier (Combat +2, Exploration 0, Downtime −2) — threaded into the
-/// Scrutinized DC exactly as the skill-check Referee does.
+/// modifier (Combat +2, Exploration 0, Downtime −2) and `health_dc_mod` the
+/// derived-body modifier (`consequence::health_dc_mod`, 2026-08-20 Chloe
+/// ruling: deception under scrutiny is a skilled act — a feverish or
+/// battered body fumbles it exactly like a lockpick) — both threaded into
+/// the Scrutinized DC exactly as the skill-check Referee does.
+/// `now_minutes` is the WorldClock (the gate's clock): expired disguise
+/// tags read as no disguise at all.
 pub fn evaluate_disguise_gate(
     text: &str,
     tags: &[crate::consequence::StatusTag],
     entities: &BTreeMap<String, serde_json::Value>,
     present_npc_ids: &[String],
     pacing_dc_mod: i32,
+    health_dc_mod: i32,
+    now_minutes: i64,
 ) -> Option<DisguiseDirective> {
-    let disguise = find_disguise_tag(tags)?;
+    let disguise = find_disguise_tag(tags, now_minutes)?;
     // Empty scene: no gate outcome at all. Falling through would compare
     // against the Soldier default and emit an AutoPass crediting soldiers
     // who are not there (and could even roll scrutiny with no observer).
@@ -1978,7 +1992,8 @@ pub fn evaluate_disguise_gate(
         let seed = hash_text(text).wrapping_add(0xE117E5);
         let mut roller = Roller::new(seed);
         let roll = roll_d20(&mut roller);
-        let dc = (DECEPTION_BASE_DC as i32 + 3 + pacing_dc_mod).clamp(1, 30) as u32;
+        let dc = (DECEPTION_BASE_DC as i32 + 3 + pacing_dc_mod + health_dc_mod)
+            .clamp(1, 30) as u32;
         let success = roll >= dc;
         let s = if success {
             "the player's composure withstands a captain's eye; the disguise holds — for now"
@@ -2006,7 +2021,7 @@ pub fn evaluate_disguise_gate(
     let seed = hash_text(text).wrapping_add(0xC0FFEE);
     let mut roller = Roller::new(seed);
     let roll = roll_d20(&mut roller);
-    let dc = (DECEPTION_BASE_DC as i32 + pacing_dc_mod).clamp(1, 30) as u32;
+    let dc = (DECEPTION_BASE_DC as i32 + pacing_dc_mod + health_dc_mod).clamp(1, 30) as u32;
     let success = roll >= dc;
     let s = if success { SCRUTINIZED_SUCCESS_SEED } else { SCRUTINIZED_FAIL_SEED };
     Some(DisguiseDirective::Scrutinized {
@@ -2143,6 +2158,47 @@ mod tests {
         // Floor: never wraps past Depleted.
         s.drain();
         assert_eq!(s, Stamina::Depleted, "stamina never wraps past Depleted");
+    }
+
+    #[test]
+    fn apply_outcome_core_black_drops_stamina_to_depleted() {
+        // Death (a destroyed core part) empties the well — the Depleted
+        // floor (2026-08-20: no separate Empty variant).
+        let mut s = fresh_state();
+        let out = RefereeOutcome {
+            part: BodyPart::Neck,
+            new_state: BodyPartState::Black,
+            stamina_after: Stamina::Winded,
+            injury_desc: "Severed".into(),
+            lethal: true,
+            directive: String::new(),
+        };
+        apply_outcome(&mut s, &out);
+        assert_eq!(s.stamina, Stamina::Depleted);
+        assert_eq!(s.body.get(&BodyPart::Neck), Some(&BodyPartState::Black));
+        // …but a black LIMB (amputation) only drains as usual.
+        let mut s = fresh_state();
+        let out = RefereeOutcome {
+            part: BodyPart::LeftHand,
+            new_state: BodyPartState::Black,
+            stamina_after: Stamina::Winded,
+            injury_desc: "Severed".into(),
+            lethal: false,
+            directive: String::new(),
+        };
+        apply_outcome(&mut s, &out);
+        assert_eq!(s.stamina, Stamina::Winded);
+    }
+
+    #[test]
+    fn recovery_refuses_the_deceased() {
+        let mut s = fresh_state();
+        s.body.insert(BodyPart::Head, BodyPartState::Black);
+        s.stamina = Stamina::Depleted;
+        assert!(
+            referee_evaluate_recovery("I rest and sleep by the campfire", &s, true).is_none(),
+            "a destroyed core part refuses recovery entirely"
+        );
     }
 
     // --- PlayerState ---
@@ -2555,7 +2611,6 @@ mod tests {
             part: BodyPart::RightUpperLeg,
             new_state: BodyPartState::Orange,
             stamina_after: Stamina::Winded,
-            narrative_hint: "test".into(),
             injury_desc: "Deep cut".into(),
             lethal: false,
             directive: String::new(),
@@ -2584,7 +2639,6 @@ mod tests {
             part: BodyPart::LeftUpperArm,
             new_state: BodyPartState::Orange,
             stamina_after: Stamina::Active,
-            narrative_hint: "test".into(),
             injury_desc: "Gash".into(),
             lethal: false,
             directive: String::new(),
@@ -2611,7 +2665,6 @@ mod tests {
             part: BodyPart::LeftHand,
             new_state: BodyPartState::Black,
             stamina_after: Stamina::Exhausted,
-            narrative_hint: "test".into(),
             injury_desc: "Severed".into(),
             lethal: true,
             directive: "down".into(),
@@ -2944,16 +2997,17 @@ mod tests {
 
     #[test]
     fn attacker_tier_default_is_soldier() {
-        // The default preserves the v1 severity distribution exactly —
-        // the [50,30,15,5] weights are what shipped before Slice 3.
+        // The default tier is Soldier; the 2026-08-20 five-tier rescale
+        // (Black tail added) keeps the shipped shape: Yellow-dominant, the
+        // old Orange 30 preserved, severe outcomes the minority.
         assert_eq!(AttackerTier::default(), AttackerTier::Soldier);
-        assert_eq!(AttackerTier::Soldier.severity_weights(), [50, 30, 15, 5]);
+        assert_eq!(AttackerTier::Soldier.severity_weights(), [55, 30, 8, 5, 2]);
     }
 
     #[test]
     fn attacker_tier_severity_weights_shift_with_tier() {
-        // Minion weights toward Minor (index 0); Legendary toward Critical (3).
-        // The shift must be monotonic per index.
+        // Minion weights toward Minor (index 0); Legendary toward Red/Purple
+        // (indices 2-3). The shift must be monotonic per index.
         let minion = AttackerTier::Minion.severity_weights();
         let legendary = AttackerTier::Legendary.severity_weights();
         assert!(
@@ -2964,7 +3018,24 @@ mod tests {
             legendary[3] > minion[3],
             "Legendary should weight Critical more heavily than Minion"
         );
-        // Sanity: the four-tier shift ladder is ordered Minion→Soldier→Elite→
+        // (2026-08-20) Black exists on every tier's table (no free zeros):
+        // the tail grows with tier and never sums past 100.
+        for tier in [
+            AttackerTier::Minion,
+            AttackerTier::Soldier,
+            AttackerTier::Elite,
+            AttackerTier::Boss,
+            AttackerTier::Legendary,
+        ] {
+            let w = tier.severity_weights();
+            assert_eq!(w.iter().sum::<u32>(), 100, "{tier:?} weights must sum to 100");
+            assert!(*w.last().unwrap() > 0, "{tier:?} must carry a Black tail");
+        }
+        assert!(
+            legendary[4] > minion[4],
+            "Legendary should weight Black more heavily than Minion"
+        );
+        // Sanity: the five-tier shift ladder is ordered Minion→Soldier→Elite→
         // Boss→Legendary, with each step increasing severe-outcome weight.
         let tiers = [
             AttackerTier::Minion,
@@ -2976,9 +3047,9 @@ mod tests {
         for window in tiers.windows(2) {
             let lower = window[0].severity_weights();
             let higher = window[1].severity_weights();
-            // Combined Heavy+Critical weight must increase with tier.
-            let lower_severe = lower[2] + lower[3];
-            let higher_severe = higher[2] + higher[3];
+            // Combined Red+Purple+Black weight must increase with tier.
+            let lower_severe = lower[2] + lower[3] + lower[4];
+            let higher_severe = higher[2] + higher[3] + higher[4];
             assert!(
                 higher_severe >= lower_severe,
                 "tier {:?} should have at least as much severe weight as {:?}",
@@ -3101,10 +3172,14 @@ mod tests {
     }
 
     #[test]
-    fn referee_same_part_repeat_hit_escalates() {
-        // Architect directive Slice 3: a second hit to an already-wounded
-        // part always escalates, never downgrades. Pre-wound the Upper Torso
-        // to Orange; subsequent Upper Torso hits must land at Red or worse.
+    fn referee_repeat_hit_never_downgrades_or_free_escalates() {
+        // (2026-08-20 Chloe ruling — replaces the Slice 3 escalation rule)
+        // A re-hit never escalates AND never downgrades: the wound tier only
+        // moves when the severity roll actually lands there (or worse).
+        // Pre-wound the Upper Torso to Orange; every repeat hit must keep
+        // Orange (a lighter roll) or earn Red/Purple/Black (the roll landing
+        // there) — never Yellow. Black is EARNED by the roll's tuned tail
+        // only, never as a free escalation from a lighter blow.
         let mut s = fresh_state();
         s.body.insert(BodyPart::UpperTorso, BodyPartState::Orange);
         let mut torso_hits = 0;
@@ -3115,7 +3190,7 @@ mod tests {
                 if o.part == BodyPart::UpperTorso {
                     torso_hits += 1;
                     assert!(
-                        o.new_state.rank() >= BodyPartState::Orange.rank(),
+                        !matches!(o.new_state, BodyPartState::Yellow),
                         "Upper Torso repeat-hit must not downgrade from Orange (got {:?})",
                         o.new_state
                     );
@@ -3187,7 +3262,7 @@ mod tests {
         // No disguise tag → nothing to gate, regardless of tier or behavior.
         let entities = entities_with_tier("soldier");
         let present = vec!["guard1".to_string()];
-        assert!(evaluate_disguise_gate("I walk past the guard", &[generic_tag("Blessed")], &entities, &present, 0).is_none());
+        assert!(evaluate_disguise_gate("I walk past the guard", &[generic_tag("Blessed")], &entities, &present, 0, 0, 0).is_none());
     }
 
     #[test]
@@ -3201,6 +3276,8 @@ mod tests {
             &[disguise_tag("city guard uniform")],
             &entities,
             &[],
+            0,
+            0,
             0
         )
         .is_none());
@@ -3215,6 +3292,8 @@ mod tests {
             &[disguise_tag("city guard uniform")],
             &entities,
             &present,
+            0,
+            0,
             0,
         ).expect("minion + confident → AutoPass");
         match out {
@@ -3238,6 +3317,8 @@ mod tests {
             &entities,
             &present,
             0,
+            0,
+            0,
         ).expect("soldier + confident → AutoPass");
         assert!(matches!(out, DisguiseDirective::AutoPass { tier_tag: "soldier", .. }));
     }
@@ -3255,6 +3336,8 @@ mod tests {
             &[disguise_tag("city guard uniform")],
             &entities,
             &present,
+            0,
+            0,
             0,
         ).expect("Elite+ + disguise -> Scrutinized (rolled here)");
         let dc_seen = match &out {
@@ -3274,6 +3357,8 @@ mod tests {
             &entities,
             &present,
             0,
+            0,
+            0,
         ).expect("Legendary + disguise -> Scrutinized (rolled here)");
         assert!(matches!(out, DisguiseDirective::Scrutinized { .. }));
     }
@@ -3288,6 +3373,8 @@ mod tests {
             &[disguise_tag("city guard uniform")],
             &entities,
             &present,
+            0,
+            0,
             0,
         ).expect("suspicious → Scrutinized");
         match out {
@@ -3311,6 +3398,8 @@ mod tests {
             &entities,
             &present,
             0,
+            0,
+            0,
         ).expect("soldier + suspicious → Scrutinized");
         assert!(matches!(out, DisguiseDirective::Scrutinized { .. }));
     }
@@ -3326,6 +3415,8 @@ mod tests {
             &[disguise_tag("city guard uniform")],
             &entities,
             &present,
+            0,
+            0,
             0,
         ).expect("Elite+ + suspicious → Scrutinized");
         match out {
@@ -3346,6 +3437,8 @@ mod tests {
             &entities,
             &present,
             2,
+            0,
+            0,
         ).unwrap();
         let downtime = evaluate_disguise_gate(
             "I sweat and stammer.",
@@ -3353,6 +3446,8 @@ mod tests {
             &entities,
             &present,
             -2,
+            0,
+            0,
         ).unwrap();
         match (combat, downtime) {
             (DisguiseDirective::Scrutinized { dc: dc_c, .. },
@@ -3362,6 +3457,88 @@ mod tests {
             }
             _ => panic!("both should be Scrutinized"),
         }
+    }
+
+    #[test]
+    fn disguise_gate_dc_threads_health_modifier() {
+        // (2026-08-20 Chloe ruling) Deception under scrutiny is a skilled
+        // act — the derived-body health modifier hardens it exactly like a
+        // skill-check DC: +4 turns the base 14 into 18, the Elite 17 into 21.
+        let entities = entities_with_tier("soldier");
+        let present = vec!["guard1".to_string()];
+        let out = evaluate_disguise_gate(
+            "I sweat and stammer.",
+            &[disguise_tag("city guard uniform")],
+            &entities,
+            &present,
+            0,
+            4,
+            0,
+        ).unwrap();
+        match out {
+            DisguiseDirective::Scrutinized { dc, .. } => {
+                assert_eq!(dc, 18, "low-tier scrutiny DC = 14 + health 4");
+            }
+            _ => panic!("expected Scrutinized"),
+        }
+        let entities = entities_with_tier("elite");
+        let out = evaluate_disguise_gate(
+            "I nod to the captain and walk past.",
+            &[disguise_tag("city guard uniform")],
+            &entities,
+            &present,
+            0,
+            4,
+            0,
+        ).unwrap();
+        match out {
+            DisguiseDirective::Scrutinized { dc, .. } => {
+                assert_eq!(dc, 21, "Elite scrutiny DC = 14 + 3 + health 4");
+            }
+            _ => panic!("expected Scrutinized"),
+        }
+    }
+
+    #[test]
+    fn disguise_gate_ignores_expired_disguise() {
+        // (2026-08-20) The gate runs on the clock: an expired disguise tag
+        // reads as NO disguise — no auto-pass narrating a costume that timed
+        // out, no scrutiny roll, no revoke.
+        let entities = entities_with_tier("soldier");
+        let present = vec!["guard1".to_string()];
+        let expired = StatusTag {
+            label: "city guard uniform".into(),
+            polarity: Polarity::Buff,
+            expires_at: 100,
+            source: String::new(),
+            kind: "disguise".into(),
+        };
+        assert!(
+            evaluate_disguise_gate(
+                "I nod to the guard and walk past confidently.",
+                &[expired],
+                &entities,
+                &present,
+                0,
+                0,
+                100
+            )
+            .is_none(),
+            "an expired disguise gates nothing"
+        );
+        // One minute earlier it was live and would auto-pass.
+        assert!(matches!(
+            evaluate_disguise_gate(
+                "I nod to the guard and walk past confidently.",
+                &[expired],
+                &entities,
+                &present,
+                0,
+                0,
+                99
+            ),
+            Some(DisguiseDirective::AutoPass { .. })
+        ));
     }
 
     #[test]
@@ -3410,14 +3587,31 @@ mod tests {
     }
 
     #[test]
-    fn find_disguise_tag_returns_first_disguise() {
+    fn find_disguise_tag_returns_first_live_disguise() {
         let tags = vec![
             generic_tag("Blessed"),
             disguise_tag("city guard uniform"),
             disguise_tag("merchant robes"), // second disguise ignored
         ];
-        let found = find_disguise_tag(&tags).expect("must find the disguise");
+        let found = find_disguise_tag(&tags, 0).expect("must find the disguise");
         assert_eq!(found.label, "city guard uniform");
+        // (2026-08-20) The gate's clock: an expired disguise is skipped in
+        // favor of the next live one — the tick's sweep is suspended in
+        // Combat, so read-time filtering is the authority.
+        let expired = StatusTag {
+            label: "stale hood".into(),
+            polarity: Polarity::Buff,
+            expires_at: 50,
+            source: String::new(),
+            kind: "disguise".into(),
+        };
+        let tags = vec![expired, disguise_tag("merchant robes")];
+        let found = find_disguise_tag(&tags, 60).expect("must find the LIVE disguise");
+        assert_eq!(found.label, "merchant robes");
+        assert!(
+            find_disguise_tag(&tags[..1], 60).is_none(),
+            "an all-expired disguise set gates nothing"
+        );
     }
 
     #[test]

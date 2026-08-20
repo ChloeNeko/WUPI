@@ -57,14 +57,22 @@ export async function renderSaves(root, cardId, onSelect, cardName) {
   const titleEl = root.querySelector('[data-title]');
   if (titleEl) titleEl.textContent = cardName ? `${cardName} — Saves` : 'Saves';
   const host = root.querySelector('[data-host]');
+  // (2026-08-20 audit) Generation token (the worlds grid's _renderGen
+  // pattern): a re-render can race an in-flight `listSaves` (delete's
+  // re-fire, a quick Back → worlds → other world → saves) — the stale
+  // completion abandons before appending, or both loads' rows land.
+  root._renderGen = (root._renderGen || 0) + 1;
+  const gen = root._renderGen;
   host.innerHTML = '';
   let saves = [];
   try {
     saves = await listSaves(cardId);
   } catch (err) {
+    if (gen !== root._renderGen) return;
     host.innerHTML = `<div class="fable-saves-empty">Couldn't load saves: ${esc(err)}</div>`;
     return;
   }
+  if (gen !== root._renderGen) return;
   // The autosave is the per-turn checkpoint = the world's latest state. Promote
   // it to a one-click Resume Latest button at the top; the list below shows the
   // manual saves only. (Resume Latest reuses the autosave, the same slot

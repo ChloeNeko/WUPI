@@ -562,10 +562,14 @@ pub fn select_focus(
 /// POSITIVE = growing frustration as the deadline slips. Pre-deadline the
 /// ratio is ROOT-compressed (`ratio^(1/coeff) − 1`); post-deadline it grows
 /// LINEARLY in the overrun (`(ratio − 1) × coeff`). `coeff` is the giver's
-/// relationship `volatility` clamped to [0.1, 3.0] (1.0 when no
-/// relationship is tracked): a patient NPC (0.4) reads half-done as
+/// relationship `volatility` clamped to [0.1, 3.0] via the shared
+/// `relationship::clamp_volatility` (1.0 when no relationship is tracked
+/// or the value is invalid): a patient NPC (0.4) reads half-done as
 /// −0.823 (Very Pleased) where a volatile one (3.0) reads it as −0.206
 /// (barely Neutral) — and the same 50% overrun reads +0.200 vs +1.500.
+/// A `now` before `accepted_at` (clock regression / un-stamped row)
+/// clamps to ratio 0 — the old negative `powf` base produced NaN, which
+/// fell through EVERY band to "Furious" (2026-08-20 audit L2).
 ///
 /// Pinned test vectors (the plan's): halfway at coeff 0.4/1.0/3.0 →
 /// −0.823/−0.500/−0.206; at the deadline → exactly 0; 50% overtime →
@@ -576,12 +580,12 @@ pub fn promise_frustration(
     now_minutes: i64,
     volatility: Option<f64>,
 ) -> f64 {
-    let coeff = volatility.unwrap_or(1.0).clamp(0.1, 3.0);
+    let coeff = crate::relationship::clamp_volatility(volatility.unwrap_or(1.0));
     // A non-positive window (0-minute promise, or a legacy un-stamped row)
     // is instantly overdue — treat the span as 1 minute so the ratio is
     // finite + the post-deadline branch takes over.
     let span = (deadline_minutes - accepted_at_minutes).max(1) as f64;
-    let ratio = (now_minutes - accepted_at_minutes) as f64 / span;
+    let ratio = (now_minutes - accepted_at_minutes).max(0) as f64 / span;
     if ratio <= 1.0 {
         ratio.powf(1.0 / coeff) - 1.0
     } else {
@@ -643,6 +647,15 @@ mod tests {
         assert!((over_patient - 0.2).abs() < 1e-9, "coeff 0.4 overtime: {over_patient}");
         let over_volatile = promise_frustration(0, 100, 150, Some(3.0));
         assert!((over_volatile - 1.5).abs() < 1e-9, "coeff 3.0 overtime: {over_volatile}");
+    }
+
+    /// A `now` before `accepted_at` (clock regression / un-stamped row)
+    /// clamps to ratio 0 instead of NaN-ing the powf (2026-08-20 audit L2).
+    #[test]
+    fn promise_frustration_pre_acceptance_never_nans() {
+        let s = promise_frustration(1000, 2000, 500, Some(1.0));
+        assert!(s.is_finite(), "score must be finite, got {s}");
+        assert_eq!(frustration_band(s), "Very Pleased");
     }
 
     /// Volatility is clamped — an absurd hand-edited coefficient can't

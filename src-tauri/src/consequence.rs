@@ -651,10 +651,14 @@ fn nudge_condition_down(c: Condition) -> Condition {
 
 /// The overall health grade. The two illness states (Sick / Infected) are
 /// CONDITIONS, not rungs on the wound ladder — an active illness tag shows
-/// instead of a grade whenever the body's wounds are no worse than minor.
+/// instead of a grade, outranking EVERY wound tier (Critical included — the
+/// 2026-08-20 same-day amendment; the old "only while no worse than minor"
+/// gate is gone). The one state above illness: `Deceased` — a Black
+/// (destroyed) core part is death, and death outranks sickness.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum HealthTier {
+    Deceased,
     Critical,
     Poor,
     Fair,
@@ -668,6 +672,7 @@ impl HealthTier {
     /// Single-word label for the vitals line (the drawer CSS uppercases it).
     pub fn semantic(self) -> &'static str {
         match self {
+            HealthTier::Deceased => "Deceased",
             HealthTier::Critical => "Critical",
             HealthTier::Poor => "Poor",
             HealthTier::Fair => "Fair",
@@ -680,15 +685,18 @@ impl HealthTier {
 
     /// Additive skill-check DC modifier (positive = harder): a battered or
     /// feverish body fumbles lockpicks and stumbles through sneaks. Fed to
-    /// `referee_evaluate_skill_checks` alongside the pacing modifier.
+    /// `referee_evaluate_skill_checks` alongside the pacing modifier —
+    /// threaded through [`health_dc_mod`], NOT the displayed tier directly
+    /// (2026-08-20 Chloe ruling: Sick +2 / Poor +3 / Infected +4 /
+    /// Critical +4 / Deceased +4 — the wound grade outranks a Sick label
+    /// at the DC; see that fn).
     pub fn skill_dc_mod(self) -> i32 {
         match self {
             HealthTier::Excellent | HealthTier::Good => 0,
-            HealthTier::Sick => 2,
-            HealthTier::Infected => 3,
             HealthTier::Fair => 1,
-            HealthTier::Poor => 2,
-            HealthTier::Critical => 4,
+            HealthTier::Sick => 2,
+            HealthTier::Poor => 3,
+            HealthTier::Infected | HealthTier::Critical | HealthTier::Deceased => 4,
         }
     }
 }
@@ -709,59 +717,157 @@ const INFECTED_STEMS: &[&str] = &[
 /// ("ill" is a substring of "thrill"/"skill"; "flu" of "influx"/"flute").
 const ILLNESS_WORDS: &[&str] = &["ill", "flu"];
 
-/// Derive the overall health tier from the wound map + active status tags.
-/// PURE FN — never stored, never written by the LLM.
+/// The core vital regions (2026-08-20 Chloe ruling, the points system):
+/// ONLY these three set the health floor by their color — and ONLY these
+/// three, when Black (destroyed), mean DEATH (`HealthTier::Deceased`; the
+/// `player_state` seams — core-black stamina floor + the recovery refusal —
+/// share this single source). LowerTorso is deliberately NOT core — it
+/// scores points like any limb.
+pub(crate) const CORE_PARTS: [BodyPart; 3] = [BodyPart::Head, BodyPart::Neck, BodyPart::UpperTorso];
+
+/// Per-part point contribution to the overall health tier (non-core parts
+/// only; core parts never score). Each grade doubles, so mixed wound loads
+/// stay honest across the bands. Black (amputated) scores ZERO — a missing
+/// limb is not bleeding.
+fn health_points(state: BodyPartState) -> u32 {
+    match state {
+        BodyPartState::Yellow => 1,
+        BodyPartState::Orange => 2,
+        BodyPartState::Red => 4,
+        BodyPartState::Purple => 8,
+        BodyPartState::Transparent | BodyPartState::Black => 0,
+    }
+}
+
+/// The wound-only grade (2026-08-20 Chloe points system — replaced the
+/// same-day worst-single-wound 1:1 ladder): the WORSE of the core floor
+/// and the points band, before any illness label. Shared by
+/// [`derive_health_tier`] (the displayed tier) and [`health_dc_mod`] (the
+/// DC, where the wound grade keeps priority over a Sick label).
 ///
-/// - Wound ladder (dominant): worst `BodyPartState` rank maps 1:1 —
-///   all-Healthy → Excellent, any Yellow → Good, any Orange → Fair,
-///   any Red → Poor, any Purple/Black → Critical.
-/// - Illness override: an ACTIVE (unexpired) tag whose label reads as
-///   infection/illness replaces the grade with Infected/Sick, but only
-///   while wounds are no worse than minor (Yellow). Fair-or-worse wounds
-///   describe the body better than an illness label does.
-/// - Infected beats Sick when both are somehow active.
+/// - **Core floor:** the worst color among Head / Neck / UpperTorso sets a
+///   floor — yellow → Good, orange → Fair, red → Poor, purple → Critical,
+///   black → **Deceased** (a destroyed core part is death; it outranks even
+///   the illness labels — the dead are not "Sick"). Core parts contribute
+///   NO points.
+/// - **Non-core points:** Yellow=1, Orange=2, Red=4, Purple=8 per part;
+///   Transparent/Black score 0. Bands: 0-7 Excellent, 8-11 Good, 12-17
+///   Fair, 18-23 Poor, 24+ Critical (3 purples or 6 reds = 24).
+/// - **Composition:** the WORSE of the core floor and the points band wins
+///   (a yellow head + 12 points reads Fair — Chloe's worked example).
+fn wound_grade(wounds: &HashMap<BodyPart, BodyPartState>) -> HealthTier {
+    // Both halves as severity ranks: 0=Critical … 4=Excellent (smaller =
+    // worse), so the overall grade is the MIN of the two.
+    let mut core_rank: u8 = 4;
+    for part in CORE_PARTS {
+        let rank = match wounds.get(&part) {
+            None | Some(BodyPartState::Transparent) => 4,
+            Some(BodyPartState::Yellow) => 3,
+            Some(BodyPartState::Orange) => 2,
+            Some(BodyPartState::Red) => 1,
+            Some(BodyPartState::Purple) => 0,
+            // A destroyed core part (severed head/neck, opened torso) is
+            // death, not a grade.
+            Some(BodyPartState::Black) => return HealthTier::Deceased,
+        };
+        if rank < core_rank {
+            core_rank = rank;
+        }
+    }
+    let mut points: u32 = 0;
+    for (part, state) in wounds {
+        if CORE_PARTS.contains(part) {
+            continue;
+        }
+        points += health_points(*state);
+    }
+    let points_rank = match points {
+        0..=7 => 4,
+        8..=11 => 3,
+        12..=17 => 2,
+        18..=23 => 1,
+        _ => 0,
+    };
+    match core_rank.min(points_rank) {
+        4 => HealthTier::Excellent,
+        3 => HealthTier::Good,
+        2 => HealthTier::Fair,
+        1 => HealthTier::Poor,
+        _ => HealthTier::Critical,
+    }
+}
+
+/// Derive the overall health tier from the wound map + active status tags.
+/// PURE FN — never stored, never written by the LLM: the wound grade
+/// ([`wound_grade`]) with the illness label applied on top.
+///
+/// - **Illness override (same-day amendment):** an ACTIVE (unexpired) tag
+///   whose label reads as infection/illness replaces the grade with
+///   Infected/Sick ENTIRELY — illness outranks EVERY wound tier, Critical
+///   included. Infected beats Sick when both are somehow active. (For the
+///   skill-check DC the wound grade still wins at Poor+ — see
+///   [`health_dc_mod`].)
+/// - **Illness eligibility (2026-08-20, M3 fix):** only PURE Debuff tags
+///   (`kind` empty, `Polarity::Debuff`) can read as illness. A kinded tag
+///   is a mechanical lane — a "Plague Doctor Outfit" disguise is a costume,
+///   not the plague — and a Buff naming an illness is ABOUT it ("Poison
+///   Resistance", "Fever Pitch Focus"), not suffering it. Neither shows on
+///   the vitals line nor touches the DCs.
 pub fn derive_health_tier(
     wounds: &HashMap<BodyPart, BodyPartState>,
     tags: &[StatusTag],
     now_minutes: i64,
 ) -> HealthTier {
-    let worst = wounds.values().map(|s| *s as u8).max().unwrap_or(0);
-    let grade = match worst {
-        0 => HealthTier::Excellent,
-        1 => HealthTier::Good,
-        2 => HealthTier::Fair,
-        3 => HealthTier::Poor,
-        _ => HealthTier::Critical,
-    };
-    if grade == HealthTier::Excellent || grade == HealthTier::Good {
-        // Illness may override only the two healthy rungs — Fair-or-worse
-        // wounds describe the body better than an illness label does.
-        let mut sick = false;
-        let mut infected = false;
-        for t in tags {
-            if t.is_expired(now_minutes) {
-                continue;
-            }
-            let label = t.label.to_lowercase();
-            if INFECTED_STEMS.iter().any(|s| label.contains(s)) {
-                infected = true;
-            }
-            if SICK_STEMS.iter().any(|s| label.contains(s))
-                || label
-                    .split(|c: char| !c.is_alphanumeric())
-                    .any(|w| ILLNESS_WORDS.contains(&w))
-            {
-                sick = true;
-            }
+    let grade = wound_grade(wounds);
+    if grade == HealthTier::Deceased {
+        // Death outranks illness — a feverish corpse is a corpse.
+        return grade;
+    }
+    // Illness replaces the grade entirely — every remaining tier, Critical
+    // included.
+    let mut sick = false;
+    let mut infected = false;
+    for t in tags {
+        if t.is_expired(now_minutes)
+            || !t.kind.is_empty()
+            || t.polarity != Polarity::Debuff
+        {
+            continue;
         }
-        if infected {
-            return HealthTier::Infected;
+        let label = t.label.to_lowercase();
+        if INFECTED_STEMS.iter().any(|s| label.contains(s)) {
+            infected = true;
         }
-        if sick {
-            return HealthTier::Sick;
+        if SICK_STEMS.iter().any(|s| label.contains(s))
+            || label
+                .split(|c: char| !c.is_alphanumeric())
+                .any(|w| ILLNESS_WORDS.contains(&w))
+        {
+            sick = true;
         }
     }
+    if infected {
+        return HealthTier::Infected;
+    }
+    if sick {
+        return HealthTier::Sick;
+    }
     grade
+}
+
+/// (2026-08-20 Chloe ruling) The skill-check DC modifier for the body.
+/// The DISPLAYED tier may be an illness label (Sick +2 / Infected +4), but
+/// for DCs the wound grade keeps priority at Poor and worse — a fever
+/// never makes a Critical body easier to lockpick. Returns the worse of
+/// the wound grade's and the displayed tier's modifier.
+pub fn health_dc_mod(
+    wounds: &HashMap<BodyPart, BodyPartState>,
+    tags: &[StatusTag],
+    now_minutes: i64,
+) -> i32 {
+    let grade = wound_grade(wounds);
+    let displayed = derive_health_tier(wounds, tags, now_minutes);
+    grade.skill_dc_mod().max(displayed.skill_dc_mod())
 }
 
 
@@ -1132,7 +1238,7 @@ pub fn compute_frustration(
     }
     let elapsed = elapsed_minutes as f64;
     let window = window_minutes as f64;
-    let coeff = if volatility > 0.0 { volatility } else { 1.0 };
+    let coeff = crate::relationship::clamp_volatility(volatility);
     let mood_score = if elapsed < window {
         // Before deadline: smooth rise from −1 (pleased at acceptance) → 0
         // (at deadline). The exponent 1/coeff sharpens (volatile) or
@@ -1497,76 +1603,259 @@ mod tests {
         assert_eq!(derive_condition(&wounds, 0, 0), Condition::Downed);
     }
 
-    // ---- Overall health tier (2026-08-20) ----
+    // ---- Overall health tier (2026-08-20 points system) ----
+
+    /// n non-core limbs at a uniform state, first n in canonical order
+    /// (Head/Neck/UpperTorso excluded — those are core and score no points).
+    fn limb_wounds(n: usize, state: BodyPartState) -> HashMap<BodyPart, BodyPartState> {
+        BodyPart::all()
+            .iter()
+            .copied()
+            .filter(|p| !CORE_PARTS.contains(p))
+            .take(n)
+            .map(|p| (p, state))
+            .collect()
+    }
 
     #[test]
-    fn health_tier_wound_ladder_maps_one_to_one() {
-        assert_eq!(derive_health_tier(&HashMap::new(), &[], 0), HealthTier::Excellent);
-        let mut w = HashMap::new();
-        w.insert(BodyPart::LeftHand, BodyPartState::Yellow);
+    fn health_tier_points_bands() {
+        // 0-7 → Excellent: 7 yellows (7 pts) stays Excellent.
+        assert_eq!(
+            derive_health_tier(&limb_wounds(7, BodyPartState::Yellow), &[], 0),
+            HealthTier::Excellent
+        );
+        // 8-11 → Good: 8 yellows, 4 oranges, 2 reds, and 1 purple all = 8 pts
+        // ("no matter what" — the color mix is irrelevant below the band edges).
+        assert_eq!(
+            derive_health_tier(&limb_wounds(8, BodyPartState::Yellow), &[], 0),
+            HealthTier::Good
+        );
+        assert_eq!(
+            derive_health_tier(&limb_wounds(4, BodyPartState::Orange), &[], 0),
+            HealthTier::Good
+        );
+        assert_eq!(
+            derive_health_tier(&limb_wounds(2, BodyPartState::Red), &[], 0),
+            HealthTier::Good
+        );
+        assert_eq!(
+            derive_health_tier(&limb_wounds(1, BodyPartState::Purple), &[], 0),
+            HealthTier::Good
+        );
+        // 11 pts (1 purple + 3 yellow) still Good.
+        let mut w = limb_wounds(1, BodyPartState::Purple);
+        for p in [BodyPart::LeftHand, BodyPart::RightHand, BodyPart::LeftFoot] {
+            w.insert(p, BodyPartState::Yellow);
+        }
         assert_eq!(derive_health_tier(&w, &[], 0), HealthTier::Good);
-        w.insert(BodyPart::LeftUpperArm, BodyPartState::Orange);
+        // 12-17 → Fair: 3 reds (12), 6 oranges (12), 2 purple + 1 yellow (17).
+        assert_eq!(
+            derive_health_tier(&limb_wounds(3, BodyPartState::Red), &[], 0),
+            HealthTier::Fair
+        );
+        assert_eq!(
+            derive_health_tier(&limb_wounds(6, BodyPartState::Orange), &[], 0),
+            HealthTier::Fair
+        );
+        let mut w = limb_wounds(2, BodyPartState::Purple);
+        w.insert(BodyPart::LeftHand, BodyPartState::Yellow);
         assert_eq!(derive_health_tier(&w, &[], 0), HealthTier::Fair);
+        // 18-23 → Poor: 2 purple + 1 orange (18), 2 purple + 1 red + 3 yellow (23).
+        let mut w = limb_wounds(2, BodyPartState::Purple);
+        w.insert(BodyPart::LeftHand, BodyPartState::Orange);
+        assert_eq!(derive_health_tier(&w, &[], 0), HealthTier::Poor);
+        let mut w = limb_wounds(2, BodyPartState::Purple);
+        w.insert(BodyPart::LeftHand, BodyPartState::Red);
+        for p in [BodyPart::RightHand, BodyPart::LeftFoot, BodyPart::RightFoot] {
+            w.insert(p, BodyPartState::Yellow);
+        }
+        assert_eq!(derive_health_tier(&w, &[], 0), HealthTier::Poor);
+        // 24+ → Critical: 3 purples, 6 reds, and one past the line.
+        assert_eq!(
+            derive_health_tier(&limb_wounds(3, BodyPartState::Purple), &[], 0),
+            HealthTier::Critical
+        );
+        assert_eq!(
+            derive_health_tier(&limb_wounds(6, BodyPartState::Red), &[], 0),
+            HealthTier::Critical
+        );
+        let mut w = limb_wounds(3, BodyPartState::Purple);
+        w.insert(BodyPart::LeftHand, BodyPartState::Yellow);
+        assert_eq!(derive_health_tier(&w, &[], 0), HealthTier::Critical);
+    }
+
+    #[test]
+    fn health_tier_black_limbs_score_zero() {
+        // Black (amputated) limbs don't count toward health — 0 points each.
+        assert_eq!(
+            derive_health_tier(&limb_wounds(3, BodyPartState::Black), &[], 0),
+            HealthTier::Excellent
+        );
+        // …and a black limb never pushes a load over a band edge
+        // (2 purple + 1 black = 16 pts → Fair, not Poor).
+        let mut w = limb_wounds(2, BodyPartState::Purple);
+        w.insert(BodyPart::LeftHand, BodyPartState::Black);
+        assert_eq!(derive_health_tier(&w, &[], 0), HealthTier::Fair);
+    }
+
+    #[test]
+    fn health_tier_core_floor_composes_with_points() {
+        // Core colors set the floor: yellow→Good, orange→Fair, red→Poor,
+        // purple→Critical, black→Deceased (death).
+        let mut w = HashMap::new();
+        w.insert(BodyPart::Head, BodyPartState::Yellow);
+        assert_eq!(derive_health_tier(&w, &[], 0), HealthTier::Good);
+        let mut w = HashMap::new();
+        w.insert(BodyPart::Neck, BodyPartState::Orange);
+        assert_eq!(derive_health_tier(&w, &[], 0), HealthTier::Fair);
+        let mut w = HashMap::new();
         w.insert(BodyPart::UpperTorso, BodyPartState::Red);
         assert_eq!(derive_health_tier(&w, &[], 0), HealthTier::Poor);
+        let mut w = HashMap::new();
+        w.insert(BodyPart::Head, BodyPartState::Purple);
+        assert_eq!(derive_health_tier(&w, &[], 0), HealthTier::Critical);
+        let mut w = HashMap::new();
+        w.insert(BodyPart::Neck, BodyPartState::Black);
+        assert_eq!(derive_health_tier(&w, &[], 0), HealthTier::Deceased);
+
+        // LowerTorso is NOT core (2026-08-20 ruling): a red lower torso is
+        // 4 points — Excellent on its own.
+        let mut w = HashMap::new();
+        w.insert(BodyPart::LowerTorso, BodyPartState::Red);
+        assert_eq!(derive_health_tier(&w, &[], 0), HealthTier::Excellent);
+
+        // Core parts contribute NO points: a purple head is a Critical FLOOR,
+        // never 8 points (else this would read Good).
+        let mut w = HashMap::new();
+        w.insert(BodyPart::Head, BodyPartState::Purple);
+        assert_eq!(derive_health_tier(&w, &[], 0), HealthTier::Critical);
+
+        // Worse of the two wins: yellow head + 12 pts → Fair (Chloe's worked
+        // example); red head + 8 pts → Poor (the floor wins); purple head +
+        // 24 pts → Critical.
+        let mut w = limb_wounds(3, BodyPartState::Red); // 12 pts
+        w.insert(BodyPart::Head, BodyPartState::Yellow);
+        assert_eq!(derive_health_tier(&w, &[], 0), HealthTier::Fair);
+        let mut w = limb_wounds(8, BodyPartState::Yellow); // 8 pts
+        w.insert(BodyPart::Head, BodyPartState::Red);
+        assert_eq!(derive_health_tier(&w, &[], 0), HealthTier::Poor);
+        let mut w = limb_wounds(3, BodyPartState::Purple); // 24 pts
         w.insert(BodyPart::Head, BodyPartState::Purple);
         assert_eq!(derive_health_tier(&w, &[], 0), HealthTier::Critical);
     }
 
     #[test]
-    fn health_tier_illness_overrides_healthy_grades_only() {
-        // Sick / Infected replace Excellent / Good; wounds win at Fair+.
+    fn health_tier_illness_overrides_every_grade() {
+        // (2026-08-20 same-day amendment) Sick/Infected outrank ALL wound
+        // tiers — Critical included; the "only while no worse than minor"
+        // gate is gone.
+        let mut w = HashMap::new();
+        w.insert(BodyPart::Head, BodyPartState::Purple);
         assert_eq!(
-            derive_health_tier(&HashMap::new(), &[tag("Feverish", "", 500)], 100),
+            derive_health_tier(&w, &[debuff("Feverish", 500)], 100),
             HealthTier::Sick
         );
         assert_eq!(
-            derive_health_tier(&HashMap::new(), &[tag("Wound Infection", "", 0)], 100),
-            HealthTier::Infected
+            derive_health_tier(
+                &limb_wounds(3, BodyPartState::Purple),
+                &[debuff("Poisoned", 500)],
+                100
+            ),
+            HealthTier::Sick
         );
         let mut w = HashMap::new();
-        w.insert(BodyPart::LeftHand, BodyPartState::Yellow);
+        w.insert(BodyPart::UpperTorso, BodyPartState::Red);
         assert_eq!(
-            derive_health_tier(&w, &[tag("Poisoned", "", 500)], 100),
+            derive_health_tier(&w, &[debuff("Wound Infection", 0)], 100),
+            HealthTier::Infected
+        );
+        // Death outranks illness — a destroyed core part reads Deceased
+        // even with an active fever.
+        let mut w = HashMap::new();
+        w.insert(BodyPart::Head, BodyPartState::Black);
+        assert_eq!(
+            derive_health_tier(&w, &[debuff("Feverish", 500)], 100),
+            HealthTier::Deceased
+        );
+    }
+
+    /// (2026-08-20 M3) Illness detection reads ONLY pure Debuff tags: kinded
+    /// lanes (a Plague Doctor disguise) and Buffs naming an illness ("Poison
+    /// Resistance") must not flip the vitals line or the DCs.
+    #[test]
+    fn illness_detection_requires_pure_debuff_lane() {
+        // A disguise whose label names the plague is a costume, not sickness.
+        assert_eq!(
+            derive_health_tier(&HashMap::new(), &[tag("Plague Doctor Outfit", "disguise", 0)], 100),
+            HealthTier::Excellent
+        );
+        // A buff ABOUT the illness ("Poison Resistance", "Fever Pitch Focus")
+        // is not suffering it.
+        assert_eq!(
+            derive_health_tier(&HashMap::new(), &[tag("Poison Resistance", "", 500)], 100),
+            HealthTier::Excellent
+        );
+        assert_eq!(
+            derive_health_tier(&HashMap::new(), &[tag("Fever Pitch Focus", "", 500)], 100),
+            HealthTier::Excellent
+        );
+        // …and the real thing still reads: a pure debuff fever is Sick.
+        assert_eq!(
+            derive_health_tier(&HashMap::new(), &[debuff("Feverish", 500)], 100),
             HealthTier::Sick
         );
-        w.insert(BodyPart::LeftUpperArm, BodyPartState::Orange);
-        assert_eq!(
-            derive_health_tier(&w, &[tag("Poisoned", "", 500)], 100),
-            HealthTier::Fair
-        );
+    }
+
+    #[test]
+    fn health_dc_mod_wound_grade_outranks_sick_label() {
+        // (2026-08-20) DCs keep wound priority at Poor+: a fever never
+        // makes a Critical body easier.
+        let crit = limb_wounds(3, BodyPartState::Purple); // 24 pts
+        assert_eq!(health_dc_mod(&crit, &[debuff("Feverish", 500)], 100), 4);
+        // Sick over a Fair body: the label's +2 is the worse mod — kept.
+        let fair = limb_wounds(3, BodyPartState::Red); // 12 pts
+        assert_eq!(health_dc_mod(&fair, &[debuff("Poisoned", 500)], 100), 2);
+        // Infected (+4) over anything.
+        assert_eq!(health_dc_mod(&HashMap::new(), &[debuff("Sepsis", 500)], 100), 4);
+        // Plain wound grade, no illness.
+        assert_eq!(health_dc_mod(&fair, &[], 100), 1);
+        // Deceased with a fever: death wins the DC too.
+        let mut dead = HashMap::new();
+        dead.insert(BodyPart::Head, BodyPartState::Black);
+        assert_eq!(health_dc_mod(&dead, &[debuff("Feverish", 500)], 100), 4);
     }
 
     #[test]
     fn health_tier_ignores_expired_and_ambiguous_labels() {
         // Expired illness no longer shows.
         assert_eq!(
-            derive_health_tier(&HashMap::new(), &[tag("Feverish", "", 100)], 100),
+            derive_health_tier(&HashMap::new(), &[debuff("Feverish", 100)], 100),
             HealthTier::Excellent
         );
-        // "ill"/"flu" match only as whole words: "Thrilling Performance" (a
-        // buff) and "Flute Melody" must not read as sick.
+        // "ill"/"flu" match only as whole words: even a DEBUFF reading
+        // "Thrilling Performance" / "Flute Melody" must not read as sick.
         assert_eq!(
-            derive_health_tier(&HashMap::new(), &[tag("Thrilling Performance", "", 500)], 100),
+            derive_health_tier(&HashMap::new(), &[debuff("Thrilling Performance", 500)], 100),
             HealthTier::Excellent
         );
         assert_eq!(
-            derive_health_tier(&HashMap::new(), &[tag("Flute Melody", "", 500)], 100),
+            derive_health_tier(&HashMap::new(), &[debuff("Flute Melody", 500)], 100),
             HealthTier::Excellent
         );
     }
 
     #[test]
     fn health_tier_infected_beats_sick_and_feeds_skill_dc() {
-        let tags = vec![tag("Feverish", "", 500), tag("Festering Wound", "", 500)];
+        let tags = vec![debuff("Feverish", 500), debuff("Festering Wound", 500)];
         assert_eq!(derive_health_tier(&HashMap::new(), &tags, 100), HealthTier::Infected);
         assert_eq!(HealthTier::Excellent.skill_dc_mod(), 0);
         assert_eq!(HealthTier::Good.skill_dc_mod(), 0);
         assert_eq!(HealthTier::Fair.skill_dc_mod(), 1);
-        assert_eq!(HealthTier::Poor.skill_dc_mod(), 2);
-        assert_eq!(HealthTier::Critical.skill_dc_mod(), 4);
         assert_eq!(HealthTier::Sick.skill_dc_mod(), 2);
-        assert_eq!(HealthTier::Infected.skill_dc_mod(), 3);
+        assert_eq!(HealthTier::Poor.skill_dc_mod(), 3);
+        assert_eq!(HealthTier::Critical.skill_dc_mod(), 4);
+        assert_eq!(HealthTier::Infected.skill_dc_mod(), 4);
+        assert_eq!(HealthTier::Deceased.skill_dc_mod(), 4);
     }
 
     #[test]
@@ -2247,6 +2536,15 @@ mod tests {
             expires_at,
             source: String::new(),
             kind: kind.to_string(),
+        }
+    }
+
+    /// Illness-eligible tag: a PURE Debuff (the 2026-08-20 M3 lane — only
+    /// kind-less Debuffs can read as Sick/Infected).
+    fn debuff(label: &str, expires_at: i64) -> StatusTag {
+        StatusTag {
+            polarity: Polarity::Debuff,
+            ..tag(label, "", expires_at)
         }
     }
 

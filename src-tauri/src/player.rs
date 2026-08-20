@@ -380,6 +380,11 @@ pub fn validate_player(p: &SavedPlayer) -> Result<(), String> {
     if has_control_chars(&p.name) {
         return Err("Name contains invalid control characters.".into());
     }
+    // The name rides a labeled LINE in the .player XML — a newline would
+    // forge a second block line and mutate across round-trips.
+    if p.name.contains('\n') || p.name.contains('\r') {
+        return Err("Name must be a single line.".into());
+    }
     for (label, val) in [
         ("Description", &p.description),
         ("Appearance", &p.appearance),
@@ -415,11 +420,19 @@ pub fn validate_player(p: &SavedPlayer) -> Result<(), String> {
         }
     }
     // Chip lists: clothing / gear / tools / weapons. Each entry must be a
-    // non-empty, bounded label.
-    validate_chip_list("Clothing", &p.clothing)?;
-    validate_chip_list("Gear", &p.gear)?;
-    validate_chip_list("Tools", &p.tools)?;
-    validate_chip_list("Weapons", &p.weapons)?;
+    // non-empty, bounded label. The v2 <inventory> sibling rides the same
+    // per-entry rule (the DTO path previously bypassed every cap —
+    // 2026-08-20 audit).
+    validate_chip_list("Clothing", p.clothing.as_deref().unwrap_or(&[]))?;
+    validate_chip_list("Gear", p.gear.as_deref().unwrap_or(&[]))?;
+    validate_chip_list("Tools", p.tools.as_deref().unwrap_or(&[]))?;
+    validate_chip_list("Weapons", p.weapons.as_deref().unwrap_or(&[]))?;
+    if let Some(inv) = &p.inventory {
+        validate_chip_list("Clothing", &inv.clothing)?;
+        validate_chip_list("Equipped", &inv.equipped)?;
+        validate_chip_list("Accessories", &inv.accessories)?;
+        validate_chip_list("Stored", &inv.stored)?;
+    }
     // Custom extensions: flat key→value string map. Keys are short ids;
     // values are short stats/amounts.
     if let Some(tags) = &p.custom_tags {
@@ -446,22 +459,20 @@ pub fn validate_player(p: &SavedPlayer) -> Result<(), String> {
     Ok(())
 }
 
-/// Validate a chip-list field (`clothing` / `gear` / `tools` / `weapons`):
-/// each entry non-empty after trim, ≤ `TRAIT_MAX`, no control chars. Shared
-/// so the four lists share one rule.
-fn validate_chip_list(label: &str, items: &Option<Vec<String>>) -> Result<(), String> {
-    if let Some(list) = items {
-        for c in list {
-            let c = c.trim();
-            if c.is_empty() {
-                return Err(format!("{} entries cannot be empty.", label));
-            }
-            if c.chars().count() > TRAIT_MAX {
-                return Err(format!("Each {} entry must be {} characters or fewer.", label, TRAIT_MAX));
-            }
-            if has_control_chars(c) {
-                return Err(format!("A {} entry contains invalid control characters.", label));
-            }
+/// Validate a chip-list field (`clothing` / `gear` / `tools` / `weapons` /
+/// the `<inventory>` sibling's lists): each entry non-empty after trim,
+/// ≤ `TRAIT_MAX`, no control chars. Shared so all the lists share one rule.
+fn validate_chip_list(label: &str, items: &[String]) -> Result<(), String> {
+    for c in items {
+        let c = c.trim();
+        if c.is_empty() {
+            return Err(format!("{} entries cannot be empty.", label));
+        }
+        if c.chars().count() > TRAIT_MAX {
+            return Err(format!("Each {} entry must be {} characters or fewer.", label, TRAIT_MAX));
+        }
+        if has_control_chars(c) {
+            return Err(format!("A {} entry contains invalid control characters.", label));
         }
     }
     Ok(())
@@ -654,6 +665,19 @@ pub fn parse_player_xml(xml: &str) -> anyhow::Result<SavedPlayer> {
         .and_then(|s| slugify_player_id(&s))
         .unwrap_or_default();
     p.id = id;
+    // Creation timestamp (preserved across rewrites; 0 when absent).
+    if let Some(ms) = root
+        .children()
+        .find(|c| c.is_element() && c.has_tag_name("metadata"))
+        .and_then(|m| {
+            m.children()
+                .find(|c| c.is_element() && c.has_tag_name("created_at_ms"))
+        })
+        .and_then(|n| crate::sim_card::node_text(n).trim().parse::<i64>().ok())
+        .filter(|ms| *ms > 0)
+    {
+        p.created_at_ms = ms;
+    }
 
     // identity line block.
     let identity_text = root
@@ -679,6 +703,12 @@ pub fn parse_player_xml(xml: &str) -> anyhow::Result<SavedPlayer> {
     p.ears = get("ears");
     p.tail = get("tail");
     p.horn = get("horn");
+    // Trait-capped flavor fields (2026-08-20 audit H2 round-trip):
+    // normalize_label maps "Job" → "occupation" (the shared drift table),
+    // "Weakness" → "weakness", "Distinguishing Marks" → "distinguishing_marks".
+    p.job = get("occupation");
+    p.weakness = get("weakness");
+    p.distinguishing_marks = get("distinguishing_marks");
 
     // persona line block — optional; Backstory rides as a persona label but
     // lands on the top-level field (the DTO's existing home).
@@ -727,6 +757,21 @@ pub fn parse_player_xml(xml: &str) -> anyhow::Result<SavedPlayer> {
         }
     }
 
+    // Legacy free-prose identity blocks (multi-paragraph — kept raw; the
+    // line-block grammar cannot carry them).
+    for (tag, field) in [("description", &mut p.description), ("appearance", &mut p.appearance)] {
+        if let Some(t) = root
+            .children()
+            .find(|c| c.is_element() && c.has_tag_name(tag))
+            .map(crate::sim_card::node_text)
+        {
+            let t = t.trim().to_owned();
+            if !t.is_empty() {
+                *field = Some(t);
+            }
+        }
+    }
+
     // <inventory> sibling (outside </player>).
     let inv_text = crate::sim_card::sibling_text(tail, &["inventory"]).unwrap_or_default();
     if !inv_text.trim().is_empty() {
@@ -764,11 +809,21 @@ pub fn render_player_xml(p: &SavedPlayer) -> String {
         p.id.trim().to_owned()
     };
     xml.push_str(&format!("  <id>{}</id>\n", xml_escape(&id)));
+    // Creation timestamp — round-tripped so `fable_player_write`'s
+    // preserve-existing logic actually sees a prior value (previously the
+    // stamp was minted fresh on EVERY write: the file never carried it).
+    if p.created_at_ms > 0 {
+        xml.push_str(&format!("  <created_at_ms>{}</created_at_ms>\n", p.created_at_ms));
+    }
     xml.push_str("  </metadata>\n");
 
     // <identity> — Name leads; trait lines (incl. conditionals) follow.
+    // The name is flattened to single-line: a newline inside it would
+    // forge a second line in the labeled block (the line-block grammar
+    // cannot carry it; the validator rejects new captures, the flatten
+    // covers legacy JSON + the boot migration).
     let mut body = String::new();
-    let name = p.name.trim();
+    let name = p.name.split_whitespace().collect::<Vec<_>>().join(" ");
     if !name.is_empty() {
         body.push_str(&format!("Name: {name}\n"));
     }
@@ -799,6 +854,17 @@ pub fn render_player_xml(p: &SavedPlayer) -> String {
             "  <persona><![CDATA[\n{}  ]]></persona>\n",
             cdata_body(&persona_body)
         ));
+    }
+
+    // Legacy free-prose identity fields (pre-v2 JSON): dedicated CDATA
+    // blocks — they can be multi-paragraph, which the labeled-line grammar
+    // cannot carry. Omitted entirely when empty (2026-08-20 audit H2:
+    // previously validated + parsed but never emitted, so the first XML
+    // write destroyed them).
+    for (tag, v) in [("description", &p.description), ("appearance", &p.appearance)] {
+        if let Some(s) = v.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            xml.push_str(&format!("  <{tag}><![CDATA[\n{}\n  ]]></{tag}>\n", cdata_body(s)));
+        }
     }
 
     if let Some(tags) = &p.custom_tags {
@@ -870,6 +936,13 @@ pub fn render_player_cache_block(p: &SavedPlayer) -> String {
             out.push_str(&format!("{label}: {value}\n"));
         }
     }
+    // Legacy free-prose identity paragraphs (same payload rule as the file:
+    // present → narrator reads them, absent → nothing rendered).
+    for (label, v) in [("Description", &p.description), ("Appearance", &p.appearance)] {
+        if let Some(s) = v.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            out.push_str(&format!("\n{label}:\n{s}\n"));
+        }
+    }
     if let Some(tags) = &p.custom_tags {
         if !tags.is_empty() {
             out.push('\n');
@@ -883,7 +956,11 @@ pub fn render_player_cache_block(p: &SavedPlayer) -> String {
 }
 
 /// The ordered identity-line view of a player (label order matches the sim
-/// identity block; the conditional traits ride as trailing lines).
+/// identity block; the conditional traits + the trait-capped flavor fields
+/// ride as trailing lines). Job/Weakness/Distinguishing Marks are identity
+/// payload — they ride BOTH the file and the narrator cache block
+/// (2026-08-20 audit H2: the fields were validated + parsed but never
+/// emitted, so the first XML write silently destroyed them).
 fn player_identity_lines(p: &SavedPlayer) -> Vec<(&'static str, String)> {
     let mut out = Vec::new();
     let mut push = |label: &'static str, v: &Option<String>| {
@@ -906,6 +983,9 @@ fn player_identity_lines(p: &SavedPlayer) -> Vec<(&'static str, String)> {
     push("Ears", &p.ears);
     push("Tail", &p.tail);
     push("Horn", &p.horn);
+    push("Job", &p.job);
+    push("Weakness", &p.weakness);
+    push("Distinguishing Marks", &p.distinguishing_marks);
     out
 }
 
@@ -930,6 +1010,12 @@ pub fn fold_legacy_lists(p: &SavedPlayer) -> SavedPlayer {
         let mut inv = PlayerInventory::default();
         if let Some(c) = &out.clothing {
             inv.clothing = c.iter().map(|s| s.trim().to_owned()).filter(|s| !s.is_empty()).collect();
+        }
+        // Legacy free-text accessories (the pre-v2 string field) split onto
+        // the v2 accessories rack (2026-08-20 audit H2: previously folded
+        // nowhere — the first XML write destroyed them).
+        if let Some(a) = &out.accessories {
+            inv.accessories = crate::sim_card::split_csv(a);
         }
         let mut stored: Vec<String> = Vec::new();
         for list in [&out.gear, &out.tools, &out.weapons] {
@@ -1411,5 +1497,71 @@ Clothing: White Cropped Tee, Gray Denim Shorts, White Knee-High Socks, White Sne
     #[test]
     fn player_xml_rejects_wrong_root() {
         assert!(parse_player_xml("<sim_card><id>x</id></sim_card>").is_err());
+    }
+
+    #[test]
+    fn player_xml_roundtrips_flavor_prose_stamp_and_accessories() {
+        // 2026-08-20 audit H2: job/weakness/marks/description/appearance were
+        // validated + parsed but never emitted — the first XML write silently
+        // destroyed them. They must now ride the file AND survive a round-trip
+        // (legacy accessories fold onto the v2 rack; the creation stamp
+        // persists instead of re-minting every write).
+        let mut sp = p("Alex");
+        sp.job = Some("Blacksmith".into());
+        sp.weakness = Some("prone to rage".into());
+        sp.distinguishing_marks = Some("scar over left eye".into());
+        sp.description = Some("Tall.\nSecond paragraph.".into());
+        sp.appearance = Some("Weathered hands.".into());
+        sp.accessories = Some("Copper Ring, Silver Chain".into());
+        sp.created_at_ms = 1724000000000;
+        let folded = fold_legacy_lists(&sp);
+        let back = parse_player_xml(&render_player_xml(&folded)).expect("round-trips");
+        assert_eq!(back.job.as_deref(), Some("Blacksmith"));
+        assert_eq!(back.weakness.as_deref(), Some("prone to rage"));
+        assert_eq!(back.distinguishing_marks.as_deref(), Some("scar over left eye"));
+        assert_eq!(back.description.as_deref(), Some("Tall.\nSecond paragraph."));
+        assert_eq!(back.appearance.as_deref(), Some("Weathered hands."));
+        assert_eq!(
+            back.inventory.as_ref().unwrap().accessories,
+            vec!["Copper Ring".to_string(), "Silver Chain".to_string()]
+        );
+        assert_eq!(back.created_at_ms, 1724000000000);
+        // The trait-capped flavor lines ride the narrator cache block too.
+        let block = render_player_cache_block(&folded);
+        assert!(block.contains("Job: Blacksmith\n"));
+        assert!(block.contains("Distinguishing Marks: scar over left eye\n"));
+        assert!(block.contains("Description:\nTall.\nSecond paragraph.\n"));
+    }
+
+    #[test]
+    fn player_xml_flattens_newline_names() {
+        // A newline inside a name would forge a second labeled line; the
+        // render flattens it so the round-trip is stable (legacy JSON names
+        // bypass the validator's single-line gate).
+        let sp = p("Alex\nthe  Bold");
+        let back = parse_player_xml(&render_player_xml(&sp)).expect("round-trips");
+        assert_eq!(back.name, "Alex the Bold");
+    }
+
+    #[test]
+    fn validate_rejects_multiline_name() {
+        let bad = p("Alex\nthe Bold");
+        assert!(validate_player(&bad).is_err());
+    }
+
+    #[test]
+    fn validate_caps_inventory_entries() {
+        let mut bad = p("Alex");
+        bad.inventory = Some(PlayerInventory {
+            stored: vec!["x".repeat(TRAIT_MAX + 1)],
+            ..Default::default()
+        });
+        assert!(validate_player(&bad).is_err());
+        // Empty-after-trim entries reject like chip lists.
+        bad.inventory = Some(PlayerInventory {
+            clothing: vec!["   ".into()],
+            ..Default::default()
+        });
+        assert!(validate_player(&bad).is_err());
     }
 }

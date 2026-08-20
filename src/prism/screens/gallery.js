@@ -11,7 +11,8 @@
 // prompt substring, handled Rust-side).
 //
 // DELETE IS PERMANENT (2026-08-18 ruling): no trash, no restore — the
-// row AND the PNG are removed the moment Delete is confirmed.
+// row AND the PNG are removed the moment Delete is confirmed (two-click
+// armed confirm — native confirm() is DEAD in the wry webview).
 //
 // Build/wire/teardown triplet (FABLE convention).
 // =============================================================
@@ -34,8 +35,41 @@ let rows = [];
 // Injected router hooks.
 let hooks = {};
 
-// Listeners (removed in teardown).
+// Listeners: the masonry element scroll is element-level (dies with the app
+// window); the window-level twin is removed in teardown + re-attached by
+// rewire (the OS desktop scrolls the same window — a closed Prism must not
+// paginate its gallery from the grave).
 let scrollHandler = null;
+let windowScrollHandler = null;
+
+// (2026-08-20 audit M10) PERMANENT delete is a TWO-CLICK armed confirm —
+// native confirm() is DEAD in the wry webview (the same hygiene rule every
+// other destructive control follows; see fable's backgrounds.js). The
+// first 🗑 arms (the button flips to the "Sure?" danger state + auto-
+// disarms after 5s), the second 🗑 executes. Only one armed button at a
+// time. Mirrors backgrounds.js's armed-delete pattern.
+let armedDelete = null;
+let armTimer = 0;
+const ARM_DISARM_MS = 5000;
+
+function disarmDelete() {
+  clearTimeout(armTimer);
+  if (armedDelete) {
+    armedDelete.classList.remove('is-armed');
+    armedDelete.textContent = '🗑';
+    armedDelete.title = 'Delete';
+    armedDelete = null;
+  }
+}
+
+function armDelete(btn) {
+  disarmDelete();
+  btn.classList.add('is-armed');
+  btn.textContent = 'Sure?';
+  btn.title = 'Click again to permanently delete';
+  armedDelete = btn;
+  armTimer = setTimeout(disarmDelete, ARM_DISARM_MS);
+}
 
 export function buildEl(routerHooks = {}) {
   hooks = routerHooks;
@@ -77,12 +111,14 @@ export function wire(rootEl) {
       t = setTimeout(() => onSearch(rootEl, search.value), 350);
     });
   }
-  // Infinite scroll.
-  scrollHandler = () => onScroll(rootEl);
+  // Infinite scroll: the masonry element + the window share one handler;
+  // the window-level attach lives in rewire so teardown/open cycles stay
+  // balanced.
   const masonry = rootEl.querySelector('[data-masonry]');
   if (masonry) {
+    scrollHandler = () => onScroll(rootEl);
     masonry.addEventListener('scroll', scrollHandler);
-    window.addEventListener('scroll', scrollHandler, { passive: true });
+    rewire(rootEl);
   }
   // Delegated click on the masonry (thumbnail open + quick actions).
   if (masonry) {
@@ -92,11 +128,22 @@ export function wire(rootEl) {
   refresh(rootEl);
 }
 
+// teardown (closePrism): remove the window-level scroll listener + disarm
+// any armed delete (its 5s timer must not outlive the session). Idempotent.
 export function teardown() {
-  if (scrollHandler) {
-    window.removeEventListener('scroll', scrollHandler);
-    scrollHandler = null;
+  if (windowScrollHandler) {
+    window.removeEventListener('scroll', windowScrollHandler);
+    windowScrollHandler = null;
   }
+  disarmDelete();
+}
+
+// Re-attach the window-level scroll listener teardown removed (openPrism on
+// reopen). Idempotent — a no-op while already attached.
+export function rewire(rootEl) {
+  if (windowScrollHandler) return;
+  windowScrollHandler = () => onScroll(rootEl);
+  window.addEventListener('scroll', windowScrollHandler, { passive: true });
 }
 
 // ── Data ────────────────────────────────────────────────────────────────
@@ -142,6 +189,9 @@ function renderMasonry(rootEl) {
   const masonry = rootEl.querySelector('[data-masonry]');
   const empty = rootEl.querySelector('.prism-gallery-empty');
   if (!masonry) return;
+  // A re-render replaces every tile — reset any armed delete (its button
+  // element is gone; only the timer + ref would linger).
+  disarmDelete();
   if (rows.length === 0) {
     masonry.innerHTML = '';
     if (empty) empty.hidden = false;
@@ -203,7 +253,9 @@ async function onMasonryClick(rootEl, e) {
     await onQuickAction(rootEl, id, act, actBtn);
     return;
   }
-  // No action button → open the metadata panel.
+  // No action button → disarm any armed delete (a click elsewhere cancels
+  // the confirm) + open the metadata panel.
+  disarmDelete();
   openMetadata(rootEl, id);
 }
 
@@ -218,9 +270,14 @@ async function onQuickAction(rootEl, id, act, btn) {
       btn.textContent = now ? '★' : '☆';
       btn.closest('.prism-tile').classList.toggle('is-favorite', now);
     } else if (act === 'delete') {
-      // PERMANENT: no trash, no undo — confirm, then the row AND the PNG
-      // are gone. One confirm guards the irreversible click.
-      if (!confirm('Permanently delete this image? This cannot be undone.')) return;
+      // PERMANENT: no trash, no undo — the row AND the PNG are gone the
+      // moment the SECOND click confirms (the two-click armed confirm
+      // above; native confirm() is dead in the wry webview).
+      if (!btn.classList.contains('is-armed')) {
+        armDelete(btn);
+        return;
+      }
+      disarmDelete();
       await galleryDelete(id);
       await refresh(rootEl);
     } else if (act === 'compose') {

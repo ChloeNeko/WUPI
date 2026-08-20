@@ -325,11 +325,15 @@ pub fn list_saves(fable_root: &Path, card_id: &str) -> std::io::Result<Vec<SaveM
 
 /// Read a save's metadata from a capped byte prefix without parsing the
 /// session/schema payloads. Cuts the text at the first unescaped
-/// `"session"` key (a needle that cannot occur inside a JSON string value:
-/// every `"` inside a value is backslash-escaped, breaking the needle at
-/// both ends), trims the trailing comma, closes the object, and
-/// deserializes the flat header. Returns `None` whenever any step doesn't
-/// line up — the caller falls back to a full parse.
+/// `"session":` KEY (a needle that cannot occur inside a JSON string
+/// value: every `"` inside a value is backslash-escaped, breaking the
+/// needle at both ends, and a VALUE that is exactly "session" is followed
+/// by `,`/`}` — never `:` — so the colon terminator is what makes the
+/// needle key-shaped; the bare `"session"` needle matched a header value
+/// named "session" and forced the full-parse fallback, 2026-08-20 audit
+/// L3), trims the trailing comma, closes the object, and deserializes the
+/// flat header. Returns `None` whenever any step doesn't line up — the
+/// caller falls back to a full parse.
 fn read_save_header(path: &Path) -> Option<(String, String, i64, bool, usize)> {
     use std::io::Read;
     const PREFIX_CAP: usize = 16 * 1024;
@@ -342,13 +346,13 @@ fn read_save_header(path: &Path) -> Option<(String, String, i64, bool, usize)> {
             break;
         }
         buf.extend_from_slice(&chunk[..n]);
-        // Stop as soon as the prefix contains the session marker.
-        if buf.windows(9).any(|w| w == b"\"session\"") || buf.len() >= PREFIX_CAP {
+        // Stop as soon as the prefix contains the session key marker.
+        if buf.windows(10).any(|w| w == b"\"session\":") || buf.len() >= PREFIX_CAP {
             break;
         }
     }
     let text = String::from_utf8_lossy(&buf);
-    let cut = text.find("\"session\"")?;
+    let cut = text.find("\"session\":")?;
     let mut prefix = text[..cut].trim_end().to_string();
     if prefix.ends_with(',') {
         prefix.pop();

@@ -2019,6 +2019,13 @@ function closeFable() {
   // teardown is best-effort in try; a throw there can't strand the OS.
   // (Boundary audit gap #2, 2026-07-23.)
   try {
+    // (2026-08-20 audit) Same kill-any-creator-turn contract as
+    // exitFlowToTitle/exitLoadToTitle: closeFable is the LAST teardown every
+    // exit funnels through, so no future path through it can leave a creator
+    // GLM turn streaming over the OS home. Currently unreachable from a
+    // live creator run (the flow's own ⌂ sinks fire first) — belt +
+    // suspenders. No-op when idle (abortCreatorTurn guards !root itself).
+    abortCreatorTurn(screens['creator-chat']);
     // Cancel the fog intro FIRST. If the user clicks EXIT during the 3s fog
     // hold, this tears down the fog overlay + stops the wind audio so the
     // next open isn't stranded with a leftover fog node or orphan audio.

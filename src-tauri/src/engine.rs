@@ -415,36 +415,43 @@ struct DecodeTelemetry {
 }
 
 impl EngineRuntime {
-    /// Coherence-preserving cancel: micro-decode the channel closer into the
+    /// Coherence-preserving cancel: micro-decode the protocol closer into the
     /// KV cache so the resident state ends at a clean turn boundary.
     ///
-    /// When `chat_stop` fires mid-generation, the model's output is left with
-    /// an open `<|channel>...` block and no closing `<channel|>`. Persisting
+    /// When generation stops with a span still open (`chat_stop`
+    /// mid-generation, `max_tokens` exhaustion, or an EOG that landed
+    /// mid-channel), the model's output is left with an open
+    /// `<|channel>...` / `<|tool_call>...` block and no closer. Persisting
     /// that raw verbatim (the original cancel bug) injects a malformed turn
     /// protocol into the next prompt → the model emits degenerate markers →
     /// StreamFilter strips them → `content_len=0` empty-line spam. Dropping
-    /// raw_output (Option 1b) avoids the corruption but breaks cache coherence
-    ///: every post-cancel turn cold-resets. Unacceptable for roleplay.
+    /// raw_output avoids the corruption but breaks cache coherence: the
+    /// post-stop turn cold-resets.
     ///
-    /// This fix takes the third path: **actually decode the closer tokens into
-    /// the KV cache**, so the cache and `raw_out` agree byte-for-byte that the
-    /// turn ended cleanly. Next turn's `common_prefix_len` hits the full prefix
-    ///: delta-prefill fast path preserved, zero stutter. The cost is 1-3 extra
-    /// forward passes at cancel time: microseconds, paid once.
+    /// This fix takes the third path: **actually decode the closer tokens
+    /// into the KV cache**, so the cache and `raw_out` agree byte-for-byte
+    /// that the turn ended cleanly. Next turn's `common_prefix_len` hits the
+    /// full prefix: delta-prefill fast path preserved, zero stutter. The
+    /// cost is 1-3 extra forward passes at stop time: microseconds, paid
+    /// once.
     ///
-    /// # The closer is always `<channel|>`
+    /// # Which closer
     ///
-    /// The Gemma4 protocol is sequential, not nested: exactly one channel is
-    /// open at a time (thought, then reply). The closer for ANY open channel
-    /// is `<channel|>`. No state machine needed to detect which channel; just
-    /// detect whether ANY channel is still open.
+    /// The Gemma4 protocol is sequential, not nested: at most one span is
+    /// open at a time. The LAST opener (channel OR tool_call — the two
+    /// spans the model can open; 2026-08-20 audit M1: the channel-only scan
+    /// never saw an open `<|tool_call>`, persisting it unclosed) determines
+    /// the closer literal: `<channel|>` for a channel, `<tool_call|>` for a
+    /// tool call.
     ///
     /// # Returns
     ///
     /// - `Ok(true)`: closer was appended (micro-decode ran).
-    /// - `Ok(false)`: skipped: raw_out empty, already cleanly closed, or the
-    ///   literal couldn't be tokenized (defensive: caller should fall back
-    ///   to dropping raw_output, accepting the cold-reset).
+    /// - `Ok(false)`: skipped: raw_out empty, no opener, or the last span
+    ///   is already closed (clean boundary).
+    /// - `Err`: a span IS open but the closer couldn't be decoded — the
+    ///   caller must fall back to dropping raw_output, accepting the
+    ///   cold-reset.
     fn append_channel_closer(
         &mut self,
         raw_out: &mut String,
@@ -457,35 +464,42 @@ impl EngineRuntime {
             return Ok(false);
         }
 
-        // Detect whether any channel is still open. Scan for the last
-        // `<|channel>` opener; if a `<channel|>` follows it, the channel is
-        // already closed (edge case 2: cancel landed at a clean boundary).
-        let last_open = raw_out.rfind("<|channel>");
-        match last_open {
-            None => {
-                // No opener at all: the model replied without using the
-                // channel protocol (some Plain-family turns do this). Nothing
-                // to close.
-                return Ok(false);
-            }
-            Some(open_idx) => {
-                let after_open = &raw_out[open_idx..];
-                if after_open.contains("<channel|>") {
-                    // The last opened channel is already closed. Clean boundary.
-                    return Ok(false);
+        // Detect whether any protocol span is still open. Sequential
+        // protocol — the LAST opener wins; if its closer follows it, we're
+        // already at a clean boundary (edge case 2: stop landed cleanly).
+        const SPANS: [(&str, &str); 2] = [
+            ("<|channel>", "<channel|>"),
+            ("<|tool_call>", "<tool_call|>"),
+        ];
+        let mut open: Option<(usize, &str)> = None;
+        for (opener, closer) in SPANS {
+            if let Some(idx) = raw_out.rfind(opener) {
+                match open {
+                    Some((i, _)) if idx <= i => {}
+                    _ => open = Some((idx, closer)),
                 }
-                // Fall through: channel is open, we need to close it.
             }
+        }
+        let Some((open_idx, closer_lit)) = open else {
+            // No opener at all: the model replied without using the
+            // channel protocol (some Plain-family turns do this). Nothing
+            // to close.
+            return Ok(false);
+        };
+        if raw_out[open_idx..].contains(closer_lit) {
+            // The last opened span is already closed. Clean boundary.
+            return Ok(false);
         }
 
         // Tokenize the closer. AddBos::Never: we're appending, not starting.
         let closer_tokens = self
             .model
-            .str_to_token("<channel|>", AddBos::Never)
+            .str_to_token(closer_lit, AddBos::Never)
             .map_err(|e| anyhow::anyhow!("tokenize closer: {e:?}"))?;
         if closer_tokens.is_empty() {
-            tracing::warn!("str_to_token(\"<channel|>\") returned empty: skipping closer");
-            return Ok(false);
+            // Err, not Ok(false): the span is open — the caller must drop
+            // raw_output rather than persist the malformed turn.
+            anyhow::bail!("str_to_token({closer_lit:?}) returned empty");
         }
 
         // Micro-decode each closer token into the cache. Same shape as the
@@ -507,12 +521,13 @@ impl EngineRuntime {
         // `token_to_piece` can return empty for special-control tokens, which
         // would desync raw_out from the cache. The literal is what the model's
         // protocol expects and what render_prompt will re-emit next turn.
-        raw_out.push_str("<channel|>");
+        raw_out.push_str(closer_lit);
 
         tracing::info!(
+            closer = closer_lit,
             closer_tokens = closer_tokens.len(),
             new_n_cur = *n_cur,
-            "appended channel closer via micro-decode (coherence-preserving cancel)"
+            "appended protocol closer via micro-decode (coherence-preserving boundary)"
         );
         Ok(true)
     }
@@ -936,33 +951,34 @@ impl EngineRuntime {
 
         let generation_elapsed = loop_start.elapsed();
 
-        // --- Coherence-preserving cancel (Path B, 2026-07-13) ---
-        // If the decode loop broke because chat_stop fired mid-generation, the
-        // model's output is left with an open `<|channel>...` block. Append
-        // the canonical closer `<channel|>` via a real micro-decode into the
-        // KV cache so the resident state ends at a clean turn boundary. This
-        // keeps cache coherence intact across cancels → next turn's delta-
-        // prefill fast path fires instead of cold-resetting → no stutter.
+        // --- Coherence-preserving boundary (Path B, 2026-07-13) ---
+        // If the decode loop broke with a protocol span still open — cancel
+        // mid-generation, max_tokens exhaustion, or an EOG that landed
+        // mid-channel (2026-08-20 audit L1: the old `if cancelled` gate let
+        // an exhausted open channel persist malformed) — append the matching
+        // closer via a real micro-decode into the KV cache so the resident
+        // state ends at a clean turn boundary. This keeps cache coherence
+        // intact → next turn's delta-prefill fast path fires instead of
+        // cold-resetting → no stutter. No-ops on a clean raw.
         //
         // Must run BEFORE the filter flush + parse_output so downstream sees
-        // the complete, closed channel structure.
+        // the complete, closed span structure.
         let mut closer_appended = false;
-        if cancelled {
-            match self.append_channel_closer(
-                &mut raw_out,
-                &mut tokens_generated,
-                &mut n_cur,
-                &mut step_batch,
-            ) {
-                Ok(true) => closer_appended = true,
-                Ok(false) => {
-                    // Skipped (empty raw, already clean, or couldn't tokenize).
-                    // Fall back to dropping raw_output to avoid persisting a
-                    // malformed turn: accepts a cold-reset next turn.
-                }
-                Err(e) => {
-                    tracing::warn!(error = %e, "append_channel_closer failed; dropping raw_output");
-                }
+        let mut closer_failed = false;
+        match self.append_channel_closer(
+            &mut raw_out,
+            &mut tokens_generated,
+            &mut n_cur,
+            &mut step_batch,
+        ) {
+            Ok(true) => closer_appended = true,
+            Ok(false) => {
+                // Nothing to close (empty raw, no opener, or already clean):
+                // the raw is structurally valid as-is — persist it.
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "append_channel_closer failed; dropping raw_output");
+                closer_failed = true;
             }
         }
 
@@ -988,15 +1004,15 @@ impl EngineRuntime {
         // assistant Message. The formatter re-renders from this next turn so
         // the rendered tokens match the KV cache exactly (no re-prefill).
         //
-        // Cancel handling (Path B, 2026-07-13): the coherence-preserving
-        // closer-append above made raw_out structurally valid (ends with
-        // `<channel|>`), so it's safe to persist verbatim: cache coherence
-        // is preserved and next turn's delta-prefill fast path fires. If the
-        // closer was NOT appended (skipped or errored: the rare fallback),
-        // drop raw_output to avoid persisting a malformed turn; that turn
-        // cold-resets next time, which is the safe degradation.
+        // The coherence-preserving closer-append above made raw_out
+        // structurally valid (every open span closed), so it's safe to
+        // persist verbatim — cache coherence is preserved and next turn's
+        // delta-prefill fast path fires, INCLUDING a cleanly-stopped partial
+        // (a raw with no open span needs no closer). Only a FAILED close
+        // (Err: a span is open but couldn't be decoded shut) drops
+        // raw_output; that turn cold-resets next time, the safe degradation.
         let mut parsed = self.formatter.parse_output(&raw_out);
-        parsed.raw = if cancelled && !closer_appended {
+        parsed.raw = if closer_failed {
             String::new()
         } else {
             raw_out

@@ -2502,7 +2502,13 @@ const dropdownMenu = document.getElementById('dropdownMenu');
           const lock = n.secure ? '🔒 ' : '';
           // No signal %: it was noisy and the same network appeared multiple
           // times at different strengths. SSID-only now (backend dedups).
-          btn.innerHTML = `<span class="status-dot"></span>${lock}${n.ssid}`;
+          // SSIDs are proximity-attacker-controlled — DOM-build with a text
+          // node, never innerHTML (no CSP on wupi.html: markup in an SSID
+          // would execute in the page origin).
+          const dot = document.createElement('span');
+          dot.className = 'status-dot';
+          btn.appendChild(dot);
+          btn.appendChild(document.createTextNode(`${lock}${n.ssid}`));
           btn.addEventListener('click', (ev) => {
             ev.stopPropagation();
             if (!n.secure) {
@@ -2637,7 +2643,12 @@ const dropdownMenu = document.getElementById('dropdownMenu');
           const btn = document.createElement('button');
           btn.className = 'dropdown-item device-opt';
           const state = d.connected ? '🟢 ' : (d.paired ? '⚪ ' : '');
-          btn.innerHTML = `<span class="status-dot ${d.paired ? 'connected' : ''}"></span>${state}${d.name}`;
+          // Bluetooth device names are attacker-influenced (pairing names)
+          // — text node, never innerHTML (same no-CSP rule as the SSIDs).
+          const dot = document.createElement('span');
+          dot.className = 'status-dot' + (d.paired ? ' connected' : '');
+          btn.appendChild(dot);
+          btn.appendChild(document.createTextNode(`${state}${d.name}`));
           if (!d.paired) {
             btn.addEventListener('click', (ev) => {
               ev.stopPropagation();
@@ -2702,7 +2713,12 @@ const dropdownMenu = document.getElementById('dropdownMenu');
         for (const d of devs) {
           const btn = document.createElement('button');
           btn.className = 'dropdown-item';
-          btn.innerHTML = `<span class="status-dot"></span>${d.name}`;
+          // Discovered BT names are raw proximity input — text node, not
+          // innerHTML (same no-CSP rule as the SSIDs above).
+          const dot = document.createElement('span');
+          dot.className = 'status-dot';
+          btn.appendChild(dot);
+          btn.appendChild(document.createTextNode(d.name));
           btn.addEventListener('click', (ev) => {
             ev.stopPropagation();
             btn.textContent = 'Pairing…';
@@ -2799,7 +2815,12 @@ const dropdownMenu = document.getElementById('dropdownMenu');
         for (const o of outs) {
           const btn = document.createElement('button');
           btn.className = 'dropdown-item output-option' + (o.is_default ? ' selected' : '');
-          btn.innerHTML = `<span class="status-dot ${o.is_default ? 'connected' : ''}"></span>${o.name}`;
+          // Output names come from the OS audio endpoints — text node, not
+          // innerHTML (same no-CSP rule as the SSIDs/BT names above).
+          const dot = document.createElement('span');
+          dot.className = 'status-dot' + (o.is_default ? ' connected' : '');
+          btn.appendChild(dot);
+          btn.appendChild(document.createTextNode(o.name));
           if (!o.is_default) {
             btn.addEventListener('click', (ev) => {
               ev.stopPropagation();
@@ -3562,6 +3583,21 @@ const dropdownMenu = document.getElementById('dropdownMenu');
     // module, so it's always available (no race with a dynamic import).
     let generating = false;
     let emptyShown = true;
+    // (2026-08-20 audit M12) Turn EPOCH — the same firewall the Fable
+    // narrator (engine/narrator.js turnEpoch) and the creator chat
+    // (_creatorEpoch) use. Every send() captures the value at entry; its
+    // channel events + the invoke's .catch/.finally backstop self-ignore
+    // once the epoch moves on (a newer turn started, or the window closed
+    // mid-turn). Kills the race where a stopped turn's late-arriving `done`
+    // — or the .finally backstop resolving after a fast replacement send —
+    // cleared the NEW turn's busy flag (composer unlocked mid-stream).
+    // The soft stop (Enter on an empty field) does NOT bump: the backend's
+    // terminal `done` (emitted even after cancel, with the partial text) is
+    // the only finalizer of the partial bubble, and it flows through the
+    // still-current epoch — mirroring narrator.js's stopFableTurn. The
+    // close hook DOES bump + resets: its view is wiped on reopen, so there
+    // is nothing left to finalize (the resetNarrator shape).
+    let turnEpoch = 0;
 
     function showEmpty() {
       if (!emptyShown) return;
@@ -3650,6 +3686,7 @@ const dropdownMenu = document.getElementById('dropdownMenu');
       const bubble = startWupiBubble();
       let streamed = '';
       setGenerating(true);
+      const myEpoch = ++turnEpoch;
 
       // No client-side pacing: chunks write straight to the bubble at the
       // backend's natural ~30 tok/s speed. The backend's StreamFilter
@@ -3660,6 +3697,11 @@ const dropdownMenu = document.getElementById('dropdownMenu');
       const channel = new Channel();
       let toolChip = null;  // tool-call status chip, created on first tool_call
       channel.onmessage = (e) => {
+        // (2026-08-20 audit M12) Events from THIS turn only — once the epoch
+        // moved on (a replacement send, the window closed mid-turn), a stale
+        // channel event self-ignores instead of clearing the new turn's busy
+        // flag or finalizing a detached bubble.
+        if (myEpoch !== turnEpoch) return;
         if (!e) return;
         if (e.type === 'chunk') {
           streamed += e.text || '';
@@ -3695,6 +3737,9 @@ const dropdownMenu = document.getElementById('dropdownMenu');
 
       invoke('chat_send', { text, onEvent: channel })
         .catch((err) => {
+          // (2026-08-20 audit M12) Epoch-guarded: a rejection landing after a
+          // replacement turn started must not kill the new turn's state.
+          if (myEpoch !== turnEpoch) return;
           if (generating) {
             setGenerating(false);
             bubble.remove();
@@ -3707,6 +3752,10 @@ const dropdownMenu = document.getElementById('dropdownMenu');
           // on "Press Enter to stop" forever (generating never cleared, so
           // send() dead-ended). On the normal path `done` has already
           // finalized; the catch path above cleared the flag too.
+          // (2026-08-20 audit M12) Epoch-guarded: the old turn's resolution
+          // can land after a fast replacement send — an unguarded backstop
+          // here cleared the NEW turn's busy flag mid-stream.
+          if (myEpoch !== turnEpoch) return;
           if (!generating) return;
           setGenerating(false);
           if (streamed) finalizeWupiBubble(bubble, streamed);
@@ -3756,8 +3805,15 @@ const dropdownMenu = document.getElementById('dropdownMenu');
     // invisibly (self-healing only when `done` finally arrived). Mirror the
     // Fable drawer close paths — stop the backend turn, let the .finally
     // backstop finalize the (detached) UI state.
+    // (2026-08-20 audit M12) The epoch bump + busy reset are the
+    // resetNarrator shape: the late `done`/backstop of the stopped turn
+    // self-ignores (its bubble dies with the wiped view on reopen), and the
+    // composer can't stay latched on "Press Enter to stop" until that late
+    // terminal arrives.
     windowCloseHooks.set('chat', () => {
       if (generating) {
+        turnEpoch++;
+        setGenerating(false);
         invoke('chat_stop').catch((err) => console.warn('[Wupi] chat_stop (close) failed', err));
       }
     });

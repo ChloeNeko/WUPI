@@ -940,13 +940,21 @@ pub fn reload_shared_model(path: &std::path::Path, n_gpu_layers: u32) -> anyhow:
 
 /// Internal: store a freshly-leaked model into the slot. Called by
 /// `spawn_load` at first boot (replacing the old `SHARED_MODEL.set(model_ref)`).
-/// Idempotent-overwrite: if a model is somehow already resident (shouldn't
-/// happen — first boot only), the prior one is leaked permanently (logged).
+/// If a model is somehow already resident (shouldn't happen — first boot
+/// only), the prior one is RECLAIMED + error-logged — the same discipline
+/// as `reload_shared_model` (2026-08-20 audit L8: the old path silently
+/// leaked the resident model where the doc claimed a log).
 fn set_shared_model(model_ref: &'static LlamaModel) {
     let ptr = std::ptr::NonNull::new(model_ref as *const LlamaModel as *mut LlamaModel)
         .expect("model ref is non-null");
     let mut g = SHARED_MODEL.write().expect("SHARED_MODEL lock not poisoned at first boot");
-    *g = Some(SharedModelPtr(ptr));
+    if let Some(prior) = g.replace(SharedModelPtr(ptr)) {
+        tracing::error!("set_shared_model: prior model was still resident — reclaiming it (leak prevented; investigate the caller's load ordering)");
+        // SAFETY: the pointer came from the same Box::leak path in
+        // set_shared_model/reload_shared_model; reclaiming frees the VRAM.
+        let boxed: Box<LlamaModel> = unsafe { Box::from_raw(prior.0.as_ptr()) };
+        drop(boxed);
+    }
 }
 
 impl LlamaCppBackend {

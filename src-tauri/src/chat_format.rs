@@ -218,27 +218,33 @@ impl ChatFormat for Gemma4Format {
             out.push('\n');
 
             if role == "model" {
-                // Cache-coherent re-render (Bug #3): when raw_output is present,
-                // render it verbatim so the token sequence matches what's
+                // Cache-coherent re-render (Bug #3): when raw_output is
+                // present, re-render it so the token sequence matches what's
                 // resident in the KV cache. Without this, the cleaned content
-                // diverges from the cache and forces a full re-prefill each turn.
-                // Legacy turns (no raw_output) fall back to strip_thinking.
-                // Tool-call turns (raw contains `<|tool_call>`) are included
-                // automatically — the markers are part of the verbatim raw.
+                // diverges from the cache and forces a full re-prefill each
+                // turn. Tool-call turns (raw contains `<|tool_call>`) are
+                // included automatically — the markers are part of the
+                // verbatim raw.
                 //
-                // ALWAYS-ON THINKING carve-out: a thought-enabled turn's
-                // raw_output carries its own `<|channel>thought ... <channel|>`
-                // block. Re-rendering that verbatim would feed the model's past
-                // reasoning back to it as literal content next turn — context
-                // pollution. So ALWAYS strip the thought from the re-rendered
-                // raw (thinking is always on; the strip must be too). Trade-off:
-                // the rendered tokens no longer byte-match the resident KV → the
-                // structural-divergence guard fires → thought-bearing chat turns
-                // cold-reset (full re-prefill). Accepted cost (Memory-enabled
-                // turns already pay it; §3). The narrative/referee precision the
-                // thought channel buys is worth one cold-reset per turn.
+                // (2026-08-20 audit M2) The strip is VERBATIM-PRESERVING
+                // (`strip_thought_blocks`): only complete thought spans are
+                // removed; `<|channel>reply` markers, closers, tool markers,
+                // and edge whitespace pass through byte-exact. The old
+                // full-marker strip + trim re-rendered a DIFFERENT byte
+                // sequence than the one resident in KV — every marker-bearing
+                // turn (and every closer-append from a stopped turn)
+                // cold-resetted, silently voiding the delta path. The §3
+                // invariant still holds: the model never sees its own prior
+                // thought, complete or partial.
+                //
+                // Thought-bearing turns are the accepted exception: stripping
+                // the thought diverges from the resident KV by design → the
+                // structural-divergence guard fires → cold-reset (§3).
+                // Legacy turns (no raw_output) fall back to strip_thinking —
+                // their content is already cleaned; markers there are
+                // training residue, not cache payload.
                 if !m.raw_output.is_empty() {
-                    out.push_str(&strip_thinking(&m.raw_output));
+                    out.push_str(&strip_thought_blocks(&m.raw_output));
                 } else {
                     out.push_str(&strip_thinking(&m.content));
                 }
@@ -387,6 +393,43 @@ fn strip_thinking(text: &str) -> String {
         }
     }
     out.trim().to_string()
+}
+
+/// The cache-coherent sibling of [`strip_thinking`]: remove ONLY complete
+/// `<|channel>thought ... <channel|>` spans (plus any UNCLOSED trailing
+/// thought span — §3: the model never sees its own prior thought, complete
+/// or not) and keep every other byte VERBATIM — `<|channel>reply` markers,
+/// `<channel|>` closers, tool markers, and edge whitespace included, no
+/// final trim. Used for the raw_output re-render path (render_prompt's
+/// model turns): the KV cache holds the marker-bearing tokens the model
+/// actually generated, so re-rendering them stripped or trimmed produced a
+/// different byte sequence → token-level prefix divergence → cold reset on
+/// every marker-bearing turn (2026-08-20 audit M2). Strip only what the
+/// §3 invariant forbids; keep everything else byte-exact.
+fn strip_thought_blocks(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(idx) = rest.find("<|channel>") {
+        let (before, after) = rest.split_at(idx);
+        out.push_str(before);
+        let after_open = &after["<|channel>".len()..];
+        let (name, body) = split_channel_word(after_open);
+        if name == "thought" {
+            // Drop the span through its closer; an unclosed thought runs to
+            // end-of-string (a stopped thought never re-enters the prompt).
+            match body.find("<channel|>") {
+                Some(c) => rest = &body[c + "<channel|>".len()..],
+                None => rest = "",
+            }
+        } else {
+            // Not a thought: keep the opener verbatim and continue scanning
+            // after it (its closer, if any, survives untouched).
+            out.push_str("<|channel>");
+            rest = after_open;
+        }
+    }
+    out.push_str(rest);
+    out
 }
 
 /// Extract ONLY the thought channel from Gemma4 protocol-wrapped model output,
@@ -1081,6 +1124,48 @@ mod tests {
         assert!(
             out.contains("visible reply"),
             "reply must survive the strip, got: {out}"
+        );
+    }
+
+    #[test]
+    fn gemma4_strip_thought_blocks_is_verbatim_preserving() {
+        // Complete thought span dropped; every other byte survives exact —
+        // reply markers, closers, edge whitespace, tool markers (the
+        // cache-coherent re-render; 2026-08-20 audit M2).
+        assert_eq!(
+            strip_thought_blocks("<|channel>thought\nsecret\n<channel|>visible"),
+            "visible"
+        );
+        assert_eq!(
+            strip_thought_blocks("<|channel>reply\nHello!<channel|>"),
+            "<|channel>reply\nHello!<channel|>"
+        );
+        assert_eq!(strip_thought_blocks("  edge whitespace  "), "  edge whitespace  ");
+        // An unclosed trailing thought never re-enters (stopped thought).
+        assert_eq!(strip_thought_blocks("ok<|channel>thought\npartial"), "ok");
+        // A "thoughtful" run is NOT a thought channel (#43 semantics).
+        assert_eq!(
+            strip_thought_blocks("<|channel>thoughtful notes<channel|>"),
+            "<|channel>thoughtful notes<channel|>"
+        );
+        assert_eq!(
+            strip_thought_blocks("<|tool_call>call:x{}<tool_call|>"),
+            "<|tool_call>call:x{}<tool_call|>"
+        );
+    }
+
+    #[test]
+    fn gemma4_raw_rerender_keeps_channel_markers_for_cache_coherence() {
+        // M2: the raw re-render must keep reply markers byte-exact — the KV
+        // cache holds the marker-bearing tokens; a stripped re-render
+        // cold-resets every marker-bearing turn.
+        let f = Gemma4Format;
+        let mut m = msg("assistant", "Hello!");
+        m.raw_output = "<|channel>reply\nHello!<channel|>".into();
+        let out = f.render_prompt("", &[m], &[], None, None, false);
+        assert!(
+            out.contains("<|channel>reply\nHello!<channel|>"),
+            "raw re-render must be byte-exact, got: {out}"
         );
     }
 

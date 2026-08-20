@@ -10,11 +10,16 @@
 // Lifecycle contract (the GUARANTEE: zero memory leaks, zero background
 // listeners):
 //   onOpen   → show #prism, hide OS chrome, pause OS aurora, show composer,
-//              subscribe to prism-gen-done.
+//              re-attach the screens' window/document-level listeners.
 //   onPause  → (alt-tab) nothing to freeze yet (no audio/RAF in v1).
 //   onResume → (focus return) no-op mirror.
-//   onClose  → full teardown: unsubscribe the gen-done listener, restore OS
-//              chrome, resume aurora, close the OS window slot.
+//   onClose  → full teardown: tear down every screen (clear the composer's
+//              generate failsafe timer + unlock its button, remove the
+//              gallery's window-scroll + the fork slider's window mouse/touch
+//              listeners), drop the outstanding render tags, restore OS
+//              chrome, resume aurora, close the OS window slot. The gen-done
+//              subscription itself is process-static (see initPrism) — a
+//              post-close event finds no render tag and is ignored.
 //
 // SCREENS (the router toggles one visible at a time):
 //   composer → the Tag Composer (primary entry point).
@@ -25,7 +30,9 @@
 // with a pending path). The result arrives seconds later via the `prism-gen-
 // done` event (the SD swap evicts/reloads the text models — multi-second).
 // This module owns the single gen-done subscriber + routes the result to the
-// active screen (composer re-enables its button; fork swaps B's image).
+// screen that ORIGINATED the render (origin-tag routing, 2026-08-20 audit
+// M8 — never to whichever screen is active when the swap finishes: composer
+// re-enables its button; fork swaps B's image).
 // =============================================================
 
 import { invoke } from '@tauri-apps/api/core';
@@ -36,22 +43,68 @@ import './prism.css';
 import { activateChrome, deactivateChrome } from './engine/chrome.js';
 import { sdStatus, clearLatch } from './engine/api.js';
 import { buildEl as buildComposer, wire as wireComposer, teardown as teardownComposer,
-  setDone as composerDone, loadFromImage as composerLoadFromImage } from './screens/composer.js';
+  rewire as rewireComposer, setDone as composerDone, loadFromImage as composerLoadFromImage } from './screens/composer.js';
 import { buildEl as buildGallery, wire as wireGallery, teardown as teardownGallery,
-  refresh as galleryRefresh } from './screens/gallery.js';
+  rewire as rewireGallery, refresh as galleryRefresh } from './screens/gallery.js';
 import { buildEl as buildFork, wire as wireFork, teardown as teardownFork,
-  load as forkLoad, onGenDone as forkOnGenDone } from './screens/fork.js';
+  rewire as rewireFork, load as forkLoad, onGenDone as forkOnGenDone } from './screens/fork.js';
+import { resolveGenDoneTarget } from './engine/routing.js';
 
 let prismRoot = null;       // the #prism app-window element
 let screens = {};           // name → { el, wire, teardown }
 let activeScreen = 'composer';
 
+// ── Render-origin tracking (the gen-done router's source of truth) ──────
+//
+// Every generate call is tagged AT RENDER START with its origin screen +
+// (once the invoke resolves) the dest path prism_generate returned — the
+// done event echoes that path back, so completions pair with their render
+// by token instead of by whichever screen is active when they land.
+// Start-ordered; the SD turn lock serializes the swap cycles server-side,
+// so completions fire in start order (engine/routing.js leans on that for
+// its FIFO fallback). Close clears the list — a post-close done event
+// pairs with nothing and is ignored.
+let pendingRenders = [];
+
+// Tag a render BEFORE the generate invoke fires (a fast stub done can
+// never beat the tag).
+function beginRender(origin) {
+  pendingRenders.push({ origin, path: null });
+}
+
+// The generate invoke resolved — attach the dest-path token to the most
+// recent still-untagged render of this origin (starts are ordered).
+function tagRenderPath(origin, path) {
+  for (let i = pendingRenders.length - 1; i >= 0; i--) {
+    const r = pendingRenders[i];
+    if (r.origin === origin && r.path === null) {
+      if (path) r.path = String(path);
+      return;
+    }
+  }
+}
+
+// The generate invoke REJECTED (never started server-side) — drop the most
+// recent still-untagged tag of this origin so the list can't accumulate
+// ghosts.
+function abortRender(origin) {
+  for (let i = pendingRenders.length - 1; i >= 0; i--) {
+    const r = pendingRenders[i];
+    if (r.origin === origin && r.path === null) {
+      pendingRenders.splice(i, 1);
+      return;
+    }
+  }
+}
+
 // External hooks set by script.js (the OS chrome integration).
 let hooks = { pauseAurora: null, resumeAurora: null, openHooks: null, closeHooks: null, closeWindow: null };
 
-// The gen-done event unlistener (nulled in closePrism so a close-mid-generation
-// can't route a result into a torn-down screen).
-let unlistenGenDone = null;
+// Whether the app window is currently shown (the static gen-done listener
+// uses this to skip post-close side work).
+function isOpen() {
+  return !!(prismRoot && prismRoot.classList.contains('show'));
+}
 
 // ── Router ──────────────────────────────────────────────────────────────
 
@@ -103,9 +156,14 @@ function screenHooks() {
       galleryRefresh(screens.gallery.el);
       showScreen('gallery');
     },
-    // Composer: a generate was kicked off (no-op routing for now; the button
-    // stays disabled until gen-done).
-    onGenerateStarted: (_params) => { /* future: could route to a preview */ },
+    // Render-origin tagging (the gen-done router pairs completions with
+    // these, never with the active screen): a screen announces its render
+    // BEFORE the invoke (onRenderStart), attaches the dest-path token once
+    // the invoke resolves (onRenderPath), and drops the tag if the invoke
+    // rejected outright (onRenderFail).
+    onRenderStart: (origin) => beginRender(origin),
+    onRenderPath: (origin, path) => tagRenderPath(origin, path),
+    onRenderFail: (origin) => abortRender(origin),
   };
 }
 
@@ -120,21 +178,17 @@ function openPrism() {
   activateChrome();
   if (hooks.pauseAurora) hooks.pauseAurora();
   showScreen('composer');
+  // Re-attach the screens' window/document-level listeners the previous
+  // closePrism tore down (idempotent — re-adding the same function refs
+  // never double-binds). The gen-done subscription is process-static (see
+  // initPrism), so no open can race a completion past its listener.
+  if (screens.composer) rewireComposer(screens.composer.el);
+  if (screens.gallery) rewireGallery(screens.gallery.el);
+  if (screens.fork) rewireFork(screens.fork.el);
   // Refresh the SD status banner (model present? real backend compiled in?
   // latch tripped?). This drives the banner that explains why generation
   // produces an empty file (stub backend) or is blocked (latch).
   refreshStatusBanner();
-  // Subscribe to gen-done (idempotent: if already listening, skip).
-  if (!unlistenGenDone) {
-    listen('prism-gen-done', (e) => {
-      onGenDone(e && e.payload);
-      // A failure may have tripped the latch — refresh the banner so the
-      // "Retry" affordance appears.
-      refreshStatusBanner();
-    }).catch((err) => {
-      console.error('[prism] listen(prism-gen-done) failed', err);
-    }).then((un) => { unlistenGenDone = un; });
-  }
 }
 
 // The SD status banner. Three states:
@@ -189,12 +243,22 @@ function escapeText(s) {
   return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }
 
-// onClose: full teardown (the GUARANTEE). Unsubscribe, restore chrome, resume
+// onClose: full teardown (the GUARANTEE). Tear down every screen (each
+// teardown is idempotent + owns ONLY its own listeners/timers: the
+// composer's failsafe timer + locked Generate button + document click-out,
+// the gallery's window scroll + any armed delete, the fork slider's window
+// mouse/touch listeners + stale rendering state), drop the outstanding
+// render tags (a done event for an in-flight render arriving after close
+// pairs with nothing and is ignored — the image still lands in the
+// gallery; the next open's refresh shows it), restore chrome, resume
 // aurora, sync the OS window set. Runs inside AppLifecycle.closeApp's
 // transitioning guard, so a re-entrant closeApp here is a safe no-op.
 function closePrism() {
   try {
-    if (unlistenGenDone) { try { unlistenGenDone(); } catch (_) {} unlistenGenDone = null; }
+    if (screens.composer) teardownComposer(screens.composer.el);
+    if (screens.gallery) teardownGallery(screens.gallery.el);
+    if (screens.fork) teardownFork(screens.fork.el);
+    pendingRenders.length = 0;
   } finally {
     // Restore OS chrome + aurora ALWAYS (even if something above threw).
     deactivateChrome();
@@ -220,32 +284,36 @@ function resumePrism() {
 
 // ── The gen-done router ─────────────────────────────────────────────────
 //
-// The single subscriber for `prism-gen-done`. Routes the result to the active
-// screen: composer re-enables its Generate button; fork swaps B's image. On
-// failure, surface a toast.
+// The single subscriber for `prism-gen-done`. Routes the result by RENDER
+// ORIGIN (engine/routing.js pairs the payload with its tagged render), NOT
+// by the active screen: a composer render re-enables the Generate button
+// wherever the user has since navigated (and never touches Fork's B layer);
+// a fork render swaps B + clears `.is-rendering` wherever it lands. On
+// failure, surface a toast. Unmatched payloads (no outstanding render —
+// stale or post-close) are ignored.
 
 function onGenDone(payload) {
   if (!payload) return;
+  const target = resolveGenDoneTarget(pendingRenders, payload);
+  if (!target) return;
+  pendingRenders.splice(target.index, 1);
   if (payload.ok && payload.image) {
-    const img = payload.image;
-    // Route to the active screen.
-    if (activeScreen === 'composer') {
-      composerDone(screens.composer.el);
-      toast('Image generated.');
-    } else if (activeScreen === 'fork') {
+    if (target.origin === 'fork') {
       forkOnGenDone(screens.fork.el, payload);
       toast('B regenerated.');
     } else {
-      // Gallery: just refresh + re-enable the composer button defensively.
       composerDone(screens.composer.el);
-      galleryRefresh(screens.gallery.el);
+      toast('Image generated.');
     }
     // Always refresh the gallery so the new thumbnail appears (background,
-    // non-blocking — the user stays on the active screen).
+    // non-blocking — the user stays on whatever screen they're on).
     galleryRefresh(screens.gallery.el);
   } else {
-    // Failure: re-enable the composer button (in case it was the source) +
-    // surface the error.
+    // Failure: a pathless failure payload can't name its origin, so reset
+    // BOTH surfaces defensively (each reset is idempotent) + surface the
+    // error. Only the matched tag is consumed — a queued sibling render
+    // still gets its own done event (the latch-skipped branch emits one),
+    // and its tag stays paired for it.
     composerDone(screens.composer.el);
     const forkLayer = screens.fork.el.querySelector('[data-layer="b"]');
     if (forkLayer) forkLayer.classList.remove('is-rendering');
@@ -320,6 +388,22 @@ export function initPrism(extHooks = {}) {
   screens.composer.wired = true;
   screens.gallery.wired = true;
   screens.fork.wired = true;
+
+  // Subscribe to gen-done ONCE, statically (2026-08-20 audit LOW: a
+  // per-open subscribe could attach after a fast render had already
+  // completed and miss its done event; the close/open resubscribe also
+  // raced a double listener). Process-lifetime — closePrism never
+  // unsubscribes; it clears the render tags instead, so a post-close event
+  // pairs with nothing and is ignored (the close-mid-generation guard the
+  // old unsubscribe provided).
+  listen('prism-gen-done', (e) => {
+    onGenDone(e && e.payload);
+    // A failure may have tripped the latch — refresh the banner so the
+    // "Retry" affordance appears (only meaningful while the app is open).
+    if (isOpen()) refreshStatusBanner();
+  }).catch((err) => {
+    console.error('[prism] listen(prism-gen-done) failed', err);
+  });
 
   // Nav buttons (top bar). EXIT routes to closeApp.
   topbar.querySelectorAll('[data-nav]').forEach((btn) => {

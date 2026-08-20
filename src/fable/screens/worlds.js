@@ -111,15 +111,23 @@ export async function renderWorlds(root, handlers) {
   // select-only capability.
   const pickMode = !!(handlers && handlers.pickMode && handlers.onSelect);
   const host = root.querySelector('[data-host]');
+  // (2026-08-20 audit) Generation token (the same pattern as _modalGen
+  // below): every screen entry re-fires this render while a prior
+  // `fable_cards_list` may still be in flight — a stale completion must
+  // abandon before appending, or both loads' tiles land (duplicated grid).
+  root._renderGen = (root._renderGen || 0) + 1;
+  const gen = root._renderGen;
   host.innerHTML = '';
   closeModal(root);
   let cards = [];
   try {
     cards = await invoke('fable_cards_list');
   } catch (err) {
+    if (gen !== root._renderGen) return;
     host.innerHTML = `<div class="fable-flow-empty"><p>Couldn't load worlds: ${esc(err)}</p></div>`;
     return;
   }
+  if (gen !== root._renderGen) return;
   if (!cards.length) {
     host.innerHTML = `<div class="fable-flow-empty">
       <p>No scenario cards installed.</p>

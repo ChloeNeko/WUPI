@@ -306,7 +306,7 @@ pub const CODEX_FRAME_MARKER: &str = "Reference knowledge: factual background";
 // episodic memory whose stored text merely contains the phrase "Reference
 // knowledge" (e.g. a turn quoting the frame after a debug session) must not
 // trip the echo-skip gate. The rendered block always starts with
-// MARKER + ": factual background you possess." so this prefix is exact.
+// MARKER + ": knowledge you possess" so this prefix is exact.
 
 /// Render a ranked hit list as the framed injection block for the
 /// `<retrieved_memory>` region of the prompt (AGENTS.md §2M, Codex class-split
@@ -347,7 +347,7 @@ pub fn render_memory_block(hits: &[RankedMemory]) -> String {
         // treat as its own knowledge, weave in naturally, and NOT preface with
         // "according to my records" (the Gemini "just know it" directive).
         out.push_str(CODEX_FRAME_MARKER);
-        out.push_str(": factual background you possess. Internalize it; weave it in naturally. Do NOT preface with \"according to my records\":");
+        out.push_str(": knowledge you possess — internalize it; weave it in naturally. Do NOT preface with \"according to my records\":");
         for h in codex {
             out.push('\n');
             out.push_str("<c");

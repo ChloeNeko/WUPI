@@ -80,7 +80,10 @@ pub const CTX_API: u32 = 16384;
 /// prefix to ~1541 tokens — ALONE over the 2048−512=1536 prompt budget, so
 /// every chat turn (even "Hello Wupi") failed `truncate_to_fit` (truncation
 /// can only drop conversation turns, never the system prefix). 3072 gives a
-/// 2560-token prompt budget: absorbs the prefix + the manager-path world-state
+/// 2304-token prompt budget (the engine's reserve is `n_ctx/4` = 768 at
+/// 3072 — see the generate() truncation math in engine.rs — not the 512
+/// floor): absorbs
+/// the prefix + the manager-path world-state
 /// slice + memory block with headroom, without doubling the persistent chat
 /// KV (~50% growth). Matches CTX_FABLE.
 pub const CTX_LOCAL_WITH_API: u32 = 3072;

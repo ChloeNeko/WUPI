@@ -355,7 +355,7 @@ pub(crate) fn expand_oversize_entries(sources: Vec<ParsedEntry>) -> Vec<ParsedEn
         let n = chunks.len();
         tracing::warn!(
             title = %src.title,
-            body_chars = src.body.len(),
+            body_chars = src.body.chars().count(),
             parts = n,
             "codex entry exceeds the 1300-char chunk budget; auto-splitting into paginated parts"
         );
@@ -399,7 +399,7 @@ async fn insert_entry(
     if src.body.chars().count() > BUDGET_CHARS {
         tracing::error!(
             title = %src.title,
-            body_chars = src.body.len(),
+            body_chars = src.body.chars().count(),
             budget = BUDGET_CHARS,
             "codex entry >1400 reached insert_entry; expand_oversize_entries should have split it. add_codex_entry will clamp the embed input."
         );
@@ -499,25 +499,37 @@ pub fn parse_compound_text(text: &str, fallback_stem: &str) -> Vec<ParsedEntry> 
 /// inherently ambiguous — a body containing a blank-line-preceded `---` line
 /// followed by a `title:` line re-parses as TWO entries, silently splitting
 /// authored lore at the next load. The guard is verify-then-sanitize: build
-/// the text verbatim, re-parse it, and if the entry count matches the intent
-/// the bodies are byte-exact (full fidelity, the overwhelmingly common case).
+/// the text verbatim, re-parse it, and if the round-trip reproduces the
+/// intent — same COUNT and, per entry, the same title + trimmed body
+/// (2026-08-20 audit L4: count-only went blind when one side of the
+/// collision empty-dropped — a forged fence with a whitespace-only tail
+/// re-assigned bodies between titles while the count stayed equal) — the
+/// bodies are byte-exact (full fidelity, the overwhelmingly common case).
 /// Only on a mismatch are the COLLIDING body fences neutralized (`---` → `—`,
 /// the same transform the front-matter sanitizer applies) — that is
 /// serialization hygiene on text that would otherwise be silently corrupted
 /// by the round trip, not a rewrite of authored lore.
 pub fn format_compound_text(entries: &[ParsedEntry]) -> String {
     let verbatim = format_compound_text_verbatim(entries);
-    // The parser drops empty-body chunks; the intent is the count of entries
-    // that will actually materialize.
-    let intended = entries.iter().filter(|e| !e.body.trim().is_empty()).count();
-    let reparsed = parse_compound_text(&verbatim, "").len();
-    if reparsed == intended {
+    // The parser drops empty-body chunks; the intent is the entries that
+    // will actually materialize.
+    let intended: Vec<(&str, &str)> = entries
+        .iter()
+        .filter(|e| !e.body.trim().is_empty())
+        .map(|e| (e.title.as_str(), e.body.trim()))
+        .collect();
+    let reparsed = parse_compound_text(&verbatim, "");
+    let round_trips = reparsed.len() == intended.len()
+        && reparsed.iter().zip(intended.iter()).all(|(r, (title, body))| {
+            r.title.trim() == *title && r.body.trim() == *body
+        });
+    if round_trips {
         return verbatim;
     }
     tracing::warn!(
-        intended,
-        reparsed,
-        "codex compound round-trip mismatch — neutralizing body fence collisions"
+        intended = intended.len(),
+        reparsed = reparsed.len(),
+        "codex compound round-trip mismatch (count or per-entry title/body) — neutralizing body fence collisions"
     );
     let sanitized: Vec<ParsedEntry> = entries
         .iter()

@@ -3545,7 +3545,9 @@ async fn chat_send(
     let context_swap_clone = state.context_swap.clone();
     let backend_slot = Arc::clone(&state.backend);
     // Wupi chat is LOCAL-ONLY (2026-08-08 override): the chat backend ALWAYS
-    // runs at 2048 (CTX_LOCAL_WITH_API). The 4096 context is retired for chat
+    // runs at 3072 (CTX_LOCAL_WITH_API, the 2026-08-17 E4B-prefix P0 raise —
+    // the old 2048's 1536-token prompt budget could not hold the swapped-in
+    // model's system prefix). The 4096 context is retired for chat
     // — it was for narrative, which the local model no longer does. The API
     // path is deleted; there is no source-dependent teardown or re-spawn here.
     let chat_context_size = settings::CTX_LOCAL_WITH_API;
@@ -11560,17 +11562,19 @@ async fn fable_send(
         // mutation, no undo push). The directives append to the rendered
         // world_state so they ride inside the existing `<world_state>` tag
         // the narrator already treats as hard fact. (2026-08-20) The DC now
-        // also carries the derived overall health tier — a Fair-or-worse
-        // body or an active illness hardens every skilled attempt.
-        let health_tier = consequence::derive_health_tier(
-            &s.player_state.body,
-            &s.status_tags,
-            s.world_clock.current_minutes,
-        );
+        // also carries the derived overall health — a Fair-or-worse body or
+        // an active illness hardens every skilled attempt. Threaded through
+        // `health_dc_mod` (NOT the displayed tier's modifier): the wound
+        // grade keeps priority over a Sick label at Poor+ (Chloe ruling —
+        // a fever never makes a Critical body easier to pick locks with).
         let skills = player_state::referee_evaluate_skill_checks(
             &text,
             pacing.mode.dc_modifier(),
-            consequence::HealthTier::skill_dc_mod(health_tier),
+            consequence::health_dc_mod(
+                &s.player_state.body,
+                &s.status_tags,
+                s.world_clock.current_minutes,
+            ),
         );
 
         // (3a) Phase 4 §11.44 (Component 1): Disguise Referee — the Rust-side
@@ -11595,17 +11599,33 @@ async fn fable_send(
                 &s.entities,
                 &present_npc_ids,
                 pacing.mode.dc_modifier(),
+                // (2026-08-20 Chloe ruling) Scrutiny Deception carries the
+                // derived-body modifier too — deception under scrutiny is a
+                // skilled act; a feverish or battered body fumbles it exactly
+                // like a lockpick. The gate also runs on the clock: an
+                // expired disguise reads as no disguise.
+                consequence::health_dc_mod(
+                    &s.player_state.body,
+                    &s.status_tags,
+                    s.world_clock.current_minutes,
+                ),
+                s.world_clock.current_minutes,
             )
         };
         // (P2 fix) A failed scrutiny mechanically revokes the disguise tag —
         // prose alone let it survive to auto-pass again next turn.
-        // (2026-08-16 audit LOW) Revoke the FIRST disguise tag (the gate's
-        // binary "the disguise" — it evaluated exactly one), not every
-        // kind=disguise tag: a blown hood check shouldn't strip an unrelated
-        // second disguise facet.
+        // (2026-08-16 audit LOW) Revoke the tag the gate actually evaluated
+        // (the FIRST LIVE kind=disguise tag — expiry-filtered like the gate),
+        // not every kind=disguise tag: a blown hood check shouldn't strip an
+        // unrelated second disguise facet or chase an already-expired one.
         if let Some(dd) = &disguise_directive {
             if dd.should_revoke() {
-                if let Some(pos) = s.status_tags.iter().position(|t| t.kind == "disguise") {
+                let now = s.world_clock.current_minutes;
+                if let Some(pos) = s
+                    .status_tags
+                    .iter()
+                    .position(|t| t.kind == "disguise" && !t.is_expired(now))
+                {
                     if undo_snapshot.is_none() {
                         undo_snapshot = Some(s.clone());
                     }
@@ -14056,7 +14076,10 @@ fn fable_list_saves(
 /// names. `health` (2026-08-20) is the DERIVED overall tier
 /// (`consequence::derive_health_tier` over body wounds + active illness
 /// tags) — "Excellent" | "Good" | "Fair" | "Poor" | "Critical" | "Sick" |
-/// "Infected" — never stored on PlayerState, injected here only.
+/// "Infected" | "Deceased" — never stored on PlayerState, injected here
+/// only. "Deceased" is the unique case (Chloe ruling): a Black (destroyed)
+/// core part — Head/Neck/UpperTorso — is instant death, no points, no
+/// illness, nothing above it; the run is over.
 ///
 /// Returns an error if no Fable game is active (the left stats panel only
 /// exists inside a running session). The lock is held briefly under
@@ -17166,7 +17189,36 @@ fn migrate_sim_cards_v2(cards_root: &std::path::Path, app: &tauri::AppHandle) {
             tracing::info!(folder = %path.display(), "boot migration: folded legacy card portrait onto stem");
         }
         let display = safe_display_stem(&card.name, folder_name);
-        let needs_rewrite = !card.format_v2;
+        // (2026-08-20 audit M6) Guard: legacy content the v2 serializer
+        // CANNOT express is load-bearing at session entry — the authored
+        // <cast> seeds npc_registry, the <locations> graph seeds travel,
+        // <player_name> is the attach anchor, <introductions> feeds the
+        // boot-bubble picker. Rewriting such a card to v2 would destroy
+        // that data one-way (serialize_v2 has no slot for it). Those cards
+        // keep their legacy bytes verbatim — the back-compat parse serves
+        // them fully — and only the folder rename proceeds. A `<cast>`-
+        // free card with authored locations still guards: the graph is the
+        // irreplaceable part. Introductions only guard when they carry
+        // MORE than the <intro> sibling already preserves (parse derives
+        // introductions from intro lines, so equality means no loss).
+        let intro_lines: Vec<String> = card
+            .intro
+            .lines()
+            .map(|l| l.trim())
+            .filter(|l| !l.is_empty())
+            .map(|l| l.strip_prefix("- ").unwrap_or(l).trim().to_owned())
+            .collect();
+        let carries_unmappable = !card.cast.is_empty()
+            || !card.locations.is_empty()
+            || card.player_name.is_some()
+            || card.introductions != intro_lines;
+        let needs_rewrite = !card.format_v2 && !carries_unmappable;
+        if !card.format_v2 && carries_unmappable {
+            tracing::info!(
+                card_id = %card.id,
+                "boot migration: legacy card carries v2-unmappable authored data (cast/locations/player_name/introductions); keeping legacy bytes, rename-only"
+            );
+        }
         let needs_rename = display != folder_name;
         if !needs_rewrite && !needs_rename {
             cache_card_folder(cards_root, &card.id, &path);
@@ -20414,6 +20466,8 @@ mod phase3_integration_tests {
             &entities,
             &present,
             0,
+            0,
+            0,
         ).expect("soldier + confident → AutoPass");
         let rendered = dd.render();
         assert!(rendered.contains("ACCEPTED"));
@@ -20442,6 +20496,8 @@ mod phase3_integration_tests {
             &tags,
             &entities,
             &[],
+            0,
+            0,
             0,
         );
         assert!(dd.is_none(), "no disguise tag → no directive");
