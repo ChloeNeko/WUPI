@@ -1,6 +1,6 @@
 [package]
 name = "wupi-updater"
-version = "0.27.1"
+version = "0.27.2"
 edition = "2021"
 # Kept in lockstep with src-tauri/Cargo.toml + tauri.conf.json by release.cjs's
 # version-sync step. The updater's own version is not user-facing (wupi.exe's
@@ -15,6 +15,11 @@ path = "src/main.rs"
 # Pure-Rust zip extraction — extracts the update payload. No system deps.
 # Version aligned with src-tauri's `zip = "2"`.
 zip = "2"
+# CRC32 for the extract-time byte-identity skip (stage.rs: a live file whose
+# size + CRC32 match a zip entry is already the payload's content and is
+# neither staged nor copied). Same crate zip itself hashes with — already in
+# the lockfile via zip, so this adds no new graph edges.
+crc32fast = "1"
 # Serialize the result marker written for the relaunched wupi.exe to read on
 # next boot (`<install>/data/_update_result.json`).
 serde_json = "1"
