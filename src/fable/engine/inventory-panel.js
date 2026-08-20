@@ -44,16 +44,22 @@
 // Clicking an item button opens a sleek popup overlaying the panel with
 // contextual actions. The item's TAGS drive which actions render:
 //   CONSUME — only if the item is consumable
-//   EQUIP   — only if the item is equippable (opens a destination sub-menu)
+//   EQUIP   — ALWAYS offered (2026-08-19: wearing is a universal physical
+//             action — the Rust [EQUIP] applier never gate-checked tags, and
+//             tag-gating stranded untagged clothes in the pack with no way
+//             to put them on). Opens the destination sub-menu.
 //   POCKET  — only if the item is pocketable (→ moves to belt)
 //   STORE   — moves the item back to bagged inventory (pack)
 //   DISCARD — always available
-// Tags are read DIRECTLY from the item's backend `tags` array (assigned by the
-// local tracker model via the [EQUIP]/[BELT]/[PACK] tags= field — no client-
-// side name heuristics). The actions mutate the live WorldSchema via
-// `fable_schema_set` (the user-edit trust path, undoable via fable_rollback),
-// passing an `eventNote` trace that the next narrator turn sees in
-// `<world_state>`'s recent_events. See `readTags` below.
+// CONSUME/POCKET stay tag-gated (consumption + pocket-size are intrinsic
+// properties). Tags are read DIRECTLY from the item's backend `tags` array
+// (assigned by the local tracker model via the [EQUIP]/[BELT]/[PACK] tags=
+// field — no client-side name heuristics anywhere; WHERE a garment belongs
+// is decided by the BACKEND router automatically at acquisition, never by
+// this panel). The actions mutate the live WorldSchema via
+// `fable_schema_set` (the user-edit trust path, undoable via
+// fable_rollback), passing an `eventNote` trace that the next narrator turn
+// sees in `<world_state>`'s recent_events. See `readTags` below.
 // =============================================================
 
 import { invoke } from '@tauri-apps/api/core';
@@ -67,10 +73,13 @@ import { isDevPreview, getDevSchema } from './dev-preview-schema.js';
 
 // The gem id → physical category key (mirrors soul-gem.js GEMS ids).
 // `slot` = the typed equipment slot(s); `stack` = 'belt' | 'pack' | null.
+// (2026-08-19 zone sweep) The three new zones live on the nearest existing
+// gem: Neck jewelry shares the head gem, Arms + Hands share the hand gem —
+// no new gems, no HUD change.
 const CATEGORY_MAP = Object.freeze({
-  head:      { slots: ['head'],                       stack: null },
+  head:      { slots: ['head', 'neck'],               stack: null },
   chest:     { slots: ['chest'],                      stack: null },
-  hand:      { slots: ['main_hand', 'off_hand'],      stack: null },
+  hand:      { slots: ['main_hand', 'off_hand', 'arms', 'hands'], stack: null },
   leg:       { slots: ['legs'],                       stack: 'belt' },
   foot:      { slots: ['feet'],                       stack: null },
   pack:      { slots: [],                             stack: 'pack' },
@@ -577,7 +586,10 @@ function renderPopupActions(popup, item, bodyEl) {
 
   const actions = [];
   if (item.tags.has('consumable')) actions.push({ key: 'consume', label: 'CONSUME' });
-  if (item.tags.has('equippable')) actions.push({ key: 'equip', label: 'EQUIP' });
+  // (2026-08-19) EQUIP is ALWAYS offered — wearing is a universal physical
+  // action (see the header note). The tag gate stranded untagged clothes in
+  // the pack with no UI path onto the body.
+  actions.push({ key: 'equip', label: 'EQUIP' });
   if (item.tags.has('pocketable') && item.source !== 'belt') actions.push({ key: 'pocket', label: 'POCKET' });
   if (item.source !== 'pack') actions.push({ key: 'store', label: 'STORE' });
   actions.push({ key: 'discard', label: 'DISCARD' });
@@ -603,29 +615,37 @@ function renderPopupActions(popup, item, bodyEl) {
   if (activePopupAnchor) positionPopup(popup, activePopupAnchor);
 }
 
-// Render the EQUIP destination sub-menu into the popup. Shows the five body
+// Render the EQUIP destination sub-menu into the popup. Shows the body
 // zones + a ‹ BACK button. Picking a zone fires handleEquip (the slot routing
 // mutation) + closes the popup. BACK returns to renderPopupActions.
 //
-// The destinations map 1:1 to the Soul Gem categories (the player already
+// The destinations map onto the Soul Gem categories (the player already
 // thinks in those zones), and each resolves to a typed equipment slot:
-//   HEAD → head,  TOP → chest,  HAND → main_hand (or off_hand),  BOTTOM → legs,  FEET → feet
+//   HEAD → head, NECK → neck (2026-08-19 zone sweep), TOP → chest,
+//   ARMS → arms, HANDS → hands (gloves/jewelry — NOT readied weapons),
+//   HAND → main_hand (or off_hand), BOTTOM → legs, FEET → feet
 const EQUIP_DESTINATIONS = Object.freeze([
   { id: 'head',  label: 'HEAD',   slot: 'head' },
+  { id: 'neck',  label: 'NECK',   slot: 'neck' },
   { id: 'chest', label: 'TOP',    slot: 'chest' },
+  { id: 'arms',  label: 'ARMS',   slot: 'arms' },
+  { id: 'hands', label: 'HANDS',  slot: 'hands' },
   { id: 'hand',  label: 'HAND',   slot: 'main_hand', alt: 'off_hand' },
   { id: 'legs',  label: 'BOTTOM', slot: 'legs' },
   { id: 'feet',  label: 'FEET',   slot: 'feet' },
 ]);
 
+// (2026-08-19 shoes+socks fix, Chloe ruling) The sub-menu stays the FIVE
+// plain zones — the player is FREE to put whatever they want wherever they
+// want, no layer picking UI. The LAYER is common sense, decided by the
+// placement rule in moveToEquipmentSlot: the zone's Outer if free, else the
+// free Inner (socks land UNDER the worn boots automatically), else the item
+// replaces the Outer (prior occupant → the pack). HAND uses main/off logic.
 function renderEquipDestinations(popup, item, bodyEl) {
   activePopupMode = 'equip';
   triggerSwapAnim(popup);
   popup.innerHTML = '';
   popup.setAttribute('aria-label', item.name + ' — equip where?');
-
-  const ps = (cachedSchema && cachedSchema.player_state) || {};
-  const eq = (ps.equipment && typeof ps.equipment === 'object') ? ps.equipment : {};
 
   for (const dest of EQUIP_DESTINATIONS) {
     const b = document.createElement('button');
@@ -826,16 +846,18 @@ async function performAction(action, item, bodyEl) {
 }
 
 // ── EQUIP routing (the sub-menu destination → typed slot) ──────────────────
-// Fires when the player picks a body zone in the EQUIP sub-menu. Routes the
-// item into the destination's typed equipment slot (Outer layer), removing it
-// from its origin first. The HAND destination defaults to main_hand; if
-// main_hand's Outer is occupied it falls back to off_hand (two-handed logic is
-// deferred — keep it simple: fill the empty hand). The event_note carries the
-// destination label so the narrator knows WHERE the item physically resides
-// ("equipped Iron Sword to Hand"). If the chosen slot's Outer is full AND it's
-// not the hand-fallback case, the item replaces the Outer occupant (the prior
-// occupant is pushed to the pack so nothing is lost — mirrors the legacy
-// migration's preserve-existing discipline).
+// Fires when the player picks a body zone in the EQUIP sub-menu — free
+// choice, whatever they want wherever they want. The HAND destination
+// defaults to main_hand; if main_hand's Outer is occupied it falls back to
+// off_hand (two-handed logic is deferred — keep it simple: fill the empty
+// hand).
+// (2026-08-19 shoes+socks fix, Chloe ruling) The LAYER is common sense, not
+// a player choice — the placement rule in moveToEquipmentSlot puts a second
+// item UNDER the worn one (socks under boots, a shirt under a cloak) without
+// disturbing it, and replaces the Outer only when both layers hold. Every
+// displaced occupant is pushed to the pack so nothing is lost. The
+// event_note carries the destination so the narrator knows WHERE the item
+// physically resides ("equipped Wool Socks to FEET").
 async function handleEquip(item, dest, bodyEl) {
   // (2026-08-16 audit M5) Same in-flight refusal as handleAction — the equip
   // path runs the same fetch→mutate→wholesale-install cycle. (D6b) Refusal
@@ -973,6 +995,39 @@ function removeItem(ps, item, count = 1) {
   return false;
 }
 
+// Garment overness ranking (2026-08-19 NPC-perception upgrade) — the JS
+// mirror of Rust `equipment::garment_rank`. Higher = more outer; decides which
+// of two garments sharing a slot sits on top so the worn layer can never
+// disagree with what the narrator-render perceives (a cloak EQUIPPED over a
+// worn shirt must take the Outer, never land beneath it). Keep the needles in
+// sync with equipment.rs when either side grows.
+const GARMENT_OVER_VOCAB = {
+  chest: ['cloak', 'cape', 'mantle', 'coat', 'jacket', 'poncho', 'shawl', 'surcoat', 'tabard'],
+  feet: ['boot', 'shoe', 'sabaton', 'sandal', 'slipper', 'heels', 'spat', 'gaiter'],
+  legs: ['greave'],
+  head: ['helm', 'helmet', 'hood', 'crown'],
+  arms: ['pauldron', 'spaulder', 'vambrace', 'bracer', 'elbow'],
+  hands: ['gauntlet'],
+};
+const GARMENT_MID_VOCAB = {
+  chest: ['armor', 'armour', 'chestplate', 'breastplate', 'cuirass', 'chainmail', 'chain mail', 'hauberk', 'sweater', 'cardigan', 'jerkin', 'doublet', 'vest', 'frock', 'bodice', 'corset'],
+  legs: ['trouser', 'pants', 'breeches', 'skirt', 'kilt'],
+};
+// Slots whose garments are exclusive — one necklace, one pair of gloves, one
+// hat, one pair of boots. Equal-rank incoming garments SWAP (the incumbent
+// rides to the pack) instead of layering. Chest/Legs layer (two shirts, hose
+// under trousers).
+const EXCLUSIVE_SLOTS = new Set(['feet', 'head', 'neck', 'arms', 'hands']);
+
+function garmentRank(slotId, name) {
+  const n = String(name || '').trim().toLowerCase();
+  const over = GARMENT_OVER_VOCAB[slotId];
+  const mid = GARMENT_MID_VOCAB[slotId];
+  if (over && over.some((t) => n.includes(t))) return 2;
+  if (mid && mid.some((t) => n.includes(t))) return 1;
+  return slotId === 'head' ? 1 : 0;
+}
+
 // Move an item into a typed equipment slot chosen by the player (via the EQUIP
 // sub-menu). `dest` is an EQUIP_DESTINATIONS entry: { id, label, slot, alt? }.
 //
@@ -980,15 +1035,20 @@ function removeItem(ps, item, count = 1) {
 //   - HAND: try main_hand first; if its Outer layer is occupied, try off_hand
 //     (the alt). If BOTH are occupied, replace main_hand's Outer (push the prior
 //     occupant to the pack so nothing is lost).
-//   - Other zones (HEAD/TOP/BOTTOM/FEET): if the slot's Outer layer is occupied,
-//     push the prior occupant to the pack, then place the new item in Outer.
-//   - The Inner layer is left untouched (the player can layer via a future UI).
+//   - Other zones (HEAD/TOP/BOTTOM/FEET) — common-sense layering (2026-08-19
+//     Chloe ruling: the player picks the zone; the SYSTEM picks the layer):
+//     free Outer → Outer; the incoming garment OUT-RANKS the worn Outer → it
+//     takes the Outer and DEMOTES the incumbent to a free Inner (a cloak over
+//     a shirt — the shirt stays worn); footwear/headwear at equal rank → SWAP;
+//     otherwise Outer held + Inner free → Inner (the item lands UNDER the worn
+//     one without disturbing it); both held → replace the Outer (prior
+//     occupant → the pack).
 //
 // The item is removed from its origin FIRST (equipment/belt/pack), so an intra-
-// equipment move (re-equipping to a different slot) clears the old slot. If the
-// origin removal fails, the move aborts (return false → no persist). Tags ride
-// forward on both the equipped item + any displaced occupant. Returns true if
-// the schema changed.
+// equipment move (re-equipping to a different slot or layer) clears the old
+// layer. If the origin removal fails, the move aborts (return false → no
+// persist). Tags ride forward on both the equipped item + any displaced
+// occupant. Returns true if the schema changed.
 function moveToEquipmentSlot(ps, item, dest) {
   if (!ps.equipment || typeof ps.equipment !== 'object') ps.equipment = {};
   if (!Array.isArray(ps.pack)) ps.pack = [];
@@ -1008,18 +1068,52 @@ function moveToEquipmentSlot(ps, item, dest) {
     }
   }
 
-  // If the item is already in the target slot's Outer layer, this is a no-op
+  // Common-sense layer pick (non-hand zones, 2026-08-19 Chloe ruling: the
+  // player picks the zone; the SYSTEM picks the layer): free Outer, else the
+  // free Inner (the item lands UNDER the worn one), else replace the Outer —
+  // EXCEPT the over-garment case: an incoming garment that OUT-RANKS the worn
+  // Outer (cloak over shirt) takes the Outer itself and demotes the incumbent
+  // beneath; equal-rank footwear/headwear swap (you don't wear two pairs of
+  // boots). Hands are always Outer (main/off above).
+  let effLayer = 'outer';
+  if (!dest.alt) {
+    // A re-equip must not see ITSELF as the incumbent garment: exclude the
+    // item's own current layer from occupancy, else the worn cloak (its own
+    // Outer) demotes itself to a bare Inner — vanishing from the narrator's
+    // equipped: render — and worn socks "displace" the boots to the pack.
+    // The JS twin of Rust `place_equipped`'s same-name-refresh guard
+    // (`isAlreadyThere` below no-ops the exact same-layer case).
+    const selfInSlot = item.source === 'equipment' && item.slot === targetSlot;
+    const layers = ps.equipment[targetSlot];
+    const wornOuter =
+      layers && layers.outer && !(selfInSlot && item.layer === 'outer') ? layers.outer : null;
+    const wornInner =
+      layers && layers.inner && !(selfInSlot && item.layer === 'inner') ? layers.inner : null;
+    if (wornOuter) {
+      const r = garmentRank(targetSlot, item.name);
+      const ro = garmentRank(targetSlot, wornOuter.name);
+      const outranks = r > ro || (EXCLUSIVE_SLOTS.has(targetSlot) && r === ro);
+      if (!outranks && !wornInner) {
+        effLayer = 'inner';
+      }
+      // outranks → 'outer' (demotion/swaps handled at placement below);
+      // can't outrank + both held → 'outer' (replace the worn Outer)
+    }
+  }
+
+  // If the item is already in the target slot's chosen layer, this is a no-op
   // move (return false so we don't persist a no-change).
   const isAlreadyThere =
-    item.source === 'equipment' && item.slot === targetSlot && item.layer === 'outer';
+    item.source === 'equipment' && item.slot === targetSlot && item.layer === effLayer;
   if (isAlreadyThere) return false;
 
   // (2026-08-16 bug 7) Resolve the LIVE stack shape BEFORE removal — the
   // render-time item's stats/tags can be stale (the panel stays open across
   // narrator turns; see findFreshStack).
   const freshStack = findFreshStack(ps, item);
-  // Remove from origin first. The origin may have been the target slot's Outer
-  // (a re-equip), in which case this clears it before we re-place.
+  // Remove from origin first. The origin may have been the target layer (a
+  // re-equip or a layer swap on the same slot), in which case this clears it
+  // before we re-place.
   // (#6) ONE copy leaves a stack — equipping one of 40 arrows must not
   // delete the other 39.
   const removed = removeItem(ps, item, 1);
@@ -1030,31 +1124,45 @@ function moveToEquipmentSlot(ps, item, dest) {
     ps.equipment[targetSlot] = { outer: null, inner: null };
   }
 
-  // If the target Outer is occupied, displace the prior occupant to the pack
-  // so nothing is lost. (#67) The old `currentOuter.name !== item.name` skip
-  // silently MERGED same-named copies: equipping a pack copy over an
-  // identically-named worn item vaporized the worn copy's stats/identity.
-  // They are two physical items — the worn one always rides to the pack.
-  // (`isAlreadyThere` above already no-ops an exact same-slot re-equip.)
-  const currentOuter = ps.equipment[targetSlot].outer;
-  if (currentOuter) {
-    if (!Array.isArray(ps.pack)) ps.pack = [];
-    // (audit #26) Merge on name — a displaced duplicate used to mint a
-    // second same-named pack stack (see mergeOrPushStack).
-    mergeOrPushStack(ps.pack, {
-      name: currentOuter.name,
-      qty: 1,
-      weight: 1.0,
-      stats: currentOuter.stats || undefined,
-      tags: Array.isArray(currentOuter.tags) ? currentOuter.tags : [],
-    });
+  // If the target layer is occupied, displace the prior occupant so nothing is
+  // lost. (#67) The old `currentOuter.name !== item.name` skip silently MERGED
+  // same-named copies: equipping a pack copy over an identically-named worn
+  // item vaporized the worn copy's stats/identity. They are two physical
+  // items — the worn one always rides to the pack. (`isAlreadyThere` above
+  // already no-ops an exact same-layer re-equip.)
+  // (2026-08-19 NPC-perception upgrade) The over-garment DEMOTION: when the
+  // incoming item out-ranks the worn Outer and the Inner is free, the
+  // incumbent DEMOTES to the Inner — it stays worn beneath the new garment
+  // (a cloak equipped over a shirt), mirroring Rust `place_equipped`. Every
+  // other occupied-target case (equal-rank footwear/headwear swap, base-layer
+  // replacement) routes the incumbent to the pack.
+  const current = ps.equipment[targetSlot][effLayer];
+  if (current) {
+    let demotedBeneath = false;
+    if (effLayer === 'outer') {
+      const r = garmentRank(targetSlot, item.name);
+      const ro = garmentRank(targetSlot, current.name);
+      demotedBeneath = r > ro && !ps.equipment[targetSlot].inner;
+    }
+    if (demotedBeneath) {
+      ps.equipment[targetSlot].inner = current;
+    } else {
+      if (!Array.isArray(ps.pack)) ps.pack = [];
+      mergeOrPushStack(ps.pack, {
+        name: current.name,
+        qty: 1,
+        weight: 1.0,
+        stats: current.stats || undefined,
+        tags: Array.isArray(current.tags) ? current.tags : [],
+      });
+    }
   }
 
-  // Place the new item in the Outer layer. (#68-adjacent) `stats` ride
+  // Place the new item in the chosen layer. (#68-adjacent) `stats` ride
   // forward — a pack/belt copy with stats used to lose them on equip.
   // (bug 7) Prefer the FRESH stack's stats/tags over the render-time item's
   // when the origin was a stack (see findFreshStack).
-  ps.equipment[targetSlot].outer = {
+  ps.equipment[targetSlot][effLayer] = {
     name: item.name,
     stats: (freshStack && typeof freshStack.stats === 'string' && freshStack.stats.trim())
       ? freshStack.stats
@@ -1064,7 +1172,7 @@ function moveToEquipmentSlot(ps, item, dest) {
       : tagsArray(item),
   };
   // Drop the slot if both layers ended up empty (defensive — shouldn't happen
-  // here since we just set Outer, but mirrors the Rust invariant).
+  // here since we just set one, but mirrors the Rust invariant).
   return true;
 }
 

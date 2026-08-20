@@ -290,16 +290,17 @@ export function buildSoulGems(root, backpack, img, gender) {
 // LOAD-WAIT: the paperdoll <img> uses width:auto, so before it loads its
 // Clamp the #inventory-panel-slot's height so its TOP edge can never climb
 // past the astrolabe/time-bar header at the top of the drawer. The panel is
-// bottom-anchored (its bottom sits a fixed gap above the backpack) + grows
-// upward via min-height/max-height; on shorter viewports (or tall content)
-// its top edge was colliding with + overlapping the time bar. This measures
-// the astrolabe header's bottom edge live, then caps max-height to the
-// vertical space between that + the panel's bottom anchor. When content is
-// shorter than the cap, max-height is a no-op; when taller, the panel
-// shrinks + its internal scroll viewport takes over (no time-bar overlap).
-// Also relaxes the CSS min-height (300px) when the cap is tighter, so the
-// floor can't force the panel past the astrolabe. ASTROLABE_FLOOR_PX is the
-// fallback when the header element can't be measured (matches its CSS box:
+// bottom-anchored (its bottom sits a fixed gap above the backpack) + has a
+// FIXED CSS height (2026-08-19: 376px — it never resizes with its content;
+// the add-an-item growth bug); on shorter viewports this measured cap
+// shrinks it so its top edge doesn't collide with + overlap the time bar.
+// This measures the astrolabe header's bottom edge live, then caps
+// max-height to the vertical space between that + the panel's bottom anchor.
+// When content is taller than the cap, the panel shrinks + its internal
+// scroll viewport takes over (no time-bar overlap). The min-height relax
+// (inline) keeps the old CSS floor from ever forcing the panel past the
+// astrolabe on very short viewports. ASTROLABE_FLOOR_PX is the fallback
+// when the header element can't be measured (matches its CSS box:
 // top:6px + ~64px of font/padding/border ≈ 72px; 80px gives a small breath).
 const ASTROLABE_FLOOR_PX = 80;
 function clampSlotBelowAstrolabe(slot, rootBox) {

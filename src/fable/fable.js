@@ -25,6 +25,9 @@
 //              pair → launchGame (see revealNewGameShell). Each picker
 //              reuses the newgame-split tile language; the Codex picker is
 //              skipped when the card already has a codex (advanceFromSim).
+//              The Load menu's per-card NEW shortcut-circuits the chain: the
+//              card is preset, so the player step launches straight into the
+//              world (flowAfterPlayer — no SIM pair, no Codex pair).
 //   Continue → resume the freshest save (resumeSave).
 //   Load     → two-level picker: worlds.js → saves.js → resume.
 // The working stage + gameplay engine (stage.js, engine/*, fx/*, panels/*)
@@ -39,12 +42,13 @@ import './fable.css';
 import './flow-cinematic.css';
 
 import { buildTitle } from './screens/title.js';
-import { buildStage, wireStage, teardownStage, toast } from './screens/stage.js';
+import { buildStage, wireStage, teardownStage, toast, bottomWarning } from './screens/stage.js';
 import { buildNewGameSplit } from './screens/newgame-split.js';
 import { buildPlayerPicker, renderPlayerPicker } from './screens/player-picker.js';
-import { buildCreatorChat, renderCreatorChat } from './screens/creator-chat.js';
+import { buildCreatorChat, renderCreatorChat, abortCreatorTurn } from './screens/creator-chat.js';
 import { createEmbers } from './screens/embers.js';
 import { parseImportFile } from './screens/st-import.js';
+import { extractLorebookEntries } from './engine/creator-engine.js';
 import { playBurnTransition, playReverseSpawn } from './engine/burn-transition.js';
 import { tileCaptionHTML } from './engine/tile-caption.js';
 import { buildWorlds, renderWorlds } from './screens/worlds.js';
@@ -378,7 +382,9 @@ async function resumeSave(cardId, saveId, opts = {}) {
   // stopped inside enterStageViaTransition right before the stage shows, so
   // the grass keeps animating until the moment the stage appears.
   fadeOutThemeMusic(fableRoot);
-  try { await invoke('fable_end'); } catch (_) {}
+  // Same funnel as launchGame: clear any prior session (stopping any live
+  // generation first — a no-op on the normal cold path).
+  await endFableSession();
 
   let openingScene = null;
   let loadMessages = null;
@@ -480,8 +486,10 @@ function onLoadClicked() {
 
 // The Load menu's card-modal handlers (2026-08-05). The modal surfaces four
 // actions per card; these are the wired behaviors:
-//   • onNewGame → fade out → the Player pair (slide 1) with reverse-spawn, so
-//     the New Game flow continues into a fresh game with a chosen player. The
+//   • onNewGame → fade out → the Player pair (slide 1) with reverse-spawn,
+//     with THIS card preset into the flow — once a player is chosen/created
+//     the game launches straight into this world (flowAfterPlayer; no SIM
+//     pair, no Codex pair). The
 //     music keeps playing (it's the same New Game ambience the flow uses).
 //   • onResume  → the saves list for this card (most-recent first; backend
 //     sorts by timestamp desc). ‹ Back from saves returns to the worlds grid.
@@ -497,17 +505,18 @@ function worldHandlers() {
   };
 }
 
-// NEW GAME from the Load menu's per-card "NEW" action. The card argument is
-// retained for the worldHandlers() call signature but is not consumed — the
-// flow always starts fresh at the Player pair (the user picks/creates a
-// player, then a SIM card, etc.). The New Game ambience is already playing
-// (it's the same track the worlds/Load screen uses), so it is NOT restarted
-// here. ‹ routes back to the worlds grid; ⌂ routes to the title (via
-// exitLoadToTitle, which also tears the ambience down).
+// NEW GAME from the Load menu's per-card "NEW" action. The card IS the
+// world — it's preset into the flow (revealNewGameShell's presetCard), so
+// after the player step the flow launches straight into that world: NO SIM
+// pair (the card was already chosen here — asking again was the double-pick
+// bug), NO Codex pair (2026-08-19, Chloe: skip it). The New Game ambience is
+// already playing (it's the same track the worlds/Load screen uses), so it
+// is NOT restarted here. ‹ routes back to the worlds grid; ⌂ routes to the
+// title (via exitLoadToTitle, which also tears the ambience down).
 function beginNewGameFromCard(card) {
-  void card;  // unused; kept for the handler signature
   withFlowBusy(() => {
     return revealNewGameShell({
+      presetCard: card,
       onBack: () => {
         // Back to the worlds grid (where this entry came from). The Load-menu
         // ambience keeps playing — it's the same track the shell was using.
@@ -664,9 +673,26 @@ function escHtml(s) {
 // swaps to the 'newgame-split' screen at peak darkness + builds slide 1 (the
 // Player pair), + (optionally) blooms the ambience. `startMusic` is false on
 // the Load-menu entry path (the track is already playing from the worlds
-// screen). `onBack`/`onHome`
+// screen). `presetCard` (the Load-menu per-card NEW entry) establishes the
+// SIM card up front so the player step routes straight into that world.
+// `onBack`/`onHome`
 // override the default ‹/⌂ routing (both default to exitFlowToTitle).
-function revealNewGameShell({ startMusic = false, onBack, onHome } = {}) {
+function revealNewGameShell({ startMusic = false, presetCard = null, onBack, onHome } = {}) {
+  // Fresh state on EVERY entry (both entries pass through here). exitLoadToTitle
+  // doesn't reset (unlike exitFlowToTitle), so without this a card established
+  // on an earlier Load-menu NEW run could survive into a later title-entry
+  // flow and hijack flowAfterPlayer into launching the stale world.
+  flowState = freshFlowState();
+  if (presetCard) {
+    flowState.selectedCardId = presetCard.id;
+    // Mirrors renderSimPickerStep's meta draft (context only — launch reads
+    // selectedPlayerId/playerDraft, not simDraft).
+    flowState.simDraft = {
+      name: presetCard.name,
+      tone: presetCard.tone || null,
+      setting: presetCard.setting_preview || null,
+    };
+  }
   startFlowAmbiance();
   if (!flowChrome) flowChrome = mountFlowChrome(fableRoot);
   if (flowChrome) {
@@ -742,6 +768,11 @@ function onNewGameClicked() {
 // Exit the New Game flow back to the title (⌂ click). Fades the new-game
 // tracks out + restarts the title theme (mirrors the old split back()).
 function exitFlowToTitle() {
+  // (2026-08-19 Chloe) ⌂ kills ANY in-flight creator GLM turn (wizard chat /
+  // import / lorebook batch / pencil edit). The creator screen is NOT
+  // re-rendered on the exit, so without this the stale-turn firewall never
+  // fired and the turn kept streaming over the title screen.
+  abortCreatorTurn(screens['creator-chat']);
   stopNewGameMusic(fableRoot);
   startThemeMusic(fableRoot);
   stopFlowAmbiance();
@@ -758,11 +789,13 @@ function exitFlowToTitle() {
 // Exit the LOAD flow (worlds/saves pickers) back to the title (⌂ home from the
 // worlds screen). Fades the new-game ambience out + restarts the title theme —
 // mirrors exitFlowToTitle. Also hides the flow-chrome buttons so ‹ + ⌂ don't
-// linger over the title (the chrome overlay persists; both go dark). The Load
+// linger over the title (the chrome overlay persists; both buttons go dark). The Load
 // menu shares the New Game music + ember background, so it shares the teardown
 // too. This is an instant screen swap (no transition), so no withFlowBusy wrap
 // — the title buttons are immediately usable again.
 function exitLoadToTitle() {
+  // (2026-08-19) Same kill-any-creator-turn contract as exitFlowToTitle.
+  abortCreatorTurn(screens['creator-chat']);
   stopNewGameMusic(fableRoot);
   startThemeMusic(fableRoot);
   stopFlowAmbiance();
@@ -785,6 +818,9 @@ function exitLoadToTitle() {
 //   Slide 1: Player pair (NEW PLAYER / LOAD PLAYER / IMPORT)
 //     → Create/Import Player → burn → GLM Player Wizard → SIM pair
 //     → Load Player          → burn → Player Picker → select → SIM pair
+//     (Load-menu per-card NEW entry: the card is preset, so every player
+//      resolution routes through flowAfterPlayer → launchGame — slides 2 + 3
+//      never show)
 //   Slide 2: SIM pair (NEW / LOAD / IMPORT SIM CARD) → establish card →
 //            advanceFromSim (skips the Codex picker when a codex exists)
 //   Slide 3: Codex pair (CREATE / CONTINUE-WITHOUT / IMPORT) — skipped if codex
@@ -903,7 +939,7 @@ function flowCreatePlayer(selectedBtn) {
         onCreated: ({ playerId, draft }) => {
           flowState.selectedPlayerId = playerId;
           flowState.playerDraft = draft;
-          flowSimPair();
+          flowAfterPlayer();
         },
         back: () => returnToPlayerPair(),
       });
@@ -922,10 +958,17 @@ async function flowImportPlayer(selectedBtn) {
   try {
     result = await parseImportFile(screens['newgame-split']);
   } catch (e) {
-    toast(`Import failed: ${e.message || e}`);
+    bottomWarning(`Import failed: ${e.message || e}`);
     return;
   }
   if (!result) return; // picker cancelled
+  // (2026-08-19) A standalone lorebook is CODEX material — it has no
+  // character to build a player card from. Bottom warning, stay on the
+  // picker (never burn into a wizard that cannot use the file).
+  if (result.lorebook && !result.charData) {
+    bottomWarning('That file is a lorebook (world lore entries), not a character — import it at the CODEX step.');
+    return;
+  }
   // (2026-08-15 audit fix) Re-check flowBusy AFTER the dialog await: two
   // rapid clicks both pass the pre-await guard, then both resolve past the
   // picker — the second would burn/render over the first's chain.
@@ -960,7 +1003,7 @@ async function flowImportPlayer(selectedBtn) {
         onCreated: ({ playerId, draft }) => {
           flowState.selectedPlayerId = playerId;
           flowState.playerDraft = draft;
-          flowSimPair();
+          flowAfterPlayer();
         },
         back: () => returnToPlayerPair(),
       });
@@ -1005,22 +1048,32 @@ function flowEditPlayer(player) {
     onCreated: ({ playerId, draft }) => {
       flowState.selectedPlayerId = playerId;
       flowState.playerDraft = draft;
-      flowSimPair();
+      flowAfterPlayer();
     },
     back: () => renderPlayerPickerStep(),
   });
 }
 
-// Route after a player is chosen (Load). The SIM pair is the next step.
-// (Loaded players have no draft; flowState.playerDraft stays null → no
-// transient starting conditions are seeded at launch.)
+// Route after the player step resolves (CREATE / IMPORT / EDIT / LOAD). When
+// the flow entered from the Load menu's per-card NEW (beginNewGameFromCard),
+// the SIM card is ALREADY established (flowState.selectedCardId) — skip the
+// SIM pair + the Codex pair and launch straight into that world. Otherwise
+// the SIM pair is the next step (the title-entry flow).
+function flowAfterPlayer() {
+  if (flowState.selectedCardId) launchGame(flowState.selectedCardId);
+  else flowSimPair();
+}
+
+// Route after a player is chosen (Load). (Loaded players have no draft;
+// flowState.playerDraft stays null → no transient starting conditions are
+// seeded at launch.)
 function advanceAfterPlayer(playerId) {
   flowState.selectedPlayerId = playerId;
   // (P2 fix) Clear any CREATEd player's draft: after CREATE → back → LOAD,
   // the stale draft made the LOADED player inherit the CREATED one's
   // wealth/reputation via buildStartingConditions.
   flowState.playerDraft = null;
-  flowSimPair();
+  flowAfterPlayer();
 }
 
 // === Sim World Wizard ====================================================
@@ -1120,10 +1173,17 @@ async function flowImportSim(selectedBtn) {
   try {
     result = await parseImportFile(screens['newgame-split']);
   } catch (e) {
-    toast(`Import failed: ${e.message || e}`);
+    bottomWarning(`Import failed: ${e.message || e}`);
     return;
   }
   if (!result) return; // picker cancelled
+  // (2026-08-19) A standalone lorebook is CODEX material — a SIM card is a
+  // character/scenario/world, not a pile of lore entries. Bottom warning,
+  // stay on the picker.
+  if (result.lorebook && !result.charData) {
+    bottomWarning('That file is a lorebook (world lore entries), not a sim card — import it at the CODEX step.');
+    return;
+  }
   // (2026-08-15 audit fix) Re-check flowBusy AFTER the dialog await (see
   // flowImportPlayer): two rapid clicks both passed the pre-await guard.
   if (flowBusy) return;
@@ -1179,14 +1239,17 @@ function flowCodexPair(cardId, { afterCodex } = {}) {
   spawnFlowTiles();
 }
 
-function flowCreateCodex(cardId, presetImport, afterCodex) {
+function flowCreateCodex(cardId, presetImport, afterCodex, presetLorebook = null) {
   const done = afterCodex || (() => launchGame(cardId));
   showScreen('creator-chat');
   setFlowStep('creator-chat');
   renderCreatorChat(screens['creator-chat'], {
     creatorKind: 'codex',
     cardId,
-    presetImportData: presetImport,
+    // With a lorebook payload the batched lore conversion owns the run — no
+    // character import block rides along (the book IS the payload).
+    presetImportData: presetLorebook ? null : presetImport,
+    presetLorebook,
     onCreated: () => done(),
     back: () => flowCodexPair(cardId, { afterCodex: done }),
   });
@@ -1198,10 +1261,25 @@ async function flowImportCodexPair(selectedBtn, cardId, afterCodex) {
   try {
     result = await parseImportFile(screens['newgame-split']);
   } catch (e) {
-    toast(`Codex import failed: ${e.message || e}`);
+    bottomWarning(`Codex import failed: ${e.message || e}`);
     return;
   }
   if (!result) return; // picker cancelled
+  // (2026-08-19 Chloe) The CODEX import is a LOREBOOK import. The payload is
+  // the mechanically-extracted entries: a standalone world book directly, or
+  // the character_book embedded in an imported character card. Anything else
+  // is unrecognized → bottom warning, never a wizard/chat window.
+  const lorebook = result.lorebook
+    || (result.charData && result.charData.character_book
+      ? {
+        name: (result.charData.name || result.charData.character_book.name || 'Imported lorebook').slice(0, 80),
+        entries: extractLorebookEntries(result.charData.character_book),
+      }
+      : null);
+  if (!lorebook || !lorebook.entries.length) {
+    bottomWarning('No lorebook entries found in that file — expected a SillyTavern world book JSON (or a card with an embedded lorebook).');
+    return;
+  }
   // (2026-08-15 audit fix) Re-check flowBusy AFTER the dialog await (see
   // flowImportPlayer): two rapid clicks both passed the pre-await guard.
   if (flowBusy) return;
@@ -1212,7 +1290,7 @@ async function flowImportCodexPair(selectedBtn, cardId, afterCodex) {
     rejectedBtns: rejected,
     onComplete: () => {
       setFlowBusy(false);
-      flowCreateCodex(cardId, result.charData, afterCodex);
+      flowCreateCodex(cardId, result.charData, afterCodex, lorebook);
     },
   });
 }
@@ -1334,7 +1412,10 @@ async function launchGame(cardId) {
   // wait (the "background + music" hold); it stops further below.
   // NOTE: the title ambient is stopped inside enterStageViaTransition (right
   // before the stage shows), not here — so the grass doesn't vanish early.
-  try { await invoke('fable_end'); } catch (_) {}
+  // endFableSession also signals every cancel slot first — a prior mid-turn
+  // exit that outran its unwind window is cleared here instead of erroring
+  // "a game is already running".
+  await endFableSession();
   let openingScene = null;
   let loadMessages = null;
   try {
@@ -1454,31 +1535,57 @@ function enterStageViaTransition(openingScene, loadMessages, opts = {}) {
 }
 
 
+// (2026-08-19 Chloe) The universal game-exit funnel: leaving a live roleplay
+// (the drawer's Home button, or any launch path that must clear a prior
+// session) STOPS ALL GENERATION, not just navigating away. Signal every
+// reserved cancel slot — the narrator turn + edit retrack (`fable_stop`: the
+// API stream AND the local tracker decode), the golden-pencil slice regen
+// (`fable_slice_stop`), and the Wupi drawer's local chat decode (`chat_stop`)
+// — then end the session, RETRYING while a cancelled turn is still unwinding:
+// `fable_stop` is signal-only and `fable_end` refuses mid-turn by design, so
+// the unwind takes a moment and the bare stop→end pair could error out and
+// leave the engine alive server-side. All signals are safe no-ops when idle.
+const FABLE_END_UNWIND_RETRIES = 10;
+const FABLE_END_UNWIND_DELAY_MS = 150;
+async function endFableSession() {
+  try { await invoke('fable_stop'); } catch (_) {}
+  try { await invoke('fable_slice_stop'); } catch (_) {}
+  try { await invoke('chat_stop'); } catch (_) {}
+  for (let i = 0; ; i++) {
+    try {
+      await invoke('fable_end');
+      return;
+    } catch (e) {
+      const msg = String((e && e.message) || e);
+      if (i < FABLE_END_UNWIND_RETRIES && msg.includes('still in flight')) {
+        await new Promise((res) => setTimeout(res, FABLE_END_UNWIND_DELAY_MS));
+        continue;
+      }
+      console.error('[fable] fable_end failed', e);
+      return;
+    }
+  }
+}
+
 // Return from the stage to the Fable title screen. Wired as the stage's
 // `onExit` hook (the Home button in the Wupi drawer footer calls it).
 // Tears down the stage's engine modules + listeners so re-entry is clean,
 // shuts down the FableEngine (the load-bearing fix: prior version leaked the
 // engine — the next fable_start would error "a game is already running"),
 // then swaps back to the title + restarts the title ambient + music.
-// No magical transition here — the return is instant (the user is leaving
-// a game, not entering one; the cinematic is for entry only).
+// No magical transition here — the return is instant (the user is leaving a
+// game, not entering one; the cinematic is for entry only).
 async function returnToTitle() {
   // Shut down the FableEngine BEFORE teardown so the narrator thread is gone
-  // by the time wireStage nulls its refs. fable_end persists the session +
-  // schema per-card first (best-effort), then joins the engine thread +
-  // restores the pre-game active_card_id server-side. Idempotent + safe if
-  // the engine never started (engineStarted gate avoids a needless IPC
-  // round-trip on the no-engine degrade path).
+  // by the time wireStage nulls its refs. endFableSession stops EVERY
+  // in-flight generation first (narrator/tracker turn, slice regen, drawer
+  // chat) + waits out the unwind, then fable_end persists the session +
+  // schema per-card (best-effort), joins the engine thread + restores the
+  // pre-game active_card_id server-side. Idempotent + safe if the engine
+  // never started (engineStarted gate avoids a needless IPC round-trip on
+  // the no-engine degrade path).
   if (engineStarted) {
-    // (2026-08-15 audit fix) Stop any in-flight turn BEFORE fable_end: the
-    // flow layer can't see narrator.js's generating flag, so invoke
-    // fable_stop unconditionally (a safe no-op when no turn is in flight) —
-    // ending the session mid-decode races the tracker's turn-lock against
-    // the engine join. Best-effort await, then proceed.
-    try { await invoke('fable_stop'); } catch (_) {}
-    try { await invoke('fable_end'); } catch (e) {
-      console.error('[fable] fable_end on return-to-title failed', e);
-    }
+    await endFableSession();
     engineStarted = false;
   }
   teardownStage();

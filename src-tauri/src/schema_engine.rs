@@ -269,6 +269,22 @@ struct TranslationRequest {
     reply: mpsc::Sender<SchemaReply>,
 }
 
+/// (2026-08-19 Stale Roulette) One site designated to the world-progression
+/// pass — the model is asked to (optionally) emit a `site_seeds` hook for
+/// it. Pure prompt input; the apply lives in `fire_world_progression_tick`.
+#[derive(Debug, Clone)]
+pub struct DesignatedSite {
+    /// The travel-node id.
+    pub id: String,
+    /// Diegetic name (prompt flavor).
+    pub name: String,
+    /// In-world days since the node's `last_evolved_minutes` watermark
+    /// (0 = never designated).
+    pub elapsed_days: i64,
+    /// The node's current un-germinated seed hooks (honor-them context).
+    pub seeds: Vec<String>,
+}
+
 /// A request to advance the off-screen world (Fable Seam #4, 2026-07-27).
 /// Fires when the in-world clock (`WorldSchema::world_clock`) advances past
 /// the configured interval. Reuses the schema engine's isolated context +
@@ -286,6 +302,10 @@ struct WorldProgressionRequest {
     /// Deferred progression attempts from prior ticks. Same fail-proof
     /// contract as the delta + translation paths.
     deferred_attempts: Vec<FailedAttempt>,
+    /// (2026-08-19 Stale Roulette) The stale un-mapped sites designated this
+    /// tick — the prompt's `## DESIGNATED SITES` section; the model may
+    /// emit `site_seeds` hooks for them (Rust validates + plants).
+    designated: Vec<DesignatedSite>,
     /// Immutable + existing key sets (same role as in `SchemaRequest`).
     immutable_keys: std::collections::HashSet<String>,
     existing_keys: std::collections::HashSet<String>,
@@ -622,19 +642,22 @@ impl SchemaEngine {
     ///
     /// `interval_hours` surfaces to the model as the magnitude of time to
     /// advance ("~N hours of off-screen activity"). `deferred_attempts`
-    /// carries failed progression attempts from prior ticks. Same shape +
+    /// carries failed progression attempts from prior ticks. `designated`
+    /// carries this tick's Stale-Roulette sites (2026-08-19). Same shape +
     /// semantics as the delta/translation paths.
     pub fn request_world_progression(
         &self,
         current_schema: &WorldSchema,
         interval_hours: u32,
         deferred_attempts: Vec<FailedAttempt>,
+        designated: Vec<DesignatedSite>,
     ) -> anyhow::Result<mpsc::Receiver<SchemaReply>> {
         let (reply_tx, reply_rx) = mpsc::channel::<SchemaReply>();
         let req = WorldProgressionRequest {
             current_schema_json: current_schema.to_json_prompt(),
             interval_hours,
             deferred_attempts,
+            designated,
             immutable_keys: current_schema.immutable_keys.clone(),
             existing_keys: current_schema.entities.keys().cloned().collect(),
             reply: reply_tx,
@@ -832,6 +855,7 @@ impl SchemaRuntime {
             &req.current_schema_json,
             req.interval_hours,
             &req.deferred_attempts,
+            &req.designated,
         );
         self.generate_with_repair(
             &initial_prompt,
@@ -923,14 +947,6 @@ impl SchemaRuntime {
             }
             last_raw = reply.clone();
             raw_outputs.push(reply.clone());
-            crate::logs::log(
-                "SCHEMA",
-                &format!(
-                    "{label} pass={pass} reply_chars={} reply={}",
-                    reply.chars().count(),
-                    crate::logs::brief_with(&reply, 60)
-                ),
-            );
 
             // Parse the JSON (channel-protocol + fence strip happens inside
             // from_model_output; on a reply already stripped this is a no-op).
@@ -946,13 +962,6 @@ impl SchemaRuntime {
                         raw_preview = %reply.chars().take(200).collect::<String>(),
                         "{label} parse failed"
                     );
-                    crate::logs::log(
-                        "SCHEMA",
-                        &format!(
-                            "{label} pass={pass} PARSE_FAIL err={}",
-                            crate::logs::brief_with(&e.to_string(), 120)
-                        ),
-                    );
                     errors.push(msg);
                     continue; // next pass
                 }
@@ -964,13 +973,6 @@ impl SchemaRuntime {
             if let Err(vfail) = schema_validator::validate(&delta, &validation_ctx) {
                 let msg = format!("pass {pass} validation: {vfail}");
                 tracing::warn!(label, pass, failure = %vfail, "{label} validation failed");
-                crate::logs::log(
-                    "SCHEMA",
-                    &format!(
-                        "{label} pass={pass} VALIDATION_FAIL {}",
-                        crate::logs::brief_with(&vfail.to_string(), 140)
-                    ),
-                );
                 errors.push(msg);
                 continue; // next pass — repair prompt will show the failure
             }
@@ -982,19 +984,6 @@ impl SchemaRuntime {
                 tokens = reply.len(),
                 deferred = prior_deferred.len(),
                 "{label} committed on pass {pass}"
-            );
-            crate::logs::log(
-                "SCHEMA",
-                &format!(
-                    "{label} COMMITTED pass={pass} summary={} events={} entities={}",
-                    delta.summary.is_some(),
-                    delta
-                        .recent_events
-                        .as_ref()
-                        .map(|v| v.len())
-                        .unwrap_or(0),
-                    delta.entities.as_ref().map(|v| v.len()).unwrap_or(0)
-                ),
             );
             return Ok(AttemptOutcome::Committed { raw_output: reply, delta });
         }
@@ -1020,13 +1009,6 @@ impl SchemaRuntime {
             passes = MAX_DELTA_PASSES,
             errors = errors.join(" | "),
             "{label} failed all {MAX_DELTA_PASSES} passes; carrying for re-attempt"
-        );
-        crate::logs::log(
-            "SCHEMA",
-            &format!(
-                "{label} ALL_PASSES_FAILED errors={}",
-                crate::logs::brief_with(&errors.join(" | "), 200)
-            ),
         );
         Ok(AttemptOutcome::Failed {
             last_raw_output: last_raw,
@@ -1282,6 +1264,7 @@ fn render_world_progression_prompt(
     current_schema_json: &str,
     interval_hours: u32,
     deferred_attempts: &[FailedAttempt],
+    designated: &[DesignatedSite],
 ) -> String {
     let mut out = String::with_capacity(2048);
     out.push_str("<|turn>system\n");
@@ -1301,6 +1284,32 @@ fn render_world_progression_prompt(
          in that window (a faction relocates, an NPC's mood shifts, a deadline approaches, \
          a rumor spreads, a rival makes a move) and emit ONLY their changed keys."
     ));
+    // (2026-08-19 Stale Roulette) The designated-site section — ONE decode,
+    // folded into the existing tick pass (not three micro-prompts). The
+    // model MAY answer with `site_seeds` hooks for these ids; "no change"
+    // is a valid outcome (Rust stamps the watermark regardless — rotation).
+    if !designated.is_empty() {
+        out.push_str("\n\n## DESIGNATED SITES\n");
+        out.push_str(
+            "These unvisited places moved while the player was elsewhere. For any that \
+             plausibly changed, add a \"site_seeds\" object to your JSON keyed by site id, \
+             each value ONE short line (≤140 chars) describing what festered, moved in, \
+             collapsed, or stirred there. Sites with existing seeds build on them, never \
+             contradict. A site that stayed quiet simply gets no entry.\n",
+        );
+        for d in designated {
+            out.push_str(&format!(
+                "- {} (id: {}) — ~{} day(s) since last touched",
+                d.name,
+                d.id,
+                d.elapsed_days
+            ));
+            if !d.seeds.is_empty() {
+                out.push_str(&format!("; known: {}", d.seeds.join(" / ")));
+            }
+            out.push('\n');
+        }
+    }
     if !deferred_attempts.is_empty() {
         out.push_str(
             "\n\n[Previously deferred progression attempts — re-attempt with the above as context:]\n",
@@ -1466,12 +1475,16 @@ Output format (raw JSON only: no markdown fences, no prose):
 {
   \"summary\": \"<one-line updated arc summary, or omit if unchanged>\",
   \"recent_events\": [\"<new off-screen event>\", ...],
-  \"entities\": {\"<key>\": \"<new value>\", \"<key_to_delete>\": null}
+  \"entities\": {\"<key>\": \"<new value>\", \"<key_to_delete>\": null},
+  \"site_seeds\": {\"<designated site id>\": \"<one short line of what changed there>\"}
 }
 
 Rules:
 - Emit ONLY changed keys. Omit unchanged sections entirely. If nothing \
 plausibly moved, emit {}.
+- site_seeds: ONLY for site ids listed under ## DESIGNATED SITES (if any), \
+one short line each; omit the whole object when none moved or none were \
+designated.
 - entities: a null value means DELETE the key. A non-null string means SET.
 - Pick 1-4 entities to advance per tick — the world moves in small ripples, \
 not wholesale rewrites. Avoid touching the player's direct possessions \
@@ -1533,6 +1546,7 @@ mod tests {
             "{\"entities\":{\"faction.cult.position\":\"east_ridge\"}}",
             24,
             &[],
+            &[],
         );
         assert!(prompt.contains("world simulation engine"));
         assert!(prompt.contains("24 hours"));
@@ -1542,11 +1556,32 @@ mod tests {
         assert!(prompt.ends_with("<|turn>model\n"));
     }
 
+    /// (2026-08-19 Stale Roulette) The designated-site section renders only
+    /// when sites were designated, carries id + known seeds, and the output
+    /// contract teaches `site_seeds`.
+    #[test]
+    fn world_progression_prompt_carries_designated_sites() {
+        let designated = vec![DesignatedSite {
+            id: "old-watchtower".into(),
+            name: "The Old Watchtower".into(),
+            elapsed_days: 30,
+            seeds: vec!["smoke seen on the horizon".into()],
+        }];
+        let prompt = render_world_progression_prompt("{}", 24, &[], &designated);
+        assert!(prompt.contains("## DESIGNATED SITES"), "section missing");
+        assert!(prompt.contains("old-watchtower"), "site id missing");
+        assert!(prompt.contains("smoke seen on the horizon"), "seed context missing");
+        assert!(prompt.contains("site_seeds"), "output contract missing");
+        // Without designated sites the section is absent (zero tokens).
+        let bare = render_world_progression_prompt("{}", 24, &[], &[]);
+        assert!(!bare.contains("## DESIGNATED SITES"), "section must be conditional");
+    }
+
     #[test]
     fn world_progression_prompt_instructs_off_screen_subset() {
         // Critical framing: the model must advance a SUBSET, not rewrite the
         // world wholesale, and must NOT touch the player's bubble.
-        let prompt = render_world_progression_prompt("{}", 12, &[]);
+        let prompt = render_world_progression_prompt("{}", 12, &[], &[]);
         assert!(prompt.contains("SUBSET"));
         assert!(prompt.contains("off-screen"));
         assert!(prompt.contains("the player's direct possessions"));
@@ -1557,7 +1592,7 @@ mod tests {
         // The system instruction must warn about immutable keys so the model
         // doesn't try to overwrite canon (the validator catches it, but the
         // instruction prevents wasted passes).
-        let prompt = render_world_progression_prompt("{}", 24, &[]);
+        let prompt = render_world_progression_prompt("{}", 24, &[], &[]);
         assert!(prompt.contains("immutable"));
         assert!(prompt.contains("NEW keys"));
     }
@@ -1572,7 +1607,7 @@ mod tests {
             errors: "pass 1 JSON parse: ... | pass 2 validation: ImmutableKeyOverwrite ...".to_string(),
             passes_used: MAX_DELTA_PASSES,
         }];
-        let prompt = render_world_progression_prompt("{}", 24, &deferred);
+        let prompt = render_world_progression_prompt("{}", 24, &deferred, &[]);
         assert!(prompt.contains("Previously deferred"));
         assert!(prompt.contains("world progression"));
         assert!(prompt.contains("ImmutableKeyOverwrite"));

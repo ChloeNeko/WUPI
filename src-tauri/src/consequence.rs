@@ -758,26 +758,11 @@ pub fn sanitize_tag_kind(raw_kind: &str, label: &str) -> String {
         eprintln!(
             "[DEBUG] [EFFECT] stripped unapproved tag_kind {raw_kind:?} — tag kept as a pure buff/debuff (approved lanes: {APPROVED_TAG_KINDS:?})"
         );
-        crate::logs::log(
-            "BRK",
-            &format!(
-                "tag_kind STRIPPED (unapproved): kind={} label={}",
-                crate::logs::brief_with(raw_kind, 30),
-                crate::logs::brief_with(label, 40)
-            ),
-        );
         return String::new();
     }
     if normalized == "disguise" && !label_describes_disguise(label) {
         eprintln!(
             "[DEBUG] [EFFECT] stripped disguise kind from label {label:?} — it names no guise/costume, not a disguise lane tag"
-        );
-        crate::logs::log(
-            "BRK",
-            &format!(
-                "tag_kind STRIPPED (not a disguise label): label={}",
-                crate::logs::brief_with(label, 40)
-            ),
         );
         return String::new();
     }

@@ -2138,6 +2138,24 @@
     backdrop-filter: blur(10px);
     -webkit-backdrop-filter: blur(10px);
 }
+/* Stack under the ring: a small uppercase progress label (lorebook imports
+   convert in batches — the label names the batch so a long import never reads
+   as a hang). */
+.fable-creator-genring-stack {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 18px;
+}
+.fable-creator-genring-label {
+    font-size: 13px;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    color: var(--fable-brass);
+    text-shadow: 0 0 10px var(--fable-brass-glow);
+    max-width: 420px;
+    text-align: center;
+}
 .fable-creator-genring-ring {
     width: 64px;
     height: 64px;
@@ -2159,6 +2177,34 @@
 }
 @keyframes creatorRingSpin {
     to { transform: rotate(360deg); }
+}
+
+/* (2026-08-19) Bottom warning popup for import failures (stage.js::
+   bottomWarning): document-level + fixed so it reads on every flow screen.
+   An unrecognized import warns HERE — never by dropping into a chat window. */
+.fable-import-warn {
+    position: fixed;
+    left: 50%;
+    bottom: 34px;
+    transform: translateX(-50%) translateY(16px);
+    z-index: 90;
+    max-width: min(680px, 86vw);
+    padding: 12px 22px;
+    border-radius: 10px;
+    background: rgba(24, 14, 6, 0.94);
+    border: 1px solid var(--fable-brass);
+    box-shadow: 0 6px 30px rgba(0, 0, 0, 0.5), 0 0 16px var(--fable-brass-glow);
+    color: #f3e3c0;
+    font-size: 14px;
+    line-height: 1.45;
+    text-align: center;
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity 0.22s ease, transform 0.22s ease;
+}
+.fable-import-warn.is-open {
+    opacity: 1;
+    transform: translateX(-50%) translateY(0);
 }
 
 /* Cinematic launch fade (launchGame): the current screen fades to opacity 0 so

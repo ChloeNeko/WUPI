@@ -3,10 +3,13 @@
 //! Rust is the SOLE authority over what the player carries and wears, mirroring
 //! the `player_state` discipline: the narrator LLM mutates this ONLY through
 //! the bracket pipeline (`[EQUIP]`/`[BELT]`/`[PACK]`), never by writing the
-//! rendered `<player_state>` block. The rendered block exposes ONLY each slot's
-//! Outer-layer item to the narrator — Inner layers are invisible to the AI (the
-//! "Heavy Cloak over Linen Shirt → AI only knows the Cloak" rule). Belt + pack
-//! are never appearance-visible (carried, not worn).
+//! rendered `<player_state>` block. The rendered block exposes what an
+//! OBSERVER sees (2026-08-19 NPC-perception upgrade): each slot's Outer-layer
+//! item, plus an Inner item only where it physically peeks — socks under boots
+//! show when the legs are bare or short-hemmed, stay hidden under trousers or
+//! a full-length gown (the "Heavy Cloak over Linen Shirt → AI only knows the
+//! Cloak; shorts + shoes → the socks show" rule). Belt + pack are never
+//! appearance-visible (carried, not worn).
 //!
 //! Lives nested inside `PlayerState` (NOT a separate AppState field), so it
 //! rides `save_split` → `<card_id>.player.json` for free + round-trips through
@@ -20,13 +23,16 @@ use std::collections::{BTreeMap, HashMap};
 // ---------------------------------------------------------------------------
 
 /// An equipment slot. Each maps to a Soul Gem inspection-panel category
-/// (see `inventory-panel.js` `CATEGORY_MAP` — Head/TOP/HAND/BOTTOM/Feet gems;
+/// (see `inventory-panel.js` `CATEGORY_MAP` — Head/TOP/HAND/BOTTOM/FEET gems;
 /// the hands share one gem, the BOTTOM gem also carries the belt):
 ///
 /// | Slot      | Panel category (`CATEGORY_MAP` key)          |
 /// |-----------|----------------------------------------------|
-/// | `Head`    | `head`                                       |
+/// | `Head`    | `head` (shares the gem with `Neck` jewelry)  |
+/// | `Neck`    | `head` gem (2026-08-19 zone sweep)           |
 /// | `Chest`   | `chest` (TOP gem)                            |
+/// | `Arms`    | `hand` gem (2026-08-19 zone sweep)           |
+/// | `Hands`   | `hand` gem (2026-08-19 zone sweep)           |
 /// | `MainHand`| `hand` (shared with OffHand)                 |
 /// | `OffHand` | `hand` (shared with MainHand)                |
 /// | `Legs`    | `leg` (BOTTOM gem, shared with the belt)     |
@@ -38,7 +44,10 @@ use std::collections::{BTreeMap, HashMap};
 #[serde(rename_all = "snake_case")]
 pub enum EquipSlot {
     Head,
+    Neck,
     Chest,
+    Arms,
+    Hands,
     MainHand,
     OffHand,
     Legs,
@@ -48,11 +57,15 @@ pub enum EquipSlot {
 impl EquipSlot {
     /// Canonical snake_case ids — the allowlist the `[EQUIP slot=...]` parser
     /// matches against (case-insensitive). Source of truth for both the parser
-    /// + the frontend's slot→body-part mapping.
+    /// + the frontend's slot→body-part mapping. Order is head-to-foot — the
+    /// render order of the `equipped:` block.
     pub fn all() -> &'static [EquipSlot] {
         &[
             EquipSlot::Head,
+            EquipSlot::Neck,
             EquipSlot::Chest,
+            EquipSlot::Arms,
+            EquipSlot::Hands,
             EquipSlot::MainHand,
             EquipSlot::OffHand,
             EquipSlot::Legs,
@@ -76,7 +89,10 @@ impl EquipSlot {
     pub fn id(self) -> &'static str {
         match self {
             EquipSlot::Head => "head",
+            EquipSlot::Neck => "neck",
             EquipSlot::Chest => "chest",
+            EquipSlot::Arms => "arms",
+            EquipSlot::Hands => "hands",
             EquipSlot::MainHand => "main_hand",
             EquipSlot::OffHand => "off_hand",
             EquipSlot::Legs => "legs",
@@ -88,7 +104,10 @@ impl EquipSlot {
     pub fn label(self) -> &'static str {
         match self {
             EquipSlot::Head => "Head",
+            EquipSlot::Neck => "Neck",
             EquipSlot::Chest => "Chest",
+            EquipSlot::Arms => "Arms",
+            EquipSlot::Hands => "Hands",
             EquipSlot::MainHand => "Main Hand",
             EquipSlot::OffHand => "Off Hand",
             EquipSlot::Legs => "Legs",
@@ -219,8 +238,11 @@ impl SlotLayers {
         self.outer.is_none() && self.inner.is_none()
     }
 
-    /// The Outer-layer item, if any — the single narrator-visible item for this
-    /// slot. Inner is deliberately hidden by the renderer.
+    /// The Outer-layer item, if any. This is the slot's TOPMOST item — the
+    /// default observer-visible one (the renderer adds an Inner only where it
+    /// physically peeks, e.g. socks under boots with bare/short-covered legs:
+    /// see `visible_equipment_lines`). Not a complete visibility answer on
+    /// its own — cross-slot facts decide the peek.
     pub fn visible(&self) -> Option<&EquippedItem> {
         self.outer.as_ref()
     }
@@ -531,14 +553,24 @@ fn noun_phrase_windows(text: &str) -> Vec<(String, Vec<String>)> {
 // Legacy migration: item_*/inv_* entity keys → typed inventory (one-shot).
 // ---------------------------------------------------------------------------
 
-/// Keyword→slot routing for the legacy `item_*`/`inv_*` entity migration AND
-/// the Player Creator's clothing chips (2026-08-18 clothing-as-inventory
-/// ruling — one router, one vocabulary). Pure heuristic on the lowercased
-/// name: a sword/axe/mace routes to MainHand, a shield to OffHand, etc.
-/// Anything that doesn't match returns `None` → the item lands in the pack
-/// instead. Mirrors the (deleted) `panels/inventory.js` glyph-picker
-/// heuristic, adapted to slot routing.
-fn route_legacy_to_slot(name_lower: &str) -> Option<EquipSlot> {
+/// Keyword→slot routing for the legacy `item_*`/`inv_*` entity migration, the
+/// Player Creator's clothing chips (2026-08-18 clothing-as-inventory ruling —
+/// one router, one vocabulary), AND the live garment auto-wear paths
+/// (2026-08-19: the `[PACK]` applier + the Soul Gem AUTO-FIT — clothes must
+/// land on the body, not in the bag). Pure heuristic on the lowercased name:
+/// a sword/axe/mace routes to MainHand, a shield to OffHand, etc. Anything
+/// that doesn't match returns `None` → the item lands in the pack instead.
+/// Mirrors the (deleted) `panels/inventory.js` glyph-picker heuristic,
+/// adapted to slot routing. `pub` because lib.rs consults it directly (the
+/// `[PACK]` auto-wear gate + the equippable-tag ensure).
+pub fn route_legacy_to_slot(name_lower: &str) -> Option<EquipSlot> {
+    // Underwear claims FIRST (2026-08-19): the deepest layer's vocabulary is
+    // word-boundary matched and shares no words with the weapon/garment
+    // needles, so precedence here is about clarity, not collision-avoidance
+    // (a "Lace Panties" chip must never fall through to the pack).
+    if let Some(slot) = underwear_slot(name_lower) {
+        return Some(slot);
+    }
     // Cheap substring scan (no regex). Order matters: the first match wins,
     // mirroring the deleted panel's glyph-picker heuristic.
     if contains_any(
@@ -558,28 +590,102 @@ fn route_legacy_to_slot(name_lower: &str) -> Option<EquipSlot> {
         &[
             // Armor family.
             "armor", "armour", "chestplate", "breastplate", "cuirass", "vest",
+            // (2026-08-19 zone sweep) the mail family — bare "mail" is a
+            // word-route (below); these compounds are substring-safe.
+            "chainmail", "chain mail", "hauberk",
             // Everyday garments (2026-08-18): clothing is inventory — a
             // cloak/tunic/dress/robe routes like any other worn thing. One-
             // piece garments (dress/robe/gown) anchor Chest: they dominate
             // the torso read + layer under a cloak exactly like the
             // "Heavy Cloak over Linen Shirt" example.
+            // (2026-08-19 vocabulary expansion) coat/jacket/frock/poncho/
+            // cardigan/sweater/garb/attire/outfit/shawl/chemise — the
+            // Creator's GLM-authored chip lists routinely used these +
+            // hit NO needle, dumping the whole wardrobe into the pack.
             "cloak", "cape", "mantle", "tunic", "shirt", "blouse", "dress", "robe",
             "gown", "bodice", "surcoat", "doublet", "jerkin", "tabard", "corset",
+            "coat", "jacket", "frock", "poncho", "cardigan", "sweater", "garb",
+            "attire", "outfit", "shawl", "chemise",
         ],
     ) {
         return Some(EquipSlot::Chest);
     }
-    if contains_any(name_lower, &["helm", "helmet", "hat", "hood", "cap", "crown"]) {
+    // (2026-08-19 zone sweep) "earring" MUST run before the Hands word-route
+    // "ring" could see it — substring here wins over the word table below.
+    if contains_any(name_lower, &["helm", "helmet", "hat", "hood", "cap", "crown", "circlet", "bonnet", "bandana", "earring"]) {
         return Some(EquipSlot::Head);
     }
-    if contains_any(name_lower, &["legging", "pants", "trouser", "greave", "skirt", "kilt", "breeches"]) {
+    // (2026-08-19 zone sweep) The neck: specific jewelry + neckwear. A neck
+    // brace is neckwear; a plain "neck" word would be too generic (a "Neck
+    // Key"?), so the phrase carries it.
+    if contains_any(
+        name_lower,
+        &["necklace", "amulet", "pendant", "locket", "gorget", "choker", "torc", "torque", "scarf", "brooch", "cravat", "neck brace"],
+    ) {
+        return Some(EquipSlot::Neck);
+    }
+    // (2026-08-19 zone sweep) The arms: sleeves, bracers, elbow/shoulder
+    // armor. "sleeve" is a WORD-route (below) — a substring would catch
+    // "Sleeveless Gown" (which Chest already claimed above anyway, but the
+    // word form is the correct discipline).
+    if contains_any(
+        name_lower,
+        &["bracer", "vambrace", "armlet", "armband", "elbow", "pauldron", "spaulder", "arm guard", "shoulder pads"],
+    ) {
+        return Some(EquipSlot::Arms);
+    }
+    // (2026-08-19 zone sweep) The hands: gloves, gauntlets, mittens, wrist
+    // jewelry. "ring" is a WORD-route (below) — an "earring" substring would
+    // be caught by Head above, but "keyring" is one word the word-table
+    // correctly ignores.
+    if contains_any(name_lower, &["glove", "gauntlet", "mitten", "bracelet"]) {
+        return Some(EquipSlot::Hands);
+    }
+    if contains_any(name_lower, &["legging", "pants", "trouser", "greave", "skirt", "kilt", "breeches", "hose"]) {
         return Some(EquipSlot::Legs);
     }
     if contains_any(
         name_lower,
-        &["boot", "sabaton", "shoe", "sandal", "slipper", "stocking", "sock"],
+        &["boot", "sabaton", "shoe", "sandal", "slipper", "stocking", "sock", "hosiery", "heels", "gaiter"],
     ) {
         return Some(EquipSlot::Feet);
+    }
+    // (2026-08-19 zone sweep) Word-routed LAST — after every substring
+    // needle, so "Knee-High Boots" hits the Feet needle before the "knee"
+    // word can misroute it, and "Sleeveless Gown" stays Chest. These are
+    // names whose SUBSTRING form would misroute: "shorts" (a "short"
+    // substring would catch "Short Boots"), "sleeve" (would catch
+    // "sleeveless"), "ring" (would catch "keyring"/"earring"), "spat"
+    // (would catch "spatula"), "mail" (would catch "mailing").
+    if let Some(slot) = word_routed_slot(name_lower) {
+        return Some(slot);
+    }
+    None
+}
+
+/// Whole-word routing table for names whose substring form would misroute
+/// (see `route_legacy_to_slot`'s tail). Checked AFTER every needle.
+fn word_routed_slot(name_lower: &str) -> Option<EquipSlot> {
+    const WORD_ROUTES: &[(&str, EquipSlot)] = &[
+        ("shorts", EquipSlot::Legs),
+        ("trunks", EquipSlot::Legs),
+        ("speedo", EquipSlot::Legs),
+        ("knee", EquipSlot::Legs),
+        ("kneepads", EquipSlot::Legs),
+        ("sleeve", EquipSlot::Arms),
+        ("sleeves", EquipSlot::Arms),
+        ("ring", EquipSlot::Hands),
+        ("rings", EquipSlot::Hands),
+        ("spat", EquipSlot::Feet),
+        ("spats", EquipSlot::Feet),
+        ("mail", EquipSlot::Chest),
+    ];
+    for w in phrase_words(name_lower) {
+        for (word, slot) in WORD_ROUTES {
+            if w == *word {
+                return Some(*slot);
+            }
+        }
     }
     None
 }
@@ -588,6 +694,558 @@ fn route_legacy_to_slot(name_lower: &str) -> Option<EquipSlot> {
 /// which callers pre-lowercase; needles are authored lowercase).
 fn contains_any(hay: &str, needles: &[&str]) -> bool {
     needles.iter().any(|n| hay.contains(n))
+}
+
+// ---------------------------------------------------------------------------
+// (2026-08-19 clothes-on-person fix) Under-clothing + auto-wear routing.
+// ---------------------------------------------------------------------------
+
+/// Under-clothing vocabulary: garments whose LOGICAL layer is Inner (worn
+/// beneath whatever else holds the slot — a sock under a boot, a chemise
+/// under a gown). Consulted ONLY as a layer PREFERENCE and only when it
+/// AGREES with [`route_legacy_to_slot`] on the slot (the agreement gate keeps
+/// a "Socketed Wand" — contains "sock" — routing MainHand/Outer, never Feet).
+/// Pure vocabulary, no state.
+fn under_garment_slot(name_lower: &str) -> Option<EquipSlot> {
+    if contains_any(name_lower, &["sock", "stocking", "hosiery"]) {
+        return Some(EquipSlot::Feet);
+    }
+    if contains_any(name_lower, &["undershirt", "chemise"]) {
+        return Some(EquipSlot::Chest);
+    }
+    underwear_slot(name_lower)
+}
+
+// ---------------------------------------------------------------------------
+// (2026-08-19 exposure upgrade, Chloe's upskirt question) Underwear — the
+// deepest layer. Word-boundary matched (NOT substring): "bra" must not catch
+// "bracelet", "briefs" must not catch "briefcase", and "Silk Slippers" must
+// never route Chest. A "Slip of Paper" is stationery, not lingerie — which is
+// why "slip"/"shift" are deliberately NOT in the vocabulary.
+// ---------------------------------------------------------------------------
+
+/// Underwear that covers the lower body (smallclothes family) — routes Legs,
+/// claims the Inner layer beneath skirts/trousers.
+/// Underwear and under-layers that anchor the LOWER body (smallclothes
+/// family, thigh/waist foundations, below-the-hem hosiery) — routes Legs,
+/// claims the Inner layer beneath skirts/trousers. The full zone sweep
+/// (2026-08-19, Chloe ruling: leotards, panties, boxers, bras, swimsuits,
+/// briefs, garter belts, "etc" — no body part overlooked):
+/// - smallclothes: drawers, panties/panty, briefs, knickers, bloomers,
+///   pantaloons, loincloth, fundoshi, boxers/boxer, thong, underwear,
+///   undergarment(s)
+/// - waist/thigh foundations: garter (belt), girdle, chastity (belt)
+/// - below-the-hem hosiery that layers UNDER skirts (peeks — see
+///   `extends_below_hem`): tights, petticoat, underskirt
+/// - swim/athletic lower pieces: bottoms (bikini bottoms, swim bottoms)
+///
+/// ("Chest of Drawers" furniture would misroute here — accepted joke: nobody
+/// packs a dresser.)
+const UNDERWEAR_LEGS_WORDS: &[&str] = &[
+    "drawers", "smallclothes", "underwear", "undergarment", "undergarments",
+    "panties", "panty", "briefs", "knickers", "bloomers", "pantaloons",
+    "loincloth", "fundoshi", "boxers", "boxer", "thong", "jock",
+    "garter", "girdle", "chastity",
+    "tights", "petticoat", "underskirt",
+    "bottoms",
+];
+
+/// Underwear and under-layers that anchor the TORSO — routes Chest, claims
+/// the Inner layer. Full-body garments (leotard, bodysuit, bodystocking,
+/// swimsuit, union suit, long johns, sleepwear) anchor Chest too: the torso
+/// is their dominant read, they render as the visible item when worn alone
+/// (inner-only slots render), and they conceal naturally under outer layers.
+/// Corsets/bustiers/basques join the under-family (worn over the chemise but
+/// under the gown); their `garment_rank` stays mid so an EXPLICIT outer
+/// placement still works.
+const UNDERWEAR_CHEST_WORDS: &[&str] = &[
+    "bra", "bralette", "brassiere", "bandeau", "camisole", "chemise", "undershirt",
+    "corset", "bustier", "basque",
+    "leotard", "bodysuit", "bodystocking",
+    "swimsuit", "swimwear", "bikini",
+    "negligee", "nightgown", "nightie", "nightdress", "lingerie",
+];
+
+/// Footwear vocabulary — when any of these appears, the name is FEET-family
+/// and must never classify as underwear ("Thong Sandals" and "Thong Boots"
+/// are footwear; the thong is a panty only when sandals are NOT involved).
+/// Guard consulted at the top of [`underwear_slot`] only.
+const FOOTWEAR_MARKERS: &[&str] = &["sandal", "slipper", "shoe", "boot", "heel", "wader"];
+
+/// Whole-word underwear classification (lowercased name). `None` when no
+/// underwear word appears. Shared by the router (slot), the under-garment
+/// preference (Inner layer), and the exposure gate (prose mentions).
+///
+/// Two-pass (all Legs words scanned before any Chest word): a compound like
+/// "Bikini Bottoms" names its zone with the LAST word — the legs pass must
+/// win over the chest word "bikini" sitting earlier in the name.
+fn underwear_slot(name_lower: &str) -> Option<EquipSlot> {
+    if contains_any(name_lower, FOOTWEAR_MARKERS) {
+        return None; // footwear names are never underwear, whatever else they contain
+    }
+    // Compound under-layer phrases whose individual words are too generic to
+    // word-match ("johns", "suit").
+    if contains_any(name_lower, &["long johns", "union suit"]) {
+        return Some(EquipSlot::Chest);
+    }
+    let words = phrase_words(name_lower);
+    if words.iter().any(|w| UNDERWEAR_LEGS_WORDS.contains(&w.as_str())) {
+        return Some(EquipSlot::Legs);
+    }
+    if words.iter().any(|w| UNDERWEAR_CHEST_WORDS.contains(&w.as_str())) {
+        return Some(EquipSlot::Chest);
+    }
+    None
+}
+
+/// Overness ranking within a slot — which garment sits on TOP when two share
+/// it (2026-08-19 NPC-perception upgrade). Higher = more outer. Consulted by
+/// every auto-placement path (the tracker's layer-less `[EQUIP]`, the `[PACK]`
+/// auto-wear, the clothing seeds, the legacy migration) so a cloak OVER a
+/// shirt never lands beneath it. Slot-local by design: rank only ever
+/// compares two garments contending for the SAME slot, so the vocabulary is
+/// per-slot and coarse. Pure heuristic on the lowercased name, mirroring
+/// [`route_legacy_to_slot`]'s substring scan.
+fn garment_rank(slot: EquipSlot, name_lower: &str) -> u8 {
+    match slot {
+        // Chest: cloaks/coats/surcoats drape over everything; armor and
+        // mid-layers sit over base shirts/dresses/chemises.
+        EquipSlot::Chest => {
+            if contains_any(
+                name_lower,
+                &["cloak", "cape", "mantle", "coat", "jacket", "poncho", "shawl", "surcoat", "tabard"],
+            ) {
+                2
+            } else if contains_any(
+                name_lower,
+                &[
+                    "armor", "armour", "chestplate", "breastplate", "cuirass", "chainmail",
+                    "chain mail", "hauberk", "sweater", "cardigan", "jerkin", "doublet",
+                    "vest", "frock", "bodice", "corset",
+                ],
+            ) {
+                1
+            } else {
+                0 // shirt/blouse/tunic/dress/gown/robe/chemise/undershirt
+            }
+        }
+        // Feet: footwear (incl. spats + gaiters, worn OVER the shoe) sits
+        // over socks/stockings/hosiery.
+        EquipSlot::Feet => {
+            if contains_any(name_lower, &["boot", "shoe", "sabaton", "sandal", "slipper", "heels", "spat", "gaiter"]) {
+                2
+            } else {
+                0
+            }
+        }
+        // Legs: greaves strap over trousers; trousers over hose/leggings.
+        EquipSlot::Legs => {
+            if contains_any(name_lower, &["greave"]) {
+                2
+            } else if contains_any(name_lower, &["trouser", "pants", "breeches", "skirt", "kilt"]) {
+                1
+            } else {
+                0 // hose/leggings (the under-layer family)
+            }
+        }
+        // Head: helmets/hoods/crowns sit over hats/caps/circlets.
+        EquipSlot::Head => {
+            if contains_any(name_lower, &["helm", "helmet", "hood", "crown"]) {
+                2
+            } else {
+                1
+            }
+        }
+        // Arms: rigid armor (pauldrons, bracers, vambraces) straps over
+        // soft sleeves/armlets.
+        EquipSlot::Arms => {
+            if contains_any(name_lower, &["pauldron", "spaulder", "vambrace", "bracer", "elbow"]) {
+                2
+            } else {
+                0 // sleeves, armlets, armbands
+            }
+        }
+        // Hands: gauntlets over gloves; rings/bracelets are the base layer.
+        EquipSlot::Hands => {
+            if contains_any(name_lower, &["gauntlet"]) {
+                2
+            } else {
+                0
+            }
+        }
+        // Neck is single-purpose (one necklace, one gorget) — rank unused;
+        // the exclusive-swap rule handles changes.
+        EquipSlot::Neck => 1,
+        // Hands (the READIED-weapon slots) are single-layer — rank unused.
+        _ => 1,
+    }
+}
+
+/// The outcome of a [`place_equipped`] call.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Placement {
+    /// The item was worn. `displaced` carries any prior occupants the caller
+    /// must route to the pack (the never-vaporize contract) — empty when the
+    /// placement layered cleanly (a free layer, or a demotion into a free
+    /// Inner).
+    Worn {
+        layer: ItemLayer,
+        displaced: Vec<EquippedItem>,
+    },
+    /// Auto placement declined (`force = false` only): both layers hold and
+    /// the incoming garment ranks at or below the worn Outer — a genuine
+    /// spare, the caller keeps it packed.
+    Packed,
+}
+
+/// The common-sense wear placement (2026-08-19 clothes-on-person fix + the
+/// NPC-perception upgrade, Chloe ruling: the system KNOWS where things
+/// belong — there is no UI affordance for it). ONE placement authority shared
+/// by the bracket `[EQUIP]` applier, the `[PACK]` auto-wear, the clothing
+/// seeds, and the legacy migration, so the layer a garment lands in can never
+/// disagree with the layer the narrator-render perceives it in.
+///
+/// - `explicit = Some(layer)` (the tracker emitted `layer=`): respected
+///   verbatim — the prior occupant of THAT layer rides to `displaced`.
+/// - Hands: single-layer, always Outer.
+/// - Under-clothing (socks/stockings/chemise via [`under_garment_slot`]):
+///   claims a free Inner FIRST (socks under boots, socks on bare feet — a
+///   later boot takes the Outer above them); a second under-garment over a
+///   held Inner is a spare (`Packed`, or an Inner swap when forced).
+/// - Free Outer (bare or inner-only slot — boots onto socked feet): Outer.
+/// - Incoming OUT-RANKS the worn Outer (cloak over shirt, boots over socks):
+///   the incoming takes Outer and the incumbent is DEMOTED to a free Inner
+///   (it stays worn — "she pulls a cloak over her shirt" no longer strips
+///   the shirt off), else the incumbent rides to `displaced`.
+/// - Equal rank on Feet/Head (footwear/headwear are exclusive — you don't
+///   wear two pairs of boots): SWAP, the incumbent rides to `displaced`.
+/// - Equal rank on Chest/Legs (a second shirt, armor over a vest): the free
+///   Inner, else `Packed` (or an Inner swap when forced).
+/// - Incoming UNDER-ranks the worn Outer (shirt under cloak): the free
+///   Inner, else `Packed` (or an Inner swap when forced — "changing the
+///   shirt under the cloak").
+///
+/// `force = true` (the bracket `[EQUIP]` contract: the model said the player
+/// wears it, so it must end up worn) never returns `Packed`.
+pub fn place_equipped(
+    equipment: &mut Equipment,
+    slot: EquipSlot,
+    item: EquippedItem,
+    explicit: Option<ItemLayer>,
+    force: bool,
+) -> Placement {
+    if let Some(layer) = explicit {
+        let layers = equipment.entry(slot).or_default();
+        let old = write_layer(layers, layer, item);
+        return Placement::Worn { layer, displaced: old.into_iter().collect() };
+    }
+    if matches!(slot, EquipSlot::MainHand | EquipSlot::OffHand) {
+        let layers = equipment.entry(slot).or_default();
+        let old = layers.outer.replace(item);
+        return Placement::Worn { layer: ItemLayer::Outer, displaced: old.into_iter().collect() };
+    }
+
+    let lower = item.name.trim().to_lowercase();
+    let rank = garment_rank(slot, &lower);
+    let under = under_garment_slot(&lower) == Some(slot);
+
+    // Same garment as an already-worn layer — a refresh emission (the tracker
+    // re-emitted the worn item with new stats/tags): update IN PLACE, before
+    // any layering logic (including the under-garment branch — a re-tagged
+    // sock must not displace itself into the pack). Never a twin beneath it,
+    // never a packed duplicate of the self-same object (the displaced vec
+    // stays empty — the old version is replaced, not displaced into
+    // co-existence).
+    {
+        let layers = equipment.entry(slot).or_default();
+        if layers.outer.as_ref().is_some_and(|o| o.name.trim().to_lowercase() == lower) {
+            layers.outer = Some(item);
+            return Placement::Worn { layer: ItemLayer::Outer, displaced: Vec::new() };
+        }
+        if layers.inner.as_ref().is_some_and(|i| i.name.trim().to_lowercase() == lower) {
+            layers.inner = Some(item);
+            return Placement::Worn { layer: ItemLayer::Inner, displaced: Vec::new() };
+        }
+    }
+
+    if under {
+        let layers = equipment.entry(slot).or_default();
+        if layers.inner.is_none() {
+            layers.inner = Some(item);
+            return Placement::Worn { layer: ItemLayer::Inner, displaced: Vec::new() };
+        }
+        if !force {
+            return Placement::Packed;
+        }
+        let old = layers.inner.replace(item);
+        return Placement::Worn { layer: ItemLayer::Inner, displaced: old.into_iter().collect() };
+    }
+
+    let layers = equipment.entry(slot).or_default();
+    if layers.outer.is_none() {
+        layers.outer = Some(item);
+        return Placement::Worn { layer: ItemLayer::Outer, displaced: Vec::new() };
+    }
+    let outer_rank = layers
+        .outer
+        .as_ref()
+        .map(|o| garment_rank(slot, &o.name.trim().to_lowercase()))
+        .unwrap_or(0);
+
+    if rank > outer_rank {
+        // Over-garment: take the Outer, demote the incumbent beneath.
+        let incumbent = layers.outer.take().expect("outer held checked above");
+        layers.outer = Some(item);
+        if layers.inner.is_none() {
+            layers.inner = Some(incumbent);
+            return Placement::Worn { layer: ItemLayer::Outer, displaced: Vec::new() };
+        }
+        return Placement::Worn { layer: ItemLayer::Outer, displaced: vec![incumbent] };
+    }
+    // Every zone EXCEPT Chest/Legs is exclusive at equal rank (one necklace,
+    // one pair of gloves, one hat, one pair of boots — you don't wear two):
+    // SWAP, the incumbent rides to `displaced`.
+    if rank == outer_rank && !matches!(slot, EquipSlot::Chest | EquipSlot::Legs) {
+        let old = layers.outer.replace(item);
+        return Placement::Worn { layer: ItemLayer::Outer, displaced: old.into_iter().collect() };
+    }
+    if layers.inner.is_none() {
+        layers.inner = Some(item);
+        return Placement::Worn { layer: ItemLayer::Inner, displaced: Vec::new() };
+    }
+    if !force {
+        return Placement::Packed;
+    }
+    let old = layers.inner.replace(item);
+    Placement::Worn { layer: ItemLayer::Inner, displaced: old.into_iter().collect() }
+}
+
+/// Write `item` into one layer of a slot, returning the prior occupant.
+fn write_layer(layers: &mut SlotLayers, layer: ItemLayer, item: EquippedItem) -> Option<EquippedItem> {
+    match layer {
+        ItemLayer::Outer => layers.outer.replace(item),
+        ItemLayer::Inner => layers.inner.replace(item),
+    }
+}
+
+/// True when this slot already wears an item with this (normalized) name —
+/// the tracker-echo guard: a re-emitted `[EQUIP]` for the garment already on
+/// that slot is a no-op, not a layer shuffle.
+pub fn slot_holds_name(equipment: &Equipment, slot: EquipSlot, name: &str) -> bool {
+    match equipment.get(&slot) {
+        Some(layers) => [&layers.outer, &layers.inner]
+            .into_iter()
+            .flatten()
+            .any(|it| it.name.trim().to_lowercase() == name.trim().to_lowercase()),
+        None => false,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// (2026-08-19 NPC-perception upgrade) Observer visibility — what renders.
+// ---------------------------------------------------------------------------
+
+/// Leg-garment vocabulary that covers the player down to the ANKLE — the
+/// condition under which Feet inner layers (socks/stockings) stay hidden
+/// inside the footwear. Long-form overrides run first ("long skirt" beats
+/// the short-hem default for plain skirts/kilts); everything else in the
+/// Legs routing vocabulary (trousers, pants, breeches, hose, leggings,
+/// greaves) reaches the shoe. Names are matched lowercased.
+fn legs_cover_ankles_name(name_lower: &str) -> bool {
+    // Word-level overrides first — "Long Wool Skirt" must beat the short-hem
+    // default for skirts even with words between "long" and "skirt".
+    if contains_any(name_lower, &["maxi", "floor", "ankle", "long"]) {
+        return true;
+    }
+    if contains_any(name_lower, &["skirt", "kilt", "short"]) {
+        return false; // knee-or-higher hem — the ankle (and the sock) shows
+    }
+    true
+}
+
+/// True when the player's legs are covered down to the ankle — the cross-slot
+/// fact that decides whether Feet inner layers peek. Consults the Legs slot
+/// (outer, else inner — hose alone still covers the ankle), then falls back
+/// to a one-piece Chest garment (dress/robe/gown drape to the ankle; a
+/// cloak/coat/jacket does NOT — the legs hang bare beneath it). Bare legs →
+/// false (the socks-between-shorts-and-shoes case).
+pub fn legs_cover_ankles(equipment: &Equipment) -> bool {
+    if let Some(layers) = equipment.get(&EquipSlot::Legs) {
+        if let Some(worn) = layers.outer.as_ref().or(layers.inner.as_ref()) {
+            return legs_cover_ankles_name(&worn.name.trim().to_lowercase());
+        }
+    }
+    if let Some(chest_outer) = equipment
+        .get(&EquipSlot::Chest)
+        .and_then(|l| l.outer.as_ref())
+    {
+        let n = chest_outer.name.trim().to_lowercase();
+        if contains_any(&n, &["mini", "short"]) {
+            return false;
+        }
+        if contains_any(&n, &["dress", "robe", "gown"]) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Legs inner garments that EXTEND BELOW a short hem — tights, stockings,
+/// hose, leggings, petticoats, underskirts peek out from under a skirt.
+/// Underwear (drawers, smallclothes, briefs) does NOT: it sits fully above
+/// the hem and stays concealed until an exposure event
+/// ([`narrative_trips_exposure`]). Substring match is safe here — the name
+/// already routed to the Legs slot.
+fn extends_below_hem(name_lower: &str) -> bool {
+    contains_any(name_lower, &["stocking", "hose", "legging", "tight", "petticoat", "underskirt"])
+}
+
+/// True when this slot's Inner item physically peeks out from under its Outer
+/// (an observer sees it). The peek channels: Feet inner shows when the legs
+/// are NOT covered to the ankle (socks between shoe-top and hem); Legs inner
+/// shows only when the hem is short AND the inner garment extends below it
+/// (tights under a skirt — never underwear). Chest/Head inner under a worn
+/// Outer never shows.
+fn inner_peeks(slot: EquipSlot, equipment: &Equipment, ankles_covered: bool) -> bool {
+    match slot {
+        EquipSlot::Feet => !ankles_covered,
+        EquipSlot::Legs => match equipment.get(&EquipSlot::Legs) {
+            Some(layers) => match (&layers.outer, &layers.inner) {
+                (Some(outer), Some(inner)) => {
+                    !legs_cover_ankles_name(&outer.name.trim().to_lowercase())
+                        && extends_below_hem(&inner.name.trim().to_lowercase())
+                }
+                _ => false,
+            },
+            None => false,
+        },
+        _ => false,
+    }
+}
+
+/// Render the observer-visible equipment lines (the `equipped:` block body —
+/// two-space-indented, canonical slot order Head→Feet). One line per slot:
+/// the Outer item (with stats in parens when present), plus — when the Inner
+/// peeks — a parenthetical naming it, so the narrator reads shorts + shoes as
+/// "the socks show". An Inner-only slot (socks, no boots) renders the Inner
+/// as the slot's visible item — it IS the topmost thing worn there. Belt +
+/// pack are never here (carried, not worn).
+pub fn visible_equipment_lines(equipment: &Equipment) -> Vec<String> {
+    let ankles_covered = legs_cover_ankles(equipment);
+    let mut out = Vec::new();
+    for slot in EquipSlot::all() {
+        let Some(layers) = equipment.get(slot) else { continue };
+        let peek = layers.inner.is_some() && layers.outer.is_some() && inner_peeks(*slot, equipment, ankles_covered);
+        match (&layers.outer, &layers.inner) {
+            (Some(outer), Some(inner)) if peek => {
+                let line = match outer.stats.as_deref() {
+                    Some(s) if !s.trim().is_empty() => {
+                        format!("  {}: {} ({})", slot.label(), outer.name, s)
+                    }
+                    _ => format!("  {}: {}", slot.label(), outer.name),
+                };
+                out.push(format!("{} ({} visible beneath)", line, inner.name));
+            }
+            (Some(outer), _) => {
+                out.push(match outer.stats.as_deref() {
+                    Some(s) if !s.trim().is_empty() => {
+                        format!("  {}: {} ({})", slot.label(), outer.name, s)
+                    }
+                    _ => format!("  {}: {}", slot.label(), outer.name),
+                });
+            }
+            (None, Some(inner)) => {
+                out.push(match inner.stats.as_deref() {
+                    Some(s) if !s.trim().is_empty() => {
+                        format!("  {}: {} ({})", slot.label(), inner.name, s)
+                    }
+                    _ => format!("  {}: {}", slot.label(), inner.name),
+                });
+            }
+            (None, None) => {}
+        }
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
+// (2026-08-19 exposure upgrade) The event-driven reveal — "someone looked up
+// her skirt". Concealed wear is hidden from the narrator BY DESIGN (the
+// perception filter stops characters reacting to what they cannot see), so
+// the narrator could otherwise improvise a garment that contradicts the
+// tracked one. The gate below fires ONLY on turns whose narrative window
+// involves exposure; those turns gain one `beneath:` line naming the real
+// concealed items. Zero tokens on every other turn (Prime Mandate).
+// ---------------------------------------------------------------------------
+
+/// Names of the CONCEALED-but-worn items (hidden inner layers — the exact
+/// complement of [`visible_equipment_lines`]), canonical slot order. These
+/// are what an exposure event (looking up a skirt, undressing) would reveal;
+/// they render ONLY behind [`narrative_trips_exposure`].
+pub fn concealed_beneath_names(equipment: &Equipment) -> Vec<String> {
+    let ankles_covered = legs_cover_ankles(equipment);
+    let mut out = Vec::new();
+    for slot in EquipSlot::all() {
+        let Some(layers) = equipment.get(slot) else { continue };
+        if let (Some(_), Some(inner)) = (&layers.outer, &layers.inner) {
+            if !inner_peeks(*slot, equipment, ankles_covered) {
+                out.push(inner.name.clone());
+            }
+        }
+    }
+    out
+}
+
+/// Exposure-event vocabulary (MAY-tune list, the stream-filter marker
+/// discipline): hem-directed phrases + undressing words + any underwear word
+/// appearing in the prose (a scene that names the smallclothes is obviously
+/// about them). Scanned over the turn's narrative window — the player's
+/// action + the preceding narrator beat (the tracker's OWN window, re-used at
+/// the narrator tail). A false positive costs one `beneath:` line; a missed
+/// reveal costs a narrator-invented garment that contradicts the tracked one
+/// — bias toward firing. Player-initiated exposure trips the SAME turn; an
+/// NPC-initiated look (written in the narrator's beat) trips the NEXT turn,
+/// once the beat has entered the window.
+pub fn narrative_trips_exposure(narrative: &[&str]) -> bool {
+    const EXPOSURE_PHRASES: &[&str] = &[
+        "up her skirt", "up my skirt", "up your skirt", "up his kilt",
+        "under her skirt", "under my skirt", "under your skirt",
+        "beneath her skirt", "beneath my skirt", "beneath your skirt",
+        "beneath his kilt", "beneath the hem", "under the hem",
+        "hikes her skirt", "hiked her skirt", "hiking her skirt",
+        "hikes my skirt", "hiked my skirt",
+        "lifts her skirt", "lifted her skirt", "lifting her skirt",
+        "lifts my skirt", "lifted my skirt",
+        "raises her skirt", "raised her skirt", "raising her skirt",
+        "flashes her", "flashed her",
+        "upskirt", "panty shot",
+        "skirt up", "skirts up", "kilt up",
+        "up her dress", "up my dress", "under her dress", "beneath her dress",
+        "peeks up", "peeked up", "glancing up her", "glanced up her",
+        "looks up her", "looked up her", "looking up her",
+        "looks up my", "looked up my", "looking up my",
+    ];
+    const UNDRESSING_WORDS: &[&str] = &[
+        "undress", "undresses", "undressed", "undressing",
+        "disrobe", "disrobes", "disrobed", "disrobing",
+        "strips", "stripped", "stripping",
+        "naked", "nude", "nudity",
+    ];
+    for text in narrative {
+        let lower = text.to_lowercase();
+        if EXPOSURE_PHRASES.iter().any(|p| lower.contains(p)) {
+            return true;
+        }
+        for w in phrase_words(&lower) {
+            if UNDERWEAR_LEGS_WORDS.contains(&w.as_str())
+                || UNDERWEAR_CHEST_WORDS.contains(&w.as_str())
+                || UNDRESSING_WORDS.contains(&w.as_str())
+            {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// Migrate legacy `item_*`/`inv_*` entity keys into the typed inventory model.
@@ -654,17 +1312,30 @@ pub fn migrate_legacy_items(
 
         if let Some(slot) = route_legacy_to_slot(&name.to_lowercase()) {
             if is_equipped {
-                // Route to the slot's Outer layer (preserving any existing item
-                // by pushing it to Inner — rare for a fresh migration). Legacy
-                // items carry no tags (the old entity convention had none) →
-                // default to empty; a future tracker turn may tag them.
-                let layers = equipment.entry(slot).or_default();
-                if layers.outer.is_none() {
-                    layers.outer = Some(EquippedItem { name: name.clone(), stats: None, ..Default::default() });
-                } else if layers.inner.is_none() {
-                    layers.inner = Some(EquippedItem { name: name.clone(), stats: None, ..Default::default() });
+                // Route through the shared placement authority (2026-08-19):
+                // under-clothing claims Inner, over-garments demote the
+                // incumbent beneath them, anything displaced rides to the
+                // pack — the same never-vaporize contract as before, now
+                // rank-aware. Legacy items carry no tags (the old entity
+                // convention had none) → default to empty; a future tracker
+                // turn may tag them.
+                let placement = place_equipped(
+                    equipment,
+                    slot,
+                    EquippedItem { name: name.clone(), stats: None, ..Default::default() },
+                    None,
+                    false,
+                );
+                if let Placement::Worn { displaced, .. } = placement {
+                    for d in displaced {
+                        stack_upsert(
+                            pack,
+                            StackItem { name: d.name, qty: 1, weight: 1.0, stats: None, ..Default::default() },
+                        );
+                    }
                 } else {
-                    // Both layers full → fall back to pack.
+                    // Both layers hold and the item doesn't outrank them →
+                    // pack.
                     stack_upsert(
                         pack,
                         StackItem { name: name.clone(), qty: 1, weight: 1.0, stats: None, ..Default::default() },
@@ -758,8 +1429,10 @@ pub fn split_outfit_line(line: &str) -> Vec<String> {
 /// slots via [`route_legacy_to_slot`] (cloak/dress/robe → Chest, trousers →
 /// Legs, boots → Feet…); chips with no body-slot vocabulary (gloves, a
 /// necklace, a sash) land in the pack — carried, still visible in the Soul
-/// Gem panel. Contention preserves everything: outer free → outer, else
-/// inner free → inner, else the pack.
+/// Gem panel. Contention routes through [`place_equipped`] (2026-08-19):
+/// under-clothing claims Inner first, an over-garment DEMOTES the incumbent
+/// beneath it (chip order can never invert the stack), anything that can't
+/// layer falls to the pack — everything is preserved.
 ///
 /// Deduped by normalized name (trim + lowercase) against the equipment
 /// layers, the pack, AND earlier chips in the same batch — a mixed-era save
@@ -803,13 +1476,16 @@ pub fn seed_clothing_items(
                     stats: None,
                     tags: tags.clone(),
                 };
-                let layers = equipment.entry(slot).or_default();
-                if layers.outer.is_none() {
-                    layers.outer = Some(item);
-                } else if layers.inner.is_none() {
-                    layers.inner = Some(item);
-                } else {
-                    // Both layers held → pack (nothing is ever vaporized).
+                // (2026-08-19 clothes-on-person fix + NPC-perception upgrade)
+                // ONE placement authority: under-clothing (socks, stockings,
+                // a chemise) claims the INNER layer FIRST so chip order never
+                // inverts the stack, and an over-garment seeded after its
+                // base (Cloak after Shirt) DEMOTES the base to Inner instead
+                // of burying beneath it — the worn layer always matches what
+                // the narrator-render perceives.
+                if let Placement::Packed = place_equipped(equipment, slot, item, None, false) {
+                    // Both layers hold and the chip doesn't outrank them →
+                    // pack (nothing is ever vaporized).
                     stack_upsert(
                         pack,
                         StackItem {
@@ -844,8 +1520,12 @@ pub fn seed_clothing_items(
 /// Seed a player card's `<inventory>` sibling (2026-08-19 v2 format):
 /// Clothing routes through the shared garment router, weapon-ish Equipped
 /// items claim the readied-hand slots (`main_hand` first, `off_hand` next),
-/// and Accessories/Stored land in the pack. FRESH runs only — a resumed
-/// campaign's inventory is authoritative. Returns the number of items seeded.
+/// and Accessories route too — SPECIFIC jewelry/wearables (a necklace, a
+/// ring, gloves) auto-wear on their zone from turn 1 (2026-08-19 zone sweep,
+/// Chloe ruling: "whatever accessories (that are obvious) equip themselves
+/// upon the first run"); anything non-specific (a trinket, a charm) plus
+/// Stored land in the pack. FRESH runs only — a resumed campaign's inventory
+/// is authoritative. Returns the number of items seeded.
 pub fn seed_player_inventory(
     inv: &crate::player::PlayerInventory,
     equipment: &mut Equipment,
@@ -893,7 +1573,41 @@ pub fn seed_player_inventory(
         );
         seeded += 1;
     }
-    for item in inv.accessories.iter().chain(inv.stored.iter()).map(|s| s.trim()).filter(|s| !s.is_empty()) {
+    // Accessories: specific/jewelry pieces WEAR (the router knows them);
+    // non-specific trinkets pack — "if something isn't specific then going
+    // into inventory is perfectly fine" (Chloe, 2026-08-19).
+    for item in inv.accessories.iter().map(|s| s.trim()).filter(|s| !s.is_empty()) {
+        let key = item.to_lowercase();
+        let tags = vec![ItemTag::Equippable];
+        let route = route_legacy_to_slot(&key);
+        let placed = route.is_some_and(|slot| {
+            // Dedup guard: an item the clothing pass already placed never
+            // mints a twin.
+            !slot_holds_name(equipment, slot, item)
+                && matches!(
+                    place_equipped(equipment, slot, EquippedItem {
+                        name: item.to_string(),
+                        stats: None,
+                        tags: tags.clone(),
+                    }, None, false),
+                    Placement::Worn { .. }
+                )
+        });
+        if !placed {
+            stack_upsert(
+                pack,
+                StackItem {
+                    name: item.to_string(),
+                    qty: 1,
+                    stats: None,
+                    tags: if route.is_some() { tags } else { Vec::new() },
+                    ..StackItem::default()
+                },
+            );
+        }
+        seeded += 1;
+    }
+    for item in inv.stored.iter().map(|s| s.trim()).filter(|s| !s.is_empty()) {
         stack_upsert(
             pack,
             StackItem {
@@ -1414,5 +2128,761 @@ mod tests {
         );
         // Unknown single word with no narrative hit + no inventory match.
         assert_eq!(resolve_item_fragment("lantern", &[], &none), None);
+    }
+
+    // ── (2026-08-19 clothes-on-person fix) auto-wear routing ─────────────
+
+    #[test]
+    fn seed_clothing_under_garments_layer_inner_regardless_of_order() {
+        // Chip order must never invert the stack: socks authored BEFORE the
+        // boots still land Inner (boots Outer, socks Inner) — and the
+        // reversed order produces the identical layout.
+        for chips in [
+            vec!["Wool Socks".to_string(), "Leather Boots".to_string()],
+            vec!["Leather Boots".to_string(), "Wool Socks".to_string()],
+        ] {
+            let mut equipment = Equipment::new();
+            let mut pack = Vec::new();
+            seed_clothing_items(&chips, &mut equipment, &mut pack);
+            let feet = equipment.get(&EquipSlot::Feet).expect("feet populated");
+            assert_eq!(feet.outer.as_ref().unwrap().name, "Leather Boots", "boots outer");
+            assert_eq!(feet.inner.as_ref().unwrap().name, "Wool Socks", "socks inner");
+            assert!(pack.is_empty());
+        }
+    }
+
+    #[test]
+    fn place_equipped_layers_with_common_sense() {
+        let mut equipment = Equipment::new();
+        // Bare equipment: a shirt claims the free chest Outer.
+        assert_worn(
+            place_equipped(&mut equipment, EquipSlot::Chest, item("Linen Shirt"), None, true),
+            ItemLayer::Outer,
+            &[],
+        );
+        // THE over-garment fix: a cloak over the worn shirt DEMOTES the shirt
+        // to Inner — it stays worn (the old default-Outer displacement
+        // stripped it off to the pack, and the old auto-wear buried the cloak
+        // UNDER the shirt).
+        assert_worn(
+            place_equipped(&mut equipment, EquipSlot::Chest, item("Travel Cloak"), None, true),
+            ItemLayer::Outer,
+            &[],
+        );
+        let chest = equipment.get(&EquipSlot::Chest).unwrap();
+        assert_eq!(chest.outer.as_ref().unwrap().name, "Travel Cloak");
+        assert_eq!(chest.inner.as_ref().unwrap().name, "Linen Shirt");
+        // A mid-layer (padded doublet) under the cloak: free Inner.
+        assert_worn(
+            place_equipped(&mut equipment, EquipSlot::Chest, item("Padded Doublet"), None, true),
+            ItemLayer::Inner,
+            &[],
+        );
+        assert_eq!(
+            equipment.get(&EquipSlot::Chest).unwrap().inner.as_ref().unwrap().name,
+            "Padded Doublet"
+        );
+    }
+
+    #[test]
+    fn place_equipped_over_garment_with_both_layers_full_displaces_outer() {
+        // Cloak arrives over shirt + doublet (both layers held): the cloak
+        // still takes Outer; the SHIRT (old outer) rides to the pack — the
+        // doublet keeps the Inner.
+        let mut equipment = Equipment::new();
+        equipment.insert(
+            EquipSlot::Chest,
+            SlotLayers {
+                outer: Some(item("Linen Shirt")),
+                inner: Some(item("Padded Doublet")),
+            },
+        );
+        assert_worn(
+            place_equipped(&mut equipment, EquipSlot::Chest, item("Travel Cloak"), None, true),
+            ItemLayer::Outer,
+            &["Linen Shirt"],
+        );
+        let chest = equipment.get(&EquipSlot::Chest).unwrap();
+        assert_eq!(chest.outer.as_ref().unwrap().name, "Travel Cloak");
+        assert_eq!(chest.inner.as_ref().unwrap().name, "Padded Doublet");
+    }
+
+    #[test]
+    fn place_equipped_footwear_swaps_at_equal_rank() {
+        // Feet/Head are exclusive: a second pair of boots SWAPS (the worn pair
+        // rides to the pack) — it never layers beneath.
+        let mut equipment = Equipment::new();
+        equipment.insert(
+            EquipSlot::Feet,
+            SlotLayers { outer: Some(item("Leather Boots")), inner: Some(item("Wool Socks")) },
+        );
+        assert_worn(
+            place_equipped(&mut equipment, EquipSlot::Feet, item("Soft Slippers"), None, true),
+            ItemLayer::Outer,
+            &["Leather Boots"],
+        );
+        let feet = equipment.get(&EquipSlot::Feet).unwrap();
+        assert_eq!(feet.outer.as_ref().unwrap().name, "Soft Slippers");
+        assert_eq!(feet.inner.as_ref().unwrap().name, "Wool Socks", "socks stay on");
+    }
+
+    #[test]
+    fn place_equipped_under_clothing_prefers_inner_and_spares_stack() {
+        let mut equipment = Equipment::new();
+        // Socks onto bare feet: Inner (a later boot takes the Outer above).
+        assert_worn(
+            place_equipped(&mut equipment, EquipSlot::Feet, item("Wool Socks"), None, false),
+            ItemLayer::Inner,
+            &[],
+        );
+        assert!(equipment.get(&EquipSlot::Feet).unwrap().outer.is_none());
+        // Boots over the socks: Outer, socks stay Inner.
+        assert_worn(
+            place_equipped(&mut equipment, EquipSlot::Feet, item("Leather Boots"), None, false),
+            ItemLayer::Outer,
+            &[],
+        );
+        // A SECOND sock-layer garment over a held Inner is a genuine spare
+        // (auto mode).
+        assert_eq!(
+            place_equipped(&mut equipment, EquipSlot::Feet, item("Silk Stockings"), None, false),
+            Placement::Packed
+        );
+        // The agreement gate: "Socketed Wand" contains "sock" but routes
+        // MainHand (weapon needles win) — hands are always Outer, never Feet.
+        assert_worn(
+            place_equipped(&mut equipment, EquipSlot::MainHand, item("Socketed Wand"), None, false),
+            ItemLayer::Outer,
+            &[],
+        );
+        // Unroutable names never reach placement (the caller routes to pack).
+    }
+
+    #[test]
+    fn place_equipped_base_garment_under_worn_outer_or_packed() {
+        // A shirt under a worn cloak: free Inner → worn beneath.
+        let mut equipment = Equipment::new();
+        equipment.insert(
+            EquipSlot::Chest,
+            SlotLayers { outer: Some(item("Travel Cloak")), inner: None },
+        );
+        assert_worn(
+            place_equipped(&mut equipment, EquipSlot::Chest, item("Linen Shirt"), None, false),
+            ItemLayer::Inner,
+            &[],
+        );
+        // Both layers held + the incoming doesn't outrank → a genuine spare
+        // (the [PACK] auto-wear rule). Forced (the bracket [EQUIP] contract:
+        // the model said the player wears it) → swaps the Inner.
+        assert_eq!(
+            place_equipped(&mut equipment, EquipSlot::Chest, item("Silk Chemise"), None, false),
+            Placement::Packed
+        );
+        assert_worn(
+            place_equipped(&mut equipment, EquipSlot::Chest, item("Silk Chemise"), None, true),
+            ItemLayer::Inner,
+            &["Linen Shirt"],
+        );
+        assert_eq!(
+            equipment.get(&EquipSlot::Chest).unwrap().inner.as_ref().unwrap().name,
+            "Silk Chemise"
+        );
+    }
+
+    #[test]
+    fn place_equipped_explicit_layer_respected_verbatim() {
+        // The tracker's explicit layer= wins: even a rank-2 cloak goes Inner
+        // when the model says so, displacing whatever held that layer.
+        let mut equipment = Equipment::new();
+        equipment.insert(
+            EquipSlot::Chest,
+            SlotLayers { outer: Some(item("Linen Shirt")), inner: Some(item("Padded Doublet")) },
+        );
+        assert_worn(
+            place_equipped(&mut equipment, EquipSlot::Chest, item("Travel Cloak"), Some(ItemLayer::Inner), true),
+            ItemLayer::Inner,
+            &["Padded Doublet"],
+        );
+        let chest = equipment.get(&EquipSlot::Chest).unwrap();
+        assert_eq!(chest.outer.as_ref().unwrap().name, "Linen Shirt");
+        assert_eq!(chest.inner.as_ref().unwrap().name, "Travel Cloak");
+    }
+
+    #[test]
+    fn place_equipped_same_name_refreshes_in_place() {
+        // A re-emission of the WORN garment (new stats) updates it in place —
+        // no twin layered beneath, no phantom duplicate in the pack.
+        let mut equipment = Equipment::new();
+        equipment.insert(
+            EquipSlot::Chest,
+            SlotLayers { outer: Some(item("Travel Cloak")), inner: Some(item("Linen Shirt")) },
+        );
+        let refreshed = EquippedItem {
+            name: "Travel Cloak".into(),
+            stats: Some("bloodstained".into()),
+            ..Default::default()
+        };
+        assert_worn(
+            place_equipped(&mut equipment, EquipSlot::Chest, refreshed, None, true),
+            ItemLayer::Outer,
+            &[],
+        );
+        let chest = equipment.get(&EquipSlot::Chest).unwrap();
+        assert_eq!(chest.outer.as_ref().unwrap().stats.as_deref(), Some("bloodstained"));
+        assert_eq!(chest.inner.as_ref().unwrap().name, "Linen Shirt", "shirt untouched");
+        // Same for a refresh of the worn INNER (socks re-tagged).
+        let socks = EquippedItem {
+            name: "Wool Socks".into(),
+            tags: vec![ItemTag::Equippable],
+            ..Default::default()
+        };
+        equipment.insert(
+            EquipSlot::Feet,
+            SlotLayers { outer: Some(item("Leather Boots")), inner: Some(item("Wool Socks")) },
+        );
+        assert_worn(
+            place_equipped(&mut equipment, EquipSlot::Feet, socks, None, true),
+            ItemLayer::Inner,
+            &[],
+        );
+        assert_eq!(
+            equipment.get(&EquipSlot::Feet).unwrap().inner.as_ref().unwrap().tags,
+            vec![ItemTag::Equippable]
+        );
+    }
+
+    #[test]
+    fn seed_clothing_later_overgarment_takes_outer() {
+        // Chip order can no longer invert the stack either: Shirt then Cloak
+        // seeds the cloak OVER the shirt (previously the cloak landed Inner).
+        let mut equipment = Equipment::new();
+        let mut pack = Vec::new();
+        seed_clothing_items(
+            &["Linen Shirt".to_string(), "Travel Cloak".to_string()],
+            &mut equipment,
+            &mut pack,
+        );
+        let chest = equipment.get(&EquipSlot::Chest).expect("chest populated");
+        assert_eq!(chest.outer.as_ref().unwrap().name, "Travel Cloak");
+        assert_eq!(chest.inner.as_ref().unwrap().name, "Linen Shirt");
+        assert!(pack.is_empty());
+    }
+
+    // ── (2026-08-19 NPC-perception upgrade) observer visibility ──────────
+
+    /// Chloe's pinned scenario: an NPC will not see under a jacket, but shorts
+    /// + shoes means they definitely see the socks.
+    #[test]
+    fn visible_render_socks_peek_with_shorts_but_not_trousers() {
+        let shorts = |legs_garment: &str| {
+            let mut equipment = Equipment::new();
+            equipment.insert(
+                EquipSlot::Legs,
+                SlotLayers { outer: Some(item(legs_garment)), inner: None },
+            );
+            equipment.insert(
+                EquipSlot::Feet,
+                SlotLayers { outer: Some(item("Leather Boots")), inner: Some(item("Wool Socks")) },
+            );
+            equipment
+        };
+        let shorts_render = visible_equipment_lines(&shorts("Wool Shorts"));
+        assert_eq!(
+            shorts_render.iter().find(|l| l.contains("Feet")).map(|l| l.as_str()),
+            Some("  Feet: Leather Boots (Wool Socks visible beneath)"),
+            "shorts + boots → the socks peek"
+        );
+        let trousers_render = visible_equipment_lines(&shorts("Wool Trousers"));
+        assert_eq!(
+            trousers_render.iter().find(|l| l.contains("Feet")).map(|l| l.as_str()),
+            Some("  Feet: Leather Boots"),
+            "trousers cover the ankle → the socks stay hidden"
+        );
+        assert!(!trousers_render.iter().any(|l| l.contains("Wool Socks")));
+    }
+
+    #[test]
+    fn visible_render_leg_coverage_sources() {
+        let boots_and_socks = || {
+            let mut equipment = Equipment::new();
+            equipment.insert(
+                EquipSlot::Feet,
+                SlotLayers { outer: Some(item("Leather Boots")), inner: Some(item("Wool Socks")) },
+            );
+            equipment
+        };
+        // Bare legs → socks show.
+        assert!(visible_equipment_lines(&boots_and_socks())
+            .iter()
+            .any(|l| l.contains("Wool Socks visible beneath")));
+        // A full-length gown (one-piece Chest garment, no Legs) covers the ankle.
+        let mut gown = boots_and_socks();
+        gown.insert(EquipSlot::Chest, SlotLayers { outer: Some(item("Silk Gown")), inner: None });
+        assert!(!visible_equipment_lines(&gown).iter().any(|l| l.contains("Wool Socks")));
+        // A jacket does NOT cover the legs.
+        let mut jacket = boots_and_socks();
+        jacket.insert(EquipSlot::Chest, SlotLayers { outer: Some(item("Leather Jacket")), inner: None });
+        assert!(visible_equipment_lines(&jacket).iter().any(|l| l.contains("Wool Socks visible beneath")));
+        // Hose alone (Legs inner, no outer) still covers the ankle.
+        let mut hose = boots_and_socks();
+        hose.insert(EquipSlot::Legs, SlotLayers { outer: None, inner: Some(item("Wool Hose")) });
+        assert!(!visible_equipment_lines(&hose).iter().any(|l| l.contains("Wool Socks")));
+        // A long skirt covers; a plain skirt/kilt does not.
+        let mut long_skirt = boots_and_socks();
+        long_skirt.insert(EquipSlot::Legs, SlotLayers { outer: Some(item("Long Wool Skirt")), inner: None });
+        assert!(!visible_equipment_lines(&long_skirt).iter().any(|l| l.contains("Wool Socks")));
+        let mut kilt = boots_and_socks();
+        kilt.insert(EquipSlot::Legs, SlotLayers { outer: Some(item("Tartan Kilt")), inner: None });
+        assert!(visible_equipment_lines(&kilt).iter().any(|l| l.contains("Wool Socks visible beneath")));
+    }
+
+    #[test]
+    fn visible_render_inner_only_slot_renders_its_item() {
+        // Socks with no boots (acquired barefoot, or boots unequipped over
+        // them): the Inner IS the topmost thing in the slot — it renders as
+        // the slot's visible item (previously the slot rendered NOTHING and
+        // the narrator saw bare feet).
+        let mut equipment = Equipment::new();
+        equipment.insert(EquipSlot::Feet, SlotLayers { outer: None, inner: Some(item("Wool Socks")) });
+        assert_eq!(
+            visible_equipment_lines(&equipment),
+            vec!["  Feet: Wool Socks".to_string()]
+        );
+    }
+
+    #[test]
+    fn visible_render_chest_inner_stays_hidden_and_stats_ride() {
+        let mut equipment = Equipment::new();
+        equipment.insert(
+            EquipSlot::Chest,
+            SlotLayers {
+                outer: Some(EquippedItem {
+                    name: "Heavy Cloak".into(),
+                    stats: Some("+1 DEF".into()),
+                    ..Default::default()
+                }),
+                inner: Some(item("Linen Shirt")),
+            },
+        );
+        equipment.insert(
+            EquipSlot::MainHand,
+            SlotLayers { outer: Some(item("Iron Sword")), inner: None },
+        );
+        let lines = visible_equipment_lines(&equipment);
+        assert!(lines.contains(&"  Chest: Heavy Cloak (+1 DEF)".to_string()));
+        assert!(lines.contains(&"  Main Hand: Iron Sword".to_string()));
+        assert!(!lines.iter().any(|l| l.contains("Linen Shirt")), "chest inner never peeks");
+    }
+
+    #[test]
+    fn visible_render_legs_inner_peeks_under_short_hems_only() {
+        // Tights under a skirt show; under trousers they don't.
+        let legs = |outer: &str| {
+            let mut equipment = Equipment::new();
+            equipment.insert(
+                EquipSlot::Legs,
+                SlotLayers { outer: Some(item(outer)), inner: Some(item("Cotton Tights")) },
+            );
+            visible_equipment_lines(&equipment)
+        };
+        assert_eq!(
+            legs("Pleated Skirt").iter().find(|l| l.contains("Legs")).map(|l| l.as_str()),
+            Some("  Legs: Pleated Skirt (Cotton Tights visible beneath)")
+        );
+        assert_eq!(
+            legs("Wool Trousers").iter().find(|l| l.contains("Legs")).map(|l| l.as_str()),
+            Some("  Legs: Wool Trousers")
+        );
+    }
+
+    #[test]
+    fn slot_holds_name_is_normalized() {
+        let mut equipment = Equipment::new();
+        equipment.insert(EquipSlot::Chest, SlotLayers { outer: Some(item("Travel Cloak")), inner: None });
+        assert!(slot_holds_name(&equipment, EquipSlot::Chest, " travel cloak "));
+        assert!(!slot_holds_name(&equipment, EquipSlot::Chest, "Wool Robe"));
+        assert!(!slot_holds_name(&equipment, EquipSlot::Feet, "Travel Cloak"));
+    }
+
+    // ── (2026-08-19 exposure upgrade) underwear + the upskirt gate ────────
+
+    #[test]
+    fn underwear_routes_by_whole_word_and_lands_inner() {
+        // Word-boundary routing: smallclothes family → Legs, torso family → Chest.
+        assert_eq!(route_legacy_to_slot("cotton drawers"), Some(EquipSlot::Legs));
+        assert_eq!(route_legacy_to_slot("lace panties"), Some(EquipSlot::Legs));
+        assert_eq!(route_legacy_to_slot("linen petticoat"), Some(EquipSlot::Legs));
+        assert_eq!(route_legacy_to_slot("silk camisole"), Some(EquipSlot::Chest));
+        assert_eq!(route_legacy_to_slot("satin bra"), Some(EquipSlot::Chest));
+        // The collision pins: the substring families must never misroute.
+        assert_eq!(route_legacy_to_slot("leather bracelet"), None, "'bra' never catches 'bracelet'");
+        assert_eq!(route_legacy_to_slot("oiled briefcase"), None, "'briefs' never catches 'briefcase'");
+        assert_eq!(route_legacy_to_slot("silk slippers"), Some(EquipSlot::Feet), "slippers stay footwear");
+        assert_eq!(route_legacy_to_slot("slip of paper"), None, "a slip of paper is stationery");
+        // Underwear claims the Inner layer under a worn skirt (the
+        // under-garment preference agrees with the router).
+        let mut equipment = Equipment::new();
+        equipment.insert(
+            EquipSlot::Legs,
+            SlotLayers { outer: Some(item("Pleated Skirt")), inner: None },
+        );
+        assert_worn(
+            place_equipped(&mut equipment, EquipSlot::Legs, item("Cotton Drawers"), None, false),
+            ItemLayer::Inner,
+            &[],
+        );
+    }
+
+    #[test]
+    fn underwear_under_skirt_stays_hidden_but_tights_peek() {
+        // Chloe's upskirt ruling, static half: underwear ends ABOVE the hem —
+        // concealed by the skirt in the every-turn render; tights/petticoats
+        // extend below it and peek.
+        let legs = |inner: &str| {
+            let mut equipment = Equipment::new();
+            equipment.insert(
+                EquipSlot::Legs,
+                SlotLayers { outer: Some(item("Pleated Skirt")), inner: Some(item(inner)) },
+            );
+            equipment
+        };
+        assert_eq!(
+            visible_equipment_lines(&legs("Cotton Drawers")),
+            vec!["  Legs: Pleated Skirt".to_string()],
+            "drawers concealed — no peek, no line"
+        );
+        assert_eq!(
+            visible_equipment_lines(&legs("Wool Tights")),
+            vec!["  Legs: Pleated Skirt (Wool Tights visible beneath)".to_string()]
+        );
+        assert!(
+            visible_equipment_lines(&legs("Linen Petticoat"))
+                .iter()
+                .any(|l| l.contains("Linen Petticoat visible beneath")),
+            "a petticoat intentionally shows at the hem"
+        );
+    }
+
+    #[test]
+    fn exposure_gate_fires_on_relevant_windows_only() {
+        assert!(narrative_trips_exposure(&["The guard crouches and looks up her skirt."]));
+        assert!(narrative_trips_exposure(&["I hike my skirt up to cross the stream."]));
+        assert!(narrative_trips_exposure(&["She flashes her smallclothes at the crowd."]));
+        assert!(narrative_trips_exposure(&["He begins to undress her."]));
+        assert!(narrative_trips_exposure(&["her cotton drawers show"]));
+        assert!(!narrative_trips_exposure(&["She eats bread by the fire."]));
+        assert!(
+            !narrative_trips_exposure(&["I polish my silk slippers."]),
+            "slippers are footwear, not underwear (word boundary)"
+        );
+        assert!(!narrative_trips_exposure(&[]));
+    }
+
+    #[test]
+    fn concealed_names_are_the_visibility_complement() {
+        let mut equipment = Equipment::new();
+        equipment.insert(
+            EquipSlot::Feet,
+            SlotLayers { outer: Some(item("Leather Boots")), inner: Some(item("Wool Socks")) },
+        );
+        equipment.insert(
+            EquipSlot::Legs,
+            SlotLayers { outer: Some(item("Wool Shorts")), inner: Some(item("Cotton Drawers")) },
+        );
+        // The socks PEAK (shorts → bare ankles) → they're visible, not
+        // concealed; the drawers are concealed.
+        assert_eq!(
+            concealed_beneath_names(&equipment),
+            vec!["Cotton Drawers".to_string()]
+        );
+    }
+
+    #[test]
+    fn beneath_line_renders_only_when_gated() {
+        let mut ps = PlayerState::default();
+        ps.equipment.insert(
+            EquipSlot::Legs,
+            SlotLayers { outer: Some(item("Pleated Skirt")), inner: Some(item("Cotton Drawers")) },
+        );
+        ps.equipment.insert(
+            EquipSlot::Chest,
+            SlotLayers { outer: Some(item("Wool Shawl")), inner: Some(item("Silk Camisole")) },
+        );
+        let ungated = ps.render_for_prompt().expect("renders");
+        assert!(!ungated.contains("Cotton Drawers"), "concealed wear hidden by default");
+        assert!(!ungated.contains("Silk Camisole"));
+        assert!(ungated.contains("Legs: Pleated Skirt"));
+        let gated = ps.render_for_prompt_with_beneath(true).expect("renders");
+        assert!(gated.contains("beneath (visible this moment): "), "the gated line renders");
+        assert!(gated.contains("Cotton Drawers"), "the REAL tracked garment is revealed");
+        assert!(gated.contains("Silk Camisole"));
+    }
+
+    // ── (2026-08-19 zone sweep) every undergarment family, every body zone ──
+
+    #[test]
+    fn undergarment_zone_sweep_routes_every_family() {
+        // Lower body: smallclothes, foundations, hosiery, swim lowers.
+        for name in [
+            "cotton drawers", "lace panties", "silk boxers", "boxer briefs",
+            "linen knickers", "wool bloomers", "leather loincloth", "silk fundoshi",
+            "garter belt", "silk girdle", "chastity belt", "lace thong",
+            "wool tights", "linen petticoat", "silk underskirt", "bikini bottoms",
+            "linen pantaloons",
+        ] {
+            assert_eq!(route_legacy_to_slot(name), Some(EquipSlot::Legs), "legs family: {name}");
+        }
+        // Torso: lingerie, shapewear, full-body + sleep + swim uppers.
+        for name in [
+            "satin bra", "lace bralette", "silk brassiere", "linen bandeau",
+            "silk camisole", "linen chemise", "cotton undershirt", "leather corset",
+            "silk bustier", "velvet basque", "black leotard", "silk bodysuit",
+            "fishnet bodystocking", "one piece swimsuit", "swimwear", "string bikini",
+            "silk negligee", "cotton nightgown", "flannel nightie", "satin nightdress",
+            "lace lingerie", "thermal long johns", "cotton union suit",
+        ] {
+            assert_eq!(route_legacy_to_slot(name), Some(EquipSlot::Chest), "chest family: {name}");
+        }
+        // Feet stay feet — the footwear guard + needle order.
+        for name in ["thong sandals", "short boots", "leather boots", "wool socks", "silk stockings"] {
+            assert_eq!(route_legacy_to_slot(name), Some(EquipSlot::Feet), "feet family: {name}");
+        }
+        // Outer legwear the sweep discovered was unroutable (packed!).
+        assert_eq!(route_legacy_to_slot("wool shorts"), Some(EquipSlot::Legs));
+        assert_eq!(route_legacy_to_slot("swim trunks"), Some(EquipSlot::Legs));
+        assert_eq!(route_legacy_to_slot("speedo"), Some(EquipSlot::Legs));
+        // The non-collision pins hold.
+        assert_eq!(route_legacy_to_slot("oiled briefcase"), None);
+        assert_eq!(route_legacy_to_slot("leather bracelet"), None);
+        assert_eq!(route_legacy_to_slot("slip of paper"), None);
+        assert_eq!(route_legacy_to_slot("shortsword"), Some(EquipSlot::MainHand));
+        assert_eq!(route_legacy_to_slot("short cloak"), Some(EquipSlot::Chest), "cloak outranks the word check");
+    }
+
+    #[test]
+    fn full_body_and_swim_layers_place_inner_and_render_alone() {
+        // A leotard/swimsuit claims the Chest Inner — worn ALONE it renders as
+        // the slot's visible item (inner-only slots render); under a dress it
+        // conceals silently until an exposure event.
+        let mut equipment = Equipment::new();
+        assert_worn(
+            place_equipped(&mut equipment, EquipSlot::Chest, item("Black Leotard"), None, false),
+            ItemLayer::Inner,
+            &[],
+        );
+        assert_eq!(
+            visible_equipment_lines(&equipment),
+            vec!["  Chest: Black Leotard".to_string()],
+            "a leotard worn alone IS the visible garment"
+        );
+        assert_worn(
+            place_equipped(&mut equipment, EquipSlot::Chest, item("Silk Gown"), None, false),
+            ItemLayer::Outer,
+            &[],
+        );
+        // Gown over leotard: the leotard conceals (chest inner never peeks)
+        // and is revealable by the gate.
+        assert_eq!(
+            visible_equipment_lines(&equipment),
+            vec!["  Chest: Silk Gown".to_string()]
+        );
+        assert_eq!(concealed_beneath_names(&equipment), vec!["Black Leotard".to_string()]);
+        // Boxers under trousers: concealed, no peek.
+        equipment.insert(
+            EquipSlot::Legs,
+            SlotLayers { outer: Some(item("Wool Trousers")), inner: Some(item("Silk Boxers")) },
+        );
+        assert!(!visible_equipment_lines(&equipment).iter().any(|l| l.contains("Boxers")));
+        assert!(concealed_beneath_names(&equipment).contains(&"Silk Boxers".to_string()));
+        // Garter belt under a skirt: concealed until exposed (it ends above
+        // the hem — not an extends-below-hem garment).
+        equipment.insert(
+            EquipSlot::Legs,
+            SlotLayers { outer: Some(item("Pleated Skirt")), inner: Some(item("Silk Garter Belt")) },
+        );
+        assert!(!visible_equipment_lines(&equipment).iter().any(|l| l.contains("Garter")));
+        assert!(narrative_trips_exposure(&["Her skirt shifts; the garter belt shows."]));
+    }
+
+    #[test]
+    fn exposure_gate_covers_the_full_undergarment_vocabulary() {
+        // The gate scans the SAME word lists the router uses — prose naming
+        // any undergarment family trips it.
+        for prose in [
+            "her leotard clings",
+            "she adjusts her bikini top",
+            "a glimpse of her negligee",
+            "his boxers show above the waistband",
+            "the garter belt snaps",
+            "lace lingerie beneath",
+        ] {
+            assert!(narrative_trips_exposure(&[prose]), "gate fires on: {prose}");
+        }
+    }
+
+    // ── (2026-08-19 zone sweep II) arms/hands/neck + armor/pads/jewelry ────
+
+    #[test]
+    fn zone_sweep_arms_hands_neck_jewelry_route() {
+        // Neck: specific jewelry + neckwear (the neck brace included).
+        for name in [
+            "silver necklace", "wooden amulet", "ruby pendant", "golden locket",
+            "steel gorget", "velvet choker", "bronze torc", "silk scarf",
+            "silver brooch", "silk cravat", "leather neck brace",
+        ] {
+            assert_eq!(route_legacy_to_slot(name), Some(EquipSlot::Neck), "neck family: {name}");
+        }
+        // Arms: sleeves, bracers, elbow/shoulder armor.
+        for name in [
+            "leather sleeves", "steel bracers", "leather vambraces", "gold armlet",
+            "red armband", "padded elbow pads", "steel pauldrons", "iron spaulders",
+            "leather arm guards", "lined shoulder pads",
+        ] {
+            assert_eq!(route_legacy_to_slot(name), Some(EquipSlot::Arms), "arms family: {name}");
+        }
+        // Hands: gloves, gauntlets, mittens, rings, wrist jewelry.
+        for name in [
+            "leather gloves", "steel gauntlets", "wool mittens",
+            "silver ring", "golden rings", "beaded bracelet",
+        ] {
+            assert_eq!(route_legacy_to_slot(name), Some(EquipSlot::Hands), "hands family: {name}");
+        }
+        // Armor, pads, straps, over-shoe wear.
+        assert_eq!(route_legacy_to_slot("dwarven chainmail"), Some(EquipSlot::Chest));
+        assert_eq!(route_legacy_to_slot("chain mail hauberk"), Some(EquipSlot::Chest));
+        assert_eq!(route_legacy_to_slot("quilted vest"), Some(EquipSlot::Chest), "vests stay chest");
+        assert_eq!(route_legacy_to_slot("padded knee pads"), Some(EquipSlot::Legs));
+        assert_eq!(route_legacy_to_slot("leather jock strap"), Some(EquipSlot::Legs));
+        assert_eq!(route_legacy_to_slot("wool leggings"), Some(EquipSlot::Legs));
+        assert_eq!(route_legacy_to_slot("polished spats"), Some(EquipSlot::Feet));
+        assert_eq!(route_legacy_to_slot("canvas gaiters"), Some(EquipSlot::Feet));
+        // The word-boundary pins: substring needles win FIRST, words are the
+        // fallback — each of these would misroute on a substring form.
+        assert_eq!(route_legacy_to_slot("knee-high boots"), Some(EquipSlot::Feet), "boots beat the knee word");
+        assert_eq!(route_legacy_to_slot("sleeveless gown"), Some(EquipSlot::Chest), "gown beats the sleeve word");
+        assert_eq!(route_legacy_to_slot("golden earring"), Some(EquipSlot::Head), "earrings are head jewelry");
+        assert_eq!(route_legacy_to_slot("brass keyring"), None, "keyring is one word — not a ring");
+        assert_eq!(route_legacy_to_slot("kitchen spatula"), None, "spatula is not spats");
+    }
+
+    #[test]
+    fn new_zone_slots_parse_and_render_head_to_foot() {
+        for (id, slot) in [
+            ("neck", EquipSlot::Neck),
+            ("arms", EquipSlot::Arms),
+            ("hands", EquipSlot::Hands),
+        ] {
+            assert_eq!(EquipSlot::from_id(id), Some(slot));
+        }
+        // Canonical order is head-to-foot (the equipped block reads as a
+        // head-to-toe look): Head < Neck < Chest < Arms < Hands < hands
+        // (weapons) < Legs < Feet.
+        let order: Vec<&str> = EquipSlot::all().iter().map(|s| s.id()).collect();
+        assert_eq!(
+            order,
+            vec!["head", "neck", "chest", "arms", "hands", "main_hand", "off_hand", "legs", "feet"]
+        );
+    }
+
+    #[test]
+    fn new_zones_place_swap_and_layer() {
+        let mut equipment = Equipment::new();
+        // Necklace on a bare neck.
+        assert_worn(
+            place_equipped(&mut equipment, EquipSlot::Neck, item("Silver Necklace"), None, false),
+            ItemLayer::Outer,
+            &[],
+        );
+        // A second necklace SWAPS (exclusive at equal rank), never layers.
+        assert_worn(
+            place_equipped(&mut equipment, EquipSlot::Neck, item("Ruby Pendant"), None, true),
+            ItemLayer::Outer,
+            &["Silver Necklace"],
+        );
+        // Sleeves first, bracers over them: rank 0 under rank 2.
+        assert_worn(
+            place_equipped(&mut equipment, EquipSlot::Arms, item("Leather Sleeves"), None, false),
+            ItemLayer::Outer,
+            &[],
+        );
+        assert_worn(
+            place_equipped(&mut equipment, EquipSlot::Arms, item("Steel Bracers"), None, false),
+            ItemLayer::Outer,
+            &[],
+        );
+        let arms = equipment.get(&EquipSlot::Arms).unwrap();
+        assert_eq!(arms.outer.as_ref().unwrap().name, "Steel Bracers");
+        assert_eq!(arms.inner.as_ref().unwrap().name, "Leather Sleeves");
+        // Render carries the new zones head-to-foot; arms inner stays hidden.
+        let lines = visible_equipment_lines(&equipment);
+        assert!(lines.contains(&"  Neck: Ruby Pendant".to_string()));
+        assert!(lines.contains(&"  Arms: Steel Bracers".to_string()));
+        assert!(!lines.iter().any(|l| l.contains("Sleeves")), "arms inner never peeks");
+    }
+
+    #[test]
+    fn player_seed_wears_specific_accessories() {
+        // (2026-08-19 Chloe ruling: "whatever accessories (that are obvious)
+        // equips themselves upon the first run") Specific jewelry/gear wears
+        // its zone; the non-specific trinket packs.
+        let inv = crate::player::PlayerInventory {
+            clothing: vec!["Linen Shirt".into(), "Wool Trousers".into()],
+            equipped: vec!["Iron Sword".into()],
+            accessories: vec!["Silver Necklace".into(), "Leather Gloves".into(), "Lucky Trinket".into()],
+            stored: vec!["Bedroll".into()],
+        };
+        let mut equipment = Equipment::new();
+        let mut pack = Vec::new();
+        let seeded = seed_player_inventory(&inv, &mut equipment, &mut pack);
+        assert_eq!(seeded, 7);
+        assert_eq!(
+            equipment.get(&EquipSlot::Neck).and_then(|l| l.outer.as_ref()).map(|i| i.name.as_str()),
+            Some("Silver Necklace")
+        );
+        assert_eq!(
+            equipment.get(&EquipSlot::Hands).and_then(|l| l.outer.as_ref()).map(|i| i.name.as_str()),
+            Some("Leather Gloves")
+        );
+        assert_eq!(
+            equipment.get(&EquipSlot::MainHand).and_then(|l| l.outer.as_ref()).map(|i| i.name.as_str()),
+            Some("Iron Sword")
+        );
+        let names: Vec<&str> = pack.iter().map(|i| i.name.as_str()).collect();
+        assert!(names.contains(&"Lucky Trinket"), "non-specific accessory packs");
+        assert!(names.contains(&"Bedroll"));
+    }
+
+    /// Test helper: assert a `Worn` placement's layer + the NAMES of any
+    /// displaced occupants (the caller-packs-them contract).
+    fn assert_worn(p: Placement, layer: ItemLayer, displaced_names: &[&str]) {
+        match p {
+            Placement::Worn { layer: l, displaced } => {
+                assert_eq!(l, layer, "worn layer");
+                let names: Vec<String> = displaced.iter().map(|d| d.name.clone()).collect();
+                let want: Vec<String> = displaced_names.iter().map(|s| s.to_string()).collect();
+                assert_eq!(names, want, "displaced occupants (the caller must pack them)");
+            }
+            Placement::Packed => panic!("expected Worn, got Packed"),
+        }
+    }
+
+    /// Test helper: a bare named item.
+    fn item(name: &str) -> EquippedItem {
+        EquippedItem { name: name.to_string(), ..Default::default() }
+    }
+
+    #[test]
+    fn garment_vocabulary_expansion_routes_common_chips() {
+        // The 2026-08-19 expansion: GLM-authored chip names that hit NO needle
+        // (and dumped whole wardrobes into the pack) now route.
+        assert_eq!(route_legacy_to_slot("wool coat"), Some(EquipSlot::Chest));
+        assert_eq!(route_legacy_to_slot("travel garb"), Some(EquipSlot::Chest));
+        assert_eq!(route_legacy_to_slot("elegant attire"), Some(EquipSlot::Chest));
+        assert_eq!(route_legacy_to_slot("silk chemise"), Some(EquipSlot::Chest));
+        assert_eq!(route_legacy_to_slot("silver circlet"), Some(EquipSlot::Head));
+        assert_eq!(route_legacy_to_slot("wool hose"), Some(EquipSlot::Legs));
+        assert_eq!(route_legacy_to_slot("silk hosiery"), Some(EquipSlot::Feet));
+        // Weapon vocabulary still wins over garment needles in compounds.
+        assert_eq!(route_legacy_to_slot("shortsword"), Some(EquipSlot::MainHand));
     }
 }

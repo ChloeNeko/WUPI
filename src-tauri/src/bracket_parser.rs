@@ -222,14 +222,17 @@ pub enum BracketCommand {
     Appearance { key: String, value: String },
 
     /// Equip (or unequip) a worn item into one of six body-anchored slots.
-    /// `slot` is a canonical `EquipSlot` id (`"main_hand"`); `layer` defaults
-    /// to Outer (narrator-visible). A bare `[EQUIP slot]` (no `name=`) is the
-    /// unequip form — `item_name` is `None` then. Named `slot`/`layer`/
-    /// `item_name`/`item_stats`/`item_tags` to avoid the `kind` discriminator
-    /// (see the enum-level note). See `equipment.rs` for the layering model.
+    /// `slot` is a canonical `EquipSlot` id (`"main_hand"`); `layer` is
+    /// `None` unless the model emitted an explicit `layer=inner/under` — the
+    /// applier's common-sense placement owns the default (a cloak OVER a
+    /// worn shirt, socks UNDER boots, footwear swaps — `equipment::
+    /// place_equipped`). A bare `[EQUIP slot]` (no `name=`) is the unequip
+    /// form — `item_name` is `None` then. Named `slot`/`layer`/`item_name`/
+    /// `item_stats`/`item_tags` to avoid the `kind` discriminator (see the
+    /// enum-level note). See `equipment.rs` for the layering model.
     Equip {
         slot: equipment::EquipSlot,
-        layer: equipment::ItemLayer,
+        layer: Option<equipment::ItemLayer>,
         item_name: Option<String>,
         item_stats: Option<String>,
         /// Behavior tags parsed from `tags=consumable,equippable` (text) or a
@@ -295,6 +298,64 @@ pub enum BracketCommand {
     /// narrator consumes it as world state and plays the lie/scheme
     /// accordingly. Flattened + capped at `INTENT_MAX`.
     Intent { npc_id: String, intent: String },
+
+    /// (2026-08-19 Hidden site maps) `[ROOM <area_id> visited|discovered]` —
+    /// the player entered (bare form / `visited`) or learned of
+    /// (`discovered`) an area of the CURRENT node's site. `area_id` comes
+    /// from the tracker's `site:` slice (or a door target id — a door is a
+    /// visible fact even when the room behind it is a `?`). The applier
+    /// refuses without a site map (reject directive) + never downgrades
+    /// Visited → Discovered.
+    Room { area_id: String, visited: bool },
+
+    /// (2026-08-19 Hidden site maps) `[ASSET <asset_id>
+    /// dead|taken|triggered|active|known|suspected|count=N]` — a site
+    /// creature/trap/loot/object's state or knowledge shifted — or the
+    /// add-form `[ASSET +<name> kind=<k> loc=<area> (count=N) (detail=…)]`
+    /// for a feature that emerges in play (asset_id empty; the applier
+    /// mints the id). Named `SiteAsset` (serialized `site_asset` under the
+    /// `kind` tag) — distinct from `schema`'s `SiteAsset` DATA type.
+    SiteAsset { asset_id: String, mutation: AssetMutation },
+
+    /// (2026-08-19 Referee QoL) `[PROMISE <npc_id> <description> |
+    /// <minutes>]` — the player accepted an obligation (the pipe separates
+    /// the description from the deadline window in minutes). Remove form:
+    /// `[PROMISE <npc_id> -<description>]` (fulfilled/reneged — v1 removes
+    /// with no history). The applier resolves the npc_id through the
+    /// registry (the PRESENCE gate) + Rust tracks the frustration curve.
+    Promise {
+        npc_id: String,
+        description: String,
+        deadline_minutes: i64,
+        remove: bool,
+    },
+}
+
+/// (2026-08-19 Hidden site maps) The `[ASSET]` mutation payload — either a
+/// state/knowledge/count mutation on an existing asset, or the add-form's
+/// full mint. Serialized snake_case alongside the parent command.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AssetMutation {
+    Dead,
+    Taken,
+    Triggered,
+    Active,
+    Known,
+    Suspected,
+    /// Set a Group's member count (1–99; the applier rejects non-Groups).
+    Count(u32),
+    /// The add-form: mint a new asset. `kind` is the raw word
+    /// ("creature"/"group"/"trap"/"hazard"/"loot"/"object" — unknown →
+    /// object at apply); `location` is the target AREA id; `count` applies
+    /// to Groups only; `detail` ≤160.
+    Add {
+        name: String,
+        kind: String,
+        location: String,
+        count: u32,
+        detail: String,
+    },
 }
 
 /// The result of parsing narrator output: the bracket commands found + the
@@ -708,8 +769,10 @@ fn tokenize_kv(tail: &str) -> Vec<(String, String)> {
 /// spaces (a quoted bracket value may legally span a newline — it must
 /// never persist a forged `location:`/`cast:`/`exits:` render line), strip
 /// the remaining control chars, char-cap. Empty stays empty (all these
-/// fields are optional).
-fn clean_free_text(raw: &str, cap: usize) -> String {
+/// fields are optional). `pub(crate)`: the world-progression tick's
+/// `site_seeds` apply runs the SAME gate on model-emitted seed hooks (one
+/// discipline, one source).
+pub(crate) fn clean_free_text(raw: &str, cap: usize) -> String {
     let flattened: String = raw
         .chars()
         .map(|c| match c {
@@ -745,6 +808,18 @@ const TASK_DESC_MAX: usize = 160;
 /// diegetic reads, not paragraphs.
 const MOOD_LABEL_MAX: usize = 60;
 const INTENT_MAX: usize = 160;
+/// (2026-08-19 Referee QoL) The `[PROMISE]` description cap — a clause, not
+/// a contract.
+const PROMISE_DESC_MAX: usize = 160;
+/// (2026-08-19 integer-overflow guard) The `[PROMISE]` deadline-window clamp
+/// (~69 in-world days — generous for any diegetic obligation). The applier
+/// computes `now + deadline`; an unclamped hallucinated astronomically-large
+/// number would overflow i64 there. Same discipline as the `[ASSET]` count
+/// clamp (`ASSET_COUNT_MAX`).
+const PROMISE_DEADLINE_MAX: i64 = 100_000;
+/// (2026-08-19 Hidden site maps) The `[ROOM]`/`[ASSET]` id caps (kebab ids
+/// are short by construction; `clean_free_text` enforces).
+pub const SITE_AREA_ID_MAX: usize = 64;
 
 /// Parse the optional `key=value` tail of a `[DISCOVER node_id ...]` bracket.
 /// Recognized keys: `name` (diegetic label — may contain spaces when quoted),
@@ -1070,10 +1145,14 @@ fn parse_equip(rest: &str) -> Option<BracketCommand> {
     }
     let slot = equipment::EquipSlot::from_id(&slot_id)?;
     // No `name=` → unequip form.
-    let layer = if layer_str == "inner" || layer_str == "under" {
-        equipment::ItemLayer::Inner
+    // `layer` stays None unless the model said it — the applier's
+    // common-sense placement owns the default (2026-08-19).
+    let layer: Option<equipment::ItemLayer> = if layer_str == "inner" || layer_str == "under" {
+        Some(equipment::ItemLayer::Inner)
+    } else if layer_str == "outer" {
+        Some(equipment::ItemLayer::Outer)
     } else {
-        equipment::ItemLayer::Outer
+        None
     };
     let item_name = if name.trim().is_empty() {
         None
@@ -2101,10 +2180,12 @@ fn json_to_equip(obj: &serde_json::Map<String, serde_json::Value>) -> Option<Bra
         .unwrap_or("")
         .trim()
         .to_lowercase();
-    let layer = if layer_str == "inner" || layer_str == "under" {
-        equipment::ItemLayer::Inner
+    let layer: Option<equipment::ItemLayer> = if layer_str == "inner" || layer_str == "under" {
+        Some(equipment::ItemLayer::Inner)
+    } else if layer_str == "outer" {
+        Some(equipment::ItemLayer::Outer)
     } else {
-        equipment::ItemLayer::Outer
+        None
     };
     let name_raw = obj
         .get("name")
@@ -2596,6 +2677,77 @@ fn json_to_npc_register(obj: &serde_json::Map<String, serde_json::Value>) -> Opt
     })
 }
 
+/// (2026-08-19 Hidden site maps) Parse the tail of an `[ASSET …]` bracket.
+/// Mutate form: first token = the asset id (or a name fragment — the
+/// applier resolves via `site_map::resolve_asset`), remainder = one mutation
+/// word (`dead|taken|triggered|active|known|suspected` or `count=N`).
+/// Add form (`+<name> kind=… loc=… (count=…) (detail=…)`): the name is a
+/// quoted span or the first bare token (quote multi-word names — the taught
+/// line says so), the rest is `tokenize_kv` fields. Malformed → None
+/// (literal prose, the universal leniency).
+fn parse_site_asset(rest: &str) -> Option<BracketCommand> {
+    let rest = rest.trim();
+    if let Some(after) = rest.strip_prefix('+') {
+        let after = after.trim_start();
+        let (name_raw, tail): (String, &str) = if after.starts_with('"') {
+            match after[1..].find('"') {
+                Some(rel) => (after[1..1 + rel].to_string(), &after[2 + rel..]),
+                None => (after.trim_start_matches('"').to_string(), ""),
+            }
+        } else {
+            match after.find(char::is_whitespace) {
+                Some(i) => (after[..i].to_string(), &after[i..]),
+                None => (after.to_string(), ""),
+            }
+        };
+        let name = clean_item_name(&name_raw)?;
+        let mut kind = String::new();
+        let mut location = String::new();
+        let mut count: u32 = 0;
+        let mut detail = String::new();
+        for (k, v) in tokenize_kv(tail) {
+            match k.as_str() {
+                "kind" | "type" => kind = clean_free_text(&v, 20),
+                "loc" | "location" | "area" => location = clean_free_text(&v, SITE_AREA_ID_MAX),
+                "count" | "qty" => {
+                    count = v.trim().parse::<u32>().ok()?.min(crate::site_map::ASSET_COUNT_MAX)
+                }
+                "detail" => detail = clean_free_text(&v, 160),
+                _ => {}
+            }
+        }
+        return Some(BracketCommand::SiteAsset {
+            asset_id: String::new(),
+            mutation: AssetMutation::Add { name, kind, location, count, detail },
+        });
+    }
+    // Mutate form.
+    let mut iter = rest.splitn(2, char::is_whitespace);
+    let asset_id = clean_free_text(iter.next().unwrap_or(""), SITE_AREA_ID_MAX);
+    if asset_id.is_empty() {
+        return None;
+    }
+    let flag = iter.next().unwrap_or("").trim().to_lowercase();
+    let mutation = if let Some(n) = flag.strip_prefix("count=") {
+        let n = n.trim().parse::<u32>().ok()?;
+        if n == 0 || n > crate::site_map::ASSET_COUNT_MAX {
+            return None;
+        }
+        AssetMutation::Count(n)
+    } else {
+        match flag.as_str() {
+            "dead" => AssetMutation::Dead,
+            "taken" => AssetMutation::Taken,
+            "triggered" => AssetMutation::Triggered,
+            "active" => AssetMutation::Active,
+            "known" => AssetMutation::Known,
+            "suspected" => AssetMutation::Suspected,
+            _ => return None,
+        }
+    };
+    Some(BracketCommand::SiteAsset { asset_id, mutation })
+}
+
 fn parse_one(bracket: &str, text_after: &str) -> Option<(BracketCommand, usize)> {
     let bracket = bracket.trim();
 
@@ -2983,6 +3135,83 @@ fn parse_one(bracket: &str, text_after: &str) -> Option<(BracketCommand, usize)>
             return None;
         }
         return Some((BracketCommand::Intent { npc_id, intent }, 0));
+    }
+
+    // [ROOM <area_id> visited|discovered] — (2026-08-19 Hidden site maps) the
+    // player entered or learned of an area of the current site. BARE form (no
+    // flag) = visited. Ids come from the tracker's `site:` slice; the applier
+    // refuses without a map. Prefix-safe vs RUMOR (diverge at the 3rd char).
+    // The JSON form is deliberately NOT dual-parsed (v1: text brackets only).
+    if let Some(rest) = strip_prefix_ci(bracket, "ROOM") {
+        let rest = rest.trim();
+        let mut iter = rest.splitn(2, char::is_whitespace);
+        let area_id = clean_free_text(iter.next().unwrap_or(""), SITE_AREA_ID_MAX);
+        if area_id.is_empty() {
+            return None;
+        }
+        let flag = iter.next().unwrap_or("").trim().to_lowercase();
+        let visited = match flag.as_str() {
+            "" | "visited" | "entered" => true,
+            "discovered" | "found" => false,
+            _ => return None,
+        };
+        return Some((BracketCommand::Room { area_id, visited }, 0));
+    }
+
+    // [ASSET <asset_id> dead|taken|triggered|active|known|suspected|count=N]
+    // / [ASSET +<name> kind=<k> loc=<area> (count=N) (detail=…)] —
+    // (2026-08-19 Hidden site maps) a site asset's state/knowledge/count
+    // mutation, or a new feature minting in play. See `parse_site_asset`.
+    // Prefix-safe vs APPEARANCE (diverge at the 2nd char).
+    if let Some(rest) = strip_prefix_ci(bracket, "ASSET") {
+        if let Some(cmd) = parse_site_asset(rest) {
+            return Some((cmd, 0));
+        }
+        return None;
+    }
+
+    // [PROMISE <npc_id> <description> | <minutes>] / [PROMISE <npc_id>
+    // -<description>] — (2026-08-19 Referee QoL) an obligation accepted or
+    // fulfilled. First token = npc_id surface form (applier resolves via
+    // `resolve_npc_surface`); the LAST pipe separates the description from
+    // the minute window (the description itself may contain pipes). Prefix-
+    // safe vs PRESENCE (diverge at the 3rd char).
+    if let Some(rest) = strip_prefix_ci(bracket, "PROMISE") {
+        let rest = rest.trim();
+        let mut iter = rest.splitn(2, char::is_whitespace);
+        let npc_id = clean_free_text(iter.next().unwrap_or(""), NODE_ID_MAX);
+        if npc_id.is_empty() {
+            return None;
+        }
+        let body = iter.next().unwrap_or("").trim();
+        if let Some(desc_raw) = body.strip_prefix('-') {
+            let description =
+                clean_free_text(&strip_one_quote_pair(desc_raw.trim()), PROMISE_DESC_MAX);
+            if description.is_empty() {
+                return None;
+            }
+            return Some((
+                BracketCommand::Promise { npc_id, description, deadline_minutes: 0, remove: true },
+                0,
+            ));
+        }
+        if let Some(pipe) = body.rfind('|') {
+            let description =
+                clean_free_text(&strip_one_quote_pair(body[..pipe].trim()), PROMISE_DESC_MAX);
+            let minutes = body[pipe + 1..]
+                .trim()
+                .parse::<i64>()
+                .ok()?
+                .min(PROMISE_DEADLINE_MAX);
+            if description.is_empty() || minutes <= 0 {
+                return None;
+            }
+            return Some((
+                BracketCommand::Promise { npc_id, description, deadline_minutes: minutes, remove: false },
+                0,
+            ));
+        }
+        return None;
     }
 
     // [TIME <in-world timestamp>] — Seam #4 clock advance. Single-region like
@@ -3678,6 +3907,166 @@ fn days_from_civil(y: i32, m: u32, d: u32) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ─────────────────────────────────────────────────────────────────────
+    // (2026-08-19) ROOM / ASSET / PROMISE — the hidden-site-maps + Referee
+    // QoL verbs. Grammar pins: bare ROOM = visited; ASSET mutate + add
+    // forms; PROMISE's pipe split + remove form.
+    // ─────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn room_bare_form_is_visited() {
+        let parsed = parse("She pushes through. [ROOM gatehouse]");
+        assert_eq!(
+            parsed.commands,
+            vec![BracketCommand::Room { area_id: "gatehouse".into(), visited: true }]
+        );
+        // The bracket is stripped from the prose.
+        assert!(!parsed.prose.contains("[ROOM"), "bracket must not leak: {:?}", parsed.prose);
+    }
+
+    #[test]
+    fn room_explicit_flags() {
+        let parsed = parse("[ROOM hall discovered] [ROOM vault visited]");
+        assert_eq!(
+            parsed.commands,
+            vec![
+                BracketCommand::Room { area_id: "hall".into(), visited: false },
+                BracketCommand::Room { area_id: "vault".into(), visited: true },
+            ]
+        );
+        // Unknown flag → the bracket drops (literal prose), never mis-parsed.
+        let bad = parse("[ROOM hall explored]");
+        assert!(bad.commands.is_empty(), "unknown flag must drop: {:?}", bad.commands);
+    }
+
+    #[test]
+    fn asset_mutate_forms() {
+        let parsed = parse("[ASSET warband-scouts dead]");
+        assert_eq!(
+            parsed.commands,
+            vec![BracketCommand::SiteAsset {
+                asset_id: "warband-scouts".into(),
+                mutation: AssetMutation::Dead,
+            }]
+        );
+        let parsed = parse("[ASSET gate-keeper suspected]");
+        assert!(matches!(
+            &parsed.commands[0],
+            BracketCommand::SiteAsset { mutation: AssetMutation::Suspected, .. }
+        ));
+        let parsed = parse("[ASSET warband-scouts count=3]");
+        assert!(matches!(
+            &parsed.commands[0],
+            BracketCommand::SiteAsset { mutation: AssetMutation::Count(3), .. }
+        ));
+        // Out-of-range counts drop whole.
+        assert!(parse("[ASSET x count=0]").commands.is_empty());
+        assert!(parse("[ASSET x count=500]").commands.is_empty());
+        // Unknown mutation word drops.
+        assert!(parse("[ASSET x banished]").commands.is_empty());
+    }
+
+    #[test]
+    fn asset_add_form_quoted_and_bare() {
+        let parsed = parse("[ASSET +\"Rabid Kennel Hound\" kind=creature loc=gatehouse detail=foaming at the jaws]");
+        match &parsed.commands[0] {
+            BracketCommand::SiteAsset { asset_id, mutation } => {
+                assert!(asset_id.is_empty(), "add form carries no id");
+                match mutation {
+                    AssetMutation::Add { name, kind, location, count, detail } => {
+                        assert_eq!(name, "Rabid Kennel Hound");
+                        assert_eq!(kind, "creature");
+                        assert_eq!(location, "gatehouse");
+                        assert_eq!(*count, 0);
+                        assert!(detail.starts_with("foaming"), "detail: {detail}");
+                    }
+                    other => panic!("expected Add, got {other:?}"),
+                }
+            }
+            other => panic!("expected SiteAsset, got {other:?}"),
+        }
+        // Bare single-token name + group count.
+        let parsed = parse("[ASSET +Warband kind=group loc=hall count=6]");
+        match &parsed.commands[0] {
+            BracketCommand::SiteAsset {
+                mutation: AssetMutation::Add { name, count, .. },
+                ..
+            } => {
+                assert_eq!(name, "Warband");
+                assert_eq!(*count, 6);
+            }
+            other => panic!("expected SiteAsset, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn promise_grammar_both_forms() {
+        let parsed = parse("[PROMISE mara return the horse | 1440]");
+        assert_eq!(
+            parsed.commands,
+            vec![BracketCommand::Promise {
+                npc_id: "mara".into(),
+                description: "return the horse".into(),
+                deadline_minutes: 1440,
+                remove: false,
+            }]
+        );
+        // Quoted descriptions with internal pipes: the LAST pipe splits.
+        let parsed = parse("[PROMISE mara \"fetch water | feed the mule\" | 90]");
+        match &parsed.commands[0] {
+            BracketCommand::Promise { description, deadline_minutes, remove, .. } => {
+                assert_eq!(description, "fetch water | feed the mule");
+                assert_eq!(*deadline_minutes, 90);
+                assert!(!remove);
+            }
+            other => panic!("expected Promise, got {other:?}"),
+        }
+        // Remove form.
+        let parsed = parse("[PROMISE mara -return the horse]");
+        assert_eq!(
+            parsed.commands,
+            vec![BracketCommand::Promise {
+                npc_id: "mara".into(),
+                description: "return the horse".into(),
+                deadline_minutes: 0,
+                remove: true,
+            }]
+        );
+        // Malformed: no pipe, non-numeric window, zero window → drop.
+        assert!(parse("[PROMISE mara return the horse]").commands.is_empty());
+        assert!(parse("[PROMISE mara x | tomorrow]").commands.is_empty());
+        assert!(parse("[PROMISE mara x | 0]").commands.is_empty());
+    }
+
+    /// (2026-08-19 integer-overflow guard) A hallucinated astronomically-
+    /// large window clamps to `PROMISE_DEADLINE_MAX` instead of overflowing
+    /// `now + deadline` at the apply site; a normal window passes verbatim.
+    #[test]
+    fn promise_deadline_clamps_huge_windows() {
+        let parsed =
+            parse("[PROMISE mara repay the debt | 9223372036854775807]");
+        match &parsed.commands[0] {
+            BracketCommand::Promise { deadline_minutes, remove, .. } => {
+                assert_eq!(*deadline_minutes, PROMISE_DEADLINE_MAX);
+                assert!(!remove);
+            }
+            other => panic!("expected Promise, got {other:?}"),
+        }
+        let parsed = parse("[PROMISE mara x | 90]");
+        match &parsed.commands[0] {
+            BracketCommand::Promise { deadline_minutes, .. } => {
+                assert_eq!(*deadline_minutes, 90, "small windows pass verbatim");
+            }
+            other => panic!("expected Promise, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn room_asset_promise_survive_case_insensitive_verbs() {
+        let parsed = parse("[room hall] [asset guards count=2] [promise mara x | 5]");
+        assert_eq!(parsed.commands.len(), 3, "case-insensitive verbs: {:?}", parsed.commands);
+    }
 
     #[test]
     fn extracts_object_command() {
@@ -5591,7 +5980,7 @@ mod tests {
         match &parsed.commands[0] {
             BracketCommand::Equip { slot, layer, item_name, item_stats, .. } => {
                 assert_eq!(*slot, equipment::EquipSlot::MainHand);
-                assert_eq!(*layer, equipment::ItemLayer::Outer, "default layer is Outer");
+                assert_eq!(*layer, None, "no layer= → the applier's common-sense placement owns it");
                 assert_eq!(item_name.as_deref(), Some("Iron Sword"));
                 assert_eq!(item_stats.as_deref(), Some("+2 ATK"));
             }
@@ -5606,8 +5995,21 @@ mod tests {
         match &parsed.commands[0] {
             BracketCommand::Equip { slot, layer, item_name, .. } => {
                 assert_eq!(*slot, equipment::EquipSlot::Chest);
-                assert_eq!(*layer, equipment::ItemLayer::Inner);
+                assert_eq!(*layer, Some(equipment::ItemLayer::Inner));
                 assert_eq!(item_name.as_deref(), Some("Linen Shirt"));
+            }
+            other => panic!("expected Equip, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn equip_bracket_explicit_outer_layer() {
+        // layer=outer is an EXPLICIT placement (respected verbatim), distinct
+        // from the absent field (auto placement).
+        let parsed = parse("[EQUIP slot=chest name=\"Travel Cloak\" layer=outer]");
+        match &parsed.commands[0] {
+            BracketCommand::Equip { layer, .. } => {
+                assert_eq!(*layer, Some(equipment::ItemLayer::Outer));
             }
             other => panic!("expected Equip, got {:?}", other),
         }
@@ -5778,7 +6180,7 @@ mod tests {
         match &parsed.commands[0] {
             BracketCommand::Equip { slot, layer, item_name, .. } => {
                 assert_eq!(*slot, equipment::EquipSlot::OffHand);
-                assert_eq!(*layer, equipment::ItemLayer::Outer);
+                assert_eq!(*layer, None, "no layer field → auto placement");
                 assert_eq!(item_name.as_deref(), Some("Round Shield"));
             }
             other => panic!("expected Equip from JSON, got {:?}", other),
@@ -5902,7 +6304,7 @@ mod tests {
                 assert_eq!(*slot, equipment::EquipSlot::MainHand);
                 assert_eq!(item_name.as_deref(), Some("Silver Coin"), "full multi-word name captured");
                 // `layer=outer` must still parse as a separate field, not be absorbed.
-                assert_eq!(*layer, equipment::ItemLayer::Outer);
+                assert_eq!(*layer, Some(equipment::ItemLayer::Outer));
             }
             other => panic!("expected Equip, got {:?}", other),
         }

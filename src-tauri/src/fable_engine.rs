@@ -128,7 +128,7 @@ const FABLE_BATCH: u32 = 512;
 /// was a shortcut that amputated generation budget to make room for bloat;
 /// the scrub fixed the bloat instead.
 const FABLE_MAX_TOKENS: i32 = 1024;
-/// The hard ceiling for a TRACKER pass (tracker_mode=true). The tracker's
+/// The hard ceiling for a TRACKER pass (`FableTurnMode::Tracker`). The tracker's
 /// contract is brackets-only — a typical bracket set is 20-100 tokens, but a
 /// multi-bracket turn (4-item inventory purchase + time + disguise) can reach
 /// 150-200. Raised 150→256 on 2026-08-10 after the T52 playtest showed the 150
@@ -289,6 +289,25 @@ impl TrackerSniper {
 // Control plane: channel types
 // ---------------------------------------------------------------------------
 
+/// Which kind of pass a `FableRequest` is (2026-08-19: replaces the old
+/// `tracker_mode: bool` — the JIT Site Architect is a third consumer).
+///
+/// - **Tracker** — the Stage-1 bracket pass: deterministic sampler, hard
+///   over-budget REFUSAL, sniper armed, `TRACKER_MAX_TOKENS` reserve.
+/// - **Architect** — the JIT site-map generator (`maybe_run_site_architect`):
+///   the SAME deterministic profile + refusal + sniper as the tracker (it
+///   emits one fenced JSON object, and the sniper is fence-aware so the
+///   fence body can't be decapitated), with `SITE_ARCHITECT_MAX_TOKENS`
+///   (512) as its reserve.
+/// - **Narrator** — the dev-only local-narrator path: creative sampler,
+///   front-truncate overflow valve, no sniper, `FABLE_MAX_TOKENS` reserve.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FableTurnMode {
+    Tracker,
+    Narrator,
+    Architect,
+}
+
 /// A request to the game thread: stream a narrator turn for `prompt`.
 struct FableRequest {
     /// Fully-rendered prompt (system + visible history + new user turn +
@@ -302,18 +321,8 @@ struct FableRequest {
     /// engine, §2C). Distinct slot from `active_cancel` so game/chat cancels
     /// never cross-wire.
     cancel: CancelToken,
-    /// §11.43.B (2026-07-28): when true, the engine uses the DETERMINISTIC
-    /// "tracker" sampler chain (temp 0.2, top_p 0.9, DRY allowed_length=1)
-    /// instead of the creative narrator chain (temp 0.85, top_p 0.95, DRY
-    /// allowed_length=2). The tracker is an AGENT — it emits rigid
-    /// bracket/JSON state deltas, never prose — so it gets no stylistic
-    /// leeway and a tighter DRY to kill single-token loops like the
-    /// `(player)(player)` pathology (which slips past the narrator's
-    /// allowed_length=2 because the loop spans only 1-2 tokens per repeat).
-    /// The §11.42 API-mode tracker call site sets this true; every other
-    /// caller (LOCAL-mode narrator, API-mode fallback narrator) leaves it
-    /// false → existing behavior unchanged.
-    tracker_mode: bool,
+    /// §11.43.B (2026-07-28): the pass's mode — see [`FableTurnMode`].
+    mode: FableTurnMode,
     /// One-shot reply channel. Sent exactly once when the turn completes
     /// (success, cancel, or error).
     reply: mpsc::Sender<FableReply>,
@@ -433,8 +442,10 @@ fn resolve_punct_biases(model: &LlamaModel) -> Vec<LlamaLogitBias> {
 
 /// Returns the sampler profile for the requested turn mode. See
 /// [`SamplerConfig`] + the `sampler_config_*` tests for the pinned values.
-fn sampler_config(tracker_mode: bool) -> SamplerConfig {
-    if tracker_mode {
+/// Tracker + Architect share the DETERMINISTIC profile (both are agents
+/// emitting rigid state — brackets or one fenced JSON object).
+fn sampler_config(mode: FableTurnMode) -> SamplerConfig {
+    if matches!(mode, FableTurnMode::Tracker | FableTurnMode::Architect) {
         SamplerConfig {
             temp: crate::settings::TEMP_TRACKER,
             top_p: crate::settings::TOP_P_TRACKER,
@@ -579,23 +590,23 @@ impl FableEngine {
     /// receiver it created. The streaming chunks arrive via `on_chunk` *as
     /// they decode*: the reply comes once when generation completes.
     ///
-    /// `tracker_mode` (§11.43.B): when true, selects the deterministic
-    /// tracker sampler chain. See [`FableRequest::tracker_mode`] for the
-    /// full rationale. Callers that don't care should pass `false` to get
-    /// the default narrator behavior.
+    /// `mode` (§11.43.B + 2026-08-19): selects the sampler profile, the
+    /// generation reserve, the sniper arming, and the over-budget behavior —
+    /// see [`FableTurnMode`]. Callers that don't care should pass
+    /// `FableTurnMode::Narrator` to get the default narrator behavior.
     pub fn request_turn(
         &self,
         prompt: String,
         on_chunk: ChunkFn,
         cancel: CancelToken,
-        tracker_mode: bool,
+        mode: FableTurnMode,
     ) -> anyhow::Result<mpsc::Receiver<FableReply>> {
         let (reply_tx, reply_rx) = mpsc::channel::<FableReply>();
         let req = FableRequest {
             prompt,
             on_chunk,
             cancel,
-            tracker_mode,
+            mode,
             reply: reply_tx,
         };
         self.tx
@@ -735,27 +746,35 @@ impl FableRuntime {
         // tracking → zero brackets. With the tracker reserve, max_prompt =
         // 3072-256 = 2816 — the prompt fits, the bracket protocol survives,
         // the tracker sees its syntax.
-        let reserve = if req.tracker_mode { TRACKER_MAX_TOKENS } else { FABLE_MAX_TOKENS };
+        // Reserve is MODE-AWARE (2026-08-10 fix + 2026-08-19 Architect): the
+        // tracker needs only TRACKER_MAX_TOKENS (256) of generation reserve,
+        // the architect SITE_ARCHITECT_MAX_TOKENS (512 — one fenced site
+        // JSON object), the narrator FABLE_MAX_TOKENS (1024).
+        let reserve = match req.mode {
+            FableTurnMode::Tracker => TRACKER_MAX_TOKENS,
+            FableTurnMode::Architect => crate::site_map::SITE_ARCHITECT_MAX_TOKENS,
+            FableTurnMode::Narrator => FABLE_MAX_TOKENS,
+        };
         let max_prompt = (FABLE_CTX as usize).saturating_sub(reserve as usize);
         if tokens.len() > max_prompt {
-            // (2026-08-16, 4th recurrence KILLED) Tracker mode REFUSES to
-            // decode an over-budget prompt. The old front-drain chopped the
-            // SYSTEM PROMPT (AGENT directive + bracket protocol) — the exact
-            // mechanism that silently killed bracket emission three times
-            // (2026-08-09, 2026-08-10 T52, and the 2026-08-16 playtest where
-            // episodic `<retrieved_knowledge>` growth made the drain
-            // progressive: 5 → 687 tokens dropped over 16 turns). A refused
-            // pass fails loudly (the caller skips brackets + logs) and the
-            // narrator still runs on pre-tracker state — strictly better
-            // than a confident decode of a headless prompt. The lib.rs
-            // char-budget guard (`build_tracker_prompt_bounded`) should
-            // catch this first; reaching this arm means that guard was
-            // bypassed or the tokenizer defied the chars/token ratio.
-            if req.tracker_mode {
+            // (2026-08-16, 4th recurrence KILLED) Tracker + Architect modes
+            // REFUSE to decode an over-budget prompt. The old front-drain
+            // chopped the SYSTEM PROMPT (AGENT directive + bracket protocol)
+            // — the exact mechanism that silently killed bracket emission
+            // three times (2026-08-09, 2026-08-10 T52, and the 2026-08-16
+            // playtest where episodic `<retrieved_knowledge>` growth made the
+            // drain progressive: 5 → 687 tokens dropped over 16 turns). A
+            // refused pass fails loudly (the caller skips brackets + logs)
+            // and the narrator still runs on pre-tracker state — strictly
+            // better than a confident decode of a headless prompt. The
+            // lib.rs char-budget guard (`build_tracker_prompt_bounded`)
+            // should catch this first; reaching this arm means that guard
+            // was bypassed or the tokenizer defied the chars/token ratio.
+            if matches!(req.mode, FableTurnMode::Tracker | FableTurnMode::Architect) {
                 return Err(GenerationOutcome::GenerationErr(anyhow::anyhow!(
-                    "TRACKER PROMPT OVERFLOW: {} tokens > {} max — refusing to decode a \
-                     headless prompt (the bracket protocol must never be front-chopped). \
-                     Fix the prompt budget, not the context.",
+                    "TRACKER/ARCHITECT PROMPT OVERFLOW: {} tokens > {} max — refusing to decode a \
+                                         headless prompt (the bracket protocol must never be front-chopped). \
+                                         Fix the prompt budget, not the context.",
                     tokens.len(),
                     max_prompt
                 )));
@@ -898,8 +917,12 @@ impl FableRuntime {
         // Not 0 — DRY at allowed_length=0 would penalize ANY 2-token
         // sequence, mangling legitimate repetitions like `{ "type": "task",
         // "task": ... }`.
-        let cfg = sampler_config(req.tracker_mode);
-        let mut sampler = if req.tracker_mode {
+        let cfg = sampler_config(req.mode);
+        // (2026-08-19) The deterministic flag covers Tracker + Architect —
+        // both are agent passes and share the profile; only the reserve
+        // differs (see above).
+        let deterministic = matches!(req.mode, FableTurnMode::Tracker | FableTurnMode::Architect);
+        let mut sampler = if deterministic {
             tracing::info!("sampler: tracker profile (temp=0.2, top_p=0.9, DRY allowed_length=1)");
             LlamaSampler::chain_simple([
                 LlamaSampler::temp(cfg.temp),
@@ -931,10 +954,14 @@ impl FableRuntime {
         let mut n_cur = n_prompt;
         let mut step_batch = LlamaBatch::new(1, 1);
         let mut out = String::new();
-        // The tracker gets a tight 256-token failsafe ceiling (the sniper is
+        // The tracker/architect get a tight failsafe ceiling (the sniper is
         // the primary stop; this is the wall behind it). The narrator keeps
         // the full 1024 budget. Both clamp to the remaining cache space.
-        let base_cap = if req.tracker_mode { TRACKER_MAX_TOKENS } else { FABLE_MAX_TOKENS };
+        let base_cap = match req.mode {
+            FableTurnMode::Tracker => TRACKER_MAX_TOKENS,
+            FableTurnMode::Architect => crate::site_map::SITE_ARCHITECT_MAX_TOKENS,
+            FableTurnMode::Narrator => FABLE_MAX_TOKENS,
+        };
         let max_tokens = base_cap
             .min((FABLE_CTX as i32 - n_prompt).max(64));
 
@@ -994,9 +1021,11 @@ impl FableRuntime {
 
         let decode_start = std::time::Instant::now();
         let mut gen_count: i32 = 0;
-        // The sniper only arms for tracker passes (the narrator MUST be allowed
-        // to generate prose — that's its whole job). One instance per turn.
-        let mut sniper = if req.tracker_mode { Some(TrackerSniper::new()) } else { None };
+        // The sniper only arms for tracker + architect passes (the narrator
+        // MUST be allowed to generate prose — that's its whole job; the
+        // architect's fenced JSON is exempt via the fence-aware state
+        // machine). One instance per turn.
+        let mut sniper = if deterministic { Some(TrackerSniper::new()) } else { None };
         for _ in 0..max_tokens {
             // Cancellation check at the TOP of the loop (between tokens,
             // never mid-decode: same KV-consistency contract as the chat
@@ -1065,12 +1094,6 @@ impl FableRuntime {
                             out_len_chars = out.len(),
                             "🎯 SNIPER: tracker bracket→prose transition detected; early-stopping decode"
                         );
-                        crate::logs::log(
-                            "ENG",
-                            &format!(
-                                "tracker SNIPER early-stop at token {gen_count} (bracket→prose transition)"
-                            ),
-                        );
                         break;
                     }
                 }
@@ -1119,18 +1142,6 @@ impl FableRuntime {
                 head_200 = %head,
                 tail_200 = %tail,
                 "FABLE DECODE: complete"
-            );
-            crate::logs::log(
-                "ENG",
-                &format!(
-                    "fable decode: gen_tokens={} max={} elapsed_ms={} tok_s={} out_chars={} hit_max={}",
-                    gen_count,
-                    max_tokens,
-                    elapsed_ms,
-                    if elapsed_ms > 0 { gen_count as u128 * 1000 / elapsed_ms } else { 0 },
-                    out.len(),
-                    gen_count >= max_tokens
-                ),
             );
         }
 
@@ -1310,7 +1321,7 @@ mod tests {
     // run in milliseconds and don't depend on the CUDA backend.
     // ─────────────────────────────────────────────────────────────────────
 
-    /// THE §11.43.B INVARIANT: the narrator profile (tracker_mode=false)
+    /// THE §11.43.B INVARIANT: the narrator profile (`FableTurnMode::Narrator`)
     /// must be byte-identical to the pre-§11.43.B values. This is the
     /// "LOCAL mode is unchanged" contract — LOCAL mode is the `false`
     /// branch. If this test fails, a change to the narrator sampler has
@@ -1318,7 +1329,7 @@ mod tests {
     /// updating AGENTS.md §11.41 + §11.43.B.
     #[test]
     fn sampler_config_returns_narrator_defaults_for_local_mode() {
-        let cfg = sampler_config(false);
+        let cfg = sampler_config(FableTurnMode::Narrator);
         // The pre-§11.43.B values from §11.41. Pinned here so any drift
         // breaks the test, not silently ships.
         assert_eq!(cfg.temp, 0.85, "narrator temp is the §11.41 value (0.85)");
@@ -1335,7 +1346,7 @@ mod tests {
     /// The tracker profile (§11.43.B): deterministic + tighter DRY.
     #[test]
     fn sampler_config_returns_deterministic_tracker_profile() {
-        let cfg = sampler_config(true);
+        let cfg = sampler_config(FableTurnMode::Tracker);
         // The §11.43.B tracker values — chosen for deterministic JSON/bracket
         // emission + tighter repetition penalty than the narrator.
         assert_eq!(cfg.temp, 0.2, "tracker temp is LOW for deterministic output");
@@ -1357,8 +1368,8 @@ mod tests {
     /// intent even if not in behavior).
     #[test]
     fn sampler_config_tracker_and_narrator_are_distinct() {
-        let tracker = sampler_config(true);
-        let narrator = sampler_config(false);
+        let tracker = sampler_config(FableTurnMode::Tracker);
+        let narrator = sampler_config(FableTurnMode::Narrator);
         assert_ne!(tracker, narrator, "tracker and narrator profiles must differ");
         // The temp + top_p + dry_allowed_length must all be tighter for the
         // tracker. (Multiplier/base are intentionally shared — only the
@@ -1366,6 +1377,18 @@ mod tests {
         assert!(tracker.temp < narrator.temp);
         assert!(tracker.top_p < narrator.top_p);
         assert!(tracker.dry_allowed_length < narrator.dry_allowed_length);
+    }
+
+    /// (2026-08-19) The Architect shares the Tracker's DETERMINISTIC profile
+    /// exactly — it emits one fenced JSON object, the same agent discipline
+    /// as the bracket pass.
+    #[test]
+    fn sampler_config_architect_shares_tracker_profile() {
+        assert_eq!(
+            sampler_config(FableTurnMode::Architect),
+            sampler_config(FableTurnMode::Tracker),
+            "architect == tracker profile (only the reserve differs)"
+        );
     }
 
     // ─────────────────────────────────────────────────────────────────────

@@ -15,7 +15,11 @@
 //      centered to the screen — see fable.css §1/§3). (2026-08-17) The
 //      wheel-driven reveal animation is REMOVED: the feed is a plain
 //      natively-scrollable column + history beats are always rendered —
-//      this module only keeps the tagging fresh.
+//      this module only keeps the tagging fresh. (2026-08-19) A LIVE
+//      recent→history flip (a beat that just aged out as new beats
+//      arrived — never a fresh rebuild node) plays the ~1s AGING MORPH
+//      (fable.css .vn-aging): portrait fades inward + collapses,
+//      nameplate fades, stagger eases to center.
 //   2. Portrait corner snaps — a single click on a beat portrait toggles
 //      a .vn-snapped class on the <img>, which detaches it to a fixed
 //      bottom-left (AI) / bottom-right (user) VN character sprite. A
@@ -62,14 +66,45 @@ let state = null;
 // classes before re-applying) so it's safe to call on every insertion.
 // Exported so beats.js / stage.js can force a refresh after a feed
 // rebuild.
+//
+// AGING MORPH (2026-08-19 per Chloe): a beat that JUST fell out of the
+// recent pair — a LIVE class flip on a surviving node, not a fresh
+// rebuild node — animates into the archive treatment over ~1s (portrait
+// fades inward + collapses, nameplate fades + collapses, corner
+// timestamp fades in, stagger eases to the centered axis, iron border
+// draws; see the .vn-aging rules in fable.css). The previous pass's
+// recent set drives the flip detection: rebuilt feeds produce nodes the
+// set has never seen, so loads/deletes/rewinds spawn history in place
+// (no replayed morph) — only the live "a new beat just aged this one
+// out" moment animates.
+let prevRecent = new Set();
+const AGE_SETTLE_MS = 1080;   // 1s transition + a frame of settle
+
+function ageOut(el) {
+  if (el.classList.contains('vn-aging')) return; // one morph per beat
+  el.classList.add('vn-aging', 'vn-age-hold');
+  // Two-phase: force one style computation in the HOLD (recent-look)
+  // state, then drop the hold — the transitions declared on the
+  // .vn-aging rules run from the recent look toward the archive look.
+  void el.offsetWidth;
+  el.classList.remove('vn-age-hold');
+  // When the timer strips .vn-aging, the terminal .vn-history
+  // display:none rules resume on elements already at 0 opacity/width —
+  // nothing snaps. A rebuild landing earlier destroys the node; the
+  // cleanup on a detached element is a harmless no-op.
+  setTimeout(() => el.classList.remove('vn-aging'), AGE_SETTLE_MS);
+}
+
 export function refreshHistory() {
   if (!state || !state.feedEl) return;
   const beats = state.feedEl.querySelectorAll(
     '.fable-mes:not(.system):not(.error)'
   );
   const total = beats.length;
+  const nextRecent = new Set();
   beats.forEach((el, i) => {
-    el.classList.remove('vn-recent', 'vn-history');
+    const wasRecent = prevRecent.has(el);
+    el.classList.remove('vn-recent', 'vn-history', 'vn-age-hold');
     // The last RECENT_BEATS read with the full card treatment. If there
     // are fewer than RECENT_BEATS+1 beats total, nothing is old enough to
     // de-style — tagging everything vn-recent avoids stripping the sole
@@ -77,10 +112,15 @@ export function refreshHistory() {
     const recentFrom = Math.max(0, total - RECENT_BEATS);
     if (total <= RECENT_BEATS || i >= recentFrom) {
       el.classList.add('vn-recent');
+      nextRecent.add(el);
     } else {
       el.classList.add('vn-history');
+      // A live recent→history flip morphs (fresh rebuild nodes never sat
+      // in prevRecent, so they skip straight to the resting archive look).
+      if (wasRecent) ageOut(el);
     }
   });
+  prevRecent = nextRecent;
 }
 
 // ── Portrait corner snaps (delegated click) ─────────────────────
@@ -208,5 +248,8 @@ export function teardown() {
     feedEl.querySelectorAll('.fable-mes-avatar-img.vn-snapped')
       .forEach((img) => img.classList.remove('vn-snapped'));
   }
+  // Aging bookkeeping: the next init starts with no prior recent set (a
+  // rebuilt feed must spawn history in place, never replay the morph).
+  prevRecent = new Set();
   state = null;
 }

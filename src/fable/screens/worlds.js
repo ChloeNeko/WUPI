@@ -11,8 +11,10 @@
 //
 // THE MODAL carries four actions: NEW / LOAD / EDIT / DELETE.
 //   • NEW     → fade transition into the Player pair (slide 1), reverse-
-//     spawn the buttons, then the New Game flow continues (the player
-//     chooses/creates a player → SIM pair → Codex → Intro → fresh game).
+//     spawn the buttons, with THIS card preset into the flow. Once the
+//     player chooses/creates a player, the game launches straight into
+//     this world (flowAfterPlayer in fable.js — no SIM pair re-pick, no
+//     Codex step).
 //   • LOAD    → the saves list for this card (screens/saves.js). The per-turn
 //     autosave is promoted to a one-click "Resume Latest" button at the top;
 //     the list below shows the manual saves (most-recent first; the backend

@@ -247,13 +247,6 @@ impl ChatEngine {
                                     // cold-path prefill wrote over stale state →
                                     // the "model goes offline" infinite failure.
                                     tracing::warn!(error = %e, "generation failed; cold-resetting KV cache + buffer");
-                                    crate::logs::log(
-                                        "ENG",
-                                        &format!(
-                                            "generation FAILED — cold-reset err={}",
-                                            crate::logs::brief_with(&format!("{e:#}"), 90)
-                                        ),
-                                    );
                                     engine.ctx.clear_kv_cache();
                                     engine.buffer.reset();
                                     EngineReply::Err(format!("{e:#}"))
@@ -270,13 +263,6 @@ impl ChatEngine {
                                         })
                                         .unwrap_or_else(|| "engine panic (unknown cause)".to_string());
                                     tracing::error!(panic = %msg, "engine generation panicked; cold-resetting");
-                                    crate::logs::log(
-                                        "ENG",
-                                        &format!(
-                                            "SELF-HEAL: generation panicked, cold-reset — {}",
-                                            crate::logs::brief_with(&msg, 90)
-                                        ),
-                                    );
                                     engine.ctx.clear_kv_cache();
                                     engine.buffer.reset();
                                     EngineReply::Err(format!("engine panic: {msg}"))
@@ -613,29 +599,12 @@ impl EngineRuntime {
                 "[DEBUG] [PREFIX] chat render: {} prompt tokens, system prefix {} tokens, budget {} tokens ({}%)",
                 full_tokens.len(), system_prefix_len, max_prompt_len, pct
             );
-            crate::logs::log(
-                "ENG",
-                &format!(
-                    "[PREFIX] prompt_tokens={} system_prefix={} budget={} pct={}",
-                    full_tokens.len(),
-                    system_prefix_len,
-                    max_prompt_len,
-                    pct
-                ),
-            );
             if pct > 70
                 && !PREFIX_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed)
             {
                 eprintln!(
                     "[DEBUG] [PREFIX] WARNING: system prefix {} tokens is >70% of the {}-token prompt budget — one more prompt-path addition locks the copilot out (truncation cannot shrink the prefix). Shrink the prompt, not the budget.",
                     system_prefix_len, max_prompt_len
-                );
-                crate::logs::log(
-                    "ENG",
-                    &format!(
-                        "[PREFIX] WARNING: system prefix {} tokens >70% of the {}-token budget — lockout risk",
-                        system_prefix_len, max_prompt_len
-                    ),
                 );
             }
         }
@@ -707,12 +676,6 @@ impl EngineRuntime {
                     committed,
                     "prompt diverged from cache mid-residency; cold-resetting before prefill"
                 );
-                crate::logs::log(
-                    "ENG",
-                    &format!(
-                        "kv path=DIVERGENT-COLD-RESET common={common} committed={committed}"
-                    ),
-                );
                 self.reset_and_prefill(&full_tokens)?;
                 (0usize, full_tokens.len())
             } else {
@@ -723,13 +686,6 @@ impl EngineRuntime {
                     self.prefill(delta, common as i32)?;
                 }
                 self.buffer.commit_delta(common, delta);
-                crate::logs::log(
-                    "ENG",
-                    &format!(
-                        "kv path=DELTA common={common} new_tokens={}",
-                        delta.len()
-                    ),
-                );
                 (common, delta.len())
             }
         };
@@ -811,19 +767,6 @@ impl EngineRuntime {
             closer_appended = gen_result.closer_appended,
             cache_total = self.buffer.committed_len(),
             "engine telemetry"
-        );
-        crate::logs::log(
-            "ENG",
-            &format!(
-                "chat decode: cached={} prefilled={} prefill_ms={:.0} ttft_ms={:.0} tok_s={:.1} gen_tokens={} cancelled={}",
-                cached_tokens,
-                prefilled_tokens,
-                prefill_ms,
-                ttft_ms,
-                gen_speed,
-                gen_result.tokens_generated,
-                gen_result.cancelled
-            ),
         );
 
         Ok(gen_result.parsed)

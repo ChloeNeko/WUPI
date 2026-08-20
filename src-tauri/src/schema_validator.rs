@@ -414,6 +414,7 @@ mod tests {
             summary: None,
             recent_events: None,
             entities: Some(ents),
+            ..Default::default()
         };
         assert!(validate(&delta, &ctx()).is_ok());
     }
@@ -431,6 +432,7 @@ mod tests {
             summary: None,
             recent_events: None,
             entities: Some(ents),
+            ..Default::default()
         };
         assert!(validate(&delta, &ctx()).is_ok());
     }
@@ -452,6 +454,7 @@ mod tests {
             summary: None,
             recent_events: None,
             entities: Some(ents),
+            ..Default::default()
         };
         let err = validate(&delta, &ctx()).unwrap_err();
         assert!(matches!(err, ValidationFailure::InvalidValue { key, .. } if key == "npc.mira.misc"));
@@ -464,6 +467,7 @@ mod tests {
             summary: None,
             recent_events: None,
             entities: Some(ents),
+            ..Default::default()
         };
         assert!(validate(&delta, &ctx()).is_ok());
     }
@@ -482,6 +486,7 @@ mod tests {
             summary: None,
             recent_events: None,
             entities: Some(ents),
+            ..Default::default()
         };
         assert!(validate(&delta, &ctx()).is_ok());
     }
@@ -499,6 +504,7 @@ mod tests {
             summary: None,
             recent_events: None,
             entities: Some(ents),
+            ..Default::default()
         };
         assert!(validate(&delta, &ctx()).is_ok());
     }
@@ -512,6 +518,7 @@ mod tests {
                 "Found a glowing key.".to_string(),
             ]),
             entities: None,
+            ..Default::default()
         };
         assert!(validate(&delta, &ctx()).is_ok());
     }
@@ -526,6 +533,7 @@ mod tests {
             summary: None,
             recent_events: None,
             entities: Some(ents),
+            ..Default::default()
         };
         let err = validate(&delta, &ctx()).unwrap_err();
         assert_eq!(
@@ -546,6 +554,7 @@ mod tests {
             summary: None,
             recent_events: None,
             entities: Some(ents),
+            ..Default::default()
         };
         assert!(matches!(
             validate(&delta, &ctx()),
@@ -566,6 +575,7 @@ mod tests {
             summary: None,
             recent_events: None,
             entities: Some(ents),
+            ..Default::default()
         };
         assert!(matches!(
             validate(&delta, &ctx()),
@@ -582,6 +592,7 @@ mod tests {
             summary: None,
             recent_events: Some(events),
             entities: None,
+            ..Default::default()
         };
         let err = validate(&delta, &ctx()).unwrap_err();
         assert!(matches!(
@@ -596,6 +607,7 @@ mod tests {
             summary: None,
             recent_events: Some(vec!["   ".to_string()]),
             entities: None,
+            ..Default::default()
         };
         let err = validate(&delta, &ctx()).unwrap_err();
         assert!(matches!(
@@ -614,6 +626,7 @@ mod tests {
             summary: None,
             recent_events: None,
             entities: Some(ents),
+            ..Default::default()
         };
         let err = validate(&delta, &ctx()).unwrap_err();
         assert!(matches!(
@@ -628,6 +641,7 @@ mod tests {
             summary: Some("x".repeat(MAX_SUMMARY_LEN + 1)),
             recent_events: None,
             entities: None,
+            ..Default::default()
         };
         let err = validate(&delta, &ctx()).unwrap_err();
         assert!(matches!(err, ValidationFailure::SummaryTooLong { .. }));
@@ -687,6 +701,7 @@ mod tests {
             summary: None,
             recent_events: None,
             entities: Some(ents),
+            ..Default::default()
         };
         let err = validate(&delta, &ctx_with_immutables(&immutable, &existing)).unwrap_err();
         assert!(matches!(err, ValidationFailure::ImmutableKeyOverwrite { key } if key == "npc.marcus.core"));
@@ -705,6 +720,7 @@ mod tests {
             summary: None,
             recent_events: None,
             entities: Some(ents),
+            ..Default::default()
         };
         assert!(matches!(
             validate(&delta, &ctx_with_immutables(&immutable, &existing)),
@@ -728,6 +744,7 @@ mod tests {
             summary: None,
             recent_events: None,
             entities: Some(ents),
+            ..Default::default()
         };
         assert!(validate(&delta, &ctx_with_immutables(&immutable, &existing)).is_ok());
     }
@@ -750,6 +767,7 @@ mod tests {
             summary: None,
             recent_events: None,
             entities: Some(ents),
+            ..Default::default()
         };
         assert!(validate(&delta, &ctx_with_immutables(&immutable, &existing)).is_ok());
     }
@@ -768,6 +786,7 @@ mod tests {
             summary: None,
             recent_events: None,
             entities: Some(ents),
+            ..Default::default()
         };
         assert!(validate(&delta, &ValidationContext::default()).is_ok());
     }
@@ -789,6 +808,7 @@ mod tests {
             summary: None,
             recent_events: None,
             entities: Some(ents),
+            ..Default::default()
         };
         // Only immutable, no existing.
         let ctx_immutable_only = ValidationContext {

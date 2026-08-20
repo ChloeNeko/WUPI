@@ -614,49 +614,178 @@ export function normalizeCharJson(obj) {
   };
 }
 
-// Normalize a STANDALONE lorebook JSON into the same charData shape so the
-// codex-import path treats character-files + lorebooks uniformly. A standalone
-// lorebook has `entries` (array or object map) but no character fields; we wrap
-// it as { character_book: {entries}, name: 'Imported lorebook' }. Returns null
-// if the object has no entries.
-export function normalizeLorebookJson(obj) {
-  if (!obj || typeof obj !== 'object') return null;
-  const data = (obj.spec && obj.data && typeof obj.data === 'object') ? obj.data : obj;
-  const entries = data.entries || obj.entries;
-  if (!entries) return null;
-  // If it's clearly a character (has name/description), defer to normalizeCharJson.
-  if ((data.name || obj.name) && (data.description || obj.description)) return null;
+// --- SillyTavern lorebook import (2026-08-19 Chloe ruling) ------------------
+//
+// A standalone lorebook JSON is a FIRST-CLASS import: recognized mechanically,
+// converted to codex entries, and refined by the assistant in batches (a real
+// book runs 70-140KB — far past the API payload budget, so a single one-shot
+// turn would have its <import> message silently dropped and the assistant
+// would truthfully report "no lorebook content").
+//
+// Hard rules (Chloe, 2026-08-19):
+//   - entries with NO keywords are SKIPPED at parse time (no retrieval trigger
+//     = dead weight; the assistant never even sees them);
+//   - every surviving entry gets a clean title + AT LEAST 3 tags (the
+//     assistant writes them; padCodexEntryTags is the mechanical floor);
+//   - bodies over 1400 chars are split into parts (Rust Gate 1 rejects an
+//     oversize `ready`; codex::expand_oversize_entries is the write backstop).
+
+// Merge an ST entry's keyword arrays. ST-native books carry `key` (array), V2
+// spec books carry `keys`, many exports carry BOTH — read the union, deduped,
+// trimmed. Secondary keys never count (they are AND-conditions, not triggers).
+function loreEntryKeys(e) {
+  const out = [];
+  const push = (v) => {
+    if (v == null) return;
+    if (Array.isArray(v)) { v.forEach(push); return; }
+    const s = String(v).trim();
+    if (s && !out.includes(s)) out.push(s);
+  };
+  push(e.key);
+  push(e.keys);
+  return out.slice(0, 12);
+}
+
+// Extract the usable entries from a lorebook container (a standalone book's
+// top level, or a card's character_book). `entries` may be an array OR an
+// object keyed by index (both are valid ST shapes — guard on truthiness, not
+// Array.isArray). Returns [{title, keys, content}] — keyless and empty-body
+// entries are already skipped.
+export function extractLorebookEntries(book) {
+  if (!book || typeof book !== 'object' || !book.entries || typeof book.entries !== 'object') return [];
+  const raw = book.entries;
+  const list = Array.isArray(raw) ? raw : Object.values(raw);
+  const out = [];
+  for (const e of list) {
+    if (!e || typeof e !== 'object') continue;
+    const content = (e.content || '').toString();
+    if (!content.trim()) continue;
+    const keys = loreEntryKeys(e);
+    if (!keys.length) continue; // no keywords → skipped (2026-08-19 ruling)
+    out.push({
+      title: (e.comment || e.name || keys[0]).toString().slice(0, 128),
+      keys,
+      content,
+    });
+  }
+  return out;
+}
+
+// Recognize a STANDALONE lorebook JSON: top-level `entries` yielding at least
+// one usable entry, with no real character fields (a `name` alone is fine —
+// Frieren-style exports name the book; any description/greeting/personality
+// makes it a character card carrying its book, which the character path owns).
+// Returns {name, entries} or null.
+export function extractStandaloneLorebook(obj) {
+  if (!obj || typeof obj !== 'object' || Array.isArray(obj)) return null;
+  if (!obj.entries || typeof obj.entries !== 'object') return null;
+  const charFields = [obj.description, obj.first_mes, obj.personality, obj.scenario, obj.mes_example];
+  if (charFields.some((v) => typeof v === 'string' && v.trim())) return null;
+  const entries = extractLorebookEntries(obj);
+  if (!entries.length) return null;
   return {
-    spec: 'lorebook',
-    name: obj.name || data.name || 'Imported lorebook',
-    description: '',
-    personality: '',
-    scenario: '',
-    first_mes: '',
-    mes_example: '',
-    creator_notes: '',
-    character_book: { entries },
+    name: (typeof obj.name === 'string' && obj.name.trim() ? obj.name : 'Imported lorebook').slice(0, 80),
+    entries,
   };
 }
 
-// Convert a character_book (SillyTavern lorebook) into the codex_entries shape
-// { title, tags, body }. `entries` may be an array OR an object keyed by index.
-export function lorebookToCodexEntries(book) {
-  // `entries` may be an array OR an object keyed by index (both are valid ST
-  // lorebook shapes). Guard on truthiness, not Array.isArray — the latter
-  // silently rejected every object-map lorebook (a latent bug the unit test
-  // caught).
-  if (!book || !book.entries) return [];
-  const raw = book.entries;
-  const list = Array.isArray(raw) ? raw : Object.values(raw);
-  return list
-    .filter((e) => e && (e.content || e.comment))
-    .map((e, i) => ({
-      title: (e.comment || e.name || `Entry ${i + 1}`).toString().slice(0, 128),
-      tags: Array.isArray(e.key)
-        ? e.key.slice(0, 8).map((k) => String(k).slice(0, 64))
-        : (e.key ? [String(e.key).slice(0, 64)] : []),
-      body: (e.content || '').toString(),
-    }))
-    .filter((e) => e.body.trim());
+// Does a normalized charData carry ANY content-bearing field? normalizeCharJson
+// accepts every object, so an arbitrary JSON file (settings dumps, arrays of
+// strings, …) produced an all-empty character card — the import "succeeded"
+// and the wizards were fed a husk. This is the recognition gate at the import
+// boundary: no content → unrecognized → bottom warning, never a wizard.
+export function charDataHasContent(c) {
+  if (!c || typeof c !== 'object') return false;
+  return !!(
+    toText(c.name) || toText(c.description) || toText(c.personality) || toText(c.scenario)
+    || toText(c.first_mes) || toText(c.mes_example) || toText(c.creator_notes)
+    || toText(c.system_prompt) || toText(c.post_history_instructions)
+    || (Array.isArray(c.tags) && c.tags.length)
+    || (Array.isArray(c.alternate_greetings) && c.alternate_greetings.length)
+    || c.character_book
+  );
+}
+
+// Chunk extracted entries into conversion batches by cumulative char size so
+// each assistant turn (input + reply JSON) stays well inside the API payload
+// budget. Whole entries only — a batch boundary never splits an entry, and a
+// single oversized entry rides alone (its SIZE is the model's split problem,
+// answered by Rust's 1400-char ready gate).
+export const LORE_BATCH_CHAR_BUDGET = 8000;
+export function batchLorebookEntries(entries, budget = LORE_BATCH_CHAR_BUDGET) {
+  const list = Array.isArray(entries) ? entries : [];
+  const batches = [];
+  let cur = [];
+  let curChars = 0;
+  for (const e of list) {
+    const size = e.content.length + e.title.length + e.keys.join(',').length + 48;
+    if (cur.length && curChars + size > budget) {
+      batches.push(cur);
+      cur = [];
+      curChars = 0;
+    }
+    cur.push(e);
+    curChars += size;
+  }
+  if (cur.length) batches.push(cur);
+  return batches;
+}
+
+// Mechanical tag floor (≥3 per entry, lowercase, deduped, capped at 8): the
+// assistant's tags first, then the SOURCE entry's ST keywords (the authored
+// retrieval triggers — the most semantically honest fallback), then the AI
+// title's words, then the book name. Only a total drought hits the generic
+// 'lore'/'world' floor.
+export function padCodexEntryTags(tags, sourceKeys, title, bookName) {
+  const out = [];
+  const push = (v) => {
+    const s = String(v == null ? '' : v).trim().toLowerCase();
+    if (s && !out.includes(s)) out.push(s);
+  };
+  (Array.isArray(tags) ? tags : (tags != null ? [tags] : [])).forEach(push);
+  (Array.isArray(sourceKeys) ? sourceKeys : (sourceKeys != null ? [sourceKeys] : [])).forEach(push);
+  String(title || '')
+    .toLowerCase()
+    .split(/[^\p{L}\p{N}]+/u)
+    .filter((w) => w.length >= 3 && w !== 'part')
+    .forEach(push);
+  push(bookName);
+  if (out.length < 3) { push('lore'); push('world'); push('imported'); }
+  return out.slice(0, 8);
+}
+
+// Match a returned entry back to its source: normalized title equality first
+// (strips "— Part N" so split parts find their origin), index clamp second
+// (the assistant keeps input order, so a same-index guess is at worst adjacent).
+function normalizeTitleForMatch(s) {
+  return String(s || '')
+    .toLowerCase()
+    .replace(/[—–-]\s*part\s*\d+\s*$/i, '')
+    .replace(/[^\p{L}\p{N}]+/gu, ' ')
+    .trim();
+}
+
+// Normalize one batch's assistant entries into the final codex shape: drop
+// body-less husks, fall missing titles back to the source title, and run every
+// entry through the tag floor. `batchSources` is the batch's extracted
+// [{title, keys, content}] in emission order.
+export function normalizeLoreImportEntries(aiEntries, batchSources, bookName) {
+  if (!Array.isArray(aiEntries)) return [];
+  const sources = Array.isArray(batchSources) ? batchSources : [];
+  return aiEntries
+    .map((e, i) => {
+      const src = e && typeof e === 'object' ? e : {};
+      const body = typeof src.body === 'string' ? src.body.trim() : '';
+      if (!body) return null;
+      const nt = normalizeTitleForMatch(src.title);
+      let source = nt ? sources.find((s) => normalizeTitleForMatch(s.title) === nt) : null;
+      if (!source) source = sources[Math.min(i, sources.length - 1)];
+      const title = toText(src.title) || (source ? source.title : '') || 'Imported entry';
+      return {
+        title,
+        tags: padCodexEntryTags(src.tags, source ? source.keys : [], title, bookName),
+        body,
+      };
+    })
+    .filter(Boolean);
 }

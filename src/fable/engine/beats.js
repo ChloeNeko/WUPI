@@ -53,12 +53,191 @@ export function setIdentity(next = {}) {
 
 // Bind the feed container. Called from stage.js wireStage with the
 // [data-feed] element. Stores the ref so every builder below can
-// append to it without re-querying.
+// append to it without re-querying. The stage DOM (and thus the feed
+// element) is REUSED across entries, so the scroll listener is swapped,
+// never stacked: a raw addEventListener here would double-bind every
+// re-entry (the stage.js stageListeners discipline, applied at the
+// module boundary).
+let boundScroll = null;
 export function initBeats(el) {
+  if (feedEl && boundScroll) feedEl.removeEventListener('scroll', boundScroll);
   feedEl = el;
+  windowStart = 0;
+  boundScroll = onFeedScroll;
+  if (feedEl) feedEl.addEventListener('scroll', boundScroll, { passive: true });
+}
+
+// ── Paged history window (2026-08-19, Chloe) ────────────────────
+// The DOM renders only the TRAILING window of the session (48 history
+// beats + the 2 recent = 50). Scrolling to the top edge prepends the
+// next 50-message page (a small white spinner pinned at the top center
+// while it builds) with the scroll position anchored on the
+// previously-first beat, so a quadruple-digit campaign never pays a
+// full-transcript DOM build on load. (Do NOT reach for
+// content-visibility:auto on the beats as a deep-DOM scroll guard — its
+// paint containment clips the hover toolrail + histools, which spawn
+// outside the beat box; see the ban note in fable.css.)
+//
+// The rendered range is CONTIGUOUS [windowStart, sessionLen): the tail is
+// never virtualized away (live streaming appends to it, and scrollDown's
+// bottom pinning depends on it). LOAD-BEARING INVARIANT:
+//   windowStart + (role beats in the DOM) === session message count
+// It holds across every path: rebuild (resets both sides), a live append
+// (both +1), a reverted turn's DOM pop (both −1), and a page prepend
+// (windowStart −50, DOM +50). appendMes's auto-index stamp + the delete
+// cascade's doomed-count both derive from it — the old bare DOM-count
+// stamp under-counts by windowStart the moment older pages are excluded.
+const FEED_WINDOW = 50;        // 48 history + the 2 recent (per Chloe)
+const FEED_PAGE = 50;          // messages per upward page load
+const FEED_LOAD_EDGE_PX = 80;  // scrolled this close to the top → load a page
+let windowStart = 0;           // session index of the first rendered role beat
+let pageLoading = false;
+let pagebarEl = null;
+// Full message array from the last rebuild. Only ever READ at indexes
+// BELOW windowStart (pages prepend older messages; the array's tail can
+// be stale behind live appends/reverts, which is exactly the region we
+// never touch — every tail mutation rebuilds through rebuildFromMessages
+// and hands us a fresh array).
+let sessionMsgs = null;
+// Bumped by clearFeed + every rebuild — lets in-flight async work
+// (entrance tweens, page loads) detect that the DOM under them was
+// replaced and self-cancel.
+let scrollGen = 0;
+
+function roleBeatsInDom() {
+  if (!feedEl) return [];
+  return feedEl.querySelectorAll(
+    '.fable-mes[data-role="user"],.fable-mes[data-role="assistant"]');
+}
+
+// The session message count (the delete-cascade warning's doomed-run math
+// feeds off this). Derived from the invariant above — pure DOM, no IPC.
+export function sessionMessageCount() {
+  if (!feedEl) return 0;
+  return windowStart + roleBeatsInDom().length;
+}
+
+function onFeedScroll() {
+  if (!feedEl || pageLoading) return;
+  if (windowStart > 0 && feedEl.scrollTop <= FEED_LOAD_EDGE_PX) {
+    loadOlderPage();
+  }
+}
+
+// The sticky zero-height spinner bar pinned at the feed's top center. Lives
+// as the feed's first real child (before every beat) so prepended pages
+// land between it and the former first beat; height 0 + pointer-events:none
+// means it never shifts content or eats a click — visible only while a
+// page build is in flight (`.is-loading` fades the circle in).
+function ensurePagebar() {
+  if (!feedEl || pagebarEl) return;
+  const bar = document.createElement('div');
+  bar.className = 'fable-feed-pagebar';
+  bar.setAttribute('aria-hidden', 'true');
+  bar.innerHTML = '<div class="fable-feed-pagebar-spin"></div>';
+  feedEl.insertBefore(bar, feedEl.firstChild);
+  pagebarEl = bar;
+}
+
+function loadOlderPage() {
+  if (!feedEl || pageLoading || windowStart <= 0 || !sessionMsgs) return;
+  pageLoading = true;
+  const gen = scrollGen;
+  ensurePagebar();
+  if (pagebarEl) pagebarEl.classList.add('is-loading');
+  // Two rAFs guarantee a PRESENTED frame with the spinner visible before
+  // the synchronous 50-beat build (layout-heavy) runs.
+  requestAnimationFrame(() => requestAnimationFrame(() => {
+    if (gen !== scrollGen || !feedEl) {
+      // A rebuild/clear superseded this load — its anchor target is gone.
+      pageLoading = false;
+      if (pagebarEl) pagebarEl.classList.remove('is-loading');
+      return;
+    }
+    const firstRole = feedEl.querySelector(
+      '.fable-mes[data-role="user"],.fable-mes[data-role="assistant"]');
+    const anchorTop = firstRole ? firstRole.offsetTop : 0;
+    const newStart = Math.max(0, windowStart - FEED_PAGE);
+    const frag = document.createDocumentFragment();
+    const fresh = [];
+    for (let i = newStart; i < windowStart; i++) {
+      const node = buildBeatFromMessage(sessionMsgs[i], i);
+      frag.appendChild(node);
+      fresh.push(node);
+    }
+    feedEl.insertBefore(frag, firstRole || null);
+    windowStart = newStart;
+    // Anchor: hold the previously-first beat at the same viewport
+    // position (the feed runs overflow-anchor:none — scrollTop is ours
+    // to fix up). Same-element offsetTop delta == exact content growth.
+    if (firstRole) feedEl.scrollTop += firstRole.offsetTop - anchorTop;
+    // Drawer states were stamped while the page nodes were detached —
+    // re-sync the fresh assistant beats (the trailing pair is untouched
+    // by a prepend, so a full-feed pass is waste).
+    fresh.forEach((node) => {
+      if (node.classList.contains('assistant')) refreshDrawer(node);
+    });
+    if (pagebarEl) pagebarEl.classList.remove('is-loading');
+    pageLoading = false;
+    // A fast flick can cross a whole page — keep feeding pages until the
+    // reader is off the load edge (or the transcript start is reached).
+    if (windowStart > 0 && feedEl.scrollTop <= FEED_LOAD_EDGE_PX) {
+      loadOlderPage();
+    }
+  }));
+}
+
+// ── Entrance + push-up scroll tween (2026-08-19, Chloe) ─────────
+// A newly appended beat rises out from behind the input row (CSS entrance
+// keyframes on the card) while the feed eases up to the new bottom over
+// ~1s — the "long smooth train": scrollTop moves every rendered beat in
+// lockstep, so nothing teleports to its final position. The tween chases
+// a LIVE target (recomputed each frame) so streaming growth during the
+// tween is followed, not fought. Any user scroll intent cancels it
+// instantly — the reader always wins.
+const ENTRANCE_MS = 1000;
+let entrance = null;
+
+function cancelEntrance() {
+  if (!entrance) return;
+  if (feedEl) {
+    feedEl.removeEventListener('wheel', entrance.stop);
+    feedEl.removeEventListener('touchstart', entrance.stop);
+  }
+  entrance = null;
+}
+
+function runEntranceScroll() {
+  if (!feedEl) return;
+  // Short transcripts (no overflow) have nowhere to scroll — the CSS
+  // entrance keyframes on the beat itself carry the whole effect.
+  if (feedEl.scrollHeight <= feedEl.clientHeight + 4) return;
+  cancelEntrance();
+  const stop = cancelEntrance;
+  feedEl.addEventListener('wheel', stop, { passive: true });
+  feedEl.addEventListener('touchstart', stop, { passive: true });
+  // A second beat arriving mid-tween continues from the CURRENT scroll
+  // position (captured fresh here) — no restart hop back to an old origin.
+  const ent = { gen: scrollGen, from: feedEl.scrollTop, start: performance.now(), stop };
+  entrance = ent;
+  const ease = (t) => 1 - Math.pow(1 - t, 3);
+  const frame = () => {
+    // Identity check: a newer entrance (or a cancel) replaced this tween —
+    // its own frame chain owns the scroll from here.
+    if (entrance !== ent || !feedEl) return;
+    if (ent.gen !== scrollGen) { cancelEntrance(); return; }
+    const t = Math.min(1, (performance.now() - ent.start) / ENTRANCE_MS);
+    const target = feedEl.scrollHeight - feedEl.clientHeight;
+    feedEl.scrollTop = ent.from + (target - ent.from) * ease(t);
+    if (t < 1) requestAnimationFrame(frame);
+    else cancelEntrance();
+  };
+  requestAnimationFrame(frame);
 }
 
 export function clearFeed() {
+  scrollGen++;
+  cancelEntrance();
   if (feedEl) feedEl.innerHTML = '';
   // (2026-08-16 audit fix #26) Drop the open-editor bookkeeping with the
   // wiped nodes: `editingBeat` holds a strong ref that survived the wipe, so
@@ -66,16 +245,25 @@ export function clearFeed() {
   // edit_message at the NEW session. The editor's listeners die with the
   // node (editClosers is a WeakMap) — only this ref needed clearing.
   editingBeat = null;
+  windowStart = 0;
+  pagebarEl = null;   // died with innerHTML wipe (if it existed)
+  pageLoading = false;
+  sessionMsgs = null;
 }
 
 // Auto-scroll the feed to its bottom. Throttled per-call via rAF so a
 // burst of appendChunk calls during streaming doesn't thrash layout.
+// Suppressed while an entrance tween owns scrollTop (the tween ends at
+// the same target — a per-chunk jump mid-tween would stutter the train).
 let scrollPending = false;
 export function scrollDown() {
-  if (!feedEl || scrollPending) return;
+  if (!feedEl || scrollPending || entrance) return;
   scrollPending = true;
   requestAnimationFrame(() => {
     scrollPending = false;
+    // An entrance may have started between the call and this frame — the
+    // tween owns scrollTop until it settles (both end at the same bottom).
+    if (entrance) return;
     feedEl.scrollTop = feedEl.scrollHeight;
   });
 }
@@ -476,20 +664,19 @@ export { swipeNextAction, computeDrawerState, canEditMessage };
 
 function appendMes(root) {
   if (!feedEl) return null;
-  // Auto-stamp the backend message index (P1 fix): the feed is 1:1 with the
-  // session's message list — role-bearing beats (user/assistant) map exactly
-  // to backend indexes. rebuildFromMessages stamps explicitly; the LIVE
-  // builders never did, so beats appended since the last rebuild (the two
-  // newest — exactly the .vn-recent toolrail targets) carried no index and
-  // edit/delete/swipe IPC-failed on -1. Rerolls REUSE the last assistant
-  // beat (beginReroll), so every role-bearing append is one new tail
-  // message — the pre-append count IS its index.
+  // Auto-stamp the backend message index (P1 fix): role-bearing beats
+  // (user/assistant) map exactly to backend indexes. rebuildFromMessages +
+  // the page loader stamp explicitly; the LIVE builders never did, so beats
+  // appended since the last rebuild (the two newest — exactly the .vn-recent
+  // toolrail targets) carried no index and edit/delete/swipe IPC-failed on
+  // -1. (2026-08-19 paging) The stamp is now WINDOW-AWARE: the DOM renders
+  // only [windowStart, sessionLen), so a bare DOM count under-counts by
+  // windowStart the moment older messages are paged out — the invariant
+  // windowStart + DOM-count === sessionLen makes this exact.
   if (root.dataset.index === undefined) {
     const role = root.dataset.role;
     if (role === 'user' || role === 'assistant') {
-      root.dataset.index = String(
-        feedEl.querySelectorAll('.fable-mes[data-role="user"],.fable-mes[data-role="assistant"]').length
-      );
+      root.dataset.index = String(windowStart + roleBeatsInDom().length);
     }
   }
   feedEl.appendChild(root);
@@ -505,7 +692,10 @@ function appendMes(root) {
     const asst = feedEl.querySelectorAll('.fable-mes.assistant');
     if (asst.length >= 2) refreshDrawer(asst[asst.length - 2]);
   }
-  scrollDown();
+  // (2026-08-19) Entrance: the beat's own rise-from-the-input-row keyframes
+  // (fable.css) + the 1s scrollTop tween that pushes the whole train up
+  // smoothly — replaces the old instant scrollDown snap.
+  runEntranceScroll();
   return root;
 }
 
@@ -747,40 +937,62 @@ export function cancelSliceRegen(beat) {
 
 // ── Feed lifecycle ───────────────────────────────────────────────
 
+// Build one beat node from a backend message shape (role/content/
+// variants/active_idx/timestamp). Shared by the rebuild window + the
+// upward page loader so both paths render byte-identical cards.
+function buildBeatFromMessage(m, i) {
+  const role = m.role === 'user' ? 'user' : 'assistant';
+  const name = role === 'user'
+    ? (identity.playerName || 'You')
+    : (identity.cardName || 'Narrator');
+  const portrait = role === 'user'
+    ? (identity.playerPortrait || '')
+    : (identity.cardPortrait || '');
+  const root = buildMes({ role, name, portraitUrl: portrait, index: i, timestamp: m.timestamp });
+  const body = bodyEl(root);
+  if (body) body.innerHTML = renderMarkdown(m.content || '');
+  root.dataset.raw = m.content || '';
+  // Variant stamp via stampVariants so the hover toolrail refreshes too.
+  // Only assistant turns carry variants; user turns are always 1/1.
+  if (role === 'assistant') {
+    stampVariants(root, Array.isArray(m.variants) ? m.variants : [], m.active_idx || 0);
+  } else {
+    stampVariants(root, [], 0);
+  }
+  return root;
+}
+
 // Wipe + rebuild the feed from a message list (the backend's source of
-// truth on load/resume/edit/rewind). Each message → one card; assistant
-// messages with variants get the swipe bar stamped.
+// truth on load/resume/edit/rewind/delete). Each message → one card;
+// assistant messages with variants get the swipe bar stamped.
+// (2026-08-19 paging) Only the TRAILING FEED_WINDOW messages render
+// (48 history + the 2 recent) — older pages prepend on demand as the
+// player scrolls up (see loadOlderPage). Mutations always land here
+// fresh from a backend response, so the window resets to the tail +
+// snaps to the bottom, exactly as before.
 export function rebuildFromMessages(messages) {
   if (!feedEl) return;
+  scrollGen++;
+  cancelEntrance();
+  pageLoading = false;   // a rebuild supersedes any in-flight page load
   feedEl.innerHTML = '';
+  pagebarEl = null;
   // The rebuilt beats are fresh nodes — any open editor lived on a node we
   // just destroyed. Drop the single-editor ref (defensive: the entry paths
   // commit before mutating actions, so an editor should never be open
   // across a rebuild; a stale commit against shifted indexes would be
   // worse than dropping it).
   editingBeat = null;
-  if (!Array.isArray(messages)) return;
-  messages.forEach((m, i) => {
-    const role = m.role === 'user' ? 'user' : 'assistant';
-    const name = role === 'user'
-      ? (identity.playerName || 'You')
-      : (identity.cardName || 'Narrator');
-    const portrait = role === 'user'
-      ? (identity.playerPortrait || '')
-      : (identity.cardPortrait || '');
-    const root = buildMes({ role, name, portraitUrl: portrait, index: i, timestamp: m.timestamp });
-    feedEl.appendChild(root);
-    const body = bodyEl(root);
-    if (body) body.innerHTML = renderMarkdown(m.content || '');
-    root.dataset.raw = m.content || '';
-    // Variant stamp via stampVariants so the hover toolrail refreshes too.
-    // Only assistant turns carry variants; user turns are always 1/1.
-    if (role === 'assistant') {
-      stampVariants(root, Array.isArray(m.variants) ? m.variants : [], m.active_idx || 0);
-    } else {
-      stampVariants(root, [], 0);
-    }
-  });
+  if (!Array.isArray(messages)) {
+    windowStart = 0;
+    sessionMsgs = null;
+    return;
+  }
+  sessionMsgs = messages;
+  windowStart = Math.max(0, messages.length - FEED_WINDOW);
+  for (let i = windowStart; i < messages.length; i++) {
+    feedEl.appendChild(buildBeatFromMessage(messages[i], i));
+  }
   // (#84) Final drawer sync pass: the loop stamps each beat while the LATER
   // beats aren't appended yet, so every transiently-last assistant kept an
   // enabled › (› folds into reroll ONLY on the true trailing beat). One

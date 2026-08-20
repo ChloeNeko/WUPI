@@ -35,6 +35,7 @@ pub mod prism;
 pub mod prompts;
 pub mod session;
 pub mod sim_card;
+pub mod site_map;
 pub mod shortcut;
 pub mod stream_filter;
 pub mod system_menu;
@@ -574,20 +575,19 @@ pub fn run() {
         let msg = format!("{info}\nbacktrace: {}", std::backtrace::Backtrace::force_capture());
         let _ = std::fs::write(std::env::temp_dir().join("wupi_panic.txt"), &msg);
         // Crash report: logs/crash-YYYYMMDD-HHMMSS.log = panic + the last
-        // 100 diagnostic lines from the RAM ring buffer (logs.rs) — an
+        // 100 verbose log lines from the RAM ring buffer (logs.rs) — an
         // abnormal crash is readable without opening the full session log.
         logs::dump_crash(&info.to_string());
     }));
 
-    // Share-safe rotating diagnostic log (logs/diagnostics.log) — the file
-    // users attach to bug reports. Arm it BEFORE anything else so boot-time
-    // events and the panic hook above land in it. Same install root as
-    // memory/ and apps/ (exe parent). See logs.rs for the privacy contract.
-    if let Some(root) = std::env::current_exe()
+    // Crash-report ring + log retention (logs.rs). Arm it BEFORE anything
+    // else so the panic hook above has a ring to dump. Same install root
+    // as memory/ and apps/ (exe parent).
+    let install_root = std::env::current_exe()
         .ok()
-        .and_then(|exe| exe.parent().map(|p| p.to_path_buf()))
-    {
-        logs::init(&root);
+        .and_then(|exe| exe.parent().map(|p| p.to_path_buf()));
+    if let Some(root) = &install_root {
+        logs::init(root);
     }
 
     // §11.59 SD abort capture. Installed as early as possible (before any
@@ -609,15 +609,23 @@ pub fn run() {
 
     let log_dir = std::env::temp_dir();
     let file_appender = tracing_appender::rolling::never(&log_dir, "wupi.log");
-    let (non_blocking, _guard) = tracing_appender::non_blocking(file_appender);
-    std::mem::forget(_guard);
+    let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
+    logs::hold_guard(guard);
+    // Full-detail mirror (2026-08-19 Chloe ruling, temporary): every
+    // formatted line is teed live into logs/wupi-YYYYMMDD-HHMMSS.log —
+    // %TEMP%\wupi.log keeps flowing unchanged. The tee, not an exit-time
+    // copy, is the guarantee: a task-kill runs no code on the way out, so
+    // the mirror must already be on disk for the whole session. Graceful
+    // exits top it up via logs::shutdown_flush (post-event-loop here, plus
+    // before the updater's hard process::exit). See logs.rs (MirrorWriter).
+    let wupi_mirror = install_root.as_deref().and_then(logs::open_wupi_mirror);
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("debug")),
         )
         .with_target(false)
-        .with_writer(non_blocking)
+        .with_writer(move || logs::MirrorWriter::new(non_blocking.clone(), wupi_mirror.clone()))
         .init();
 
     tracing::info!("=== WUPI starting ===");
@@ -1314,6 +1322,11 @@ pub fn run() {
             }
         });
     tracing::info!("=== WUPI event loop exited ===");
+    // Graceful-exit flush: drop the writer guards so the non-blocking
+    // workers flush + join before the process ends (tops up the tail of
+    // both %TEMP%\wupi.log and the logs/wupi-*.log mirror). Hard kills
+    // never get here — the live tee already has everything on disk.
+    logs::shutdown_flush();
 }
 
 #[tauri::command]
@@ -2853,10 +2866,6 @@ async fn route_to_fable_manager(
     };
 
     let delta_applied = delta.has_changes();
-    crate::logs::log(
-        "SCHEMA",
-        &format!("manager translation applied={}", delta_applied),
-    );
     if delta_applied {
         push_fable_history(&state).await;
         let mut s = state.fable_schema.lock().await;
@@ -3206,14 +3215,6 @@ fn strip_invalid_relationship_writes(
                 {
                     ents.remove(key);
                     stripped.push(format!("{key} (relationships map at cap — new NPC not tracked)"));
-                    crate::logs::log(
-                        "SCHEMA",
-                        &format!(
-                            "[rel] {} NOT tracked — relationships at cap {}",
-                            crate::logs::brief_with(npc_id, 40),
-                            crate::schema::MAX_TRACKED_RELATIONSHIPS
-                        ),
-                    );
                     continue;
                 }
                 accepted_upserts.push((npc_id.to_string(), new_tier));
@@ -3225,13 +3226,6 @@ fn strip_invalid_relationship_writes(
                     npc_id = %npc_id,
                     new_tier = ?new_tier,
                     "[rel] LLM Stranger→Acquaintance auto-advance accepted"
-                );
-                crate::logs::log(
-                    "SCHEMA",
-                    &format!(
-                        "[rel] LLM Stranger→Acquaintance accepted {}",
-                        crate::logs::brief_with(npc_id, 40)
-                    ),
                 );
             }
             relationship::RelationshipValidation::Reject { actual_tier } => {
@@ -3798,16 +3792,6 @@ async fn chat_send(
             // One turn id for BOTH rows (user + assistant, all their chunks):
             // the §4 retention key the prune evicts whole turns by.
             let turn_uuid = memory::new_turn_uuid();
-            crate::logs::log(
-                "MEM",
-                &format!(
-                    "chat archive armed turn={} user_chars={} asst_chars={} echo_skip={}",
-                    turn_uuid,
-                    user_text.as_ref().map(|t| t.chars().count()).unwrap_or(0),
-                    asst_text.chars().count(),
-                    codex_was_injected
-                ),
-            );
             tokio::spawn(async move {
                 if let Some(text) = user_text {
                     if let Err(e) = engine.add_memory(text, &card_id, memory::Role::User, 1.0, Some(&turn_uuid)).await {
@@ -3816,7 +3800,6 @@ async fn chat_send(
                 }
                 if codex_was_injected {
                     tracing::debug!("codex echo-skip: assistant reply not archived (codex reference was injected this turn)");
-                    crate::logs::log("MEM", "codex echo-skip — assistant reply NOT archived");
                 } else if let Err(e) = engine.add_memory(asst_text, &card_id, memory::Role::Assistant, 1.0, Some(&turn_uuid)).await {
                     tracing::warn!(error = %format!("{e:#}"), "archive assistant turn failed");
                 }
@@ -3876,16 +3859,7 @@ async fn chat_send(
             user_words = user_text_for_gate.split_whitespace().count(),
             "schema delta skipped by content gate (non-substantive turn)"
         );
-        crate::logs::log(
-            "SCHEMA",
-            &format!(
-                "delta gate SKIP user_words={} user_chars={}",
-                user_text_for_gate.split_whitespace().count(),
-                user_text_for_gate.chars().count()
-            ),
-        );
     } else {
-        crate::logs::log("SCHEMA", "delta gate FIRE");
         let current_schema = state.schema.lock().await.clone();
         // Drain the failed-delta queue (fail-proof contract §5 layer 3):
         // prior turns' attempts that exhausted all 3 passes WITHOUT
@@ -3901,10 +3875,6 @@ async fn chat_send(
             tracing::info!(
                 deferred = deferred.len(),
                 "delta attempt includes deferred re-attempts"
-            );
-            crate::logs::log(
-                "SCHEMA",
-                &format!("failed_delta_queue drained count={}", deferred.len()),
             );
         }
         let schema_slot = state.schema.clone();
@@ -3934,13 +3904,6 @@ async fn chat_send(
                 Ok(t) => t,
                 Err(e) => {
                     tracing::warn!(error = %e, "schema delta: could not acquire schema engine; schema unchanged");
-                    crate::logs::log(
-                        "SCHEMA",
-                        &format!(
-                            "delta infra fail: engine acquire err={}",
-                            crate::logs::brief_with(&e, 90)
-                        ),
-                    );
                     reenqueue_failed_attempts(&failed_queue_slot, deferred, "failed_delta_queue").await;
                     return;
                 }
@@ -4503,16 +4466,6 @@ async fn run_agent_loop(
                     None => (false, format!("unknown tool: {}", call.name)),
                 },
             };
-            crate::logs::log(
-                "TOOL",
-                &format!(
-                    "dispatch {} ok={} args={} result={}",
-                    call.name,
-                    outcome.0,
-                    crate::logs::brief_with(&call.args.to_string(), 60),
-                    crate::logs::brief_with(&outcome.1, 60)
-                ),
-            );
 
             // delete_sim_card removed the card FOLDER; its memory partition
             // lives in memory.sqlite outside that tree. Same contract as
@@ -4654,7 +4607,6 @@ fn push_failed_attempt_capped(
             queue_len = q.len(),
             "failed_delta_queue overflow; evicted oldest entry"
         );
-        crate::logs::log("SCHEMA", "failed queue OVERFLOW — evicted oldest entry");
     }
     q.push(attempt);
 }
@@ -4678,13 +4630,6 @@ fn bump_retry_budget(
         tracing::warn!(
             passes = attempt.passes_used,
             "failed schema attempt exhausted its retry budget; dropping (systematic failure — see the errors above)"
-        );
-        crate::logs::log(
-            "SCHEMA",
-            &format!(
-                "circuit breaker DROPPED a failed attempt (budget spent) errors={}",
-                crate::logs::brief_with(&attempt.errors, 140)
-            ),
         );
         return None;
     }
@@ -4717,10 +4662,6 @@ async fn reenqueue_failed_attempts(    queue: &Arc<tokio::sync::Mutex<Vec<schema
         queue = label,
         count,
         "infra failure before the deferred re-attempts ran — restored to the queue"
-    );
-    crate::logs::log(
-        "SCHEMA",
-        &format!("infra fail — restored {count} deferred attempt(s) to {label}"),
     );
 }
 
@@ -5011,6 +4952,26 @@ async fn apply_phase3_bracket_commands(
         .iter()
         .filter(|c| matches!(c, bracket_parser::BracketCommand::Intent { .. }))
         .collect();
+    // (2026-08-19 Hidden site maps + Referee QoL) The site verbs mutate the
+    // CURRENT node's `site_maps` entry (knowledge/state/count/add — the
+    // hidden-truth reveal channel is bracket-only, never the schema delta),
+    // and the promise verb writes the giver-keyed obligations list. All run
+    // after TRAVEL (arrival first, then the interior).
+    let room_cmds: Vec<&bracket_parser::BracketCommand> = parsed
+        .commands
+        .iter()
+        .filter(|c| matches!(c, bracket_parser::BracketCommand::Room { .. }))
+        .collect();
+    let asset_cmds: Vec<&bracket_parser::BracketCommand> = parsed
+        .commands
+        .iter()
+        .filter(|c| matches!(c, bracket_parser::BracketCommand::SiteAsset { .. }))
+        .collect();
+    let promise_cmds: Vec<&bracket_parser::BracketCommand> = parsed
+        .commands
+        .iter()
+        .filter(|c| matches!(c, bracket_parser::BracketCommand::Promise { .. }))
+        .collect();
 
     if effects.is_empty()
         && milestones.is_empty()
@@ -5037,6 +4998,11 @@ async fn apply_phase3_bracket_commands(
         && npc_item_cmds.is_empty()
         && mood_cmds.is_empty()
         && intent_cmds.is_empty()
+        // (2026-08-19) Same discipline: a [ROOM]-only / [ASSET]-only /
+        // [PROMISE]-only turn must reach the appliers below.
+        && room_cmds.is_empty()
+        && asset_cmds.is_empty()
+        && promise_cmds.is_empty()
     {
         // Phase 5A: even with no bracket commands this turn, presence grace-
         // decay must run if there are existing presences (a turn with zero
@@ -5150,14 +5116,6 @@ async fn apply_phase3_bracket_commands(
                         cap = crate::schema::MAX_TRACKED_RELATIONSHIPS,
                         "[MILESTONE] relationships map at cap — not tracking a new NPC"
                     );
-                    crate::logs::log(
-                        "BRK",
-                        &format!(
-                            "[MILESTONE] {} NOT tracked — relationships at cap {} (mid-band truncation guard)",
-                            crate::logs::brief_with(npc_id, 40),
-                            crate::schema::MAX_TRACKED_RELATIONSHIPS
-                        ),
-                    );
                     continue;
                 }
                 // (2026-08-15 audit fix) Snapshot ONLY on a real change: a
@@ -5174,13 +5132,6 @@ async fn apply_phase3_bracket_commands(
                         npc_id = %npc_id,
                         event_id = %event_id,
                         "[MILESTONE] relationship event recorded"
-                    );
-                    crate::logs::log(
-                        "BRK",
-                        &format!(
-                            "[MILESTONE] {} +{event_id}",
-                            crate::logs::brief_with(npc_id, 40)
-                        ),
                     );
                 } else {
                     tracing::info!(
@@ -5288,7 +5239,6 @@ async fn apply_phase3_bracket_commands(
             }
         });
         if let Some(condition) = last_weather {
-            let prev_condition = s.weather.condition.clone();
             if undo_snapshot.is_none() {
                 undo_snapshot = Some(s.clone());
             }
@@ -5298,14 +5248,6 @@ async fn apply_phase3_bracket_commands(
             };
             mutated = true;
             tracing::info!(condition = %condition, "[WEATHER] weather condition set");
-            crate::logs::log(
-                "BRK",
-                &format!(
-                    "[WEATHER] set -> {} (was \"{}\")",
-                    crate::logs::brief_with(&condition, 40),
-                    prev_condition
-                ),
-            );
         }
 
         // [DATE] — rewrite the free-form calendar label (2026-08-13). The
@@ -5340,16 +5282,7 @@ async fn apply_phase3_bracket_commands(
                     rejected = %value,
                     "[DATE] rejected a deletion-only rewrite (tracker echo-loss); keeping the current label"
                 );
-                crate::logs::log(
-                    "BRK",
-                    &format!(
-                        "[DATE] REJECTED deletion-only rewrite -> {} (kept {:?})",
-                        crate::logs::brief_with(value, 40),
-                        s.calendar
-                    ),
-                );
             } else {
-                let prev_label = s.calendar.clone();
                 if undo_snapshot.is_none() {
                     undo_snapshot = Some(s.clone());
                 }
@@ -5360,14 +5293,6 @@ async fn apply_phase3_bracket_commands(
                 s.calendar_synced_minutes = Some(s.world_clock.current_minutes);
                 mutated = true;
                 tracing::info!(calendar = %value, "[DATE] calendar label set");
-                crate::logs::log(
-                    "BRK",
-                    &format!(
-                        "[DATE] label -> {} (was {:?})",
-                        crate::logs::brief_with(value, 40),
-                        prev_label
-                    ),
-                );
             }
         }
 
@@ -5408,10 +5333,6 @@ async fn apply_phase3_bracket_commands(
                         resolved = %existing,
                         "[DISCOVER] shorthand resolves to an existing node — re-discovery no-op"
                     );
-                    crate::logs::log(
-                        "BRK",
-                        &format!("[DISCOVER] ghost-guard no-op: '{id}' aliases existing '{existing}'"),
-                    );
                     continue;
                 }
                 let label = if name.trim().is_empty() {
@@ -5436,7 +5357,7 @@ async fn apply_phase3_bracket_commands(
                         // they stand; render noise + a degenerate graph).
                         .filter(|n| !n.is_empty() && *n != id)
                         .collect(),
-                    setting: setting.trim().to_string(),
+                    setting: setting.trim().to_string(), ..Default::default()
                 };
                 let was_empty_graph = !s.travel_graph.is_set();
                 if s.travel_graph.upsert_node(node) {
@@ -5455,15 +5376,6 @@ async fn apply_phase3_bracket_commands(
                         node_id = %id,
                         neighbor_count = neighbors.len(),
                         "[DISCOVER] travel-graph node registered"
-                    );
-                    crate::logs::log(
-                        "BRK",
-                        &format!(
-                            "[DISCOVER] node registered id={id} name={} neighbors={} seeded_current={}",
-                            crate::logs::brief_with(&label, 40),
-                            neighbors.len(),
-                            was_empty_graph
-                        ),
                     );
                 }
             }
@@ -5522,13 +5434,6 @@ async fn apply_phase3_bracket_commands(
                         Some(id) => {
                             if pre.travel_graph.find_node(&id).is_none() {
                                 undo_snapshot.get_or_insert(pre);
-                                crate::logs::log(
-                                    "BRK",
-                                    &format!(
-                                        "[TRAVEL] MINTED node id={id} from dest={}",
-                                        crate::logs::brief_with(&dest_raw, 40)
-                                    ),
-                                );
                             }
                             Some(id)
                         }
@@ -5543,14 +5448,6 @@ async fn apply_phase3_bracket_commands(
                     let known: Vec<&str> =
                         s.travel_graph.nodes.iter().map(|n| n.id.as_str()).collect();
                     tracing::warn!(dest = %dest_raw, known = ?known, "[TRAVEL] rejected — unresolvable + unmintable destination");
-                    crate::logs::log(
-                        "BRK",
-                        &format!(
-                            "[TRAVEL] REJECTED unmintable dest={} known_nodes={}",
-                            crate::logs::brief_with(&dest_raw, 40),
-                            known.len()
-                        ),
-                    );
                     reject_directives.push(format!(
                         "Travel to \"{dest_raw}\" is not possible — that location is not in the world. \
                          Known locations: {}. Stay where you are or travel to a known location.",
@@ -5594,10 +5491,6 @@ async fn apply_phase3_bracket_commands(
                         to = %dest,
                         "[TRAVEL] auto-linked edge + advanced (known non-adjacent)"
                     );
-                    crate::logs::log(
-                        "BRK",
-                        &format!("[TRAVEL] AUTO-LINK {from_id} <-> {dest} + moved"),
-                    );
                 }
                 Some(dest) => {
                     // Legal adjacent move (or the bootstrap first-move-from-None
@@ -5614,11 +5507,364 @@ async fn apply_phase3_bracket_commands(
                         to = %dest,
                         "[TRAVEL] current_node advanced"
                     );
-                    crate::logs::log(
-                        "BRK",
-                        &format!("[TRAVEL] moved {:?} -> {dest}", prev),
-                    );
                 }
+            }
+        }
+
+        // ── (2026-08-19 Hidden site maps) [ROOM] — visit or discover an area
+        // of the CURRENT node's site map. Applied AFTER [TRAVEL] (the player
+        // moves first, then records which interior area they entered). No
+        // map at the current node → reject directive (the model may not
+        // invent interiors Rust never generated); Visited is terminal (a
+        // Visited→Discovered emission is a no-op, never a knowledge
+        // downgrade).
+        for cmd in &room_cmds {
+            if let bracket_parser::BracketCommand::Room { area_id, visited } = cmd {
+                let Some(cur_id) = s.travel_graph.current_node.clone() else {
+                    reject_directives.push(
+                        "[ROOM] cannot apply — no current location.".to_string(),
+                    );
+                    continue;
+                };
+                let (has_map, known): (bool, Option<crate::site_map::AreaKnowledge>) =
+                    match s.site_maps.get(&cur_id) {
+                        None => (false, None),
+                        Some(map) => (
+                            true,
+                            map.areas
+                                .iter()
+                                .find(|a| a.id == *area_id)
+                                .and_then(|area| match (area.knowledge, visited) {
+                                    // Already visited: re-visit re-emissions are
+                                    // no-ops, downgrades never happen.
+                                    (crate::site_map::AreaKnowledge::Visited, _) => None,
+                                    (_, true) => Some(crate::site_map::AreaKnowledge::Visited),
+                                    (_, false) => Some(crate::site_map::AreaKnowledge::Discovered),
+                                }),
+                        ),
+                    };
+                if !has_map {
+                    reject_directives.push(
+                        "No hidden site map exists at this location — [ROOM] cannot apply here."
+                            .to_string(),
+                    );
+                    continue;
+                }
+                let Some(new_knowledge) = known else {
+                    // Unknown area id OR already-visited no-op.
+                    if s
+                        .site_maps
+                        .get(&cur_id)
+                        .map(|m| m.areas.iter().any(|a| a.id == *area_id))
+                        .unwrap_or(false)
+                    {
+                        tracing::debug!(area = %area_id, "[ROOM] already visited — no-op");
+                        continue;
+                    }
+                    reject_directives.push(format!(
+                        "Area \"{area_id}\" is not part of this site. Use an area id from the site block."
+                    ));
+                    continue;
+                };
+                if undo_snapshot.is_none() {
+                    undo_snapshot = Some(s.clone());
+                }
+                if let Some(map) = s.site_maps.get_mut(&cur_id) {
+                    if let Some(area) = map.areas.iter_mut().find(|a| a.id == *area_id) {
+                        area.knowledge = new_knowledge;
+                        if *visited {
+                            map.last_visit_minutes = now_minutes;
+                        }
+                    }
+                }
+                mutated = true;
+                tracing::info!(area = %area_id, visited, "[ROOM] site area knowledge advanced");
+            }
+        }
+
+        // ── (2026-08-19 Hidden site maps) [ASSET] — a site asset's state /
+        // knowledge / group-count mutation, or a new feature minting into
+        // the current site. State mutations imply Known (you watched it
+        // die / get carried off / spring); the add-form mints a kebab id
+        // from the name + requires a valid area id. Two-phase (immutable
+        // plan → snapshot → mutate) so the undo snapshot never fights the
+        // mutable map borrow.
+        for cmd in &asset_cmds {
+            if let bracket_parser::BracketCommand::SiteAsset { asset_id, mutation } = cmd {
+                let Some(cur_id) = s.travel_graph.current_node.clone() else {
+                    reject_directives.push(
+                        "[ASSET] cannot apply — no current location.".to_string(),
+                    );
+                    continue;
+                };
+                // Local action plan: computed under the immutable borrow,
+                // consumed under the mutable one.
+                enum AssetAct {
+                    Mint {
+                        id: String,
+                        name: String,
+                        kind: crate::site_map::AssetKind,
+                        location: String,
+                        count: u32,
+                        detail: String,
+                    },
+                    Count(String, u32),
+                    Mutate(String, &'static str),
+                }
+                let plan = {
+                    let Some(map_ref) = s.site_maps.get(&cur_id) else {
+                        reject_directives.push(
+                            "No hidden site map exists at this location — [ASSET] cannot apply here."
+                                .to_string(),
+                        );
+                        continue;
+                    };
+                    match mutation {
+                        bracket_parser::AssetMutation::Add {
+                            name,
+                            kind,
+                            location,
+                            count,
+                            detail,
+                        } => {
+                            let id = crate::site_map::kebabify(name);
+                            let kind_parsed = match kind.trim().to_lowercase().as_str() {
+                                "creature" => crate::site_map::AssetKind::Creature,
+                                "group" => crate::site_map::AssetKind::Group,
+                                "trap" => crate::site_map::AssetKind::Trap,
+                                "hazard" => crate::site_map::AssetKind::Hazard,
+                                "loot" => crate::site_map::AssetKind::Loot,
+                                _ => crate::site_map::AssetKind::Object,
+                            };
+                            // A Group minted without an explicit count= defaults
+                            // to 1: the bracket mint path skips site_map
+                            // validate (which requires 1..=99 for groups — 0
+                            // is the non-group sentinel), so a verbatim 0
+                            // rendered no ×N yet still counted as a hostile
+                            // for the mob-tier read.
+                            let effective_count = if kind_parsed
+                                == crate::site_map::AssetKind::Group
+                            {
+                                (*count)
+                                    .clamp(1, crate::site_map::ASSET_COUNT_MAX)
+                            } else {
+                                0
+                            };
+                            let already = map_ref.assets.iter().any(|a| a.id == id);
+                            let bad_loc = !map_ref.areas.iter().any(|a| a.id == *location);
+                            if id.is_empty()
+                                || bad_loc
+                                || already
+                                || map_ref.assets.len() >= crate::site_map::MAX_SITE_ASSETS
+                            {
+                                reject_directives.push(format!(
+                                    "Could not add site asset \"{}\" — use a real area id from \
+                                     the site block{}.",
+                                    name,
+                                    if already {
+                                        " (it is already tracked — emit its id instead)"
+                                    } else {
+                                        ""
+                                    }
+                                ));
+                                continue;
+                            }
+                            AssetAct::Mint {
+                                id,
+                                name: name.clone(),
+                                kind: kind_parsed,
+                                location: location.clone(),
+                                count: effective_count,
+                                detail: detail.clone(),
+                            }
+                        }
+                        bracket_parser::AssetMutation::Count(n) => {
+                            let Some(rid) = crate::site_map::resolve_asset(map_ref, asset_id)
+                                .map(|a| a.id.clone())
+                            else {
+                                reject_directives.push(format!(
+                                    "Site asset \"{asset_id}\" is not part of this site. Use an \
+                                     asset id from the site block."
+                                ));
+                                continue;
+                            };
+                            if map_ref
+                                .assets
+                                .iter()
+                                .any(|a| a.id == rid && a.kind != crate::site_map::AssetKind::Group)
+                            {
+                                reject_directives.push(format!(
+                                    "Site asset \"{asset_id}\" is not a group — count=N cannot \
+                                     apply."
+                                ));
+                                continue;
+                            }
+                            AssetAct::Count(rid, *n)
+                        }
+                        other => {
+                            let Some(rid) = crate::site_map::resolve_asset(map_ref, asset_id)
+                                .map(|a| a.id.clone())
+                            else {
+                                reject_directives.push(format!(
+                                    "Site asset \"{asset_id}\" is not part of this site. Use an \
+                                     asset id from the site block."
+                                ));
+                                continue;
+                            };
+                            let tag = match other {
+                                bracket_parser::AssetMutation::Dead => "dead",
+                                bracket_parser::AssetMutation::Taken => "taken",
+                                bracket_parser::AssetMutation::Triggered => "triggered",
+                                bracket_parser::AssetMutation::Active => "active",
+                                bracket_parser::AssetMutation::Known => "known",
+                                bracket_parser::AssetMutation::Suspected => "suspected",
+                                _ => unreachable!("Add/Count handled in their own arms"),
+                            };
+                            AssetAct::Mutate(rid, tag)
+                        }
+                    }
+                };
+                if undo_snapshot.is_none() {
+                    undo_snapshot = Some(s.clone());
+                }
+                let Some(map) = s.site_maps.get_mut(&cur_id) else {
+                    continue;
+                };
+                match plan {
+                    AssetAct::Mint { id, name, kind, location, count, detail } => {
+                        map.assets.push(crate::site_map::SiteAsset {
+                            id: id.clone(),
+                            name,
+                            kind,
+                            location,
+                            state: crate::site_map::AssetState::Active,
+                            knowledge: crate::site_map::AssetKnowledge::Known,
+                            count,
+                            detail,
+                            tier: None,
+                        });
+                        tracing::info!(asset = %id, "[ASSET] minted into the current site");
+                    }
+                    AssetAct::Count(rid, n) => {
+                        if let Some(a) = map.assets.iter_mut().find(|a| a.id == rid) {
+                            a.count = n;
+                        }
+                    }
+                    AssetAct::Mutate(rid, tag) => {
+                        if let Some(a) = map.assets.iter_mut().find(|a| a.id == rid) {
+                            match tag {
+                                "dead" => {
+                                    a.state = crate::site_map::AssetState::Dead;
+                                    a.knowledge = crate::site_map::AssetKnowledge::Known;
+                                }
+                                "taken" => {
+                                    a.state = crate::site_map::AssetState::Taken;
+                                    a.knowledge = crate::site_map::AssetKnowledge::Known;
+                                }
+                                "triggered" => {
+                                    a.state = crate::site_map::AssetState::Triggered;
+                                    a.knowledge = crate::site_map::AssetKnowledge::Known;
+                                }
+                                "active" => {
+                                    a.state = crate::site_map::AssetState::Active;
+                                }
+                                "known" => {
+                                    a.knowledge = crate::site_map::AssetKnowledge::Known;
+                                }
+                                "suspected" => {
+                                    a.knowledge = crate::site_map::AssetKnowledge::Suspected;
+                                }
+                                _ => unreachable!("tag set above"),
+                            }
+                        }
+                    }
+                }
+                mutated = true;
+            }
+        }
+
+        // ── (2026-08-19 Referee QoL) [PROMISE] — the player accepted (or
+        // fulfilled) an obligation to a REGISTERED NPC. The npc_id resolves
+        // through the same surface gate as PRESENCE; Rust tracks acceptance
+        // + deadline (the frustration curve's inputs). A re-emission of the
+        // same (npc, description) refreshes the deadline rather than
+        // stacking a twin. Removal keeps no history (v1).
+        for cmd in &promise_cmds {
+            if let bracket_parser::BracketCommand::Promise {
+                npc_id,
+                description,
+                deadline_minutes,
+                remove,
+            } = cmd
+            {
+                let Some(entry) =
+                    schema::resolve_npc_surface(&s.npc_registry.entries, npc_id).map(|e| e.id.clone())
+                else {
+                    reject_directives.push(format!(
+                        "Promise giver \"{npc_id}\" is not a registered NPC. Use an npc_id from \
+                         the cast line."
+                    ));
+                    continue;
+                };
+                if *remove {
+                    // No match → no-op: skip without minting a ring entry (the
+                    // P3 no-op discipline). Otherwise snapshot BEFORE the
+                    // retain — a post-removal clone would push the already-
+                    // fulfilled state to the undo ring and a rollback could
+                    // never restore the promise.
+                    if !s
+                        .promises
+                        .iter()
+                        .any(|p| p.npc_id == entry && p.description == *description)
+                    {
+                        continue;
+                    }
+                    if undo_snapshot.is_none() {
+                        undo_snapshot = Some(s.clone());
+                    }
+                    s.promises
+                        .retain(|p| !(p.npc_id == entry && p.description == *description));
+                    mutated = true;
+                    continue;
+                }
+                let deadline = now_minutes + deadline_minutes;
+                // Same discipline as the remove-branch above: check with a
+                // shared borrow, snapshot, THEN take the mutable borrow —
+                // cloning `s` while the `iter_mut` loan is alive won't borrowck.
+                if s
+                    .promises
+                    .iter()
+                    .any(|p| p.npc_id == entry && p.description == *description)
+                {
+                    if undo_snapshot.is_none() {
+                        undo_snapshot = Some(s.clone());
+                    }
+                    if let Some(p) = s
+                        .promises
+                        .iter_mut()
+                        .find(|p| p.npc_id == entry && p.description == *description)
+                    {
+                        p.deadline_minutes = deadline;
+                        p.accepted_at_minutes = now_minutes;
+                    }
+                    mutated = true;
+                    continue;
+                }
+                if undo_snapshot.is_none() {
+                    undo_snapshot = Some(s.clone());
+                }
+                s.promises.push(schema::Promise {
+                    npc_id: entry.clone(),
+                    description: description.clone(),
+                    deadline_minutes: deadline,
+                    accepted_at_minutes: now_minutes,
+                });
+                let overflow = s.promises.len().saturating_sub(schema::MAX_PROMISES);
+                if overflow > 0 {
+                    s.promises.drain(..overflow);
+                }
+                mutated = true;
+                tracing::info!(npc = %entry, "[PROMISE] obligation tracked");
             }
         }
 
@@ -5652,13 +5898,6 @@ async fn apply_phase3_bracket_commands(
                     .any(|r| r.label == *label && r.origin_node == cur_id);
                 if dupe {
                     tracing::debug!(label = %label, "[RUMOR] duplicate suppressed");
-                    crate::logs::log(
-                        "BRK",
-                        &format!(
-                            "[RUMOR] duplicate suppressed at {cur_id}: {}",
-                            crate::logs::brief_with(label, 40)
-                        ),
-                    );
                     continue;
                 }
                 if undo_snapshot.is_none() {
@@ -5673,10 +5912,6 @@ async fn apply_phase3_bracket_commands(
                 let overflow = s.rumors.len().saturating_sub(crate::schema::MAX_STORED_RUMORS);
                 if overflow > 0 {
                     s.rumors.drain(..overflow);
-                    crate::logs::log(
-                        "BRK",
-                        &format!("[RUMOR] cap overflow — drained {overflow} oldest"),
-                    );
                 }
                 mutated = true;
                 tracing::info!(
@@ -5684,25 +5919,11 @@ async fn apply_phase3_bracket_commands(
                     origin = %cur_id,
                     "[RUMOR] rumor seeded at current node"
                 );
-                crate::logs::log(
-                    "BRK",
-                    &format!(
-                        "[RUMOR] seeded at {cur_id}: {}",
-                        crate::logs::brief_with(label, 40)
-                    ),
-                );
             } else {
                 // No current node → can't root the rumor. Warn-and-skip.
                 tracing::warn!(
                     label = %label,
                     "[RUMOR] dropped — no current node to root at"
-                );
-                crate::logs::log(
-                    "BRK",
-                    &format!(
-                        "[RUMOR] DROPPED (no current node): {}",
-                        crate::logs::brief_with(label, 40)
-                    ),
                 );
             }
         }
@@ -5718,6 +5939,18 @@ async fn apply_phase3_bracket_commands(
     // to a bare slug (lowercase, non-alphanumeric→underscore); diegetic
     // name/role/tier stay verbatim. No borrow dance needed — `upsert_entry` is
     // a single `&mut self` call, no concurrent immutable read of the registry.
+    // (2026-08-19) The active player's name, slugged once — shared by the
+    // NPC_REGISTER + PRESENCE player-name guards below. The tracker is
+    // name-blind by design (retrieval diet — no card/player identity in its
+    // prompt); the applier is not.
+    let player_slug = state
+        .active_fable_card
+        .lock()
+        .expect("active_fable_card mutex")
+        .as_ref()
+        .and_then(|c| c.player_name.as_deref())
+        .map(|n| sanitize_slug(n))
+        .unwrap_or_default();
     for cmd in &npc_register_cmds {
         if let bracket_parser::BracketCommand::NpcRegister {
             npc_id,
@@ -5735,6 +5968,23 @@ async fn apply_phase3_bracket_commands(
             } else {
                 name.trim().to_string()
             };
+            // (2026-08-19) Player-name guard: the player is NEVER an NPC.
+            // The tracker is name-blind by design (the retrieval diet — no
+            // card or player identity in its prompt), so a player-named
+            // target in an action ("he walks to lacey" with Lacey as the
+            // attached player) reads as a brand-new character and minted a
+            // ghost NPC the narrator then played as a second Lacey. The
+            // applier is not blind: `player_slug` (hoisted above the loop)
+            // rejects an exact id/name match with a teaching directive.
+            if !player_slug.is_empty()
+                && (id == player_slug || sanitize_slug(&label) == player_slug)
+            {
+                reject_directives.push(format!(
+                    "NPC not registered — \"{label}\" is the player's own name. The player is never an NPC: never register them and never assert their presence."
+                ));
+                tracing::warn!(npc_id = %id, "[NPC_REGISTER] rejected — player-name collision");
+                continue;
+            }
             let entry = schema::NpcEntry {
                 id: id.clone(),
                 name: label,
@@ -5762,13 +6012,7 @@ async fn apply_phase3_bracket_commands(
                 // discovered entry (authored core entries are pinned) and
                 // retry once — the fix for the 96-cap brick (discovery used
                 // to refuse permanently once 96 ids accumulated).
-                if let Some(evicted) = s.evict_archived_registry_entry() {
-                    crate::logs::log(
-                        "BRK",
-                        &format!(
-                            "[NPC_REGISTER] registry cap relief: evicted archived stale {evicted} (relationship kept — re-registration resumes the tier)",
-                        ),
-                    );
+                if s.evict_archived_registry_entry().is_some() {
                     inserted = s.npc_registry.upsert_entry(entry.clone());
                 }
             }
@@ -5778,11 +6022,6 @@ async fn apply_phase3_bracket_commands(
                 }
                 mutated = true;
                 tracing::info!(npc_id = %id, "[NPC_REGISTER] npc_registry entry registered");
-            } else if !dup {
-                crate::logs::log(
-                    "BRK",
-                    &format!("[NPC_REGISTER] REJECTED registry full id={} len={}", id, s.npc_registry.entries.len()),
-                );
             }
         }
     }
@@ -5838,7 +6077,17 @@ async fn apply_phase3_bracket_commands(
                         asserted.insert(entry.id.clone(), stance_clean.to_string());
                     }
                     None => {
-                        unknown_surfaces.push(npc_id.clone());
+                        // (2026-08-19) A surface that IS the player's name
+                        // gets the pointed directive — the generic
+                        // "not a known NPC" message invites a registration
+                        // attempt next turn instead of teaching the collision.
+                        if !player_slug.is_empty() && sanitize_slug(npc_id) == player_slug {
+                            reject_directives.push(format!(
+                                "Presence not recorded — \"{npc_id}\" is the player's own name. The player is never an NPC; never register or assert them."
+                            ));
+                        } else {
+                            unknown_surfaces.push(npc_id.clone());
+                        }
                     }
                 }
             }
@@ -5928,10 +6177,6 @@ async fn apply_phase3_bracket_commands(
                             "[PRESENCE] dropped — grace expired (not re-asserted for {} turns",
                             schema::PRESENCE_GRACE_RESET
                         );
-                        crate::logs::log(
-                            "BRK",
-                            &format!("[PRESENCE] {} dropped — grace expired", p.npc_id),
-                        );
                     }
                 }
                 asserted.remove(&p.npc_id);
@@ -5975,10 +6220,6 @@ async fn apply_phase3_bracket_commands(
                     if contacted.len() > STAMPED_SHOWN {
                         list.push_str(&format!(" (+{} more)", contacted.len() - STAMPED_SHOWN));
                     }
-                    crate::logs::log(
-                        "BRK",
-                        &format!("[PRESENCE] contact stamp {list} (reaper key refreshed)"),
-                    );
                 }
             }
         }
@@ -6075,14 +6316,6 @@ async fn apply_phase3_bracket_commands(
                         item_name.as_deref().unwrap_or(""),
                         r
                     );
-                    crate::logs::log(
-                        "INV",
-                        &format!(
-                            "[EQUIP] fragment resolved \"{}\" -> \"{}\"",
-                            crate::logs::brief_with(item_name.as_deref().unwrap_or(""), 30),
-                            crate::logs::brief_with(r, 40)
-                        ),
-                    );
                 }
                 let item_name: Option<&str> = match (&equip_resolved, item_name) {
                     (Some(r), _) => Some(r.as_str()),
@@ -6090,41 +6323,42 @@ async fn apply_phase3_bracket_commands(
                 };
                 // (P3 fix) Skip true no-ops BEFORE snapshotting: an unequip
                 // of an empty slot changes nothing, and an equip of the
-                // identical item already in the layer re-writes the same
+                // identical item already worn in the slot re-writes the same
                 // value — neither may mint an undo-ring entry (the old
                 // unconditional snapshot was ring noise per tracker echo).
+                // (2026-08-19) The layer-less unequip form takes the Outer
+                // with an Inner fallback, so its no-op test covers both; the
+                // equip echo test normalizes the name (seed-case mismatch)
+                // and requires stats+tags equality too — a re-emission with
+                // NEW stats still applies.
                 let current = s.player_state.equipment.get(slot);
                 let is_noop = match item_name {
-                    None => current
-                        .map(|layers| match layer {
-                            equipment::ItemLayer::Outer => layers.outer.is_none(),
-                            equipment::ItemLayer::Inner => layers.inner.is_none(),
-                        })
-                        .unwrap_or(true),
+                    None => match layer {
+                        Some(equipment::ItemLayer::Outer) => current
+                            .map(|layers| layers.outer.is_none())
+                            .unwrap_or(true),
+                        Some(equipment::ItemLayer::Inner) => current
+                            .map(|layers| layers.inner.is_none())
+                            .unwrap_or(true),
+                        None => current
+                            .map(|layers| layers.outer.is_none() && layers.inner.is_none())
+                            .unwrap_or(true),
+                    },
                     Some(name) => current
                         .map(|layers| {
-                            match layer {
-                                equipment::ItemLayer::Outer => &layers.outer,
-                                equipment::ItemLayer::Inner => &layers.inner,
-                            }
-                            .as_ref()
-                            .map(|it| {
-                                it.name == *name && it.stats == *item_stats && it.tags == *item_tags
-                            })
-                            .unwrap_or(false)
+                            [&layers.outer, &layers.inner]
+                                .into_iter()
+                                .flatten()
+                                .any(|it| {
+                                    it.name.trim().to_lowercase()
+                                        == name.trim().to_lowercase()
+                                        && it.stats == *item_stats
+                                        && it.tags == *item_tags
+                                })
                         })
                         .unwrap_or(false),
                 };
                 if is_noop {
-                    crate::logs::log(
-                        "INV",
-                        &format!(
-                            "[EQUIP] no-op skipped slot={:?} layer={:?} name={:?}",
-                            slot,
-                            layer,
-                            item_name
-                        ),
-                    );
                     continue;
                 }
                 if undo_snapshot.is_none() {
@@ -6139,10 +6373,15 @@ async fn apply_phase3_bracket_commands(
                         // preserve-existing discipline the Soul Gem UI path
                         // and migrate_legacy_items follow — the tracker path
                         // used to silently vaporize it).
+                        // (2026-08-19) The layer-less form takes the Outer —
+                        // the topmost, observer-visible garment ("takes off
+                        // the boots") — falling back to the Inner when that
+                        // is all the slot holds ("takes off the socks").
                         if let Some(layers) = s.player_state.equipment.get_mut(slot) {
                             let taken = match layer {
-                                equipment::ItemLayer::Outer => layers.outer.take(),
-                                equipment::ItemLayer::Inner => layers.inner.take(),
+                                Some(equipment::ItemLayer::Outer) => layers.outer.take(),
+                                Some(equipment::ItemLayer::Inner) => layers.inner.take(),
+                                None => layers.outer.take().or_else(|| layers.inner.take()),
                             };
                             // End the equipment borrow before touching pack
                             // (disjoint fields, but the map borrow outlives
@@ -6166,16 +6405,6 @@ async fn apply_phase3_bracket_commands(
                                     name = %item.name,
                                     "[EQUIP] unequipped → pack"
                                 );
-                                crate::logs::log(
-                                    "INV",
-                                    &format!(
-                                        "[EQUIP] UNEQUIP {:?}/{:?} \"{}\" tags={:?} -> pack",
-                                        slot,
-                                        layer,
-                                        crate::logs::brief_with(&item.name, 40),
-                                        item.tags
-                                    ),
-                                );
                             }
                             if slot_now_empty {
                                 s.player_state.equipment.remove(slot);
@@ -6188,60 +6417,42 @@ async fn apply_phase3_bracket_commands(
                             stats: item_stats.clone(),
                             tags: item_tags.clone(),
                         };
-                        // (P2 fix) A displaced layer occupant routes to the
-                        // pack so nothing is lost — mirrors the UI path
-                        // ("a displaced Outer goes to the pack").
-                        let displaced = {
-                            let layers = s
-                                .player_state
-                                .equipment
-                                .entry(*slot)
-                                .or_insert_with(equipment::SlotLayers::default);
-                            match layer {
-                                equipment::ItemLayer::Outer => layers.outer.replace(item),
-                                equipment::ItemLayer::Inner => layers.inner.replace(item),
-                            }
-                        };
-                        if let Some(d) = displaced {
-                            equipment::stack_upsert(
-                                &mut s.player_state.pack,
-                                equipment::StackItem {
-                                    name: d.name.clone(),
-                                    qty: 1,
-                                    stats: d.stats.clone(),
-                                    tags: d.tags.clone(),
-                                    ..equipment::StackItem::default()
-                                },
-                            );
-                            tracing::info!(
-                                slot = ?slot,
-                                layer = ?layer,
-                                name = %d.name,
-                                "[EQUIP] displaced occupant → pack"
-                            );
-                            crate::logs::log(
-                                "INV",
-                                &format!(
-                                    "[EQUIP] DISPLACED {:?}/{:?} \"{}\" -> pack",
-                                    slot,
-                                    layer,
-                                    crate::logs::brief_with(&d.name, 40)
-                                ),
-                            );
-                        }
-                        mutated = true;
-                        tracing::info!(slot = ?slot, layer = ?layer, name = %name, "[EQUIP] equipped");
-                        crate::logs::log(
-                            "INV",
-                            &format!(
-                                "[EQUIP] EQUIPPED {:?}/{:?} \"{}\" stats={:?} tags={:?}",
-                                slot,
-                                layer,
-                                crate::logs::brief_with(name, 40),
-                                item_stats,
-                                item_tags
-                            ),
+                        // (2026-08-19 NPC-perception upgrade) Common-sense
+                        // placement: with no explicit `layer=` the garment
+                        // lands where it physically belongs — a cloak OVER a
+                        // worn shirt DEMOTES the shirt to Inner (it stays
+                        // worn; the old default-Outer displacement stripped
+                        // it off), socks under boots, footwear swaps. Any
+                        // displaced occupant rides to the pack — nothing is
+                        // ever silently vaporized.
+                        let placement = equipment::place_equipped(
+                            &mut s.player_state.equipment,
+                            *slot,
+                            item,
+                            *layer,
+                            true,
                         );
+                        if let equipment::Placement::Worn { layer: worn_layer, displaced } = placement {
+                            for d in displaced {
+                                tracing::info!(
+                                    slot = ?slot,
+                                    name = %d.name,
+                                    "[EQUIP] displaced occupant → pack"
+                                );
+                                equipment::stack_upsert(
+                                    &mut s.player_state.pack,
+                                    equipment::StackItem {
+                                        name: d.name.clone(),
+                                        qty: 1,
+                                        stats: d.stats.clone(),
+                                        tags: d.tags.clone(),
+                                        ..equipment::StackItem::default()
+                                    },
+                                );
+                            }
+                            mutated = true;
+                            tracing::info!(slot = ?slot, layer = ?worn_layer, name = %name, "[EQUIP] equipped");
+                        }
                     }
                 }
             }
@@ -6276,14 +6487,6 @@ async fn apply_phase3_bracket_commands(
                         "[DEBUG] [INVENTORY] resolved fragment \"{}\" → \"{}\"",
                         item_name, r
                     );
-                    crate::logs::log(
-                        "INV",
-                        &format!(
-                            "[BELT] fragment resolved \"{}\" -> \"{}\"",
-                            crate::logs::brief_with(item_name, 30),
-                            crate::logs::brief_with(r, 40)
-                        ),
-                    );
                 }
                 let item_name: &str = belt_resolved.as_deref().unwrap_or(item_name);
                 let pre_list = s.player_state.belt.clone();
@@ -6294,14 +6497,6 @@ async fn apply_phase3_bracket_commands(
                         undo_snapshot.get_or_insert(pre_schema);
                         mutated = true;
                         tracing::info!(name = %item_name, "[BELT] removed");
-                        crate::logs::log(
-                            "INV",
-                            &format!(
-                                "[BELT] REMOVED \"{}\" (rack now {})",
-                                crate::logs::brief_with(item_name, 40),
-                                s.player_state.belt.len()
-                            ),
-                        );
                     }
                 } else {
                     equipment::stack_upsert(
@@ -6324,13 +6519,6 @@ async fn apply_phase3_bracket_commands(
                     while s.player_state.belt.len() > equipment::BELT_MAX {
                         let evicted = s.player_state.belt.remove(0);
                         tracing::info!(name = %evicted.name, "[BELT] rack full — spilling oldest to the pack");
-                        crate::logs::log(
-                            "INV",
-                            &format!(
-                                "[BELT] SPILL (rack full) \"{}\" -> pack",
-                                crate::logs::brief_with(&evicted.name, 40)
-                            ),
-                        );
                         let note = format!("stashed {} in the pack (belt full)", evicted.name);
                         let capped: String = if note.chars().count() > EVENT_NOTE_MAX {
                             note.chars().take(EVENT_NOTE_MAX).collect()
@@ -6346,17 +6534,6 @@ async fn apply_phase3_bracket_commands(
                         undo_snapshot.get_or_insert(pre_schema);
                         mutated = true;
                         tracing::info!(name = %item_name, qty, "[BELT] added");
-                        crate::logs::log(
-                            "INV",
-                            &format!(
-                                "[BELT] ADDED \"{}\" x{} stats={:?} tags={:?} (rack now {})",
-                                crate::logs::brief_with(item_name, 40),
-                                qty,
-                                item_stats,
-                                item_tags,
-                                s.player_state.belt.len()
-                            ),
-                        );
                     }
                 }
             }
@@ -6393,14 +6570,6 @@ async fn apply_phase3_bracket_commands(
                         "[DEBUG] [INVENTORY] resolved fragment \"{}\" → \"{}\"",
                         item_name, r
                     );
-                    crate::logs::log(
-                        "INV",
-                        &format!(
-                            "[PACK] fragment resolved \"{}\" -> \"{}\"",
-                            crate::logs::brief_with(item_name, 30),
-                            crate::logs::brief_with(r, 40)
-                        ),
-                    );
                 }
                 let item_name: &str = pack_resolved.as_deref().unwrap_or(item_name);
                 let pre_list = s.player_state.pack.clone();
@@ -6411,41 +6580,110 @@ async fn apply_phase3_bracket_commands(
                         undo_snapshot.get_or_insert(pre_schema);
                         mutated = true;
                         tracing::info!(name = %item_name, "[PACK] removed");
-                        crate::logs::log(
-                            "INV",
-                            &format!(
-                                "[PACK] REMOVED \"{}\" (pack now {} stack(s))",
-                                crate::logs::brief_with(item_name, 40),
-                                s.player_state.pack.len()
-                            ),
-                        );
                     }
                 } else {
-                    equipment::stack_upsert(
-                        &mut s.player_state.pack,
-                        equipment::StackItem {
+                    // (2026-08-19 clothes-on-person fix, Chloe ruling: the
+                    // system KNOWS where things belong — no UI affordance) A
+                    // NEWLY-acquired garment WEARS instead of packing when its
+                    // slot can take it (`place_equipped`: boots onto bare
+                    // feet, socks UNDER boots, a cloak OVER a worn shirt —
+                    // over-garments demote, they never bury). The new-stack
+                    // guard means deliberate storage is never fought — a
+                    // re-stow merges onto an existing pack stack (or follows
+                    // this turn's earlier unequip→pack, since the EQUIP loop
+                    // runs first). A garment that stays packed only when BOTH
+                    // layers hold a higher-ranked garment still carries the
+                    // equippable tag, so the Soul Gem popup offers manual
+                    // EQUIP on it.
+                    let mut tags = item_tags.clone();
+                    let routable = equipment::route_legacy_to_slot(&item_name.to_lowercase());
+                    if routable.is_some() && !tags.contains(&equipment::ItemTag::Equippable) {
+                        tags.push(equipment::ItemTag::Equippable);
+                    }
+                    let is_new_stack = !s.player_state.pack.iter().any(|i| {
+                        i.name.trim().to_lowercase() == item_name.trim().to_lowercase()
+                    });
+                    // (2026-08-19 NPC-perception upgrade) Auto-wear through
+                    // the shared placement authority: over-garments DEMOTE the
+                    // incumbent beneath them (a bought cloak goes OVER the
+                    // worn shirt), under-clothing claims Inner, footwear
+                    // swaps. force=false — both layers holding a garment the
+                    // new one doesn't outrank = a genuine spare (stays
+                    // packed, `equippable` tag ensured above).
+                    let wear_slot = if is_new_stack {
+                        equipment::route_legacy_to_slot(&item_name.to_lowercase())
+                    } else {
+                        None
+                    };
+                    let placement = wear_slot.and_then(|slot| {
+                        let item = equipment::EquippedItem {
                             name: item_name.to_string(),
-                            qty: *qty,
-                            weight: *weight,
                             stats: item_stats.clone(),
-                            tags: item_tags.clone(),
-                        },
-                    );
-                    if s.player_state.pack != pre_list {
+                            tags: tags.clone(),
+                        };
+                        match equipment::place_equipped(
+                            &mut s.player_state.equipment,
+                            slot,
+                            item,
+                            None,
+                            false,
+                        ) {
+                            equipment::Placement::Worn { layer, displaced } => {
+                                Some((slot, layer, displaced))
+                            }
+                            equipment::Placement::Packed => None,
+                        }
+                    });
+                    if let Some((slot, layer, displaced)) = placement {
+                        for d in displaced {
+                            tracing::info!(
+                                slot = ?slot,
+                                name = %d.name,
+                                "[PACK] auto-wear displaced occupant → pack"
+                            );
+                            equipment::stack_upsert(
+                                &mut s.player_state.pack,
+                                equipment::StackItem {
+                                    name: d.name.clone(),
+                                    qty: 1,
+                                    stats: d.stats.clone(),
+                                    tags: d.tags.clone(),
+                                    ..equipment::StackItem::default()
+                                },
+                            );
+                        }
+                        // qty > 1: a slot holds ONE copy; the rest stay packed.
+                        if *qty > 1 {
+                            equipment::stack_upsert(
+                                &mut s.player_state.pack,
+                                equipment::StackItem {
+                                    name: item_name.to_string(),
+                                    qty: *qty - 1,
+                                    weight: *weight,
+                                    stats: item_stats.clone(),
+                                    tags: tags.clone(),
+                                },
+                            );
+                        }
                         undo_snapshot.get_or_insert(pre_schema);
                         mutated = true;
-                        tracing::info!(name = %item_name, qty, weight, "[PACK] added");
-                        crate::logs::log(
-                            "INV",
-                            &format!(
-                                "[PACK] ADDED \"{}\" x{} stats={:?} tags={:?} (pack now {} stack(s))",
-                                crate::logs::brief_with(item_name, 40),
-                                qty,
-                                item_stats,
-                                item_tags,
-                                s.player_state.pack.len()
-                            ),
+                        tracing::info!(name = %item_name, slot = ?slot, layer = ?layer, "[PACK] auto-wore garment");
+                    } else {
+                        equipment::stack_upsert(
+                            &mut s.player_state.pack,
+                            equipment::StackItem {
+                                name: item_name.to_string(),
+                                qty: *qty,
+                                weight: *weight,
+                                stats: item_stats.clone(),
+                                tags,
+                            },
                         );
+                        if s.player_state.pack != pre_list {
+                            undo_snapshot.get_or_insert(pre_schema);
+                            mutated = true;
+                            tracing::info!(name = %item_name, qty, weight, "[PACK] added");
+                        }
                     }
                 }
             }
@@ -6472,7 +6710,7 @@ async fn apply_phase3_bracket_commands(
                 else {
                     reject_directives.push(format!(
                         "NPC item change not recorded — \"{}\" is not a known NPC. Re-emit with a valid id or alias from the cast line.",
-                        crate::logs::brief_with(npc_id, 40)
+                        echo_id(npc_id, 40)
                     ));
                     continue;
                 };
@@ -6485,16 +6723,6 @@ async fn apply_phase3_bracket_commands(
                 let item_corpus: &[&str] = if *remove { &[] } else { &narrative_corpus };
                 let resolved =
                     equipment::resolve_item_fragment(item_name, item_corpus, &npc_names);
-                if let Some(r) = &resolved {
-                    crate::logs::log(
-                        "INV",
-                        &format!(
-                            "[NPC_ITEM] fragment resolved \"{}\" -> \"{}\"",
-                            crate::logs::brief_with(item_name, 30),
-                            crate::logs::brief_with(r, 40)
-                        ),
-                    );
-                }
                 let item_name: &str = resolved.as_deref().unwrap_or(item_name);
                 let pre_schema = s.clone();
                 let interior = s.npc_interior.entry(id.clone()).or_default();
@@ -6515,15 +6743,6 @@ async fn apply_phase3_bracket_commands(
                     if existed {
                         changed = true;
                         tracing::info!(npc_id = %id, name = %item_name, "[NPC_ITEM] removed");
-                        crate::logs::log(
-                            "INV",
-                            &format!(
-                                "[NPC_ITEM] {} REMOVED \"{}\" (rack now {} stack(s))",
-                                id,
-                                crate::logs::brief_with(item_name, 40),
-                                interior.items.len()
-                            ),
-                        );
                     }
                 } else {
                     equipment::stack_upsert(
@@ -6546,27 +6765,11 @@ async fn apply_phase3_bracket_commands(
                     if interior.items != pre_items {
                         changed = true;
                         tracing::info!(npc_id = %id, name = %item_name, qty, "[NPC_ITEM] added");
-                        crate::logs::log(
-                            "INV",
-                            &format!(
-                                "[NPC_ITEM] {} ADDED \"{}\" x{} (rack now {} stack(s))",
-                                id,
-                                crate::logs::brief_with(item_name, 40),
-                                qty,
-                                interior.items.len()
-                            ),
-                        );
                     }
                 }
                 if changed {
                     undo_snapshot.get_or_insert(pre_schema);
                     mutated = true;
-                    if was_archived {
-                        crate::logs::log(
-                            "INV",
-                            &format!("[NPC_ITEM] {id} un-archived (live state resumed)"),
-                        );
-                    }
                 }
             }
         }
@@ -6580,7 +6783,7 @@ async fn apply_phase3_bracket_commands(
                 else {
                     reject_directives.push(format!(
                         "Mood not recorded — \"{}\" is not a known NPC. Re-emit with a valid id or alias from the cast line.",
-                        crate::logs::brief_with(npc_id, 40)
+                        echo_id(npc_id, 40)
                     ));
                     continue;
                 };
@@ -6602,15 +6805,6 @@ async fn apply_phase3_bracket_commands(
                     undo_snapshot.get_or_insert(pre_schema);
                     mutated = true;
                     tracing::info!(npc_id = %id, "[MOOD] interior mood set");
-                    crate::logs::log(
-                        "BRK",
-                        &format!(
-                            "[MOOD] {} -> {}{}",
-                            id,
-                            crate::logs::brief_with(mood, 40),
-                            if was_archived { " (un-archived)" } else { "" }
-                        ),
-                    );
                 }
             }
         }
@@ -6625,7 +6819,7 @@ async fn apply_phase3_bracket_commands(
                 else {
                     reject_directives.push(format!(
                         "Intent not recorded — \"{}\" is not a known NPC. Re-emit with a valid id or alias from the cast line.",
-                        crate::logs::brief_with(npc_id, 40)
+                        echo_id(npc_id, 40)
                     ));
                     continue;
                 };
@@ -6646,15 +6840,6 @@ async fn apply_phase3_bracket_commands(
                     undo_snapshot.get_or_insert(pre_schema);
                     mutated = true;
                     tracing::info!(npc_id = %id, "[INTENT] interior intent set");
-                    crate::logs::log(
-                        "BRK",
-                        &format!(
-                            "[INTENT] {} -> {}{}",
-                            id,
-                            crate::logs::brief_with(intent, 60),
-                            if was_archived { " (un-archived)" } else { "" }
-                        ),
-                    );
                 }
             }
         }
@@ -6667,6 +6852,265 @@ async fn apply_phase3_bracket_commands(
     }
 
     (mutated, reject_directives)
+}
+
+// ---------------------------------------------------------------------------
+// (2026-08-19 Hidden site maps) The JIT Site Architect
+// ---------------------------------------------------------------------------
+
+/// The site brief the architect decodes against (collected under the schema
+/// lock, then released for the decode — the schema lock is NEVER held across
+/// a multi-second LLM wait).
+struct SiteBrief {
+    node_id: String,
+    node_name: String,
+    tone: String,
+    elapsed_days: i64,
+    seeds: Vec<String>,
+    premise: String,
+}
+
+/// The architect's system contract: ONE fenced ```json object matching the
+/// SiteMap schema, terse geometry, reciprocal connections, entrance-only
+/// visited. The fence is load-bearing — the TrackerSniper is fence-aware
+/// (fable_engine.rs B12), so the JSON body can't be decapitated.
+const SITE_ARCHITECT_SYSTEM_INSTRUCTION: &str = "\
+You are a dungeon architect. Generate ONE hidden site map for the interior \
+the player just entered, as a single fenced ```json object. The map is \
+objective truth committed before narration: fixed rooms, connections, and \
+inhabitants that exist whether or not the player ever finds them.
+
+Schema (enum values lowercase snake_case; ids are kebab-case):
+{
+  \"threat\": \"low|moderate|high|deadly\",
+  \"entrance\": \"<area_id of the arrival area — knowledge 'visited', the ONLY visited area>\",
+  \"areas\": [ {\"id\": \"kebab-id\", \"name\": \"Diegetic Name\", \"knowledge\": \"unrevealed|discovered|visited\", \"geometry\": [\"one terse line\"], \"connections\": [{\"to\": \"<other area id>\", \"state\": \"open|locked|blocked\", \"detail\": \"door or passage detail\"}]}],
+  \"assets\": [ {\"id\": \"kebab-id\", \"name\": \"...\", \"kind\": \"creature|group|trap|hazard|loot|object\", \"location\": \"<area id>\", \"state\": \"active|dead|taken|triggered\", \"knowledge\": \"unrevealed|suspected|known\", \"count\": <group size 1-99, else 0>, \"detail\": \"...\", \"tier\": \"minion|soldier|elite|boss|legendary\"} ]
+}
+
+Hard rules:
+- 3 to 8 areas (the output must fit one ~512-token JSON object — never more). Every connection is RECIPROCAL (both areas list it with the same state + detail).
+- Every area is reachable from the entrance; locked and blocked routes still count as connections.
+- The entrance is the only 'visited' area; everything else is 'unrevealed' (the player just walked in).
+- Geometry: at most 3 lines of 120 chars each. Details at most 160 chars. Terse, concrete, sensory.
+- Unseen creatures are 'unrevealed' — their truth is fixed now, discovered later.
+- A group carries count 1-99; every other kind uses count 0.
+- Locked/blocked doors guard real things. Honor the seeds and the tone.
+- Output ONLY the fenced ```json object. No prose before or after.";
+
+/// Render the architect's `<|turn>` prompt (the Gemma4 protocol shape). Pure.
+pub(crate) fn render_site_architect_prompt(b: &SiteBrief) -> String {
+    let mut out = String::with_capacity(2048);
+    out.push_str("<|turn>system\n");
+    out.push_str(SITE_ARCHITECT_SYSTEM_INSTRUCTION);
+    if crate::settings::THINKING_ENABLED {
+        out.push_str("<|think|>");
+    }
+    out.push_str("<turn|>\n");
+    out.push_str("<|turn>user\n");
+    out.push_str("Design the hidden interior the player just entered.\n");
+    out.push_str(&format!("Place: {}\n", b.node_name));
+    if !b.tone.trim().is_empty() {
+        out.push_str(&format!("Tone: {}\n", b.tone.trim()));
+    }
+    out.push_str(&format!(
+        "In-world time since this place was last known to change: ~{} day(s).\n",
+        b.elapsed_days
+    ));
+    if !b.seeds.is_empty() {
+        out.push_str("Established seeds (honor them):\n");
+        for s in &b.seeds {
+            out.push_str(&format!("- {}\n", s));
+        }
+    }
+    out.push_str(&format!("Arrival scene (the premise):\n{}\n", b.premise));
+    out.push_str("Output ONLY one fenced ```json object matching the schema.\n");
+    out.push_str("<turn|>\n");
+    out.push_str("<|turn>model\n");
+    out
+}
+
+/// The single correction pass's prompt (the `generate_with_repair` shape:
+/// prior raw output + every error, embedded).
+fn render_site_architect_repair(prior_raw: &str, errors: &[String]) -> String {
+    let mut out = String::with_capacity(2048);
+    out.push_str("<|turn>system\n");
+    out.push_str(
+        "Your previous site map was invalid. Emit ONLY one corrected fenced ```json object. \
+         Fix EVERY error:\n",
+    );
+    for e in errors {
+        out.push_str(&format!("- {}\n", e));
+    }
+    if crate::settings::THINKING_ENABLED {
+        out.push_str("<|think|>");
+    }
+    out.push_str("<turn|>\n");
+    out.push_str("<|turn>user\n");
+    out.push_str("Your previous output was:\n");
+    out.push_str(&prior_raw.chars().take(2000).collect::<String>());
+    out.push_str("\n---\nEmit the corrected fenced ```json object now.\n<turn|>\n");
+    out.push_str("<|turn>model\n");
+    out
+}
+
+/// (2026-08-19 Hidden site maps) The JIT Architect: on ARRIVAL at a node with
+/// no map whose `setting` is indoor OR that carries seeds, run ONE
+/// deterministic E4B pass (the Tracker profile — the Architect mode shares
+/// it, with a 512-token reserve + hard over-budget refusal) that emits the
+/// site's objective truth as one fenced JSON object. On success the map is
+/// inserted + the node's seeds consumed; the same turn's Stage-2 narrator
+/// tail then renders the knowledge-filtered `site:` block (schema dictates,
+/// narrator illustrates).
+///
+/// **Lock discipline:** called in the `fable_send` window where the engine
+/// Arc, the Fable lease, and the turn lock are all still held — a second
+/// `request_turn` on the same engine is a fresh prefill (the dev-narrator
+/// precedent). The schema lock is taken only for the trigger check + the
+/// insert, NEVER across the decode. **Failure contract:** any failure (2
+/// parse/validate passes, engine/channel error, cancel) skips SILENTLY —
+/// the narrator proceeds map-less (today's behavior) and the idempotence
+/// check re-architects next turn. Cost: one ~512-token decode (~8-15s on
+/// the E4B) ONCE per site — the accepted price of objective reality before
+/// narration.
+async fn maybe_run_site_architect(
+    state: &tauri::State<'_, AppState>,
+    engine: &Arc<fable_engine::FableEngine>,
+    cancel: &llm::CancelToken,
+    tracker_window: &[session::Message],
+) {
+    // 1. Trigger check under the schema lock (idempotent: a mapped node
+    //    never re-architects — write-once maps).
+    let brief: Option<SiteBrief> = {
+        let s = state.fable_schema.lock().await;
+        let Some(cur) = s.travel_graph.current_node.clone() else {
+            return;
+        };
+        if s.site_maps.contains_key(&cur) {
+            return;
+        }
+        let (node_name, setting, seeds, evolved) =
+            match s.travel_graph.find_node(&cur) {
+                Some(n) => (n.name.clone(), n.setting.clone(), n.seeds.clone(), n.last_evolved_minutes),
+                None => (cur.clone(), String::new(), Vec::new(), 0),
+            };
+        let indoor = setting.trim().eq_ignore_ascii_case("indoor");
+        if !indoor && seeds.is_empty() {
+            return;
+        }
+        let now = s.world_clock.current_minutes;
+        let elapsed_days = if evolved > 0 { (now - evolved).max(0) / 1440 } else { 0 };
+        let premise: String = {
+            let mut acc = String::new();
+            for m in tracker_window {
+                let t = m.content.trim();
+                if !t.is_empty() {
+                    if !acc.is_empty() {
+                        acc.push(' ');
+                    }
+                    acc.push_str(t);
+                }
+            }
+            acc.chars().take(1200).collect()
+        };
+        Some(SiteBrief {
+            node_id: cur,
+            node_name,
+            tone: s.tone.clone().unwrap_or_default(),
+            elapsed_days,
+            seeds,
+            premise,
+        })
+    };
+    let Some(brief) = brief else {
+        return;
+    };
+
+    // 2. Decode — ONE correction pass on failure (the generate_with_repair
+    //    shape); a second failure skips silently.
+    let noop_chunk: llm::ChunkFn = Arc::new(|_: &str| {});
+    let mut attempt_prompt = render_site_architect_prompt(&brief);
+    let mut parsed_map: Option<crate::site_map::SiteMap> = None;
+    for pass in 1..=2u8 {
+        let reply = match engine.request_turn(
+            attempt_prompt.clone(),
+            noop_chunk.clone(),
+            cancel.clone(),
+            fable_engine::FableTurnMode::Architect,
+        ) {
+            Ok(reply_rx) => match tokio::task::spawn_blocking(move || reply_rx.recv()).await {
+                Ok(Ok(r)) => r,
+                _ => {
+                    return;
+                }
+            },
+            Err(_) => {
+                return;
+            }
+        };
+        if !reply.error.is_empty() || reply.cancelled {
+            return;
+        }
+        let raw = reply.raw_output;
+        // Pass 1's errors feed the ONE correction prompt; a pass-2 failure
+        // falls through and skips silently (the documented shape).
+        let parsed = match crate::site_map::SiteMap::from_model_output(&raw) {
+            Err(e) => Err(vec![e]),
+            Ok(m) => match crate::site_map::validate(&m) {
+                Ok(()) => Ok(m),
+                Err(errs) => Err(errs),
+            },
+        };
+        match parsed {
+            Ok(m) => {
+                parsed_map = Some(m);
+                break;
+            }
+            Err(errors) if pass == 1 => {
+                attempt_prompt = render_site_architect_repair(&raw, &errors);
+            }
+            Err(_) => {}
+        }
+    }
+    let Some(mut map) = parsed_map else {
+        return;
+    };
+
+    // 3. Insert under the schema lock. Re-verify idempotence + arrival (a
+    //    [TRAVEL] in this turn's brackets may have moved the player — the
+    //    map belongs to wherever they NOW stand, which is what we checked;
+    //    a concurrent map insert is impossible under the turn lock, but the
+    //    check is free). Snapshot BEFORE the insert (the uniform undo-ring
+    //    discipline — a reverted turn un-creates the map with everything
+    //    else).
+    let (area_count, asset_count, threat) = (map.areas.len(), map.assets.len(), map.threat);
+    {
+        let mut s = state.fable_schema.lock().await;
+        let Some(cur) = s.travel_graph.current_node.clone() else {
+            return;
+        };
+        if cur != brief.node_id || s.site_maps.contains_key(&cur) {
+            return;
+        }
+        map.node_id = cur.clone();
+        map.last_visit_minutes = s.world_clock.current_minutes;
+        let snap = s.clone();
+        // The seeds just germinated into a map — consume them.
+        if let Some(node) = s.travel_graph.nodes.iter_mut().find(|n| n.id == cur) {
+            node.seeds.clear();
+        }
+        crate::site_map::evict_lru_site_map(&mut s.site_maps, &cur);
+        s.site_maps.insert(cur, map);
+        drop(s);
+        tracing::info!(
+            node = %brief.node_id,
+            areas = area_count,
+            assets = asset_count,
+            threat = %threat.word(),
+            "site architect: interior map inserted"
+        );
+        push_fable_history_snapshot(&state, snap).await;
+    }
 }
 
 /// Applies the turn's `[TIME ...]` bracket + the pure-Rust tick mutations
@@ -6737,10 +7181,6 @@ async fn apply_time_command_and_maybe_tick(
                 prev_minutes = prev,
                 "ignoring [TIME] regression: clock only moves forward"
             );
-            crate::logs::log(
-                "BRK",
-                &format!("[TIME] REGRESSION rejected new={new_minutes} prev={prev}"),
-            );
             return false;
         }
         // (P1d) Pacing-aware clamp + directive derivation (pure core in
@@ -6763,13 +7203,6 @@ async fn apply_time_command_and_maybe_tick(
         };
         if !dirs.is_empty() {
             tracing::info!(count = dirs.len(), "[TIME] pacing clamp/day-crossing directives queued");
-            crate::logs::log(
-                "BRK",
-                &format!(
-                    "[TIME] clamped prev={} asked={} effective={} dirs={}",
-                    prev, new_minutes, effective_minutes, dirs.len()
-                ),
-            );
         }
         time_directives.extend(dirs);
         // (P1d) Bootstrap the sync stamp on the first observation of a
@@ -6806,15 +7239,6 @@ async fn apply_time_command_and_maybe_tick(
         prev_minutes,
         first_set = was_first_set,
         "clock advanced via [TIME] bracket"
-    );
-    crate::logs::log(
-        "BRK",
-        &format!(
-            "[TIME] advanced prev={} -> applied={} (first_set={})",
-            prev_minutes,
-            schema_snapshot.world_clock.current_minutes,
-            was_first_set
-        ),
     );
 
     // 3. First-call baseline: stamp `last_tick_minutes` and bail (no fire).
@@ -7111,16 +7535,38 @@ async fn fire_world_progression_tick(
     if interval_hours == 0 {
         return; // combat suspended the background sim between arm and fire
     }
+    // (2026-08-19 Stale Roulette) Designate the 3 stalest un-mapped sites —
+    // the world-progression pass may seed them; the watermarks stamp below
+    // regardless (rotation). Mapped sites never regenerate (write-once) and
+    // the current node is excluded (the player's bubble).
+    let designated: Vec<schema_engine::DesignatedSite> = site_map::select_stale_sites(
+        &schema_snapshot.travel_graph,
+        &schema_snapshot.site_maps,
+        schema_snapshot.travel_graph.current_node.as_deref(),
+        3,
+    )
+    .into_iter()
+    .map(|id| {
+        let node = schema_snapshot.travel_graph.find_node(&id);
+        let evolved = node.map(|n| n.last_evolved_minutes).unwrap_or(0);
+        schema_engine::DesignatedSite {
+            elapsed_days: if evolved > 0 {
+                (schema_snapshot.world_clock.current_minutes - evolved).max(0) / 1440
+            } else {
+                0
+            },
+            seeds: node.map(|n| n.seeds.clone()).unwrap_or_default(),
+            name: node.map(|n| n.name.clone()).unwrap_or_else(|| id.clone()),
+            id,
+        }
+    })
+    .collect();
     let deferred = {
         let mut q = state.failed_progression_queue.lock().await;
         std::mem::take(&mut *q)
     };
     if !deferred.is_empty() {
         tracing::info!(deferred = deferred.len(), "progression tick includes deferred re-attempts");
-        crate::logs::log(
-            "SCHEMA",
-            &format!("world tick FIRED (deferred re-attempts: {})", deferred.len()),
-        );
     }
 
     let context_swap = state.context_swap.clone();
@@ -7150,6 +7596,7 @@ async fn fire_world_progression_tick(
         &schema_snapshot,
         interval_hours,
         deferred.clone(),
+        designated.clone(),
     ) {
         Ok(rx) => rx,
         Err(e) => {
@@ -7186,10 +7633,6 @@ async fn fire_world_progression_tick(
     // queues at its boundary for exactly this reason).
     if !tick_session_live(state, turn_card_id, turn_generation).await {
         drop(deferred);
-        crate::logs::log(
-            "SCHEMA",
-            "world tick DROPPED — session identity changed during the LLM wait",
-        );
         return;
     }
 
@@ -7222,6 +7665,55 @@ async fn fire_world_progression_tick(
         return;
     }
 
+    // 7b. (2026-08-19 Stale Roulette) Consume the delta's `site_seeds` +
+    //     stamp the designated watermarks BEFORE the apply gate — a
+    //     seeds-only delta (has_changes() == false) still plants. The seeds
+    //     are Rust-consumed (`apply_delta` never touches node seeds — the
+    //     strip_invalid_relationship_writes pattern), each validated against
+    //     the graph + `clean_free_text`-capped, pushed into `Node.seeds`
+    //     (cap 2 FIFO). Stamping ALL designated sites (seeds or not) is the
+    //     rotation guarantee: a quiet site still rotates out of the next
+    //     tick's stalest-3.
+    if !designated.is_empty() {
+        let seeds_taken: Option<std::collections::HashMap<String, String>> =
+            reply.delta.as_ref().and_then(|d| d.site_seeds.clone());
+        {
+            let mut s = state.fable_schema.lock().await;
+            let snap = s.clone();
+            if let Some(seeds) = seeds_taken {
+                for (node_id, seed_raw) in seeds {
+                    let Some(node) = s.travel_graph.nodes.iter_mut().find(|n| n.id == node_id)
+                    else {
+                        // Unknown node — refuse quietly; seeds never mint nodes.
+                        continue;
+                    };
+                    let seed = bracket_parser::clean_free_text(
+                        &seed_raw,
+                        crate::site_map::SITE_SEED_CHAR_MAX,
+                    );
+                    if seed.is_empty() {
+                        continue;
+                    }
+                    if !node.seeds.iter().any(|existing| *existing == seed) {
+                        node.seeds.push(seed);
+                    }
+                    let overflow = node.seeds.len().saturating_sub(crate::site_map::NODE_SEEDS_MAX);
+                    if overflow > 0 {
+                        node.seeds.drain(..overflow);
+                    }
+                }
+            }
+            let now = s.world_clock.current_minutes;
+            for d in &designated {
+                if let Some(node) = s.travel_graph.nodes.iter_mut().find(|n| n.id == d.id) {
+                    node.last_evolved_minutes = now;
+                }
+            }
+            drop(s);
+            push_fable_history_snapshot(&state, snap).await;
+        }
+    }
+
     // 8. Apply the resulting delta to `fable_schema`. The next narrator turn
     //    sees the moved world via the existing `<world_state>` injection.
     if let Some(mut delta) = reply.delta {
@@ -7250,16 +7742,8 @@ async fn fire_world_progression_tick(
                     .unwrap_or(0),
                 "world progression delta applied to game_schema"
             );
-            crate::logs::log(
-                "SCHEMA",
-                &format!(
-                    "world tick delta applied entities={}",
-                    delta.entities.as_ref().map(|m| m.len()).unwrap_or(0)
-                ),
-            );
         } else {
             tracing::debug!("world progression pass emitted empty delta (nothing moved)");
-            crate::logs::log("SCHEMA", "world tick emitted EMPTY delta");
         }
     }
 
@@ -8763,10 +9247,6 @@ async fn enter_fable_session(
                         &mut prior_schema.player_state.pack,
                     );
                     tracing::info!(seeded, "player inventory seeded into typed model");
-                    crate::logs::log(
-                        "INV",
-                        &format!("player inventory seed: {} item(s) -> typed model", seeded),
-                    );
                 }
             }
             // Transient starting gameplay conditions (2026-08-13): the Player
@@ -8817,7 +9297,7 @@ async fn enter_fable_session(
                     id: cn.id.clone(),
                     name: cn.name.clone(),
                     neighbors: cn.neighbors.clone(),
-                    setting: cn.setting.clone(),
+                    setting: cn.setting.clone(), ..Default::default()
                 })
                 .collect(),
             // The first <node> in document order is the seed location.
@@ -8841,7 +9321,7 @@ async fn enter_fable_session(
                 id: node_id.clone(),
                 name: loc.to_owned(),
                 neighbors: vec![],
-                setting: String::new(),
+                setting: String::new(), ..Default::default()
             };
             if prior_schema.travel_graph.upsert_node(node) {
                 prior_schema.travel_graph.current_node = Some(node_id.clone());
@@ -8854,22 +9334,40 @@ async fn enter_fable_session(
     // seed above (same gate shape: only seed when the schema's registry is
     // empty AND the card declares a cast — a resumed save with a populated
     // registry is left alone, preserving the player's [PRESENCE] state).
+    // (2026-08-19 player-name guard, entry seam) Authored registry seeds are
+    // written blind to whichever player attaches later — an entry whose id
+    // or name IS the player would put the player on-camera as an NPC from
+    // turn 1 (the twin-Lacey corruption, authored-data edition). Both seed
+    // sites below skip such collisions loudly (SYS), never fatally.
+    let entry_player_slug = card
+        .player_name
+        .as_deref()
+        .map(|n| sanitize_slug(n))
+        .unwrap_or_default();
     if prior_schema.npc_registry.entries.is_empty() && !card.cast.is_empty() {
         prior_schema.npc_registry = schema::NpcRegistry {
             entries: card
                 .cast
                 .iter()
-                .map(|cn| schema::NpcEntry {
-                    id: cn.id.clone(),
-                    name: cn.name.clone(),
-                    role: cn.role.clone(),
-                    tier: cn.tier.clone(),
-                    aliases: cn.aliases.clone(),
-                    // (2026-08-18) Authored cast = Core prominence: full
-                    // interior, reaper-immune, registry-pinned (§ the 3-tier
-                    // ruling — the card author put them in the world
-                    // deliberately).
-                    prominence: schema::NpcProminence::Core,
+                .filter_map(|cn| {
+                    if !entry_player_slug.is_empty()
+                        && (sanitize_slug(&cn.id) == entry_player_slug
+                            || sanitize_slug(&cn.name) == entry_player_slug)
+                    {
+                        return None;
+                    }
+                    Some(schema::NpcEntry {
+                        id: cn.id.clone(),
+                        name: cn.name.clone(),
+                        role: cn.role.clone(),
+                        tier: cn.tier.clone(),
+                        aliases: cn.aliases.clone(),
+                        // (2026-08-18) Authored cast = Core prominence: full
+                        // interior, reaper-immune, registry-pinned (§ the 3-tier
+                        // ruling — the card author put them in the world
+                        // deliberately).
+                        prominence: schema::NpcProminence::Core,
+                    })
                 })
                 .collect(),
         };
@@ -8891,7 +9389,20 @@ async fn enter_fable_session(
             .entries
             .iter()
             .any(|e| e.id == card.id);
-        if !already {
+        // (2026-08-19 player-name guard, entry seam) An npc card sharing the
+        // attached player's exact name would self-register the player as an
+        // NPC from turn 1 — skip loudly; the character can still emerge in
+        // play under a distinguishing name.
+        let self_collides_player = !entry_player_slug.is_empty()
+            && (sanitize_slug(&card.id) == entry_player_slug
+                || sanitize_slug(&card.name) == entry_player_slug);
+        if self_collides_player {
+            tracing::warn!(
+                card = %card.id,
+                "npc card shares the attached player's name — self-register skipped"
+            );
+        }
+        if !already && !self_collides_player {
             prior_schema.npc_registry.entries.push(schema::NpcEntry {
                 id: card.id.clone(),
                 name: card.name.clone(),
@@ -8907,34 +9418,98 @@ async fn enter_fable_session(
                 .npc_interior
                 .entry(card.id.clone())
                 .or_default();
-            for (name, equippable) in card
+            // (2026-08-19 zone sweep, Chloe ruling: npc-card clothing is
+            // auto-EQUIPPED and tracked from turn one) The outfit splits from
+            // the held rack: Clothing + garment-routable Equipped/Accessories
+            // WEAR (`worn` — renders as the `wearing:` line); weapon-ish
+            // Equipped + non-specific Accessories + Stored stay HELD (the
+            // `[NPC_ITEM]` theft loop's rack). A legacy interior that seeded
+            // everything onto `items` migrates: worn-class names move across,
+            // so an outfit never renders as a shopping bag twice.
+            let weaponish = |name: &str| {
+                const WEAPON_TERMS: [&str; 14] = [
+                    "sword", "blade", "axe", "bow", "dagger", "staff", "spear",
+                    "hammer", "knife", "wand", "mace", "lance", "rapier", "scythe",
+                ];
+                let lower = name.to_lowercase();
+                WEAPON_TERMS.iter().any(|t| lower.contains(t))
+            };
+            let worn_class = |name: &str, from_clothing: bool| {
+                if from_clothing {
+                    return true; // the Clothing line IS the outfit
+                }
+                // Equipped garments + specific jewelry wear; weapons stay held;
+                // non-specific accessories stay held (Chloe: "if something
+                // isn't specific then going into inventory is perfectly fine").
+                let lower = name.to_lowercase();
+                !weaponish(name) && equipment::route_legacy_to_slot(&lower).is_some()
+            };
+            // Legacy migration first: worn-class names already on the held
+            // rack (pre-split saves) move to `worn`.
+            let legacy_moves: Vec<equipment::StackItem> = rack
+                .items
+                .iter()
+                .filter(|it| worn_class(&it.name, false))
+                .cloned()
+                .collect();
+            if !legacy_moves.is_empty() {
+                rack.items.retain(|it| !worn_class(&it.name, false));
+                for it in legacy_moves {
+                    equipment::stack_upsert(&mut rack.worn, it);
+                }
+            }
+            for (name, line) in card
                 .inventory
                 .clothing
                 .iter()
-                .map(|n| (n, true))
-                .chain(card.inventory.equipped.iter().map(|n| (n, true)))
-                .chain(card.inventory.accessories.iter().map(|n| (n, false)))
-                .chain(card.inventory.stored.iter().map(|n| (n, false)))
+                .map(|n| (n, 0))
+                .chain(card.inventory.equipped.iter().map(|n| (n, 1)))
+                .chain(card.inventory.accessories.iter().map(|n| (n, 2)))
+                .chain(card.inventory.stored.iter().map(|n| (n, 3)))
             {
                 let name = name.trim();
                 if name.is_empty() {
                     continue;
                 }
-                equipment::stack_upsert(
-                    &mut rack.items,
-                    equipment::StackItem {
-                        name: name.to_string(),
-                        qty: 1,
-                        stats: None,
-                        tags: if equippable { vec![equipment::ItemTag::Equippable] } else { vec![] },
-                        ..equipment::StackItem::default()
-                    },
-                );
+                // Idempotence: the name already lives where it belongs
+                // (stack_upsert would merge anyway, but the line split must
+                // not flap a resumed save's evolved rack).
+                let already_worn = rack
+                    .worn
+                    .iter()
+                    .any(|i| i.name.trim().eq_ignore_ascii_case(name));
+                let already_held = rack
+                    .items
+                    .iter()
+                    .any(|i| i.name.trim().eq_ignore_ascii_case(name));
+                if already_worn || already_held {
+                    continue;
+                }
+                let equippable = line != 3;
+                let item = equipment::StackItem {
+                    name: name.to_string(),
+                    qty: 1,
+                    stats: None,
+                    tags: if equippable { vec![equipment::ItemTag::Equippable] } else { vec![] },
+                    ..equipment::StackItem::default()
+                };
+                let wear = match line {
+                    0 => true,                       // Clothing
+                    1 => worn_class(name, false),    // Equipped garments wear
+                    2 => worn_class(name, false),    // specific Accessories wear
+                    _ => false,                      // Stored
+                };
+                if wear {
+                    equipment::stack_upsert(&mut rack.worn, item);
+                } else {
+                    equipment::stack_upsert(&mut rack.items, item);
+                }
             }
-            crate::logs::log(
-                "BRK",
-                &format!("npc card inventory seeded: {} item(s) on the rack", rack.items.len()),
-            );
+            // Cap the worn rack FIFO (authored outfits are small; the clip
+            // keeps a GLM-authored maximalist card bounded).
+            while rack.worn.len() > schema::NPC_WORN_MAX {
+                rack.worn.remove(0);
+            }
         }
     }
     // Cold-start anchors (2026-08-19 v2): seed clock / weather / calendar /
@@ -9041,7 +9616,7 @@ async fn enter_fable_session(
                         id: id.clone(),
                         name: name.clone(),
                         neighbors: vec![],
-                        setting: String::new(),
+                        setting: String::new(), ..Default::default()
                     };
                     if prior_schema.travel_graph.upsert_node(node) {
                         prior_schema.travel_graph.current_node = Some(id.clone());
@@ -9507,7 +10082,11 @@ fn build_narrator_system_prompt(
     out.push_str("- [MILESTONE <npc_id> <event_id>] — a relationship meaningfully shifts.\n");
     out.push_str("- [TASK <npc_id> <description> | <difficulty> <suitability> <eta-minutes>] — all five fields; the pipe separates description from the three trailing fields.\n");
     out.push_str("- [APPEARANCE key=value] — keys: hair_color, eye_color, scars, wounds, tattoos, disguise, body_type, skin_complexion, hair_length, hair_style, breast_size, ears, tail, horn. Bare [APPEARANCE key] clears.\n");
-    out.push_str("- [EQUIP slot=<slot> name=<item> (layer=outer|inner) (stats=<note>) (tags=<tags>)] — slots: head, chest, main_hand, off_hand, legs, feet. main_hand/off_hand are READIED weapons only — belt-hung blades go in [BELT]. Bare [EQUIP slot=<slot>] unequips. Quote multi-word names.\n");
+    // (2026-08-19 NPC-perception upgrade) layer= is deliberately NOT taught:
+    // the applier's common-sense placement owns layering (cloak over shirt,
+    // socks under boots, footwear swaps). The parser still accepts an explicit
+    // layer=outer|inner (respected verbatim) for training-residue emissions.
+    out.push_str("- [EQUIP slot=<slot> name=<item> (stats=<note>) (tags=<tags>)] — slots: head, neck, chest, arms, hands, main_hand, off_hand, legs, feet (necklace → neck, bracers/gloves → arms/hands). main_hand/off_hand are READIED weapons only — belt-hung blades go in [BELT]. Bare [EQUIP slot=<slot>] unequips. Quote multi-word names.\n");
     out.push_str("- [BELT name=<item> (qty=N) (tags=<tags>)] / [BELT -<name>] — quick-access items (a belt knife, a potion, a pouch).\n");
     out.push_str("- [PACK name=<item> (qty=N) (tags=<tags>)] / [PACK -<name>] — deep storage add/remove; check the pack line first.\n");
     // (2026-08-18 Dedicated-NPC interior state) The NPC-interior verbs —
@@ -9516,6 +10095,13 @@ fn build_narrator_system_prompt(
     out.push_str("- [NPC_ITEM <npc_id> +<item> (qty=N)] / [NPC_ITEM <npc_id> -<item>] — an NPC gains/loses a held item (steals, receives, spends). Quote multi-word names.\n");
     out.push_str("- [MOOD <npc_id> <short mood>] — an on-camera NPC's emotional state shifted.\n");
     out.push_str("- [INTENT <npc_id> <one-line plan or suspicion>] — what that NPC now intends or believes about the player.\n");
+    // (2026-08-19 Hidden site maps + Referee QoL) The site verbs + the
+    // promise verb. ROOM/ASSET ids come from the `site:` slice in
+    // <world_state> (door target ids are legal ROOM targets — a door is a
+    // visible fact); without a site block both reject.
+    out.push_str("- [ROOM <area_id> visited|discovered] — the player entered (bare form = visited) or learned of a room of the current site. Ids come from the site block.\n");
+    out.push_str("- [ASSET <asset_id> dead|taken|triggered|active|known|suspected|count=N] — a site creature/trap/loot/object changed; add form: [ASSET +<name> kind=<creature|group|trap|hazard|loot|object> loc=<area_id> (count=N) (detail=…)].\n");
+    out.push_str("- [PROMISE <npc_id> <description> | <minutes>] — the player accepted an obligation; fulfilled/reneged: [PROMISE <npc_id> -<description>].\n");
     out.push_str("Tags (EQUIP/BELT/PACK): consumable, equippable, pocketable — see <item_rules> above.\n");
     // NOTE (#26c, 2026-08-15): `CharacterTurn` / `Object` / `Fx` are
     // LEGACY-RECOGNIZED only — the parser + streaming filter still accept +
@@ -9840,8 +10426,9 @@ fn build_creator_assistant_system_prompt(creator_kind: &str) -> String {
 fn render_fable_world_state(
     s: &schema::WorldSchema,
     turn_directives: &[String],
+    reveal_beneath: bool,
 ) -> String {
-    let mut rendered = s.render_for_prompt();
+    let mut rendered = s.render_for_prompt_with_beneath(reveal_beneath);
 
     // Condition + active status tags (Phase 3 Slice 2 + 4 render). Expired
     // tags don't count (2026-08-16 audit M1) — the tick's sweep is suspended
@@ -9930,6 +10517,13 @@ struct LeanCaps {
     event_chars: usize,
     pack: usize,
     custom: usize,
+    /// (2026-08-19 Hidden site maps) The `site:` line cap — the tracker's
+    /// slice is ids, not prose, but an 8-area site with doors + assets is
+    /// still a long single line.
+    site: usize,
+    /// (2026-08-19 Referee QoL) The `bonds:`/`owed:` line caps.
+    bonds: usize,
+    owed: usize,
     /// `None` = the cast line passes through uncapped (stage 0 — it is
     /// the [PRESENCE] id whitelist, clipped only under real pressure).
     cast: Option<usize>,
@@ -9949,6 +10543,9 @@ const STAGE0: LeanCaps = LeanCaps {
     event_chars: 170,
     pack: 240,
     custom: 260,
+    site: 240,
+    bonds: 200,
+    owed: 200,
     cast: None,
 };
 // Stage 1 — long-campaign bloat: narrative context shrinks first.
@@ -9961,6 +10558,9 @@ const STAGE1: LeanCaps = LeanCaps {
     event_chars: 170,
     pack: 200,
     custom: 260,
+    site: 160,
+    bonds: 140,
+    owed: 140,
     cast: None,
 };
 // Stage 2 — pathological composition: everything clipped, cast included.
@@ -9973,6 +10573,9 @@ const STAGE2: LeanCaps = LeanCaps {
     event_chars: 170,
     pack: 160,
     custom: 160,
+    site: 120,
+    bonds: 100,
+    owed: 100,
     cast: Some(520),
 };
 // The world-state's share of TRACKER_PROMPT_CHAR_BUDGET: fixed overhead
@@ -9981,7 +10584,21 @@ const STAGE2: LeanCaps = LeanCaps {
 const WS_BUDGET: usize = 3_200;
 
 fn render_tracker_world_state(s: &schema::WorldSchema) -> String {
-    let rich = render_fable_world_state(s, &[]);
+    let mut rich = render_fable_world_state(s, &[], false);
+    // (2026-08-19 Hidden site maps) The TRACKER gets the compact id-bearing
+    // site slice, not the narrator prose: swap the multi-line `site:` block
+    // for the single-line ids + doors (a door's TARGET id is exactly how an
+    // unrevealed room is first entered via [ROOM] — the tracker may see it;
+    // the room's contents stay a `?`).
+    if let Some(compact) = s
+        .travel_graph
+        .current_node
+        .as_deref()
+        .and_then(|cur| s.site_maps.get(cur))
+        .and_then(site_map::render_tracker_slice)
+    {
+        rich = swap_site_block_for_tracker(&rich, &compact);
+    }
     let mut lean = lean_world_state_surgery(&rich, &STAGE0);
     if lean.chars().count() > WS_BUDGET {
         lean = lean_world_state_surgery(&rich, &STAGE1);
@@ -9997,6 +10614,29 @@ fn render_tracker_world_state(s: &schema::WorldSchema) -> String {
         lean = truncate_at_line_boundary(&lean, WS_BUDGET);
     }
     lean
+}
+
+/// (2026-08-19) Replace the rich `site:` block (the `site:` line + its
+/// indented continuations) with the compact single-line tracker slice.
+/// Pure; a no-op passthrough when no block is present.
+fn swap_site_block_for_tracker(rich: &str, compact: &str) -> String {
+    let mut out: Vec<String> = Vec::with_capacity(32);
+    let mut in_site = false;
+    for line in rich.lines() {
+        if in_site {
+            if line.starts_with("  ") {
+                continue;
+            }
+            in_site = false;
+        }
+        if line == "site:" {
+            in_site = true;
+            out.push(format!("site: {compact}"));
+            continue;
+        }
+        out.push(line.to_string());
+    }
+    out.join("\n")
 }
 
 /// One line-surgery pass of [`render_tracker_world_state`] over the rich
@@ -10018,7 +10658,35 @@ fn lean_world_state_surgery(rich: &str, caps: &LeanCaps) -> String {
         event_lines.clear();
     };
 
+    // (2026-08-19) The `site:` block collector — the rich render emits
+    // `site:` + indented continuation lines; the surgery flattens the whole
+    // block to ONE capped line (dropping the block + its continuations
+    // together, the injuries-line discipline, but capped rather than
+    // dropped: the tracker needs the ids).
+    let mut site_lines: Vec<String> = Vec::new();
+    let mut in_site = false;
+
     for line in rich.lines() {
+        if in_site {
+            if line.starts_with("  ") {
+                site_lines.push(line.trim().to_string());
+                continue;
+            }
+            in_site = false;
+            out.push(format!(
+                "site: {}",
+                lean_truncate_line(&site_lines.join("; "), caps.site)
+            ));
+            site_lines.clear();
+        }
+        // The block HEADER (bare `site:` with no content) opens the block —
+        // never pushed verbatim (the flush emits the flattened line). The
+        // single-line form (`site: <ids>`, post-swap) falls through to the
+        // strip-prefix caps below.
+        if line == "site:" {
+            in_site = true;
+            continue;
+        }
         if line.starts_with("recent_events:") {
             flush_events(&mut out, &mut event_lines);
             in_events = true;
@@ -10049,12 +10717,27 @@ fn lean_world_state_surgery(rich: &str, caps: &LeanCaps) -> String {
             Some(format!("pack: {}", lean_truncate_line(v, caps.pack)))
         } else if let Some(v) = line.strip_prefix("custom: ") {
             Some(format!("custom: {}", lean_truncate_line(v, caps.custom)))
+        } else if let Some(v) = line.strip_prefix("site: ") {
+            // The post-swap single-line form (the tracker slice).
+            Some(format!("site: {}", lean_truncate_line(v, caps.site)))
+        } else if let Some(v) = line.strip_prefix("bonds: ") {
+            Some(format!("bonds: {}", lean_truncate_line(v, caps.bonds)))
+        } else if let Some(v) = line.strip_prefix("owed: ") {
+            Some(format!("owed: {}", lean_truncate_line(v, caps.owed)))
         } else if let (Some(v), Some(cap)) = (line.strip_prefix("cast: "), caps.cast) {
             Some(format!("cast: {}", lean_truncate_line(v, cap)))
         } else {
             None
         };
         out.push(capped.unwrap_or_else(|| line.to_string()));
+    }
+    // A site block still open at EOF (site: was the last block in the rich
+    // render — it never is, the player_state block follows, but be total).
+    if in_site && !site_lines.is_empty() {
+        out.push(format!(
+            "site: {}",
+            lean_truncate_line(&site_lines.join("; "), caps.site)
+        ));
     }
     flush_events(&mut out, &mut event_lines);
     out.join("\n")
@@ -10263,69 +10946,19 @@ async fn restore_tick_directives(state: &AppState, snapshot: &[String]) {
 /// (left-drawer Consume/Equip) was consumed at turn start; every abort path
 /// re-arms it so the retry turn still honors the tactile UI action instead
 /// of silently eating it.
-/// One-line per-turn digest of the world state the narrator prompt carries —
-/// the "what the AI actually sees" verification line: location + its diegetic
-/// name, exit count, on-camera NPCs, equipped OUTER layer (the only layer the
-/// narrator ever sees), belt rack, pack stack count, clock, weather, rumors.
-/// Share-safe: ids + brief-capped names only (diaglog.rs contract).
-fn log_world_digest(s: &schema::WorldSchema) {
-    if !crate::logs::is_on() {
-        return;
-    }
-    let loc = s
-        .travel_graph
-        .current_node
-        .clone()
-        .unwrap_or_else(|| "(none)".into());
-    let (loc_name, exits) = s
-        .travel_graph
-        .nodes
-        .iter()
-        .find(|n| n.id == loc)
-        .map(|n| (n.name.clone(), n.neighbors.len()))
-        .unwrap_or_default();
-    let present: Vec<&str> = s.presences.iter().map(|p| p.npc_id.as_str()).collect();
-    let equipped: Vec<String> = s
-        .player_state
-        .equipment
-        .iter()
-        .filter_map(|(slot, layers)| {
-            layers.outer.as_ref().map(|it| {
-                format!("{slot:?}:{}", crate::logs::brief_with(&it.name, 24))
-            })
-        })
-        .collect();
-    let belt: Vec<String> = s
-        .player_state
-        .belt
-        .iter()
-        .map(|it| format!("{}x{}", crate::logs::brief_with(&it.name, 24), it.qty))
-        .collect();
-    let (day, hh, mm) = if s.world_clock.is_set() {
-        let m = s.world_clock.current_minutes;
-        ((m / 60) / 24, (m / 60) % 24, m % 60)
+/// Capped, whitespace-collapsed echo of an id/name the tracker emitted —
+/// used inside reject-directive text so the model sees exactly what it sent.
+/// (The one survivor of the retired logs::brief previewer: these strings
+/// are model-facing directives, not log lines.)
+fn echo_id(s: &str, cap: usize) -> String {
+    let collapsed = s.split_whitespace().collect::<Vec<&str>>().join(" ");
+    let n = collapsed.chars().count();
+    if n <= cap {
+        collapsed
     } else {
-        (-1, 0, 0)
-    };
-    crate::logs::log(
-        "FABLE",
-        &format!(
-            "world digest: loc={} (\"{}\") exits={} present=[{}] equipped=[{}] belt=[{}] pack_stacks={} clock=D{}/{}:{:02} weather=\"{}\" rumors={} entities={}",
-            loc,
-            crate::logs::brief_with(&loc_name, 24),
-            exits,
-            present.join(","),
-            equipped.join(","),
-            belt.join(","),
-            s.player_state.pack.len(),
-            day,
-            hh,
-            mm,
-            crate::logs::brief_with(&s.weather.condition, 24),
-            s.rumors.len(),
-            s.entities.len()
-        ),
-    );
+        let head: String = collapsed.chars().take(cap).collect();
+        format!("{head}\u{2026}(+{n}c)")
+    }
 }
 
 async fn emit_fable_api_lost(
@@ -10372,10 +11005,6 @@ async fn emit_fable_api_lost(
     // api_lost reverts just completed above, so the captured pairing is the
     // reverted state, not a later racing snapshot.
     spawn_reserved_autosave(app, state).await;
-    crate::logs::log(
-        "FABLE",
-        &format!("api_lost msg={}", crate::logs::brief_with(message, 90)),
-    );
     on_event
         .send(serde_json::json!({
             "type": "api_lost",
@@ -10518,16 +11147,6 @@ async fn fable_send(
     reroll: Option<bool>,
 ) -> Result<(), String> {
     tracing::info!(?text, regenerate, reroll, "fable_send");
-    crate::logs::log(
-        "FABLE",
-        &format!(
-            "turn start action={} chars={} regenerate={} reroll={}",
-            crate::logs::brief(&text),
-            text.chars().count(),
-            regenerate.unwrap_or(false),
-            reroll.unwrap_or(false)
-        ),
-    );
     // `regenerate: Some(true)` is set by the frontend after a rewind-and-edit
     // mutation: the user turn to reply to is already the last message in
     // `fable_session` (the mutation command left it there), so we SKIP pushing
@@ -10751,13 +11370,6 @@ async fn fable_send(
         } else {
             scene_pacing::evaluate(&text)
         };
-        crate::logs::log(
-            "REF",
-            &format!(
-                "pacing mode={:?} spatial={} emotional={} kinetic={} redo={}",
-                pacing.mode, pacing.spatial, pacing.emotional, pacing.kinetic, is_redo_turn
-            ),
-        );
 
         // Track whether anything mutated so we snapshot once for undo. All
         // three engines share a single history push (the snapshot captures
@@ -10839,13 +11451,6 @@ async fn fable_send(
             // Diagnostics (REF): the relation-to-player ladder moving is a
             // referee outcome — ids + tiers + reasons are mechanical tokens,
             // share-safe by construction.
-            crate::logs::log(
-                "REF",
-                &format!(
-                    "[rel] transition(s): {}",
-                    rel_transitions_logged.join(", ")
-                ),
-            );
         }
 
         // (2) Combat Referee. Slice 3 (2026-07-28): the outcome now carries a
@@ -10885,8 +11490,31 @@ async fn fable_send(
             consequence::Polarity::Debuff,
             s.world_clock.current_minutes,
         );
-        let attacker_tier =
-            player_state::select_attacker_tier_from_entities(&s.entities, &present_npc_ids);
+        let attacker_tier = {
+            // (2026-08-19 Hidden site maps) Combine the two tier sources with
+            // max: an on-camera NPC's declared `npc.<id>.tier` AND the
+            // current site's strongest revealed mob (Known/Suspected
+            // Creature/Group assets not Dead/Taken — the Schrödinger's
+            // Goblin in the room fights at its real weight even before the
+            // tracker registers it as an NPC).
+            let npc_tier =
+                player_state::select_attacker_tier_from_entities(&s.entities, &present_npc_ids);
+            let mob_tier = s
+                .travel_graph
+                .current_node
+                .as_deref()
+                .and_then(|cur| s.site_maps.get(cur))
+                .and_then(site_map::present_mob_tier);
+            // `select_attacker_tier_from_entities` returns a concrete tier
+            // (Soldier floor when no on-camera NPC declares one), so only the
+            // mob side is optional: max when present, the npc tier as-is when
+            // the current site has no revealed mob.
+            let combined = match mob_tier {
+                Some(m) => npc_tier.max(m),
+                None => npc_tier,
+            };
+            combined
+        };
         let combat_directive: Option<String> = if let Some(outcome) =
             player_state::referee_evaluate_with_tier(
                 &text,
@@ -10909,17 +11537,6 @@ async fn fable_send(
                 attacker_tier = ?attacker_tier,
                 "referee fired on combat/exertion keyword"
             );
-            crate::logs::log(
-                "REF",
-                &format!(
-                    "combat tier={:?} part={} state={:?} stamina={:?} lethal={}",
-                    attacker_tier,
-                    outcome.part.id(),
-                    outcome.new_state,
-                    outcome.stamina_after,
-                    outcome.lethal
-                ),
-            );
             if undo_snapshot.is_none() {
                 undo_snapshot = Some(s.clone());
             }
@@ -10939,15 +11556,6 @@ async fn fable_send(
         // world_state so they ride inside the existing `<world_state>` tag
         // the narrator already treats as hard fact.
         let skills = player_state::referee_evaluate_skill_checks(&text, pacing.mode.dc_modifier());
-        for sc in &skills {
-            crate::logs::log(
-                "REF",
-                &format!(
-                    "skill_check {} roll={} dc={} success={}",
-                    sc.skill, sc.roll, sc.dc, sc.success
-                ),
-            );
-        }
 
         // (3a) Phase 4 §11.44 (Component 1): Disguise Referee — the Rust-side
         // gate. Pure fn, no mutation (mirrors the skill-check Referee's
@@ -10990,7 +11598,6 @@ async fn fable_send(
                     tracing::info!(
                         "[disguise] scrutiny FAILED — disguise tag revoked mechanically"
                     );
-                    crate::logs::log("REF", "disguise scrutiny FAILED — tag revoked");
                 }
             }
         }
@@ -11035,17 +11642,6 @@ async fn fable_send(
             }
             line.push('.');
             tracing::info!("recovery referee fired (stamina={}, healed={:?})", r.stamina_recovered, r.healed.is_some());
-            crate::logs::log(
-                "REF",
-                &format!(
-                    "recovery stamina={} healed={}",
-                    r.stamina_recovered,
-                    r.healed
-                        .as_ref()
-                        .map(|(p, st)| format!("{}->{:?}", p.id(), st))
-                        .unwrap_or_else(|| "-".into())
-                ),
-            );
             line
         });
 
@@ -11084,22 +11680,11 @@ async fn fable_send(
         }
         if disguise_directive.is_some() {
             tracing::info!("disguise gate directive injected");
-            crate::logs::log(
-                "REF",
-                &format!(
-                    "disguise directive={}",
-                    crate::logs::brief_with(&disguise_directive.as_ref().map(|d| d.render()).unwrap_or_default(), 80)
-                ),
-            );
         }
         if !tick_directives.is_empty() {
             tracing::info!(
                 count = tick_directives.len(),
                 "off-screen task directives injected (from world progression tick)"
-            );
-            crate::logs::log(
-                "REF",
-                &format!("tick_directives_injected count={}", tick_directives.len()),
             );
         }
         if let Some(cd) = &combat_directive {
@@ -11435,15 +12020,17 @@ async fn fable_send(
                 }
             };
         tracing::info!("fable_send: API mode — tracker stage (local) starting");
-        let tracker_t0 = std::time::Instant::now();
         let engine = engine_opt
             .as_ref()
             .expect("tracker engine alive (dropped only in the API arm, post-tracker)");
         let tracker_reply_opt: Option<fable_engine::FableReply> = match tracker_prompt_opt {
             Some(tracker_prompt) => {
-                match engine
-                    .request_turn(tracker_prompt, noop_chunk.clone(), cancel.clone(), true)
-                {
+                match engine.request_turn(
+                    tracker_prompt,
+                    noop_chunk.clone(),
+                    cancel.clone(),
+                    fable_engine::FableTurnMode::Tracker,
+                ) {
                     Ok(reply_rx) => {
                         match tokio::task::spawn_blocking(move || reply_rx.recv()).await {
                             Ok(Ok(r)) => Some(r),
@@ -11467,22 +12054,6 @@ async fn fable_send(
             // above — proceed to the API narrator with pre-tracker state.
             None => None,
         };
-        crate::logs::log(
-            "FABLE",
-            &format!(
-                "tracker done {}ms ok={} cancelled={} raw_chars={}",
-                tracker_t0.elapsed().as_millis(),
-                tracker_reply_opt
-                    .as_ref()
-                    .map(|r| r.error.is_empty())
-                    .unwrap_or(false),
-                tracker_reply_opt.as_ref().map(|r| r.cancelled).unwrap_or(false),
-                tracker_reply_opt
-                    .as_ref()
-                    .map(|r| r.raw_output.chars().count())
-                    .unwrap_or(0)
-            ),
-        );
 
         // Apply the tracker's brackets to fable_schema (if it produced any).
         // Reuses the existing apply pipeline verbatim — zero new apply code.
@@ -11491,19 +12062,6 @@ async fn fable_send(
             if tracker_reply.error.is_empty() {
                 let cleaned_tracker = schema::extract_reply_channel(&tracker_reply.raw_output);
                 let tracker_parsed = bracket_parser::parse(&cleaned_tracker);
-                for cmd in &tracker_parsed.commands {
-                    crate::logs::log(
-                        "BRK",
-                        &format!(
-                            "cmd {}",
-                            crate::logs::brief_with(
-                                &serde_json::to_string(cmd)
-                                    .unwrap_or_else(|_| "<unserializable>".into()),
-                                200
-                            )
-                        ),
-                    );
-                }
                 if !tracker_parsed.commands.is_empty() {
                     tracing::info!(
                         cmd_count = tracker_parsed.commands.len(),
@@ -11555,43 +12113,28 @@ async fn fable_send(
                     let (_, travel_rejects) =
                         apply_phase3_bracket_commands(&tracker_parsed, &state, true, &tracker_window)
                             .await;
-                    for rd in &travel_rejects {
-                        crate::logs::log(
-                            "BRK",
-                            &format!("reject {}", crate::logs::brief_with(rd, 140)),
-                        );
-                    }
-                    let reject_count = travel_rejects.len();
                     turn_directives.extend(travel_rejects);
                     tick_armed =
                         apply_time_command_and_maybe_tick(&tracker_parsed, &state).await;
-                    crate::logs::log(
-                        "BRK",
-                        &format!(
-                            "applied {} cmd(s), {} reject directive(s), tick_armed={}",
-                            tracker_parsed.commands.len(),
-                            reject_count,
-                            tick_armed
-                        ),
-                    );
                 } else {
                     tracing::info!("fable_send: tracker produced no bracket commands");
-                    crate::logs::log("BRK", "tracker produced no bracket commands");
                 }
             } else {
                 tracing::warn!(
                     error = %tracker_reply.error,
                     "fable_send: tracker stage errored; proceeding to API narrator with pre-tracker state"
                 );
-                crate::logs::log(
-                    "FABLE",
-                    &format!(
-                        "tracker ERRORED err={}",
-                        crate::logs::brief_with(&tracker_reply.error, 120)
-                    ),
-                );
             }
         }
+
+        // (2026-08-19 Hidden site maps) JIT ARCHITECT — runs in the window
+        // where the engine Arc, the Fable lease, AND the turn lock are all
+        // still held (zero lock changes: a second request_turn on the same
+        // engine is a fresh prefill, the documented dev-narrator precedent).
+        // Arrival trigger, idempotent under the schema lock; on any failure
+        // it skips silently (the narrator proceeds map-less — today's
+        // behavior — and the next turn re-architects).
+        maybe_run_site_architect(&state, engine, &cancel, &tracker_window).await;
 
         // The tracker's local-model work is done — release the local-model
         // turn lock NOW so a concurrent chat_send / schema-delta can use the
@@ -11631,10 +12174,22 @@ async fn fable_send(
         // (combat lethality + skill checks + tick directives — assembled
         // pre-tracker, Referees run once) ride this render so the narrator
         // sees one coherent block of hard facts.
+        // (2026-08-19 exposure gate, the upskirt ruling) The reveal flag is
+        // computed from the SAME 2-message window the tracker read (the
+        // player's action + the preceding beat): when that window involves
+        // exposure, the player_state block gains one `beneath:` line naming
+        // the concealed wear — the narrator narrates the real garment, never
+        // an improvised contradiction. Every other turn renders identically
+        // (the flag is false and costs nothing).
+        let exposure_corpus: Vec<&str> = tracker_window
+            .iter()
+            .map(|m| m.content.as_str())
+            .chain(player_action.as_deref())
+            .collect();
+        let reveal_beneath = equipment::narrative_trips_exposure(&exposure_corpus);
         let narrator_world_state: Option<String> = {
             let s = state.fable_schema.lock().await;
-            log_world_digest(&s);
-            let rendered = render_fable_world_state(&s, &turn_directives);
+            let rendered = render_fable_world_state(&s, &turn_directives, reveal_beneath);
             if rendered.trim().is_empty() { None } else { Some(rendered) }
         };
 
@@ -11687,7 +12242,7 @@ async fn fable_send(
         // brackets; brackets this pass emits are STRIPPED-AND-DROPPED at the
         // post-reply parse (2026-08-15: the old defensive apply re-applied
         // them — a duplicate [TIME] double-advanced the clock in dev).
-        // tracker_mode=false → creative sampler for more natural prose to
+        // Narrator mode → creative sampler for more natural prose to
         // look at while styling.
         if dev_local_narrator {
             tracing::info!(
@@ -11715,7 +12270,7 @@ async fn fable_send(
                 narrator_prompt,
                 on_chunk.clone(),
                 cancel.clone(),
-                false, // tracker_mode=false → creative sampler
+                fable_engine::FableTurnMode::Narrator, // creative sampler
             ) {
                 Ok(reply_rx) => match tokio::task::spawn_blocking(move || reply_rx.recv()).await {
                     Ok(Ok(r)) => fable_engine::FableReply {
@@ -11847,29 +12402,12 @@ async fn fable_send(
             content: narrator_turn_tail.trim().to_string(),
             raw_output: String::new(),
         });
-        crate::logs::log(
-            "API",
-            &format!(
-                "narrator stream start msgs={} ctx={}",
-                api_msgs.len(),
-                context_size
-            ),
-        );
-        let narrator_t0 = std::time::Instant::now();
         let http = http_backend_cached(&state, &profile);
         match http
             .stream(api_msgs, None, None, Vec::new(), context_size, on_chunk.clone(), cancel.clone())
             .await
         {
             Ok(out) => {
-                crate::logs::log(
-                    "API",
-                    &format!(
-                        "narrator stream done {}ms cancelled={}",
-                        narrator_t0.elapsed().as_millis(),
-                        cancel.load(std::sync::atomic::Ordering::Relaxed)
-                    ),
-                );
                 fable_engine::FableReply {
                 // The API has no Gemma4 protocol markers, so raw_output is
                 // just the content. extract_reply_channel downstream is a
@@ -11922,13 +12460,6 @@ async fn fable_send(
             turn_card = %card.id,
             "fable_send: session ended mid-turn; dropping the turn (no ghost archival)"
         );
-        crate::logs::log(
-            "FABLE",
-            &format!(
-                "session changed mid-turn (card={}) — turn DROPPED, no ghost archival",
-                card.id
-            ),
-        );
         let _ = on_event.send(serde_json::json!({
             "type": "done",
             "final_text": "",
@@ -11948,7 +12479,6 @@ async fn fable_send(
     // consumed once. This is distinct from a soft `fable_stop` cancel
     // (reply.cancelled without the abort flag), which keeps its partial prose.
     if state.fable_abort_requested.swap(false, std::sync::atomic::Ordering::Relaxed) {
-        crate::logs::log("FABLE", "turn ABORTED (interrupt-reroll) — reverting schema + tick directives");
         // The drained tick directives never reached a delivered beat —
         // restore them for the next turn (2026-08-15 audit fix: a reroll
         // abort used to permanently drop one-shot world events).
@@ -12145,7 +12675,6 @@ async fn fable_send(
     // pop (same flags as the HTTP-Err path above).
     if parsed.prose.trim().is_empty() {
         tracing::warn!("fable_send: narrator returned empty prose; emitting api_lost (no phantom turn)");
-        crate::logs::log("API", "narrator returned EMPTY prose — api_lost path");
         restore_tick_directives(&state, &directives_at_turn_start).await;
         return emit_fable_api_lost(
             &on_event,
@@ -12195,19 +12724,6 @@ async fn fable_send(
         // One turn id for BOTH rows: the §4 retention key (same as the chat
         // archive spawn — the prune is partition-scoped, not path-scoped).
         let turn_uuid = memory::new_turn_uuid();
-        crate::logs::log(
-            "MEM",
-            &format!(
-                "fable archive armed turn={} user_chars={} asst_chars={} skip_asst={} (codex={} reroll={} regen={})",
-                turn_uuid,
-                user_text.chars().count(),
-                asst_text.chars().count(),
-                skip_asst_archive,
-                codex_was_injected,
-                reroll,
-                regenerate
-            ),
-        );
         tokio::spawn(async move {
             // (P3) A reroll/regenerate turn carries an EMPTY user text —
             // don't archive it (add_memory would warn "chunked to nothing"
@@ -12302,14 +12818,6 @@ async fn fable_send(
     // [TIME] gate already stamped the tick baseline — skipping the off-screen
     // pass made the clock advance with no world progression, permanently.
     // Log + fire the tick anyway.
-    crate::logs::log(
-        "FABLE",
-        &format!(
-            "turn done prose_chars={} cancelled={}",
-            parsed.prose.chars().count(),
-            reply.cancelled
-        ),
-    );
     if let Err(e) = on_event.send(serde_json::json!({
         "type": "done",
         "final_text": parsed.prose,
@@ -12347,7 +12855,6 @@ async fn fable_send(
 #[tauri::command]
 async fn fable_stop(state: tauri::State<'_, AppState>) -> Result<(), String> {
     tracing::info!("fable_stop requested");
-    crate::logs::log("FABLE", "fable_stop — soft cancel signaled (full revert on next check)");
     for slot in [&state.active_fable_cancel, &state.active_retrack_cancel] {
         let slot = slot.lock().expect("cancel slot mutex");
         if let Some(cancel) = slot.as_ref() {
@@ -12368,7 +12875,6 @@ async fn fable_stop(state: tauri::State<'_, AppState>) -> Result<(), String> {
 #[tauri::command]
 async fn fable_interrupt_reroll(state: tauri::State<'_, AppState>) -> Result<(), String> {
     tracing::info!("fable_interrupt_reroll requested");
-    crate::logs::log("FABLE", "interrupt_reroll — abort flag set (discard + revert + fresh roll)");
     state
         .fable_abort_requested
         .store(true, std::sync::atomic::Ordering::Relaxed);
@@ -12890,7 +13396,10 @@ async fn creator_assistant_turn(
             "Imported reference data, mechanically extracted from an external file. \
              Treat it as the user's AUTHORED starting concept — map its fields onto \
              the schema with high fidelity (preserve its lore; do not rewrite, \
-             condense, or paraphrase it away), and fill gaps by asking. The user's \
+             condense, or paraphrase it away), and fill gaps by asking. When the \
+             user's instructions explicitly ask you to refine or clean up this \
+             material (e.g. a raw lorebook import), apply that refinement while \
+             preserving every lore fact. The user's \
              live instructions outrank it: if they clearly describe a different \
              concept than this import, discard the imported material entirely — \
              emit \"discard_import\": true in your envelope and rebuild the draft \
@@ -13553,13 +14062,18 @@ async fn player_state_get(
 }
 
 /// Return the identity of the currently-seated fable card plus the chat-UI
-/// portrait data: `{ name, player_name, card_id, card_portrait_url,
+/// portrait data: `{ name, subtype, player_name, card_id, card_portrait_url,
 /// player_portrait_url, npc_names }`.
 ///
-/// - `name` / `player_name` — the stage's "(name) is currently typing.."
+/// - `name` / `player_name` — the stage's "(name) is currently typing..."
 ///   indicator + message-header names (card name → narrator beats;
 ///   player_name → user beats). `player_name` is "" when the card omits
 ///   `<player_name>`.
+/// - `subtype` — the wizard discriminator (`"npc"` | `"scenario"` |
+///   `"world"`), null when the card carries no `<subtype>`. Drives the
+///   typing indicator's voice (2026-08-19): npc cards read
+///   "(Name) is currently typing...", scenario/world cards read
+///   "Narrator is currently thinking...".
 /// - `card_id` — the seated card's id (for resolving the card portrait
 ///   sibling file `cards/<Name>/<Name>.<ext>`).
 /// - `card_portrait_url` — absolute path to the card/narrator portrait, or
@@ -13609,6 +14123,7 @@ fn fable_active_card_get(
         }).collect();
         serde_json::json!({
             "name": c.name,
+            "subtype": c.subtype.clone(),
             "player_name": c.player_name.clone().unwrap_or_default(),
             "card_id": c.id,
             "card_portrait_url": card_portrait_url,
@@ -13699,20 +14214,6 @@ async fn fable_schema_set(
     let schema_snapshot = state.fable_schema.lock().await.clone();
     save_schema(&app, &roleplay_card_id, &schema_snapshot).await;
     tracing::info!(card_id = %roleplay_card_id, "fable_schema_set: manual edit applied + persisted");
-    crate::logs::log(
-        "INV",
-        &format!(
-            "soul-gem UI edit applied (note={}) loc={:?} belt={} pack_stacks={} equipped_slots={}",
-            crate::logs::brief_with(
-                event_note.as_deref().unwrap_or(""),
-                60
-            ),
-            schema_snapshot.travel_graph.current_node,
-            schema_snapshot.player_state.belt.len(),
-            schema_snapshot.player_state.pack.len(),
-            schema_snapshot.player_state.equipment.len()
-        ),
-    );
     Ok(())
 }
 
@@ -15050,7 +15551,6 @@ async fn fable_rollback(
         hist.pop_back().map(|(_tag, snap)| snap)
     };
     let prior = prior.ok_or_else(|| "nothing to roll back: history is empty".to_string())?;
-    crate::logs::log("FABLE", "rollback — restoring prior schema snapshot from the ring");
     let diff = {
         let live = state.fable_schema.lock().await;
         // diff_schemas(prior=before-rollback-state, live=after-rollback-state):
@@ -15609,14 +16109,6 @@ async fn edit_message(
     app: tauri::AppHandle,
 ) -> Result<EditResponse, String> {
     let card_id = active_fable_card_id(&state)?;
-    crate::logs::log(
-        "FABLE",
-        &format!(
-            "edit_message index={} new_text={}",
-            index,
-            crate::logs::brief(&new_text)
-        ),
-    );
     let is_assistant = {
         let mut gs = state.fable_session.lock().await;
         // (2026-08-16 bug 14) Refuse a non-trailing ASSISTANT edit UP FRONT.
@@ -15680,7 +16172,6 @@ async fn retrack_edited_assistant_message(
     state: &tauri::State<'_, AppState>,
     app: &tauri::AppHandle,
 ) {
-    crate::logs::log("FABLE", &format!("edit re-track START index={index}"));
     // (2026-08-16 bug 8) Session identity captured at ENTRY for the deferred
     // tick. The old fire-site read pulled `active_card_id` FRESH and passed
     // it to the guard — comparing the live slot against itself, a no-op that
@@ -15715,14 +16206,6 @@ async fn retrack_edited_assistant_message(
                 index,
                 total = gs.messages.len(),
                 "edit re-track refused: message is not the trailing assistant beat (later turns' world state would be discarded)"
-            );
-            crate::logs::log(
-                "FABLE",
-                &format!(
-                    "edit re-track REFUSED index={} (not trailing; len={})",
-                    index,
-                    gs.messages.len()
-                ),
             );
             return;
         }
@@ -15866,7 +16349,12 @@ async fn retrack_edited_assistant_message(
         let (_lease, engine) = acquire_fable_engine_leased(state, app).await?;
         let noop_chunk: llm::ChunkFn = Arc::new(|_: &str| {});
         let reply_rx = engine
-            .request_turn(tracker_prompt, noop_chunk, cancel.clone(), true)
+            .request_turn(
+                tracker_prompt,
+                noop_chunk,
+                cancel.clone(),
+                fable_engine::FableTurnMode::Tracker,
+            )
             .map_err(|e| format!("tracker request_turn: {e}"))?;
         let reply = tokio::task::spawn_blocking(move || reply_rx.recv())
             .await
@@ -15952,16 +16440,78 @@ async fn retrack_edited_assistant_message(
 /// retroactively undo its tracker mutations, by design). Returns the new
 /// message list. Destructive (no conversation-undo), so the drawer gates it
 /// behind a two-step inline confirm.
+///
+/// CASCADE (2026-08-19, Chloe): `cascade: Some(true)` removes the target AND
+/// every message below it (a transcript GAP between surviving beats is
+/// meaningless — the frontend sends this whenever the doomed run is 2+
+/// messages). This is a rewind-shaped truncation, so it runs the SAME
+/// server-side ring discipline `rewind_and_edit_user` uses (#36 semantics,
+/// `>=` compare): entries tagged at/after the truncation point are tail-owned
+/// by the deleted run and dropped, and the surviving era's snapshot is
+/// restored so world state matches the surviving timeline (an abrupt exit is
+/// covered by the reserved autosave). `schema_pop_count` stays 0 — the pop +
+/// restore already happened here.
 #[tauri::command]
 async fn delete_message(
     index: usize,
+    cascade: Option<bool>,
     state: tauri::State<'_, AppState>,
     app: tauri::AppHandle,
 ) -> Result<EditResponse, String> {
     let card_id = active_fable_card_id(&state)?;
+    if cascade.unwrap_or(false) {
+        let (messages, surviving) = {
+            let mut gs = state.fable_session.lock().await;
+            let len = gs.messages.len();
+            if index >= len {
+                return Err(format!("delete_message: index {index} out of bounds (len {len})"));
+            }
+            gs.messages.truncate(index);
+            let surviving = gs.messages.len();
+            (project_messages(&gs), surviving)
+        };
+        // Mirror of rewind_and_edit_user's ring block (#36): pop everything
+        // the deleted tail owned, then consume the era's top snapshot as the
+        // restored live schema. popped == 0 means the deleted turns never
+        // pushed — touching the ring would over-roll.
+        let restore: Option<schema::WorldSchema> = {
+            let mut hist = state.fable_schema_history.lock().await;
+            let mut popped = 0usize;
+            while hist
+                .back()
+                .map(|(tag, _)| *tag >= surviving)
+                .unwrap_or(false)
+            {
+                hist.pop_back();
+                popped += 1;
+            }
+            if popped > 0 {
+                let snap = hist.pop_back().map(|(_, s)| s);
+                if snap.is_none() {
+                    tracing::warn!(popped, "cascade delete: popped the tail's entries but no older snapshot remains to restore");
+                } else {
+                    tracing::info!(popped, surviving, "cascade delete: popped ring entries owned by the deleted run + restoring the era's snapshot");
+                }
+                snap
+            } else {
+                None
+            }
+        };
+        if let Some(snap) = restore {
+            *state.fable_schema.lock().await = snap;
+        }
+        persist_fable_session(&app, &state, &card_id).await?;
+        // The truncated session must reach the reserved autosave too — an
+        // abrupt exit right after the delete would otherwise resume the
+        // deleted tail from the last autosave (the rewind precedent).
+        spawn_reserved_autosave(&app, &state).await;
+        return Ok(EditResponse {
+            messages,
+            schema_pop_count: 0,
+        });
+    }
     let messages = {
         let mut gs = state.fable_session.lock().await;
-        crate::logs::log("FABLE", &format!("delete_message index={}", index));
         gs.remove_at(index)?;
         project_messages(&gs)
     };
@@ -16048,13 +16598,6 @@ async fn swipe_variant(
     // work (no re-tracking, per the binding's design). Push the displaced live
     // schema to the ring buffer so manual fable_rollback can still return.
     let schema_installed = install_schema.is_some();
-    crate::logs::log(
-        "FABLE",
-        &format!(
-            "swipe_variant index={} variant_idx={} schema_installed={}",
-            index, variant_idx, schema_installed
-        ),
-    );
     if let Some(schema) = install_schema {
         let snap = state.fable_schema.lock().await.clone();
         push_fable_history_snapshot(&state, snap).await;
@@ -16084,7 +16627,6 @@ async fn rewind_and_edit_user(
     app: tauri::AppHandle,
 ) -> Result<EditResponse, String> {
     let card_id = active_fable_card_id(&state)?;
-    let new_text_brief = crate::logs::brief(&new_text);
     let (messages, surviving) = {
         let mut gs = state.fable_session.lock().await;
         apply_rewind_and_edit(&mut gs, index, new_text)?;
@@ -16094,13 +16636,6 @@ async fn rewind_and_edit_user(
         let surviving = gs.messages.len();
         (project_messages(&gs), surviving)
     };
-    crate::logs::log(
-        "FABLE",
-        &format!(
-            "rewind_and_edit_user index={} surviving={} new_text={}",
-            index, surviving, new_text_brief
-        ),
-    );
     // (#36) Pop the ring to the surviving length, SERVER-SIDE. The old
     // contract returned `deleted assistant turns` and let the frontend call
     // `fable_rollback` N times — but a turn pushes 0..3+ entries (referee /
@@ -16547,10 +17082,6 @@ pub(crate) fn migrate_card_folder_contents(old: &std::path::Path, new: &std::pat
     }
     // Everything movable has moved; drop the husk (its .sim/.lnk remain).
     let _ = std::fs::remove_dir_all(old);
-    crate::logs::log(
-        "SYS",
-        &format!("card folder renamed: {} -> {}", old_stem, new_stem),
-    );
 }
 
 /// The ONE-SHOT boot migration to the v2 card/player format (Chloe ruling
@@ -16587,10 +17118,6 @@ fn migrate_sim_cards_v2(cards_root: &std::path::Path, app: &tauri::AppHandle) {
             continue;
         };
         let Ok(card) = sim_card::parse_from_xml_str(&xml) else {
-            crate::logs::log(
-                "SYS",
-                &format!("v2 migration: unparseable card folder '{}' skipped", crate::logs::brief(folder_name)),
-            );
             continue;
         };
         // System cards (wupi.sim never lives here, but belt-and-suspenders)
@@ -16604,13 +17131,7 @@ fn migrate_sim_cards_v2(cards_root: &std::path::Path, app: &tauri::AppHandle) {
         // namesake file). Runs for already-v2 folders too — idempotent.
         let folded_portrait = rename_legacy_portraits(&path);
         if folded_portrait {
-            crate::logs::log(
-                "SYS",
-                &format!(
-                    "v2 migration: portrait namesake rename in '{}'",
-                    crate::logs::brief(folder_name)
-                ),
-            );
+            tracing::info!(folder = %path.display(), "boot migration: folded legacy card portrait onto stem");
         }
         let display = safe_display_stem(&card.name, folder_name);
         let needs_rewrite = !card.format_v2;
@@ -16649,7 +17170,7 @@ fn migrate_sim_cards_v2(cards_root: &std::path::Path, app: &tauri::AppHandle) {
         let out_xml = if needs_rewrite { card.serialize_v2() } else { xml };
         if needs_rename && target != path {
             if let Err(e) = std::fs::create_dir_all(&target) {
-                crate::logs::log("SYS", &format!("v2 migration: mkdir {} failed: {}", crate::logs::brief(&target.display().to_string()), e));
+                tracing::warn!(card_id = %card.id, err = %e, "v2 migration: target folder create failed (skipped)");
                 continue;
             }
             let new_stem = target
@@ -16658,7 +17179,7 @@ fn migrate_sim_cards_v2(cards_root: &std::path::Path, app: &tauri::AppHandle) {
                 .unwrap_or(folder_name)
                 .to_owned();
             if let Err(e) = write_atomic(&target.join(format!("{new_stem}.sim")), out_xml.as_bytes()) {
-                crate::logs::log("SYS", &format!("v2 migration: write {} failed: {}", crate::logs::brief(&new_stem), e));
+                tracing::warn!(card_id = %card.id, err = %e, "v2 migration: renamed card write failed (skipped)");
                 continue;
             }
             // Carry saves/session/codex/schema-split/portrait; re-stem the
@@ -16667,7 +17188,7 @@ fn migrate_sim_cards_v2(cards_root: &std::path::Path, app: &tauri::AppHandle) {
             cache_card_folder(cards_root, &card.id, &target);
         } else {
             if let Err(e) = write_atomic(&sim_path, out_xml.as_bytes()) {
-                crate::logs::log("SYS", &format!("v2 migration: rewrite {} failed: {}", crate::logs::brief(folder_name), e));
+                tracing::warn!(card_id = %card.id, err = %e, "v2 migration: card rewrite failed (skipped)");
                 continue;
             }
             cache_card_folder(cards_root, &card.id, &path);
@@ -16676,15 +17197,6 @@ fn migrate_sim_cards_v2(cards_root: &std::path::Path, app: &tauri::AppHandle) {
         if let Err(e) = build_card_shortcut(app, &card.id, false) {
             tracing::warn!(card_id = %card.id, err = %e, "v2 migration: shortcut refresh failed (non-fatal)");
         }
-        crate::logs::log(
-            "SYS",
-            &format!(
-                "v2 migration: card '{}' -> {}{}",
-                crate::logs::brief(folder_name),
-                target.display(),
-                if needs_rewrite { " (format v2)" } else { "" }
-            ),
-        );
     }
 }
 
@@ -16703,23 +17215,13 @@ fn migrate_players_v2(players_root: &std::path::Path) {
         let player_file = path.join(format!("{folder_name}.player"));
         let legacy_json = path.join(format!("{folder_name}.json"));
         let Some(sp) = load_player_at(&player_file).or_else(|| load_player_at(&legacy_json)) else {
-            crate::logs::log(
-                "SYS",
-                &format!("v2 migration: unparseable player folder '{}' skipped", crate::logs::brief(folder_name)),
-            );
             continue;
         };
         let sp = player::fold_legacy_lists(&sp);
         // (2026-08-19 portrait namesake fold) legacy `portrait.<ext>` →
         // `<folder>.<ext>` before the carry below (no-op once folded).
         if rename_legacy_portraits(&path) {
-            crate::logs::log(
-                "SYS",
-                &format!(
-                    "v2 migration: portrait namesake rename in '{}'",
-                    crate::logs::brief(folder_name)
-                ),
-            );
+            tracing::info!(folder = %path.display(), "boot migration: folded legacy player portrait onto stem");
         }
         let display = safe_display_stem(&sp.name, folder_name);
         let needs_rename = display != folder_name;
@@ -16729,7 +17231,7 @@ fn migrate_players_v2(players_root: &std::path::Path) {
             path.clone()
         };
         if let Err(e) = std::fs::create_dir_all(&target) {
-            crate::logs::log("SYS", &format!("v2 migration: player mkdir failed: {e}"));
+            tracing::warn!(player = %sp.name, err = %e, "player migration: target folder create failed (skipped)");
             continue;
         }
         let new_stem = target
@@ -16739,7 +17241,7 @@ fn migrate_players_v2(players_root: &std::path::Path) {
             .to_owned();
         let xml = player::render_player_xml(&sp);
         if let Err(e) = write_atomic(&target.join(format!("{new_stem}.player")), xml.as_bytes()) {
-            crate::logs::log("SYS", &format!("v2 migration: player write failed: {e}"));
+            tracing::warn!(player = %sp.name, err = %e, "player migration: player write failed (skipped)");
             continue;
         }
         // Carry the portrait (the namesake `<folder>.<ext>` — the fold above
@@ -16757,14 +17259,6 @@ fn migrate_players_v2(players_root: &std::path::Path) {
             let _ = std::fs::remove_dir_all(&path);
         }
         cache_player_folder(players_root, &sp.id, &target);
-        crate::logs::log(
-            "SYS",
-            &format!(
-                "v2 migration: player '{}' -> {}",
-                crate::logs::brief(folder_name),
-                target.display()
-            ),
-        );
     }
 }
 
@@ -18329,7 +18823,7 @@ mod tests {
     fn lean_tracker_world_state_caps_and_drops() {
         let schema = maxed_world_schema();
         let lean = render_tracker_world_state(&schema);
-        let rich = render_fable_world_state(&schema, &[]);
+        let rich = render_fable_world_state(&schema, &[], false);
 
         assert!(lean.chars().count() < rich.chars().count() / 2,
             "the lean render must be decisively smaller (lean {} vs rich {})",
@@ -18424,7 +18918,7 @@ mod tests {
                 },
             );
         }
-        let rich = render_fable_world_state(&s, &[]);
+        let rich = render_fable_world_state(&s, &[], false);
         let stage2 = lean_world_state_surgery(&rich, &STAGE2);
         let minds = stage2
             .lines()
@@ -18439,6 +18933,97 @@ mod tests {
             minds.chars().count() <= 180 + 40,
             "stage-2 minds cap holds: {minds}"
         );
+    }
+
+    /// (2026-08-19 Hidden site maps) The tracker path swaps the rich
+    /// multi-line `site:` block for the compact id-bearing slice — the
+    /// tracker gets DOOR TARGET IDS (how an unrevealed room is entered),
+    /// never the narrator prose, and the lean surgery caps it as one line.
+    #[test]
+    fn tracker_render_swaps_site_block_for_compact_ids() {
+        let mut s = schema::WorldSchema::default();
+        s.world_clock.current_minutes = 1_000;
+        let mut map = site_map::SiteMap::default();
+        map.node_id = "warren".into();
+        map.entrance = "gatehouse".into();
+        map.areas = vec![
+            site_map::SiteArea {
+                id: "gatehouse".into(),
+                name: "Gatehouse".into(),
+                knowledge: site_map::AreaKnowledge::Visited,
+                geometry: vec!["cold draft through murder holes".into()],
+                connections: vec![site_map::SiteConnection {
+                    to: "hall".into(),
+                    state: site_map::ConnState::Locked,
+                    detail: "iron-bound door".into(),
+                }],
+            },
+            site_map::SiteArea { id: "hall".into(), name: "Great Hall".into(), ..Default::default() },
+            site_map::SiteArea { id: "vault".into(), name: "Vault".into(), ..Default::default() },
+        ];
+        s.site_maps.insert("warren".into(), map);
+        s.travel_graph.current_node = Some("warren".into());
+
+        let lean = render_tracker_world_state(&s);
+        // The tracker slice: one flattened line with ids + door states.
+        assert!(
+            lean.contains("gatehouse:v doors=hall:locked"),
+            "compact id slice missing: {lean}"
+        );
+        // The narrator prose does NOT survive the swap.
+        assert!(!lean.contains("cold draft"), "narrator geometry must be swapped out");
+        assert!(!lean.contains("threat:"), "narrator threat line must be swapped out");
+        // No multi-line site block remains (one capped line).
+        assert!(!lean.contains("site:\n"), "site block must be single-line");
+
+        // The RICH render (narrator path) keeps the prose + hides truth.
+        let rich = render_fable_world_state(&s, &[], false);
+        assert!(rich.contains("site:\n"), "rich render keeps the block");
+        assert!(rich.contains("cold draft"), "rich render keeps geometry");
+        assert!(!rich.contains("Great Hall"), "unrevealed area stays hidden");
+    }
+
+    /// (2026-08-19) The lean surgery's site-block arm: the rich multi-line
+    /// block (when driven directly, pre-swap) flattens to one capped line.
+    #[test]
+    fn lean_surgery_flattens_site_block_to_one_line() {
+        let rich = "location: Warren (exits: town)\nsite:\n  threat: high; entrance: Gatehouse\n  Gatehouse (gatehouse) — visited: cold draft\n  ways on: Town\ncast: mara";
+        let lean = lean_world_state_surgery(rich, &STAGE0);
+        let site_lines = lean.lines().filter(|l| l.starts_with("site: ")).count();
+        assert_eq!(site_lines, 1, "one flattened site line: {lean}");
+        assert!(lean.contains("threat: high"), "content survives the flatten");
+        assert!(!lean.contains("\n  threat"), "no indented continuations remain");
+        assert!(lean.contains("cast: mara"), "following lines survive");
+    }
+
+    /// (2026-08-19) swap_site_block_for_tracker: pure passthrough when no
+    /// block is present.
+    #[test]
+    fn swap_site_block_passthrough_without_block() {
+        let untouched = swap_site_block_for_tracker("location: Town\ncast: mara", "areas=x:v");
+        assert_eq!(untouched, "location: Town\ncast: mara");
+    }
+
+    /// (2026-08-19) The architect prompt carries the JSON contract + the
+    /// full site brief (protocol-shaped: `<|turn>` open/close).
+    #[test]
+    fn site_architect_prompt_carries_contract_and_brief() {
+        let b = SiteBrief {
+            node_id: "warren".into(),
+            node_name: "The Rotting Warren".into(),
+            tone: "grim".into(),
+            elapsed_days: 12,
+            seeds: vec!["goblin warband moved in".into()],
+            premise: "You duck through the collapsed palisade.".into(),
+        };
+        let p = render_site_architect_prompt(&b);
+        assert!(p.starts_with("<|turn>system\n"));
+        assert!(p.ends_with("<|turn>model\n"));
+        assert!(p.contains("dungeon architect"));
+        assert!(p.contains("RECIPROCAL"), "the reciprocity rule is load-bearing");
+        assert!(p.contains("The Rotting Warren"));
+        assert!(p.contains("goblin warband moved in"), "seeds ride the brief");
+        assert!(p.contains("~12 day(s)"), "watermark age rides the brief");
     }
 
     /// Helper for the budget tests: a world schema with every rendered
@@ -18493,14 +19078,14 @@ mod tests {
                 id: format!("district_{i}"),
                 name: format!("District {i} of the Old Quarter"),
                 neighbors: vec!["grand_market".to_owned()],
-                setting: String::new(),
+                setting: String::new(), ..Default::default()
             })
             .collect();
         nodes.push(Node {
             id: "grand_market".to_owned(),
             name: "The Grand Market of Ashfall".to_owned(),
             neighbors: (0..12).map(|i| format!("district_{i}")).collect(),
-            setting: String::new(),
+            setting: String::new(), ..Default::default()
         });
         s.travel_graph = TravelGraph {
             nodes,

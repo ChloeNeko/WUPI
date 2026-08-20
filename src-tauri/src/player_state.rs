@@ -514,11 +514,26 @@ impl PlayerState {
     /// `appearance:` block is emitted LAST so the model reads the character's
     /// current look right before generating prose — the diegetic ground truth
     /// that must stay consistent turn to turn. This is the fact block the
-    /// narrator reads as hard truth. The `equipped:` block (Outer-layer items
-    /// only — Inner layers are hidden from the narrator) follows appearance so
-    /// the visible garments + readied weapons read as one cohesive look
-    /// (2026-08-18: clothing IS this block — garments are equipped items).
+    /// narrator reads as hard truth. The `equipped:` block (observer-visible
+    /// items — outer garments always, plus an inner item only where it
+    /// physically peeks, e.g. socks under boots with bare/short-covered legs)
+    /// follows appearance so the visible garments + readied weapons read as
+    /// one cohesive look (2026-08-18: clothing IS this block — garments are
+    /// equipped items; 2026-08-19: visibility, not blanket outer-only).
     pub fn render_for_prompt(&self) -> Option<String> {
+        self.render_for_prompt_with_beneath(false)
+    }
+
+    /// The exposure-gated variant (2026-08-19, the upskirt ruling): when
+    /// `reveal_beneath` is set — the turn's narrative window tripped
+    /// `equipment::narrative_trips_exposure` ("someone looked up her skirt",
+    /// undressing, the prose naming the smallclothes) — the CONCEALED inner
+    /// layers render as one `beneath:` line, so the narrator narrates the
+    /// real tracked garment instead of improvising a contradiction. Every
+    /// other turn is byte-identical to the ungated render (zero tokens —
+    /// Prime Mandate: concealed wear earns its place only in the 100% of
+    /// gated turns where the scene actually exposes it).
+    pub fn render_for_prompt_with_beneath(&self, reveal_beneath: bool) -> Option<String> {
         if self.is_default() {
             return None;
         }
@@ -610,32 +625,32 @@ impl PlayerState {
             lines.push(format!("appearance:\n{}", body));
         }
 
-        // Equipped items — Outer layer ONLY. The narrator sees what an observer
-        // sees: a Heavy Cloak (Outer) over a Linen Shirt (Inner) reads as just
-        // the cloak. Inner layers are hidden by design (concealed garments,
-        // hidden armor). Iterated in canonical slot order (Head→Feet) so the
-        // readied weapon + visible garments read head-to-foot as one look. Belt
-        // + pack are NEVER here — they're carried, not worn.
+        // Equipped items — what an OBSERVER sees (2026-08-19 NPC-perception
+        // upgrade: outer garments always; an Inner item only where it
+        // physically peeks — socks under boots show when the legs are bare or
+        // short-hemmed, stay hidden under trousers or a full-length gown; an
+        // Inner-only slot renders its item as the slot's visible wearer). A
+        // Heavy Cloak (Outer) over a Linen Shirt (Inner) still reads as just
+        // the cloak. Iterated in canonical slot order (Head→Feet) so the
+        // readied weapon + visible garments read head-to-foot as one look.
+        // Belt + pack are NEVER here — they're carried, not worn.
         if !self.equipment.is_empty() {
-            let equipped_lines: Vec<String> = equipment::EquipSlot::all()
-                .iter()
-                .filter_map(|slot| {
-                    self.equipment.get(slot).and_then(|layers| {
-                        layers.visible().map(|item| {
-                            // "Main Hand: Iron Sword" — append stats in parens
-                            // if present ("Main Hand: Iron Sword (+2 ATK)").
-                            match &item.stats {
-                                Some(s) if !s.trim().is_empty() => {
-                                    format!("  {}: {} ({})", slot.label(), item.name, s)
-                                }
-                                _ => format!("  {}: {}", slot.label(), item.name),
-                            }
-                        })
-                    })
-                })
-                .collect();
+            let equipped_lines = equipment::visible_equipment_lines(&self.equipment);
             if !equipped_lines.is_empty() {
                 lines.push(format!("equipped:\n{}", equipped_lines.join("\n")));
+            }
+            // The exposure-gated reveal: concealed wear, named only on turns
+            // whose scene exposes it. Lives INSIDE the equipped block's
+            // guard (nothing worn → nothing to reveal) but renders as its own
+            // top-level line so the lean surgery passes it through verbatim.
+            if reveal_beneath {
+                let concealed = equipment::concealed_beneath_names(&self.equipment);
+                if !concealed.is_empty() {
+                    lines.push(format!(
+                        "beneath (visible this moment): {}",
+                        concealed.join(", ")
+                    ));
+                }
             }
         }
 
@@ -1416,18 +1431,6 @@ pub fn referee_evaluate_with_tier(
     // was lethal; Minions always lethal, Legendary 45%, a Downed player
     // unfinishable).
     let lethal = (lethality_roll as i32) >= lethality_dc;
-    crate::logs::log(
-        "REF",
-        &format!(
-            "combat dice: d20={} dc={} (tier_mod={} cond={} pacing={}) -> lethal={}",
-            lethality_roll,
-            lethality_dc,
-            attacker_tier.lethality_dc_mod(),
-            condition_penalty,
-            pacing_dc_mod,
-            lethal
-        ),
-    );
 
     // Narrative hint: a short second-person prose seed. The narrator reads the
     // canonical body-state change as hard fact; this hint just nudges prose.
@@ -1719,18 +1722,6 @@ pub fn referee_evaluate_skill_checks(text: &str, pacing_dc_mod: i32) -> Vec<Skil
         let dc = (spec.base_dc as i32 + pacing_dc_mod)
             .clamp(1, 30) as u32;
         let success = roll >= dc;
-        crate::logs::log(
-            "REF",
-            &format!(
-                "skill dice: {} d20={} dc={} (base={} pacing={}) -> {}",
-                spec.name,
-                roll,
-                dc,
-                spec.base_dc,
-                pacing_dc_mod,
-                if success { "SUCCESS" } else { "FAIL" }
-            ),
-        );
         let seed_text = if success { spec.success_seed } else { spec.fail_seed };
         let directive = format!(
             "{} (DC {}): {}. {}.",
@@ -1979,16 +1970,6 @@ pub fn evaluate_disguise_gate(
         let roll = roll_d20(&mut roller);
         let dc = (DECEPTION_BASE_DC as i32 + 3 + pacing_dc_mod).clamp(1, 30) as u32;
         let success = roll >= dc;
-        crate::logs::log(
-            "REF",
-            &format!(
-                "disguise dice (elite+): d20={} dc={} (base+3+pacing{}) -> {}",
-                roll,
-                dc,
-                pacing_dc_mod,
-                if success { "HOLDS" } else { "BLOWN" }
-            ),
-        );
         let s = if success {
             "the player's composure withstands a captain's eye; the disguise holds — for now"
         } else {
@@ -2017,16 +1998,6 @@ pub fn evaluate_disguise_gate(
     let roll = roll_d20(&mut roller);
     let dc = (DECEPTION_BASE_DC as i32 + pacing_dc_mod).clamp(1, 30) as u32;
     let success = roll >= dc;
-    crate::logs::log(
-        "REF",
-        &format!(
-            "disguise dice (suspicious): d20={} dc={} (base+pacing{}) -> {}",
-            roll,
-            dc,
-            pacing_dc_mod,
-            if success { "HOLDS" } else { "BLOWN" }
-        ),
-    );
     let s = if success { SCRUTINIZED_SUCCESS_SEED } else { SCRUTINIZED_FAIL_SEED };
     Some(DisguiseDirective::Scrutinized {
         label,

@@ -1118,6 +1118,46 @@ body.fable-active.fable-chrome-peek .top-bar { transform: translateY(0); }
         inset 0 0 0 1px rgba(0, 0, 0, 0.25);
 }
 
+/* --- Typing indicator (subtype-aware reprise, 2026-08-19) --- */
+/* A small label pinned just above the input row while a turn is in flight:
+   "(Name) is currently typing..." for npc-subtype cards, "Narrator is
+   currently thinking..." for scenario/world cards (the text is computed by
+   stage.js::typingLabel at show time). Hidden by default; the stage toggles
+   `.is-visible` from setGenerating (the onTurnStart/onTurnEnd hooks) — it
+   covers the whole turn, tracker stage included. Small, soft glow,
+   low-contrast until active. */
+.fable-typing-indicator {
+    position: absolute;
+    left: 0;
+    right: 0;
+    bottom: 96px;   /* just above the input row (70px at rest, 93px auto-grown to 2 lines — clears both) */
+    z-index: 24;    /* under the input row (25) + the edge drawers (30/40) */
+    display: flex;
+    justify-content: center;
+    padding: 0 max(40px, 12vw);   /* tracks the input row's side padding */
+    pointer-events: none;
+    opacity: 0;
+    transform: translateY(6px);
+    transition: opacity 220ms ease, transform 220ms ease;
+}
+.fable-typing-indicator.is-visible {
+    opacity: 0.85;
+    transform: translateY(0);
+}
+.fable-typing-indicator__text {
+    font-size: 12.5px;
+    font-style: italic;
+    letter-spacing: 0.04em;
+    color: var(--fable-text-dim);
+    text-shadow: 0 0 6px var(--fable-brass-glow);
+    /* A gentle "still working" pulse while the label is up. */
+    animation: fableTypingPulse 1.4s ease-in-out infinite;
+}
+@keyframes fableTypingPulse {
+    0%, 100% { opacity: 0.55; }
+    50%      { opacity: 1; }
+}
+
 /* API-lost composer lock (2026-08-07 override). When the API narrator dies
    mid-session there's no local fallback: the input greys out + a red glowing
    "API LOST CONNECTION" message takes the placeholder. Enter probes the
@@ -2107,7 +2147,16 @@ body.fable-active.fable-chrome-peek .top-bar { transform: translateY(0); }
        it never crosses the figure's centerline; height fills the vertical
        space above the backpack up toward the time scrubber. */
     width: clamp(155px, 13vw, 213px);
-    min-height: 300px;
+    /* (2026-08-19 inventory bugfix) FIXED height — the panel NEVER resizes
+       with its content: the loading placeholder, the empty state, and the
+       6-button list viewport (header ≈33px + body padding 20px + viewport
+       316px ≈ 370px content + border) all render inside the SAME box, so
+       adding or removing items can't grow/shrink the popup (it used to jump
+       ~70px taller the moment a zone gained its first item — bottom-anchored,
+       so it climbed upward into the gems). max-height (65vh here, the live
+       astrolabe clamp in soul-gem.js inline) still shrinks it on short
+       viewports; the body clips + its internal scroll takes over. */
+    height: 376px;
     max-height: 65vh;
     /* Flex column + overflow hidden so when soul-gem.js's
        clampSlotBelowAstrolabe() caps max-height (to keep the panel below the
@@ -2152,6 +2201,14 @@ body.fable-active.fable-chrome-peek .top-bar { transform: translateY(0); }
     flex: 1 1 auto;                    /* fill remaining slot height; shrink when the slot is max-height-capped */
     min-width: 0;
     overflow: hidden;                  /* clip the viewport when the body shrinks below the viewport's fixed height */
+    /* (2026-08-19) Flex column so the fixed-height panel's placeholder states
+       (loading / empty) center vertically instead of hugging the top of an
+       always-370px body — the panel no longer shrinks to fit tiny content
+       (the add-an-item growth bug), so the placeholders must sit nicely
+       inside the constant box. The viewport list is flex:0 (fixed inline
+       height, never stretched). */
+    display: flex;
+    flex-direction: column;
 }
 
 /* ── ITEM BUTTON LIST (engine/inventory-panel.js) ───────────────────────
@@ -2175,6 +2232,7 @@ body.fable-active.fable-chrome-peek .top-bar { transform: translateY(0); }
 .inv-viewport {
     overflow: hidden;
     position: relative;
+    flex: 0 0 auto;                    /* (2026-08-19) fixed inline height — never stretched by the body's flex column */
     border-radius: 6px;
     background: rgba(0, 0, 0, 0.35);
     outline: none;
@@ -2260,9 +2318,12 @@ body.fable-active.fable-chrome-peek .top-bar { transform: translateY(0); }
     color: rgba(230, 213, 138, 0.6);
     letter-spacing: 0.02em;
 }
-/* Loading + empty placeholders. Centered, dimmed. */
+/* Loading + empty placeholders. Centered, dimmed. margin:auto centers them
+   vertically (and horizontally) inside the flex-column slot body — the
+   panel's fixed height leaves generous space around them. */
 .inv-loading,
 .inv-empty {
+    margin: auto;
     padding: 24px 8px;
     text-align: center;
     font-family: var(--fable-font-serif, 'Cinzel', serif);
@@ -3565,6 +3626,33 @@ body.fable-active.fable-chrome-peek .top-bar { transform: translateY(0); }
 }
 .fable-save-close:hover { color: var(--fable-text); }
 
+/* --- Cascade-delete confirm modal (2026-08-19, Chloe) --- */
+/* Same tier + structure as .fable-save-overlay (the markup reuses the save
+   modal's chrome classes; this modifier carries the copy block + a red
+   confirm face). Opened by the feed delete handler when the doomed run is
+   2+ messages — "You are going to delete N messages, are you sure?" */
+.fable-delete-overlay {
+    position: absolute;
+    inset: 0;
+    z-index: 46;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}
+.fable-delete-overlay[hidden] { display: none; }
+.fable-delete-text {
+    margin: 0 0 20px;
+    color: var(--fable-text-dim);
+    font-size: 15.5px;
+    line-height: 1.55;
+}
+.fable-delete-modal .fable-save-btn.primary {
+    /* Destructive confirm reads RED, not brass — the delete affordance's
+       color language across the app. */
+    background: linear-gradient(135deg, #f08a8a, #c94141);
+    color: #2a0d0d;
+}
+
 /* --- Background Library modal (2026-08-11) --- */
 /* Same tier + structure as .fable-save-overlay (full-stage overlay, dim blur
    backdrop, centered card, [hidden] toggle). Wider than the save modal so the
@@ -4259,6 +4347,41 @@ body.fable-active.fable-chrome-peek .top-bar { transform: translateY(0); }
    margin soaks up the free space → the recent 2 park right above the
    input box. When it overflows, that margin collapses to 0 + the feed
    scrolls. Best of both.                                                  */
+/* ── Feed viewport wrapper + TOP BLUR STRIP (2026-08-19 per Chloe) ── */
+/* The wrapper owns the feed's old layer slot (absolute inset:0, z-index 5)
+   and holds TWO children: the scrollable feed + a 12px frosted band pinned
+   to the screen's top edge. The wrapper's opacity (0.9999 — visually a
+   no-op) establishes a BACKDROP ROOT: the strip's backdrop-filter can only
+   sample paint from INSIDE this wrapper (the chat bubbles), never the
+   stage background, the FX layer, the drawers, or the OS top bar (which
+   also sits z 9999 above the entire stage). The strip is pointer-events:
+   none, so it can never intercept the chrome-peek top bar or bubble
+   clicks. Width matches the bubbles' extremes — the capped column width
+   (the feed's side padding + the 1040px max) plus the ±48px recent-beat
+   stagger on both sides — so the frosted band spans exactly the leftmost
+   AI edge to the rightmost user edge. */
+.fable-feed-viewport {
+    position: absolute;
+    inset: 0;
+    z-index: 5;          /* the feed's former slot in the stage stacking order */
+    opacity: 0.9999;     /* backdrop-root fence — do NOT clean this up to 1 */
+}
+.fable-feed-topblur {
+    position: absolute;
+    top: 0;              /* touches the screen's very top edge */
+    left: 50%;
+    transform: translateX(-50%);
+    width: calc(min(1040px, 100% - 2 * max(40px, 12vw)) + 96px);
+    height: 12px;
+    z-index: 10;         /* above the feed's paint INSIDE the wrapper only */
+    backdrop-filter: blur(5px);
+    -webkit-backdrop-filter: blur(5px);
+    /* a whisper of tint guarantees the band reads even over fast content */
+    background: linear-gradient(180deg, rgba(16, 13, 9, 0.10), rgba(16, 13, 9, 0));
+    border-radius: 0 0 8px 8px;
+    pointer-events: none;
+}
+
 .fable-feed {
     --fable-feed-pad-bot: 108px;  /* bottom padding — reserves space above the input row overlay. Set so the visible gap to the input box ≈ 34px (2026-08-14 per Chloe). */
     position: absolute;
@@ -4293,6 +4416,42 @@ body.fable-active.fable-chrome-peek .top-bar { transform: translateY(0); }
 }
 .fable-feed::-webkit-scrollbar { width: 0; height: 0; }
 .fable-feed::-webkit-scrollbar-thumb { background: transparent; }
+
+/* ── HISTORY PAGE LOADER (2026-08-19 per Chloe) ──────────────────── */
+/* The feed renders only the trailing 50-message window; scrolling to the
+   top edge prepends the next page (beats.js loadOlderPage). While a page
+   builds, a small WHITE loading circle shows at the very top center of
+   the feed. The bar is a sticky ZERO-HEIGHT first child (no layout shift
+   when it appears — the feed runs overflow-anchor:none, so any real
+   height would jump the anchor math), its circle absolutely positioned
+   inside. pointer-events:none — it is pure feedback. */
+.fable-feed-pagebar {
+    position: sticky;
+    top: 6px;
+    height: 0;
+    flex: none;
+    align-self: stretch;   /* full-width sticky box so the abs spinner's left:50% centers on the screen, not a 0-width flex item */
+    z-index: 6;
+    pointer-events: none;
+}
+.fable-feed-pagebar-spin {
+    position: absolute;
+    top: 0;
+    left: 50%;
+    width: 16px;
+    height: 16px;
+    border-radius: 50%;
+    border: 2px solid rgba(255, 255, 255, 0.18);
+    border-top-color: rgba(255, 255, 255, 0.92);
+    opacity: 0;
+    transform: translateX(-50%);
+    transition: opacity 120ms ease;
+    animation: fable-pagebar-spin 700ms linear infinite;
+}
+.fable-feed-pagebar.is-loading .fable-feed-pagebar-spin { opacity: 1; }
+@keyframes fable-pagebar-spin {
+    to { transform: translateX(-50%) rotate(360deg); }
+}
 
 /* ── The message card ───────────────────────────────────────────── */
 /* 2026-08-11 layout pass: the card is now a vertical stack — a      */
@@ -4333,10 +4492,25 @@ body.fable-active.fable-chrome-peek .top-bar { transform: translateY(0); }
     border: 0;
     box-shadow: none;
     transform: translateX(calc(-1 * var(--fable-mes-shift)));
-    animation: fable-mes-in-left 280ms ease-out;
+    /* (2026-08-19 per Chloe) ENTRANCE: a fresh beat rises OUT FROM BEHIND
+       THE INPUT ROW — it fades in bottom-to-top over 1s while the feed's
+       scrollTop tween (beats.js runEntranceScroll) pushes the whole train
+       up in lockstep, so the card reads as emerging from directly behind
+       and on top of the composer. The 64px start offset + the feed's 108px
+       bottom padding put the origin inside the input row's zone. The base
+       TRANSITION (not animation) below carries the aging morph's stagger
+       slide (±48px → centered) + the MARGIN flip (recent −4px → archive
+       20px — without it the history→recent seam pops ~24px in one frame
+       while the collapse animates) — it never fires on fresh nodes
+       (initial render doesn't transition), only on the live
+       vn-recent→vn-history class flip. */
+    animation: fable-mes-in-left 1s cubic-bezier(0.22, 1, 0.36, 1);
+    transition:
+        transform 1s cubic-bezier(0.22, 1, 0.36, 1),
+        margin 1s cubic-bezier(0.22, 1, 0.36, 1);
 }
 @keyframes fable-mes-in-left {
-    from { opacity: 0; transform: translate(calc(-1 * var(--fable-mes-shift)), 8px); }
+    from { opacity: 0; transform: translate(calc(-1 * var(--fable-mes-shift)), 64px); }
     to   { opacity: 1; transform: translate(calc(-1 * var(--fable-mes-shift)), 0); }
 }
 .fable-mes.user {
@@ -4344,7 +4518,7 @@ body.fable-active.fable-chrome-peek .top-bar { transform: translateY(0); }
     animation-name: fable-mes-in-right;
 }
 @keyframes fable-mes-in-right {
-    from { opacity: 0; transform: translate(var(--fable-mes-shift), 8px); }
+    from { opacity: 0; transform: translate(var(--fable-mes-shift), 64px); }
     to   { opacity: 1; transform: translate(var(--fable-mes-shift), 0); }
 }
 
@@ -4868,14 +5042,35 @@ body.fable-active.fable-chrome-peek .top-bar { transform: translateY(0); }
 /* animation:none keeps a feed rebuild from replaying the slide-in       */
 /* keyframes across the whole archive — history spawns in place.         */
 /*                                                                       */
-/* .vn-recent beats (last 2) are never touched — full name + portrait +  */
-/* stagger + the over-avatar timestamp, exactly as built. Both classes   */
-/* carry the SAME inter-beat margin so the transcript is spaced          */
-/* uniformly (see the margin note at the .vn-recent rule below).        */
+/* .vn-recent beats (last 2) are never touched — full name + portrait +
+   stagger + the over-avatar timestamp, exactly as built. The two classes
+   carry DIFFERENT inter-beat margins (2026-08-20): the recent pair stays
+   tight; the archive is positively spaced (see the margin note at the
+   .vn-history rule below). */
 .fable-mes.vn-history {
-    margin: -4px auto;            /* mirrors .vn-recent exactly — uniform transcript spacing */
+    /* (2026-08-20 per Chloe) POSITIVE, GENEROUS archive margin — history
+       beats need clear air between them. The old mirror of the recent
+       pair's -4px summed to an 8px OVERLAP between adjacent archive
+       bubbles (flex margins add, they never collapse), so the transcript
+       read as one stuck-together slab; Chloe tuned the final number to a
+       40px GAP. 20px per side → adjacent history beats sit exactly 40px
+       apart. The history→recent boundary has its OWN tighter rule below
+       (the archive hands off to the live exchange, it doesn't keep the
+       archive's air). */
+    margin: 20px auto;            /* 20px/side → 40px gap between archive beats */
     animation: none;              /* history spawns in place — no slide-in on feed rebuild */
     transform: none;              /* centered to the screen — no ±48px stagger (latest 2 keep theirs) */
+}
+/* The history→recent seam (2026-08-20 per Chloe): the gap where the last
+   archive beat meets the first recent beat must read TIGHTER than the
+   archive's 40px rhythm (16px at the plain sum read as "a bit far") —
+   the live exchange pulls the transcript back together. The sibling
+   selector fires only on the actual seam (a history beat immediately
+   followed by a recent one); 20 − 12 = an 8px gap into the recent pair.
+   A system/error beat between them drops the seam back to the plain sum
+   (rare, harmless). */
+.fable-mes.vn-history + .fable-mes.vn-recent {
+    margin-top: -12px;            /* 20px history bottom − 12px → 8px seam gap */
 }
 /* History beat outer brass edge (2026-08-12 per Chloe): once a beat reveals
    as history, a brass border hugs its OUTER edge — the LEFT side of
@@ -4901,12 +5096,13 @@ body.fable-active.fable-chrome-peek .top-bar { transform: translateY(0); }
     box-shadow: none;
 }
 /* The latest 2 beats sit CLOSE (negative margin over the base 10px) so
-   the active exchange reads as one tight beat-pair. The feed is a flex
-   column (margins don't collapse) → the resting gap between adjacent
-   beats is the sum of both margins. This is the SINGLE governing rule
-   for the recent-pair margin. The .vn-history rule above mirrors the
-   SAME -4px margin, so the whole transcript (archive + recent pair) is
-   spaced uniformly (2026-08-17 per Chloe). */
+   the active exchange reads as one tight beat-pair — the overlap lands in
+   transparent header banding, never bubble-on-bubble (the lower beat's
+   nameplate padding absorbs it). The feed is a flex column (margins don't
+   collapse) → the resting gap between adjacent beats is the sum of both
+   margins. This is the SINGLE governing rule for the recent-pair margin.
+   History beats carry their OWN positive margin above (2026-08-20) — the
+   archive must read as separated beats, not a stuck-together slab. */
 .fable-mes.vn-recent {
     margin: -4px auto;
 }
@@ -5032,6 +5228,146 @@ body.fable-active.fable-chrome-peek .top-bar { transform: translateY(0); }
     .fable-mes.user .fable-mes-avatar:not(:has(.fable-mes-avatar-img.vn-snapped)) {
     display: none;
 }
+
+/* ── AGING MORPH (2026-08-19 per Chloe) ──────────────────────────── */
+/* When a beat falls out of the recent pair it MORPHS into the archive
+   treatment over ~1s instead of snapping:
+     • the portrait fades INWARD — AI slides right / user slides left,
+       toward the prose — while its column collapses (the bubble narrows),
+     • the nameplate band fades + collapses (the over-avatar timestamp
+       rides it out),
+     • the corner timestamp fades in (a beat behind the exit),
+     • the ±48px stagger eases to the centered archive axis (the base
+       transform transition on .fable-mes),
+     • the row's iron history border + wrapped corners draw in.
+   vn-interactions.js drives two phases: `.vn-aging.vn-age-hold` pins the
+   RECENT look for one forced style pass; dropping the hold runs the
+   transitions declared here (the release rules below are the TARGET
+   state). When the JS timer later strips `.vn-aging`, the terminal
+   `.vn-history` display:none rules resume on elements already at 0
+   opacity / 0 width — nothing snaps. Fresh rebuild nodes never carry
+   `.vn-aging` (they were never in the prior recent set), so
+   loads/deletes/rewinds spawn history in place, exactly as before. */
+.fable-mes.vn-history.vn-aging .fable-mes-header {
+    display: flex;               /* keep the band painted during the morph */
+    overflow: hidden;
+    max-height: 0;
+    opacity: 0;
+    padding-top: 0;
+    padding-bottom: 0;
+    transition:
+        max-height 1s cubic-bezier(0.22, 1, 0.36, 1),
+        opacity 700ms ease,
+        padding 1s cubic-bezier(0.22, 1, 0.36, 1);
+}
+.fable-mes.vn-history.vn-aging.vn-age-hold .fable-mes-header {
+    /* 64px pins just ABOVE the real band (~56px: 14px pad + ~36px name
+       line + 6px pad) — the max-height transition starts biting the
+       visible band almost immediately instead of spending its first half
+      burning invisible slack down from an oversized pin. */
+    max-height: 64px;
+    opacity: 1;
+    padding-top: 14px;
+    padding-bottom: 6px;
+}
+/* The avatar column: collapses to zero width AND zero height while the
+   portrait fades and drifts INWARD (toward the prose — +34px for AI /
+   −34px for user). The HEIGHT collapse is load-bearing (2026-08-20 per
+   Chloe): without it the wrapper kept its full 270px height for the whole
+   morph (a width-0, invisible, but TALL flex item) and the beat only got
+   shorter the instant .vn-aging expired and display:none landed — the
+   "instantly becomes shorter" snap. min-height:0 unlocks the shrink (a
+   flex item floors at content height by default); the img inside stays
+   180×270 anchored top and is progressively clipped from the bottom by
+   overflow:hidden while it fades — one continuous motion with the width
+   collapse + inward drift + centering. The :not(:has(.vn-snapped))
+   argument matches the terminal hide rule's specificity so the morph
+   override wins the cascade, and snapped sprites (position:fixed) stay
+   out of the animation entirely. */
+.fable-mes.vn-history.vn-aging .fable-mes-avatar:not(:has(.fable-mes-avatar-img.vn-snapped)) {
+    display: flex;
+    overflow: hidden;            /* clip the fixed-size <img> as the column narrows + shortens */
+    flex: 0 0 0px;
+    width: 0;
+    min-width: 0;
+    height: 0;                   /* animate the height OFF too — no end-of-morph snap */
+    min-height: 0;               /* unlock the flex-item content floor */
+    opacity: 0;
+    transform: translateX(34px);
+    transition:
+        flex-basis 1s cubic-bezier(0.22, 1, 0.36, 1),
+        width 1s cubic-bezier(0.22, 1, 0.36, 1),
+        height 1s cubic-bezier(0.22, 1, 0.36, 1),
+        opacity 800ms ease,
+        transform 1s cubic-bezier(0.22, 1, 0.36, 1);
+}
+.fable-mes.user.vn-history.vn-aging .fable-mes-avatar:not(:has(.fable-mes-avatar-img.vn-snapped)) {
+    transform: translateX(-34px);
+}
+.fable-mes.vn-history.vn-aging.vn-age-hold
+    .fable-mes-avatar:not(:has(.fable-mes-avatar-img.vn-snapped)) {
+    flex-basis: var(--fable-mes-avatar-w);
+    width: var(--fable-mes-avatar-w);
+    min-width: var(--fable-mes-avatar-w);
+    height: var(--fable-mes-avatar-h);
+    min-height: var(--fable-mes-avatar-h);
+    opacity: 1;
+    transform: translateX(0);
+}
+/* Timestamp crossfade: the over-avatar stamp fades with the header; the
+   corner stamp fades in a beat later (300ms delay) so the handoff reads
+   as a replacement, not a blink. */
+.fable-mes.vn-history.vn-aging .fable-mes-time--over {
+    display: block;
+    opacity: 0;
+    transition: opacity 600ms ease;
+}
+.fable-mes.vn-history.vn-aging.vn-age-hold .fable-mes-time--over {
+    opacity: 1;
+}
+.fable-mes.vn-history.vn-aging .fable-mes-time--corner {
+    display: block;
+    opacity: 1;
+    transition: opacity 1s ease 300ms;
+}
+.fable-mes.vn-history.vn-aging.vn-age-hold .fable-mes-time--corner {
+    opacity: 0;
+    transition: none;
+}
+/* The row's history treatment (4px iron edge + wrapped outer corners +
+   no shadow) draws in; the hold pins the recent defaults first. */
+.fable-mes.vn-history.vn-aging .fable-mes-row {
+    transition:
+        border-left-width 1s cubic-bezier(0.22, 1, 0.36, 1),
+        border-right-width 1s cubic-bezier(0.22, 1, 0.36, 1),
+        border-color 1s ease,
+        border-top-left-radius 1s cubic-bezier(0.22, 1, 0.36, 1),
+        border-bottom-left-radius 1s cubic-bezier(0.22, 1, 0.36, 1),
+        border-top-right-radius 1s cubic-bezier(0.22, 1, 0.36, 1),
+        border-bottom-right-radius 1s cubic-bezier(0.22, 1, 0.36, 1),
+        box-shadow 800ms ease;
+}
+.fable-mes.vn-history.vn-aging.vn-age-hold .fable-mes-row,
+.fable-mes.user.vn-history.vn-aging.vn-age-hold .fable-mes-row {
+    border-left: 1px solid rgba(255, 255, 255, 0.04);
+    border-right: 1px solid rgba(255, 255, 255, 0.04);
+    border-top-left-radius: 15px;
+    border-bottom-left-radius: 15px;
+    border-top-right-radius: 15px;
+    border-bottom-right-radius: 15px;
+    box-shadow: 0 6px 20px rgba(0, 0, 0, 0.35);
+}
+
+/* ── Offscreen render skipping — REMOVED (2026-08-20) ─────────────── */
+/* content-visibility:auto is PERMANENTLY BANNED on .fable-mes. While
+   debugging the aging morph it was added here as a scroll-perf guard for
+   paged history — but `auto` turns on PAINT CONTAINMENT for every
+   on-screen beat, which clips all descendant painting to the beat's own
+   box: the hover toolrail (spawns ~96px OUTSIDE the card edge) and the
+   history histools (right:-42px) rendered as cut slivers and could never
+   spawn outward, and .vn-snapped fixed sprites would have re-anchored to
+   the beat (containment makes it their containing block). The paged
+   window (beats.js FEED_WINDOW) already bounds the DOM; do not re-add. */
 
 /* ── 4. Per-beat controls (RETIRED 2026-08-11) ──────────────────── */
 /* The old in-flow .fable-mes-controls bar, the later hover side-drawer,

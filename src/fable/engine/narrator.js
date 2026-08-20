@@ -716,19 +716,27 @@ export async function editMessage(index, newText) {
   }
 }
 
-// Delete a single message by index. Permanently removes the message + shifts
-// the tail down — the same primitive the model-facing fable_message_delete
-// tool uses (Conversation::remove_at). No inference, no schema change
-// (schema_pop_count is 0). Rebuilds the feed from the returned messages[].
-// Destructive (no conversation-undo), so the drawer gates it behind a
-// two-step inline confirm.
-export async function deleteMessage(index) {
+// Delete a message by index. CASCADE (2026-08-19, Chloe): `opts.cascade`
+// removes the target AND every message below it (the only shape the feed's
+// delete button offers for 2+ doomed messages — a transcript gap between
+// surviving beats is meaningless). The backend truncates the session tail and
+// rewinds the world-schema ring to the surviving era (the rewind_and_edit_
+// user discipline), so world state matches the surviving timeline. The
+// single-message path (the trailing beat, no confirm modal) keeps the old
+// `Conversation::remove_at` primitive: prose-only, no schema change
+// (schema_pop_count is 0 either way). Rebuilds the feed from the returned
+// messages[]. Destructive (no conversation-undo), so the drawer gates it
+// behind a two-step inline confirm (+ the cascade confirm modal).
+export async function deleteMessage(index, opts = {}) {
   if (generating) return false;
   generating = true;
   const myEpoch = turnEpoch;
   if (onTurnStart) onTurnStart();
   try {
-    const res = await invoke('delete_message', { index });
+    const res = await invoke('delete_message', {
+      index,
+      cascade: opts.cascade === true,
+    });
     if (myEpoch !== turnEpoch) return false; // stage exited mid-delete (J1)
     if (res && Array.isArray(res.messages)) {
       hidePencil(); // (yellow J2) the rebuild dissolves the pencil's selection

@@ -25,8 +25,12 @@
 // 2026-08-18 Chloe: IMPORTS are ONE-SHOT conversions — no interview chat.
 // An import seeds a single conversion turn (the bronze ring + blur, same
 // overlay as the pencil edit), and its `ready` lands straight on the FINAL
-// review card; the corner pencil is the change path. The chat surface only
-// appears as a fallback (GLM asks anyway, a failure, or ‹ from review).
+// review card; the corner pencil is the change path.
+// 2026-08-19 Chloe: imports NEVER touch the chat surface, period. A failed
+// import conversion (assistant asks anyway / api_lost / unparseable /
+// retries exhausted) warns at the BOTTOM of the screen + returns to its
+// picker — and lorebook imports run as SEQUENTIAL BATCH conversions under
+// the ring (a whole book overflows the API payload budget).
 // =============================================================
 
 import { invoke, Channel, convertFileSrc } from '@tauri-apps/api/core';
@@ -51,7 +55,10 @@ import {
   creatorRetryAllowed,
   MAX_CREATOR_RETRIES,
   MANDATORY_LABELS,
+  batchLorebookEntries,
+  normalizeLoreImportEntries,
 } from '../engine/creator-engine.js';
+import { bottomWarning } from './stage.js';
 import { renderIdCard, wireIdCard, PENCIL_SVG } from './id-card.js';
 
 const GREETINGS = {
@@ -65,11 +72,48 @@ const GREETINGS = {
 // the <import> block onto the WUPI schema and emit ready in that same turn —
 // the result lands straight on the review card, where the corner pencil is
 // the change path. Chat exists only as the fallback surface (ask / failure).
+// (2026-08-19 Chloe) Codex/lorebook imports NEVER touch the chat surface at
+// all: they run the batched lorebook conversion below, and ANY failure is a
+// bottom warning + return to the picker. The codex key here is retired —
+// player/sim imports are the remaining one-shot users.
 const IMPORT_CONVERT_INSTRUCTIONS = {
   player: 'Convert the imported character into a final PLAYER Card draft NOW — a one-shot conversion, not an interview. Map every content-bearing field from the import onto the schema (identity, appearance, clothing, inventory, persona, backstory), derive any missing mandatory field sensibly from the import itself, and emit ready in this single turn. Do not ask the user questions — they review and edit the card afterward.',
   sim: 'Convert the imported card into a final SIM Card draft NOW — a one-shot conversion, not an interview. Choose the card_type the import actually is (npc / scenario / world; an imported CHARACTER is an npc card — identity traits + the full persona set + inventory), map every content-bearing field onto that branch, derive the universal anchors (date, time, weather, tone, location) from the import\'s setting, and carry its first_mes / alternate_greetings straight into draft.intro as the agreed intro. Emit ready in this single turn. Do not ask the user questions — they review and edit the card afterward.',
-  codex: 'Convert the imported lorebook into final codex entries NOW — one concept per entry, each body under 1400 characters (split longer concepts into "— Part 1/Part 2" entries so nothing is truncated). Emit ready in this single turn. Do not ask the user questions — they review and edit the result afterward.',
 };
+
+// The lorebook refinement law shared by every lore conversion turn (2026-08-19
+// Chloe): the assistant is a REFINER of authored lore — clean it, title it,
+// tag it, split it to fit the embed cap — never an interviewer and never a
+// rewriter that loses facts.
+const LORE_REFINE_RULES =
+  'For EVERY entry: a clean, descriptive title (strip decorative box-drawing rules, symbol clutter, emoji, and meta-labels like "READ THIS" from source titles), AT LEAST 3 short lowercase tag keywords, and a refined body. ' +
+  'Refine each body: resolve ambiguity, fix garbled or unrecognizable symbols and broken formatting, remove filler words and redundant phrasing — while PRESERVING every lore fact (names, numbers, relationships, rules); never invent or drop lore. ' +
+  'Keep each body under 1400 characters; a concept that is longer after tightening splits into "<Concept> — Part 1", "<Concept> — Part 2", … entries so nothing is lost. ' +
+  'The source entry\'s "keys" are its authored retrieval triggers — reuse the meaningful ones as tags.';
+
+// One batch's instruction. A real lorebook (70-140KB) far exceeds the API
+// payload budget, so the book converts in sequential batches; each turn sees
+// ONLY its batch in the <import> block and must emit ready for exactly that
+// batch. Order is preserved so the frontend can re-associate split parts.
+function loreBatchInstruction(i, n) {
+  return `Convert batch ${i} of ${n} of the imported SillyTavern lorebook into final codex entries NOW — a one-shot conversion, not an interview: do not ask the user questions. ${LORE_REFINE_RULES} ` +
+    `This batch is a subset of a larger book: convert ONLY the entries in the <import> block, keep their order, and emit ready in this same turn with draft.entries holding exactly this batch's refined entries (an input entry that must split for the cap becomes "<Concept> — Part 1/Part 2" outputs).`;
+}
+
+// (2026-08-19 Chloe) Kill ANY in-flight creator turn from OUTSIDE the screen
+// (the flow-chrome ‹/⌂ handlers in fable.js). Mirrors the render-time
+// stale-turn firewall: bump the epoch (every channel handler + scheduled
+// retry from the old render self-ignores), clear a pending retry timer, +
+// signal the reserved creator cancel slot. Safe any time — idle = no-op.
+export function abortCreatorTurn(root) {
+  if (!root) return;
+  root._creatorEpoch = (root._creatorEpoch || 0) + 1;
+  if (root._creatorRetryTimer) {
+    clearTimeout(root._creatorRetryTimer);
+    root._creatorRetryTimer = null;
+  }
+  invoke('creator_assistant_stop').catch(() => {});
+}
 
 // Build the screen element (registered once in fable.js).
 export function buildCreatorChat() {
@@ -141,7 +185,36 @@ export function renderCreatorChat(root, config) {
   // review card lands — the corner pencil is the change path. The chat
   // surface survives only as the fallback (GLM asks anyway / a failure / the
   // review ‹ back).
-  const importConvert = !!config.presetImportData && !config.seedDraft;
+  const importOrigin = !!config.presetImportData && !config.seedDraft;
+  // `importConvert` is the one-shot conversion PHASE flag — cleared the
+  // moment the conversion's review card lands (showReview). After that, a
+  // pencil-edit cancel/ask/unparseable/api_lost must flow the NORMAL review
+  // path, never importFail (which discards the converted draft + imported
+  // portrait and ejects to the picker). `importOrigin` (const) keeps the
+  // run's ORIGIN alive for the edit-snapshot rule + the review ‹ routing.
+  let importConvert = importOrigin;
+  // (2026-08-19 Chloe) The lorebook conversion run: presetLorebook
+  // {name, entries} drives a SEQUENTIAL batch conversion under the bronze
+  // ring — each batch is its own assistant turn (a whole real-world book is
+  // 70-140KB and overflows the API payload budget, which used to silently
+  // drop the <import> message entirely), entries accumulate in
+  // loreRun.collected, and the FINAL review card lands when the last batch
+  // settles. This run NEVER shows the chat surface: any failure (ask /
+  // api_lost / unparseable / retries exhausted) is a bottom warning + back.
+  // It is nulled the moment the run settles (complete or failed) — a later
+  // pencil-edit `done` must route through the NORMAL ready path, never back
+  // into the batch handler. loreImported records the run's ORIGIN for the
+  // edit-snapshot rule after the run object is gone.
+  let loreRun = (config.presetLorebook && creatorKind === 'codex' && !config.seedDraft
+    && Array.isArray(config.presetLorebook.entries) && config.presetLorebook.entries.length)
+    ? {
+      name: config.presetLorebook.name || 'Imported lorebook',
+      batches: batchLorebookEntries(config.presetLorebook.entries),
+      idx: 0,
+      collected: [],
+    }
+    : null;
+  const loreImported = !!loreRun;
   // (P1 fix) Stale-turn firewall: ‹/⌂ stay clickable during a GLM turn, so
   // exiting mid-generation left the turn running — its `done` handler then
   // corrupted the NEXT wizard run on this shared screen (hid the prompt
@@ -175,6 +248,16 @@ export function renderCreatorChat(root, config) {
       root._creatorCloseEditPopup = null;
     }
     endEditGen();
+    // (2026-08-19 Chloe) ‹ during ANY in-flight creator turn — wizard chat,
+    // player/sim one-shot import, lorebook batch chain, or a pencil edit —
+    // kills it NOW. Without this the turn kept streaming after the screen
+    // swap (the stale-turn firewall only fires on the NEXT
+    // renderCreatorChat), and a lore batch chain kept firing GLM turns in
+    // the background while the user sat on a picker.
+    if (state.busy || root._creatorRetryTimer) {
+      loreRun = null;
+      abortCreatorTurn(root);
+    }
     if (typeof back === 'function') back();
   };
 
@@ -211,9 +294,9 @@ export function renderCreatorChat(root, config) {
   inputEl.disabled = false;
   // The greeting opens the conversation unless an initial message is supplied,
   // a seed draft is provided (edit mode skips straight to the review card), or
-  // this is an import run (no chat at all — the one-shot conversion fires at
-  // the render tail below).
-  if (!importConvert && !config.initialMessage && !config.seedDraft) {
+  // this is an import run (no chat at all — the one-shot/batched conversion
+  // fires at the render tail below).
+  if (!loreRun && !importConvert && !config.initialMessage && !config.seedDraft) {
     appendBubble(messagesEl, 'assistant', GREETINGS[creatorKind] || GREETINGS.player);
   }
   // Edit mode: a pre-seeded draft (e.g. editing a saved player) loads straight
@@ -289,8 +372,9 @@ export function renderCreatorChat(root, config) {
       // pause left the bronze ring stuck over the screen with no turn behind
       // it (the timer was the only thing that would have re-fired callApi).
       endEditGen();
-      if (importConvert) {
-        exitReviewToChat('Import conversion cancelled — describe what you want here, or press ‹ to go back.');
+      if (loreRun || importConvert) {
+        // (2026-08-19) Import runs never fall to the chat surface.
+        importFail('Import conversion cancelled.');
       }
       setBusy(false);
       trace('retry pause cancelled (stop) — turn aborted');
@@ -340,6 +424,11 @@ export function renderCreatorChat(root, config) {
     const bubble = editMode ? null : appendBubble(messagesEl, 'assistant', '');
     if (bubble) bubble.setTyping(true);
     if (editMode) beginEditGen();
+    // (2026-08-19) The lorebook batch label rides the opts — set AFTER
+    // beginEditGen builds the overlay (a pre-call setEditGenLabel wrote into
+    // nothing on batch 1 / the dead prior overlay on batch 2+), and the
+    // validation-retry re-fire (`callApi(opts)`) re-labels the rebuilt ring.
+    if (editMode && opts.genLabel) setEditGenLabel(opts.genLabel);
     let acc = '';
     const channel = new Channel();
     channel.onmessage = (msg) => {
@@ -355,8 +444,10 @@ export function renderCreatorChat(root, config) {
         // Mid-stream abort (Escape/Stop): restore the prior prompt + re-enable.
         if (bubble) { bubble.setTyping(false); bubble.restore(priorText); }
         if (editMode) endEditGen();   // un-blur — the review card returns untouched
-        if (importConvert) {
-          exitReviewToChat('Import conversion cancelled — describe what you want here, or press ‹ to go back.');
+        if (loreRun || importConvert) {
+          // (2026-08-19) An import run has NO chat surface to fall back to —
+          // a cancel warns at the bottom + returns to its picker.
+          importFail('Import conversion cancelled.');
         }
         setBusy(false);
         trace('cancelled (stop) — turn aborted');
@@ -455,6 +546,10 @@ export function renderCreatorChat(root, config) {
   }
 
   function handleDone(text, bubble, editMode = false) {
+    // (2026-08-19) The lorebook conversion owns its `done` handling: batch
+    // accumulation, no history push (each batch is an independent turn), no
+    // chat fallback.
+    if (loreRun) return handleLoreBatchDone(text);
     state.history.push({ role: 'assistant', content: text });
     const env = parseEnvelope(text);
     if (!env) {
@@ -462,8 +557,13 @@ export function renderCreatorChat(root, config) {
       trace('envelope UNPARSEABLE — showing raw reply');
       if (editMode) {
         endEditGen();
-        exitReviewToChat(stripToJsonFallback(text));
-        setBusy(false);
+        if (importConvert) {
+          // (2026-08-19) Import runs have no chat surface — warn + go back.
+          importFail('The import could not be converted — try again.');
+        } else {
+          exitReviewToChat(stripToJsonFallback(text));
+          setBusy(false);
+        }
       } else {
         bubble.setTyping(false);
         bubble.update(stripToJsonFallback(text));
@@ -528,11 +628,18 @@ export function renderCreatorChat(root, config) {
         : '';
       const askText = (env.message || '').trim() + qText;
       if (editMode) {
-        // GLM needs more info before the card can re-finalize → drop back to
-        // the chat surface with the follow-up questions in the prompt block.
         endEditGen();
-        exitReviewToChat(askText.trim() || 'Tell me what to change.');
-        setBusy(false);
+        if (importConvert) {
+          // (2026-08-19 Chloe) An import conversion that asks instead of
+          // converting is a FAILED import — bottom warning + back, never a
+          // chat window ("Looks like no lorebook content…" ends here).
+          importFail(`The assistant could not convert the import${askText ? `: "${askText.slice(0, 120)}"` : ''} — try again.`);
+        } else {
+          // GLM needs more info before the card can re-finalize → drop back to
+          // the chat surface with the follow-up questions in the prompt block.
+          exitReviewToChat(askText.trim() || 'Tell me what to change.');
+          setBusy(false);
+        }
       } else {
         bubble.setTyping(false);
         bubble.update(askText);
@@ -543,6 +650,10 @@ export function renderCreatorChat(root, config) {
 
   // --- the review card ---------------------------------------------------
   function showReview() {
+    // The import conversion phase ENDS here: its draft + portrait are on the
+    // card, so every later edit turn belongs to the normal review flow (a
+    // pencil-edit failure surfaces on the card, not importFail).
+    importConvert = false;
     state.done = true;
     inputEl.disabled = true;
     // Engage review-mode on the wizard container so the existing
@@ -587,13 +698,97 @@ export function renderCreatorChat(root, config) {
   }
 
   // Edit-mode error routing: with a review card on screen the error lands ON
-  // it (showReviewError); during a one-shot import conversion there is no
-  // review yet — showReviewError no-ops while review is hidden, which would
-  // make the failure invisible. Drop to the chat surface instead so the ⚠ is
-  // readable and the composer offers a retry path.
+  // it (showReviewError); an IMPORT run (one-shot or lorebook) has no chat
+  // surface to drop to — the failure is a bottom warning + return to the
+  // picker (2026-08-19 Chloe: imports never open a chat window).
   function surfaceEditModeError(msg) {
-    if (importConvert) exitReviewToChat(msg);
+    if (loreRun || importConvert) importFail(msg);
     else showReviewError(msg);
+  }
+
+  // (2026-08-19 Chloe) The import failure contract: NO chat window, ever. Warn
+  // at the bottom of the screen (document-fixed popup) + route back to the
+  // picker the import launched from. `back` re-renders the prior step; the
+  // warning survives the screen swap.
+  function importFail(msg) {
+    endEditGen();
+    setBusy(false);
+    // Kill any armed retry pause too — importFail is the shared failure sink
+    // for every import path, and a surviving 900ms timer would fire a fresh
+    // GLM batch over the picker screen after the bounce (the ‹ guard +
+    // stopTurn already clear it before landing here; this makes the sink
+    // self-sufficient).
+    if (root._creatorRetryTimer) {
+      clearTimeout(root._creatorRetryTimer);
+      root._creatorRetryTimer = null;
+    }
+    loreRun = null; // kill the batch chain — a racing late `done` must not fire the next batch
+    trace(`import failed: ${String(msg).slice(0, 200)}`);
+    bottomWarning(String(msg).replace(/^⚠\s*/, ''));
+    if (typeof back === 'function') back();
+  }
+
+  // --- the lorebook batch conversion (2026-08-19 Chloe) --------------------
+  // A standalone SillyTavern lorebook converts in SEQUENTIAL batches (a real
+  // book is 70-140KB — past the API payload budget, so a single turn's
+  // <import> message would be silently dropped and the assistant would see
+  // no content at all). Each batch is an independent assistant turn under the
+  // bronze ring; entries accumulate; the last batch lands the FINAL review
+  // card. The run has NO chat surface — every failure routes to importFail.
+  function fireLoreBatch() {
+    const { batches, idx } = loreRun;
+    state.history = [{
+      role: 'user',
+      content: loreBatchInstruction(idx + 1, batches.length),
+    }];
+    state.importData = {
+      spec: 'lorebook',
+      name: loreRun.name,
+      batch: idx + 1,
+      batches: batches.length,
+      entries: batches[idx],
+    };
+    trace(`lore convert batch ${idx + 1}/${batches.length} (${batches[idx].length} entries)`);
+    callApi({
+      editMode: true,
+      genLabel: `Converting lorebook — batch ${idx + 1} of ${batches.length}`,
+    });
+  }
+
+  // One batch's `done`: normalize the entries (title fallback + the ≥3-tag
+  // mechanical floor), then fire the next batch or land the review card.
+  function handleLoreBatchDone(text) {
+    const env = parseEnvelope(text);
+    const aiEntries = env && env.draft && Array.isArray(env.draft.entries) ? env.draft.entries : null;
+    if (!env || env.action !== 'ready' || !aiEntries || !aiEntries.length) {
+      const why = env && env.message ? String(env.message).slice(0, 140) : '';
+      importFail(`The lorebook import could not be converted${why ? ` — "${why}"` : ''}. Try again.`);
+      return;
+    }
+    const sources = loreRun.batches[loreRun.idx];
+    const merged = normalizeLoreImportEntries(aiEntries, sources, loreRun.name);
+    if (!merged.length) {
+      importFail('The lorebook import came back empty — try again.');
+      return;
+    }
+    loreRun.collected.push(...merged);
+    loreRun.idx += 1;
+    trace(`lore batch ${loreRun.idx}/${loreRun.batches.length} converted — ${merged.length} entries (total ${loreRun.collected.length})`);
+    if (loreRun.idx < loreRun.batches.length) {
+      state.codexValidationRetries = 0; // fresh retry budget per batch
+      fireLoreBatch();
+    } else {
+      state.draft.entries = loreRun.collected;
+      // The refined draft is the whole context now — a later pencil edit must
+      // never re-send the last batch's raw payload as the "import", and its
+      // `done` must flow through the normal ready path (loreRun → null).
+      state.importData = null;
+      state.codexValidationRetries = 0;
+      loreRun = null;
+      endEditGen();
+      showReview();
+      setBusy(false);
+    }
   }
 
   // --- the edit popup (corner pencil → centered mini-editor) --------------
@@ -674,10 +869,17 @@ export function renderCreatorChat(root, config) {
     // conversation). Inject the entity's CURRENT state as context right
     // before the instruction, size-capped so a codex-laden draft can't
     // bloat the call. Consecutive user turns are fine for the API path.
-    if (config.seedDraft) {
+    // (2026-08-19) IMPORT runs need it too — their history carries only the
+    // conversion instruction, so a pencil edit post-import was equally
+    // blind. importOrigin/loreImported keep the rule alive after the
+    // conversion phase flag / lore run object clear at completion. Codex
+    // drafts get a larger cap (an imported lorebook's entries are the
+    // substance being edited).
+    if (config.seedDraft || importOrigin || loreImported) {
       try {
         let snapshot = JSON.stringify(state.draft, null, 2) || '';
-        if (snapshot.length > 6000) snapshot = snapshot.slice(0, 6000) + '\n…(truncated)';
+        const cap = creatorKind === 'codex' ? 20000 : 6000;
+        if (snapshot.length > cap) snapshot = snapshot.slice(0, cap) + '\n…(truncated)';
         state.history.push({
           role: 'user',
           content: `Current state of the ${creatorKind === 'player' ? 'player' : 'card'} being edited ` +
@@ -698,7 +900,13 @@ export function renderCreatorChat(root, config) {
     const overlay = document.createElement('div');
     overlay.className = 'fable-creator-genring';
     overlay.dataset.genring = '';
-    overlay.innerHTML = `<div class="fable-creator-genring-ring"></div>`;
+    // Stack: ring + an optional progress label (the lorebook conversion names
+    // its batch so a long import never reads as a hang). Empty label = 0px.
+    overlay.innerHTML = `
+      <div class="fable-creator-genring-stack">
+        <div class="fable-creator-genring-ring"></div>
+        <div class="fable-creator-genring-label" data-genring-label></div>
+      </div>`;
     root.appendChild(overlay);
     // Escape is the cut-off path while the ring spins (the composer is hidden
     // in review mode, so its own Escape handler can't fire here).
@@ -707,6 +915,11 @@ export function renderCreatorChat(root, config) {
     };
     document.addEventListener('keydown', onEsc, { capture: true });
     overlay._cleanup = () => document.removeEventListener('keydown', onEsc, { capture: true });
+  }
+
+  function setEditGenLabel(text) {
+    const el = root.querySelector('[data-genring-label]');
+    if (el) el.textContent = text || '';
   }
 
   function endEditGen() {
@@ -757,7 +970,12 @@ export function renderCreatorChat(root, config) {
         } catch (_) { /* cropper failure — keep current portrait */ }
       });
     }
-    // Back → return to chat to request changes.
+    // Back → return to chat to request changes — EXCEPT import-origin runs
+    // (one-shot + lorebook): their only history is the conversion
+    // instruction, so the chat surface would be an empty husk over a stale
+    // batch payload. Per the "imports never touch the chat surface" ruling,
+    // ‹ routes to the picker the import launched from (the same sink
+    // importFail uses).
     const backBtn = el.querySelector('[data-review-back]');
     if (backBtn) backBtn.addEventListener('click', () => {
       // (2026-08-16 yellow J5) Never exit mid-CREATE: the write is a
@@ -765,6 +983,10 @@ export function renderCreatorChat(root, config) {
       // (showReviewError no-ops once the card is hidden) — a ‹ click during
       // the write made that failure invisible.
       if (state.busy) return;
+      if (importOrigin || loreImported) {
+        if (typeof back === 'function') back();
+        return;
+      }
       exitReviewToChat();
     });
     // The corner pencil → the edit popup (replaces the old review "Edit"
@@ -921,14 +1143,17 @@ export function renderCreatorChat(root, config) {
     }
   }
 
-  // The one-shot import conversion: seed the history with the conversion
-  // instruction + fire the turn in edit mode — the SAME bronze-ring blur the
-  // review-card pencil edit uses (callApi({editMode:true})): ring up for the
-  // whole conversion, showReview() lands the final card on `ready`
-  // (mandatory-gate retries re-fire beneath the still-spinning ring). The
-  // chat surface is only the fallback surface (ask / failure / ‹ from
-  // review).
-  if (importConvert) {
+  // The lorebook conversion (2026-08-19): batched turns under the bronze
+  // ring, straight to the FINAL review card — no chat surface at any point.
+  if (loreRun) {
+    trace(`lore convert — ${loreRun.batches.length} batch(es), ${config.presetLorebook.entries.length} entries`);
+    fireLoreBatch();
+  } else if (importConvert) {
+    // The one-shot player/sim import conversion: seed the history with the
+    // conversion instruction + fire the turn in edit mode — the SAME
+    // bronze-ring blur the review-card pencil edit uses. ring up for the
+    // whole conversion, showReview() lands the final card on `ready`
+    // (mandatory-gate retries re-fire beneath the still-spinning ring).
     state.history.push({
       role: 'user',
       content: IMPORT_CONVERT_INSTRUCTIONS[creatorKind] || IMPORT_CONVERT_INSTRUCTIONS.player,

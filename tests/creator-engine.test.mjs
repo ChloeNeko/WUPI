@@ -18,8 +18,12 @@ import {
   readCharaChunk,
   base64ToUtf8,
   normalizeCharJson,
-  normalizeLorebookJson,
-  lorebookToCodexEntries,
+  extractLorebookEntries,
+  extractStandaloneLorebook,
+  charDataHasContent,
+  batchLorebookEntries,
+  padCodexEntryTags,
+  normalizeLoreImportEntries,
 } from '../src/fable/engine/creator-engine.js';
 
 let passed = 0;
@@ -341,41 +345,141 @@ test('normalizeCharJson: missing V2 fields → empty defaults (not undefined)', 
   assert.deepEqual(c2.tags, []);
 });
 
-// ── normalizeLorebookJson ──────────────────────────────────────────────────
-test('normalizeLorebookJson: standalone lorebook → charData with character_book', () => {
-  const c = normalizeLorebookJson({ entries: [{ key: ['k'], content: 'body', comment: 'C' }] });
-  assert.ok(c.character_book);
-  assert.ok(Array.isArray(c.character_book.entries));
-  assert.equal(c.spec, 'lorebook');
-});
-
-test('normalizeLorebookJson: character-shaped object (has name+desc) → null (defer)', () => {
-  assert.equal(normalizeLorebookJson({ name: 'X', description: 'Y', entries: [] }), null);
-});
-
-test('normalizeLorebookJson: no entries → null', () => {
-  assert.equal(normalizeLorebookJson({ name: 'X' }), null);
-});
-
-// ── lorebookToCodexEntries ─────────────────────────────────────────────────
-test('lorebookToCodexEntries: array + object-map shapes', () => {
-  const arr = lorebookToCodexEntries({ entries: [{ comment: 'T1', content: 'B1', key: ['a', 'b'] }] });
+// ── extractLorebookEntries (the mechanical lorebook→codex extraction) ──────
+// (2026-08-19 Chloe rules: keyword-less entries are SKIPPED at parse time;
+// content-less entries are skipped; title falls back comment → name → first
+// key; keys read the `key` ∪ `keys` union.)
+test('extractLorebookEntries: array + object-map shapes, title/keys/body', () => {
+  const arr = extractLorebookEntries({ entries: [{ comment: 'T1', content: 'B1', key: ['a', 'b'] }] });
   assert.equal(arr.length, 1);
   assert.equal(arr[0].title, 'T1');
-  assert.deepEqual(arr[0].tags, ['a', 'b']);
-  const map = lorebookToCodexEntries({ entries: { 0: { comment: 'M', content: 'B' } } });
+  assert.deepEqual(arr[0].keys, ['a', 'b']);
+  assert.equal(arr[0].content, 'B1');
+  const map = extractLorebookEntries({ entries: { 0: { comment: 'M', content: 'B', keys: ['k1', 'k2', 'k1'] } } });
   assert.equal(map.length, 1);
   assert.equal(map[0].title, 'M');
+  // key + keys union, deduped (real ST exports carry both fields).
+  assert.deepEqual(map[0].keys, ['k1', 'k2']);
 });
 
-test('lorebookToCodexEntries: drops empty-body entries', () => {
-  const r = lorebookToCodexEntries({ entries: [{ comment: 'empty', content: '   ' }] });
-  assert.equal(r.length, 0);
+test('extractLorebookEntries: SKIPS entries with no keywords (2026-08-19 ruling)', () => {
+  const r = extractLorebookEntries({
+    entries: [
+      { comment: 'READ THIS legend', content: 'symbol legend', key: [] },
+      { comment: 'constant header', content: 'always-on text' },
+      { comment: 'real', content: 'kept', key: ['x'] },
+      { comment: 'empty body', content: '   ', key: ['y'] },
+    ],
+  });
+  assert.equal(r.length, 1);
+  assert.equal(r[0].title, 'real');
 });
 
-test('lorebookToCodexEntries: no book → []', () => {
-  assert.deepEqual(lorebookToCodexEntries(null), []);
-  assert.deepEqual(lorebookToCodexEntries({}), []);
+test('extractLorebookEntries: no book / junk → []', () => {
+  assert.deepEqual(extractLorebookEntries(null), []);
+  assert.deepEqual(extractLorebookEntries({}), []);
+  assert.deepEqual(extractLorebookEntries({ entries: 'nope' }), []);
+});
+
+// ── extractStandaloneLorebook (recognition at the import boundary) ─────────
+test('extractStandaloneLorebook: Frieren-style book (name, EMPTY description, entries map) → recognized', () => {
+  const lore = extractStandaloneLorebook({
+    name: 'Frieren',
+    description: '',
+    entries: { 1: { uid: 1, comment: '═══════[Setting]═══════', content: 'A world.', key: [], keys: [] }, 2: { uid: 2, comment: 'Mana', content: 'Mana is everywhere.', key: ['mana', 'magic'] } },
+  });
+  assert.ok(lore);
+  assert.equal(lore.name, 'Frieren');
+  // The keyless decorative header is skipped — only the keyed entry survives.
+  assert.equal(lore.entries.length, 1);
+  assert.equal(lore.entries[0].title, 'Mana');
+});
+
+test('extractStandaloneLorebook: character-shaped object → null (character path owns it)', () => {
+  assert.equal(extractStandaloneLorebook({ name: 'X', description: 'Y', entries: [{ key: ['k'], content: 'b' }] }), null);
+  assert.equal(extractStandaloneLorebook({ name: 'X', first_mes: 'hi', entries: [{ key: ['k'], content: 'b' }] }), null);
+});
+
+test('extractStandaloneLorebook: no usable entries / arrays / non-objects → null', () => {
+  assert.equal(extractStandaloneLorebook({ name: 'X' }), null);
+  assert.equal(extractStandaloneLorebook({ entries: [{ comment: 'keyless', content: 'b' }] }), null);
+  assert.equal(extractStandaloneLorebook([1, 2, 3]), null);
+  assert.equal(extractStandaloneLorebook('nope'), null);
+});
+
+// ── charDataHasContent (the unrecognized-JSON gate) ─────────────────────────
+test('charDataHasContent: empty husk → false, any content field → true', () => {
+  assert.equal(charDataHasContent(normalizeCharJson({ random: 'settings dump' })), false);
+  assert.equal(charDataHasContent(normalizeCharJson({ name: 'Kael' })), true);
+  assert.equal(charDataHasContent(normalizeCharJson({ description: 'tall' })), true);
+  assert.equal(charDataHasContent(normalizeCharJson({ tags: ['a'] })), true);
+  assert.equal(charDataHasContent(normalizeCharJson({ character_book: { entries: [] } })), true);
+  assert.equal(charDataHasContent(null), false);
+});
+
+// ── batchLorebookEntries (the API-budget chunker) ───────────────────────────
+test('batchLorebookEntries: whole entries only, budget respected, order kept', () => {
+  const mk = (i, size) => ({ title: `T${i}`, keys: ['k'], content: 'x'.repeat(size) });
+  const entries = [mk(1, 3000), mk(2, 3000), mk(3, 3000), mk(4, 100)];
+  const batches = batchLorebookEntries(entries, 8000);
+  // 3000+3000+3000 > 8000 → the third entry opens a fresh batch.
+  assert.equal(batches.length, 2);
+  assert.deepEqual(batches[0].map((e) => e.title), ['T1', 'T2']);
+  assert.deepEqual(batches[1].map((e) => e.title), ['T3', 'T4']);
+  // Flattened batches preserve the original order exactly.
+  assert.deepEqual(batches.flat().map((e) => e.title), ['T1', 'T2', 'T3', 'T4']);
+});
+
+test('batchLorebookEntries: a single oversized entry rides alone', () => {
+  const entries = [{ title: 'Big', keys: ['k'], content: 'x'.repeat(20000) }, { title: 'Small', keys: ['k'], content: 'y' }];
+  const batches = batchLorebookEntries(entries, 8000);
+  assert.equal(batches.length, 2);
+  assert.equal(batches[0][0].title, 'Big');
+  assert.deepEqual(batches[1].map((e) => e.title), ['Small']);
+});
+
+test('batchLorebookEntries: empty / non-array → []', () => {
+  assert.deepEqual(batchLorebookEntries([]), []);
+  assert.deepEqual(batchLorebookEntries(null), []);
+});
+
+// ── padCodexEntryTags (the ≥3-tag mechanical floor) ─────────────────────────
+test('padCodexEntryTags: pads to ≥3 from source keys → title words → book name', () => {
+  // Assistant gave 1 tag; source keys top it up.
+  assert.deepEqual(
+    padCodexEntryTags(['demons'], ['demon', 'abyss'], 'Demon Lords', 'Frieren'),
+    ['demons', 'demon', 'abyss', 'lords', 'frieren'],
+  );
+  // No assistant tags, no source keys — title words + book name carry it.
+  const t = padCodexEntryTags([], [], 'Continental Magic', 'Frieren');
+  assert.ok(t.length >= 3);
+  assert.ok(t.includes('continental'));
+  assert.ok(t.includes('frieren'));
+  // Total drought → the generic floor guarantees 3.
+  assert.equal(padCodexEntryTags([], [], '??', '').length >= 3, true);
+  // Dedupe is case-insensitive + capped at 8.
+  assert.equal(padCodexEntryTags(['A', 'a', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I'], [], 'T', 'N').length, 8);
+});
+
+// ── normalizeLoreImportEntries (the batch result normalizer) ────────────────
+test('normalizeLoreImportEntries: title fallback, tag floor, part-suffix source match, husk drop', () => {
+  const sources = [
+    { title: 'Demon Lords', keys: ['demon', 'abyss'], content: 'raw' },
+    { title: 'Mana', keys: ['mana'], content: 'raw2' },
+  ];
+  const merged = normalizeLoreImportEntries([
+    { title: '', tags: [], body: 'Refined body one.' },               // husk title → source title; tags floored
+    { title: 'Mana — Part 1', tags: ['mana'], body: 'Refined body two.' }, // part suffix matches its source
+    { tags: ['x'], body: '' },                                        // body-less husk dropped
+  ], sources, 'Frieren');
+  assert.equal(merged.length, 2);
+  assert.equal(merged[0].title, 'Demon Lords');
+  assert.ok(merged[0].tags.length >= 3);
+  assert.ok(merged[0].tags.includes('demon'));
+  assert.ok(merged[1].tags.includes('mana'));
+  assert.ok(merged[1].tags.length >= 3);
+  // Non-array input → [].
+  assert.deepEqual(normalizeLoreImportEntries(null, sources, 'Frieren'), []);
 });
 
 // ── the mandatory-field gate (2026-08-15 Chloe) ────────────────────────────

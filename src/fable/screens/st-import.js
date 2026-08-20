@@ -9,10 +9,12 @@
 // ALSO become the auto-filled portrait (saved on CREATE even without a
 // re-crop; the review slot crops on click).
 //
-// JSON PATH: JSON.parse accepts both the V2/V3 wrapper
-// ({ spec: 'chara_card_v2', data: {...} }) and a plain character JSON
-// ({ name, description, personality, scenario, first_mes, ... }), plus a
-// standalone lorebook ({ entries }).
+// JSON PATH: a standalone lorebook ({ entries }) is recognized FIRST and
+// returns as `lorebook` (the codex import converts it — see creator-engine);
+// otherwise JSON.parse accepts the V2/V3 wrapper ({ spec: 'chara_card_v2',
+// data: {...} }) and the plain character JSON ({ name, description,
+// personality, scenario, first_mes, ... }). An object with no content of
+// either kind throws (unrecognized → the caller's bottom warning).
 //
 // GLM does its own field mapping from the normalized charData (the old
 // fixed SCHEMA_MAPS/mapImport surface + the wizard-coupled
@@ -26,7 +28,8 @@ import {
   readCharaChunk,
   base64ToUtf8,
   normalizeCharJson,
-  normalizeLorebookJson,
+  extractStandaloneLorebook,
+  charDataHasContent,
 } from '../engine/creator-engine.js';
 
 // Read a file's bytes as a Uint8Array via the existing portrait-bytes IPC
@@ -53,7 +56,7 @@ async function readJsonFile(srcPath) {
 
 // --- PNG chunk walker + JSON normalize ------------------------------------
 // The pure parse primitives (findCharaChunk, base64ToUtf8, normalizeCharJson,
-// normalizeLorebookJson, lorebookToCodexEntries) live in
+// extractStandaloneLorebook, charDataHasContent) live in
 // engine/creator-engine.js so they're unit-testable + shared with the
 // codex-import path. This module keeps only the Tauri-coupled I/O
 // (readImageAsDataUrl / readJsonFile) + the import entry point.
@@ -63,12 +66,21 @@ async function readJsonFile(srcPath) {
 // (for GLM to refine via the import_data IPC arg — GLM does its own field
 // mapping), + return the raw portrait data URL (uncropped) so the review
 // slot can pre-fill + crop on click. Returns
-// { charData, portraitDataUrl?, portraitExt?, portraitBytes?, introText }
-// or null on cancel. `portraitBytes` carries the RAW PNG bytes so the
-// imported portrait is saved on CREATE even if the user never re-opens the
+// { charData, portraitDataUrl?, portraitExt?, portraitBytes?, introText,
+//   lorebook } or null on cancel. `portraitBytes` carries the RAW PNG bytes so
+// the imported portrait is saved on CREATE even if the user never re-opens the
 // cropper — without it the review preview shows a portrait that `doCreate`
 // silently drops (state.portraitBytes stays null). A later cropper confirm
 // overrides these with the cropped bytes (cropped always wins).
+//
+// `lorebook` (2026-08-19): {name, entries} when the file is a standalone ST
+// lorebook — charData is null in that case and the CODEX import step owns the
+// conversion (batched refinement → straight to the review card). Recognition
+// order is load-bearing: the lorebook check runs FIRST — normalizeCharJson
+// accepts any object, so a world book used to normalize into an all-empty
+// character card and the codex wizard was fed a husk ("no lorebook content").
+// An object with NO content of either kind throws → the caller's bottom
+// warning fires and the flow never leaves the picker (no chat window).
 export async function parseImportFile(screenEl) {
   void screenEl; // accepted for call-site symmetry; the picker needs no anchor element
   let picked;
@@ -106,18 +118,29 @@ export async function parseImportFile(screenEl) {
       json = JSON.parse(b64);
     }
     charData = normalizeCharJson(json);
-    if (!charData) throw new Error('embedded character JSON is empty');
+    if (!charDataHasContent(charData)) throw new Error('no character or lorebook content found in this PNG');
     portraitDataUrl = dataUrl; // uncropped preview — the review slot crops on click
     portraitExt = 'png';
     // Keep the raw PNG bytes as the save fallback (see jsdoc above).
     portraitBytes = u8;
   } else if (lower.endsWith('.json')) {
-    const json = await readJsonFile(srcPath);
-    // Try a character shape first (V2/V3 wrapper or plain), then a standalone
-    // lorebook ({ entries } with no character fields) — both surface as a
-    // charData object so GLM/the codex path convert them uniformly.
-    charData = normalizeCharJson(json) || normalizeLorebookJson(json);
-    if (!charData) throw new Error('character or lorebook JSON is empty / unrecognized');
+    let json;
+    try {
+      json = await readJsonFile(srcPath);
+    } catch (_) {
+      throw new Error('that file is not valid JSON');
+    }
+    if (!json || typeof json !== 'object' || Array.isArray(json)) {
+      throw new Error('no character or lorebook content found in that file');
+    }
+    // Lorebook FIRST (see jsdoc) — a standalone ST world book never reaches
+    // the character normalizer.
+    const lore = extractStandaloneLorebook(json);
+    if (lore) {
+      return { charData: null, portraitDataUrl: null, portraitExt: null, portraitBytes: null, introText: '', lorebook: lore };
+    }
+    charData = normalizeCharJson(json);
+    if (!charDataHasContent(charData)) throw new Error('no character or lorebook content found in that file');
   } else {
     throw new Error('select a .png or .json file');
   }
@@ -135,6 +158,6 @@ export async function parseImportFile(screenEl) {
         .filter(Boolean)
         .join('\n')
     : '';
-  return { charData, portraitDataUrl, portraitExt, portraitBytes, introText };
+  return { charData, portraitDataUrl, portraitExt, portraitBytes, introText, lorebook: null };
 }
 

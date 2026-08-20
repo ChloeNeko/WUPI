@@ -241,63 +241,6 @@ pub const MAX_EPISODIC_CHUNKS: usize = 2000;
 /// on every single turn at the boundary. Must stay < [`MAX_EPISODIC_CHUNKS`].
 pub const EPISODIC_PRUNE_TARGET: usize = 1800;
 
-/// Diag-log mirror of one completed hybrid search (logs.rs — share-safe).
-/// Tail call of the three search fns: logs candidate counts, the best raw
-/// BM25 score (scale reference), and one line per returned memory with its
-/// true cosine / per-list ranks / fused score. Pure observability — no
-/// behavior, no text bodies (query passes through `brief`).
-fn log_search_hits(
-    kind: &str,
-    card: &str,
-    query: &str,
-    sparse: &[(MemoryId, f32)],
-    dense: &[(MemoryId, f32)],
-    hits: &[RankedMemory],
-) {
-    if !crate::logs::is_on() {
-        return;
-    }
-    crate::logs::log(
-        "MEM",
-        &format!(
-            "search kind={kind} card={card} q={} sparse={} dense={} hits={} best_bm25={}",
-            crate::logs::brief(query),
-            sparse.len(),
-            dense.len(),
-            hits.len(),
-            sparse
-                .first()
-                .map(|(_, s)| format!("{s:.2}"))
-                .unwrap_or_else(|| "-".into())
-        ),
-    );
-    for r in hits {
-        crate::logs::log(
-            "MEM",
-            &format!(
-                "hit id={} card={} chars={} codex={} cos={} dr={} sr={} fused={:.4}",
-                r.entry.id,
-                r.entry.card_id,
-                r.entry.text_content.chars().count(),
-                r.entry.metadata_json.is_some(),
-                r.debug
-                    .dense_cosine
-                    .map(|v| format!("{v:.3}"))
-                    .unwrap_or_else(|| "-".into()),
-                r.debug
-                    .dense_rank
-                    .map(|v| v.to_string())
-                    .unwrap_or_else(|| "-".into()),
-                r.debug
-                    .sparse_rank
-                    .map(|v| v.to_string())
-                    .unwrap_or_else(|| "-".into()),
-                r.score
-            ),
-        );
-    }
-}
-
 /// A search result carrying its fused RRF score.
 ///
 /// Returned by [`MemoryEngine::search`] so the debug IPC can show *why* a
@@ -642,16 +585,6 @@ impl<E: Embedder> MemoryEngine<E> {
         if chunks.is_empty() {
             anyhow::bail!("add_memory: text chunked to nothing (was empty?)");
         }
-        crate::logs::log(
-            "MEM",
-            &format!(
-                "archive card={} chars={} chunks={} turn={}",
-                card_id,
-                text.chars().count(),
-                chunks.len(),
-                turn_uuid.unwrap_or("-")
-            ),
-        );
 
         // Single-chunk fast path: zero overhead vs the pre-chunking behavior.
         // Same one embed, same one insert, parent_uuid = NULL.
@@ -757,16 +690,7 @@ impl<E: Embedder> MemoryEngine<E> {
         // instruction prefix here (see memory_embedder_llama.rs); documents
         // (add_memory) are embedded raw. Using the query-specific entry point
         // is what keeps irrelevant matches below the dense cosine floor.
-        let embed_t0 = std::time::Instant::now();
         let embedding = self.embedder.embed_query(query.to_owned()).await?;
-        crate::logs::log(
-            "MEM",
-            &format!(
-                "embed_query {}ms chars={}",
-                embed_t0.elapsed().as_millis(),
-                query.chars().count()
-            ),
-        );
 
         // query + card_id are borrowed; the closure needs 'static, so take
         // owned copies.
@@ -791,13 +715,6 @@ impl<E: Embedder> MemoryEngine<E> {
                 Ok(ids) => ids,
                 Err(e) => {
                     tracing::warn!(error = %format!("{e:#}"), "fts5 search failed; dense-only this turn");
-                    crate::logs::log(
-                        "MEM",
-                        &format!(
-                            "fts5_fail part=card err={}",
-                            crate::logs::brief_with(&format!("{e:#}"), 90)
-                        ),
-                    );
                     Vec::new()
                 }
             };
@@ -827,7 +744,6 @@ impl<E: Embedder> MemoryEngine<E> {
                 limit,
             );
             let hydrated = fetch_entries(&c, &fused)?;
-            log_search_hits("card", &card_id_owned, &query_owned, &sparse, &dense, &hydrated);
             Ok(hydrated)
         })
         .await
@@ -866,16 +782,7 @@ impl<E: Embedder> MemoryEngine<E> {
         const RETRIEVAL_DEPTH: usize = 64;
 
         // Embed ONCE: the query vector is identical for both partitions.
-        let embed_t0 = std::time::Instant::now();
         let embedding = self.embedder.embed_query(query.to_owned()).await?;
-        crate::logs::log(
-            "MEM",
-            &format!(
-                "embed_query {}ms chars={}",
-                embed_t0.elapsed().as_millis(),
-                query.chars().count()
-            ),
-        );
 
         let query_owned = query.to_owned();
         let active_card_owned = active_card_id.to_owned();
@@ -889,13 +796,6 @@ impl<E: Embedder> MemoryEngine<E> {
                 Ok(ids) => ids,
                 Err(e) => {
                     tracing::warn!(error = %format!("{e:#}"), "fts5 (active card) failed; dense-only");
-                    crate::logs::log(
-                        "MEM",
-                        &format!(
-                            "fts5_fail part=active err={}",
-                            crate::logs::brief_with(&format!("{e:#}"), 90)
-                        ),
-                    );
                     Vec::new()
                 }
             };
@@ -903,13 +803,6 @@ impl<E: Embedder> MemoryEngine<E> {
                 Ok(ids) => ids,
                 Err(e) => {
                     tracing::warn!(error = %format!("{e:#}"), "fts5 (system) failed; dense-only");
-                    crate::logs::log(
-                        "MEM",
-                        &format!(
-                            "fts5_fail part=system err={}",
-                            crate::logs::brief_with(&format!("{e:#}"), 90)
-                        ),
-                    );
                     Vec::new()
                 }
             };
@@ -957,7 +850,6 @@ impl<E: Embedder> MemoryEngine<E> {
                 limit,
             );
             let hydrated = fetch_entries(&c, &fused)?;
-            log_search_hits("wupi", &active_card_owned, &query_owned, &sparse, &dense, &hydrated);
             Ok(hydrated)
         })
         .await
@@ -990,16 +882,7 @@ impl<E: Embedder> MemoryEngine<E> {
         const RETRIEVAL_DEPTH: usize = 64;
 
         // Embed ONCE: the query vector is identical for both partitions.
-        let embed_t0 = std::time::Instant::now();
         let embedding = self.embedder.embed_query(query.to_owned()).await?;
-        crate::logs::log(
-            "MEM",
-            &format!(
-                "embed_query {}ms chars={}",
-                embed_t0.elapsed().as_millis(),
-                query.chars().count()
-            ),
-        );
 
         let query_owned = query.to_owned();
         let active_card_owned = active_card_id.to_owned();
@@ -1013,13 +896,6 @@ impl<E: Embedder> MemoryEngine<E> {
                 Ok(ids) => ids,
                 Err(e) => {
                     tracing::warn!(error = %format!("{e:#}"), "fts5 (fable active card) failed; dense-only");
-                    crate::logs::log(
-                        "MEM",
-                        &format!(
-                            "fts5_fail part=fable-active err={}",
-                            crate::logs::brief_with(&format!("{e:#}"), 90)
-                        ),
-                    );
                     Vec::new()
                 }
             };
@@ -1027,13 +903,6 @@ impl<E: Embedder> MemoryEngine<E> {
                 Ok(ids) => ids,
                 Err(e) => {
                     tracing::warn!(error = %format!("{e:#}"), "fts5 (fable system) failed; dense-only");
-                    crate::logs::log(
-                        "MEM",
-                        &format!(
-                            "fts5_fail part=fable-system err={}",
-                            crate::logs::brief_with(&format!("{e:#}"), 90)
-                        ),
-                    );
                     Vec::new()
                 }
             };
@@ -1044,13 +913,6 @@ impl<E: Embedder> MemoryEngine<E> {
                 Ok(ids) => ids,
                 Err(e) => {
                     tracing::warn!(error = %format!("{e:#}"), "fts5 (fable codex) failed; dense-only");
-                    crate::logs::log(
-                        "MEM",
-                        &format!(
-                            "fts5_fail part=fable-codex err={}",
-                            crate::logs::brief_with(&format!("{e:#}"), 90)
-                        ),
-                    );
                     Vec::new()
                 }
             };
@@ -1096,7 +958,6 @@ impl<E: Embedder> MemoryEngine<E> {
                 limit,
             );
             let hydrated = fetch_entries(&c, &fused)?;
-            log_search_hits("fable", &active_card_owned, &query_owned, &sparse, &dense, &hydrated);
             Ok(hydrated)
         })
         .await
@@ -1487,13 +1348,6 @@ impl<E: Embedder> MemoryEngine<E> {
                 return Ok(0);
             }
             let excess = (count as usize).saturating_sub(target);
-            crate::logs::log(
-                "MEM",
-                &format!(
-                    "prune card={} episodic={} cap={} target={} excess={}",
-                    card_id, count, cap, target, excess
-                ),
-            );
 
             // Walk oldest-first, collecting row ids until `excess` is covered,
             // and note which turn groups the cut touched. Set membership (not a

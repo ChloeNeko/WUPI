@@ -120,6 +120,10 @@ let lastSentTurnText = '';
 let lastSendAt = 0;
 let cardContext = null;  // { card, saveId } for the active session
 let activeCardName = '';  // display name of the seated card (the typing indicator)
+// The seated card's wizard subtype ("npc" | "scenario" | "world" | ''). Drives
+// the typing indicator's voice: an npc card reads as the character themselves
+// typing; a scenario/world card narrates through the unseen "Narrator".
+let activeCardSubtype = '';
 let activePlayerName = '';  // protagonist name (card.player_name) → user-beat headers
 // Portrait identity for the VN chat (Phase 2 portrait bridge). Resolved in
 // refreshActiveCardName from fable_active_card_get's extended return shape.
@@ -132,6 +136,13 @@ let cornerDwellTimer = null; // 300ms arm-before-open timer (right edge)
 let leftCornerTrigger = null;   // the left-edge hover zone (Card / Tracker drawer)
 let leftCornerDwellTimer = null; // 300ms arm-before-open timer (left edge)
 let saveModalClose = null;  // fn: close the save modal (set in wireStage, called by Esc)
+// (2026-08-19) Cascade-delete confirm: the doomed run's target index while
+// the confirm modal is open (-1 = closed). The Confirm button reads this —
+// the click that opened the modal may belong to a beat a rebuild already
+// replaced, so the index is captured at OPEN time, never re-read from the
+// DOM at CONFIRM time.
+let deleteConfirmIndex = -1;
+let deleteModalClose = null;  // fn: close the delete modal (set in wireStage, called by Esc)
 const CORNER_DWELL_MS = 300;
 
 // STORED stage-element listeners (Chloe 2026-07-23: the resource-isolation
@@ -165,8 +176,33 @@ export function buildStage() {
          rounded glass card with a flush-left 2:3 portrait (dissolved inner
          edge) + a name header + the prose body. engine/beats.js owns the
          DOM; this is its mount point. Sits above the bg/FX, below the input
-         row + drawers. -->
-    <div class="fable-feed" data-feed></div>
+         row + drawers.
+         (2026-08-19) FEED VIEWPORT WRAPPER: the feed + the top blur strip
+         share this wrapper. The wrapper's opacity (0.9999 — visually a
+         no-op) establishes a BACKDROP ROOT, which is the load-bearing fence
+         for the strip: its backdrop-filter can only sample content painted
+         INSIDE this wrapper (the chat bubbles) — never the stage
+         background, the FX layer, or the OS top bar (which also sits z
+         9999 above the whole stage). The strip itself is pointer-events:
+         none, so nothing here can ever intercept the chrome-peek top bar
+         or a bubble click. -->
+    <div class="fable-feed-viewport">
+      <div class="fable-feed" data-feed></div>
+      <!-- 12px bubbles-only frosted band at the screen's top edge: the
+           transcript reads as always a tiny bit faded at the very top, so
+           bubbles appear to fade in as they scroll up under it. -->
+      <div class="fable-feed-topblur" aria-hidden="true"></div>
+    </div>
+    <!-- Typing indicator (re-instated 2026-08-19, subtype-aware): a small
+         label pinned just above the input row while a turn is in flight.
+         npc-subtype cards read "(Name) is currently typing..."; scenario/world
+         cards read "Narrator is currently thinking...". Toggled via the
+         .is-visible class from setGenerating (the onTurnStart/onTurnEnd
+         hooks) — it covers the WHOLE turn, including the silent tracker
+         stage before the first chunk streams. -->
+    <div class="fable-typing-indicator" data-typing-indicator aria-hidden="true">
+      <span class="fable-typing-indicator__text" data-typing-text></span>
+    </div>
     <form class="fable-input-row" data-input-form>
       <!-- The input is a single centered, max-width text box. The send button
            is GONE (2026-07-27): generation is fired by pressing Enter on a
@@ -279,6 +315,25 @@ export function buildStage() {
           <button class="fable-save-btn primary" data-save-named>Save</button>
         </div>
         <button class="fable-save-close" data-save-close aria-label="Close">✕</button>
+      </div>
+    </div>
+
+    <!-- Cascade-delete confirm (2026-08-19, Chloe): deleting a beat removes
+         it AND every message below it (a transcript gap is meaningless), so
+         any doomed run of 2+ messages gets an explicit count-first confirm —
+         "You are going to delete N messages, are you sure?" The SOLE
+         trailing beat never opens this (the two-click arm already served as
+         its confirmation). Mirrors the save modal's overlay pattern; Esc +
+         backdrop + Cancel all dismiss. -->
+    <div class="fable-delete-overlay" data-delete-overlay hidden>
+      <div class="fable-save-backdrop" data-delete-backdrop></div>
+      <div class="fable-save-modal fable-delete-modal">
+        <h2 class="fable-save-title">Delete Messages</h2>
+        <p class="fable-delete-text" data-delete-text></p>
+        <div class="fable-save-actions">
+          <button class="fable-save-btn ghost" data-delete-cancel>Cancel</button>
+          <button class="fable-save-btn primary" data-delete-confirm>Delete</button>
+        </div>
       </div>
     </div>
 
@@ -450,6 +505,13 @@ export async function wireStage(root, hooks) {
     } else if (act === 'delete') {
       // (#78) Two-click inline confirm (the #24 API-profile-delete pattern —
       // see the helpers above): first click arms, second click deletes.
+      // (2026-08-19 cascade, Chloe) A delete now takes every message BELOW
+      // the target too — a transcript gap between surviving beats is
+      // meaningless. The arm stays the first gate; the second click either
+      // deletes the SOLE trailing beat outright (no further warning — the
+      // arm WAS the confirmation) or opens the count-first confirm modal
+      // for a doomed run of 2+ ("You are going to delete N messages, are
+      // you sure?"). The minimum the modal ever shows is therefore 2.
       if (btn.dataset.armed !== '1') {
         feedEl.querySelectorAll('[data-drawer-act="delete"][data-armed="1"]')
           .forEach(disarmDeleteButton);
@@ -457,7 +519,12 @@ export async function wireStage(root, hooks) {
         return;
       }
       disarmDeleteButton(btn);
-      narrator.deleteMessage(index);
+      const doomed = beats.sessionMessageCount() - index;
+      if (doomed > 1) {
+        openDeleteConfirm(index, doomed);
+      } else {
+        narrator.deleteMessage(index);
+      }
     } else if (act === 'prev') {
       const active = Number.parseInt(beat.dataset.variantActive || '0', 10);
       if (active > 0) narrator.swipeVariant(index, active - 1);
@@ -1014,6 +1081,43 @@ export async function wireStage(root, hooks) {
   // Expose closeSaveModal to onKeyDown's Esc handler via a module ref.
   saveModalClose = closeSaveModal;
 
+  // ── Cascade-delete confirm modal (2026-08-19, Chloe) ──────────────
+  // Opened by the feed delete handler when the doomed run is 2+ messages.
+  // Confirm fires narrator.deleteMessage(index, { cascade: true }); every
+  // dismiss path (Cancel / backdrop / Esc) just closes. The cancel button
+  // takes focus on open so an accidental Enter can never confirm a delete.
+  const deleteOverlay = root.querySelector('[data-delete-overlay]');
+  function closeDeleteModal() {
+    if (deleteOverlay) deleteOverlay.hidden = true;
+    deleteConfirmIndex = -1;
+  }
+  function openDeleteConfirm(index, count) {
+    if (!deleteOverlay) {
+      // Modal missing from the template (defensive) — delete directly
+      // rather than stranding the armed click as a no-op.
+      narrator.deleteMessage(index, { cascade: true });
+      return;
+    }
+    deleteConfirmIndex = index;
+    const textEl = deleteOverlay.querySelector('[data-delete-text]');
+    if (textEl) {
+      textEl.textContent =
+        `You are going to delete ${count} messages, are you sure?`;
+    }
+    deleteOverlay.hidden = false;
+    const cancelBtn = deleteOverlay.querySelector('[data-delete-cancel]');
+    setTimeout(() => cancelBtn && cancelBtn.focus(), 30);
+  }
+  deleteModalClose = closeDeleteModal;
+  on(root.querySelector('[data-delete-cancel]'), 'click', closeDeleteModal);
+  on(root.querySelector('[data-delete-backdrop]'), 'click', closeDeleteModal);
+  on(root.querySelector('[data-delete-confirm]'), 'click', () => {
+    if (deleteOverlay && deleteOverlay.hidden) return;
+    const idx = deleteConfirmIndex;
+    closeDeleteModal();
+    if (idx >= 0) narrator.deleteMessage(idx, { cascade: true });
+  });
+
   on(footLoad, 'click', () => {
     if (footLoad.disabled) return;
     armFootCooldown();
@@ -1163,9 +1267,24 @@ function on(el, type, handler, opts) {
 // accumulated one document listener per aborted entry.
 let wireEpoch = 0;
 
+// The typing indicator's label (2026-08-19, subtype-aware): an npc-subtype
+// card IS the character, so the card name reads as them typing; a scenario/
+// world card narrates through an unseen voice → "Narrator is currently
+// thinking...". Unknown/legacy subtypes (no <subtype> in the file, the
+// legacy plain-string IPC shape, dev preview) fall into the npc lane — the
+// named-persona reading. "Game Master" is the no-name fallback.
+function typingLabel() {
+  if (activeCardSubtype === 'scenario' || activeCardSubtype === 'world') {
+    return 'Narrator is currently thinking...';
+  }
+  const who = activeCardName || 'Game Master';
+  return `${who} is currently typing...`;
+}
+
 // Generation state reflection (2026-07-27, no send button): the send/stop
-// toggle button + its SVG icons are GONE. The only UI feedback for a turn in
-// flight is now the in-card streaming caret (the .streaming class on the
+// toggle button + its SVG icons are GONE. The UI feedback for a turn in
+// flight is the typing indicator above the input row (subtype-aware label,
+// 2026-08-19) + the in-card streaming caret (the .streaming class on the
 // narrator beat, see fable.css). The input stays ENABLED so the empty-Enter-
 // to-stop affordance (wired above in wireStage) works: pressing Enter on an
 // empty field while generating stops the turn. The placeholder flips to hint
@@ -1173,6 +1292,20 @@ let wireEpoch = 0;
 function setGenerating(on) {
   const input = stageRoot && stageRoot.querySelector('[data-input]');
   if (!input) return;
+  // The typing indicator: label text is computed at SHOW time (the card
+  // identity is cached by then; a mid-teardown call just hides). Shown for
+  // the WHOLE turn — the tracker stage before the first chunk has no other
+  // in-flight signal.
+  const indicator = stageRoot.querySelector('[data-typing-indicator]');
+  if (indicator) {
+    if (on) {
+      const label = stageRoot.querySelector('[data-typing-text]');
+      if (label) label.textContent = typingLabel();
+      indicator.classList.add('is-visible');
+    } else {
+      indicator.classList.remove('is-visible');
+    }
+  }
   if (on) {
     // Idempotent stash: reroll / rewind-edit fire onTurnStart, then
     // sendFableTurn fires it AGAIN — the second call must not stash the
@@ -1345,6 +1478,12 @@ function onKeyDown(e) {
     const overlay = stageRoot && stageRoot.querySelector('[data-save-overlay]');
     if (overlay && !overlay.hidden) { saveModalClose(); e.preventDefault(); e.stopPropagation(); return; }
   }
+  // (2026-08-19) The cascade-delete confirm sits at the save modal's
+  // z-tier — Esc dismisses it (as a cancel) right after the save modal.
+  if (deleteModalClose) {
+    const overlay = stageRoot && stageRoot.querySelector('[data-delete-overlay]');
+    if (overlay && !overlay.hidden) { deleteModalClose(); e.preventDefault(); e.stopPropagation(); return; }
+  }
   // Backgrounds gallery modal — same z-tier as the save modal, so it dismisses
   // right after it (before the drawer/panel surfaces below).
   if (backgrounds.isOpen()) { backgrounds.closeBackgroundsPanel(); e.preventDefault(); e.stopPropagation(); return; }
@@ -1431,6 +1570,25 @@ export function toast(msg) {
   toastTimer = setTimeout(() => { t.hidden = true; }, 2200);
 }
 
+// (2026-08-19 Chloe) Bottom warning popup for IMPORT failures: a fixed,
+// document-level notice so it shows on ANY flow screen (the stage toast above
+// is stage-gated and invisible during the New Game pickers — an unrecognized
+// import previously failed silently or fell into a chat window). Auto-dismisses.
+let importWarnTimer = null;
+export function bottomWarning(msg) {
+  let el = document.querySelector('.fable-import-warn');
+  if (!el) {
+    el = document.createElement('div');
+    el.className = 'fable-import-warn';
+    el.setAttribute('role', 'alert');
+    document.body.appendChild(el);
+  }
+  el.textContent = msg;
+  el.classList.add('is-open');
+  if (importWarnTimer) clearTimeout(importWarnTimer);
+  importWarnTimer = setTimeout(() => { el.classList.remove('is-open'); }, 3600);
+}
+
 // Populate the feed from a load result (messages: [{role, content, variants?,
 // active_idx?, timestamp?}]). Forwards straight to beats.rebuildFromMessages,
 // which is the single source of truth for the feed DOM.
@@ -1440,12 +1598,15 @@ export function loadHistory(messages) {
 }
 
 // ── Typing indicator + card identity ────────────────────────────────────
-// "(name) is currently typing.." pinned above the input row while a beat
-// streams. The card identity (name + player_name) is fetched once on stage
-// entry (best-effort) + cached in `activeCardName` (the display name for the
-// typing label) + stashed in `activePlayerName` so the initNarrator call
-// (which runs right after this in wireStage) can forward both into the
-// beats builders for the message headers. Generic fallback when no name.
+// The subtype-aware typing label ("(Name) is currently typing..." for npc
+// cards / "Narrator is currently thinking..." for scenario+world — see
+// typingLabel) pinned above the input row while a turn is in flight. The
+// card identity (name + subtype + player_name) is fetched once on stage
+// entry (best-effort) + cached in `activeCardName`/`activeCardSubtype`
+// (the display voice for the typing label) + stashed in `activePlayerName`
+// so the initNarrator call (which runs right after this in wireStage) can
+// forward both into the beats builders for the message headers. Generic
+// fallback when no name.
 //
 // DEFENSIVE DUAL-SHAPE: `fable_active_card_get` returns a plain card-name
 // string today; a parallel Rust change widens it to `{name, player_name}`.
@@ -1461,6 +1622,7 @@ async function refreshActiveCardName(root) {
   // back to the AI portrait (per the deferred-NPC-portrait rule).
   if (DEV_PREVIEW) {
     activeCardName = 'Game Master';
+    activeCardSubtype = '';
     activePlayerName = 'Wanderer';
     activeCardPortrait = '';
     activePlayerPortrait = '';
@@ -1472,12 +1634,16 @@ async function refreshActiveCardName(root) {
     if (typeof res === 'string') {
       // Legacy plain-string shape (older backend): just the card name.
       activeCardName = res;
+      activeCardSubtype = '';
       activePlayerName = '';
       activeCardPortrait = '';
       activePlayerPortrait = '';
       npcNameMap = new Map();
     } else if (res && typeof res === 'object') {
       activeCardName = typeof res.name === 'string' ? res.name : '';
+      // The wizard subtype ("npc" | "scenario" | "world") — drives the typing
+      // label's voice. Null/absent (legacy card) reads as the npc lane.
+      activeCardSubtype = typeof res.subtype === 'string' ? res.subtype : '';
       activePlayerName = typeof res.player_name === 'string' ? res.player_name : '';
       // Portrait paths arrive as absolute filesystem paths; convertFileSrc
       // mints the asset:// URL the webview can <img src>. Empty when absent.
@@ -1497,6 +1663,7 @@ async function refreshActiveCardName(root) {
       }
     } else {
       activeCardName = '';
+      activeCardSubtype = '';
       activePlayerName = '';
       activeCardPortrait = '';
       activePlayerPortrait = '';
@@ -1504,6 +1671,7 @@ async function refreshActiveCardName(root) {
     }
   } catch (_) {
     activeCardName = '';
+    activeCardSubtype = '';
     activePlayerName = '';
     activeCardPortrait = '';
     activePlayerPortrait = '';
@@ -1544,6 +1712,11 @@ export function teardownStage() {
   cancelLeftCornerDwell();
   leftCornerTrigger = null;
   saveModalClose = null;
+  // (2026-08-19) Cascade-delete confirm state: a close mid-confirm must not
+  // leave the modal ref alive (Esc on the next session would call a stale
+  // closer) or a stale doomed index for the next session's Confirm click.
+  deleteModalClose = null;
+  deleteConfirmIndex = -1;
   // Reset the API-lost composer lock so a re-entry isn't stuck greyed out.
   composerLocked = false;
   pendingTurnText = '';
@@ -1565,9 +1738,15 @@ export function teardownStage() {
   // listeners + the floating pencil element) before the feed is wiped.
   if (sliceApi) { sliceApi.teardown(); sliceApi = null; }
   // Wipe the dialogue feed so a prior session's cards don't leak into the
-  // next entry (the stage DOM is reused across games).
+  // next session (the stage DOM is reused across games).
   beats.clearFeed();
   activeCardName = '';
+  activeCardSubtype = '';
+  // Hide the typing indicator: the epoch guard can block a mid-exit turn's
+  // late finishTurn (→ setGenerating(false)), and the reused stage DOM would
+  // otherwise carry the visible label into the next session's first paint.
+  const staleIndicator = stageRoot && stageRoot.querySelector('[data-typing-indicator]');
+  if (staleIndicator) staleIndicator.classList.remove('is-visible');
   // Reset the engine module state so a close mid-turn can't leave a stuck
   // `generating` (would no-op the next session's first send) or a dangling
   // activeBeat, and so the Wupi drawer starts fresh next entry.

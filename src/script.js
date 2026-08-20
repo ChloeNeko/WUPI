@@ -1245,13 +1245,16 @@ function spawnLaunchSparkles(parent, count = 18) {
   // biggest slice (longest distance). The TOTAL duration is LOAD-BEARING for
   // audio sync: the three move-whooshes fire at the rise/dart-right/dart-
   // center keyframe offsets (0 / 0.39 / 0.78), so at this duration they land
-  // at 0 / 585 / 1170ms.
-  // 2026-08-14 final: the 1800ms pass was "almost perfect, a tiny bit fast
-  // needed"; 1200ms was too fast. Chloe's call: the SWEET SPOT between the
-  // two — 1500ms, keeping the original fractional keyframe structure (rise
-  // 450 / hold 135 / dart 210 / hold 450 / dart 180 / hold 150). Hops
-  // untouched throughout.
-  const ENTRY_DURATION = 1500;
+  // at 0 / 702 / 1404ms.
+  // 2026-08-14: 1500ms was the sweet spot between the 1800ms ("almost
+  // perfect, a tiny bit fast needed") and 1200ms (too fast) passes.
+  // 2026-08-19 final: Chloe's match-the-audio pass — the movements ran ahead
+  // of their whooshes (0.59s fire spacing vs the ~0.68s tails at 1.85×, each
+  // segment landing before its whoosh resolved). Slowed ×1.2 → 1800ms so the
+  // fire spacing (~0.70s) rides the tail: each whoosh resolves just as the
+  // next fires. Fractional keyframe structure kept (rise 540 / hold 162 /
+  // dart 252 / hold 540 / dart 216 / hold 180). Hops untouched throughout.
+  const ENTRY_DURATION = 1800;
   // Sharp accel + sharp decel — the "fairy dart" easing. Most of the
   // motion happens in the middle of the segment, with hard start/stop.
   const ZOOM_EASE = 'cubic-bezier(0.65, 0, 0.35, 1)';
@@ -1288,8 +1291,10 @@ function spawnLaunchSparkles(parent, count = 18) {
   // the durations — 1.55× (the 1800ms pass) felt right, 2.3× (the 1200ms
   // pass) over-quick; 1.85 ≈ 2800/1500 tracks the entry's cumulative
   // speed-up (the flight's 720/350 ≈ 2.06 — one shared rate, weighted toward
-  // the three entry whooshes). Tails shrink to ~0.68s vs the 0.59s fire
-  // spacing: barely a kiss, no overlap roar. The hops themselves are
+  // the three entry whooshes). 2026-08-19: the rate STAYS 1.85× (the audio
+  // is the reference — the movements slowed to meet it, not the clip
+  // slackened). Tails ~0.68s vs the ~0.70s fire spacing at the 1800ms entry:
+  // each whoosh resolves just as the next fires. The hops themselves are
   // UNTOUCHED (HOP_DURATION / HOP_2_DELAY_MS / HOP_PLAYBACK_RATE unchanged).
   const INTRO_MOVE_PLAYBACK_RATE = 1.85;
   // Sparkle trail: a sparkle spawns every TRAIL_INTERVAL ms along the paw's
@@ -1311,10 +1316,12 @@ function spawnLaunchSparkles(parent, count = 18) {
   // ("just make it a straight line, you aren't curving it correctly") the
   // flight is a single CSS transition to the corner — no WAAPI arc. Tuning
   // history: 720 → 575 → 490 → 400 (the "almost perfect" pass) → 300 (too
-  // fast) → 350 (the sweet spot, 2026-08-14 final). Its whoosh plays at
-  // INTRO_MOVE_PLAYBACK_RATE to match. The finish-SFX lead-in (fired FLIGHT -
-  // 120ms before land) still lands its attack on touchdown.
-  const FLIGHT_DURATION_MS = 350;
+  // fast) → 350 (the sweet spot, 2026-08-14 final) → 420 (2026-08-19: slowed
+  // ×1.2 with the entry to ride its whoosh — Chloe's match-the-audio pass).
+  // Its whoosh plays at INTRO_MOVE_PLAYBACK_RATE to match. The finish-SFX
+  // lead-in (fired FLIGHT - 120ms before land) still lands its attack on
+  // touchdown.
+  const FLIGHT_DURATION_MS = 420;
   // Staged-reveal delays (ms) measured from flight-land (transitionend).
   // Top-bar fade is 0.6s in CSS; aurora wipe arms AFTER it finishes so the
   // two blur costs never overlap.
@@ -1444,15 +1451,15 @@ function spawnLaunchSparkles(parent, count = 18) {
     // rise to top-left). Schedules the two dart move sounds to fire at the
     // exact WAAPI offsets where those segments begin (dart-right + dart-center
     // keyframes below) so each "flight" cue lands on its motion. All three
-    // play at INTRO_MOVE_PLAYBACK_RATE (2026-08-14 final: 1.85×, matched to
-    // the 1500ms entry).
+    // play at INTRO_MOVE_PLAYBACK_RATE (2026-08-14 final: 1.85×; the 2026-08-19
+    // pass slowed the ENTRY to meet the audio, rate unchanged).
     try { playSfx(INTRO_MOVE_SRC, { playbackRate: INTRO_MOVE_PLAYBACK_RATE }); } catch (e) { /* autoplay blocked: silent */ }
     // Dart-whoosh timers at the keyframe offsets where those segments begin
     // (dart-right + dart-center keyframes below) so each "flight" cue lands
-    // on its motion: ~585ms / ~1170ms at the 1500ms entry — 0.59s apart vs
-    // the ~0.68s tails at 1.85×, no overlap roar.
-    const dartRightAt = ENTRY_DURATION * 0.39;  // ~585ms
-    const dartCenterAt = ENTRY_DURATION * 0.78; // ~1170ms
+    // on its motion: ~702ms / ~1404ms at the 1800ms entry — 0.70s apart vs
+    // the ~0.68s tails at 1.85×: each whoosh resolves just as the next fires.
+    const dartRightAt = ENTRY_DURATION * 0.39;  // ~702ms
+    const dartCenterAt = ENTRY_DURATION * 0.78; // ~1404ms
     setTimeout(() => { try { playSfx(INTRO_MOVE_SRC, { playbackRate: INTRO_MOVE_PLAYBACK_RATE }); } catch (e) {} }, dartRightAt);
     setTimeout(() => { try { playSfx(INTRO_MOVE_SRC, { playbackRate: INTRO_MOVE_PLAYBACK_RATE }); } catch (e) {} }, dartCenterAt);
 
@@ -1588,7 +1595,8 @@ function spawnLaunchSparkles(parent, count = 18) {
     if (!bootPaw) { startLoadingScreen(); return; }
 
     // Movement SFX: the corner flight (movement #4). Fires now (liftoff) at
-    // INTRO_MOVE_PLAYBACK_RATE to match the ×0.8 flight (2026-08-14). The
+    // INTRO_MOVE_PLAYBACK_RATE (rate unchanged on the 2026-08-19 slow pass —
+    // the flight itself stretched 350 → 420 to ride the whoosh). The
     // finish SFX is triggered just before landing (see the pre-land timer
     // below) so its tail rings out through + past touchdown rather than
     // starting cold at the transitionend instant. playSfx appends the node to
@@ -1728,6 +1736,40 @@ function spawnLaunchSparkles(parent, count = 18) {
     });
   }
 
+  // ── Boot update bar (2026-08-19, Chloe): when the boot gate finds an
+  //    update, the news leaves the terminal entirely — a bold label +
+  //    progress bar mount directly UNDER the LOADING OS title
+  //    ("UPDATING FROM x TO y", Fredoka 700 at half the title's size, theme
+  //    accent colors via the same --ui-accent* vars + Vibrant override in
+  //    styles.css). The bar is fed by the SAME update-progress event the
+  //    paw-menu panel listens to — that listener only acts in its own
+  //    'installing' state (never true during boot), so the two never fight
+  //    over one event stream.
+  const bootUpdateEl = document.getElementById('bootUpdate');
+  const bootUpdateLabelEl = document.getElementById('bootUpdateLabel');
+  const bootUpdateBarEl = document.getElementById('bootUpdateBar');
+
+  function showBootUpdateBar(fromVer, toVer) {
+    if (!bootUpdateEl) return;
+    if (bootUpdateLabelEl) {
+      bootUpdateLabelEl.textContent = `UPDATING FROM ${fromVer} TO ${toVer}`;
+    }
+    if (bootUpdateBarEl) bootUpdateBarEl.style.width = '0%';
+    bootUpdateEl.hidden = false;
+  }
+
+  function hideBootUpdateBar() {
+    if (bootUpdateEl) bootUpdateEl.hidden = true;
+  }
+
+  listen('update-progress', (e) => {
+    if (!bootUpdateEl || bootUpdateEl.hidden) return;
+    const pct = e?.payload?.percent;
+    if (typeof pct === 'number' && bootUpdateBarEl) {
+      bootUpdateBarEl.style.width = `${Math.min(100, Math.max(0, pct))}%`;
+    }
+  }).catch((e) => console.warn('[Wupi] boot update-progress listen failed', e));
+
   // ── The boot gate: update check → install (if any) → proceed.
   //    The LOADING OS text + cosmetic terminal stream + model load are
   //    HELD DARK until this resolves. On update-found: install + restart
@@ -1735,25 +1777,20 @@ function spawnLaunchSparkles(parent, count = 18) {
   //    (network/manifest unreachable): call proceedAfterGate() so a
   //    network blip can't strand the user on the loading screen.
   async function runBootGate() {
-    // Surface the outcome of an update that just relanched us (if any). Rust
-    // consumes (deletes) the marker, so this fires exactly once per update.
+    // Consume the outcome marker of an update that just relaunched us (if
+    // any). Rust deletes the marker on read, so the invoke must ALWAYS run —
+    // skipping it would leave a stale marker to surface on a much later
+    // boot. 2026-08-19: the success path is SILENT per Chloe (no "updated
+    // to vX ✓" / auto-restart note — the new version speaks for itself);
+    // only a FAILED last update still prints, because a silently-dead
+    // update is info the user needs.
     try {
       const result = await invoke('updater_consume_result');
-      if (result) {
-        if (result.ok) {
-          appendTerminalLine(`› updated to v${result.version} ✓`, false);
-          // The update applied but the updater's relaunch retries all failed
-          // (transient lock on the freshly-written exe) — this boot is a
-          // manual launch. Honest, one line, no error styling.
-          if (result.relaunched === false) {
-            appendTerminalLine('› auto-restart failed — this was a manual launch', false);
-          }
-        } else {
-          appendTerminalLine(
-            `› last update failed: ${String(result.error || '').slice(0, 80)}`,
-            false
-          );
-        }
+      if (result && !result.ok) {
+        appendTerminalLine(
+          `› last update failed: ${String(result.error || '').slice(0, 80)}`,
+          false
+        );
       }
     } catch (e) {
       /* non-fatal — no marker to read */
@@ -1781,18 +1818,20 @@ function spawnLaunchSparkles(parent, count = 18) {
     }
 
     if (!update) {
-      appendTerminalLine('› no new updates found', false);
+      // Silent up-to-date path (2026-08-19): the "no new updates found"
+      // line is gone per Chloe — an uneventful check prints nothing.
       proceedAfterGate();
       return;
     }
 
     // Update found — install + restart. The model never loads (no wasted
-    // CPU/VRAM on a process about to be replaced). The update-progress
-    // event still drives a progress bar in the paw-menu panel if the user
-    // happened to have it open, but on the boot path the terminal lines
-    // are the visible cue.
-    appendTerminalLine(`› update version ${update.version} found`, false);
-    appendTerminalLine('› installing update please wait..', false);
+    // CPU/VRAM on a process about to be replaced). The boot bar under the
+    // LOADING OS title is the visible cue (2026-08-19: the detection text
+    // no longer prints in the terminal); update-progress events feed the
+    // bar, and they'd also drive the paw-menu panel's bar if the user
+    // happened to have it open (its listener only acts in its own
+    // 'installing' state).
+    showBootUpdateBar(current, update.version);
     // apply downloads the zip, then spawns updater.exe + EXITS this process
     // (the temp-staged handoff). The await NEVER resolves on success — the
     // process is gone; the relaunched boot surfaces the outcome via
@@ -1803,6 +1842,10 @@ function spawnLaunchSparkles(parent, count = 18) {
       await invoke('updater_apply', { update });
     } catch (err) {
       console.error('[Wupi] updater_apply failed during boot gate', err);
+      // Staging/spawn failure — the update isn't happening after all: drop
+      // the bar (its "UPDATING…" claim is now false) + surface the failure
+      // in the terminal instead, then proceed with the current binary.
+      hideBootUpdateBar();
       appendTerminalLine(`› update failed: ${String(err?.message || err).slice(0, 80)}`, false);
       appendTerminalLine('› proceeding with current version', false);
       proceedAfterGate();
@@ -2131,25 +2174,15 @@ const dropdownMenu = document.getElementById('dropdownMenu');
           <span>Checking…</span>
         </div>`;
     } else if (state === 'up-to-date') {
-      // A re-check affordance is mandatory here: this state used to be a dead
-      // end (no button + no auto-check on reopen), so one transiently-failed
-      // check — which the Rust side reported as "no update" — froze the panel
-      // on a fraudulent "up to date" until the app was restarted.
+      // No re-check button here anymore (removed 2026-08-19 per Chloe): the
+      // panel AUTO-FIRES a re-check on open for this state (see the
+      // checkForUpdatesBtn handler below), so re-checking = close + reopen —
+      // the state is not a dead end, it just doesn't carry its own button.
       updateStatusEl.innerHTML = `
         <div class="update-status-row">
           <span class="status-dot connected"></span>
           <span>WUPI is up to date</span>
-        </div>
-        <button class="dropdown-item update-action-btn" id="updateRecheckBtn">
-          <svg class="menu-svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-            <path d="M21 12a9 9 0 1 1-2.64-6.36M21 3v6h-6" stroke-linecap="round" stroke-linejoin="round"/>
-          </svg>
-          Check Again
-        </button>`;
-      document.getElementById('updateRecheckBtn')?.addEventListener('click', (e) => {
-        e.stopPropagation();
-        runUpdateCheck();
-      });
+        </div>`;
     } else if (state === 'available') {
       const notesHtml = payload.notes
         ? `<div class="update-notes">${escape(payload.notes)}</div>`

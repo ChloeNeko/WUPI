@@ -70,9 +70,19 @@
          crossfades into the starry sky + aurora. z-index 100001 (above
          #boot-paw's 100000) so it can fully take over the screen. The text
          spans + terminal lines are populated by script.js; CSS handles the
-         violet abyss bg, float animation, and per-span glow transitions. -->
+         violet abyss bg, float animation, and per-span glow transitions.
+         The .boot-update block stays hidden unless the boot gate finds an
+         update — then script.js mounts it under the title with the
+         "UPDATING FROM x TO y" label + a progress bar fed by the
+         update-progress event. -->
     <div id="boot-loading">
         <div class="boot-loading-text" id="bootLoadingText"></div>
+        <div class="boot-update" id="bootUpdate" hidden>
+            <div class="boot-update-label" id="bootUpdateLabel"></div>
+            <div class="boot-update-track">
+                <div class="boot-update-bar" id="bootUpdateBar"></div>
+            </div>
+        </div>
         <div class="boot-terminal" id="bootTerminal"></div>
     </div>
 

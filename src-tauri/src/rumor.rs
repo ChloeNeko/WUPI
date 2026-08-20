@@ -301,19 +301,19 @@ mod tests {
                     id: "tavern".to_string(),
                     name: "The Rusty Tavern".to_string(),
                     neighbors: vec!["cellar".to_string()],
-                    setting: String::new(),
+                    setting: String::new(), ..Default::default()
                 },
                 Node {
                     id: "cellar".to_string(),
                     name: "The Cellar".to_string(),
                     neighbors: vec!["tavern".to_string(), "cellar_tunnel".to_string()],
-                    setting: "indoor".to_string(),
+                    setting: "indoor".to_string(), ..Default::default()
                 },
                 Node {
                     id: "cellar_tunnel".to_string(),
                     name: "Smuggler's Tunnel".to_string(),
                     neighbors: vec!["cellar".to_string()],
-                    setting: "indoor".to_string(),
+                    setting: "indoor".to_string(), ..Default::default()
                 },
             ],
             current_node: Some("tavern".to_string()),
@@ -334,25 +334,25 @@ mod tests {
                         "market".to_string(),
                         "guardhouse".to_string(),
                     ],
-                    setting: String::new(),
+                    setting: String::new(), ..Default::default()
                 },
                 Node {
                     id: "cellar".to_string(),
                     name: "The Cellar".to_string(),
                     neighbors: vec!["tavern".to_string()],
-                    setting: "indoor".to_string(),
+                    setting: "indoor".to_string(), ..Default::default()
                 },
                 Node {
                     id: "market".to_string(),
                     name: "Market Square".to_string(),
                     neighbors: vec!["tavern".to_string()],
-                    setting: String::new(),
+                    setting: String::new(), ..Default::default()
                 },
                 Node {
                     id: "guardhouse".to_string(),
                     name: "Guardhouse".to_string(),
                     neighbors: vec!["tavern".to_string()],
-                    setting: "indoor".to_string(),
+                    setting: "indoor".to_string(), ..Default::default()
                 },
             ],
             current_node: Some("tavern".to_string()),

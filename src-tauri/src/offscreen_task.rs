@@ -551,6 +551,65 @@ pub fn select_focus(
 }
 
 // ===========================================================================
+// Promise frustration curve (2026-08-19 Referee QoL)
+// ===========================================================================
+
+/// The volatility-scaled promise-frustration score (pure Rust).
+///
+/// Maps elapsed-vs-deadline time onto a single axis the renderer bands:
+/// NEGATIVE = the giver is pleased (the promise is comfortably ahead of
+/// schedule — early fulfillment or healthy margin), 0 = neutral timing,
+/// POSITIVE = growing frustration as the deadline slips. Pre-deadline the
+/// ratio is ROOT-compressed (`ratio^(1/coeff) − 1`); post-deadline it grows
+/// LINEARLY in the overrun (`(ratio − 1) × coeff`). `coeff` is the giver's
+/// relationship `volatility` clamped to [0.1, 3.0] (1.0 when no
+/// relationship is tracked): a patient NPC (0.4) reads half-done as
+/// −0.823 (Very Pleased) where a volatile one (3.0) reads it as −0.206
+/// (barely Neutral) — and the same 50% overrun reads +0.200 vs +1.500.
+///
+/// Pinned test vectors (the plan's): halfway at coeff 0.4/1.0/3.0 →
+/// −0.823/−0.500/−0.206; at the deadline → exactly 0; 50% overtime →
+/// 0.200/0.500/1.500.
+pub fn promise_frustration(
+    accepted_at_minutes: i64,
+    deadline_minutes: i64,
+    now_minutes: i64,
+    volatility: Option<f64>,
+) -> f64 {
+    let coeff = volatility.unwrap_or(1.0).clamp(0.1, 3.0);
+    // A non-positive window (0-minute promise, or a legacy un-stamped row)
+    // is instantly overdue — treat the span as 1 minute so the ratio is
+    // finite + the post-deadline branch takes over.
+    let span = (deadline_minutes - accepted_at_minutes).max(1) as f64;
+    let ratio = (now_minutes - accepted_at_minutes) as f64 / span;
+    if ratio <= 1.0 {
+        ratio.powf(1.0 / coeff) - 1.0
+    } else {
+        (ratio - 1.0) * coeff
+    }
+}
+
+/// Band the frustration score into the label the `owed:` render shows (and
+/// the narrator plays). Ordered worst→best; boundaries are inclusive `<=`.
+pub fn frustration_band(score: f64) -> &'static str {
+    if score <= -0.5 {
+        "Very Pleased"
+    } else if score <= -0.1 {
+        "Pleased"
+    } else if score <= 0.1 {
+        "Neutral"
+    } else if score <= 0.5 {
+        "Mildly Frustrated"
+    } else if score <= 1.0 {
+        "Frustrated"
+    } else if score <= 1.5 {
+        "Very Frustrated"
+    } else {
+        "Furious"
+    }
+}
+
+// ===========================================================================
 // Tests
 // ===========================================================================
 
@@ -558,6 +617,78 @@ pub fn select_focus(
 mod tests {
     use super::*;
     use std::collections::HashSet;
+
+    // ---- Promise frustration curve (2026-08-19) ----
+
+    /// The plan's pinned vectors: halfway (ratio 0.5) at the three reference
+    /// volatilities, the deadline itself, and 50% overtime.
+    #[test]
+    fn promise_frustration_pinned_vectors() {
+        let halfway = promise_frustration(0, 100, 50, None);
+        assert!((halfway - (-0.5)).abs() < 1e-9, "coeff 1.0 halfway: {halfway}");
+        // Pre-deadline is root-compressed: patient NPCs read MORE pleased.
+        let patient = promise_frustration(0, 100, 50, Some(0.4));
+        assert!((patient - (-0.823)).abs() < 1e-3, "coeff 0.4 halfway: {patient}");
+        let volatile = promise_frustration(0, 100, 50, Some(3.0));
+        assert!((volatile - (-0.206)).abs() < 1e-3, "coeff 3.0 halfway: {volatile}");
+        // At the deadline every coeff reads exactly 0.
+        for coeff in [0.1f64, 1.0, 3.0] {
+            let at_deadline = promise_frustration(0, 100, 100, Some(coeff));
+            assert!(at_deadline.abs() < 1e-9, "coeff {coeff} at deadline: {at_deadline}");
+        }
+        // Post-deadline grows linearly in the overrun, scaled by coeff.
+        let over = promise_frustration(0, 100, 150, None);
+        assert!((over - 0.5).abs() < 1e-9, "coeff 1.0 overtime: {over}");
+        let over_patient = promise_frustration(0, 100, 150, Some(0.4));
+        assert!((over_patient - 0.2).abs() < 1e-9, "coeff 0.4 overtime: {over_patient}");
+        let over_volatile = promise_frustration(0, 100, 150, Some(3.0));
+        assert!((over_volatile - 1.5).abs() < 1e-9, "coeff 3.0 overtime: {over_volatile}");
+    }
+
+    /// Volatility is clamped — an absurd hand-edited coefficient can't
+    /// degenerate the curve (and `None` = the 1.0 default).
+    #[test]
+    fn promise_frustration_clamps_volatility() {
+        let lo = promise_frustration(0, 100, 50, Some(0.0001));
+        let lo_clamped = promise_frustration(0, 100, 50, Some(0.1));
+        assert!((lo - lo_clamped).abs() < 1e-9, "volatility clamps at 0.1");
+        let hi = promise_frustration(0, 100, 50, Some(99.0));
+        let hi_clamped = promise_frustration(0, 100, 50, Some(3.0));
+        assert!((hi - hi_clamped).abs() < 1e-9, "volatility clamps at 3.0");
+        assert_eq!(
+            promise_frustration(0, 100, 50, None),
+            promise_frustration(0, 100, 50, Some(1.0)),
+            "None defaults to 1.0"
+        );
+    }
+
+    /// A degenerate window (deadline ≤ accepted) reads as overdue, never
+    /// NaN.
+    #[test]
+    fn promise_frustration_survives_zero_window() {
+        let s = promise_frustration(100, 100, 100, None);
+        assert!(s.is_finite(), "zero window must stay finite: {s}");
+        let late = promise_frustration(100, 100, 130, None);
+        assert!(late.is_finite() && late > 0.0, "zero window overdue: {late}");
+    }
+
+    /// The band boundaries (inclusive <=, worst→best).
+    #[test]
+    fn frustration_bands_match_the_plan() {
+        assert_eq!(frustration_band(-0.9), "Very Pleased");
+        assert_eq!(frustration_band(-0.5), "Very Pleased");
+        assert_eq!(frustration_band(-0.499), "Pleased");
+        assert_eq!(frustration_band(-0.1), "Pleased");
+        assert_eq!(frustration_band(0.0), "Neutral");
+        assert_eq!(frustration_band(0.1), "Neutral");
+        assert_eq!(frustration_band(0.11), "Mildly Frustrated");
+        assert_eq!(frustration_band(0.5), "Mildly Frustrated");
+        assert_eq!(frustration_band(0.51), "Frustrated");
+        assert_eq!(frustration_band(1.0), "Frustrated");
+        assert_eq!(frustration_band(1.2), "Very Frustrated");
+        assert_eq!(frustration_band(1.5), "Very Frustrated");
+        assert_eq!(frustration_band(1.51), "Furious");
+    }
 
     // ---- TaskDifficulty ----
 

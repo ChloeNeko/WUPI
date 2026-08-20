@@ -218,6 +218,22 @@ pub struct Node {
     /// string match, forward-compat for richer flags without a migration.
     #[serde(default)]
     pub setting: String,
+
+    /// (2026-08-19 Hidden site maps) Un-germinated site hooks for this node —
+    /// short one-line premises the World Progression tick's Stale Roulette
+    /// pass emits (`site_seeds` on the delta) and the JIT Architect folds
+    /// into the map it generates on arrival. Capped at
+    /// `site_map::NODE_SEEDS_MAX` (FIFO). Rust-owned: only the tick apply +
+    /// the architect's seed-consume write here.
+    #[serde(default)]
+    pub seeds: Vec<String>,
+
+    /// (2026-08-19 Stale Roulette) The clock minute this node was last
+    /// designated to the world-progression pass (stamped on EVERY designated
+    /// site, seeds or not — stamping all is what guarantees rotation).
+    /// 0 = never designated → sorts FIRST in `select_stale_sites`.
+    #[serde(default)]
+    pub last_evolved_minutes: i64,
 }
 
 /// The spatial travel graph (Rust-authoritative — same line as `world_clock` /
@@ -608,7 +624,7 @@ impl TravelGraph {
             id: id.clone(),
             name,
             neighbors: Vec::new(),
-            setting: String::new(),
+            setting: String::new(), ..Default::default()
         };
         if self.upsert_node(node) {
             tracing::info!(node_id = %id, "[TRAVEL] minted unknown destination as a new node");
@@ -1093,6 +1109,11 @@ pub const NPC_MINDS_ENTRY_CHAR_CAP: usize = 200;
 /// Per-NPC held-item cap (FIFO drain — a hoarder NPC's oldest acquisition
 /// drops when the 17th lands; same belt-style discipline).
 pub const NPC_INTERIOR_ITEMS_MAX: usize = 16;
+
+/// Cap on an NPC's WORN outfit rack (seeded from the card): an authored
+/// outfit is a handful of garments; beyond this the seed clips FIFO (the
+/// registry + prose carry the rest).
+pub const NPC_WORN_MAX: usize = 10;
 /// Char cap for the reaper's compressed archive stub.
 pub const NPC_ARCHIVE_STUB_CHAR_CAP: usize = 160;
 
@@ -1130,6 +1151,16 @@ pub struct NpcInterior {
     /// player pack, capped FIFO at `NPC_INTERIOR_ITEMS_MAX`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub items: Vec<equipment::StackItem>,
+
+    /// Items the NPC WEARS — the outfit (clothing + specific jewelry), seeded
+    /// from an npc card's `<inventory>` Clothing/Equipped/Accessories lines
+    /// through the shared garment router (2026-08-19 zone sweep, Chloe
+    /// ruling: npc-card clothing is auto-EQUIPPED and tracked from turn one).
+    /// Distinguished from `items` so the `wearing:` render reads as an
+    /// outfit, not a shopping bag. Same typed stack discipline; capped at
+    /// `NPC_WORN_MAX` at seed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub worn: Vec<equipment::StackItem>,
 
     /// Interaction counter — incremented on every `[PRESENCE]` assert and
     /// interior mutation. Diagnostics/reaper signal.
@@ -1240,6 +1271,10 @@ pub const MAX_TRAVEL_NODES: usize = 96;
 /// number (the raw-editor JSON tab installs whole registries; the applier's
 /// refuse-at-cap discipline now backstops it).
 pub const MAX_NPC_REGISTRY: usize = 96;
+/// (2026-08-19 Referee QoL) Open `[PROMISE]` cap — FIFO like the tasks; a
+/// long campaign can't accumulate an unbounded obligations list on the
+/// npc.json slice + the `owed:` render.
+pub const MAX_PROMISES: usize = 8;
 
 /// The scene pacing mode (Fable Seam #4 expansion, 2026-07-27): a
 /// Rust-computed per-turn classification of the scene's rhythm. Drives:
@@ -1427,6 +1462,29 @@ pub struct ScenePacing {
     pub kinetic: u8,
 }
 
+/// (2026-08-19 Referee QoL) One open player promise: what the player owes
+/// WHOM, and by when. Pure data — the frustration math lives in
+/// `offscreen_task::promise_frustration` (the volatility-scaled curve).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
+pub struct Promise {
+    /// The giver's canonical registry id (resolved by the applier through
+    /// `resolve_npc_surface`, same gate as PRESENCE).
+    #[serde(default)]
+    pub npc_id: String,
+    /// The diegetic obligation ("return the horse", "meet me at the well by
+    /// dusk"). The remove-form match key (npc_id + description).
+    #[serde(default)]
+    pub description: String,
+    /// The in-world minute the promise falls due (accepted + the emitted
+    /// window).
+    #[serde(default)]
+    pub deadline_minutes: i64,
+    /// The in-world minute the promise was accepted (the curve's zero
+    /// point; 0 = an un-stamped legacy row).
+    #[serde(default)]
+    pub accepted_at_minutes: i64,
+}
+
 /// The persistent world-state schema. The single source of truth for the
 /// simulated world's current state, maintained by the background delta pass.
 ///
@@ -1592,6 +1650,19 @@ pub struct WorldSchema {
     #[serde(default)]
     pub travel_graph: TravelGraph,
 
+    /// (2026-08-19 Hidden site maps) The pre-generated interiors, keyed by
+    /// travel-node id. Rust is the SOLE authority — `apply_delta` has no
+    /// field for it and `merge_patch` has no arm (the unknown-field refusal
+    /// is the immunity, the `npc_interior` pattern). Writers: the JIT
+    /// Architect insert (`maybe_run_site_architect`), the `[ROOM]`/
+    /// `[ASSET]` bracket appliers, and LRU eviction at
+    /// `site_map::MAX_SITE_MAPS`. Maps are write-once (a mapped node never
+    /// re-architects + is excluded from the Stale Roulette). HashMap, never
+    /// a diff target — same precedent as `npc_interior`. Rides world.json
+    /// automatically (the save split is remove-based).
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub site_maps: HashMap<String, crate::site_map::SiteMap>,
+
     /// Entity keys flagged immutable (the `[CORE]`-style lock; closes the §5
     /// "deliberately permissive at v1" NPC-drift hole). A key in this set can
     /// be SET once (on its first appearance in the schema) but never
@@ -1664,6 +1735,17 @@ pub struct WorldSchema {
     /// `#[serde(default)]` keeps pre-Phase-3 saves loadable as an empty queue.
     #[serde(default)]
     pub offscreen_tasks: Vec<OffScreenTask>,
+
+    /// (2026-08-19 Referee QoL) Open player promises (`[PROMISE <npc_id>
+    /// <description> | <minutes>]`). The tracker emits them; Rust tracks
+    /// acceptance + deadline and renders the frustration band on the
+    /// `owed:` line for PRESENT givers. Fulfilled promises are REMOVED
+    /// (`[PROMISE <npc_id> -<description>`) — v1 keeps no history.
+    /// Rust-owned: no `apply_delta` field, no `merge_patch` arm; capped at
+    /// `MAX_PROMISES` (FIFO) in `enforce_typed_caps`. Rides the npc.json
+    /// split (giver-keyed, like relationships).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub promises: Vec<Promise>,
 
     /// Propagation-based rumor state (Fable Phase 4 Component 4, 2026-07-28):
     /// free-form diegetic phrases that spread between connected nodes on the
@@ -1782,19 +1864,6 @@ impl WorldSchema {
     /// - `entities`: for each (key, value) in the delta: `Some(v)` → upsert,
     ///   `None` → remove the key (no-op if it didn't exist).
     pub fn apply_delta(&mut self, delta: SchemaDelta) {
-        crate::logs::log(
-            "SCHEMA",
-            &format!(
-                "apply_delta summary={} events={} entities={}",
-                delta.summary.is_some(),
-                delta
-                    .recent_events
-                    .as_ref()
-                    .map(|v| v.len())
-                    .unwrap_or(0),
-                delta.entities.as_ref().map(|v| v.len()).unwrap_or(0)
-            ),
-        );
         if let Some(summary) = delta.summary {
             self.summary = summary;
         }
@@ -2107,10 +2176,6 @@ impl WorldSchema {
         if !merged.is_empty() {
             self.enforce_typed_caps();
         }
-        crate::logs::log(
-            "SCHEMA",
-            &format!("merge_patch applied_fields={}", merged.join(",")),
-        );
         Ok(merged)
     }
 
@@ -2147,6 +2212,16 @@ impl WorldSchema {
     }
 
     pub fn render_for_prompt(&self) -> String {
+        self.render_for_prompt_with_beneath(false)
+    }
+
+    /// The exposure-gated variant (2026-08-19): passes the reveal flag down
+    /// to the player_state block (a `beneath:` line naming concealed wear on
+    /// turns whose narrative window tripped the exposure gate — see
+    /// `equipment::narrative_trips_exposure`). Used ONLY by the API narrator
+    /// tail render; the tracker skeleton + every other consumer stay on the
+    /// ungated `render_for_prompt`.
+    pub fn render_for_prompt_with_beneath(&self, reveal_beneath: bool) -> String {
         let empty = self.summary.trim().is_empty()
             && self.recent_events.is_empty()
             && self.player_state.is_default()
@@ -2240,6 +2315,27 @@ impl WorldSchema {
             out.push_str("location: ");
             out.push_str(&travel_line);
             out.push('\n');
+        }
+        // (2026-08-19 Hidden site maps) The `site:` block — the knowledge-
+        // filtered interior of the CURRENT node, straight after `location:`
+        // (the "what's inside here" pairing with "where am I"). Dormant when
+        // the current node has no map (the common case outdoors — zero
+        // tokens). Multi-line indented block; every line flattened (a
+        // hand-edited save can't forge a render line) — the tracker's lean
+        // render flattens + caps it further.
+        if let Some(cur_id) = self.travel_graph.current_node.as_deref() {
+            if let Some(site_block) = self
+                .site_maps
+                .get(cur_id)
+                .and_then(crate::site_map::render_narrator_slice)
+            {
+                out.push_str("site:\n");
+                for line in site_block.lines() {
+                    out.push_str("  ");
+                    out.push_str(&Self::flatten_inline(line));
+                    out.push('\n');
+                }
+            }
         }
         // Present NPCs (Phase 5A, 2026-07-29): the on-camera whitelist. The
         // narrator sees ONLY the NPCs the Tracker asserted via `[PRESENCE]`
@@ -2347,6 +2443,59 @@ impl WorldSchema {
                 out.push('\n');
             }
         }
+        // (2026-08-19 zone sweep) The `wearing:` line — the OUTFITS of
+        // PRESENT NPCs (seeded from an npc card's `<inventory>` Clothing/
+        // Equipped-garments/Accessories through the shared garment router:
+        // npc-card clothing is auto-EQUIPPED from turn one, never mixed into
+        // the held rack). Same present-scoped whitelist + cap discipline as
+        // `holding:`; per-NPC names capped at 5 + `(+N)`. Dormant when no
+        // present NPC wears anything (zero tokens, always).
+        if !self.presences.is_empty() && !self.npc_interior.is_empty() {
+            const WEARING_PROMPT_CAP: usize = 6;
+            const PER_NPC_WORN_CAP: usize = 5;
+            let mut parts: Vec<String> = Vec::new();
+            let mut hidden = 0usize;
+            for p in &self.presences {
+                let Some(interior) = self.npc_interior.get(&p.npc_id) else {
+                    continue;
+                };
+                if interior.worn.is_empty() {
+                    continue;
+                }
+                let shown: Vec<String> = interior
+                    .worn
+                    .iter()
+                    .take(PER_NPC_WORN_CAP)
+                    .map(|it| {
+                        if it.qty > 1 {
+                            format!("{} ×{}", it.name, it.qty)
+                        } else {
+                            it.name.clone()
+                        }
+                    })
+                    .collect();
+                let extra = interior.worn.len().saturating_sub(PER_NPC_WORN_CAP);
+                let list = if extra > 0 {
+                    format!("{}, (+{extra} more)", shown.join(", "))
+                } else {
+                    shown.join(", ")
+                };
+                let entry = format!("{}({})", p.name, list);
+                if parts.len() < WEARING_PROMPT_CAP {
+                    parts.push(entry);
+                } else {
+                    hidden += 1;
+                }
+            }
+            if !parts.is_empty() {
+                if hidden > 0 {
+                    parts.push(format!("(+{hidden} more)"));
+                }
+                out.push_str("wearing: ");
+                out.push_str(&Self::flatten_inline(&parts.join(", ")));
+                out.push('\n');
+            }
+        }
         // (2026-08-19 v2 cards) The `holding:` line — the item racks of
         // PRESENT NPCs (seeded from an npc card's `<inventory>` sibling +
         // mutated by `[NPC_ITEM]` in play). Same scene-scoped whitelist as
@@ -2390,6 +2539,65 @@ impl WorldSchema {
                 }
                 out.push_str("holding: ");
                 out.push_str(&Self::flatten_inline(&parts.join(", ")));
+                out.push('\n');
+            }
+        }
+        // (2026-08-19 Referee QoL) The `owed:` line — open promises held by
+        // PRESENT givers only (scene-scoped like minds:/holding:; an
+        // off-screen creditor is not narrator news until they return). The
+        // label comes from the volatility-scaled frustration curve; v1
+        // renders the band only — NO automatic relationship mutation.
+        // Dormant when empty (zero tokens, always). Capped at 4 givers.
+        if !self.promises.is_empty() && !self.presences.is_empty() {
+            const OWED_PROMPT_CAP: usize = 4;
+            let mut parts: Vec<String> = Vec::new();
+            for p in &self.presences {
+                if parts.len() >= OWED_PROMPT_CAP {
+                    break;
+                }
+                let Some(promise) = self.promises.iter().find(|pr| pr.npc_id == p.npc_id) else {
+                    continue;
+                };
+                let vol = self.relationships.get(&p.npc_id).map(|r| r.volatility);
+                let band = crate::offscreen_task::frustration_band(
+                    crate::offscreen_task::promise_frustration(
+                        promise.accepted_at_minutes,
+                        promise.deadline_minutes,
+                        self.world_clock.current_minutes,
+                        vol,
+                    ),
+                );
+                parts.push(format!("{} — \"{}\" — {}", p.name, promise.description, band));
+            }
+            if !parts.is_empty() {
+                out.push_str("owed: ");
+                out.push_str(&Self::flatten_inline(&parts.join("; ")));
+                out.push('\n');
+            }
+        }
+        // (2026-08-19 Referee QoL) The `bonds:` line — PRESENT NPCs whose
+        // relationship tier is LOUD (≥ Friendly on the affinity track or
+        // ≤ Rival on the grudge track); the quiet middle
+        // (Stranger/Acquaintance) stays silent. Cap 6, existing tier
+        // glosses. Dormant when empty (zero tokens, always).
+        if !self.relationships.is_empty() && !self.presences.is_empty() {
+            const BONDS_PROMPT_CAP: usize = 6;
+            let mut parts: Vec<String> = Vec::new();
+            for p in &self.presences {
+                if parts.len() >= BONDS_PROMPT_CAP {
+                    break;
+                }
+                let Some(rel) = self.relationships.get(&p.npc_id) else {
+                    continue;
+                };
+                if rel.tier < RelationshipTier::Friendly && rel.tier > RelationshipTier::Rival {
+                    continue;
+                }
+                parts.push(format!("{} [{}] {}", p.name, rel.tier.tag(), rel.tier.label()));
+            }
+            if !parts.is_empty() {
+                out.push_str("bonds: ");
+                out.push_str(&Self::flatten_inline(&parts.join("; ")));
                 out.push('\n');
             }
         }
@@ -2543,7 +2751,7 @@ impl WorldSchema {
         // LAST in the world-state block so it's the loudest signal — the
         // player's injuries + fatigue are the most turn-relevant facts.
         // Returns None when fully default, so a fresh game adds zero tokens.
-        if let Some(player_block) = self.player_state.render_for_prompt() {
+        if let Some(player_block) = self.player_state.render_for_prompt_with_beneath(reveal_beneath) {
             out.push_str("player_state:\n");
             for line in player_block.lines() {
                 out.push_str("  ");
@@ -2707,8 +2915,8 @@ impl WorldSchema {
             // mid-band entries fall, sorted-key first for determinism. A
             // pathological save whose extremes alone exceed the cap keeps
             // them all — the cap is a bloat guard, not a family-separation
-            // law. Dropped ids surface under SCHEMA so the truncation is
-            // auditable in diagnostics.log.
+            // law. Dropped ids surface via a tracing warn (wupi.log + the
+            // logs/ mirror) so the truncation stays auditable.
             let pinned: std::collections::HashSet<String> = self
                 .relationships
                 .iter()
@@ -2740,12 +2948,11 @@ impl WorldSchema {
                 if dropped.len() > DROPPED_SHOWN {
                     list.push_str(&format!(" (+{} more)", dropped.len() - DROPPED_SHOWN));
                 }
-                crate::logs::log(
-                    "SCHEMA",
-                    &format!(
-                        "relationships cap {MAX_TRACKED_RELATIONSHIPS}: kept {pinned_count} pinned extreme(s), dropped {} mid-band: {list}",
-                        dropped.len()
-                    ),
+                tracing::warn!(
+                    cap = MAX_TRACKED_RELATIONSHIPS,
+                    pinned = pinned_count,
+                    dropped = %list,
+                    "relationship cap truncation: mid-band entries fell"
                 );
             }
             self.relationships.retain(|k, _| keep.contains(k));
@@ -2766,6 +2973,25 @@ impl WorldSchema {
             if interior.items.len() > NPC_INTERIOR_ITEMS_MAX {
                 let overflow = interior.items.len() - NPC_INTERIOR_ITEMS_MAX;
                 interior.items.drain(..overflow);
+            }
+        }
+        // (2026-08-19 Referee QoL) Open-promise cap — FIFO like the tasks.
+        if self.promises.len() > MAX_PROMISES {
+            let overflow = self.promises.len() - MAX_PROMISES;
+            self.promises.drain(..overflow);
+        }
+        // (2026-08-19 Hidden site maps) LRU eviction at the map cap — never
+        // the current node's map. A WHILE, not one call: a hand-edited
+        // install can sit over the cap by 2+ maps and must converge in a
+        // single pass (the None break guards the degenerate all-current case).
+        while self.site_maps.len() > crate::site_map::MAX_SITE_MAPS {
+            let current = self
+                .travel_graph
+                .current_node
+                .clone()
+                .unwrap_or_default();
+            if crate::site_map::evict_lru_site_map(&mut self.site_maps, &current).is_none() {
+                break;
             }
         }
         self.cap_recent_events();
@@ -2902,15 +3128,9 @@ impl WorldSchema {
             interior.mood = None;
             interior.intent = None;
             interior.items.clear();
+            interior.worn.clear();
             interior.archived = Some(stub.clone());
             reaped += 1;
-            crate::logs::log(
-                "BRK",
-                &format!(
-                    "[tick] npc reaper archived {id} stub={}",
-                    crate::logs::brief_with(&stub, 40)
-                ),
-            );
         }
         if !held.is_empty() {
             const HELD_SHOWN: usize = 8;
@@ -2918,10 +3138,6 @@ impl WorldSchema {
             if held.len() > HELD_SHOWN {
                 list.push_str(&format!(" (+{} more)", held.len() - HELD_SHOWN));
             }
-            crate::logs::log(
-                "BRK",
-                &format!("[tick] npc reaper held {} past-TTL protected: {list}", held.len()),
-            );
         }
         reaped
     }
@@ -3055,6 +3271,7 @@ impl WorldSchema {
             "presences",
             "offscreen_tasks",
             "npc_interior",
+            "promises",
         ] {
             if let Some(v) = world.remove(key) {
                 npc.insert(key.to_string(), v);
@@ -3361,6 +3578,14 @@ pub struct SchemaDelta {
     pub recent_events: Option<Vec<String>>,
     #[serde(default)]
     pub entities: Option<HashMap<String, Option<serde_json::Value>>>,
+    /// (2026-08-19 Stale Roulette) Site-seed hooks the WORLD-PROGRESSION pass
+    /// may emit for its designated nodes (`{node_id: "one-line hook"}`).
+    /// Consumed + stripped by `fire_world_progression_tick` BEFORE
+    /// `apply_delta` (validated against the graph + `clean_free_text`-capped,
+    /// then pushed into `Node.seeds`) — `apply_delta` itself NEVER touches
+    /// node seeds (site maps + the roulette are Rust-authoritative).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub site_seeds: Option<HashMap<String, String>>,
 }
 
 impl SchemaDelta {
@@ -3388,15 +3613,6 @@ impl SchemaDelta {
         // repair (wrong keys/types) still goes through the 3-pass loop.
         let repaired = crate::json_repair::repair(cleaned);
         let result = serde_json::from_str(&repaired);
-        crate::logs::log(
-            "SCHEMA",
-            &format!(
-                "json_parse reply_chars={} repair_applied={} ok={}",
-                reply.chars().count(),
-                cleaned != repaired,
-                result.is_ok()
-            ),
-        );
         result
     }
 
@@ -3619,6 +3835,7 @@ mod tests {
                 ("iron_sword".to_string(), Some(serde_json::Value::String("acquired".into()))),
                 ("loc.current".to_string(), Some(serde_json::Value::String("tavern".into()))),
             ])),
+            ..Default::default()
         };
         schema.apply_delta(delta);
         assert_eq!(
@@ -3650,6 +3867,7 @@ mod tests {
                 ("iron_sword".to_string(), None), // delete
                 ("loc.current".to_string(), Some(serde_json::Value::String("forest".into()))),
             ])),
+            ..Default::default()
         };
         schema.apply_delta(delta);
         assert!(!schema.entities.contains_key("iron_sword"), "null should delete");
@@ -3666,6 +3884,7 @@ mod tests {
             summary: None,
             recent_events: None,
             entities: Some(HashMap::from([("ghost".to_string(), None)])),
+            ..Default::default()
         };
         schema.apply_delta(delta);
         assert!(schema.entities.is_empty());
@@ -3683,6 +3902,7 @@ mod tests {
             summary: None,
             recent_events: Some(vec!["ordered ale".to_string(), "heard rumor".to_string()]),
             entities: None,
+            ..Default::default()
         };
         schema.apply_delta(delta);
         assert_eq!(
@@ -3703,6 +3923,7 @@ mod tests {
             summary: Some("new summary".to_string()),
             recent_events: None,
             entities: None,
+            ..Default::default()
         };
         schema.apply_delta(delta);
         assert_eq!(schema.summary, "new summary");
@@ -3986,6 +4207,7 @@ mod tests {
             summary: Some("hi".into()),
             recent_events: None,
             entities: None,
+            ..Default::default()
         }
         .has_changes());
         // Recent events populated → has_changes.
@@ -3993,6 +4215,7 @@ mod tests {
             summary: None,
             recent_events: Some(vec!["e".into()]),
             entities: None,
+            ..Default::default()
         }
         .has_changes());
         // Entity mutations (even a delete/null) → has_changes.
@@ -4002,6 +4225,7 @@ mod tests {
             summary: None,
             recent_events: None,
             entities: Some(ents),
+            ..Default::default()
         }
         .has_changes());
     }
@@ -4016,6 +4240,7 @@ mod tests {
             summary: None,
             recent_events: Some(Vec::new()),
             entities: Some(HashMap::new()),
+            ..Default::default()
         }
         .has_changes());
     }
@@ -4517,6 +4742,7 @@ mod tests {
             summary: None,
             recent_events: None,
             entities: Some(ents),
+            ..Default::default()
         };
         schema.apply_delta(delta);
         // The typed world_clock is unchanged.
@@ -4596,6 +4822,7 @@ mod tests {
             summary: None,
             recent_events: None,
             entities: Some(ents),
+            ..Default::default()
         };
         schema.apply_delta(delta);
         // The typed weather is unchanged.
@@ -4659,19 +4886,19 @@ mod tests {
                     id: "tavern".to_string(),
                     name: "The Rusty Anchor".to_string(),
                     neighbors: vec!["cellar".to_string(), "market_square".to_string()],
-                    setting: "indoor".to_string(),
+                    setting: "indoor".to_string(), ..Default::default()
                 },
                 Node {
                     id: "cellar".to_string(),
                     name: "The Cellar".to_string(),
                     neighbors: vec!["tavern".to_string()],
-                    setting: "outdoor".to_string(),
+                    setting: "outdoor".to_string(), ..Default::default()
                 },
                 Node {
                     id: "market_square".to_string(),
                     name: "Market Square".to_string(),
                     neighbors: vec!["tavern".to_string()],
-                    setting: "".to_string(),
+                    setting: "".to_string(), ..Default::default()
                 },
             ],
             current_node: Some("tavern".to_string()),
@@ -4695,7 +4922,7 @@ mod tests {
             id: "lonely".to_string(),
             name: "A Lonely Place".to_string(),
             neighbors: vec![],
-            setting: "".to_string(),
+            setting: "".to_string(), ..Default::default()
         });
         // is_set is about the GRAPH existing, not the current_node pointer.
         assert!(g.is_set());
@@ -4761,7 +4988,7 @@ mod tests {
             id: "distant".to_string(),
             name: "Far Away".to_string(),
             neighbors: vec!["market_square".to_string()],
-            setting: "".to_string(),
+            setting: "".to_string(), ..Default::default()
         });
         // "distant" exists in graph but is not in tavern's neighbor list.
         assert!(!g.is_adjacent_to_current("distant"));
@@ -4874,7 +5101,7 @@ mod tests {
                 id: format!("n{i}"),
                 name: format!("Node {i}"),
                 neighbors: vec![],
-                setting: String::new(),
+                setting: String::new(), ..Default::default()
             });
         }
         assert_eq!(g.nodes.len(), MAX_TRAVEL_NODES);
@@ -4903,7 +5130,7 @@ mod tests {
             id: "greywater-village".to_string(),
             name: "Greywater Village".to_string(),
             neighbors: vec![],
-            setting: String::new(),
+            setting: String::new(), ..Default::default()
         });
         let id3 = g.resolve_or_mint_node("greywater", &[]).expect("re-finds the mint");
         assert_eq!(id3, "greywater-village");
@@ -4919,7 +5146,7 @@ mod tests {
             id: "market-stalls".to_string(),
             name: "Market Stalls".to_string(),
             neighbors: vec![],
-            setting: String::new(),
+            setting: String::new(), ..Default::default()
         });
         let id = g.resolve_or_mint_node("market", &[]).expect("ambiguous fragment mints fresh");
         assert_eq!(id, "market", "minted as its own node — no silent guess between the two");
@@ -4929,7 +5156,7 @@ mod tests {
             id: "the-crooked-lantern-tavern".to_string(),
             name: "The Crooked Lantern Tavern".to_string(),
             neighbors: vec![],
-            setting: String::new(),
+            setting: String::new(), ..Default::default()
         });
         let id2 = g2
             .resolve_or_mint_node("the", &[])
@@ -5057,7 +5284,7 @@ mod tests {
             id: "market-square".to_string(),
             name: "Market Square".to_string(),
             neighbors: vec![],
-            setting: String::new(),
+            setting: String::new(), ..Default::default()
         });
         assert_eq!(
             g2.resolve_fragment_alias("market"),
@@ -5186,7 +5413,7 @@ mod tests {
                 id: "island".to_string(),
                 name: "Deserted Island".to_string(),
                 neighbors: vec![],
-                setting: "".to_string(),
+                setting: "".to_string(), ..Default::default()
             }],
             current_node: Some("island".to_string()),
         };
@@ -5203,7 +5430,7 @@ mod tests {
                 id: "tavern".to_string(),
                 name: "Tavern".to_string(),
                 neighbors: vec!["ghost_node".to_string()],
-                setting: "".to_string(),
+                setting: "".to_string(), ..Default::default()
             }],
             current_node: Some("tavern".to_string()),
         };
@@ -5240,7 +5467,7 @@ mod tests {
                 id: "hall".to_string(),
                 name: "Great Hall".to_string(),
                 neighbors: vec![],
-                setting: "INDOOR".to_string(),
+                setting: "INDOOR".to_string(), ..Default::default()
             }],
             current_node: Some("hall".to_string()),
         };
@@ -5256,7 +5483,7 @@ mod tests {
             id: "shell_town".into(),
             name: "Shell Town".into(),
             neighbors: vec![],
-            setting: "outdoor".into(),
+            setting: "outdoor".into(), ..Default::default()
         });
         assert!(inserted, "first insert returns true");
         assert_eq!(g.nodes.len(), 1);
@@ -5267,8 +5494,8 @@ mod tests {
     fn upsert_node_is_idempotent_on_duplicate_id() {
         // Re-discovering an existing id is a no-op (the tracker may re-emit it).
         let mut g = TravelGraph::default();
-        g.upsert_node(Node { id: "shell_town".into(), name: "Shell Town".into(), neighbors: vec![], setting: String::new() });
-        let inserted = g.upsert_node(Node { id: "shell_town".into(), name: "DIFFERENT NAME".into(), neighbors: vec![], setting: String::new() });
+        g.upsert_node(Node { id: "shell_town".into(), name: "Shell Town".into(), neighbors: vec![], setting: String::new(), ..Default::default() });
+        let inserted = g.upsert_node(Node { id: "shell_town".into(), name: "DIFFERENT NAME".into(), neighbors: vec![], setting: String::new(), ..Default::default() });
         assert!(!inserted, "duplicate id returns false (no-op)");
         assert_eq!(g.nodes.len(), 1, "no duplicate node added");
         // The original entry wins (first writer semantics).
@@ -5280,14 +5507,14 @@ mod tests {
         // Discover a new node that names an EXISTING neighbor: the existing
         // node gains a back-edge so the graph stays undirected.
         let mut g = TravelGraph {
-            nodes: vec![Node { id: "loguetown".into(), name: "Loguetown".into(), neighbors: vec![], setting: String::new() }],
+            nodes: vec![Node { id: "loguetown".into(), name: "Loguetown".into(), neighbors: vec![], setting: String::new(), ..Default::default() }],
             current_node: None,
         };
         g.upsert_node(Node {
             id: "shell_town".into(),
             name: "Shell Town".into(),
             neighbors: vec!["loguetown".into()],
-            setting: String::new(),
+            setting: String::new(), ..Default::default()
         });
         // loguetown should now list shell_town as a neighbor (back-link).
         assert!(g.find_node("loguetown").unwrap().neighbors.contains(&"shell_town".to_string()),
@@ -5305,7 +5532,7 @@ mod tests {
             id: "shell_town".into(),
             name: "Shell Town".into(),
             neighbors: vec!["foosha".into()], // foosha doesn't exist yet
-            setting: String::new(),
+            setting: String::new(), ..Default::default()
         });
         assert!(g.find_node("shell_town").unwrap().neighbors.contains(&"foosha".to_string()),
             "forward edge to unknown neighbor kept");
@@ -5314,7 +5541,7 @@ mod tests {
             id: "foosha".into(),
             name: "Foosha Village".into(),
             neighbors: vec!["shell_town".into()],
-            setting: String::new(),
+            setting: String::new(), ..Default::default()
         });
         assert!(g.find_node("shell_town").unwrap().neighbors.contains(&"foosha".to_string()));
         assert!(g.find_node("foosha").unwrap().neighbors.contains(&"shell_town".to_string()));
@@ -5323,7 +5550,7 @@ mod tests {
     #[test]
     fn upsert_node_empty_id_returns_false() {
         let mut g = TravelGraph::default();
-        let inserted = g.upsert_node(Node { id: String::new(), name: "X".into(), neighbors: vec![], setting: String::new() });
+        let inserted = g.upsert_node(Node { id: String::new(), name: "X".into(), neighbors: vec![], setting: String::new(), ..Default::default() });
         assert!(!inserted);
         assert!(g.nodes.is_empty());
     }
@@ -5340,9 +5567,9 @@ mod tests {
         // new "docks" node are disconnected.
         let mut g = TravelGraph {
             nodes: vec![
-                Node { id: "tavern".into(), name: "Tavern".into(), neighbors: vec!["cellar".into()], setting: "indoor".into() },
-                Node { id: "cellar".into(), name: "Cellar".into(), neighbors: vec!["tavern".into()], setting: "".into() },
-                Node { id: "docks".into(), name: "Docks".into(), neighbors: vec![], setting: "outdoor".into() },
+                Node { id: "tavern".into(), name: "Tavern".into(), neighbors: vec!["cellar".into()], setting: "indoor".into(), ..Default::default() },
+                Node { id: "cellar".into(), name: "Cellar".into(), neighbors: vec!["tavern".into()], setting: "".into(), ..Default::default() },
+                Node { id: "docks".into(), name: "Docks".into(), neighbors: vec![], setting: "outdoor".into(), ..Default::default() },
             ],
             current_node: Some("tavern".into()),
         };
@@ -5547,6 +5774,7 @@ mod tests {
             summary: None,
             recent_events: None,
             entities: Some(ents),
+            ..Default::default()
         };
         schema.apply_delta(delta);
         // The typed travel_graph is unchanged.
@@ -5627,6 +5855,7 @@ mod tests {
             summary: None,
             recent_events: None,
             entities: Some(ents),
+            ..Default::default()
         };
         schema.apply_delta(delta);
         assert_eq!(schema.npc_registry, original, "registry must be LLM-immutable");
@@ -5666,6 +5895,7 @@ mod tests {
             summary: None,
             recent_events: None,
             entities: Some(ents),
+            ..Default::default()
         };
         schema.apply_delta(delta);
         assert_eq!(schema.npc_interior, original, "interior must be LLM-immutable");
@@ -5730,6 +5960,44 @@ mod tests {
         assert!(minds_line.contains("intends \"get her out\""), "intent renders: {minds_line}");
         assert!(minds_line.contains("carries Worn Ring"), "items render: {minds_line}");
         assert!(!rendered.contains("cheerful"), "off-camera interior never renders");
+
+        // (2026-08-19 zone sweep) The `wearing:` line — present-NPC outfits
+        // (seeded from npc-card clothing) render SEPARATELY from the held
+        // rack; an outfit is never a shopping bag.
+        s.npc_interior.insert(
+            "mara".into(),
+            NpcInterior {
+                mood: Some("suspicious".into()),
+                intent: Some("get her out".into()),
+                worn: vec![
+                    equipment::StackItem { name: "Linen Shirt".into(), ..Default::default() },
+                    equipment::StackItem { name: "Wool Trousers".into(), ..Default::default() },
+                ],
+                items: vec![equipment::StackItem {
+                    name: "Worn Ring".into(),
+                    ..Default::default()
+                }],
+                ..NpcInterior::default()
+            },
+        );
+        let rendered = s.render_for_prompt();
+        let wearing_line = rendered
+            .lines()
+            .find(|l| l.starts_with("wearing: "))
+            .expect("wearing line renders for the present NPC");
+        assert!(
+            wearing_line.contains("Mara(Linen Shirt, Wool Trousers)"),
+            "outfit renders by name: {wearing_line}"
+        );
+        let holding_line = rendered
+            .lines()
+            .find(|l| l.starts_with("holding: "))
+            .expect("holding line renders for the present NPC");
+        assert!(
+            holding_line.contains("Mara(Worn Ring"),
+            "held items stay on the rack line: {holding_line}"
+        );
+        assert!(!wearing_line.contains("Worn Ring"), "held items never bleed into the outfit");
         // Archived interiors render the recall stub instead.
         s.npc_interior.insert(
             "mara".into(),
@@ -6289,9 +6557,191 @@ mod tests {
             summary: None,
             recent_events: None,
             entities: Some(ents),
+            ..Default::default()
         };
         schema.apply_delta(delta);
         assert_eq!(schema.presences, original, "presences must be LLM-immutable");
+    }
+
+    /// (2026-08-19 Hidden site maps) THE immunity pin: a delta (even one
+    /// smuggling an entities key named "site_maps") NEVER touches the typed
+    /// site-map store. Mirrors `apply_delta_does_not_touch_presences`.
+    #[test]
+    fn apply_delta_does_not_touch_site_maps() {
+        let mut schema = WorldSchema::default();
+        let mut map = crate::site_map::SiteMap::default();
+        map.node_id = "warren".into();
+        map.entrance = "gatehouse".into();
+        map.areas = vec![
+            crate::site_map::SiteArea { id: "gatehouse".into(), name: "Gatehouse".into(), knowledge: crate::site_map::AreaKnowledge::Visited, ..Default::default() },
+            crate::site_map::SiteArea { id: "hall".into(), name: "Hall".into(), ..Default::default() },
+            crate::site_map::SiteArea { id: "vault".into(), name: "Vault".into(), ..Default::default() },
+        ];
+        schema.site_maps.insert("warren".into(), map);
+        let original = schema.site_maps.clone();
+        let mut ents = HashMap::new();
+        ents.insert(
+            "site_maps".to_string(),
+            Some(serde_json::Value::String("injected".into())),
+        );
+        let delta = SchemaDelta {
+            entities: Some(ents),
+            ..Default::default()
+        };
+        schema.apply_delta(delta);
+        assert_eq!(schema.site_maps, original, "site_maps must be LLM-immutable");
+    }
+
+    /// (2026-08-19) merge_patch has no arm for site_maps — the unknown-field
+    /// refusal is the immunity. Same for promises.
+    #[test]
+    fn merge_patch_refuses_site_maps_and_promises() {
+        let mut schema = WorldSchema::default();
+        let err = schema
+            .merge_patch(serde_json::json!({ "site_maps": {} }))
+            .expect_err("site_maps patch must be refused");
+        assert!(err.contains("unknown top-level field"), "error should explain: {err}");
+        let err = schema
+            .merge_patch(serde_json::json!({ "promises": [] }))
+            .expect_err("promises patch must be refused");
+        assert!(err.contains("unknown top-level field"), "error should explain: {err}");
+    }
+
+    /// (2026-08-19) The 3-file split: site_maps ride world.json; promises
+    /// (giver-keyed) ride npc.json. Round-trips through save/load_split.
+    #[test]
+    fn save_split_routes_site_maps_to_world_slice() {
+        let dir = std::env::temp_dir().join(format!("wupi-site-split-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let world_p = dir.join("world.json");
+        let player_p = dir.join("player.json");
+        let npc_p = dir.join("npc.json");
+        let mut s = WorldSchema::default();
+        let mut map = crate::site_map::SiteMap::default();
+        map.node_id = "warren".into();
+        map.entrance = "gatehouse".into();
+        map.areas = vec![
+            crate::site_map::SiteArea { id: "gatehouse".into(), name: "Gatehouse".into(), knowledge: crate::site_map::AreaKnowledge::Visited, ..Default::default() },
+            crate::site_map::SiteArea { id: "hall".into(), name: "Hall".into(), ..Default::default() },
+            crate::site_map::SiteArea { id: "vault".into(), name: "Vault".into(), ..Default::default() },
+        ];
+        s.site_maps.insert("warren".into(), map);
+        s.promises = vec![Promise {
+            npc_id: "mara".into(),
+            description: "return the horse".into(),
+            deadline_minutes: 2_000,
+            accepted_at_minutes: 1_000,
+        }];
+        s.save_split(&world_p, &player_p, &npc_p).expect("save_split");
+        let world_json: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&world_p).expect("world file"))
+                .expect("world json");
+        assert!(world_json.get("site_maps").is_some(), "site maps ride the world slice");
+        assert!(world_json.get("promises").is_none(), "promises never ride the world slice");
+        let npc_json: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&npc_p).expect("npc file"))
+                .expect("npc json");
+        assert!(npc_json.get("promises").is_some(), "promises ride the npc slice");
+        let loaded = WorldSchema::load_split(&world_p, &player_p, &npc_p).expect("load_split");
+        assert!(loaded.site_maps.contains_key("warren"), "site maps round-trip");
+        assert_eq!(loaded.promises.len(), 1, "promises round-trip");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// (2026-08-19) The three new render lines: `site:` only for the CURRENT
+    /// node's map (knowledge-filtered), `owed:` for present givers with the
+    /// frustration band, `bonds:` for present loud-tier NPCs only.
+    #[test]
+    fn render_carries_site_owed_bonds_lines() {
+        let mut s = WorldSchema::default();
+        s.world_clock.current_minutes = 1_500;
+        s.presences = vec![
+            Presence { npc_id: "mara".into(), name: "Mara".into(), stance: String::new(), ttl: PRESENCE_GRACE_RESET },
+            Presence { npc_id: "harsk".into(), name: "Harsk".into(), stance: String::new(), ttl: PRESENCE_GRACE_RESET },
+            Presence { npc_id: "randopasserby".into(), name: "Passerby".into(), stance: String::new(), ttl: PRESENCE_GRACE_RESET },
+        ];
+        s.relationships.insert(
+            "mara".into(),
+            RelationshipState { tier: RelationshipTier::Friendly, ..Default::default() },
+        );
+        s.relationships.insert(
+            "harsk".into(),
+            RelationshipState { tier: RelationshipTier::Nemesis, ..Default::default() },
+        );
+        s.relationships.insert(
+            "randopasserby".into(),
+            RelationshipState { tier: RelationshipTier::Acquaintance, ..Default::default() },
+        );
+        s.promises = vec![Promise {
+            npc_id: "mara".into(),
+            description: "return the horse".into(),
+            // Halfway at coeff 1.0 → −0.5 → "Very Pleased"
+            deadline_minutes: 2_000,
+            accepted_at_minutes: 1_000,
+        }];
+        let mut map = crate::site_map::SiteMap::default();
+        map.node_id = "warren".into();
+        map.threat = crate::site_map::SiteThreat::High;
+        map.entrance = "gatehouse".into();
+        map.areas = vec![
+            crate::site_map::SiteArea {
+                id: "gatehouse".into(),
+                name: "Gatehouse".into(),
+                knowledge: crate::site_map::AreaKnowledge::Visited,
+                geometry: vec!["cold draft".into()],
+                connections: vec![crate::site_map::SiteConnection {
+                    to: "hall".into(),
+                    state: crate::site_map::ConnState::Open,
+                    detail: String::new(),
+                }],
+            },
+            crate::site_map::SiteArea { id: "hall".into(), name: "Great Hall".into(), ..Default::default() },
+            crate::site_map::SiteArea { id: "vault".into(), name: "Vault".into(), ..Default::default() },
+        ];
+        s.site_maps.insert("warren".into(), map);
+        s.travel_graph.current_node = Some("warren".into());
+
+        let rendered = s.render_for_prompt_with_beneath(false);
+        assert!(rendered.contains("site:\n"), "site block renders for the current node: {rendered}");
+        assert!(rendered.contains("threat: high"), "site block carries the threat line");
+        // Unrevealed truth stays hidden.
+        assert!(!rendered.contains("Great Hall"), "unrevealed area must not render");
+        assert!(
+            rendered.contains("owed: Mara — \"return the horse\" — Very Pleased"),
+            "owed line with the frustration band: {rendered}"
+        );
+        assert!(
+            rendered.contains("bonds: Mara [friendly]") && rendered.contains("Harsk [nemesis]"),
+            "bonds line carries the loud tiers: {rendered}"
+        );
+        assert!(
+            !rendered.contains("Passerby [acquaintance]"),
+            "the quiet middle stays silent: {rendered}"
+        );
+
+        // A DIFFERENT current node → no site block (dormant).
+        s.travel_graph.current_node = Some("town".into());
+        let rendered = s.render_for_prompt_with_beneath(false);
+        assert!(!rendered.contains("site:\n"), "site block is current-node-scoped");
+        // owed/bonds are presence-scoped, not node-scoped — still render.
+        assert!(rendered.contains("owed:"));
+    }
+
+    /// (2026-08-19) enforce_typed_caps: promise FIFO cap.
+    #[test]
+    fn enforce_typed_caps_drops_oldest_promises() {
+        let mut s = WorldSchema::default();
+        for i in 0..(MAX_PROMISES + 3) {
+            s.promises.push(Promise {
+                npc_id: format!("npc{i}"),
+                description: format!("obligation {i}"),
+                deadline_minutes: 100 + i as i64,
+                accepted_at_minutes: 0,
+            });
+        }
+        s.enforce_typed_caps();
+        assert_eq!(s.promises.len(), MAX_PROMISES, "capped at MAX_PROMISES");
+        assert_eq!(s.promises[0].description, "obligation 3", "FIFO — oldest dropped");
     }
 
     /// NpcRegistry dormant contract: empty registry is_set()==false, renders

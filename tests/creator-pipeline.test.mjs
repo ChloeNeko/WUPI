@@ -184,5 +184,85 @@ test('pipeline: ready missing body_type is gated, then the corrective turn fills
   assert.equal(player.body_type, 'lean');
 });
 
+// ── lorebook import pipeline (2026-08-19 Chloe ruling) ─────────────────────
+// The full codex import chain, exactly as creator-chat.js drives it:
+// recognition → mechanical extraction (keyless entries SKIPPED) → batching →
+// one synthetic GLM `ready` per batch (Rust's 1400 gate shape holds) →
+// normalizeLoreImportEntries (title fallback + ≥3-tag floor) → the compound
+// .codex text Rust seeds. No app, no GLM, no key.
+import {
+  extractStandaloneLorebook,
+  batchLorebookEntries,
+  normalizeLoreImportEntries,
+} from '../src/fable/engine/creator-engine.js';
+import { codexEntriesToCompound } from '../src/fable/screens/card-serialize.js';
+
+test('lorebook pipeline: Frieren-shaped JSON → batched GLM replies → compound codex', () => {
+  // 1. Recognition: a real-world ST world book (name + EMPTY description +
+  //    object-map entries, decorative keyless headers mixed with keyed lore).
+  const bookJson = {
+    name: 'Frieren',
+    description: '',
+    entries: {
+      1: { uid: 1, key: [], keys: [], comment: '⚠️⛔READ THIS⛔⚠️', content: 'symbol legend' },
+      2: { uid: 2, key: [], keys: [], comment: '═══════[Setting]═══════', content: 'Takes place in the anime.' },
+      3: { uid: 3, key: ['mana'], keys: ['mana'], comment: '═══════[Mana]═══════', content: 'Mana is the source of all magic.' },
+      4: { uid: 4, key: ['frieren', 'elf'], keys: [], comment: 'Frieren', content: 'Frieren is an elf mage, over a thousand years old.' },
+      5: { uid: 5, key: [], keys: [], comment: '═══════[Writing]═══════', content: '' },
+    },
+  };
+  const lore = extractStandaloneLorebook(bookJson);
+  assert.ok(lore, 'the book must be recognized');
+  assert.equal(lore.name, 'Frieren');
+  // Keyless entries (the READ THIS legend, the Setting header) + the
+  // empty-body header are ALL skipped — only keyed lore survives.
+  assert.deepEqual(lore.entries.map((e) => e.title), ['═══════[Mana]═══════', 'Frieren']);
+
+  // 2. Batching: a tiny book is ONE batch; a big book never splits an entry.
+  assert.equal(batchLorebookEntries(lore.entries).length, 1);
+  const big = batchLorebookEntries(
+    Array.from({ length: 12 }, (_, i) => ({ title: `E${i}`, keys: ['k'], content: 'x'.repeat(3000) })),
+    8000,
+  );
+  assert.ok(big.length >= 2);
+  assert.deepEqual(big.flat().map((e) => e.title), Array.from({ length: 12 }, (_, i) => `E${i}`));
+
+  // 3. The synthetic GLM batch reply — messy shape parseEnvelope must handle:
+  //    fenced, clean titles, sparse tags (the floor must top them up), and a
+  //    1400-cap split ("— Part 1/2") whose part suffix re-finds its source.
+  const glmReply = 'Sure! Converted:\n```json\n' + JSON.stringify({
+    action: 'ready',
+    draft: {
+      entries: [
+        { title: 'Mana', tags: ['mana'], body: 'Mana is the source of all magic. It permeates the world.' },
+        { title: 'Frieren', tags: ['frieren'], body: 'Frieren is an elf mage. ' + 'She has lived for over a thousand years, watching eras pass. '.repeat(12) },
+        { title: 'Frieren — Part 2', tags: ['elf', 'mage'], body: 'The second half of her story.' },
+      ],
+    },
+  }) + '\n```';
+  const env = parseEnvelope(glmReply);
+  assert.equal(env.action, 'ready');
+
+  // 4. Normalization: husks dropped, titles kept, EVERY entry ≥3 tags, and
+  //    the split part re-associates with the Frieren source for its keys.
+  const merged = normalizeLoreImportEntries(env.draft.entries, lore.entries, lore.name);
+  assert.equal(merged.length, 3);
+  for (const e of merged) {
+    assert.ok(e.title && e.title !== '', 'title present');
+    assert.ok(Array.isArray(e.tags) && e.tags.length >= 3, `entry "${e.title}" has ≥3 tags`);
+  }
+  assert.ok(merged[1].tags.includes('elf'), 'the Frieren source keys pad the split part 1');
+  // Bodies stay under the 1400 embed cap GLM was told to respect (Rust Gate 1
+  // backstops this at creator_assistant_turn time).
+  for (const e of merged) assert.ok(e.body.length <= 1400);
+
+  // 5. CREATE: the compound .codex text Rust seeds parses back to shape.
+  const compound = codexEntriesToCompound(merged);
+  assert.ok(compound.includes('title: Mana'));
+  assert.ok(compound.includes('tags: mana'));
+  assert.ok(!compound.includes('═══════'), 'decorative junk never reaches the codex');
+  assert.ok(compound.split(/^---$/m).length - 1 === merged.length * 2, 'one fence pair per entry');
+});
+
 console.log('\n%s passed, %s failed', passed, failed);
 process.exit(failed === 0 ? 0 : 1);

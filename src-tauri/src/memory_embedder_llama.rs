@@ -154,7 +154,8 @@ impl LlamaCppEmbedder {
                     Ok(mut rt) => {
                         // Self-test BEFORE signaling ready: the probe runs on the
                         // embedder thread (owns ctx + model), computes cosine in
-                        // Rust (bypasses vec0), and logs the result. If the
+                        // Rust (bypasses vec0), and logs ONE failure line if the
+                        // cosines collapse. If the
                         // embedder is broken, we want to know at startup, not
                         // after the first chat turn produces garbage retrieval.
                         // Runs once, ~ms on GPU, never blocks the readiness
@@ -314,6 +315,10 @@ impl LlamaCppEmbedder {
 /// If all three are ~0.05 (random unit vectors), the EMBEDDER is broken and
 /// vec0 is exonerated. If they make sense here but the 🧠 panel shows garbage,
 /// vec0 storage is the suspect. Runs ONCE at startup; costs 4 embeds (~ms).
+///
+/// Failure log is FAILURE-ONLY (2026-08-19): healthy boots log nothing —
+/// the per-pair cosines land in the verbose tracing log only, and a single
+/// tracing error fires when the cosines have collapsed.
 fn run_self_test(runtime: &mut EmbedderRuntime) {
     let pairs: &[(&str, &str, &str)] = &[
         ("gold", "gold is a precious metal", "HIGH"),
@@ -331,6 +336,7 @@ fn run_self_test(runtime: &mut EmbedderRuntime) {
             return;
         }
     };
+    let mut cosines: Vec<f32> = Vec::with_capacity(pairs.len());
     for &(q, target, label) in pairs {
         // q is always "gold" in this set, but keep the pattern general.
         let _ = q;
@@ -343,18 +349,26 @@ fn run_self_test(runtime: &mut EmbedderRuntime) {
                     cosine = %format!("{cos:.4}"),
                     "embedder self-test pair"
                 );
-                crate::logs::log(
-                    "MEM",
-                    &format!(
-                        "self-test target={} expected={} cos={cos:.4}",
-                        crate::logs::brief_with(target, 40),
-                        label
-                    ),
-                );
+                cosines.push(cos);
             }
             Err(e) => {
                 tracing::warn!(error = %format!("{e:#}"), "self-test: failed to embed '{target}'");
             }
+        }
+    }
+    // Healthy = HIGH inside its documented 0.6-0.9 band and at least the
+    // worst documented healthy gap (0.6 - 0.45 = 0.15) above LOW. Random
+    // unit vectors (~0.05 across the board) trip both. MEDIUM is unconstrained
+    // (its documented 0.4-0.7 band overlaps LOW's, so ordering through it
+    // would false-positive on healthy embedders).
+    if cosines.len() == pairs.len() {
+        let (high, _medium, low) = (cosines[0], cosines[1], cosines[2]);
+        if high < 0.6 || high - low < 0.15 {
+            tracing::error!(
+                high = %format!("{high:.3}"),
+                low = %format!("{low:.3}"),
+                "embedder self-test FAILED — cosines collapsed (embedder suspect, vec0 exonerated)"
+            );
         }
     }
 }

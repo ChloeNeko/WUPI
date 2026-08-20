@@ -1,169 +1,235 @@
-//! Share-safe rotating diagnostic log — `logs/diagnostics.log` beside the exe.
+//! Crash reports + the per-session full-detail log mirror (`logs/`).
 //!
-//! PRIVACY CONTRACT (load-bearing, 2026-08-18): this file is what users
-//! attach to bug reports, so it must NEVER carry prose: no user messages,
-//! no narrator beats, no card/codex bodies, no prompts, no save payloads.
-//! Free text enters ONLY through [`brief`] / [`brief_with`] (whitespace-
-//! collapsed, char-capped preview + source length) or as short mechanical
-//! tokens (verbs, keys, slugs, ids, dice). The verbose internal tracing log
-//! (`%TEMP%\wupi.log`) is a DIFFERENT file and deliberately stays out of the
-//! portable `logs/` folder for exactly this reason.
+//! (2026-08-19 Chloe ruling — temporary debugging posture) The share-safe
+//! rotating `diagnostics.log` system is RETIRED: nothing is redacted
+//! anymore, the brief/preview privacy contract is gone with it. The verbose
+//! tracing log still lives at `%TEMP%\wupi.log` exactly as before, and
+//! every formatted line is ALSO teed live into `logs/wupi-YYYYMMDD-HHMMSS`
+//! `.log` (stamped at boot) by [`MirrorWriter`]. The tee — not an exit-time
+//! copy — is the mechanism: a `TerminateProcess` task-kill cannot run any
+//! Rust code, so only a writer that has been on disk for the whole session
+//! guarantees the full log survives ANY death (graceful quit, panic,
+//! C-level ggml abort, hard kill). [`shutdown_flush`] tops the file up on
+//! the paths that DO run code before exiting.
 //!
-//! Rotation is crash-report style: the active session writes
-//! `logs/diagnostics.log`; at boot (and when the active file passes
-//! [`DIAG_MAX_FILE_BYTES`]) it is renamed to `diagnostics-YYYYMMDD-HHMMSS.log`
-//! (local time, stamped from the file's last-write time at boot) and a fresh
-//! file opens. The prune matches ONLY this module's own `diagnostics-*.log`
-//! prefix — anything else a user keeps in `logs/` is untouchable.
-//!
-//! Writes are line-flushed (a crash must not eat the tail), mutex-guarded,
-//! and failure-tolerant: if the disk refuses writes the logger goes silent
-//! for the rest of the process rather than spamming or panicking — but the
-//! RAM ring buffer keeps capturing. Callable from any thread (engine
-//! threads, spawn_blocking closures, tokio workers).
-//!
-//! CRASH REPORTS: the last [`DIAG_RING_LINES`] lines also live in a
-//! fixed-size `VecDeque<String>` in RAM. [`dump_crash`] — wired to the
-//! global panic hook in lib.rs and the SD-abort callback — writes
+//! CRASH REPORTS (kept from the old system, same shape): the last
+//! [`RING_LINES`] verbose lines live in a fixed-size RAM `VecDeque` fed by
+//! the tee. [`dump_crash`] — wired to the global panic hook in lib.rs and
+//! the SD-abort callback in scene_art.rs — writes
 //! `logs/crash-YYYYMMDD-HHMMSS.log` containing the panic message plus that
-//! ring tail, so an abnormal crash can be located and read WITHOUT opening
-//! the full session log. The full log survives alongside (both, just in
-//! case); crash files are pruned to the newest [`DIAG_KEEP_CRASH_FILES`].
-//! Note: C-level aborts (CUDA / ggml) are not Rust panics — the SD-abort
-//! callback covers the image-gen path; the raw backtrace lives in
+//! ring tail. C-level aborts (CUDA / ggml) are not Rust panics — the
+//! SD-abort callback covers the image-gen path; the raw backtrace stays in
 //! `%TEMP%\wupi_panic.txt` (the pre-existing hook output).
 //!
-//! Categories in use: SYS (boot/system) · ENG (local decode engines) ·
-//! MEM (memory + embedder) · SCHEMA (delta/repair/queues) · FABLE (turn
-//! flow/session ops + the per-turn world digest) · BRK (bracket commands +
-//! world tracking: travel/map, weather, date, rumors, presence) · INV
-//! (inventory: equip/belt/pack appliers, fragment resolution, spills,
-//! soul-gem UI edits) · REF (referees/dice) · TOOL (tool calls) ·
-//! API (HTTP narrator/slice/creator).
+//! Retention at boot: `crash-*.log` newest [`KEEP_CRASH_FILES`] kept,
+//! `wupi-*.log` newest [`KEEP_MIRROR_FILES`] kept (full-detail logs are
+//! large — the cap keeps the portable folder bounded; raise the constant
+//! if a bug hunt needs more history). The prune matches ONLY this
+//! module's own MINTED names (`<prefix>-YYYYMMDD-HHMMSS(-N).log` — see
+//! [`is_minted_log_name`]) — anything else a user keeps in `logs/`,
+//! including their own `wupi-notes.log`, is untouchable. The retired
+//! diagnostics system's `README.txt` is removed only when its content
+//! carries our generated header — a user-authored README survives.
+//! No README is ever written into `logs/`.
+//!
+//! Fail-silent discipline throughout: every write path swallows errors (a
+//! logger must never take the app down), the ring survives disk failures
+//! in RAM, and everything is callable from any thread.
 
 use std::collections::VecDeque;
-use std::fs::{File, OpenOptions};
-use std::io::{BufWriter, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
-use std::time::SystemTime;
 
 use chrono::Local;
+use tracing_appender::non_blocking::{NonBlocking, WorkerGuard};
 
-/// Master switch — flip to `false` to ship a build with diagnostics off.
-pub const DIAG_LOG_ENABLED: bool = true;
-/// Active file name inside `logs/`.
-pub const DIAG_CURRENT_NAME: &str = "diagnostics.log";
-/// Rotate mid-session once the active file grows past this.
-const DIAG_MAX_FILE_BYTES: u64 = 8 * 1024 * 1024;
-/// Timestamped files to retain (newest kept, oldest pruned).
-const DIAG_KEEP_FILES: usize = 20;
 /// Crash reports to retain (newest kept, oldest pruned).
-const DIAG_KEEP_CRASH_FILES: usize = 10;
-/// RAM ring buffer size — the crash-report tail (Chloe ruling, 2026-08-18).
-const DIAG_RING_LINES: usize = 100;
-/// Default preview budget for [`brief`] — CHARS, not bytes (CJK-safe).
-const DIAG_SCRUB_MAX_CHARS: usize = 48;
-/// Hard per-line cap — a malformed caller can never emit a prose wall.
-const DIAG_LINE_MAX_CHARS: usize = 600;
+const KEEP_CRASH_FILES: usize = 10;
+/// Full-detail mirror logs to retain (newest kept, oldest pruned).
+const KEEP_MIRROR_FILES: usize = 10;
+/// RAM ring buffer size — the crash-report tail.
+const RING_LINES: usize = 100;
+/// Hard cap for the panic line in a crash report (one line, no prose wall).
+const CRASH_LINE_MAX_CHARS: usize = 600;
+/// A partial line still larger than this after a write is garbage (no
+/// newline for a whole buffer) — drop it instead of growing the feed.
+const RING_PARTIAL_MAX_BYTES: usize = 16 * 1024;
 
-struct DiagWriter {
-    writer: Option<BufWriter<File>>,
+struct CrashLog {
     dir: PathBuf,
-    written: u64,
-    dead: bool,
-    /// The last [`DIAG_RING_LINES`] formatted lines, RAM-only. Updated on
-    /// EVERY emit — including after `dead` flips (disk refused writes) — so
-    /// a crash dump still carries the tail context.
+    /// The last [`RING_LINES`] formatted verbose lines, RAM-only, fed by
+    /// [`MirrorWriter`]. Updated even when the mirror file itself refuses
+    /// writes, so a crash dump still carries the tail context.
     ring: VecDeque<String>,
 }
 
-static DIAG: OnceLock<Mutex<DiagWriter>> = OnceLock::new();
+static CRASH: OnceLock<Mutex<CrashLog>> = OnceLock::new();
 
-/// True when the logger is armed — gate expensive call-site prep (e.g.
-/// serializing a command for preview) on this.
-pub fn is_on() -> bool {
-    DIAG_LOG_ENABLED && DIAG.get().is_some()
-}
+/// Worker guards for the non-blocking appenders (temp + mirror), parked
+/// for the process lifetime. [`shutdown_flush`] takes and drops them on a
+/// graceful exit so the workers flush + join before the process ends.
+static WRITER_GUARDS: Mutex<Vec<WorkerGuard>> = Mutex::new(Vec::new());
 
-/// Arm the logger. Call once at boot, before the Tauri builder —
-/// `install_root` is the exe's parent dir (the same root `memory/` and
-/// `apps/` live under). Fails soft: if `logs/` can't be created or the file
-/// can't be opened, every [`log`] call is a no-op for the process.
+/// Arm the crash ring + prune old files. Call once at boot, before the
+/// Tauri builder — `install_root` is the exe's parent dir (the same root
+/// `memory/` and `apps/` live under). Fails soft: if `logs/` can't be
+/// created, the ring stays unarmed and [`dump_crash`] is a no-op.
 pub fn init(install_root: &Path) {
-    if !DIAG_LOG_ENABLED || DIAG.get().is_some() {
-        return;
-    }
     let dir = install_root.join("logs");
     if std::fs::create_dir_all(&dir).is_err() {
         return;
     }
-    write_readme_if_missing(&dir);
-    let current = dir.join(DIAG_CURRENT_NAME);
-    if current.exists() {
-        let mtime = std::fs::metadata(&current).and_then(|m| m.modified()).ok();
-        rotate_closed_file(&current, mtime);
-    }
-    let file = match OpenOptions::new()
-        .create(true)
-        .truncate(true)
-        .write(true)
-        .open(&current)
+    if CRASH
+        .set(Mutex::new(CrashLog {
+            dir: dir.clone(),
+            ring: VecDeque::with_capacity(RING_LINES + 1),
+        }))
+        .is_err()
     {
-        Ok(f) => f,
-        Err(_) => return,
-    };
-    let writer = DiagWriter {
-        writer: Some(BufWriter::new(file)),
-        dir: dir.clone(),
-        written: 0,
-        dead: false,
-        ring: VecDeque::with_capacity(DIAG_RING_LINES + 1),
-    };
-    if DIAG.set(Mutex::new(writer)).is_err() {
         return;
     }
-    log(
-        "SYS",
-        &format!(
-            "==== WUPI v{} session open — diagnostic log (redacted, share-safe) ====",
-            env!("CARGO_PKG_VERSION")
-        ),
-    );
-    prune_prefixed(&dir, "diagnostics-", DIAG_KEEP_FILES);
-    prune_prefixed(&dir, "crash-", DIAG_KEEP_CRASH_FILES);
+    prune_minted(&dir, "crash-", KEEP_CRASH_FILES);
+    prune_minted(&dir, "wupi-", KEEP_MIRROR_FILES);
+    // Remove the README.txt the retired diagnostics system used to write —
+    // CONTENT-VERIFIED against our generated header so a user's own
+    // README.txt survives (an unconditional delete could eat a user file).
+    if let Ok(text) = std::fs::read_to_string(dir.join("README.txt")) {
+        if text.trim_start().starts_with(README_MARKER) {
+            let _ = std::fs::remove_file(dir.join("README.txt"));
+        }
+    }
 }
 
-/// Emit one diagnostic line: `YYYY-MM-DD HH:MM:SS.mmm [CAT] message`.
-/// No-op before [`init`], when disabled, or after a write failure.
-pub fn log(cat: &str, msg: &str) {
-    if !DIAG_LOG_ENABLED {
+/// First line of the retired diagnostics system's generated `logs/README.txt`
+/// — the content marker distinguishing our own stale artifact from a
+/// user-authored file of the same name.
+const README_MARKER: &str = "WUPI diagnostic logs";
+
+/// Open this session's full-detail mirror appender:
+/// `logs/wupi-YYYYMMDD-HHMMSS.log` (unique-suffixed within the second).
+/// Its WorkerGuard is parked in [`WRITER_GUARDS`]; the file itself is
+/// written live for the whole session (that is the task-kill guarantee).
+pub fn open_wupi_mirror(install_root: &Path) -> Option<NonBlocking> {
+    let dir = install_root.join("logs");
+    std::fs::create_dir_all(&dir).ok()?;
+    let stamp = Local::now().format("%Y%m%d-%H%M%S").to_string();
+    let name = unique_prefixed_name(&dir, "wupi", &stamp);
+    let appender = tracing_appender::rolling::never(&dir, name);
+    let (nb, guard) = tracing_appender::non_blocking(appender);
+    hold_guard(guard);
+    Some(nb)
+}
+
+/// Park a non-blocking writer guard for the process lifetime.
+pub fn hold_guard(guard: WorkerGuard) {
+    if let Ok(mut guards) = WRITER_GUARDS.lock() {
+        guards.push(guard);
+    }
+}
+
+/// Graceful-exit flush (RunEvent::Exit): dropping the guards flushes +
+/// joins the writer workers so the tail of both `%TEMP%\wupi.log` and the
+/// mirror lands on disk. Idempotent. After a hard kill nothing can run —
+/// the live tee is the guarantee there, this just tops up the polite path.
+pub fn shutdown_flush() {
+    if let Ok(mut guards) = WRITER_GUARDS.lock() {
+        guards.clear(); // drops the guards
+    }
+}
+
+/// The tee: every formatted tracing line goes to BOTH `%TEMP%\wupi.log`
+/// (unchanged primary) and this session's `logs/wupi-*.log` mirror, and
+/// complete lines feed the crash RAM ring. Fail-silent per side — one
+/// dead sink must never take the other down, and a panic in here while
+/// unwinding a panic would abort the process.
+pub struct MirrorWriter {
+    temp: NonBlocking,
+    mirror: Option<NonBlocking>,
+    /// Partial-line accumulator for the ring feed. One writer is built per
+    /// tracing event and fmt events end with `\n`, so lines complete per
+    /// event; the buffer only ever holds a transient partial.
+    line: String,
+}
+
+impl MirrorWriter {
+    pub fn new(
+        temp: NonBlocking,
+        mirror: Option<NonBlocking>,
+    ) -> Self {
+        Self {
+            temp,
+            mirror,
+            line: String::new(),
+        }
+    }
+}
+
+impl Write for MirrorWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if let Some(m) = self.mirror.as_mut() {
+            let _ = m.write(buf);
+        }
+        let _ = self.temp.write(buf);
+        ring_extend(absorb_complete_lines(&mut self.line, buf));
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        if let Some(m) = self.mirror.as_mut() {
+            let _ = m.flush();
+        }
+        let _ = self.temp.flush();
+        Ok(())
+    }
+}
+
+/// Push complete lines into the RAM ring, evicting past [`RING_LINES`].
+fn ring_extend(lines: Vec<String>) {
+    if lines.is_empty() {
         return;
     }
-    let Some(guard) = DIAG.get() else { return };
-    let mut w = match guard.lock() {
-        Ok(g) => g,
-        Err(poisoned) => poisoned.into_inner(),
-    };
-    emit(&mut w, cat, msg);
+    let Some(cl) = CRASH.get() else { return };
+    let Ok(mut w) = cl.lock() else { return };
+    for line in lines {
+        w.ring.push_back(line);
+        while w.ring.len() > RING_LINES {
+            w.ring.pop_front();
+        }
+    }
 }
 
-/// Crash-report dump (Chloe ruling, 2026-08-18): write
-/// `logs/crash-YYYYMMDD-HHMMSS.log` containing the panic message + the
-/// RAM ring buffer's last lines, so a crash is readable without opening
-/// the full session log. Mirrors a SYS line into the active log too.
-/// Best-effort: failures are swallowed (`%TEMP%\wupi_panic.txt`, written
-/// by lib.rs's hook, is the independent backstop with the full backtrace).
+/// Split `bytes` into complete `\n`-terminated lines, buffering the
+/// partial tail into `buf`. Lossy UTF-8 — a split multibyte must never
+/// panic the writer.
+fn absorb_complete_lines(buf: &mut String, bytes: &[u8]) -> Vec<String> {
+    buf.push_str(&String::from_utf8_lossy(bytes));
+    let mut out = Vec::new();
+    while let Some(idx) = buf.find('\n') {
+        let line: String = buf.drain(..=idx).collect();
+        out.push(line.trim_end_matches(['\r', '\n']).to_string());
+    }
+    if buf.len() > RING_PARTIAL_MAX_BYTES {
+        buf.clear();
+    }
+    out
+}
+
+/// Crash-report dump: write `logs/crash-YYYYMMDD-HHMMSS.log` containing
+/// the panic message + the RAM ring tail (the last verbose log lines), so
+/// a crash is readable without opening the full session log. Best-effort:
+/// failures are swallowed (`%TEMP%\wupi_panic.txt`, written by lib.rs's
+/// hook, is the independent backstop with the full backtrace).
 pub fn dump_crash(panic_info: &str) {
-    let Some(guard) = DIAG.get() else { return };
-    let mut w = match guard.lock() {
+    let Some(guard) = CRASH.get() else { return };
+    let w = match guard.lock() {
         Ok(g) => g,
         Err(poisoned) => poisoned.into_inner(),
     };
     let stamp = Local::now().format("%Y%m%d-%H%M%S").to_string();
-    let path = unique_prefixed_path(&w.dir, "crash", &stamp);
+    let name = unique_prefixed_name(&w.dir, "crash", &stamp);
     let mut body = format!(
-        "==== WUPI v{} CRASH {} ====\npanic: {}\nfull backtrace: %TEMP%\\wupi_panic.txt\n\n---- last {} diagnostic lines (RAM ring buffer) ----\n",
+        "==== WUPI v{} CRASH {} ====\npanic: {}\nfull backtrace: %TEMP%\\wupi_panic.txt\nfull session log: logs\\wupi-*.log (this boot) + %TEMP%\\wupi.log\n\n---- last {} verbose log lines (RAM ring buffer) ----\n",
         env!("CARGO_PKG_VERSION"),
         Local::now().format("%Y-%m-%d %H:%M:%S%.3f"),
         one_line_capped(panic_info),
@@ -173,110 +239,56 @@ pub fn dump_crash(panic_info: &str) {
         body.push_str(line);
         body.push('\n');
     }
-    let _ = std::fs::write(&path, body);
-    let name = path
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_default();
-    emit(
-        &mut w,
-        "SYS",
-        &format!("CRASH REPORT written: {name} ({})", one_line_capped(panic_info)),
-    );
+    let _ = std::fs::write(w.dir.join(name), body);
 }
 
-/// Raw emit while the mutex is held — NEVER call [`log`] from inside here
-/// (std Mutex is non-reentrant; this helper exists to keep rotation +
-/// crash dumps safe). The ring is updated even when `dead` (disk refused
-/// writes) so the crash tail survives a mid-session disk failure.
-fn emit(w: &mut DiagWriter, cat: &str, msg: &str) {
-    let body = format!(
-        "{} [{}] {}",
-        Local::now().format("%Y-%m-%d %H:%M:%S%.3f"),
-        cat,
-        one_line_capped(msg)
-    );
-    w.ring.push_back(body.clone());
-    while w.ring.len() > DIAG_RING_LINES {
-        w.ring.pop_front();
-    }
-    if w.dead {
-        return;
-    }
-    let mut file_line = body;
-    file_line.push('\n');
-    if let Some(writer) = w.writer.as_mut() {
-        if writer.write_all(file_line.as_bytes()).is_err() || writer.flush().is_err() {
-            w.dead = true;
-            return;
-        }
-    }
-    w.written = w.written.saturating_add(file_line.len() as u64);
-    if w.written >= DIAG_MAX_FILE_BYTES {
-        rotate_active(w);
-    }
-}
-
-fn rotate_active(w: &mut DiagWriter) {
-    if let Some(mut old) = w.writer.take() {
-        let _ = old.flush();
-    }
-    let current = w.dir.join(DIAG_CURRENT_NAME);
-    rotate_closed_file(&current, Some(SystemTime::now()));
-    w.written = 0;
-    match OpenOptions::new()
-        .create(true)
-        .truncate(true)
-        .write(true)
-        .open(&current)
-    {
-        Ok(f) => {
-            w.writer = Some(BufWriter::new(f));
-            let kb = DIAG_MAX_FILE_BYTES / 1024;
-            emit(
-                w,
-                "SYS",
-                &format!("size rotation at ~{kb} KiB — continuing in a fresh {DIAG_CURRENT_NAME}"),
-            );
-        }
-        Err(_) => {
-            w.dead = true;
-        }
-    }
-}
-
-fn stamp_for(mtime: Option<SystemTime>) -> String {
-    match mtime {
-        Some(st) => chrono::DateTime::<Local>::from(st)
-            .format("%Y%m%d-%H%M%S")
-            .to_string(),
-        None => Local::now().format("%Y%m%d-%H%M%S").to_string(),
-    }
-}
-
-fn unique_prefixed_path(dir: &Path, prefix: &str, stamp: &str) -> PathBuf {
-    let mut candidate = dir.join(format!("{prefix}-{stamp}.log"));
+fn unique_prefixed_name(dir: &Path, prefix: &str, stamp: &str) -> String {
+    let mut candidate = format!("{prefix}-{stamp}.log");
     let mut n = 2u32;
-    while candidate.exists() {
-        candidate = dir.join(format!("{prefix}-{stamp}-{n}.log"));
+    while dir.join(&candidate).exists() {
+        candidate = format!("{prefix}-{stamp}-{n}.log");
         n += 1;
     }
     candidate
 }
 
-fn rotate_closed_file(path: &Path, mtime: Option<SystemTime>) {
-    let Some(dir) = path.parent() else { return };
-    let stamp = stamp_for(mtime);
-    let target = unique_prefixed_path(dir, "diagnostics", &stamp);
-    let _ = std::fs::rename(path, target);
+/// True only for a name THIS module minted: `{prefix}YYYYMMDD-HHMMSS.log`
+/// or `{prefix}YYYYMMDD-HHMMSS-N.log` where `prefix` carries its own
+/// trailing dash ("wupi-", "crash-"; the unique suffix comes from
+/// [`unique_prefixed_name`]). The bare `wupi-*.log` glob also swept
+/// user-kept files like `wupi-notes.log` — the prune must match the minted
+/// shape exactly.
+fn is_minted_log_name(name: &str, prefix: &str) -> bool {
+    // `prefix` carries its own trailing dash ("wupi-", "crash-").
+    let Some(rest) = name.strip_prefix(prefix) else {
+        return false;
+    };
+    let Some(stem) = rest.strip_suffix(".log") else {
+        return false;
+    };
+    // Positional: the 15-char YYYYMMDD-HHMMSS stamp at the head, then either
+    // end-of-name or "-N" (the unique suffix). A split-based parse can't
+    // work — the stamp itself contains the dash.
+    let b = stem.as_bytes();
+    if b.len() < 15 || b[8] != b'-' {
+        return false;
+    }
+    if !b[..8].iter().all(|c| c.is_ascii_digit()) {
+        return false;
+    }
+    if !b[9..15].iter().all(|c| c.is_ascii_digit()) {
+        return false;
+    }
+    let tail = &b[15..];
+    tail.is_empty() || (tail[0] == b'-' && tail.len() > 1 && tail[1..].iter().all(|c| c.is_ascii_digit()))
 }
 
-fn prune_prefixed(dir: &Path, prefix: &str, keep: usize) {
+fn prune_minted(dir: &Path, prefix: &str, keep: usize) {
     let Ok(entries) = std::fs::read_dir(dir) else { return };
     let mut names: Vec<String> = entries
         .flatten()
         .filter_map(|e| e.file_name().into_string().ok())
-        .filter(|n| n.starts_with(prefix) && n.ends_with(".log"))
+        .filter(|n| is_minted_log_name(n, prefix))
         .collect();
     if names.len() <= keep {
         return;
@@ -286,71 +298,20 @@ fn prune_prefixed(dir: &Path, prefix: &str, keep: usize) {
     for name in names.into_iter().take(excess) {
         let _ = std::fs::remove_file(dir.join(name));
     }
-    log(
-        "SYS",
-        &format!("pruned {excess} old log(s) matching {prefix}* (keep {keep})"),
-    );
 }
 
-fn write_readme_if_missing(dir: &Path) {
-    let readme = dir.join("README.txt");
-    if readme.exists() {
-        return;
-    }
-    let _ = std::fs::write(&readme, README_TEXT);
-}
-
-const README_TEXT: &str = "\
-WUPI diagnostic logs
-====================
-diagnostics.log                 - the CURRENT session
-diagnostics-YYYYMMDD-HHMMSS.log - previous sessions (newest 20 kept)
-crash-YYYYMMDD-HHMMSS.log       - crash reports: the panic + the last 100
-                                  diagnostic lines (RAM ring buffer), newest
-                                  10 kept
-
-Safe to attach to bug reports: these logs deliberately contain no message
-prose, prompts, or card/character text. Free text appears only as short
-(~48 char) previews; everything else is lengths, scores (cosine / BM25 /
-RRF), dice, timings, ids, and state transitions - enough to see how the
-memory, tracker, and schema systems behaved without seeing what you wrote.
-
-For a crash, attach BOTH the newest crash-*.log (instant summary) and
-diagnostics.log (full session) if you can.
-";
-
-/// Redacted preview of free text: collapses whitespace, caps at `cap` CHARS
-/// (CJK-safe), and appends the true length so magnitude survives redaction.
-pub fn brief_with(s: &str, cap: usize) -> String {
-    let collapsed = s.split_whitespace().collect::<Vec<&str>>().join(" ");
-    let n = collapsed.chars().count();
-    if n == 0 {
-        return "(empty)".to_string();
-    }
-    if n <= cap {
-        return format!("\"{collapsed}\"");
-    }
-    let head: String = collapsed.chars().take(cap).collect();
-    format!("\"{head}\u{2026}\"(+{n}c)")
-}
-
-/// [`brief_with`] at the default [`DIAG_SCRUB_MAX_CHARS`] budget.
-pub fn brief(s: &str) -> String {
-    brief_with(s, DIAG_SCRUB_MAX_CHARS)
-}
-
-/// Flatten to one line (control chars -> space) and hard-cap so no caller
-/// can smuggle a prose wall or forge log lines via newlines.
+/// Flatten to one line (control chars -> space) and hard-cap so the panic
+/// header can't become a prose wall or forge extra log lines.
 fn one_line_capped(msg: &str) -> String {
     let flat: String = msg
         .chars()
         .map(|c| if c.is_control() { ' ' } else { c })
         .collect();
     let n = flat.chars().count();
-    if n <= DIAG_LINE_MAX_CHARS {
+    if n <= CRASH_LINE_MAX_CHARS {
         return flat;
     }
-    let head: String = flat.chars().take(DIAG_LINE_MAX_CHARS).collect();
+    let head: String = flat.chars().take(CRASH_LINE_MAX_CHARS).collect();
     format!("{head}\u{2026}(+{n}c)")
 }
 
@@ -359,14 +320,21 @@ mod tests {
     use super::*;
 
     #[test]
-    fn brief_collapses_and_caps() {
-        assert_eq!(brief("a"), "\"a\"");
-        assert_eq!(brief("  a\n b  "), "\"a b\"");
-        assert_eq!(brief(""), "(empty)");
-        let long = "x".repeat(200);
-        let b = brief(&long);
-        assert!(b.starts_with('\"') && b.contains("(+200c)"));
-        assert!(b.chars().count() < 80);
+    fn absorb_splits_and_keeps_partial() {
+        let mut buf = String::new();
+        assert!(absorb_complete_lines(&mut buf, b"hel").is_empty());
+        let lines = absorb_complete_lines(&mut buf, b"lo\r\nworld\n");
+        assert_eq!(lines, vec!["hello".to_string(), "world".to_string()]);
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn absorb_is_lossy_on_split_multibyte() {
+        let mut buf = String::new();
+        // "é" is C3 A9 — feed the first byte alone, then the rest + newline.
+        assert!(absorb_complete_lines(&mut buf, &[0xC3]).is_empty());
+        let lines = absorb_complete_lines(&mut buf, &[0xA9, b'\n']);
+        assert_eq!(lines.len(), 1);
     }
 
     #[test]
@@ -376,10 +344,51 @@ mod tests {
     }
 
     #[test]
-    fn disabled_log_is_noop() {
-        // Never initialized in tests -> DIAG unset -> must not panic.
-        if !is_on() {
-            log("TEST", "hello");
+    fn minted_shape_filter_accepts_only_own_names() {
+        for good in [
+            "wupi-20260819-143005.log",
+            "wupi-20260819-143005-2.log",
+            "crash-20260819-143005.log",
+            "crash-20260819-143005-12.log",
+        ] {
+            let prefix = if good.starts_with("crash-") { "crash-" } else { "wupi-" };
+            assert!(is_minted_log_name(good, prefix), "should match: {good}");
         }
+        for bad in [
+            "wupi-notes.log",
+            "wupi-.log",
+            "wupi-20260819.log",
+            "wupi-20260819-1430.log",
+            "wupi-2026AB19-143005.log",
+            "wupi-20260819-143005-.log",
+            "wupi-20260819-143005-x.log",
+            "crash-20260819-143005.txt",
+        ] {
+            assert!(!is_minted_log_name(bad, "wupi-"), "should NOT match: {bad}");
+        }
+        // A wupi- name checked against the crash prefix must not match either.
+        assert!(!is_minted_log_name("crash-20260819-143005.log", "wupi-"));
+    }
+
+    #[test]
+    fn dump_crash_writes_panic_plus_ring() {
+        let dir = std::env::temp_dir().join(format!("wupi_logs_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        init(&dir);
+        ring_extend(vec!["line-1".into(), "line-2".into()]);
+        dump_crash("boom: test panic\nsecond line");
+        let mut found = Vec::new();
+        for e in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+            let name = e.file_name().to_string_lossy().into_owned();
+            if name.starts_with("crash-") && name.ends_with(".log") {
+                found.push((name, std::fs::read_to_string(e.path()).unwrap_or_default()));
+            }
+        }
+        assert_eq!(found.len(), 1);
+        let (_, body) = found.remove(0);
+        assert!(body.contains("panic: "));
+        assert!(body.contains("boom: test panic second line"));
+        assert!(body.contains("line-2"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
