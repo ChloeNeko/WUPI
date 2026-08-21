@@ -1,6 +1,6 @@
 [package]
 name = "wupi-updater"
-version = "0.27.2"
+version = "0.27.3"
 edition = "2021"
 # Kept in lockstep with src-tauri/Cargo.toml + tauri.conf.json by release.cjs's
 # version-sync step. The updater's own version is not user-facing (wupi.exe's
@@ -20,9 +20,6 @@ zip = "2"
 # neither staged nor copied). Same crate zip itself hashes with — already in
 # the lockfile via zip, so this adds no new graph edges.
 crc32fast = "1"
-# Serialize the result marker written for the relaunched wupi.exe to read on
-# next boot (`<install>/data/_update_result.json`).
-serde_json = "1"
 
 [target.'cfg(windows)'.dependencies]
 # Win32 process wait: OpenProcess + WaitForSingleObject to block until the

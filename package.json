@@ -1,6 +1,6 @@
 {
   "name": "wupi",
-  "version": "0.27.2",
+  "version": "0.27.3",
   "private": true,
   "type": "module",
   "scripts": {
@@ -11,6 +11,7 @@
     "tauri": "tauri",
     "check": "node scripts/cargo-check.cjs",
     "release": "node scripts/release.cjs",
+    "build:exe": "node scripts/build-exe.cjs",
     "sd:dev": "tauri dev -f diffusion-rs > logs/sd-out.log 2>&1",
     "sd:check": "cd src-tauri && cargo check --lib --no-default-features --features diffusion-rs",
     "sd:abort": "node scripts/sd-read-abort.cjs"
