@@ -1,6 +1,6 @@
 [package]
 name = "wupi-updater"
-version = "0.28.1"
+version = "0.28.2"
 edition = "2021"
 # Kept in lockstep with src-tauri/Cargo.toml + tauri.conf.json by release.cjs's
 # version-sync step. The updater's own version is not user-facing (wupi.exe's
@@ -25,10 +25,15 @@ crc32fast = "1"
 # Win32 process wait: OpenProcess + WaitForSingleObject to block until the
 # spawning wupi.exe has fully exited + released its OS file locks (so the
 # overwrite of wupi.exe + bin/*.dll succeeds). Official Microsoft crate,
-# version aligned with src-tauri's. Feature-gated to the two APIs we touch.
+# version aligned with src-tauri's. Feature-gated to the APIs we touch:
+# Threading for the parent wait, ToolHelp for the relaunch ladder's takeover
+# attribution (main.rs any_wupi_process_alive — a vanished result marker is
+# attributed to the USER only when a wupi.exe/fable.exe is actually alive;
+# otherwise it was our own deceased child and the ladder retries).
 windows = { version = "0.58", features = [
     "Win32_Foundation",
     "Win32_System_Threading",
+    "Win32_System_Diagnostics_ToolHelp",
 ] }
 
 [dev-dependencies]
