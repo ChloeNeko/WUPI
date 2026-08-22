@@ -221,6 +221,16 @@ pub const PRISM_HIRES_ESRGAN_FILE: &str = "esrgan.pth";
 pub const PRISM_DEFAULT_WIDTH: i32 = 832;
 pub const PRISM_DEFAULT_HEIGHT: i32 = 1216;
 
+/// Hard ceiling for any render dimension (2026-08-20 audit P2-4). The floor
+/// (64) already existed; the ceiling did not — a hand-edited gallery row
+/// (Fork passes dims verbatim) or a crafted IPC payload with huge values
+/// sailed straight into the ggml allocator → OOM → the one-strike latch
+/// (ALL generation dead until acked), and the hires `×1.5` cast in
+/// `generate` wraps `i32` past ~1.43e9. 2048 is the practical SDXL ceiling:
+/// the composer's presets top out at ~1.0 MP and 2048×2048 (4 MP base,
+/// ~9 MP after the ×1.5 hires) is already deep stretch on 12 GB.
+pub const PRISM_DIM_MAX: i32 = 2048;
+
 /// The result of a successful generation. The caller (the done-beat spawn)
 /// emits this as a `{type:"image", url}` channel event so the frontend can
 /// display it. `bytes` is the raw PNG; the caller may write it to `dest`
@@ -860,6 +870,80 @@ fn is_gguf_unet(path: &std::path::Path) -> bool {
     }
 }
 
+/// (2026-08-20 audit P2-3) Structural integrity check for the optional
+/// ESRGAN hires scaffold. A present-but-truncated `esrgan.pth` (interrupted
+/// overlay download, disk-full, bad manual copy) used to reach the loader,
+/// fail the WHOLE render, and trip the one-strike latch — all generation
+/// dead until acked — when the documented contract is "a miss is non-fatal,
+/// LANCZOS fallback". torch serializes modern `.pth` weights as ZIP
+/// archives, so: prove the file is at least plausibly sized, and when it
+/// carries the ZIP magic, prove the End-of-Central-Directory record parses
+/// and points inside the file (any truncation breaks one of the two). A
+/// non-ZIP file (legacy pre-1.6 torch pickle, a foreign re-pack) passes on
+/// the size floor alone — we only reject what we can PROVE broken, never
+/// downgrade a working scaffold on a format guess.
+fn esrgan_file_intact(path: &std::path::Path) -> bool {
+    use std::io::{Read, Seek, SeekFrom};
+    // The real model is ~18 MB; anything under 1 MB is not a partial
+    // RealESRGAN, it's wreckage.
+    const MIN_PLAUSIBLE_BYTES: u64 = 1024 * 1024;
+    let Ok(meta) = std::fs::metadata(path) else {
+        return false;
+    };
+    let len = meta.len();
+    if len < MIN_PLAUSIBLE_BYTES {
+        tracing::warn!(
+            file = %path.display(),
+            bytes = len,
+            "esrgan scaffold implausibly small — treating as corrupt, using the LANCZOS fallback (delete models/sd/esrgan.pth to re-fetch it on the next boot overlay)"
+        );
+        return false;
+    }
+    let Ok(mut f) = std::fs::File::open(path) else {
+        return false;
+    };
+    let mut magic = [0u8; 4];
+    if f.read_exact(&mut magic).is_err() {
+        return false;
+    }
+    if &magic != b"PK\x03\x04" {
+        // Not ZIP-serialized — legacy pickle format; the size floor already
+        // caught the common truncation class, and we don't guess further.
+        return true;
+    }
+    // EOCD hunt: the fixed record is 22 bytes and the ZIP comment that may
+    // follow it is capped at 65_535, so the record lives in the last
+    // 65_535 + 22 bytes of the file.
+    let tail_len = len.min(65_557);
+    if f.seek(SeekFrom::Start(len - tail_len)).is_err() {
+        return false;
+    }
+    let mut tail = vec![0u8; tail_len as usize];
+    if f.read_exact(&mut tail).is_err() {
+        return false;
+    }
+    let eocd = tail
+        .windows(4)
+        .rposition(|w| w == [0x50, 0x4b, 0x05, 0x06])
+        .filter(|&pos| tail.len() - pos >= 22)
+        .and_then(|pos| {
+            let cd_size = u32::from_le_bytes(tail[pos + 12..pos + 16].try_into().ok()?) as u64;
+            let cd_offset = u32::from_le_bytes(tail[pos + 16..pos + 20].try_into().ok()?) as u64;
+            Some((cd_size, cd_offset))
+        });
+    let intact = eocd
+        .map(|(cd_size, cd_offset)| cd_offset.saturating_add(cd_size) <= len)
+        .unwrap_or(false);
+    if !intact {
+        tracing::warn!(
+            file = %path.display(),
+            bytes = len,
+            "esrgan scaffold failed the zip integrity check (truncated download?) — using the LANCZOS fallback (delete models/sd/esrgan.pth to re-fetch it on the next boot overlay)"
+        );
+    }
+    intact
+}
+
 /// Detect whether a GGUF carries a FULL checkpoint (embedded CLIP text
 /// encoders + VAE) vs a bare ComfyUI-convention UNet. True iff the byte
 /// pattern `first_stage_model` (the VAE tensor-name prefix — present in every
@@ -1186,12 +1270,16 @@ impl SceneImageGenerator for DiffusionRsGenerator {
         // fills a real `sd_hires_params_t` (own scale/target/steps/denoise)
         // into the single gen_img call, and generate_image loads the MODEL
         // upscaler itself from `model_path` — no separate upscaler ctx.
-        // Missing ESRGAN file → LANCZOS pixel upscale (zero-download
-        // fallback; the refine pass still runs, slightly softer scaffold).
+        // Missing OR CORRUPT ESRGAN file → LANCZOS pixel upscale
+        // (zero-download fallback; the refine pass still runs, slightly
+        // softer scaffold). Presence alone isn't enough (2026-08-20 audit
+        // P2-3): a truncated file used to fail the whole render + trip the
+        // one-strike latch.
         let esrgan_path = model_path
             .parent()
             .map(|dir| dir.join(PRISM_HIRES_ESRGAN_FILE))
-            .filter(|p| p.is_file());
+            .filter(|p| p.is_file())
+            .filter(|p| esrgan_file_intact(p));
         let hires_params = diffusion_rs::api::HiresParamsBuilder::default()
             .width((request.width as f32 * PRISM_HIRES_SCALE).round() as i32)
             .height((request.height as f32 * PRISM_HIRES_SCALE).round() as i32)
@@ -1219,7 +1307,7 @@ impl SceneImageGenerator for DiffusionRsGenerator {
             None => {
                 tracing::warn!(
                     file = PRISM_HIRES_ESRGAN_FILE,
-                    "prism hires refine: ESRGAN model missing in models/sd/ — falling back to the LANCZOS upscaler (refine pass still runs; drop the file in for the sharper scaffold)",
+                    "prism hires refine: ESRGAN scaffold absent or failed the integrity check — falling back to the LANCZOS upscaler (refine pass still runs; re-fetch the file via the boot overlay for the sharper scaffold)",
                 );
                 mb.hires_params(
                     diffusion_rs::api::Upscaler::SD_HIRES_UPSCALER_LANCZOS,
@@ -1315,6 +1403,11 @@ pub enum SwapOutcome {
     Skipped,
     /// The swap was cancelled (the user navigated away / ended the game /
     /// the cancel token fired mid-cycle). The orchestrator cleaned up.
+    /// (2026-08-20 P3) Currently NEVER CONSTRUCTED: the dead `active_sd_cancel`
+    /// slot + its always-false check were removed — mid-render cancel is by
+    /// design unsupported (the ggml render holds the turn lock; exiting
+    /// waits for the cycle). The variant stays as the contract for a future
+    /// real cancel slot.
     Cancelled,
     /// Generation failed (OOM, corrupt model, backend error). The one-strike
     /// latch is now tripped; auto-gen is disabled until the user re-enables

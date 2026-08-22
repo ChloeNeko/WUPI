@@ -53,7 +53,13 @@ export function getDevSchema() {
 }
 
 const DEV_SCHEMA = {
-  world_clock: { current_minutes: 540, last_tick_minutes: 540, day_label: 'Day 1' },
+  // (2026-08-20 P3) `day_label: 'Day 1'` REMOVED: a phantom field (WorldClock
+  // carries only current_minutes/last_tick_minutes on the wire) holding the
+  // app-wide-banned "Day N" string. The date lives in the top-level
+  // `calendar` label, which the mock now carries so the calendar click-card
+  // renders realistically in preview.
+  calendar: 'March 15',
+  world_clock: { current_minutes: 540, last_tick_minutes: 540 },
   weather: { condition: 'Rain, cold' },
   travel_graph: {
     current_node: 'rusty_tavern',

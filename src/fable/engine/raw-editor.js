@@ -35,12 +35,26 @@ import * as narrator from './narrator.js';
 
 // kind → { title, isXml, read(), save(text) }. The read/save pair selects the
 // matching backend IPC. `isXml` chooses the client-side pre-check (XML sniff
-// for the .sim tab; JSON.parse otherwise).
+// for the .sim/.player tabs; JSON.parse otherwise).
+// (2026-08-21, Chloe) The PLAYER tab edits the identity file — the attached
+// SavedPlayer's .player XML (fable_player_raw_get/set, same parse-gated path
+// as the player-picker's editor) — NOT the per-card player.json gameplay
+// state. The attached id is resolved at read time and stashed for save.
+let playerRawId = null;
 const FILE_FOR = {
   card:   { title: 'Sim Card (.sim)',   isXml: true,  read: () => invoke('fable_card_raw_get'), save: (t) => invoke('fable_card_raw_set', { xml: t }) },
   codex:  { title: 'Codex (.codex)',     isXml: false, read: async () => (await invoke('fable_codex_get')).raw, save: (t) => invoke('fable_codex_raw_set', { text: t }) },
   world:  { title: 'World (world.json)', isXml: false, read: () => invoke('fable_json_raw_get', { kind: 'world' }),  save: (t) => invoke('fable_json_raw_set', { kind: 'world',  json: t }) },
-  player: { title: 'Player (player.json)', isXml: false, read: () => invoke('fable_json_raw_get', { kind: 'player' }), save: (t) => invoke('fable_json_raw_set', { kind: 'player', json: t }) },
+  player: {
+    title: 'Player (.player)', isXml: true,
+    read: async () => {
+      const p = await invoke('fable_active_player_get');
+      if (!p || !p.id) throw new Error('No player attached to this game.');
+      playerRawId = p.id;
+      return invoke('fable_player_raw_get', { id: playerRawId });
+    },
+    save: (t) => invoke('fable_player_raw_set', { id: playerRawId, xml: t }),
+  },
   npc:    { title: 'NPC (npc.json)',     isXml: false, read: () => invoke('fable_json_raw_get', { kind: 'npc' }),     save: (t) => invoke('fable_json_raw_set', { kind: 'npc',     json: t }) },
 };
 

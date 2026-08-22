@@ -221,6 +221,13 @@ pub struct SavedPlayer {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub inventory: Option<PlayerInventory>,
 
+    /// (2026-08-20 Economy) The `<properties>` sibling twin — authored
+    /// player-owned property seeds (pipe-kv lines, parsed by
+    /// `economy::parse_property_lines`). Seeded with
+    /// `Owner::Player` on FRESH runs at attach. Optional in full.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub properties: Option<Vec<crate::economy::AuthoredProperty>>,
+
     /// Absolute portrait path, resolved at load (the file is the namesake
     /// `<Name>.<ext>` sibling in the player folder — presence is a stat
     /// fact). None when no portrait was uploaded.
@@ -649,6 +656,7 @@ pub fn parse_player_xml(xml: &str) -> anyhow::Result<SavedPlayer> {
         custom_tags: None,
         persona: None,
         inventory: None,
+        properties: None,
         portrait: None,
         created_at_ms: 0,
     };
@@ -792,6 +800,16 @@ pub fn parse_player_xml(xml: &str) -> anyhow::Result<SavedPlayer> {
         }
     }
 
+    // (2026-08-20 Economy) <properties> sibling (outside </player>) — the
+    // player's authored property seeds, seeded Player-owned on fresh runs.
+    let props_text = crate::sim_card::sibling_text(tail, &["properties"]).unwrap_or_default();
+    if !props_text.trim().is_empty() {
+        let props = crate::economy::parse_property_lines(&props_text);
+        if !props.is_empty() {
+            p.properties = Some(props);
+        }
+    }
+
     Ok(p)
 }
 
@@ -897,6 +915,16 @@ pub fn render_player_xml(p: &SavedPlayer) -> String {
             body.push_str(&format!("Stored: {}\n", inv.stored.join(", ")));
         }
         xml.push_str(&format!("\n<inventory><![CDATA[\n{}]]></inventory>\n", cdata_body(&body)));
+    }
+
+    // (2026-08-20 Economy) The <properties> sibling twin — omitted entirely
+    // when empty (the inventory rule).
+    if let Some(props) = p.properties.as_ref().filter(|v| !v.is_empty()) {
+        let body = crate::economy::render_property_lines(props);
+        xml.push_str(&format!(
+            "\n<properties><![CDATA[\n{}]]></properties>\n",
+            cdata_body(&body)
+        ));
     }
 
     xml
@@ -1084,6 +1112,7 @@ mod tests {
             custom_tags: None,
             persona: None,
             inventory: None,
+            properties: None,
             portrait: None,
             created_at_ms: 0,
         }
@@ -1418,6 +1447,32 @@ Clothing: White Cropped Tee, Gray Denim Shorts, White Knee-High Socks, White Sne
             back.inventory.as_ref().unwrap().clothing,
             sp.inventory.as_ref().unwrap().clothing
         );
+    }
+
+    #[test]
+    fn player_xml_properties_sibling_round_trips() {
+        // (2026-08-20 Economy) The <properties> sibling twin — parses,
+        // round-trips, and omits entirely when empty.
+        let mut sp = p("Kira");
+        sp.properties = Some(vec![
+            crate::economy::AuthoredProperty {
+                id: "farm".into(),
+                node: "mill-road".into(),
+                kind: "estate".into(),
+                owner: None,
+                revenue: 3,
+                upkeep: 1,
+                price: Some(120),
+            },
+        ]);
+        let xml = render_player_xml(&sp);
+        assert!(xml.contains("<properties>"), "emitted: {xml}");
+        assert!(xml.contains("id: farm | node: mill-road"), "{xml}");
+        let back = parse_player_xml(&xml).expect("round-trip parses");
+        assert_eq!(back.properties, sp.properties);
+        // Empty → no sibling on disk.
+        let bare = render_player_xml(&p("Naked"));
+        assert!(!bare.contains("<properties>"));
     }
 
     #[test]

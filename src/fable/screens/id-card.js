@@ -155,10 +155,32 @@ export function wireIdCard(root) {
   const card = root && root.querySelector('.fable-id-card');
   if (!card) return;
   balanceHeadText(card.querySelector('.fable-id-card-head-text'));
+  wireScrollFades(card);
   const btn = card.querySelector('[data-id-expand]');
   const tpl = card.querySelector('template[data-id-extra]');
   if (!btn || !tpl) return;
   btn.addEventListener('click', () => openIdDetails(card, btn, tpl.innerHTML));
+}
+
+// World/scenario core values (Setting/Purpose/Tone) cap at 4.5 lines + scroll
+// with no visible scrollbar (CSS). The bottom fade mounts ONLY while text
+// actually remains below (2026-08-20 Chloe — the faded half-tops at the
+// bottom are the more-below hint, and it clears once you reach the end).
+function wireScrollFades(card) {
+  // The --world modifier sits on the card ROOT (renderIdCard), so a
+  // descendant selector can never match it — guard + query from the card.
+  if (!card.classList.contains('fable-id-card--world')) return;
+  card.querySelectorAll('.fable-id-card-core dd').forEach((dd) => {
+    if (dd.dataset.fadeWired) return;
+    dd.dataset.fadeWired = '1';
+    const refresh = () => {
+      const overflowing = dd.scrollHeight > dd.clientHeight + 1;
+      const atEnd = dd.scrollTop + dd.clientHeight >= dd.scrollHeight - 1;
+      dd.classList.toggle('is-overflow', overflowing && !atEnd);
+    };
+    dd.addEventListener('scroll', refresh, { passive: true });
+    refresh();
+  });
 }
 
 // Balance a wrapped header so the FIRST line is always shorter than the
@@ -232,10 +254,14 @@ function openIdDetails(card, btn, sectionsHtml) {
   // interrupted, so a plain replace is enough.
   mount.querySelectorAll('[data-id-details]').forEach((el) => el.remove());
 
-  // Popup title: the card's Name (first core value); generic fallback when
-  // the card has no fields.
+  // Popup title: the card's NAME — the header text (2026-08-20 Chloe; the old
+  // first-core-value fallback read RACE on NPC/player faces and the Setting
+  // prose on world faces). balanceHeadText keeps the original string in
+  // data-head-text; the first core dd is only the headless-card fallback.
+  const headEl = card.querySelector('.fable-id-card-head-text');
   const nameEl = card.querySelector('.fable-id-card-core dd');
-  const title = (nameEl && nameEl.textContent || '').trim() || 'Card Details';
+  const title = ((headEl && (headEl.dataset.headText || headEl.textContent))
+    || (nameEl && nameEl.textContent) || '').trim() || 'Card Details';
 
   const overlay = document.createElement('div');
   overlay.className = 'fable-id-details-overlay';

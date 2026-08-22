@@ -29,7 +29,7 @@
 //              card is preset, so the player step launches straight into the
 //              world (flowAfterPlayer — no SIM pair, no Codex pair).
 //   Continue → resume the freshest save (resumeSave).
-//   Load     → two-level picker: worlds.js → saves.js → resume.
+//   Load     → two-level picker: worlds.js → saves popup → resume.
 // The working stage + gameplay engine (stage.js, engine/*, fx/*, panels/*)
 // are the destination of every flow.
 // =============================================================
@@ -52,7 +52,7 @@ import { extractLorebookEntries } from './engine/creator-engine.js';
 import { playBurnTransition, playReverseSpawn } from './engine/burn-transition.js';
 import { tileCaptionHTML } from './engine/tile-caption.js';
 import { buildWorlds, renderWorlds } from './screens/worlds.js';
-import { buildSaves, renderSaves } from './screens/saves.js';
+import { openSavesModal } from './screens/saves.js';
 import {
   startThemeMusic, stopThemeMusic, fadeOutThemeMusic,
   pauseThemeMusic, resumeThemeMusic,
@@ -350,7 +350,8 @@ let engineStarted = false;
 // target carries both card_id + save_id, so this is a one-shot resume.
 //
 // LOAD: a two-level picker — choose a world (screens/worlds.js), then choose
-// a save in that world (screens/saves.js). Both feed into resumeSave.
+// a save in that world via the centered saves POPUP (screens/saves.js — the
+// screen page is retired, 2026-08-20). Both feed into resumeSave.
 //
 // NEW GAME: reveals the cinematic creator flow shell — background + music +
 // the ‹ / ⌂ flow-chrome buttons (see onNewGameClicked / revealNewGameShell),
@@ -413,6 +414,22 @@ async function resumeSave(cardId, saveId, opts = {}) {
     return;
   }
 
+  // (2026-08-21, Chloe) The title-Continue path re-gained its black cinematic:
+  // the fade was removed from enterStageViaTransition wholesale, so Continue
+  // opened the stage with an instant jump. `viaTransition` wraps the stage
+  // entry in the SAME 2s fade-to-black → swap → 2s reveal New Game uses (the
+  // swap at peak black also hides the ambient teardown, so the grass keeps
+  // animating until the moment the stage appears).
+  if (opts && opts.viaTransition) {
+    playMagicalTransition({
+      blackHoldMs: 1150,
+      onMidpoint: () => enterStageViaTransition(openingScene, loadMessages, opts),
+    }).catch((e) => {
+      console.error('[fable] Continue transition failed, jumping to the stage', e);
+      enterStageViaTransition(openingScene, loadMessages, opts);
+    });
+    return;
+  }
   enterStageViaTransition(openingScene, loadMessages, opts);
 }
 
@@ -427,8 +444,9 @@ function onContinueClicked() {
     return;
   }
   // resumeSave sets the busy flag itself (it's also called from the saves
-  // screen); no separate wrap needed here.
-  resumeSave(target.card_id, target.save_id);
+  // screen); no separate wrap needed here. `viaTransition` gives the
+  // title-Continue entry the same black cinematic as New Game (2026-08-21).
+  resumeSave(target.card_id, target.save_id, { viaTransition: true });
 }
 
 // LOAD button handler: show the world picker (the "Load Game" grid) +
@@ -446,9 +464,11 @@ function onContinueClicked() {
 // playMagicalTransition — that double-fades; see title.js).
 function onLoadClicked() {
   withFlowBusy(() => {
-    // Stop the title ambient (grass + particles) at click so the dim falls over
-    // a static frame (matches New Game).
-    if (screens.title && screens.title._stopAmbient) screens.title._stopAmbient();
+    // (2026-08-21, Chloe) NOTE: the title ambient (grass + particles) is NOT
+    // stopped here — showScreen('worlds') at the transition midpoint stops it
+    // under full black, exactly like New Game (stopping at click killed the
+    // grass instantly under a still-visible title — the same regression
+    // onNewGameClicked's comment documents).
     // Fade the title theme out — the Load menu gets the SAME newgame.mp3 +
     // fire.mp3 ambience as New Game (Chloe 2026-08-05). The pair fades in at
     // the transition midpoint, mirroring onNewGameClicked.
@@ -529,10 +549,16 @@ function beginNewGameFromCard(card) {
   });
 }
 
-// RESUME from the Load menu → the saves list for this card.
+// RESUME from the Load menu → the centered saves POPUP over the card modal
+// (2026-08-20 Chloe: the saves screen page is retired — LOAD never navigates
+// away; the card modal re-emerges when the popup closes). Selecting a save
+// feeds resumeSave exactly as before.
 function openWorldSaves(card) {
-  showScreen('saves');
-  renderSaves(screens.saves, card.id, (save) => resumeSave(card.id, save.save_id), card.name);
+  openSavesModal(screens.worlds, {
+    cardId: card.id,
+    cardName: card.name,
+    onSelect: (save) => resumeSave(card.id, save.save_id),
+  });
 }
 
 // EDIT from the Load menu → a centered raw-XML editor modal over the worlds
@@ -2143,7 +2169,8 @@ export function initFable(extHooks = {}) {
     // CONTINUE: resume the freshest New Game save (autosave-inclusive).
     // Target stashed by title._refreshTitleGate.
     continue: () => onContinueClicked(),
-    // LOAD: two-level picker — worlds screen → saves screen → resumeSave.
+    // LOAD: two-level picker — worlds screen → card modal → saves popup →
+    // resumeSave (the saves screen page is retired, 2026-08-20).
     load: () => onLoadClicked(),
     // ONLINE: opens the in-Fable API connection window (Fable-styled twin of
     // the WUPI-home AI panel). Never disabled — it's the path to connect an
@@ -2165,7 +2192,6 @@ export function initFable(extHooks = {}) {
   // player/sim/codex/intro wizards (Phases 3-5). Built once; rendered on entry.
   screens['creator-chat'] = buildCreatorChat();
   screens.worlds = buildWorlds({ back: () => exitLoadToTitle() });
-  screens.saves = buildSaves({ back: () => showScreen('worlds') });
   for (const s of Object.values(screens)) fableRoot.appendChild(s);
 
   // ── The persistent New Game flow ambiance ─────────────────────────
@@ -2230,6 +2256,49 @@ export function initFable(extHooks = {}) {
       AppLifecycle.closeApp('fable');
     });
   }
+
+  // ── Second-instance direct launch (Rust `direct-launch` event) ──────
+  // (2026-08-20 audit P2-5) Double-clicking `Launch <Card>.lnk` (or any
+  // `fable.exe --card …`) while WUPI is already running: the second exe
+  // exits after the single-instance focus signal, and Rust forwards its
+  // parsed argv here. Mirror the boot-time DIRECT_LAUNCH contract — gate
+  // on the API, resume the save, fall back to the title on failure — minus
+  // the splash choreography (the app is already revealed).
+  listen('direct-launch', (e) => {
+    const ctx = e.payload || {};
+    if (!ctx.cardSlug) return;
+    (async () => {
+      // Enter Fable if another surface owns the screen (OS home / PRISM);
+      // launchFable drives the full AppLifecycle boot transition. When
+      // Fable is already up, go straight to the resume.
+      if (!fableRoot.classList.contains('show')) {
+        try {
+          await launchFable();
+        } catch (err) {
+          console.error('[fable] second-instance launch entry failed', err);
+          return;
+        }
+      }
+      // Same API gate as the boot path (source === 'api' AND apiReady —
+      // apiReady alone survives an api_disconnect): a dead stage helps
+      // nobody; the title carries the ONLINE panel.
+      const src = await invoke('model_source_get').catch(() => null);
+      if (!src || src.source !== 'api' || !src.apiReady) {
+        showScreen('title');
+        return;
+      }
+      // resumeSave funnels through endFableSession (kills any live
+      // generation safely) → fable_start → enterStageViaTransition, and its
+      // own flowBusy guard dedupes a rapid .lnk double-click.
+      try {
+        await resumeSave(ctx.cardSlug, ctx.saveId ?? null);
+      } catch (err) {
+        console.error('[fable] second-instance direct launch failed, returning to title', err);
+        setFlowBusy(false);
+        showScreen('title');
+      }
+    })();
+  }).catch(() => {});
 }
 
 // Exposed for the stage's pause menu + toast (dev/debug convenience).

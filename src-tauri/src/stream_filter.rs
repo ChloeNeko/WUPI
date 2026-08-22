@@ -34,7 +34,7 @@ use regex::Regex;
 /// rejected brackets from FINALIZED prose, so the live stream and the stored
 /// beat can't diverge). Body alternation is quote-aware, mirroring the
 /// parser's `find_bracket_close` (see `with_brackets` for the full rationale).
-const BRACKET_STRIP_PATTERN: &str = r#"(?i)\[(?:CHARACTER_TURN:(?:end|[^\]\s]+)|OBJECT\s*(?:[^"\]]+|"[^"]*"?)+|FX\s*(?:[^"\]]+|"[^"]*"?)+|TIME\s*(?:[^"\]]+|"[^"]*"?)+|DATE\s*(?:[^"\]]+|"[^"]*"?)+|WEATHER\s*(?:[^"\]]+|"[^"]*"?)+|TRAVEL\s*(?:[^"\]]+|"[^"]*"?)+|EFFECT\s*(?:[^"\]]+|"[^"]*"?)+|MILESTONE\s*(?:[^"\]]+|"[^"]*"?)+|TASK\s*(?:[^"\]]+|"[^"]*"?)+|RUMOR\s*(?:[^"\]]+|"[^"]*"?)+|PRESENCE\s*(?:[^"\]]+|"[^"]*"?)+|DISCOVER\s*(?:[^"\]]+|"[^"]*"?)+|NPC_REGISTER\s*(?:[^"\]]+|"[^"]*"?)+|NPC_ITEM\s*(?:[^"\]]+|"[^"]*"?)+|MOOD\s*(?:[^"\]]+|"[^"]*"?)+|INTENT\s*(?:[^"\]]+|"[^"]*"?)+|APPEARANCE\s*(?:[^"\]]+|"[^"]*"?)+|EQUIP\s*(?:[^"\]]+|"[^"]*"?)+|BELT\s*(?:[^"\]]+|"[^"]*"?)+|PACK\s*(?:[^"\]]+|"[^"]*"?)+|ROOM\s*(?:[^"\]]+|"[^"]*"?)+|ASSET\s*(?:[^"\]]+|"[^"]*"?)+|PROMISE\s*(?:[^"\]]+|"[^"]*"?)+)\]"#;
+const BRACKET_STRIP_PATTERN: &str = r#"(?i)\[(?:CHARACTER_TURN:(?:end|[^\]\s]+)|OBJECT\s*(?:[^"\]]+|"[^"]*"?)+|FX\s*(?:[^"\]]+|"[^"]*"?)+|TIME\s*(?:[^"\]]+|"[^"]*"?)+|DATE\s*(?:[^"\]]+|"[^"]*"?)+|WEATHER\s*(?:[^"\]]+|"[^"]*"?)+|TRAVEL\s*(?:[^"\]]+|"[^"]*"?)+|EFFECT\s*(?:[^"\]]+|"[^"]*"?)+|MILESTONE\s*(?:[^"\]]+|"[^"]*"?)+|TASK\s*(?:[^"\]]+|"[^"]*"?)+|RUMOR\s*(?:[^"\]]+|"[^"]*"?)+|PRESENCE\s*(?:[^"\]]+|"[^"]*"?)+|DISCOVER\s*(?:[^"\]]+|"[^"]*"?)+|NPC_REGISTER\s*(?:[^"\]]+|"[^"]*"?)+|NPC_ITEM\s*(?:[^"\]]+|"[^"]*"?)+|MOOD\s*(?:[^"\]]+|"[^"]*"?)+|INTENT\s*(?:[^"\]]+|"[^"]*"?)+|APPEARANCE\s*(?:[^"\]]+|"[^"]*"?)+|EQUIP\s*(?:[^"\]]+|"[^"]*"?)+|BELT\s*(?:[^"\]]+|"[^"]*"?)+|PACK\s*(?:[^"\]]+|"[^"]*"?)+|ROOM\s*(?:[^"\]]+|"[^"]*"?)+|ASSET\s*(?:[^"\]]+|"[^"]*"?)+|PROMISE\s*(?:[^"\]]+|"[^"]*"?)+|LEDGER\s*(?:[^"\]]+|"[^"]*"?)+)\]"#;
 
 /// (2026-08-16 yellow B10) Whole-text strip of verb-shaped brackets. The
 /// streaming filter strips these live, but `bracket_parser::parse` only
@@ -2002,16 +2002,20 @@ mod tests {
     /// ASSET / PROMISE — must strip from finalized prose exactly like the
     /// parser drops them (a REJECTED emission — `[ROOM hall explored]`,
     /// `[ASSET x count=0]` — must not re-leak into the stored beat).
+    /// (2026-08-20 Economy) LEDGER joins the same parity.
     #[test]
     fn strip_bracket_shaped_covers_room_asset_promise() {
         let text = "She enters. [ROOM gatehouse] The guards stir. \
                     [ASSET warband-scouts dead] A debt is named. \
                     [PROMISE mara return the horse | 1440] \
-                    Rejected residue: [ROOM hall explored] [ASSET x count=0]";
+                    Coin moves. [LEDGER deposit 25 forge] \
+                    Rejected residue: [ROOM hall explored] [ASSET x count=0] \
+                    [LEDGER embezzle 100 forge]";
         let stripped = strip_bracket_shaped(text);
         assert!(!stripped.contains("[ROOM"), "ROOM leaked: {stripped:?}");
         assert!(!stripped.contains("[ASSET"), "ASSET leaked: {stripped:?}");
         assert!(!stripped.contains("[PROMISE"), "PROMISE leaked: {stripped:?}");
+        assert!(!stripped.contains("[LEDGER"), "LEDGER leaked: {stripped:?}");
         assert!(stripped.contains("She enters."), "prose survives");
         assert!(stripped.contains("Rejected residue:"), "prose survives");
     }

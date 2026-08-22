@@ -104,7 +104,7 @@ export function refreshHistory() {
   const nextRecent = new Set();
   beats.forEach((el, i) => {
     const wasRecent = prevRecent.has(el);
-    el.classList.remove('vn-recent', 'vn-history', 'vn-age-hold');
+    el.classList.remove('vn-recent', 'vn-history', 'vn-age-hold', 'vn-spawn');
     // The last RECENT_BEATS read with the full card treatment. If there
     // are fewer than RECENT_BEATS+1 beats total, nothing is old enough to
     // de-style — tagging everything vn-recent avoids stripping the sole
@@ -117,7 +117,25 @@ export function refreshHistory() {
       el.classList.add('vn-history');
       // A live recent→history flip morphs (fresh rebuild nodes never sat
       // in prevRecent, so they skip straight to the resting archive look).
-      if (wasRecent) ageOut(el);
+      if (wasRecent) {
+        ageOut(el);
+      } else if (!el.classList.contains('vn-aging')) {
+        // (2026-08-21) Spawn-in-place marker for every OTHER history tag
+        // (rebuild-fresh nodes + already-archived restags): the base
+        // .fable-mes carries `transition: margin 1s` for the live aging
+        // flip, and a rebuild whose nodes get a style pass BEFORE this
+        // observer delivers (any post-rebuild synchronous layout force —
+        // e.g. the composer focus() at turn end) legitimately fired that
+        // transition: the archive margins grew 10px→20px over the 1s
+        // AFTER beats.js's bottom pin, all accumulating below the pinned
+        // scrollTop — the feed landed ~2 beats above the bottom on every
+        // edit/reroll/rewind rebuild. .vn-spawn carries transition:none
+        // (fable.css) so the tag lands instantly. The vn-aging guard
+        // spares a beat still mid-morph (a fast follow-up append within
+        // the 1080ms window must not snap its glide); history→history
+        // restags have no class delta, so the kill is a no-op there.
+        el.classList.add('vn-spawn');
+      }
     }
   });
   prevRecent = nextRecent;

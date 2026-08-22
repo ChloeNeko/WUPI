@@ -329,6 +329,74 @@ pub enum BracketCommand {
         deadline_minutes: i64,
         remove: bool,
     },
+
+    /// (2026-08-20 Economy) `[LEDGER <op> …]` — the money & management
+    /// verb. Nine sub-forms (see [`LedgerOp`]); the payload is a flat
+    /// field set where each op reads only its own slots. Amounts are
+    /// pre-clamped to `economy::LEDGER_AMOUNT_MAX`; ids run through
+    /// `clean_free_text`; the applier (lib.rs) owns validation (node
+    /// existence, ownership, same-node gating on the till ops AND buy,
+    /// owner= registry resolution, caps) + the reject matrix. No JSON
+    /// dual-parser arm (the ROOM/ASSET/PROMISE precedent).
+    Ledger {
+        op: LedgerOp,
+        /// Property id (found/deposit/withdraw/invest/buy) or node id
+        /// (prosperity); empty for lifestyle.
+        id: String,
+        /// `node=` value (found/job).
+        node: String,
+        /// `kind=` raw word (found: business|estate|settlement; validated
+        /// at apply, empty → Business). Named `prop_kind` (not `kind`) to
+        /// avoid colliding with this enum's `#[serde(tag = "kind")]`
+        /// external discriminator (same reason `Effect.tag_kind` isn't
+        /// named `kind`).
+        prop_kind: String,
+        revenue: u32,
+        upkeep: u32,
+        /// The amount (deposit/withdraw/invest) or the pct (prosperity).
+        amount: u32,
+        /// Job title (job/job remove).
+        title: String,
+        /// `wage=` value (job). `Some` only when the emission actually
+        /// carried the kv — a re-emission without `wage=` must not read as
+        /// "negotiated down to zero" at the apply.
+        wage: Option<u32>,
+        /// Lifestyle word (lifestyle; parsed at apply).
+        lifestyle: String,
+        /// `owner=` value (found: an npc id for an NPC-held property; empty →
+        /// Unowned). Validated at apply against the registry — the only path
+        /// that mints NPC ownership in play (2026-08-20 audit).
+        owner: String,
+        /// (2026-08-21 economy addendum) `currency` op: the money-unit label
+        /// ("dollars", "gold/silver/copper"). Raw-cleaned here
+        /// (`clean_free_text`); the applier runs
+        /// `economy::normalize_currency_label` + rejects invalid shapes.
+        currency: String,
+        /// (2026-08-21 Cinderfen playtest) Prosperity DELTA emissions — the
+        /// model invents `[LEDGER update <node> -5/day]`; the parser aliases
+        /// `update`/`adjust` to prosperity and carries the SIGNED delta
+        /// here. `0` = the taught absolute form (set via `amount`).
+        prosperity_delta: i32,
+    },
+}
+
+/// (2026-08-20 Economy) The `[LEDGER]` sub-operation discriminator.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LedgerOp {
+    Found,
+    Deposit,
+    Withdraw,
+    Invest,
+    Buy,
+    Lifestyle,
+    Job,
+    JobRemove,
+    Prosperity,
+    /// (2026-08-21 economy addendum) Set the world's money-unit label —
+    /// `[LEDGER currency <label>]` / `[LEDGER currency_label=<label>]`.
+    /// Pure display metadata: every amount everywhere stays the base unit.
+    Currency,
 }
 
 /// (2026-08-19 Hidden site maps) The `[ASSET]` mutation payload — either a
@@ -1115,6 +1183,16 @@ fn clean_item_name(raw: &str) -> Option<String> {
         }
     }
     let cleaned = collapsed.trim().trim_matches(|c| EDGE_QUOTES.contains(&c));
+    // (2026-08-21 Cinderfen playtest) Junk-name gate — the tracker's
+    // malformed emissions minted literal pack items named "+extra",
+    // "+None", "+Salt": the NPC_ITEM add-form's leading `+` leaking into
+    // PACK/BELT positionals, plus bare sentinels. Strip leading `+` signs;
+    // reject the residual junk words outright (a 3+ char floor already
+    // exists below — these are the words that PASS it).
+    let cleaned = cleaned.trim_start_matches('+').trim();
+    if matches!(cleaned.to_lowercase().as_str(), "none" | "null" | "nan" | "extra") {
+        return None;
+    }
     let count = cleaned.chars().count();
     if count < 3 || count > INV_NAME_MAX {
         return None;
@@ -3214,6 +3292,19 @@ fn parse_one(bracket: &str, text_after: &str) -> Option<(BracketCommand, usize)>
         return None;
     }
 
+    // [LEDGER <op> …] — (2026-08-20 Economy) the money & management verb.
+    // Nine sub-forms via `parse_ledger` below (the 2026-08-21 addendum
+    // added `currency`). Prefix-safe: no other verb
+    // starts with L (diverges at char 1). The JSON form is deliberately
+    // NOT dual-parsed (v1: text brackets only, the ROOM/ASSET/PROMISE
+    // precedent).
+    if let Some(rest) = strip_prefix_ci(bracket, "LEDGER") {
+        if let Some(cmd) = parse_ledger(rest) {
+            return Some((cmd, 0));
+        }
+        return None;
+    }
+
     // [TIME <in-world timestamp>] — Seam #4 clock advance. Single-region like
     // OBJECT/FX. The body is parsed by parse_in_world_time into minutes-since-
     // epoch; on failure the bracket is emitted as literal prose (better to
@@ -3616,6 +3707,265 @@ fn split_kv_positional(s: &str) -> (std::collections::HashMap<&str, &str>, Vec<&
     (kv, positional)
 }
 
+/// (2026-08-20 Economy) Parse the `[LEDGER <op> …]` sub-forms. Every form
+/// leads with the bare op word, then positionals + a `key=value` tail
+/// (quote-aware via `split_kv_positional`). Malformed shapes drop to
+/// `None` (literal prose — the graceful-degradation contract); AMBIGUOUS
+/// values (unknown kind/tier words) parse fine and reject at the applier,
+/// which owns the full validation matrix. Amounts clamp to
+/// `economy::LEDGER_AMOUNT_MAX` (the `PROMISE_DEADLINE_MAX` overflow
+/// discipline).
+///
+/// Taught byte-exact:
+/// ```text
+/// [LEDGER found <id> node=<n> kind=<business|estate|settlement> revenue=<r> upkeep=<u> (owner=<npc_id>)]
+/// [LEDGER deposit <amount> <id>]   [LEDGER withdraw <amount> <id>]   [LEDGER invest <amount> <id>]
+/// [LEDGER buy <id>]
+/// [LEDGER lifestyle <squatter|modest|comfortable|aristocratic>]
+/// [LEDGER job <title> node=<n> wage=<w>]   [LEDGER job -<title>]
+/// [LEDGER prosperity <node_id> <pct>]
+/// [LEDGER currency <label>]   (kv alias: currency_label=<label>)
+/// ```
+fn parse_ledger(rest: &str) -> Option<BracketCommand> {
+    let rest = rest.trim();
+    let (raw_kv, pos) = split_kv_positional(rest);
+    // Case-insensitive keys (split_kv_positional preserves case).
+    let kv: std::collections::HashMap<String, &str> = raw_kv
+        .into_iter()
+        .map(|(k, v)| (k.to_lowercase(), v))
+        .collect();
+    let clamp_amount = |raw: &str| -> u32 {
+        let t = raw.trim();
+        match t.parse::<u64>() {
+            Ok(n) => n.min(crate::economy::LEDGER_AMOUNT_MAX as u64) as u32,
+            // An all-digit overflow (beyond u64) still means "a huge
+            // amount" — clamp, don't drop; anything non-numeric reads as 0
+            // (the caller drops zero-amount emissions).
+            Err(_) if !t.is_empty() && t.bytes().all(|b| b.is_ascii_digit()) => {
+                crate::economy::LEDGER_AMOUNT_MAX
+            }
+            Err(_) => 0,
+        }
+    };
+    let clean_id = |raw: &str| clean_free_text(raw, NODE_ID_MAX);
+    // (2026-08-21 Cinderfen playtest) `@`-compound ids — the model invents
+    // "brick@iron-forge" (property@node); split at the LAST '@' (email
+    // discipline) into property id + node. The taught kv `node=` wins when
+    // both are present.
+    let split_at_id = |raw: &str| -> (String, String) {
+        if let Some(at) = raw.rfind('@') {
+            let id = clean_id(&raw[..at]);
+            let node = clean_id(&raw[at + 1..]);
+            if !id.is_empty() && !node.is_empty() {
+                return (id, node);
+            }
+        }
+        (clean_id(raw), String::new())
+    };
+    // (2026-08-21 Cinderfen playtest) Tolerant pct token — the model's
+    // prosperity deltas carry a sign and/or a "/day" suffix ("-5/day",
+    // "+10", "120/day"). Strip the suffix, keep the sign: a signed/suffixed
+    // token is a DELTA (`prosperity_delta`); a bare number stays the taught
+    // absolute form.
+    let parse_pct = |raw: &str| -> Option<(u32, i32)> {
+        let t = raw.trim();
+        let (sign, body) = match t.strip_prefix('-') {
+            Some(r) => (-1i32, r),
+            None => match t.strip_prefix('+') {
+                Some(r) => (1i32, r),
+                None => (0i32, t),
+            },
+        };
+        let had_suffix = body.contains('/');
+        let digits = body.split('/').next().unwrap_or("").trim();
+        if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        let mag: u64 = digits.parse().ok()?;
+        let mag = mag.min(crate::economy::LEDGER_AMOUNT_MAX as u64) as u32;
+        if sign != 0 || had_suffix {
+            Some((mag, sign * (mag as i32)))
+        } else {
+            Some((mag, 0))
+        }
+    };
+    let first = pos.first().copied().unwrap_or("").trim();
+    // The no-op payload scaffold every arm fills only its own slots from.
+    let mut cmd = BracketCommand::Ledger {
+        op: LedgerOp::Found,
+        id: String::new(),
+        node: String::new(),
+        prop_kind: String::new(),
+        revenue: 0,
+        upkeep: 0,
+        amount: 0,
+        title: String::new(),
+        wage: None,
+        lifestyle: String::new(),
+        owner: String::new(),
+        currency: String::new(),
+        prosperity_delta: 0,
+    };
+    // (2026-08-21 economy addendum) [LEDGER currency <label>] — the kv-only
+    // form (`currency_label="dollars"`) carries NO positional op word, so it
+    // must be recognized BEFORE the empty-op bail below. Positional form:
+    // everything past the op word is the label (multi-word + quoted OK, the
+    // job-title pattern); a kv value wins when both are present.
+    let currency_kv = kv
+        .get("currency_label")
+        .or_else(|| kv.get("currency"))
+        .or_else(|| kv.get("label"))
+        .copied()
+        .unwrap_or("");
+    let first_lc = first.to_lowercase();
+    if first_lc == "currency" || first_lc == "currency_label" || (first.is_empty() && !currency_kv.is_empty()) {
+        let joined = pos[1.min(pos.len())..].join(" ");
+        let raw = if joined.trim().is_empty() { currency_kv.to_string() } else { joined };
+        // Empty / oversize / control-char labels drop to None (literal
+        // prose); tier shape + tier count validate at the applier (the
+        // reject-directive channel teaches the correct form back). The +1
+        // clean headroom makes oversize DETECTABLE — clean_free_text
+        // truncates at its cap, so cleaning at exactly MAX would silently
+        // store a clipped label instead of dropping the emission.
+        let label = clean_free_text(
+            &strip_one_quote_pair(raw.trim()),
+            crate::economy::CURRENCY_LABEL_MAX + 1,
+        );
+        if label.is_empty() || label.chars().count() > crate::economy::CURRENCY_LABEL_MAX {
+            return None;
+        }
+        if let BracketCommand::Ledger {
+            op: op_slot,
+            currency: slot,
+            ..
+        } = &mut cmd
+        {
+            *op_slot = LedgerOp::Currency;
+            *slot = label;
+        }
+        return Some(cmd);
+    }
+    if first.is_empty() {
+        return None;
+    }
+    // The op each arm produces; written into the payload at the end.
+    let op = match first.to_lowercase().as_str() {
+        "found" => {
+            let (id, at_node) = split_at_id(pos.get(1).copied().unwrap_or(""));
+            if id.is_empty() {
+                return None;
+            }
+            if let BracketCommand::Ledger { id: slot, node, prop_kind, revenue, upkeep, owner, .. } = &mut cmd {
+                *slot = id;
+                let kv_node = clean_id(kv.get("node").copied().unwrap_or(""));
+                // The taught kv `node=` wins; the `@`-split part is the
+                // fallback (2026-08-21 Cinderfen tolerance).
+                *node = if kv_node.is_empty() { at_node } else { kv_node };
+                *prop_kind = clean_free_text(kv.get("kind").copied().unwrap_or(""), NODE_ID_MAX);
+                *revenue = clamp_amount(kv.get("revenue").copied().unwrap_or("0"));
+                *upkeep = clamp_amount(kv.get("upkeep").copied().unwrap_or("0"));
+                *owner = clean_id(kv.get("owner").copied().unwrap_or(""));
+            }
+            LedgerOp::Found
+        }
+        "deposit" | "withdraw" | "invest" => {
+            let amount = clamp_amount(pos.get(1).copied().unwrap_or(""));
+            let (id, at_node) = split_at_id(pos.get(2).copied().unwrap_or(""));
+            if amount == 0 || id.is_empty() {
+                return None;
+            }
+            if let BracketCommand::Ledger { id: slot, node, amount: slot_amount, .. } = &mut cmd {
+                *slot = id;
+                *node = at_node;
+                *slot_amount = amount;
+            }
+            match first_lc.as_str() {
+                "deposit" => LedgerOp::Deposit,
+                "withdraw" => LedgerOp::Withdraw,
+                _ => LedgerOp::Invest,
+            }
+        }
+        "buy" => {
+            let (id, at_node) = split_at_id(pos.get(1).copied().unwrap_or(""));
+            if id.is_empty() {
+                return None;
+            }
+            if let BracketCommand::Ledger { id: slot, node, .. } = &mut cmd {
+                *slot = id;
+                *node = at_node;
+            }
+            LedgerOp::Buy
+        }
+        "lifestyle" => {
+            let word = clean_free_text(pos.get(1).copied().unwrap_or(""), NODE_ID_MAX);
+            if word.is_empty() {
+                return None;
+            }
+            if let BracketCommand::Ledger { lifestyle, .. } = &mut cmd {
+                *lifestyle = word;
+            }
+            LedgerOp::Lifestyle
+        }
+        "job" => {
+            // The title spans every positional past the op (kv tokens are
+            // already separated out), so a bare multi-word title survives;
+            // a quoted one arrives as a single positional (quotes stripped).
+            let raw_title = pos[1.min(pos.len())..].join(" ").trim().to_string();
+            if let Some(stripped) = raw_title.strip_prefix('-') {
+                let title = clean_free_text(&strip_one_quote_pair(stripped.trim()), EFFECT_LABEL_MAX);
+                if title.is_empty() {
+                    return None;
+                }
+                if let BracketCommand::Ledger { title: slot, .. } = &mut cmd {
+                    *slot = title;
+                }
+                LedgerOp::JobRemove
+            } else {
+                let title = clean_free_text(&strip_one_quote_pair(&raw_title), EFFECT_LABEL_MAX);
+                if title.is_empty() {
+                    return None;
+                }
+                if let BracketCommand::Ledger {
+                    title: slot,
+                    node,
+                    wage,
+                    ..
+                } = &mut cmd
+                {
+                    *slot = title;
+                    *node = clean_id(kv.get("node").copied().unwrap_or(""));
+                    *wage = kv.get("wage").map(|v| clamp_amount(v));
+                }
+                LedgerOp::Job
+            }
+        }
+        // (2026-08-21 Cinderfen playtest) `update`/`adjust` are prosperity
+        // aliases — the model's invented `[LEDGER update <node> -5/day]`
+        // op for a location's fortunes. Delta-shaped tokens (sign or /day
+        // suffix) ride `prosperity_delta`; bare numbers stay absolute.
+        "prosperity" | "update" | "adjust" => {
+            let id = clean_id(pos.get(1).copied().unwrap_or(""));
+            let Some((amount, delta)) = parse_pct(pos.get(2).copied().unwrap_or("")) else {
+                return None;
+            };
+            if id.is_empty() || amount == 0 {
+                return None;
+            }
+            if let BracketCommand::Ledger { id: slot, amount: slot_amount, prosperity_delta: slot_delta, .. } = &mut cmd {
+                *slot = id;
+                *slot_amount = amount;
+                *slot_delta = delta;
+            }
+            LedgerOp::Prosperity
+        }
+        _ => return None,
+    };
+    if let BracketCommand::Ledger { op: op_slot, .. } = &mut cmd {
+        *op_slot = op;
+    }
+    Some(cmd)
+}
+
 /// Fallback for `[TASK ...]` without a `|` separator. Splits by whitespace:
 /// first token = npc_id, last 3 = difficulty/suitability/eta, middle (joined)
 /// = description. The model occasionally omits the pipe; this keeps the parse
@@ -3710,6 +4060,69 @@ pub fn parse_in_world_time(s: &str) -> Option<i64> {
     // comfortably while staying far from i64 overflow in downstream sums).
     let raw = parse_in_world_time_inner(s);
     raw.map(|m| m.clamp(0, 4_000_000_000))
+}
+
+/// (2026-08-21 Cinderfen playtest, multi-day clock fix) Does a `[TIME]` body
+/// carry an ABSOLUTE day signal — a "Day N" / "D N" index (glued or split)
+/// or a DD/MM/YYYY calendar date? A body with ONLY a clock ("07:15",
+/// "2:30 PM") is a TIME-OF-DAY emission: the model means "the clock now
+/// reads 07:15", which on a multi-day campaign must map to the next future
+/// occurrence of that time (see [`resolve_time_of_day_emission`]), not
+/// absolute minutes from day 0. Pure; tokenization mirrors
+/// `parse_in_world_time_inner` (whitespace + comma splits).
+pub fn time_body_has_day_signal(raw: &str) -> bool {
+    let toks: Vec<&str> = raw
+        .split(|c: char| c.is_whitespace() || c == ',')
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .collect();
+    // A bare "day"/"d" word expects its number on the NEXT token ("Day 3").
+    let mut expect_number = false;
+    for tok in &toks {
+        let lower = tok.to_lowercase();
+        if expect_number {
+            expect_number = false;
+            if lower.parse::<i64>().is_ok() {
+                return true;
+            }
+        }
+        if let Some(rest) = lower.strip_prefix("day").or_else(|| lower.strip_prefix("d")) {
+            let rest = rest.trim_start_matches(|c: char| c == '-' || c == '_');
+            if !rest.is_empty() && rest.parse::<i64>().is_ok() {
+                return true;
+            }
+            if rest.is_empty() {
+                expect_number = true;
+            }
+            continue;
+        }
+        if tok.contains('/') {
+            let parts: Vec<&str> = tok.split('/').collect();
+            if parts.len() == 3
+                && parts[0].parse::<u32>().is_ok()
+                && parts[1].parse::<u32>().is_ok()
+                && parts[2].parse::<i32>().is_ok()
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// (2026-08-21 Cinderfen playtest, multi-day clock fix) Map a TIME-OF-DAY
+/// emission's parsed minutes to the NEXT future occurrence of that
+/// time-of-day on the live clock — "reach tomorrow morning" via
+/// `[TIME 07:15]`. A restatement of the CURRENT time-of-day is a no-op
+/// (returns `current_minutes`), never a day jump. Pure; call only for
+/// bodies where [`time_body_has_day_signal`] is false. Day-bearing bodies
+/// stay absolute upstream (regression reject / pacing clamp as before).
+pub fn resolve_time_of_day_emission(parsed: i64, current_minutes: i64) -> i64 {
+    let tod = parsed.rem_euclid(1440);
+    if current_minutes.rem_euclid(1440) == tod {
+        return current_minutes;
+    }
+    tod + 1440 * ((current_minutes - tod).div_euclid(1440) + 1)
 }
 
 fn parse_in_world_time_inner(s: &str) -> Option<i64> {
@@ -4037,6 +4450,243 @@ mod tests {
         assert!(parse("[PROMISE mara return the horse]").commands.is_empty());
         assert!(parse("[PROMISE mara x | tomorrow]").commands.is_empty());
         assert!(parse("[PROMISE mara x | 0]").commands.is_empty());
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // (2026-08-20 Economy) [LEDGER] — every sub-form + the malformed drops.
+    // ─────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn ledger_grammar_found_deposit_withdraw_invest_buy() {
+        let parsed =
+            parse("[LEDGER found forge node=iron-forge kind=business revenue=8 upkeep=3]");
+        match &parsed.commands[0] {
+            BracketCommand::Ledger { op, id, node, prop_kind, revenue, upkeep, .. } => {
+                assert_eq!(*op, LedgerOp::Found);
+                assert_eq!(id, "forge");
+                assert_eq!(node, "iron-forge");
+                assert_eq!(prop_kind, "business");
+                assert_eq!(*revenue, 8);
+                assert_eq!(*upkeep, 3);
+            }
+            other => panic!("expected Ledger, got {other:?}"),
+        }
+        // (2026-08-20 audit) The owner= kv — the in-play NPC-ownership path.
+        let parsed = parse(
+            "[LEDGER found guild node=town kind=business revenue=6 upkeep=2 owner=mara]",
+        );
+        match &parsed.commands[0] {
+            BracketCommand::Ledger { op, owner, .. } => {
+                assert_eq!(*op, LedgerOp::Found);
+                assert_eq!(owner, "mara");
+            }
+            other => panic!("expected Ledger, got {other:?}"),
+        }
+        // Omitted owner parses as empty (Unowned at apply).
+        let parsed =
+            parse("[LEDGER found stall node=town revenue=1 upkeep=1]");
+        match &parsed.commands[0] {
+            BracketCommand::Ledger { owner, .. } => assert_eq!(owner, ""),
+            other => panic!("expected Ledger, got {other:?}"),
+        }
+        for (verb, want) in [
+            ("deposit", LedgerOp::Deposit),
+            ("WITHDRAW", LedgerOp::Withdraw),
+            ("invest", LedgerOp::Invest),
+        ] {
+            let parsed = parse(&format!("[LEDGER {verb} 25 forge]"));
+            match &parsed.commands[0] {
+                BracketCommand::Ledger { op, id, amount, .. } => {
+                    assert_eq!(*op, want, "case-insensitive verb");
+                    assert_eq!(id, "forge");
+                    assert_eq!(*amount, 25);
+                }
+                other => panic!("expected Ledger, got {other:?}"),
+            }
+        }
+        let parsed = parse("[LEDGER buy forge]");
+        match &parsed.commands[0] {
+            BracketCommand::Ledger { op, id, .. } => {
+                assert_eq!(*op, LedgerOp::Buy);
+                assert_eq!(id, "forge");
+            }
+            other => panic!("expected Ledger, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ledger_grammar_lifestyle_job_prosperity() {
+        let parsed = parse("[LEDGER lifestyle comfortable]");
+        match &parsed.commands[0] {
+            BracketCommand::Ledger { op, lifestyle, .. } => {
+                assert_eq!(*op, LedgerOp::Lifestyle);
+                assert_eq!(lifestyle, "comfortable");
+            }
+            other => panic!("expected Ledger, got {other:?}"),
+        }
+        // Bare multi-word title absorbs up to the kv tail; the quoted form
+        // arrives as one positional.
+        for form in [
+            "[LEDGER job Master Blacksmith node=iron-forge wage=12]",
+            "[LEDGER job \"Master Blacksmith\" node=iron-forge wage=12]",
+        ] {
+            let parsed = parse(form);
+            match &parsed.commands[0] {
+                BracketCommand::Ledger { op, title, node, wage, .. } => {
+                    assert_eq!(*op, LedgerOp::Job, "{form}");
+                    assert_eq!(title, "Master Blacksmith", "{form}");
+                    assert_eq!(node, "iron-forge");
+                    assert_eq!(*wage, Some(12));
+                }
+                other => panic!("expected Ledger, got {other:?}"),
+            }
+        }
+        // Absent `wage=` parses to None — the re-emission refresh must not
+        // read it as a negotiated-down-to-zero wage.
+        let parsed = parse("[LEDGER job Master Blacksmith node=iron-forge]");
+        match &parsed.commands[0] {
+            BracketCommand::Ledger { op, wage, .. } => {
+                assert_eq!(*op, LedgerOp::Job);
+                assert_eq!(*wage, None);
+            }
+            other => panic!("expected Ledger, got {other:?}"),
+        }
+        let parsed = parse("[LEDGER job -Master Blacksmith]");
+        match &parsed.commands[0] {
+            BracketCommand::Ledger { op, title, .. } => {
+                assert_eq!(*op, LedgerOp::JobRemove);
+                assert_eq!(title, "Master Blacksmith");
+            }
+            other => panic!("expected Ledger, got {other:?}"),
+        }
+        let parsed = parse("[LEDGER prosperity iron-forge 140]");
+        match &parsed.commands[0] {
+            BracketCommand::Ledger { op, id, amount, prosperity_delta, .. } => {
+                assert_eq!(*op, LedgerOp::Prosperity);
+                assert_eq!(id, "iron-forge");
+                assert_eq!(*amount, 140);
+                assert_eq!(*prosperity_delta, 0, "a bare number is the taught absolute form");
+            }
+            other => panic!("expected Ledger, got {other:?}"),
+        }
+    }
+
+    /// (2026-08-21 Cinderfen playtest) The tracker's real malformed-emission
+    /// shapes, tolerated mechanically: `@`-compound ids ("brick@iron-forge"),
+    /// the invented `update` op for prosperity deltas (sign + "/day"),
+    /// and node-ids where property ids belong (the applier resolves those).
+    #[test]
+    fn ledger_tolerates_at_compound_ids_and_update_alias() {
+        // `@`-compound found: the node rides the id token; a taught kv
+        // node= still wins when both are present.
+        let parsed = parse("[LEDGER found brick@iron-forge kind=business revenue=8 upkeep=3]");
+        match &parsed.commands[0] {
+            BracketCommand::Ledger { op, id, node, .. } => {
+                assert_eq!(*op, LedgerOp::Found);
+                assert_eq!(id, "brick");
+                assert_eq!(node, "iron-forge");
+            }
+            other => panic!("expected Ledger, got {other:?}"),
+        }
+        let parsed = parse("[LEDGER found mill@riverville node=town]");
+        match &parsed.commands[0] {
+            BracketCommand::Ledger { id, node, .. } => {
+                assert_eq!(id, "mill");
+                assert_eq!(node, "town", "the taught kv node= wins over the @-part");
+            }
+            other => panic!("expected Ledger, got {other:?}"),
+        }
+        // `@`-compound deposit: the node part lands in the node slot as the
+        // resolution hint.
+        let parsed = parse("[LEDGER deposit 750 brick@iron-forge]");
+        match &parsed.commands[0] {
+            BracketCommand::Ledger { op, id, node, amount, .. } => {
+                assert_eq!(*op, LedgerOp::Deposit);
+                assert_eq!(id, "brick");
+                assert_eq!(node, "iron-forge");
+                assert_eq!(*amount, 750);
+            }
+            other => panic!("expected Ledger, got {other:?}"),
+        }
+        // The invented `update` op → prosperity DELTA ("-5/day": signed,
+        // suffix-stripped).
+        let parsed = parse("[LEDGER update market-square -5/day]");
+        match &parsed.commands[0] {
+            BracketCommand::Ledger { op, id, amount, prosperity_delta, .. } => {
+                assert_eq!(*op, LedgerOp::Prosperity);
+                assert_eq!(id, "market-square");
+                assert_eq!(*amount, 5);
+                assert_eq!(*prosperity_delta, -5);
+            }
+            other => panic!("expected Ledger, got {other:?}"),
+        }
+        // A suffixed-but-unsigned token is still a delta; a signed bare
+        // number too.
+        let parsed = parse("[LEDGER adjust market-square 20/day]");
+        match &parsed.commands[0] {
+            BracketCommand::Ledger { op, prosperity_delta, .. } => {
+                assert_eq!(*op, LedgerOp::Prosperity);
+                assert_eq!(*prosperity_delta, 20);
+            }
+            other => panic!("expected Ledger, got {other:?}"),
+        }
+        let parsed = parse("[LEDGER update market-square +10]");
+        match &parsed.commands[0] {
+            BracketCommand::Ledger { prosperity_delta, .. } => assert_eq!(*prosperity_delta, 10),
+            other => panic!("expected Ledger, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ledger_grammar_currency() {
+        // (2026-08-21 economy addendum) Positional, multi-word, quoted, and
+        // the kv-only form (which carries NO op word — the form Chloe
+        // specced). Empty → literal prose (drop).
+        for (form, want) in [
+            ("[LEDGER currency dollars]", "dollars"),
+            ("[LEDGER currency gold coins]", "gold coins"),
+            ("[LEDGER currency \"gold sovereigns\"]", "gold sovereigns"),
+            ("[LEDGER currency gold/silver/copper]", "gold/silver/copper"),
+            ("[LEDGER currency_label=\"dollars\"]", "dollars"),
+            ("[LEDGER currency_label=beli]", "beli"),
+            ("[LEDGER CURRENCY Yen]", "Yen"),
+        ] {
+            let parsed = parse(form);
+            match &parsed.commands[0] {
+                BracketCommand::Ledger { op, currency, .. } => {
+                    assert_eq!(*op, LedgerOp::Currency, "{form}");
+                    assert_eq!(currency, want, "{form}");
+                }
+                other => panic!("expected Ledger, got {other:?} ({form})"),
+            }
+        }
+        // Empty / bare-op forms drop to literal prose; tier shape validates
+        // at the applier (reject-directive channel), not here.
+        assert!(parse("[LEDGER currency]").commands.is_empty());
+        assert!(parse("[LEDGER currency_label=]").commands.is_empty());
+        assert!(parse("[LEDGER]").commands.is_empty());
+    }
+
+    #[test]
+    fn ledger_malformed_and_overflow_shapes_drop_or_clamp() {
+        // Unknown op / missing operands → drop whole (literal prose).
+        assert!(parse("[LEDGER embezzle 100 forge]").commands.is_empty());
+        assert!(parse("[LEDGER deposit forge]").commands.is_empty());
+        assert!(parse("[LEDGER found ]").commands.is_empty());
+        assert!(parse("[LEDGER lifestyle]").commands.is_empty());
+        assert!(parse("[LEDGER job]").commands.is_empty());
+        // Zero amounts drop (a no-op emission is noise).
+        assert!(parse("[LEDGER deposit 0 forge]").commands.is_empty());
+        assert!(parse("[LEDGER prosperity forge 0]").commands.is_empty());
+        // Astronomical amounts CLAMP (the PROMISE_DEADLINE_MAX discipline),
+        // never overflow the u32 at the apply site.
+        let parsed = parse("[LEDGER deposit 99999999999999999999 forge]");
+        match &parsed.commands[0] {
+            BracketCommand::Ledger { amount, .. } => {
+                assert_eq!(*amount, crate::economy::LEDGER_AMOUNT_MAX);
+            }
+            other => panic!("expected Ledger, got {other:?}"),
+        }
     }
 
     /// (2026-08-19 integer-overflow guard) A hallucinated astronomically-
@@ -4851,6 +5501,40 @@ mod tests {
         assert_eq!(parse_in_world_time("Day 5, lunch"), Some(5760));
         // A malformed day token is skipped; the clock still parses.
         assert_eq!(parse_in_world_time("Dayz, 14:00"), Some(840));
+    }
+
+    /// (2026-08-21 Cinderfen playtest, multi-day clock fix) The day-signal
+    /// detector + the time-of-day → next-occurrence mapping. The playtest:
+    /// on day 4 (4,740 min) the tracker repeatedly emitted `[TIME 07:15]`
+    /// meaning "next morning", which parsed to absolute 435 and was
+    /// correctly-but-fatally rejected as a regression — the story could
+    /// never reach morning by time-of-day.
+    #[test]
+    fn time_of_day_emission_maps_to_next_occurrence() {
+        // Day-signal detection: clock-only bodies carry no absolute anchor.
+        assert!(!time_body_has_day_signal("07:15"));
+        assert!(!time_body_has_day_signal("2:30 PM"));
+        assert!(!time_body_has_day_signal("12:00 AM"));
+        // Day/date bodies are absolute.
+        assert!(time_body_has_day_signal("Day 17, 12:00 AM"));
+        assert!(time_body_has_day_signal("day3, 08:00"));
+        assert!(time_body_has_day_signal("D 4"));
+        assert!(time_body_has_day_signal("22:00, 01/01/2026"));
+
+        // The mapping: day-4 06:00 (4,680) + "07:15" (435) → day-4 07:15.
+        assert_eq!(resolve_time_of_day_emission(435, 4_680), 4_755);
+        // Later-today still lands today: day-4 04:00 (4,320) + "07:15".
+        assert_eq!(resolve_time_of_day_emission(435, 4_320), 4_755);
+        // Earlier-than-now rolls to tomorrow: day-4 07:15 (4,755) + "06:00"
+        // (360) → day-5 06:00.
+        assert_eq!(resolve_time_of_day_emission(360, 4_755), 6_120);
+        // Restating the CURRENT time-of-day is a no-op, never a day jump.
+        assert_eq!(resolve_time_of_day_emission(435, 4_755), 4_755);
+        // "12:00 AM" at day-4 04:00 → next midnight = day-5 00:00.
+        assert_eq!(resolve_time_of_day_emission(0, 4_320), 5_760);
+        // Pre-day-1 clocks (cold campaign, current < 1440): a later
+        // time-of-day lands today, not tomorrow.
+        assert_eq!(resolve_time_of_day_emission(870, 300), 870);
     }
 
     // ── 2026-07-27 extra-spaces normalization tests ──────────────────────
@@ -6154,6 +6838,26 @@ mod tests {
         assert_eq!(parse("[BELT \"W]").commands.len(), 0);
         assert_eq!(parse("[PACK \"\"").commands.len(), 0);
         assert_eq!(parse("[PACK -\"Ro]").commands.len(), 0);
+    }
+
+    /// (2026-08-21 Cinderfen playtest) The NPC_ITEM add-form's leading `+`
+    /// leaking into PACK/BELT minted literal "+Salt"/"+extra"/"+None" pack
+    /// items. The `+` strips (the item was real); the bare junk words drop
+    /// the emission entirely.
+    #[test]
+    fn pack_junk_names_stripped_or_dropped() {
+        let parsed = parse("[PACK name=\"+Salt\" qty=2]");
+        match &parsed.commands[0] {
+            BracketCommand::Pack { item_name, qty, remove, .. } => {
+                assert_eq!(item_name, "Salt", "the + is syntax confusion, the item is real");
+                assert_eq!(*qty, 2);
+                assert!(!*remove);
+            }
+            other => panic!("expected Pack, got {other:?}"),
+        }
+        assert_eq!(parse("[PACK name=\"+extra\"]").commands.len(), 0);
+        assert_eq!(parse("[PACK name=None]").commands.len(), 0);
+        assert_eq!(parse("[PACK name=\"+None\" qty=1]").commands.len(), 0);
     }
 
     #[test]

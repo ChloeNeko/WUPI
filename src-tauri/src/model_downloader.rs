@@ -105,10 +105,15 @@ const HF_TOKEN: &str = match option_env!("HF_TOKEN") {
 };
 
 /// One required file: its HF repo filename + the subdirectory under the
-/// models root it lands in (`""` = the models root itself).
+/// models root it lands in (`""` = the models root itself). `optional`
+/// files still ride the overlay by default (fresh installs get them), but a
+/// PERMANENT/exhausted download failure logs + continues instead of failing
+/// the whole boot — only the render-time feature that wants the file
+/// degrades (2026-08-20 audit P2-3).
 pub struct RequiredFile {
     pub name: &'static str,
     pub subdir: &'static str,
+    pub optional: bool,
 }
 
 /// The files we need, in download order. WUPI first because the chat engine
@@ -120,22 +125,25 @@ pub struct RequiredFile {
 /// checkpoint's own source, scene_art.rs ClipOverride), and `vae.safetensors`
 /// (distributed for layout completeness; the single-file path deliberately
 /// keeps the GGUF's embedded VAE — sd.cpp's SDXL Conv2D guard depends on it).
-/// The ESRGAN file (recipe v2, 2026-08-18) is the mandatory hires-refine
-/// scaffold (~18 MB; a miss is non-fatal — scene_art falls back to LANCZOS).
+/// The ESRGAN file (recipe v2, 2026-08-18) is the hires-refine scaffold
+/// (~18 MB; OPTIONAL — scene_art falls back to LANCZOS on a miss or a
+/// corrupt/truncated file, so even a permanent fetch failure must not
+/// block boot).
 /// They land in `models/sd/`, exactly where `resolve_sd_model_path` looks.
 pub const REQUIRED_FILES: &[RequiredFile] = &[
-    RequiredFile { name: "WUPI.gguf", subdir: "" },
-    RequiredFile { name: "Embed.gguf", subdir: "" },
-    RequiredFile { name: "image.gguf", subdir: "sd" },
-    RequiredFile { name: "vae.safetensors", subdir: "sd" },
-    RequiredFile { name: "clip_l.safetensors", subdir: "sd" },
-    RequiredFile { name: "clip_g.safetensors", subdir: "sd" },
-    // The mandatory hires-refine ESRGAN scaffold (recipe v2, 2026-08-18 —
-    // ~18 MB, the RealESRGAN_x4plus_anime_6B model under its short shipped
-    // name). A missing file is NOT fatal: scene_art falls back to the
-    // LANCZOS upscaler, but it must ride the overlay so fresh installs get
-    // the sharper scaffold by default.
-    RequiredFile { name: "esrgan.pth", subdir: "sd" },
+    RequiredFile { name: "WUPI.gguf", subdir: "", optional: false },
+    RequiredFile { name: "Embed.gguf", subdir: "", optional: false },
+    RequiredFile { name: "image.gguf", subdir: "sd", optional: false },
+    RequiredFile { name: "vae.safetensors", subdir: "sd", optional: false },
+    RequiredFile { name: "clip_l.safetensors", subdir: "sd", optional: false },
+    RequiredFile { name: "clip_g.safetensors", subdir: "sd", optional: false },
+    // The hires-refine ESRGAN scaffold (recipe v2, 2026-08-18 — ~18 MB, the
+    // RealESRGAN_x4plus_anime_6B model under its short shipped name). A
+    // missing file is NOT fatal (scene_art falls back to the LANCZOS
+    // upscaler), and since 2026-08-20 neither is a failed download: it
+    // rides the overlay so fresh installs get the sharper scaffold by
+    // default, but `optional` keeps a dead fetch from bricking boot.
+    RequiredFile { name: "esrgan.pth", subdir: "sd", optional: true },
 ];
 
 /// Chunk size: reqwest's `bytes_stream()` yields its own chunks (typically
@@ -230,6 +238,11 @@ fn http_client() -> Result<reqwest::Client, String> {
     reqwest::Client::builder()
         .use_rustls_tls()
         .redirect(reqwest::redirect::Policy::default())
+        // (2026-08-20) Connect cap only — no total timeout (the GB-scale
+        // weights on slow links would trip it); the per-chunk idle guard in
+        // download_one's stream loop is the hang net. reqwest's default is
+        // NO timeout, and this overlay runs at the boot gate.
+        .connect_timeout(std::time::Duration::from_secs(30))
         .build()
         .map_err(|e| format!("failed to build HTTP client: {e}"))
 }
@@ -265,7 +278,7 @@ async fn download_one(
     // attempt. HF's signed CDN URLs expire; a saved URL from a prior run is
     // useless. The Bearer token authenticates this hop only.
     {
-        let mut p = progress.lock().expect("progress mutex");
+        let mut p = progress.lock().unwrap_or_else(|e| e.into_inner());
         p.phase = DownloadPhase::Resolving;
         p.current_file = filename.to_owned();
         p.current_file_offset = 0;
@@ -314,7 +327,7 @@ async fn download_one(
         remote_total
     };
     {
-        let mut p = progress.lock().expect("progress mutex");
+        let mut p = progress.lock().unwrap_or_else(|e| e.into_inner());
         p.phase = DownloadPhase::Downloading;
         p.current_file_offset = resume_offset;
         p.current_file_total = absolute_total;
@@ -344,7 +357,23 @@ async fn download_one(
     let mut written_this_run: u64 = 0;
     let mut last_emit = std::time::Instant::now();
 
-    while let Some(chunk_result) = stream.next().await {
+    // (2026-08-20) Idle guard: a CDN connection that accepts then goes
+    // silent stalls stream.next() forever under reqwest's no-timeout
+    // default — the overlay boot gate wedges with a frozen progress bar.
+    // 120s without a byte = dead link; fail loudly so the retry/backoff
+    // pass can fire (and the .part resumes on the next attempt).
+    const CHUNK_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+    loop {
+        let chunk_result = match tokio::time::timeout(CHUNK_IDLE_TIMEOUT, stream.next()).await {
+            Ok(Some(r)) => r,
+            Ok(None) => break, // stream complete
+            Err(_) => {
+                return Err(format!(
+                    "download of {filename} stalled: no data for {}s (dead link?)",
+                    CHUNK_IDLE_TIMEOUT.as_secs()
+                ))
+            }
+        };
         // Cancel check at the top of each chunk (between writes, never mid):
         // mirrors the engine decode-loop cancel invariant. Relaxed is correct
         // for the same reason (single-bit signal, no dependent data; §3).
@@ -368,7 +397,7 @@ async fn download_one(
         // percentage is correct across resumes, not just within one run.
         let new_offset = resume_offset + written_this_run;
         {
-            let mut p = progress.lock().expect("progress mutex");
+            let mut p = progress.lock().unwrap_or_else(|e| e.into_inner());
             p.current_file_offset = new_offset;
             p.overall_downloaded = p.overall_downloaded.saturating_add(chunk.len() as u64);
         }
@@ -383,7 +412,7 @@ async fn download_one(
     // the kernel flushing pages can't leave a short final file). The rename
     // is atomic on the same filesystem (NTFS rename = single metadata op).
     {
-        let mut p = progress.lock().expect("progress mutex");
+        let mut p = progress.lock().unwrap_or_else(|e| e.into_inner());
         p.phase = DownloadPhase::Finalizing;
     }
     let _ = app.emit("download-progress", progress_snapshot(&progress));
@@ -404,7 +433,7 @@ async fn download_one(
 
 /// Take a non-blocking snapshot of the shared progress for event emission.
 fn progress_snapshot(progress: &Arc<std::sync::Mutex<DownloadProgress>>) -> DownloadProgress {
-    progress.lock().expect("progress mutex").clone()
+    progress.lock().unwrap_or_else(|e| e.into_inner()).clone()
 }
 
 // ── Public entry: download all required files ──────────────────────────────
@@ -461,12 +490,42 @@ fn is_permanent_error(err: &str) -> bool {
 /// (the kind that correlate with the window being alt-tabbed / hidden)
 /// trigger an automatic resume-from-`.part` retry; permanent errors fail
 /// fast.
+/// (2026-08-21 Cinderfen playtest) The in-flight guard: two concurrent
+/// download loops interleave appends on the same `.part` files — the
+/// playtest's double-dispatch corrupted `image.gguf` (the final file GREW
+/// after rename, then failed with a misleading cross-file rename error).
+/// One downloader per process, ever; a second dispatch rejects cleanly.
+/// Scope-based release: every exit path (Ok, Err, `?` propagation, panic
+/// unwind) clears the slot.
+static DOWNLOAD_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
+
+/// RAII ownership of [`DOWNLOAD_IN_FLIGHT`].
+struct DownloadGuard;
+
+impl DownloadGuard {
+    fn acquire() -> Result<Self, String> {
+        DOWNLOAD_IN_FLIGHT
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .map_err(|_| {
+                "a model download is already running in this process".to_owned()
+            })?;
+        Ok(DownloadGuard)
+    }
+}
+
+impl Drop for DownloadGuard {
+    fn drop(&mut self) {
+        DOWNLOAD_IN_FLIGHT.store(false, Ordering::Release);
+    }
+}
+
 pub async fn download_all(
     dest_dir: PathBuf,
     progress: Arc<std::sync::Mutex<DownloadProgress>>,
     cancel: CancelToken,
     app: tauri::AppHandle,
 ) -> Result<(), String> {
+    let _in_flight = DownloadGuard::acquire()?;
     std::fs::create_dir_all(&dest_dir)
         .map_err(|e| format!("create models dir {}: {e}", dest_dir.display()))?;
 
@@ -561,12 +620,28 @@ pub async fn download_all(
             }
         }
         if let Some(e) = last_err {
+            // (2026-08-20 audit P2-3) An optional file's permanent failure
+            // degrades its feature, never the boot: log + continue so a
+            // dead ESRGAN fetch can't brick the overlay for the GGUFs and
+            // the SD set that DO gate boot.
+            if rf.optional {
+                tracing::warn!(
+                    file = rf.name,
+                    error = %e,
+                    "optional model file failed to download; continuing (the render-time consumer falls back)"
+                );
+                if let Ok(mut p) = progress.lock() {
+                    p.current_file.clear();
+                }
+                let _ = app.emit("download-progress", progress_snapshot(&progress));
+                continue;
+            }
             return Err(e);
         }
     }
 
     {
-        let mut p = progress.lock().expect("progress mutex");
+        let mut p = progress.lock().unwrap_or_else(|e| e.into_inner());
         p.phase = DownloadPhase::Done;
         p.current_file.clear();
     }

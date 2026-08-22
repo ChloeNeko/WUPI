@@ -62,6 +62,58 @@ export function cdata(text) {
   return `<![CDATA[${String(text || '').replace(/]]>/g, ']]]]><![CDATA[>')}]]>`;
 }
 
+// ── (2026-08-20 audit) Authored starting holdings — draft.properties ─────
+// The optional GLM field (player + sim schemas, taught in the Rust creator
+// prompt). Normalized ONCE here into the AuthoredProperty shape; the sim
+// path renders it to the pipe-kv `<properties>` sibling (Rust
+// parse_property_lines reads it back), the player path carries the objects
+// on the SavedPlayer DTO (Rust renders the `.player` XML twin + seeds them
+// Player-owned on fresh runs). The Rust seed refuses past MAX_PROPERTIES
+// (8) — cap here so a GLM overshoot doesn't seed-and-drop.
+const PROPERTY_KINDS = new Set(['business', 'estate', 'settlement']);
+const MAX_DRAFT_PROPERTIES = 8;
+
+export function normalizeProperties(props) {
+  if (!Array.isArray(props)) return [];
+  const clampAmount = (v) => {
+    const n = Math.floor(Number(v));
+    return Number.isFinite(n) && n > 0 ? Math.min(n, 100000) : 0;
+  };
+  const out = [];
+  for (const src of props.slice(0, MAX_DRAFT_PROPERTIES)) {
+    if (!src || typeof src !== 'object') continue;
+    const id = slugify(text(src.id));
+    const node = text(src.node).trim();
+    if (!id || !node) continue; // the Rust parser skips these too
+    const kindRaw = text(src.kind).trim().toLowerCase();
+    const owner = text(src.owner).trim();
+    const price = clampAmount(src.price);
+    out.push({
+      id,
+      node,
+      kind: PROPERTY_KINDS.has(kindRaw) ? kindRaw : 'business',
+      revenue: clampAmount(src.revenue),
+      upkeep: clampAmount(src.upkeep),
+      ...(owner ? { owner } : {}),
+      ...(price > 0 ? { price } : {}),
+    });
+  }
+  return out;
+}
+
+// The pipe-kv line grammar (`id: forge | node: iron-forge | kind: business
+// | revenue: 8 | upkeep: 3`) — the round-trip half of Rust's
+// economy::parse_property_lines.
+export function renderPropertyLines(props) {
+  return normalizeProperties(props).map((p) => {
+    const parts = [`id: ${p.id}`, `node: ${p.node}`, `kind: ${p.kind}`];
+    if (p.owner) parts.push(`owner: ${p.owner}`);
+    parts.push(`revenue: ${p.revenue}`, `upkeep: ${p.upkeep}`);
+    if (p.price > 0) parts.push(`price: ${p.price}`);
+    return parts.join(' | ');
+  }).join('\n');
+}
+
 // Coerce ANY GLM draft value into a serialize-safe string. GLM occasionally
 // emits numbers ("age": 24), arrays, or nulls/objects despite the string
 // schema — calling (v || '').trim() on those crashes CREATE. Arrays join
@@ -150,6 +202,12 @@ export function serializePlayer(draft) {
   if (Object.keys(persona).length) player.persona = persona;
   const backstory = opt(d.backstory);
   if (backstory) player.backstory = backstory;
+  // (2026-08-20 audit) Authored starting holdings — the `.player`
+  // `<properties>` twin (Player-owned seeds on fresh runs; Rust renders
+  // the XML). Previously the entire Rust-side pathway was unreachable
+  // except by hand-editing XML.
+  const authored = normalizeProperties(d.properties);
+  if (authored.length) player.properties = authored;
   // The optional `<inventory>` sibling seed.
   const srcInv = d.inventory && typeof d.inventory === 'object' && !Array.isArray(d.inventory)
     ? d.inventory
@@ -185,7 +243,12 @@ export function serializePlayer(draft) {
 // `<inventory>` sibling; everything static (identity traits, persona,
 // scenario/world prose, custom tags) lives inside the cached root.
 // Returns { xml, intro }.
-export function serializeSimCard(f) {
+//
+// `opts.pinnedId` (edit runs): the loaded card's existing id. A rename
+// changes ONLY the display name — the id (and everything keyed off it:
+// folder, saves/, .codex, memory partition) survives. Fresh creates omit
+// it and derive the id from the name as before (2026-08-20 rename ruling).
+export function serializeSimCard(f, opts = {}) {
   const d = f || {};
   const subtype = text(d.card_type).trim().toLowerCase(); // npc | scenario | world
   const name = text(d.name).trim();
@@ -239,10 +302,15 @@ export function serializeSimCard(f) {
   xml += '  <metadata>\n';
   xml += '  <type>simulation</type>\n';
   if (subtype) xml += `  <subtype>${escapeXml(subtype)}</subtype>\n`;
-  // The client slug rides in-file: the parsed id and the on-disk folder
-  // agree BY CONSTRUCTION (the folder is the display name, the id the slug
-  // — both derive from `name` on the Rust side).
-  xml += `  <id>${escapeXml(slugify(name))}</id>\n`;
+  // The client slug rides in-file. Fresh creates: the parsed id and the
+  // on-disk folder agree BY CONSTRUCTION (the folder is the display name,
+  // the id the slug — both derive from `name` on the Rust side). Edit
+  // runs: the PINNED id wins over the name-derived slug so a rename never
+  // mints a new identity (the backend's `renamingId` contract).
+  const cardId = (typeof opts.pinnedId === 'string' && opts.pinnedId.trim())
+    ? opts.pinnedId.trim()
+    : slugify(name);
+  xml += `  <id>${escapeXml(cardId)}</id>\n`;
   xml += '  </metadata>\n';
 
   xml += `  <identity><![CDATA[\n${identityLines.join('\n')}\n  ]]></identity>\n`;
@@ -252,9 +320,20 @@ export function serializeSimCard(f) {
   }
 
   // scenario/world dedicated prose (Chloe's 2026-08-19 ruling: kept).
+  // (2026-08-20) The PURPOSE is persisted for BOTH branches: the world branch
+  // used to fold directive into <setting> (`setting || directive` — setting
+  // wins, the purpose was LOST on disk and the load modal's Purpose row went
+  // empty for every world card). <setting> now carries the setting alone
+  // (either branch, when present); <plot> carries the directive as a
+  // 'Premise:' line for world + the labeled scenario block — parseSimDraft
+  // (worlds.js) + Rust's render_cache_block both read it back.
+  const setting = text(d.setting).trim();
+  if ((subtype === 'world' || subtype === 'scenario') && setting) {
+    xml += `  <setting><![CDATA[\n${setting}\n  ]]></setting>\n`;
+  }
   if (subtype === 'world') {
-    const setting = text(d.setting).trim() || text(d.directive).trim();
-    if (setting) xml += `  <setting><![CDATA[\n${setting}\n  ]]></setting>\n`;
+    const plot = composeLabeled([['Premise', d.directive]]);
+    if (plot) xml += `  <plot><![CDATA[\n${plot.replace(/\n\n+/g, '\n')}\n  ]]></plot>\n`;
   }
   if (subtype === 'scenario') {
     const plot = composeLabeled([
@@ -315,6 +394,18 @@ export function serializeSimCard(f) {
     if (invLines.length) {
       xml += `\n<inventory><![CDATA[\n${invLines.join('\n')}\n]]></inventory>\n`;
     }
+  }
+
+  // (2026-08-20 audit) The authored `<properties>` sibling — starting
+  // holdings that seed the world economy at play start (ALL subtypes: an
+  // npc card's property belongs to that character; scenario/world keep the
+  // authored owner). Rust reads it via economy::parse_property_lines +
+  // seeds at enter_fable_session. Omitted entirely when empty (the format
+  // rule) — before this, the whole Rust-side seed pathway was unreachable
+  // except by hand-editing XML in the raw editor.
+  const propLines = renderPropertyLines(d.properties);
+  if (propLines) {
+    xml += `\n<properties><![CDATA[\n${propLines}\n]]></properties>\n`;
   }
 
   return { xml, intro };

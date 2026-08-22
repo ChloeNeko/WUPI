@@ -213,7 +213,7 @@ async function renderPlayer(bodyEl, head) {
   head.setName(player && player.name);
 
   const parts = [];
-  parts.push(renderVitals(ps));
+  parts.push(renderVitals(ps, schema));
   const identity = renderIdentity(player);
   if (identity) parts.push(identity);
   const persona = renderPlayerPersona(player);
@@ -289,14 +289,40 @@ function renderAppearance(ps) {
 
 // Vitals: always present. (2026-08-20) Health sits ABOVE stamina — the
 // derived overall tier from the backend (`ps.health`, injected by
-// player_state_get). Gold + Reputation are GONE: reputation is per-faction
-// world-tracker state, and currency is inventory (belt/pack items).
-function renderVitals(ps) {
+// player_state_get). (2026-08-20 Economy) WEALTH sits directly UNDER
+// stamina — pocket coin, the liquid pool of the three-pool money model
+// (property treasuries render in the World tab's Ledger section) — and
+// NET WORTH (pocket + player-owned tills, the kingdom-management figure
+// `economy::player_net_worth` exposes on the payload) renders ONLY when
+// the player actually holds tills (net ≠ pocket — the rail's
+// hide-when-untracked contract). A stale payload without the field falls
+// back to a client-side sum over the live schema's player-owned tills.
+// Reputation stays per-faction world-tracker state, never a vital.
+function renderVitals(ps, schema) {
   const hp = healthInfo(ps);
   const stam = staminaInfo(ps.stamina);
-  return section('Vitals',
-    row('Health', hp.label, hp.cls)
-    + row('Stamina', stam.label, stam.cls));
+  const pocket = Number(ps.wealth || 0);
+  // (2026-08-21) ZERO hardcoded currency: the Wealth row prints the
+  // Rust-formatted `wealth_display` ("0" naked until the tracker learns
+  // the world's unit, "150 dollars" / "12g 5s 4c" after). The label rides
+  // the payload for the rows below; fmtMoney is the fallback mirror.
+  // (2026-08-21, Chloe) The Wealth LABEL renders gold; the value stays
+  // white — money rows across BOTH tabs.
+  const cur = currencyOf(ps, schema);
+  const wealthText = nonEmpty(ps.wealth_display)
+    ? String(ps.wealth_display)
+    : fmtMoney(pocket, cur);
+  let rows = row('Health', hp.label, hp.cls)
+    + row('Stamina', stam.label, stam.cls)
+    + row('Wealth', wealthText, '', 'lbl-gold');
+  let net = Number.isFinite(Number(ps.net_worth)) ? Number(ps.net_worth) : null;
+  if (net === null && schema && schema.properties && typeof schema.properties === 'object') {
+    net = Object.values(schema.properties)
+      .filter((p) => p && p.owner && p.owner.kind === 'player')
+      .reduce((sum, p) => sum + Number(p.treasury_balance || 0), pocket);
+  }
+  if (net !== null && net !== pocket) rows += row('Net Worth', fmtMoney(net, cur));
+  return section('Vitals', rows);
 }
 
 // Active status tags (schema.status_tags): every LIVE effect with its
@@ -423,6 +449,13 @@ async function renderCard(body, head) {
   }
   if (!nonEmpty(card.name)) head.setTitle(cardTabTitle(card.subtype));
   head.setName(card.name);
+  // (2026-08-20 Economy) Best-effort schema fetch, NPC cards ONLY — an npc
+  // card's WEALTH is the sum of its properties' treasuries (an NPC's money
+  // IS their holdings; there is no separate NPC purse). It renders inside
+  // the Inventory section (see below), not a Vitals block.
+  const schema = String(card.subtype || '').toLowerCase() === 'npc'
+    ? await invoke('fable_schema_get').catch(() => null)
+    : null;
   const parts = [];
   // The v2 <identity> line block (present for every card — the KV-cache
   // payload; missing traits are simply absent).
@@ -452,12 +485,22 @@ async function renderCard(body, head) {
   const tags = renderCustomTags(card.custom_tags);
   if (tags) parts.push(tags);
   // The <inventory> sibling (npc cards). STACKED — the clothing list runs long.
+  // (2026-08-21, Chloe) An NPC card's WEALTH row leads the Inventory section —
+  // directly under the divider, directly above Clothing — defaulting to a
+  // naked 0 when the economy is dormant (no properties tracked at all; no
+  // hardcoded unit). Same money-row styling as the Player tab (2026-08-21):
+  // gold label, white value.
   const inv = card.inventory || {};
   const invRows = [
     ['Clothing', inv.clothing], ['Equipped', inv.equipped],
     ['Accessories', inv.accessories], ['Stored', inv.stored],
   ].filter(([, v]) => Array.isArray(v) && v.length).map(([l, v]) => stackRow(l, v.join(', '))).join('');
-  if (invRows) parts.push(section('Inventory', invRows));
+  let invInner = invRows;
+  if (schema) {
+    const till = npcTreasuryTotal(schema, card.card_id);
+    invInner = row('Wealth', fmtMoney(till === null ? 0 : till, currencyOf(schema)), '', 'lbl-gold') + invInner;
+  }
+  if (invInner) parts.push(section('Inventory', invInner));
   body.innerHTML = parts.length ? parts.join('') : emptyBox('No active card.');
 }
 
@@ -541,120 +584,24 @@ async function renderWorld(body) {
   // (2026-08-20) DATE first (the authored/[DATE]-rewritten calendar label —
   // seeded from the card's <world> sibling on a fresh start), then the clock,
   // then TONE (world state since 2026-08-19 — it lives HERE, not on the card
-  // section, which no longer renders the anchor seeds at all). Date + Time
-  // are the two INLINE-EDITABLE rows: click the value to edit (Enter saves,
-  // Esc cancels). Time renders as a 12-hour AM/PM readout — NEVER "Day N"
-  // (the date label carries the day).
+  // section, which no longer renders the anchor seeds at all). Time renders
+  // as a 12-hour AM/PM readout — NEVER "Day N" (the date label carries the
+  // day). (2026-08-21, Chloe) The click-to-edit inline rows are RETIRED —
+  // ALL editing flows through the ✎ raw editor button, nothing else.
   const calLabel = nonEmpty(schema.calendar) ? String(schema.calendar).trim() : '';
-  parts.push(rowEditable('Date', calLabel || '—'));
-  parts.push(rowEditable('Time', mins > 0 ? clockLabel(mins) : '—'));
+  parts.push(row('Date', calLabel || '—'));
+  parts.push(row('Time', mins > 0 ? clockLabel(mins) : '—'));
   if (weather.trim()) parts.push(row('Weather', weather.trim()));
   if (nonEmpty(schema.tone)) parts.push(row('Tone', String(schema.tone).trim()));
   if (node.trim()) parts.push(row('Location', prettify(node)));
+  // (2026-08-20 Economy) The Ledger section — properties, jobs, lifestyle.
+  const ledger = renderLedgerSection(schema);
+  if (ledger) parts.push(ledger);
   if (nonEmpty(schema.summary)) parts.push(proseBlock('Summary', schema.summary));
   if (rumors.length) parts.push(listBlock('Rumors', rumors));
   if (events.length) parts.push(listBlock('Recent events', events.slice(-5)));
   if (worldEnts.length) parts.push(listBlock('Tracked details', worldEnts.map(([k, v]) => `${prettify(k)}: ${v}`)));
   body.innerHTML = parts.length ? parts.join('') : '<div class="fable-drop-empty">World state not yet established.</div>';
-  wireWorldEdits(body, schema);
-}
-
-// ── World-tab inline date/time editing ───────────────────────────────────
-// The sanctioned write path is `fable_json_raw_set` (kind=world) — the same
-// recompose-into-live-schema gate the ✎ raw editor uses. The patch is built
-// from the LIVE schema snapshot (never a stale disk read) and touches ONLY
-// the edited keys; every other world-slice key passes through untouched.
-
-// An editable row: same stacked centered layout as `row()`, but the value
-// swaps to a text input on click.
-function rowEditable(label, val) {
-  return `<div class="fable-drop-row fable-drop-row--edit" data-edit-row="${esc(label)}"><span>${esc(label)}</span><span class="fable-drop-val fable-drop-val--edit" data-edit-val>${esc(val)}</span></div>`;
-}
-
-function wireWorldEdits(bodyEl, schema) {
-  const clock = schema.world_clock || {};
-  const base = Number(clock.current_minutes) || 0;
-  const handlers = {
-    Date: (v) => {
-      const label = String(v || '').replace(/\s+/g, ' ').trim().slice(0, 80);
-      if (!label) return;
-      // Re-stamp the sync marker so the label isn't "stale" against the clock.
-      saveWorldSlice({ calendar: label, calendar_synced_minutes: base });
-    },
-    Time: (v) => {
-      const tod = parseTimeInput(v);
-      if (tod === null) return;
-      // Keep the epoch DAY; replace the time-of-day. minute 0 is the dormant
-      // sentinel, so a midnight set on day 0 nudges to 00:01 (is_set() gate).
-      let next = Math.floor(base / 1440) * 1440 + tod;
-      if (next <= 0) next = 1;
-      const lastTick = Math.min(Number(clock.last_tick_minutes) || 0, next);
-      saveWorldSlice({ world_clock: { current_minutes: next, last_tick_minutes: lastTick } });
-    },
-  };
-  for (const valEl of bodyEl.querySelectorAll('[data-edit-val]')) {
-    const rowEl = valEl.closest('[data-edit-row]');
-    const commit = rowEl && handlers[rowEl.dataset.editRow];
-    if (commit) valEl.addEventListener('click', () => beginInlineEdit(valEl, commit));
-  }
-}
-
-// Swap a value span for a focused text input. Enter commits (calls back with
-// the raw text), Esc/blur cancels. stopPropagation keeps Enter/Esc off the
-// stage-level key handlers while the input is live.
-function beginInlineEdit(valEl, commit) {
-  if (valEl.parentNode.querySelector('.fable-drop-edit-input')) return;
-  const input = document.createElement('input');
-  input.type = 'text';
-  input.className = 'fable-drop-edit-input';
-  input.value = valEl.textContent === '—' ? '' : valEl.textContent;
-  valEl.hidden = true;
-  valEl.parentNode.appendChild(input);
-  input.focus();
-  input.select();
-  let done = false;
-  const finish = (save) => {
-    if (done) return;
-    done = true;
-    const v = input.value;
-    input.remove();
-    valEl.hidden = false;
-    if (save) commit(v);
-  };
-  input.addEventListener('keydown', (e) => {
-    e.stopPropagation();
-    if (e.key === 'Enter') { e.preventDefault(); finish(true); }
-    else if (e.key === 'Escape') { e.preventDefault(); finish(false); }
-  });
-  input.addEventListener('blur', () => finish(false));
-}
-
-// "10:30", "10:30 AM", "10:30pm", "22:05", "9am" → minute-of-day. Null when
-// unparseable (the edit silently no-ops — the row keeps its current value).
-function parseTimeInput(v) {
-  const m = String(v || '').trim().match(/^(\d{1,2})(?::(\d{2}))?\s*(am|pm)?$/i);
-  if (!m) return null;
-  let h = parseInt(m[1], 10);
-  const min = m[2] ? parseInt(m[2], 10) : 0;
-  if (min > 59) return null;
-  const mer = m[3] ? m[3].toLowerCase() : null;
-  if (mer) {
-    if (h < 1 || h > 12) return null;
-    h = (h % 12) + (mer === 'pm' ? 12 : 0);
-  } else if (h > 23) {
-    return null;
-  }
-  return h * 60 + min;
-}
-
-async function saveWorldSlice(patch) {
-  try {
-    await invoke('fable_json_raw_set', { kind: 'world', json: JSON.stringify(patch) });
-  } catch (err) {
-    console.warn('[tab-rail] world slice save failed', err);
-    return;
-  }
-  renderActive();
 }
 
 // ── NPC tab (READ-ONLY) ─────────────────────────────────────────────────
@@ -730,6 +677,49 @@ function prettify(k) {
 function prettifyNpcKey(k) {
   return prettySlug(String(k).replace(/^npc\./, ''));
 }
+// (2026-08-21 economy addendum) Money formatting — the JS MIRROR of Rust's
+// `economy::format_money`/`money_plain` (tab-rail keeps no build step; the
+// hot-path rows print Rust-formatted `wealth_display` strings directly, this
+// mirror serves only rows the drawer computes itself: per-property
+// till/net figures + the stale-payload fallback). ZERO hardcoded units: an
+// empty label renders the naked base-unit integer ("0"); a flat label
+// renders "150 dollars"; a 2-3 tier slash label (gold/silver/copper,
+// highest first) splits by modulo at render time only — 3 tiers step
+// 1:10:100 (1254 → "12g 5s 4c"), 2 tiers step 1:100 (1254 → "12d 54c"),
+// leading zero tiers suppressed, the base tier always shown.
+function fmtMoney(n, label) {
+  const sign = n < 0 ? '-' : '';
+  const abs = Math.abs(Math.floor(Number(n) || 0));
+  const lbl = String(label || '').trim();
+  const tiers = lbl.split('/').map((t) => t.trim()).filter(Boolean);
+  if (tiers.length < 2 || tiers.length > 3) {
+    return lbl ? `${n} ${lbl}` : `${n}`;
+  }
+  const values = tiers.length === 3
+    ? [Math.floor(abs / 100), Math.floor(abs / 10) % 10, abs % 10]
+    : [Math.floor(abs / 100), abs % 100];
+  const abbrev = (t) => {
+    const c = t.split('').find((ch) => /[a-z0-9]/i.test(ch));
+    return c ? c.toLowerCase() : '?';
+  };
+  let start = values.findIndex((v) => v > 0);
+  if (start < 0) start = values.length - 1;
+  const body = values.slice(start)
+    .map((v, i) => `${v}${abbrev(tiers[start + i])}`)
+    .join(' ');
+  return `${sign}${body}`;
+}
+// The world's currency label from whichever payload is in hand — the
+// player_state payload carries it (Rust insert) and the full schema
+// serializes it; empty string when unknown (naked integers).
+function currencyOf(...sources) {
+  for (const src of sources) {
+    if (src && typeof src === 'object' && nonEmpty(src.currency_label)) {
+      return String(src.currency_label).trim();
+    }
+  }
+  return '';
+}
 // BodyPart wire keys are PascalCase ("LeftUpperArm") → "Left Upper Arm".
 function pascalToWords(k) {
   return String(k || '').replace(/([a-z0-9])([A-Z])/g, '$1 $2');
@@ -785,11 +775,13 @@ function healthInfo(ps) {
 // payload fallback only): core floor from Head/Neck/UpperTorso worst color
 // (yellow→Good, orange→Fair, red→Poor, purple→Critical, black core =
 // Deceased — checked FIRST, death outranks everything), non-core points
-// Yellow=1/Orange=2/Red=4/Purple=8 (Black = 0), banded 0-7/8-11/12-17/
-// 18-23/24+ → Excellent/Good/Fair/Poor/Critical; the worse of the two
-// halves wins. Body keys are the PascalCase serde wire names.
+// Yellow=1/Orange=2/Red=4/Purple=8/Black=16 (Black = 16 since the 2026-08-20
+// audit unification — a lone amputation reads Fair, a permanent floor, never
+// Excellent), banded 0-7/8-11/12-17/18-23/24+ → Excellent/Good/Fair/Poor/
+// Critical; the worse of the two halves wins. Body keys are the PascalCase
+// serde wire names.
 function derivedHealth(bodyMap) {
-  const pts = { yellow: 1, orange: 2, red: 4, purple: 8 };
+  const pts = { yellow: 1, orange: 2, red: 4, purple: 8, black: 16 };
   const coreFloor = { yellow: 'Good', orange: 'Fair', red: 'Poor', purple: 'Critical' };
   const order = ['Critical', 'Poor', 'Fair', 'Good', 'Excellent'];
   const worse = (a, b) => (order.indexOf(a) <= order.indexOf(b) ? a : b);
@@ -836,10 +828,77 @@ function clockLabel(minutes) {
   if (h === 0) h = 12;
   return `${h}:${String(min).padStart(2, '0')} ${mer}`;
 }
+// (2026-08-20 Economy) Owner wire → the owning npc id, else null. The
+// backend serializes Owner adjacently tagged: {"kind":"npc","id":"liam"} /
+// {"kind":"player"} / {"kind":"unowned"}.
+function ownerNpcId(owner) {
+  return (owner && typeof owner === 'object' && owner.kind === 'npc' && nonEmpty(owner.id))
+    ? String(owner.id)
+    : null;
+}
+
+// An NPC card's wealth — the SUM of its properties' treasuries (an NPC's
+// money IS their holdings; there is no separate NPC purse). (2026-08-20
+// audit) Returns NULL while the economy is dormant (no properties at all)
+// so the caller's hide-when-untracked guard actually fires — it used to
+// return 0 unconditionally, rendering a dead "Vitals / Wealth 0" section
+// on every NPC card. A live economy where this NPC owns nothing still
+// shows a true 0 (naked — no hardcoded unit, 2026-08-21).
+function npcTreasuryTotal(schema, npcId) {
+  if (!schema || !npcId || !schema.properties || typeof schema.properties !== 'object') return null;
+  if (!Object.keys(schema.properties).length) return null;
+  return Object.values(schema.properties)
+    .filter((p) => p && ownerNpcId(p.owner) === String(npcId))
+    .reduce((sum, p) => sum + Number(p.treasury_balance || 0), 0);
+}
+
+// (2026-08-20 Economy) The World tab's Ledger section — each property's
+// till + net/day (computed at its node's prosperity, mirroring the Rust
+// curve), the deficit marker, NPC-owner tags, then the lifestyle tier +
+// jobs. Hidden entirely when the economy is dormant (no properties, no
+// jobs, Squatter).
+function renderLedgerSection(schema) {
+  const props = (schema && schema.properties && typeof schema.properties === 'object')
+    ? Object.entries(schema.properties)
+    : [];
+  const ps = (schema && schema.player_state) || {};
+  const jobs = Array.isArray(ps.jobs) ? ps.jobs : [];
+  const lifestyle = String(ps.lifestyle || '').toLowerCase();
+  if (!props.length && !jobs.length && (!lifestyle || lifestyle === 'squatter')) return '';
+  const prosperityOf = (nodeId) => {
+    const nodes = (schema.travel_graph && Array.isArray(schema.travel_graph.nodes))
+      ? schema.travel_graph.nodes
+      : [];
+    const n = nodes.find((x) => x && x.id === nodeId);
+    return (n && Number.isFinite(Number(n.prosperity))) ? Number(n.prosperity) : 100;
+  };
+  const rows = [];
+  const cur = currencyOf(schema);
+  for (const [id, p] of props) {
+    const pct = prosperityOf(p.node_id);
+    const net = Math.floor((Number(p.daily_revenue || 0) * pct) / 100)
+      - Number(p.daily_upkeep || 0);
+    let val = `${fmtMoney(Number(p.treasury_balance || 0), cur)} · ${net >= 0 ? '+' : ''}${fmtMoney(net, cur)}/day`;
+    const deficit = Number(p.deficit_days || 0) > 0;
+    if (deficit) val += ` · BANKRUPT ${p.deficit_days}d`;
+    const owner = ownerNpcId(p.owner);
+    if (owner) val += ` · ${prettify(owner)}`;
+    rows.push(row(`${id} @ ${p.node_id}`, val, deficit ? 'bad' : ''));
+  }
+  if (lifestyle && lifestyle !== 'squatter') rows.push(row('Lifestyle', prettify(lifestyle)));
+  for (const j of jobs) {
+    rows.push(row('Job', `${j.title} @ ${j.node_id} +${fmtMoney(Number(j.daily_wage || 0), cur)}/day`));
+  }
+  return section('Ledger', rows.join(''));
+}
+
 // ─ read-only block builders (reused by Card / World / Codex / NPC / Player) ─
 // `cls` (optional) adds a severity class to the value (bad/warn/good/hp-*).
-function row(label, val, cls) {
-  return `<div class="fable-drop-row"><span>${esc(label)}</span><span class="fable-drop-val ${cls || ''}">${esc(val)}</span></div>`;
+// `labelCls` (optional) adds a class to the LABEL span — used by the money
+// rows (Wealth): the label renders gold, the value stays white (2026-08-21,
+// Chloe).
+function row(label, val, cls, labelCls) {
+  return `<div class="fable-drop-row"><span class="${labelCls || ''}">${esc(label)}</span><span class="fable-drop-val ${cls || ''}">${esc(val)}</span></div>`;
 }
 // STACKED row (label ABOVE value) for long-prose fields — persona lines,
 // inventory lists, custom tags — where a side-by-side row put a paragraph

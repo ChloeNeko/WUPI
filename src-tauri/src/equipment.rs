@@ -1800,7 +1800,7 @@ mod tests {
                 inner: None,
             },
         );
-        let rendered = ps.render_for_prompt().expect("non-default state renders");
+        let rendered = ps.render_for_prompt("").expect("non-default state renders");
         assert!(rendered.contains("equipped:"), "equipped block emitted");
         assert!(rendered.contains("Chest: Heavy Cloak"), "outer layer shown");
         assert!(rendered.contains("Main Hand: Iron Sword (+2 ATK)"), "stats in parens");
@@ -1812,7 +1812,7 @@ mod tests {
         // Only stamina differs from default → no equipped block at all.
         let mut ps = PlayerState::default();
         ps.stamina = crate::player_state::Stamina::Winded;
-        let rendered = ps.render_for_prompt().expect("non-default renders");
+        let rendered = ps.render_for_prompt("").expect("non-default renders");
         assert!(!rendered.contains("equipped:"), "empty equipment → no equipped block");
     }
 
@@ -2657,11 +2657,11 @@ mod tests {
             EquipSlot::Chest,
             SlotLayers { outer: Some(item("Wool Shawl")), inner: Some(item("Silk Camisole")) },
         );
-        let ungated = ps.render_for_prompt().expect("renders");
+        let ungated = ps.render_for_prompt("").expect("renders");
         assert!(!ungated.contains("Cotton Drawers"), "concealed wear hidden by default");
         assert!(!ungated.contains("Silk Camisole"));
         assert!(ungated.contains("Legs: Pleated Skirt"));
-        let gated = ps.render_for_prompt_with_beneath(true).expect("renders");
+        let gated = ps.render_for_prompt_with_beneath(true, "").expect("renders");
         assert!(gated.contains("beneath (visible this moment): "), "the gated line renders");
         assert!(gated.contains("Cotton Drawers"), "the REAL tracked garment is revealed");
         assert!(gated.contains("Silk Camisole"));

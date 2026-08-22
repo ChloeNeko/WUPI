@@ -1,17 +1,22 @@
-//! Crash reports ONLY — session logging is disabled (2026-08-20 Chloe
-//! ruling).
+//! Crash reports + ONE post-loading session log (2026-08-20 Chloe rulings).
 //!
 //! History: the 2026-08-19 posture teed every formatted line into
 //! `%TEMP%\wupi.log` + a per-boot `logs/wupi-YYYYMMDD-HHMMSS.log` mirror
 //! (stamped at launch, one file per process — restarts and updater
 //! relaunches each minted another, which read as "multiple logs for one
-//! session"). 2026-08-20: Chloe ruled launch-time logging OFF entirely —
-//! the app creates NO log file when it boots. The surviving surface is the
-//! crash-report system:
+//! session"). 2026-08-20 morning: Chloe ruled launch-time logging OFF —
+//! nothing logs (and no file exists) until the frontend confirms the first
+//! real screen via the `logs_begin` IPC. 2026-08-20 evening amendment:
+//! the ring-only interim build wrote NO session file at all and Chloe
+//! flagged the empty `logs/` folder as a bug — so `logs_begin` now also
+//! mints exactly ONE session file, `logs/wupi-YYYYMMDD-HHMMSS.log`, and
+//! every formatted line tees to it (line-flushed) AND to the crash ring.
+//! Boots that die before the first real screen (crash-and-restart loops,
+//! updater relaunches that never reach the reveal) still mint nothing.
+//! Boot retention keeps the newest [`KEEP_SESSION_FILES`] session logs.
 //!
 //! - The last [`RING_LINES`] verbose tracing lines live in a fixed-size RAM
-//!   `VecDeque` fed by [`RingWriter`] (the tracing subscriber's only sink).
-//!   RAM-only — nothing touches disk during normal operation.
+//!   `VecDeque` fed by the [`SessionWriter`] tee (crash-report tail source).
 //! - [`dump_crash`] — wired to the global panic hook in lib.rs and the
 //!   SD-abort callback in scene_art.rs — writes
 //!   `logs/crash-YYYYMMDD-HHMMSS.log` containing the panic message plus
@@ -20,11 +25,10 @@
 //!   path; the raw backtrace stays in `%TEMP%\wupi_panic.txt` (the
 //!   pre-existing hook output).
 //!
-//! Retention at boot: `crash-*.log` newest [`KEEP_CRASH_FILES`] kept. The
-//! retired mirror system's own minted `wupi-*.log` files are swept to ZERO
-//! (they are this module's artifacts, identified by the exact minted-name
-//! shape — see [`is_minted_log_name`]); anything else a user keeps in
-//! `logs/`, including their own `wupi-notes.log`, is untouchable. The
+//! Retention at boot: `crash-*.log` newest [`KEEP_CRASH_FILES`] kept,
+//! `wupi-*.log` newest [`KEEP_SESSION_FILES`] kept (both minted-shape
+//! matched only — see [`is_minted_log_name`]; anything else a user keeps
+//! in `logs/`, including their own `wupi-notes.log`, is untouchable). The
 //! retired diagnostics system's `README.txt` is removed only when its
 //! content carries our generated header — a user-authored README survives.
 //! No README is ever written into `logs/`.
@@ -42,6 +46,8 @@ use chrono::Local;
 
 /// Crash reports to retain (newest kept, oldest pruned).
 const KEEP_CRASH_FILES: usize = 10;
+/// Session logs (`wupi-*.log`) to retain at boot (newest kept).
+const KEEP_SESSION_FILES: usize = 10;
 /// RAM ring buffer size — the crash-report tail.
 const RING_LINES: usize = 100;
 /// Hard cap for the panic line in a crash report (one line, no prose wall).
@@ -53,7 +59,7 @@ const RING_PARTIAL_MAX_BYTES: usize = 16 * 1024;
 struct CrashLog {
     dir: PathBuf,
     /// The last [`RING_LINES`] formatted verbose lines, RAM-only, fed by
-    /// [`RingWriter`]. The single crash-report source.
+    /// [`SessionWriter`]. The single crash-report source.
     ring: VecDeque<String>,
 }
 
@@ -78,10 +84,10 @@ pub fn init(install_root: &Path) {
         return;
     }
     prune_minted(&dir, "crash-", KEEP_CRASH_FILES);
-    // One-time sweep of the retired mirror system's own minted files (keep
-    // 0 — session logging is off; the folder should hold only crash
-    // reports). Minted-shape-matched, so user-kept files never match.
-    prune_minted(&dir, "wupi-", 0);
+    // Session-log retention (2026-08-20 evening amendment): keep the newest
+    // KEEP_SESSION_FILES `wupi-*.log` files — `logs_begin` mints one per
+    // session. Minted-shape-matched, so user-kept files never match.
+    prune_minted(&dir, "wupi-", KEEP_SESSION_FILES);
     // Remove the README.txt the retired diagnostics system used to write —
     // CONTENT-VERIFIED against our generated header so a user's own
     // README.txt survives (an unconditional delete could eat a user file).
@@ -97,17 +103,55 @@ pub fn init(install_root: &Path) {
 /// user-authored file of the same name.
 const README_MARKER: &str = "WUPI diagnostic logs";
 
-/// The tracing subscriber's ONLY sink (2026-08-20): complete lines feed the
-/// crash RAM ring; no file, no console. Fail-silent — a panic in here while
-/// unwinding a panic would abort the process.
-pub struct RingWriter {
+/// The session log file opened by [`begin_session_logging`] — every
+/// formatted complete line is appended here (line-flushed) in addition to
+/// feeding the RAM ring. `None` until logging begins, or forever when the
+/// file couldn't be created (ring-only degraded mode — logging must never
+/// take the app down).
+static SESSION_FILE: OnceLock<Option<Mutex<std::fs::File>>> = OnceLock::new();
+
+/// Mint `logs/wupi-YYYYMMDD-HHMMSS.log` (unique-suffixed on collision) for
+/// this session's tee sink. Best-effort: `None` when the dir/file is
+/// unwritable.
+fn open_session_file() -> Option<Mutex<std::fs::File>> {
+    let guard = CRASH.get()?;
+    let cl = guard.lock().ok()?;
+    let stamp = Local::now().format("%Y%m%d-%H%M%S").to_string();
+    let name = unique_prefixed_name(&cl.dir, "wupi", &stamp);
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(cl.dir.join(name))
+        .ok()
+        .map(Mutex::new)
+}
+
+/// Append + flush complete lines to the session file, if one exists.
+/// Fail-silent per line-batch (a full disk downgrades to ring-only).
+fn append_session_lines(lines: &[String]) {
+    use std::io::Write as _;
+    let Some(Some(file)) = SESSION_FILE.get() else { return };
+    let Ok(mut guard) = file.lock() else { return };
+    let f: &mut std::fs::File = &mut guard;
+    for line in lines {
+        let _ = writeln!(f, "{line}");
+    }
+    // Per-batch flush: a hard kill (updater exit(0), crash) must never
+    // lose the lines that were already formatted.
+    let _ = f.flush();
+}
+
+/// The tracing subscriber's ONLY sink (2026-08-20): complete lines tee into
+/// the crash RAM ring AND the session file. Fail-silent — a panic in here
+/// while unwinding a panic would abort the process.
+pub struct SessionWriter {
     /// Partial-line accumulator. One writer is built per tracing event and
     /// fmt events end with `\n`, so lines complete per event; the buffer
     /// only ever holds a transient partial.
     line: String,
 }
 
-impl RingWriter {
+impl SessionWriter {
     pub fn new() -> Self {
         Self {
             line: String::new(),
@@ -115,15 +159,19 @@ impl RingWriter {
     }
 }
 
-impl Default for RingWriter {
+impl Default for SessionWriter {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl Write for RingWriter {
+impl Write for SessionWriter {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        ring_extend(absorb_complete_lines(&mut self.line, buf));
+        let lines = absorb_complete_lines(&mut self.line, buf);
+        if !lines.is_empty() {
+            ring_extend(&lines);
+            append_session_lines(&lines);
+        }
         Ok(buf.len())
     }
 
@@ -132,43 +180,44 @@ impl Write for RingWriter {
     }
 }
 
-/// Install the (ring-only) global tracing subscriber — the single logging
-/// start point (2026-08-20 Chloe ruling). NOTHING logs during early boot:
-/// no subscriber exists at process start, so every tracing event before
-/// this call is dropped — the LOADING OS screen, the boot updater gate,
-/// and the model load all run silent (and file-less: no `%TEMP%\wupi.log`
-/// is ever created). The frontend invokes the `logs_begin` IPC the moment
-/// the first real screen is reached — the OS home reveal
-/// (`endLoadingScreen` in script.js) for wupi.exe, the Fable-entry boot
-/// teardown for fable.exe — and that lands here. Once-only: a second call
-/// is a no-op (`.init()` panics on a second global default). From this
-/// point the RAM ring accumulates the tail that `dump_crash` writes ONLY
-/// on an actual crash.
+/// Install the global tracing subscriber — the single logging start point
+/// (2026-08-20 Chloe ruling, evening amendment). NOTHING logs during early
+/// boot: no subscriber exists at process start, so every tracing event
+/// before this call is dropped — the LOADING OS screen, the boot updater
+/// gate, and the model load all run silent (and file-less: no
+/// `%TEMP%\wupi.log` is ever created). The frontend invokes the
+/// `logs_begin` IPC the moment the first real screen is reached — the OS
+/// home reveal (`endLoadingScreen` in script.js) for wupi.exe, the
+/// Fable-entry boot teardown for fable.exe — and that lands here. At that
+/// moment exactly ONE session file (`logs/wupi-*.log`) is minted and every
+/// subsequent line tees to it plus the crash ring. Once-only: a second
+/// call is a no-op (`.init()` panics on a second global default).
 pub fn begin_session_logging() {
     static BEGUN: OnceLock<()> = OnceLock::new();
     if BEGUN.set(()).is_err() {
         return;
     }
+    let _ = SESSION_FILE.set(open_session_file());
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("debug")),
         )
         .with_target(false)
-        .with_writer(|| RingWriter::new())
+        .with_writer(|| SessionWriter::new())
         .init();
     tracing::info!("=== WUPI session logging begun (post-boot) ===");
 }
 
 /// Push complete lines into the RAM ring, evicting past [`RING_LINES`].
-fn ring_extend(lines: Vec<String>) {
+fn ring_extend(lines: &[String]) {
     if lines.is_empty() {
         return;
     }
     let Some(cl) = CRASH.get() else { return };
     let Ok(mut w) = cl.lock() else { return };
     for line in lines {
-        w.ring.push_back(line);
+        w.ring.push_back(line.clone());
         while w.ring.len() > RING_LINES {
             w.ring.pop_front();
         }
@@ -193,10 +242,10 @@ fn absorb_complete_lines(buf: &mut String, bytes: &[u8]) -> Vec<String> {
 
 /// Crash-report dump: write `logs/crash-YYYYMMDD-HHMMSS.log` containing
 /// the panic message + the RAM ring tail (the last verbose log lines).
-/// The ONLY file this module ever writes (2026-08-20: session logging is
-/// disabled — no per-boot log exists). Best-effort: failures are swallowed
-/// (`%TEMP%\wupi_panic.txt`, written by lib.rs's hook, is the independent
-/// backstop with the full backtrace).
+/// Best-effort: failures are swallowed (`%TEMP%\wupi_panic.txt`, written by
+/// lib.rs's hook, is the independent backstop with the full backtrace).
+/// The session file `logs/wupi-*.log` (when logging had begun) carries the
+/// fuller session; this report is the crash-time excerpt.
 pub fn dump_crash(panic_info: &str) {
     let Some(guard) = CRASH.get() else { return };
     let w = match guard.lock() {
@@ -206,7 +255,7 @@ pub fn dump_crash(panic_info: &str) {
     let stamp = Local::now().format("%Y%m%d-%H%M%S").to_string();
     let name = unique_prefixed_name(&w.dir, "crash", &stamp);
     let mut body = format!(
-        "==== WUPI v{} CRASH {} ====\npanic: {}\nfull backtrace: %TEMP%\\wupi_panic.txt\nsession logging is OFF (2026-08-20) — this ring tail is the only log\n\n---- last {} verbose log lines (RAM ring buffer) ----\n",
+        "==== WUPI v{} CRASH {} ====\npanic: {}\nfull backtrace: %TEMP%\\wupi_panic.txt\nfull session (if begun): logs/wupi-*.log\n\n---- last {} verbose log lines (RAM ring buffer) ----\n",
         env!("CARGO_PKG_VERSION"),
         Local::now().format("%Y-%m-%d %H:%M:%S%.3f"),
         one_line_capped(panic_info),
@@ -352,7 +401,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("wupi_logs_test_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         init(&dir);
-        ring_extend(vec!["line-1".into(), "line-2".into()]);
+        ring_extend(&["line-1".to_string(), "line-2".to_string()]);
         dump_crash("boom: test panic\nsecond line");
         let mut found = Vec::new();
         for e in std::fs::read_dir(&dir).into_iter().flatten().flatten() {

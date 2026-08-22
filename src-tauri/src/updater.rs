@@ -22,8 +22,9 @@
 //! 4. Emit `update-relaunching` and `std::process::exit(0)`. The exit is the
 //!    whole point — it releases wupi.exe's locks. The apply IPC therefore NEVER
 //!    returns to the frontend on success (the process is gone); the frontend
-//!    treats it as fire-and-forget, and the relaunched wupi.exe reads
-//!    `data/_update_result.json` on next boot to surface success/failure.
+//!    treats it as fire-and-forget, and every subsequent boot deletes the
+//!    updater's `%TEMP%` presence marker (the takeover-guard signal — no
+//!    outcome is surfaced anywhere; 2026-08-20 Chloe rulings).
 //!
 //! The `data/_update/` staging folder is DELETED COMPLETELY by the updater
 //! binary when it finishes (`purge::purge_update_staging`, retried across
@@ -62,12 +63,14 @@ use serde::{Deserialize, Serialize};
 const MANIFEST_URL: &str = "https://chloeneko.github.io/WUPI/updater/latest.json";
 
 /// The result of [`check_for_updates`]: a new version is available, with its
-/// version string, the portable-zip URL, and the release notes.
+/// version string, the portable-zip URL, the release notes, and the optional
+/// hex SHA-256 over the zip (verified post-download when present).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UpdateInfo {
     pub version: String,
     pub url: String,
     pub notes: String,
+    pub sha256: Option<String>,
 }
 
 /// The manifest shape published by `release.cjs`. Mirrors the old Tauri
@@ -83,6 +86,13 @@ struct Manifest {
 #[derive(Debug, Deserialize)]
 struct PlatformEntry {
     url: Option<String>,
+    // (2026-08-20) Optional hex SHA-256 over the portable zip, same digest
+    // HF exposes as x-file-sha256. Present → hard post-download gate;
+    // absent → warn + proceed (the unsigned-manifest transition window).
+    // minisign verification stays deferred — this closes corrupted/wrong-
+    // payload installs, not a malicious manifest (that needs the key
+    // ceremony).
+    sha256: Option<String>,
     // `signature` ignored — we don't verify minisig (deferred).
 }
 
@@ -135,10 +145,12 @@ pub async fn check_for_updates(
         .url
         .clone()
         .ok_or("manifest windows-x86_64 entry has no url")?;
+    let sha256 = entry.sha256.clone();
     Ok(Some(UpdateInfo {
         version: manifest.version,
         url,
         notes: manifest.notes.unwrap_or_default(),
+        sha256,
     }))
 }
 
@@ -165,6 +177,14 @@ pub async fn perform_update(
 
     // ── Phase 1: download with progress events ────────────────────────────
     download_with_progress(&update.url, &zip_part, app_handle).await?;
+    // ── Phase 1b: integrity gate (2026-08-20) ─────────────────────────────
+    // The manifest's optional `sha256` over the zip. Present → hard gate: a
+    // mismatched or corrupted payload is deleted + aborted BEFORE the atomic
+    // rename (a bad zip must never reach the updater's overwrite pass).
+    // Absent → warn + proceed (unsigned-manifest transition window; minisign
+    // verification remains deferred pending the key ceremony — until a hash
+    // ships, HTTPS is the only transport integrity).
+    verify_download_sha256(&zip_part, update.sha256.as_deref()).await?;
     // Atomic rename: .part → final. A crash leaves only the .part; the next
     // attempt re-downloads.
     std::fs::rename(&zip_part, &zip_final).map_err(|e| format!("rename .part: {e}"))?;
@@ -216,9 +236,9 @@ pub async fn perform_update(
 
     let _ = app_handle.emit("update-relaunching", &update);
 
-    // (2026-08-20) No log flush before the hard exit: session logging is
-    // ring-only RAM (logs.rs) — there is no file sink to top up, and crash
-    // files are written synchronously at crash time.
+    // (2026-08-20) No log flush before the hard exit: this apply runs at
+    // the BOOT GATE — before logs_begin — so no session file exists yet;
+    // once logging has begun elsewhere, logs.rs flushes per line anyway.
 
     // Exit immediately — releases every OS file lock on the install so the
     // updater's overwrite succeeds. The updater waits on our PID (passed above)
@@ -227,40 +247,20 @@ pub async fn perform_update(
     std::process::exit(0);
 }
 
-/// The outcome the updater.exe writes to `data/_update_result.json` for the
-/// relaunched wupi.exe to read on its next boot (so the UI can show "Updated
-/// to vX.Y.Z" or surface the error). Mirrors the JSON the updater binary writes.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct UpdateResult {
-    pub ok: bool,
-    pub version: Option<String>,
-    pub error: Option<String>,
-    /// Whether the updater's post-apply relaunch produced a living wupi.exe
-    /// (2026-08-18 self-healing-relaunch fix): `None` = not attempted
-    /// (copy-phase-failure policy) or marker written by an older updater;
-    /// `Some(false)` = the update applied but every spawn attempt failed —
-    /// the boot toast tells the user this was a manual launch.
-    #[serde(default)]
-    pub relaunched: Option<bool>,
-}
-
-/// Read + DELETE `data/_update_result.json` under `exe_dir`. Returns `None`
-/// when the marker is absent (the common boot — no update just ran). The read
-/// is destructive so the toast fires exactly once. A malformed marker is
-/// dropped (returns `None`) — we never let a bad marker block boot.
-pub fn read_and_clear_result(exe_dir: &Path) -> Option<UpdateResult> {
-    let marker = exe_dir.join("data").join("_update_result.json");
-    let contents = std::fs::read_to_string(&marker).ok()?;
-    let result: UpdateResult = match serde_json::from_str(&contents) {
-        Ok(r) => r,
-        Err(e) => {
-            tracing::warn!(?e, "updater: malformed _update_result.json — dropping");
-            let _ = std::fs::remove_file(&marker);
-            return None;
-        }
-    };
-    let _ = std::fs::remove_file(&marker);
-    Some(result)
+/// Delete the updater's marker files if present. The `%TEMP%` marker
+/// (`wupi_update_result.json`) is PRESENCE-ONLY — the updater's
+/// user-takeover signal (it touches the empty file before its relaunch
+/// loop; a boot from this install deleting it = the user took over) — and
+/// carries no outcome: NO update result is ever surfaced to the UI
+/// (2026-08-20 Chloe ruling — a crashed update leaves crash logs; the
+/// updater's `%TEMP%` log is the apply-side trail). `exe_dir` is used ONLY
+/// for the one-hop legacy cleanup: the prior version's updater wrote
+/// `data/_update_result.json`, and this is the only code that will ever
+/// remove such a leftover — after one update hop + one boot the legacy
+/// path can never reappear, so the install folder stays marker-free.
+pub fn clear_result_markers(exe_dir: &Path) {
+    let _ = std::fs::remove_file(std::env::temp_dir().join("wupi_update_result.json"));
+    let _ = std::fs::remove_file(exe_dir.join("data").join("_update_result.json"));
 }
 
 /// Resolve `<exe_dir>` — the directory containing `wupi.exe`.
@@ -367,6 +367,13 @@ async fn download_with_progress(
 
     let client = reqwest::Client::builder()
         .user_agent("wupi-updater")
+        // (2026-08-20) Connect cap only — the GB-scale body must have NO total
+        // timeout (it would kill legit slow links); the per-chunk idle guard
+        // in the stream loop below is the hang net, mirroring the narrator
+        // path's TTFT/idle discipline. reqwest's default is NO timeout at
+        // all, and this download runs at the boot gate: a hung connection
+        // wedges the entire boot until process kill.
+        .connect_timeout(std::time::Duration::from_secs(30))
         .build()
         .map_err(|e| format!("build client: {e}"))?;
     let resp = client
@@ -391,12 +398,27 @@ async fn download_with_progress(
     let mut stream = resp.bytes_stream();
     let mut written: u64 = 0;
     let mut last_pct: u64 = 0;
-    while let Some(chunk) = stream
-        .next()
-        .await
-        .transpose()
-        .map_err(|e| format!("zip stream: {e}"))?
-    {
+    // (2026-08-20) Idle guard: a connection that accepts then goes silent
+    // stalls stream.next() forever under reqwest's no-timeout default. A
+    // healthy CDN serving a GB file streams chunks continuously; 60s without
+    // a byte = dead link, fail loudly so the boot gate can surface it.
+    const CHUNK_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+    loop {
+        let chunk = match tokio::time::timeout(CHUNK_IDLE_TIMEOUT, stream.next()).await {
+            Ok(c) => c,
+            Err(_) => {
+                return Err(format!(
+                    "zip stream stalled: no data for {}s (dead link?)",
+                    CHUNK_IDLE_TIMEOUT.as_secs()
+                ))
+            }
+        };
+        let Some(chunk) = chunk
+            .transpose()
+            .map_err(|e| format!("zip stream: {e}"))?
+        else {
+            break;
+        };
         file.write_all(&chunk)
             .await
             .map_err(|e| format!("write chunk: {e}"))?;
@@ -420,5 +442,58 @@ async fn download_with_progress(
         }
     }
     file.flush().await.map_err(|e| format!("flush: {e}"))?;
+    Ok(())
+}
+
+/// Streamed SHA-256 over a file (1 MB chunks — a 2-4 GB zip never loads whole
+/// into RAM). Returns lowercase hex.
+async fn sha256_file(path: &Path) -> Result<String, String> {
+    use sha2::{Digest, Sha256};
+    use tokio::io::AsyncReadExt;
+
+    let mut file = tokio::fs::File::open(path)
+        .await
+        .map_err(|e| format!("open for hash: {e}"))?;
+    let mut hasher = Sha256::new();
+    let mut buf = vec![0u8; 1024 * 1024];
+    loop {
+        let n = file
+            .read(&mut buf)
+            .await
+            .map_err(|e| format!("hash read: {e}"))?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    let digest = hasher.finalize();
+    let mut out = String::with_capacity(digest.len() * 2);
+    for b in digest {
+        out.push_str(&format!("{b:02x}"));
+    }
+    Ok(out)
+}
+
+/// Post-download integrity gate. `expected` = the manifest's hex sha256.
+/// `None` → warn + proceed (transition window); malformed → hard error;
+/// mismatch → delete the .part + hard error (the updater must never receive
+/// a corrupted payload).
+async fn verify_download_sha256(part: &Path, expected: Option<&str>) -> Result<(), String> {
+    let Some(expected) = expected else {
+        tracing::warn!("update manifest carries no sha256 — zip integrity unverified (HTTPS only; add the field to release.cjs's manifest when convenient)");
+        return Ok(());
+    };
+    let expected = expected.trim().to_ascii_lowercase();
+    if expected.len() != 64 || !expected.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err("manifest sha256 is malformed (expected 64 hex chars)".into());
+    }
+    let actual = sha256_file(part).await?;
+    if actual != expected {
+        let _ = std::fs::remove_file(part);
+        return Err(format!(
+            "update zip checksum mismatch (expected {expected}, got {actual}) — download discarded"
+        ));
+    }
+    tracing::info!("update zip checksum verified");
     Ok(())
 }

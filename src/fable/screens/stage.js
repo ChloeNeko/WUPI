@@ -185,17 +185,20 @@ export function buildStage() {
     <div class="fable-feed-viewport">
       <div class="fable-feed" data-feed></div>
     </div>
-    <!-- Typing indicator (re-instated 2026-08-19, subtype-aware): a small
-         label pinned just above the input row while a turn is in flight.
-         npc-subtype cards read "(Name) is currently typing..."; scenario/world
-         cards read "Narrator is currently thinking...". Toggled via the
-         .is-visible class from setGenerating (the onTurnStart/onTurnEnd
-         hooks) — it covers the WHOLE turn, including the silent tracker
-         stage before the first chunk streams. -->
-    <div class="fable-typing-indicator" data-typing-indicator aria-hidden="true">
-      <span class="fable-typing-indicator__text" data-typing-text></span>
-    </div>
     <form class="fable-input-row" data-input-form>
+      <!-- Typing indicator (re-instated 2026-08-19, subtype-aware): a small
+           label pinned directly above the input row while a turn is in flight.
+           npc-subtype cards read "(Name) is currently typing..."; scenario/world
+           cards read "Narrator is currently thinking...". Toggled via the
+           .is-visible class from setGenerating (the onTurnStart/onTurnEnd
+           hooks) — it covers the WHOLE turn, including the silent tracker
+           stage before the first chunk streams. (2026-08-21) Mounted INSIDE
+           the input-row form + anchored bottom:100% in CSS, so it rides the
+           form's top edge — directly above the field whether the box is at
+           rest (54px) or auto-grown to 2 lines. -->
+      <div class="fable-typing-indicator" data-typing-indicator aria-hidden="true">
+        <span class="fable-typing-indicator__text" data-typing-text></span>
+      </div>
       <!-- The input is a single centered, max-width text box. The send button
            is GONE (2026-07-27): generation is fired by pressing Enter on a
            non-empty field, and stopped by pressing Enter on an EMPTY field
@@ -611,6 +614,13 @@ export async function wireStage(root, hooks) {
       leftDrawer.refreshAll();
     },
     npcPretty: hooks.npcPretty || ((id) => npcNameMap.get(id) || null),
+    // (2026-08-21) Tracker-skip visibility: the whole 2026-08-21 playtest
+    // ran with world-state tracking silently dead (over-budget tracker
+    // prompt, skipped every turn — the log was the only witness). One
+    // brass warning per session when it happens live.
+    onTrackerSkipped: () => {
+      bottomWarning('Tracking offline this turn — the tracker prompt is over budget. Time, clothing, and inventory may not update. Check the latest session log.');
+    },
     cardName: activeCardName,
     playerName: activePlayerName,
     // Phase 2 portrait bridge: pass the resolved asset:// URLs + the npc name
@@ -747,7 +757,10 @@ export async function wireStage(root, hooks) {
     // whatever the player typed into the composer during that wait.
     if (input.value.trim() === text) {
       input.value = '';
-      input.style.height = 'auto';
+      // (2026-08-21) Full reset through autoGrow — restores the 54px base
+      // AND clears the internal scroll offset the capped box may hold (a
+      // raw style.height='auto' left the scrolled state behind).
+      autoGrow(input);
     }
     lastSendAt = Date.now(); // (audit #26) the double-Enter debounce anchor
     lastSentTurnText = text; // (2026-08-15) the api_lost retry affordance's source
@@ -1184,36 +1197,92 @@ export async function wireStage(root, hooks) {
   // §2A "ambient title music" will be re-sourced when audio assets are re-added.
 }
 
-// Auto-grow the composer to fit content, capped at 4 lines (Chloe
-// 2026-08-02: "automatically size the box as you type in more lines with
-// a max limit of 4 lines"). Beyond 4 lines the field scrolls internally
-// (the scrollbar is hidden via CSS — still scrollable, no visual handle).
-// Cap the auto-grow at exactly 2 rendered lines. Computed from the textarea's
-// LIVE computed style (font-size × line-height) + its vertical padding so the
-// cap tracks the real metrics instead of drifting on a magic pixel constant.
-// (Was 4 lines; capped at 2 lines 2026-08-14 per Chloe.)
-const INPUT_MAX_LINES = 2;
-function inputMaxHeightPx(el) {
+// Auto-grow the composer to fit content, capped at exactly 3 rendered
+// lines (2026-08-21, Chloe — was 2; before that 4). Past the cap the 4th+
+// lines are cut off at a WHOLE-LINE boundary (the top edge never slices a
+// line in half) and the box scrolls internally, following the caret line
+// in one-line steps.
+//
+// (2026-08-21 rewrite) The old implementation set height:'auto' on every
+// keystroke to measure, clamped back, and flipped overflow hidden/auto —
+// three failure modes: the first keystroke collapsed the resting 54px box
+// to ~52px; past the cap scrollTop sat pinned at 0 while overflow was
+// still 'hidden' (the caret typed blind below the fold); and the per-
+// keystroke auto→clamp dance fought the browser's caret-reveal scroll,
+// visibly shuffling the text ("the bottom half appears from the top" —
+// scroll offsets landing mid-line).
+//
+// The new shape measures in a hidden MIRROR div (same font/padding/width/
+// wrap rules) — the live textarea is only ever WRITTEN, never danced
+// through height:auto, so nothing on screen can jump. The mirror also
+// yields the CARET's line offset (marker span at the selection point),
+// which drives the line-locked follow: scrollTop only moves when the
+// caret line leaves the window, and always lands on a line-height
+// multiple.
+const INPUT_MAX_LINES = 3;
+let inputMirrorEl = null;
+function inputMetrics(el) {
   const cs = getComputedStyle(el);
   const lineHeight = parseFloat(cs.lineHeight) || (parseFloat(cs.fontSize) * 1.5);
   const padTop = parseFloat(cs.paddingTop) || 0;
   const padBottom = parseFloat(cs.paddingBottom) || 0;
-  return Math.ceil(lineHeight * INPUT_MAX_LINES + padTop + padBottom);
+  const borderY = (parseFloat(cs.borderTopWidth) || 0) + (parseFloat(cs.borderBottomWidth) || 0);
+  return { cs, lineHeight, padTop, padBottom, borderY };
+}
+// (Re)build the measurement mirror: a fixed off-screen div sharing the
+// textarea's exact text metrics. Width is re-synced on every call so a
+// window resize is picked up at the next keystroke without a listener.
+function ensureInputMirror(el, m) {
+  if (!inputMirrorEl) {
+    inputMirrorEl = document.createElement('div');
+    inputMirrorEl.style.cssText =
+      'position:fixed;left:-99999px;top:0;visibility:hidden;' +
+      'white-space:pre-wrap;overflow-wrap:break-word;word-break:normal;' +
+      'box-sizing:border-box;border:0;margin:0;';
+    document.body.appendChild(inputMirrorEl);
+  }
+  const cs = m.cs;
+  inputMirrorEl.style.font = cs.font;
+  inputMirrorEl.style.letterSpacing = cs.letterSpacing;
+  inputMirrorEl.style.paddingTop = cs.paddingTop;
+  inputMirrorEl.style.paddingBottom = cs.paddingBottom;
+  inputMirrorEl.style.paddingLeft = cs.paddingLeft;
+  inputMirrorEl.style.paddingRight = cs.paddingRight;
+  inputMirrorEl.style.width = el.getBoundingClientRect().width + 'px';
+  return inputMirrorEl;
+}
+function escText(s) {
+  return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;');
 }
 function autoGrow(el) {
-  el.style.height = 'auto';
-  const max = inputMaxHeightPx(el);
-  // Cap at the 2-line height; if content exceeds it, CLAMP to the cap and let
-  // the textarea scroll internally (overflow flipped to auto in CSS once over).
-  // Setting exactly `max` (not scrollHeight) means the box never grows to show
-  // a 3rd line peeking — the 3rd line lives below the fold, scrollable but
-  // invisible until the user scrolls.
-  const clamped = Math.min(el.scrollHeight, max);
-  el.style.height = clamped + 'px';
-  // Once content overflows the 2-line cap, switch to auto overflow so the
-  // cursor can still navigate the hidden 3rd+ lines; otherwise hidden so no
-  // half-line peeks at the bottom edge.
-  el.style.overflow = el.scrollHeight > max + 1 ? 'auto' : 'hidden';
+  const m = inputMetrics(el);
+  // Border-box caps: base = the tuned 1-line resting box (54px), max =
+  // exactly INPUT_MAX_LINES whole lines of text + padding + border.
+  const base = Math.ceil(m.lineHeight + m.padTop + m.padBottom + m.borderY);
+  const max = Math.ceil(m.lineHeight * INPUT_MAX_LINES + m.padTop + m.padBottom + m.borderY);
+  const mirror = ensureInputMirror(el, m);
+  // Full content height + the caret line's content-space top, both off-screen.
+  mirror.textContent = el.value;
+  const full = Math.ceil(mirror.scrollHeight + m.borderY);
+  mirror.innerHTML = escText(el.value.slice(0, el.selectionStart)) + '<span data-mk></span>';
+  const marker = mirror.querySelector('[data-mk]');
+  const caretTop = marker ? (marker.offsetTop - m.padTop) : 0;
+  el.style.height = Math.min(Math.max(full, base), max) + 'px';
+  if (full > max + 1) {
+    // Over the cap: internal scroll ON, 4th+ lines cut at line boundaries.
+    // Follow the caret ONLY when its line leaves the window (stable view
+    // otherwise), and quantize to whole lines — no half-line slivers.
+    el.style.overflow = 'auto';
+    const viewH = m.lineHeight * INPUT_MAX_LINES;
+    let st = el.scrollTop;
+    if (caretTop + m.lineHeight > st + viewH) st = caretTop - (viewH - m.lineHeight);
+    else if (caretTop < st) st = caretTop;
+    st = Math.max(0, Math.round(st / m.lineHeight) * m.lineHeight);
+    el.scrollTop = st;
+  } else {
+    el.style.overflow = 'hidden';
+    el.scrollTop = 0;
+  }
 }
 
 // Track a stage-element listener so teardownStage can remove it (prevents
@@ -1421,7 +1490,88 @@ async function onStageApiChanged() {
   }
 }
 
+// ←/→ variant keybinds (2026-08-21): keyboard twins of the trailing
+// assistant beat's ‹/› chevrons. → steps forward through the existing
+// variants and folds into Regenerate at the last one (swipeNextAction —
+// the same pure decision the delegated feed handler routes); ← steps back
+// one variant and is a strict no-op at the first variant (the "no
+// variants" case). Routed through the same narrator wrappers + gates as
+// the chevron clicks so the two affordances can never diverge.
+function onVariantArrowKey(e) {
+  // Plain arrows only — never hijack a modified key.
+  if (e.ctrlKey || e.metaKey || e.altKey || e.shiftKey) return;
+  // Caret territory: an editable focus keeps its arrows (composer, inline
+  // editor, drawer chat, modal inputs).
+  const el = document.activeElement;
+  if (el && (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA' || el.tagName === 'SELECT'
+    || el.isContentEditable)) return;
+  // The stage must be the visible screen — a stale bound listener (the
+  // teardown race window) must never swipe a hidden feed.
+  if (!stageRoot || stageRoot.hidden) return;
+  // No overlay surface may sit above the feed (mirror of the Esc chain's
+  // checks): arrows never act underneath a popup, modal, panel, drawer,
+  // editor, or in-flight slice regen.
+  if (document.querySelector('.fable-online-popup')) return;
+  if (rawEditorOpen()) return;
+  const saveOverlay = stageRoot.querySelector('[data-save-overlay]');
+  if (saveOverlay && !saveOverlay.hidden) return;
+  const deleteOverlay = stageRoot.querySelector('[data-delete-overlay]');
+  if (deleteOverlay && !deleteOverlay.hidden) return;
+  if (backgrounds.isOpen()) return;
+  if (panelActive()) return;
+  if (beats.openEditingBeat()) return;
+  if (narrator.isSliceRegenerating()) return;
+  if (wupiDrawer.isOpen() || leftDrawer.isOpenState()) return;
+
+  const isNext = e.key === 'ArrowRight';
+  // Mid-turn gate, the delegated click handler's exactly: only → during an
+  // in-flight REROLL stays live (abort the roll + start a fresh one);
+  // everything else waits for the turn to finish.
+  if (narrator.isGenerating() || narrator.isRerolling()) {
+    if (isNext && narrator.isRerolling()) {
+      e.preventDefault();
+      narrator.interruptAndReroll();
+    }
+    return;
+  }
+
+  // The trailing assistant beat is the target (reroll only ever applies to
+  // the trailing turn; its ‹/› cover the whole variant loop). Click-time
+  // authority, #84 pattern: re-derive count/active/isLastAssistant from the
+  // live DOM instead of trusting the stamped chevron state.
+  const asst = stageRoot.querySelectorAll('.fable-mes.assistant');
+  const beat = asst.length ? asst[asst.length - 1] : null;
+  if (!beat) return;
+  const index = Number.parseInt(beat.dataset.index || '-1', 10);
+  if (index < 0) return; // unindexed beat — not swipable
+  const count = Number.parseInt(beat.dataset.variantCount || '1', 10) || 1;
+  const active = Number.parseInt(beat.dataset.variantActive || '0', 10) || 0;
+
+  if (isNext) {
+    const { canNext } = beats.computeDrawerState({
+      role: 'assistant',
+      count,
+      active,
+      isLastAssistant: beats.isTrailingAssistant(beat),
+    });
+    if (!canNext) return;
+    e.preventDefault();
+    const action = beats.swipeNextAction({ count, active });
+    if (action.kind === 'swipe') narrator.swipeVariant(index, action.variantIdx);
+    else narrator.rerollLastTurn();
+  } else {
+    // ← with no earlier variant does nothing.
+    if (active <= 0) return;
+    e.preventDefault();
+    narrator.swipeVariant(index, active - 1);
+  }
+}
+
 function onKeyDown(e) {
+  if (e.key === 'ArrowLeft' || e.key === 'ArrowRight') {
+    onVariantArrowKey(e);
+    return;
+  }
   if (e.key !== 'Escape') return;
   // Online/API popup FIRST: it's body-mounted above every stage surface
   // (z:100100), so while it's open it owns Esc — its own document-level

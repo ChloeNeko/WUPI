@@ -618,10 +618,13 @@ fn area_knowledge(map: &SiteMap, id: &str) -> AreaKnowledge {
 /// geometry + their Known assets (state/count/detail) + Suspected assets as
 /// suspicion lines + named ways on; Discovered areas render name-only;
 /// unrevealed neighbors render as `?` stub counts. Hidden truth (unrevealed
-/// areas/assets) NEVER renders. `(+N more)` caps bound the block.
+/// areas/assets) NEVER renders. `(+N more)` caps bound the block — sized to
+/// the full architect cap (2026-08-21 evening follow-up to the 8192 ruling:
+/// 6 → 8 areas, 6 → 8 assets per area): a fully-explored MAX_SITE_AREAS
+/// dungeon renders EVERY revealed area; only unrevealed space counts hidden.
 pub fn render_narrator_slice(map: &SiteMap) -> Option<String> {
-    const AREAS_SHOWN: usize = 6;
-    const ASSETS_SHOWN: usize = 6;
+    const AREAS_SHOWN: usize = MAX_SITE_AREAS;
+    const ASSETS_SHOWN: usize = 8;
     let mut out: Vec<String> = Vec::new();
     out.push(format!(
         "threat: {}; entrance: {}",

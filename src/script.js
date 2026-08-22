@@ -1072,6 +1072,12 @@ function spawnLaunchSparkles(parent, count = 18) {
     invoke('fable_reveal_window').catch((e) =>
       console.warn(`[Wupi] ${tag}: fable_reveal_window failed`, e),
     );
+    // Consume + DELETE the updater's presence marker (%TEMP%), same as the OS
+    // boot gate does — every boot from this install must clear it (the
+    // updater's user-takeover guard polls the marker between relaunch
+    // attempts, and no updater file may outlive a boot). Pure deletion, no
+    // payload: update outcomes are never surfaced (2026-08-20 Chloe ruling).
+    invoke('updater_consume_result').catch(() => { /* non-fatal */ });
     const splash = document.getElementById('fable-entry-splash');
     const fadeSplash = () => {
       if (!splash) {
@@ -1119,7 +1125,8 @@ function spawnLaunchSparkles(parent, count = 18) {
     document.getElementById('boot-loading')?.remove();
     // (2026-08-20) The Fable entry's "boot ceremony bypassed" moment — the
     // equivalent of endLoadingScreen's logs_begin on the OS path: session
-    // logging starts now that the entry splash/first-run gate is behind us.
+    // logging starts now (one logs/wupi-*.log file + the crash ring) that
+    // the entry splash/first-run gate is behind us.
     invoke('logs_begin').catch(() => { /* logging start is best-effort */ });
     // Drop the boot body classes: .booting keeps the top-bar/dock hidden + body
     // transparent; .loading (if present) holds the dock back. Clearing both
@@ -1793,24 +1800,12 @@ function spawnLaunchSparkles(parent, count = 18) {
   //    (network/manifest unreachable): call proceedAfterGate() so a
   //    network blip can't strand the user on the loading screen.
   async function runBootGate() {
-    // Consume the outcome marker of an update that just relaunched us (if
-    // any). Rust deletes the marker on read, so the invoke must ALWAYS run —
-    // skipping it would leave a stale marker to surface on a much later
-    // boot. 2026-08-19: the success path is SILENT per Chloe (no "updated
-    // to vX ✓" / auto-restart note — the new version speaks for itself);
-    // only a FAILED last update still prints, because a silently-dead
-    // update is info the user needs.
-    try {
-      const result = await invoke('updater_consume_result');
-      if (result && !result.ok) {
-        appendTerminalLine(
-          `› last update failed: ${String(result.error || '').slice(0, 80)}`,
-          false
-        );
-      }
-    } catch (e) {
-      /* non-fatal — no marker to read */
-    }
+    // Consume (DELETE) the updater's presence marker from a just-relaunched
+    // update (if any) — the user-takeover signal, so the invoke must ALWAYS
+    // run. Pure deletion, no payload: update outcomes are NEVER surfaced
+    // (2026-08-20 Chloe ruling — a crashed update leaves crash logs; the
+    // updater's %TEMP% log covers the apply side).
+    invoke('updater_consume_result').catch(() => { /* non-fatal */ });
 
     // Stream the gate steps into the boot terminal as they happen so the
     // user sees exactly what's blocking the LOADING OS fill.
@@ -1850,8 +1845,9 @@ function spawnLaunchSparkles(parent, count = 18) {
     showBootUpdateBar(current, update.version);
     // apply downloads the zip, then spawns updater.exe + EXITS this process
     // (the temp-staged handoff). The await NEVER resolves on success — the
-    // process is gone; the relaunched boot surfaces the outcome via
-    // updater_consume_result at the top of the next runBootGate. Only a
+    // process is gone; the relaunched boot only consumes the updater's
+    // presence marker (takeover signal) at the top of the next runBootGate —
+    // no outcome is ever surfaced (2026-08-20 Chloe ruling). Only a
     // staging/spawn failure throws, in which case we proceed with the current
     // binary (the user can retry from the paw-menu panel).
     try {
@@ -1909,8 +1905,9 @@ function spawnLaunchSparkles(parent, count = 18) {
     // (2026-08-20 Chloe ruling) Session logging starts HERE — the loading OS
     // screen + boot updater gate are over, the OS home is revealing. Until
     // this fires the backend writes nothing (no %TEMP%\wupi.log, no logs/
-    // files); from here the RAM ring accumulates the tail that ONLY a crash
-    // dumps. Fire-and-forget: logging must never gate the reveal.
+    // files); from here ONE session file (logs/wupi-*.log) is minted and
+    // every line tees to it + the RAM ring behind crash reports.
+    // Fire-and-forget: logging must never gate the reveal.
     invoke('logs_begin').catch(() => { /* logging start is best-effort */ });
     if (bootLoading) {
       bootLoading.classList.add('fade-out');
@@ -2274,8 +2271,9 @@ const dropdownMenu = document.getElementById('dropdownMenu');
     }
     setUpdateState('installing', { percent: 0 });
     // apply downloads, then spawns updater.exe + EXITS this process. The await
-    // never resolves on success — the process is gone, + the relaunched boot
-    // surfaces the outcome via updater_consume_result. Only a failure throws.
+    // never resolves on success — the process is gone; the relaunched boot
+    // only consumes the updater's presence marker (no outcome surfaced,
+    // 2026-08-20 Chloe ruling). Only a failure throws.
     try {
       await invoke('updater_apply', { update: pendingUpdate });
       // Unreachable on success (process exited). Defensive only.
@@ -3173,7 +3171,8 @@ const dropdownMenu = document.getElementById('dropdownMenu');
   })();
 
   // AI: Connection Profile panel (LOCAL | ONLINE mode selector + profile CRUD)
-  // Source of truth = api_config.json (loaded at boot into AppState). The
+  // Source of truth = api.json (loaded at boot into AppState; renamed from
+  // api_config.json 2026-08-20). The
   // panel shows two large mode boxes: LOCAL (the single WUPI E4B bubble) or
   // ONLINE (saved endpoint profiles + an editor). Selecting ONLINE is pure
   // bookkeeping (v0.6.3 local-always: the local model stays resident as the

@@ -15,8 +15,9 @@ copy config.example.json config.json
 Edit `config.json`:
 - `endpoint` / `apiKey` — **usually nothing to do here.** If a real key isn't
   set, the harness automatically borrows the CONNECTED profile from WUPI's own
-  `api_config.json` (searched at `src-tauri/target/{debug,release}/data/` and
-  `<wupiRoot>/data/`, or point `apiConfigPath` at it directly) — the battle
+  `api.json` (searched at `src-tauri/target/{debug,release}/data/` and
+  `<wupiRoot>/data/`, falling back to the pre-rename `api_config.json`, or
+  point `apiConfigPath` at it directly) — the battle
   then runs on exactly the endpoint + key your app uses. Precedence:
   `WUPI_BATTLE_ENDPOINT`/`WUPI_BATTLE_KEY` env vars > a non-placeholder
   `config.json` key > the WUPI profile. The borrowed profile's name + masked

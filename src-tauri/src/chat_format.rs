@@ -481,8 +481,8 @@ fn push_escaped(out: &mut String, s: &str) {
     }
 }
 
-/// Detect the agent loop's tool-response content marker and render it as the
-/// Gemma 4 `<|tool_response>` protocol token. Returns `None` for ordinary
+/// Detect the agent loop's tool-response content marker(s) and render them as
+/// Gemma 4 `<|tool_response>` protocol tokens. Returns `None` for ordinary
 /// user messages (the common case).
 ///
 /// The agent loop inserts user-role messages with content shaped like:
@@ -494,31 +494,54 @@ fn push_escaped(out: &mut String, s: &str) {
 /// (per the documented protocol token at line 146). The `name`, `ok`, and
 /// `output` fields are extracted and re-serialized compactly so the wire
 /// format is deterministic (cache-coherent: same input → same tokens).
+///
+/// (2026-08-20 audit fix) MULTI-CALL ITERATIONS: `run_agent_loop` inserts one
+/// user message per executed call, and the window assembler's
+/// `normalize_alternating` rolls consecutive same-role turns into ONE message
+/// joined by `\n\n` — so a 2-call iteration arrives here as TWO concatenated
+/// envelopes. Whole-string `from_str` on that blob fails → the old code fell
+/// to the plain-text arm and leaked the raw `__tool_response__` JSON into the
+/// prompt as literal prose for the rest of the visible window. Parse as a
+/// STREAM of whitespace-separated JSON values instead: when EVERY value is a
+/// valid envelope, render one protocol token per value (newline-joined);
+/// any non-envelope value → `None` (the conservative plain-text fallback).
 fn render_tool_response_marker(content: &str) -> Option<String> {
     let trimmed = content.trim();
     if !trimmed.starts_with("{\"__tool_response__\":") {
         return None;
     }
-    let v: serde_json::Value = serde_json::from_str(trimmed).ok()?;
-    if v.get("__tool_response__")?.as_bool() != Some(true) {
+    let mut out = String::new();
+    let mut seen = 0usize;
+    for item in serde_json::Deserializer::from_str(trimmed).into_iter::<serde_json::Value>() {
+        let v = item.ok()?;
+        if v.get("__tool_response__")?.as_bool() != Some(true) {
+            return None;
+        }
+        let name = v.get("name")?.as_str()?;
+        let ok = v.get("ok")?.as_bool().unwrap_or(false);
+        let output = v.get("output");
+        // Build the compact payload: {"ok":...,"output":...}. The output value
+        // is re-stringified to drop whitespace (deterministic tokens).
+        let payload = serde_json::json!({
+            "ok": ok,
+            "output": output.unwrap_or(&serde_json::Value::Null),
+        });
+        let payload_compact = serde_json::to_string(&payload).unwrap_or_else(|_| "{}".into());
+        if seen > 0 {
+            out.push('\n');
+        }
+        out.push_str(&format!(
+            "<|tool_response>response:{}{}<tool_response|>",
+            name,
+            // The `{args}` slot is optional per Gemma's grammar; we always include it.
+            payload_compact
+        ));
+        seen += 1;
+    }
+    if seen == 0 {
         return None;
     }
-    let name = v.get("name")?.as_str()?;
-    let ok = v.get("ok")?.as_bool().unwrap_or(false);
-    let output = v.get("output");
-    // Build the compact payload: {"ok":...,"output":...}. The output value is
-    // re-stringified to drop whitespace (deterministic tokens).
-    let payload = serde_json::json!({
-        "ok": ok,
-        "output": output.unwrap_or(&serde_json::Value::Null),
-    });
-    let payload_compact = serde_json::to_string(&payload).unwrap_or_else(|_| "{}".into());
-    Some(format!(
-        "<|tool_response>response:{}{}<tool_response|>",
-        name,
-        // The `{args}` slot is optional per Gemma's grammar; we always include it.
-        payload_compact
-    ))
+    Some(out)
 }
 
 // ---------------------------------------------------------------------------
@@ -1097,6 +1120,30 @@ mod tests {
         assert!(render_tool_response_marker("").is_none());
         // Not a tool response envelope.
         assert!(render_tool_response_marker("{\"name\":\"file_read\"}").is_none());
+    }
+
+    #[test]
+    fn render_tool_response_marker_multi_envelope_stream() {
+        // (2026-08-20 audit fix) A multi-call iteration arrives as ONE message
+        // after normalize_alternating rolls the consecutive user turns
+        // together (\n\n join). Every envelope must render as its own protocol
+        // token — the raw JSON must NOT leak as literal prose.
+        let merged = concat!(
+            "{\"__tool_response__\":true,\"name\":\"file_read\",\"ok\":true,\"output\":\"a\"}\n\n",
+            "{\"__tool_response__\":true,\"name\":\"memory_search\",\"ok\":false,\"output\":\"no hits\"}",
+        );
+        let rendered = render_tool_response_marker(merged).unwrap();
+        assert_eq!(
+            rendered,
+            "<|tool_response>response:file_read{\"ok\":true,\"output\":\"a\"}<tool_response|>\n\
+             <|tool_response>response:memory_search{\"ok\":false,\"output\":\"no hits\"}<tool_response|>"
+        );
+        // Deterministic: same merged input → same tokens (cache-coherent).
+        assert_eq!(rendered, render_tool_response_marker(merged).unwrap());
+        // A trailing non-envelope value poisons the whole message → the
+        // conservative plain-text fallback (None), never a partial render.
+        let poisoned = format!("{merged}\n\n{{\"ordinary\":true}}");
+        assert!(render_tool_response_marker(&poisoned).is_none());
     }
 
     #[test]

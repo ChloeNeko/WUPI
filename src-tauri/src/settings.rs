@@ -86,20 +86,35 @@ pub const CTX_API: u32 = 16384;
 /// the prefix + the manager-path world-state
 /// slice + memory block with headroom, without doubling the persistent chat
 /// KV (~50% growth). Matches CTX_FABLE.
-pub const CTX_LOCAL_WITH_API: u32 = 3072;
+/// (2026-08-21 Chloe ruling — FINAL: 8192; was 3072 since the 2026-08-17 P0,
+/// with a same-day interim at 4096) The E4B swap made context cheap; the
+/// copilot prompt budget gets durable slack so the 2026-08-17 P0 (E4B prefix
+/// ~1541 tokens locking the copilot out of every turn at 2048) can never
+/// recur on any prefix growth. Engine reserve at 8192 is `n_ctx/4` = 2048,
+/// leaving 6144 prompt tokens. KV cost: ~187 MiB Q8_0 worst-case linear
+/// (sublinear in practice — the E4B's 512-token SWA layers don't grow; read
+/// the exact MiB off the boot telemetry); the chat slot is the default
+/// resident under the swap-lock. Matches CTX_FABLE.
+pub const CTX_LOCAL_WITH_API: u32 = 8192;
 
-/// Fable engine context (the tracker pass). **2026-08-08 override: 3072.** The
-/// local model's Fable role is TRACKING ONLY (bracket commands + schema state) —
-/// the API narrates. The tracker window is 2 messages (1 turn) — it
-/// relies on the schema delta + Rust state, not re-read history.
-/// 3072 fits the AGENT section (~386 tok) + bracket protocol (~477 tok) +
-/// world_state + the 1-turn window + the 256-token tracker generation
-/// reserve (TRACKER_MAX_TOKENS; raised 150→256 post-T52; the sniper is the
-/// primary stop). The prior
-/// 4096 was sized for the deleted local-narrator path; 2048 was too tight
-/// (the fixed overhead alone is ~860 tok, nearly half the budget before any
-/// card/world_state enters).
-pub const CTX_FABLE: u32 = 3072;
+/// Fable engine context (the tracker pass). **2026-08-08: 3072. 2026-08-21
+/// Chloe ruling — FINAL: 8192 (E4B; same-day interims at 4096).** The local
+/// model's Fable role is TRACKING ONLY (bracket commands + schema state) —
+/// the API narrates. The tracker window is 2 messages (1 turn) — it relies
+/// on the schema delta + Rust state, not re-read history. 3072 fit the
+/// 2026-08-08 teaching set, but the 2026-08-18→21 verb growth (NPC interior
+/// + site + economy) pushed real campaigns against the derived char budget
+/// from turn ~22 (the Cinderfen economy playtest). 8192 + the raised
+/// world-state visibility caps (STAGE0 + WS_BUDGET, lib.rs) are one ruling:
+/// track MORE stuff, and extremely long roleplays must never approach the
+/// ceiling — the worst realistic composition (fixed teaching ~7.6k + WS
+/// ≤17k + maxed window) lands ~90% of the derived budget, and a REAL
+/// campaign world state (~1-3k) never approaches it. KV cost:
+/// ~120-190 MiB Q8_0 in the swap-locked fable slot (sublinear in practice —
+/// the E4B's 512-token SWA layers don't grow; read the exact MiB off the
+/// boot telemetry). `TRACKER_PROMPT_CHAR_BUDGET` is DERIVED from this (see
+/// below): raising this constant automatically raises the budget.
+pub const CTX_FABLE: u32 = 8192;
 
 /// Schema-delta engine context. The micro-delta pass only needs system
 /// instruction + current schema JSON + one exchange (see schema_engine.rs).
@@ -129,18 +144,17 @@ pub const WINDOW_API_FABLE: usize = 16;
 pub const WINDOW_TRACKER: usize = 2;
 
 /// Char cap on each ASSISTANT message fed into the tracker window (2026-08-10,
-/// T52 overflow fix). The tracker sees the last 1 turn (the player's action +
-/// the preceding narrator beat). The narrator beat can run 1500-4700 chars
-/// (~400-1200 tokens) — feeding it raw pushed the tracker prompt to 3331 tokens
-/// (over the 2922 budget) 7 times in T52, front-truncating the bracket protocol
-/// on the worst turns. The tracker doesn't need the full prose — it needs the
-/// gist (what happened) to decide whether brackets fire. Capping at 600 chars
-/// (~150 tokens) per assistant message mathematically bounds the window to
-/// ~300 tokens, keeping the total prompt under 2922 even with a maxed-out
-/// world_state block. User messages are NOT capped (they're the player's action
-/// — typically short, and truncating them would lose the trigger the tracker
-/// keys off). The narrator window is unaffected (it has the 16k API budget).
-pub const TRACKER_ASSISTANT_CHAR_CAP: usize = 600;
+/// T52 overflow fix; RAISED 600 → 1,200 on the 2026-08-21 8192 ruling —
+/// evening follow-up). The tracker sees the last 1 turn (the player's action +
+/// the preceding narrator beat). The narrator beat can run 1500-4700 chars;
+/// at the old 600 the tracker read only the beat's opening paragraph — the
+/// consequences that drive [PRESENCE]/[MOOD]/[INTENT]/[NPC_ITEM] live deeper
+/// in the prose. 1,200 chars (~300 tokens) covers a full 2-3 paragraph beat;
+/// the window is still mathematically bounded (~1,950 chars worst case with
+/// a realistic action, pinned by the budget test). User messages are NOT
+/// capped (they're the player's action — the trigger the tracker keys
+/// off). The narrator window is unaffected (it has the 16k API budget).
+pub const TRACKER_ASSISTANT_CHAR_CAP: usize = 1_200;
 
 /// (2026-08-16 bug 12) Per-side char cap for the exchange/request folded
 /// into the 2048-token schema prompts (delta + translation). The deferred
@@ -205,6 +219,17 @@ pub const API_TEMP: f32 = 0.85;
 /// API top_p.
 pub const API_TOP_P: f32 = 0.95;
 
+/// (2026-08-21 narrator length cap) `max_tokens` for the FABLE API narrator
+/// ONLY — the one lever that bounds beat length mechanically. The request
+/// body previously shipped NO max_tokens at all, so GLM generated to its
+/// provider default and beats ran long (2026-08-21 playtest: "most replies
+/// got really long"). 800 tokens ≈ a full 3-5 paragraph beat — generous for
+/// the authored one-beat-per-turn pacing, but a hard ceiling the provider
+/// enforces server-side. The creator assistant + slice-regen paths stay
+/// UNCAPPED (`None`): lorebook batch conversion legitimately needs long
+/// outputs and slice spans are short by construction.
+pub const API_NARRATOR_MAX_TOKENS: u32 = 800;
+
 // ---------------------------------------------------------------------------
 // World-sim growth caps
 // ---------------------------------------------------------------------------
@@ -226,20 +251,38 @@ pub const FABLE_STATUS_TAG_CAP: usize = 16;
 /// truncation guard runs.
 pub const FABLE_ACTION_CHAR_CAP: usize = 4000;
 
-/// (2026-08-16 tracker-budget fix) TOTAL char budget for the fully rendered
-/// TRACKER prompt (system prompt + window + generation cue) — the lib.rs-side
-/// guard that keeps the fable engine's overflow backstop from ever firing.
-/// Derivation: CTX_FABLE (3072) − TRACKER_MAX_TOKENS (256, fable_engine.rs)
-/// = 2816 max prompt tokens; observed prose density on WUPI.gguf is
-/// ~3.7–4.0 chars/token, so 3.5 chars/token (the CONSERVATIVE low end) gives
-/// 2816 × 3.5 = 9856, rounded down to 9800. An over-budget render drops the
-/// lowest-priority tail block (the preceding assistant beat) and re-renders
-/// ONCE (`build_tracker_prompt_bounded`); still over = the tracker pass
-/// fails loudly instead of decoding — the engine's old front-drain silently
-/// decapitated the system prompt (bracket protocol) three separate times
-/// (2026-08-09, 2026-08-10 T52, 2026-08-16 playtest: 5→687 tokens dropped
-/// over 16 turns), which is why overflow is now a hard error in tracker mode.
-pub const TRACKER_PROMPT_CHAR_BUDGET: usize = 9_800;
+/// (2026-08-16 tracker-budget fix; 2026-08-21 DERIVED, economy-playtest
+/// recalibration) Chars-per-token used to derive the tracker prompt budget
+/// from the tracker context. Observed density on WUPI.gguf across the
+/// 2026-08-16/21 playtests: 3.7–4.0 chars/token on real tracker prompts
+/// (bracket-dense but English-prose-dominated). The constant uses 3.6 — a
+/// half-step margin below the observed floor, reclaiming the headroom the
+/// original conservative 3.5 left on the table (the 2026-08-21 Cinderfen
+/// playtest: real campaigns hit the old 9,800 cap from turn ~22 and silently
+/// lost the site/economy verb teaching to the core-tier degrade). If a
+/// prompt class ever tokenizes below 3.6 the engine's tracker-mode backstop
+/// hard-errors the decode (a loud skip, never a headless decode) — the
+/// failure mode this margin trades against.
+pub const TRACKER_PROMPT_CHARS_PER_TOKEN: f32 = 3.6;
+
+/// (2026-08-21 DERIVED — no longer a hand-set number) TOTAL char budget for
+/// the fully rendered TRACKER prompt (system prompt + window + generation
+/// cue) — the lib.rs-side guard that keeps the fable engine's overflow
+/// backstop from ever firing. Derivation: CTX_FABLE − TRACKER_MAX_TOKENS
+/// (fable_engine.rs) = max prompt tokens ×
+/// [`TRACKER_PROMPT_CHARS_PER_TOKEN`]. DERIVED so the coupling is explicit:
+/// raising CTX_FABLE (a Foundation-Law constant, Chloe's call alone)
+/// automatically raises this budget — no second number to forget. An
+/// over-budget render takes exactly ONE fallback in
+/// `build_tracker_prompt_bounded` (drop the preceding assistant beat — the
+/// window tail-drop); still over = the tracker pass fails loudly instead of
+/// decoding — the engine's old front-drain silently decapitated the system
+/// prompt (bracket protocol) three separate times (2026-08-09, 2026-08-10
+/// T52, 2026-08-16 playtest), which is why overflow is a hard error in
+/// tracker mode.
+pub const TRACKER_PROMPT_CHAR_BUDGET: usize = ((CTX_FABLE as f32
+    - crate::fable_engine::TRACKER_MAX_TOKENS as f32)
+    * TRACKER_PROMPT_CHARS_PER_TOKEN) as usize;
 
 /// (2026-08-18 Dedicated-NPC reaper — Chloe's 3-tier / Garbage-Collector
 /// ruling) In-world days a `named` (discovered, non-authored) NPC's interior

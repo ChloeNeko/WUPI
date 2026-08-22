@@ -9,16 +9,35 @@
 
 use std::path::{Path, PathBuf};
 
-/// Extract the whole zip into `staging` (a fresh `%TEMP%` dir), then verify the
-/// payload contains `wupi.exe`. Returns the entry count. The live install is
-/// NOT touched here — staging is the bricking-safety gate.
-pub fn extract_to_staging(zip_path: &Path, staging: &Path) -> Result<usize, String> {
+/// Extract the zip into `staging` (a fresh `%TEMP%` dir), then verify the
+/// payload contains `wupi.exe`. Returns the number of entries actually
+/// staged. The live install is never WRITTEN here — staging is the
+/// bricking-safety gate.
+///
+/// (2026-08-20) Two extract-time skips, both decided against the LIVE
+/// `target` before any bytes are decompressed or written. A patch-hop
+/// payload is dominated by unchanged multi-hundred-MB runtime DLLs, and
+/// re-materializing those into `%TEMP%` only to rename-copy them back was
+/// the bulk of the post-download dead window before the relaunch:
+///
+/// 1. **Preserve rule** — entries under preserved paths (user data) would
+///    be skipped by the copy phase anyway; they never stage.
+/// 2. **Byte-identity** — an entry whose live destination already exists
+///    with the SAME uncompressed size AND CRC32 (from the zip's central
+///    directory) already IS the payload's content; it is neither staged
+///    nor copied. The comparison only READS the live file — the first
+///    write to the install still happens exclusively in the copy phase,
+///    so the gate's ordering is unchanged.
+pub fn extract_to_staging(zip_path: &Path, staging: &Path, target: &Path) -> Result<usize, String> {
     let file = std::fs::File::open(zip_path).map_err(|e| format!("open zip: {e}"))?;
     let mut archive = zip::ZipArchive::new(file).map_err(|e| format!("read zip: {e}"))?;
     let staging_canon = staging
         .canonicalize()
         .map_err(|e| format!("canonicalize staging: {e}"))?;
     let count = archive.len();
+    let mut staged = 0usize;
+    let mut skipped_identical = 0usize;
+    let mut skipped_preserved = 0usize;
     for i in 0..count {
         let mut entry = archive
             .by_index(i)
@@ -28,7 +47,17 @@ pub fn extract_to_staging(zip_path: &Path, staging: &Path) -> Result<usize, Stri
             Some(p) => p,
             None => continue,
         };
-        let out = staging.join(entry_path);
+        // Skip 1: preserved user data — the copy phase would drop it anyway.
+        if crate::preserve::is_preserved(&entry_path) {
+            skipped_preserved += 1;
+            continue;
+        }
+        // Skip 2: the live file is already byte-identical to this entry.
+        if entry_matches_live(&entry, &target.join(&entry_path)) {
+            skipped_identical += 1;
+            continue;
+        }
+        let out = staging.join(&entry_path);
         if let Some(parent) = out.parent() {
             std::fs::create_dir_all(parent)
                 .map_err(|e| format!("mkdir {}: {e}", parent.display()))?;
@@ -48,14 +77,54 @@ pub fn extract_to_staging(zip_path: &Path, staging: &Path) -> Result<usize, Stri
             std::io::copy(&mut entry, &mut out_file)
                 .map_err(|e| format!("write {}: {e}", out.display()))?;
         }
+        staged += 1;
     }
     // bricking-safety gate: refuse a payload with no wupi.exe (truncated/wrong
-    // zip) before we touch the live install.
+    // zip) before we touch the live install. The exe counts as present when
+    // the archive LISTS it — a byte-identical exe is skipped at extract (it
+    // already lives in the install) and would never appear in staging.
     let exe_name = crate::exe_basename();
-    if !staging.join(&exe_name).is_file() {
+    let exe_listed = archive.by_name(&exe_name).is_ok();
+    if !staging.join(&exe_name).is_file() && !exe_listed {
         return Err(format!("payload missing {exe_name} — refusing to apply"));
     }
-    Ok(count)
+    if skipped_identical + skipped_preserved > 0 {
+        crate::log(format!(
+            "extract: {staged} staged, {skipped_identical} already byte-identical in the install (skipped), {skipped_preserved} preserved (skipped)"
+        ));
+    }
+    Ok(staged)
+}
+
+/// Size + CRC32 match between a zip entry and a live file — the
+/// byte-identity probe behind the extract-time skip. Size is checked from
+/// metadata alone so the CRC pass (the only real read) runs just on
+/// size-matched candidates; a CRC32 collision between a size-matched live
+/// file and our own release pipeline's payload content is not a realistic
+/// failure mode. Unreadable/mismatched → false (extract normally).
+fn entry_matches_live(entry: &zip::read::ZipFile, dst: &Path) -> bool {
+    use std::io::Read;
+    if entry.is_dir() {
+        return false;
+    }
+    let Ok(meta) = std::fs::metadata(dst) else {
+        return false;
+    };
+    if !meta.is_file() || meta.len() != entry.size() {
+        return false;
+    }
+    let Ok(mut f) = std::fs::File::open(dst) else {
+        return false;
+    };
+    let mut hasher = crc32fast::Hasher::new();
+    let mut buf = vec![0u8; 64 * 1024];
+    loop {
+        match f.read(&mut buf) {
+            Ok(0) => return hasher.finalize() == entry.crc32(),
+            Ok(n) => hasher.update(&buf[..n]),
+            Err(_) => return false,
+        }
+    }
 }
 
 /// Walk `staging` and copy each file into `target_dir`, skipping preserved
@@ -293,8 +362,10 @@ mod tests {
         );
 
         std::fs::create_dir_all(&staging).unwrap();
-        let n = extract_to_staging(&zip_path, &staging).unwrap();
-        assert_eq!(n, 4);
+        let n = extract_to_staging(&zip_path, &staging, &target).unwrap();
+        // 3 staged — the preserved data/user.xml never even extracts.
+        assert_eq!(n, 3);
+        assert!(!staging.join("data/user.xml").exists());
         copy_into_target(&staging, &target).unwrap();
 
         // wupi.exe overwritten with the new payload.
@@ -317,13 +388,77 @@ mod tests {
     }
 
     #[test]
+    fn extract_skips_entries_already_identical_in_install() {
+        let tmp = TempDir::new().unwrap();
+        let target = tmp.path().join("install");
+        let staging = tmp.path().join("stage");
+        let zip_path = tmp.path().join("payload.zip");
+
+        // Live install already carries the exact DLL bytes + an OLD exe.
+        std::fs::create_dir_all(target.join("bin")).unwrap();
+        std::fs::write(target.join("bin/big.dll"), b"SAME DLL BYTES").unwrap();
+        std::fs::write(target.join("wupi.exe"), b"OLD EXE").unwrap();
+
+        make_zip(
+            &zip_path,
+            &[
+                ("wupi.exe", b"NEW EXE".as_slice()),
+                ("bin/big.dll", b"SAME DLL BYTES".as_slice()),
+            ],
+        );
+
+        std::fs::create_dir_all(&staging).unwrap();
+        let n = extract_to_staging(&zip_path, &staging, &target).unwrap();
+        // Only the changed exe staged; the identical DLL was skipped before
+        // any decompression/write.
+        assert_eq!(n, 1);
+        assert!(staging.join("wupi.exe").is_file());
+        assert!(!staging.join("bin/big.dll").exists());
+        // The extract phase never writes the live install.
+        assert_eq!(
+            std::fs::read(target.join("bin/big.dll")).unwrap(),
+            b"SAME DLL BYTES"
+        );
+
+        copy_into_target(&staging, &target).unwrap();
+        assert_eq!(std::fs::read(target.join("wupi.exe")).unwrap(), b"NEW EXE");
+        assert_eq!(
+            std::fs::read(target.join("bin/big.dll")).unwrap(),
+            b"SAME DLL BYTES"
+        );
+    }
+
+    #[test]
+    fn extract_gate_passes_when_exe_identical_but_listed() {
+        let tmp = TempDir::new().unwrap();
+        let target = tmp.path().join("install");
+        let staging = tmp.path().join("stage");
+        let zip_path = tmp.path().join("payload.zip");
+
+        // Every payload file already lives byte-identical in the install.
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::write(target.join("wupi.exe"), b"THE EXE").unwrap();
+        make_zip(&zip_path, &[("wupi.exe", b"THE EXE".as_slice())]);
+
+        std::fs::create_dir_all(&staging).unwrap();
+        let n = extract_to_staging(&zip_path, &staging, &target).unwrap();
+        // Nothing staged — but the gate must NOT reject: the archive LISTS
+        // wupi.exe (it is merely already applied).
+        assert_eq!(n, 0);
+        // And an empty staging copies as a clean no-op.
+        copy_into_target(&staging, &target).unwrap();
+        assert_eq!(std::fs::read(target.join("wupi.exe")).unwrap(), b"THE EXE");
+    }
+
+    #[test]
     fn extract_rejects_payload_without_wupi_exe() {
         let tmp = TempDir::new().unwrap();
+        let target = tmp.path().join("install");
         let staging = tmp.path().join("stage");
         let zip_path = tmp.path().join("payload.zip");
         std::fs::create_dir_all(&staging).unwrap();
         make_zip(&zip_path, &[("assets/x.txt", b"x".as_slice())]);
-        let err = extract_to_staging(&zip_path, &staging).unwrap_err();
+        let err = extract_to_staging(&zip_path, &staging, &target).unwrap_err();
         assert!(err.contains("missing"));
     }
 }

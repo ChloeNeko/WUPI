@@ -30,7 +30,10 @@
 //! whether the playbook synced cleanly.
 
 use std::collections::{HashMap, HashSet};
-use std::hash::{Hash, Hasher};
+// (2026-08-20 P3) The persisted reconcile identity is `stable_hash64`
+// (FNV-1a, below) — `DefaultHasher` is gone from every path (its std-
+// internal algorithm carries no cross-version stability guarantee, and the
+// hash lives in stored row metadata).
 use std::path::Path;
 
 use crate::memory::{MemoryEngine, MemoryId};
@@ -156,11 +159,12 @@ async fn seed_compound_codex<E: Embedder>(
         return Ok(report);
     }
 
-    // Chunk-budget gate: split any entry whose body exceeds the 1300-char
-    // CHUNK_CHAR_BUDGET into paginated "Title - Part N" children BEFORE the
-    // reconcile loop. Post-parse/pre-reconcile placement keeps the parts the
-    // canonical title-keyed set (idempotent re-seeds) and guarantees every
-    // body reaching `add_codex_entry` is ≤1300 — under the ~1400-char bge
+    // Chunk-budget gate: split any entry whose body exceeds the 1300-byte
+    // CHUNK_CHAR_BUDGET (byte-enforced — see memory.rs) into paginated
+    // "Title - Part N" children BEFORE the reconcile loop. Post-parse/
+    // pre-reconcile placement keeps the parts the canonical title-keyed set
+    // (idempotent re-seeds) and guarantees every body reaching
+    // `add_codex_entry` is ≤1300 bytes — under the ~1400-byte bge
     // truncate (see memory.rs's clamp for the final backstop).
     //
     // Duplicate-title disambiguation runs FIRST (before the part split, so
@@ -324,12 +328,18 @@ fn dedupe_duplicate_titles(sources: Vec<ParsedEntry>) -> Vec<ParsedEntry> {
 }
 
 /// Expand any entry whose body exceeds the episodic chunker's
-/// [`CHUNK_CHAR_BUDGET`] (1300) into paginated `"{title} - Part N"` children,
-/// each within that budget, split on sentence/paragraph boundaries via
-/// [`crate::memory::chunk_text`] (reused from the episodic chunker). Gating at
-/// the SAME budget the episodic path uses keeps codex rows consistent with
-/// chat rows; bge-small silently truncates bodies >~1400 chars, so 1300 also
-/// sits safely under that cap.
+/// [`CHUNK_CHAR_BUDGET`] (1300, enforced on UTF-8 BYTES) into paginated
+/// `"{title} - Part N"` children, each within that budget, split on
+/// sentence/paragraph boundaries via [`crate::memory::chunk_text`] (reused
+/// from the episodic chunker). Gating at the SAME budget the episodic path
+/// uses keeps codex rows consistent with chat rows; bge-small silently
+/// truncates bodies past its cap, so 1300 also sits safely under it.
+/// (2026-08-20 audit P2-8) The gate reads BYTES — `chunk_text`, the
+/// `add_codex_entry` embed clamp, and `insert_entry`'s backstop log all
+/// measure bytes, and every downstream consumer of a "≤1300" body means
+/// bytes. The old chars-count gate let a ≤1300-CHAR CJK/accented body
+/// (2–4× its byte length) skip the split + take a permanently clamped,
+/// degraded embedding.
 ///
 /// **Placement matters:** called post-parse + pre-reconcile in
 /// [`seed_compound_codex`], so the parts become the canonical title-keyed set.
@@ -337,17 +347,18 @@ fn dedupe_duplicate_titles(sources: Vec<ParsedEntry>) -> Vec<ParsedEntry> {
 /// per-part hashes → "unchanged", not churn (a split at insert-time would key
 /// the reconcile on the original title + orphan the parts every boot).
 ///
-/// Each part's hash is `DefaultHasher` over its part body (deterministic), so a
-/// body edit changes the parts' hashes + triggers an `updated` reconcile.
-/// Entries already ≤1300 pass through unchanged. (A single-chunk split is
-/// unreachable in practice — every chunk is ≤1300, so any body >1300 must
-/// yield ≥2 — but the n==1 branch stays as a defensive collapse-to-original
-/// in case `chunk_text`'s budget ever drifts above the gate.)
+/// Each part's hash is `stable_hash64` over its part body (deterministic), so
+/// a body edit changes the parts' hashes + triggers an `updated` reconcile.
+/// Entries already ≤1300 (bytes) pass through unchanged. (A single-chunk
+/// split is unreachable in practice — every chunk is ≤1300, so any body
+/// >1300 must yield ≥2 — but the n==1 branch stays as a defensive
+/// collapse-to-original in case `chunk_text`'s budget ever drifts above the
+/// gate.)
 pub(crate) fn expand_oversize_entries(sources: Vec<ParsedEntry>) -> Vec<ParsedEntry> {
     const CAP: usize = crate::memory::CHUNK_CHAR_BUDGET;
     let mut out = Vec::with_capacity(sources.len());
     for src in sources {
-        if src.body.chars().count() <= CAP {
+        if src.body.len() <= CAP {
             out.push(src);
             continue;
         }
@@ -355,9 +366,9 @@ pub(crate) fn expand_oversize_entries(sources: Vec<ParsedEntry>) -> Vec<ParsedEn
         let n = chunks.len();
         tracing::warn!(
             title = %src.title,
-            body_chars = src.body.chars().count(),
+            body_bytes = src.body.len(),
             parts = n,
-            "codex entry exceeds the 1300-char chunk budget; auto-splitting into paginated parts"
+            "codex entry exceeds the 1300-byte chunk budget; auto-splitting into paginated parts"
         );
         for (i, body) in chunks.into_iter().enumerate() {
             let title = if n > 1 {
@@ -365,11 +376,7 @@ pub(crate) fn expand_oversize_entries(sources: Vec<ParsedEntry>) -> Vec<ParsedEn
             } else {
                 src.title.clone()
             };
-            let hash = {
-                let mut h = std::hash::DefaultHasher::new();
-                body.hash(&mut h);
-                h.finish()
-            };
+            let hash = stable_hash64(&body);
             out.push(ParsedEntry {
                 title,
                 tags: src.tags.clone(),
@@ -466,9 +473,7 @@ fn parse_compound_file(path: &Path) -> anyhow::Result<Vec<ParsedEntry>> {
 pub fn parse_compound_text(text: &str, fallback_stem: &str) -> Vec<ParsedEntry> {
     let mut out = Vec::new();
     for chunk in split_compound(text) {
-        let mut hasher = std::hash::DefaultHasher::new();
-        chunk.hash(&mut hasher);
-        let hash = hasher.finish();
+        let hash = stable_hash64(chunk);
 
         let (front, body) = split_front_matter(chunk);
         let (title, tags) = parse_front_matter(front, fallback_stem);
@@ -483,6 +488,27 @@ pub fn parse_compound_text(text: &str, fallback_stem: &str) -> Vec<ParsedEntry> 
         });
     }
     out
+}
+
+/// (2026-08-20 audit P3) Stable 64-bit FNV-1a over the UTF-8 bytes — the
+/// codex reconcile hash PERSISTS in row metadata, and `DefaultHasher`
+/// (SipHash-with-zero-keys) carries NO cross-version stability guarantee
+/// from std: a future toolchain bump could silently change what every
+/// stored hash means, orphaning the reconcile (every entry suddenly reads
+/// `updated`, forever churning). FNV-1a is specified, dependency-free, and
+/// frozen here for the process's lifetime. NOT cryptographic — identity
+/// only. (One-time migration cost on the switch: stored SipHash values
+/// mismatch the first re-seed, every entry updates once, then idempotence
+/// resumes on FNV values.)
+pub(crate) fn stable_hash64(s: &str) -> u64 {
+    const FNV_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+    const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+    let mut h = FNV_OFFSET_BASIS;
+    for b in s.as_bytes() {
+        h ^= *b as u64;
+        h = h.wrapping_mul(FNV_PRIME);
+    }
+    h
 }
 
 /// Serialize entries back into the compound `.codex` text format. The inverse
@@ -1020,23 +1046,22 @@ mod tests {
         );
     }
 
-    /// Reconcile determinism: the same parsed entry produces the same hash
+    /// Reconcile determinism: the same parsed text produces the same hash
     /// (so an unchanged file → all `unchanged` on re-seed). This is the
-    /// idempotence invariant that makes the boot seed cheap.
+    /// idempotence invariant that makes the boot seed cheap. Runs through
+    /// `stable_hash64` (the persisted identity, 2026-08-20 P3) — NOT
+    /// `DefaultHasher`, whose std-internal algorithm is exactly the
+    /// cross-version churn the switch eliminated.
     #[test]
     fn parsed_entry_hash_is_deterministic() {
         let text = "---\ntitle: X\ntags: a\n---\n\nbody.\n";
-        let e1 = {
-            let mut h = std::hash::DefaultHasher::new();
-            text.hash(&mut h);
-            h.finish()
-        };
-        let e2 = {
-            let mut h = std::hash::DefaultHasher::new();
-            text.hash(&mut h);
-            h.finish()
-        };
-        assert_eq!(e1, e2);
+        let e1 = parse_compound_text(text, "stem");
+        let e2 = parse_compound_text(text, "stem");
+        assert!(!e1.is_empty(), "fixture must parse to one entry");
+        assert_eq!(
+            e1[0].hash, e2[0].hash,
+            "same text must parse to the same hash (idempotent re-seed)"
+        );
     }
 
     #[test]

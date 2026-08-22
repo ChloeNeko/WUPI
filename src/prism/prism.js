@@ -47,7 +47,8 @@ import { buildEl as buildComposer, wire as wireComposer, teardown as teardownCom
 import { buildEl as buildGallery, wire as wireGallery, teardown as teardownGallery,
   rewire as rewireGallery, refresh as galleryRefresh } from './screens/gallery.js';
 import { buildEl as buildFork, wire as wireFork, teardown as teardownFork,
-  rewire as rewireFork, load as forkLoad, onGenDone as forkOnGenDone } from './screens/fork.js';
+  rewire as rewireFork, load as forkLoad, onGenDone as forkOnGenDone,
+  onGenFail as forkOnGenFail } from './screens/fork.js';
 import { resolveGenDoneTarget } from './engine/routing.js';
 
 let prismRoot = null;       // the #prism app-window element
@@ -315,8 +316,10 @@ function onGenDone(payload) {
     // still gets its own done event (the latch-skipped branch emits one),
     // and its tag stays paired for it.
     composerDone(screens.composer.el);
-    const forkLayer = screens.fork.el.querySelector('[data-layer="b"]');
-    if (forkLayer) forkLayer.classList.remove('is-rendering');
+    // Fork's reset re-arms its regen button + clears the B shimmer (the
+    // 2026-08-20 guard: the button now stays disabled until a routed
+    // done/fail arrives, so a failure MUST re-arm it or it sticks).
+    forkOnGenFail(screens.fork.el);
     if (payload.cancelled) {
       toast('Generation cancelled.');
     } else {

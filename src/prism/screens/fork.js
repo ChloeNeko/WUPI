@@ -55,6 +55,11 @@ export function buildEl(routerHooks = {}) {
   bParams = null;
   bResultPath = null;
   splitPct = 50;
+  // A rebuilt screen starts with a clean regen state (a prior open's
+  // armed failsafe must not fire into the new DOM).
+  regenInFlight = false;
+  clearTimeout(regenFailsafeTimer);
+  regenFailsafeTimer = null;
 
   const el = document.createElement('div');
   el.className = 'prism-screen prism-fork';
@@ -116,15 +121,10 @@ export function teardown(rootEl) {
   // live on the canvas/handle elements — element-level, fine to keep).
   detachSliderWindow();
   sliderDragging = false;
-  // Clear a stale B-rendering shimmer + re-enable the regen button: the
-  // render's done event is dropped at close, so nothing else would ever
-  // clear them.
-  if (rootEl) {
-    const bLayer = rootEl.querySelector('[data-layer="b"]');
-    if (bLayer) bLayer.classList.remove('is-rendering');
-    const btn = rootEl.querySelector('[data-act="regen"]');
-    if (btn) { btn.disabled = false; btn.textContent = 'Regenerate B'; }
-  }
+  // Clear a stale B-rendering shimmer + re-arm the regen button + kill the
+  // failsafe: the render's done event is dropped at close, so nothing else
+  // would ever clear them.
+  resetRegen(rootEl);
 }
 
 // Re-attach the window-level listeners teardown removed (openPrism on
@@ -191,8 +191,33 @@ function onBFieldChange(rootEl, ctrl) {
 
 // ── Regenerate B ────────────────────────────────────────────────────────
 
+// The regen-button in-flight flag + failsafe timer (mirrors the Composer's
+// generate-button discipline): prism_generate returns IMMEDIATELY (the
+// multi-second swap cycle runs detached), so the button must stay disabled
+// until the ORIGIN-ROUTED prism-gen-done flips it back — re-enabling on
+// invoke-resolve (the old `finally` reset) let every extra click queue
+// ANOTHER full unload→render→reload cycle behind the turn lock and reopen
+// the dest-path duplicate-row race (same-ms clicks, one PNG, two rows).
+// The ≤5min failsafe nets an emit-less backend failure path.
+let regenInFlight = false;
+let regenFailsafeTimer = null;
+
+function resetRegen(rootEl) {
+  regenInFlight = false;
+  clearTimeout(regenFailsafeTimer);
+  regenFailsafeTimer = null;
+  if (rootEl) {
+    const bLayer = rootEl.querySelector('[data-layer="b"]');
+    if (bLayer) bLayer.classList.remove('is-rendering');
+    const btn = rootEl.querySelector('[data-act="regen"]');
+    if (btn) { btn.disabled = false; btn.textContent = 'Regenerate B'; }
+  }
+}
+
 async function onRegenerate(rootEl) {
   if (!bParams) return;
+  if (regenInFlight) return; // one swap cycle at a time — never queue a second
+  regenInFlight = true;
   const btn = rootEl.querySelector('[data-act="regen"]');
   if (btn) { btn.disabled = true; btn.textContent = 'Generating…'; }
   // Tag the render BEFORE the invoke fires (prism.js pairs the eventual
@@ -203,31 +228,43 @@ async function onRegenerate(rootEl) {
   try {
     const res = await generate(bParams);
     if (hooks.onRenderPath) hooks.onRenderPath('fork', res && res.path);
-    // The result arrives via prism-gen-done; the origin router calls
-    // onGenDone with the path, which setLayerImage('b', path) swaps in.
-    // Until then, mark B as "rendering".
+    // The result arrives via prism-gen-done; the routed onGenDone below
+    // resets the button. Until then, mark B as "rendering" + arm the
+    // failsafe as the net for an emit-less failure path.
     const bLayer = rootEl.querySelector('[data-layer="b"]');
     if (bLayer) bLayer.classList.add('is-rendering');
+    clearTimeout(regenFailsafeTimer);
+    regenFailsafeTimer = setTimeout(() => {
+      resetRegen(rootEl);
+      if (hooks.onToast) hooks.onToast('Generation timed out (no completion signal).');
+    }, 5 * 60 * 1000);
   } catch (err) {
     // The invoke itself rejected — the render never started server-side;
     // drop its origin tag so the router can't accumulate ghosts.
     if (hooks.onRenderFail) hooks.onRenderFail('fork');
+    resetRegen(rootEl);
     if (hooks.onToast) hooks.onToast(String(err));
-  } finally {
-    if (btn) { btn.disabled = false; btn.textContent = 'Regenerate B'; }
   }
 }
 
 // Called by prism.js when a FORK-ORIGINATED generation completes (the
 // origin-token router — regardless of which screen is active when the
-// swap finishes): swap B's image + clear the rendering flag.
+// swap finishes): swap B's image, clear the rendering flag, re-arm the
+// button.
 export function onGenDone(rootEl, payload) {
-  const bLayer = rootEl.querySelector('[data-layer="b"]');
-  if (bLayer) bLayer.classList.remove('is-rendering');
+  resetRegen(rootEl);
   if (payload && payload.image && payload.image.path) {
     bResultPath = payload.image.path;
     setLayerImage(rootEl, 'b', payload.image.path);
   }
+}
+
+// Called by prism.js on a FAILED fork-originated render (or a pathless
+// failure payload the router resets defensively): re-arm the button. A
+// queued server-side render, if one exists, still completes + inserts its
+// gallery row on its own done event.
+export function onGenFail(rootEl) {
+  resetRegen(rootEl);
 }
 
 // ── Drag-to-compare slider ──────────────────────────────────────────────

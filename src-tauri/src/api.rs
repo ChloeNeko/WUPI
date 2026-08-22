@@ -1,12 +1,15 @@
 //! API connection config: saved endpoint profiles + the active model-source
-//! selector, persisted to `api_config.json` in the app data dir.
+//! selector, persisted to `api.json` in the app data dir (renamed from
+//! `api_config.json` on 2026-08-20 — same content, same shape; the updater's
+//! rename step + [`ApiConfig::migrate_legacy_name`] carry existing profiles
+//! across untouched).
 //!
 //! This is the config half of the API feature. The HTTP backend impl
 //! (`HttpBackend: GenerationClient`) lives in `llm.rs`; this module owns only
 //! the persisted state: the list of saved API profiles (endpoint URL + model
 //! name + API key) and which model source (local WUPI.gguf vs API) is active.
 //!
-//! **Storage contract** (mirrors `theme.rs` exactly): `api_config.json` in the
+//! **Storage contract** (mirrors `theme.rs` exactly): `api.json` in the
 //! app data dir, atomic save (temp + rename), graceful default on any error.
 //! The file holds real API keys in plaintext: acceptable per the design call
 //! that WUPI runs on private offline personal computers with no network
@@ -58,7 +61,7 @@ pub struct ApiProfile {
     pub max_context: Option<u32>,
 }
 
-/// The active chat source. Persisted in `api_config.json` so the user's last
+/// The active chat source. Persisted in `api.json` so the user's last
 /// choice is restored at boot; the model swap is re-performed in `setup()`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -102,17 +105,50 @@ pub struct ApiConfig {
 }
 
 impl ApiConfig {
-    /// Path to `api_config.json` inside the app data dir. Computed once in
+    /// Path to `api.json` inside the app data dir. Computed once in
     /// setup and cached on AppState (the `api_config_path` OnceLock) so the
     /// load/save helpers below stay `&Path`-based and need no `AppHandle`.
     /// Mirrors `ThemeSettings::resolve_path` exactly.
     pub fn resolve_path(app_data_dir: &std::path::Path) -> PathBuf {
+        app_data_dir.join("api.json")
+    }
+
+    /// The pre-rename filename (`api_config.json`, retired 2026-08-20).
+    /// Read-side only — never written except by the migration below.
+    fn legacy_path(app_data_dir: &std::path::Path) -> PathBuf {
         app_data_dir.join("api_config.json")
+    }
+
+    /// One-shot filename migration (2026-08-20 rename): move an existing
+    /// `api_config.json` to `api.json` with its profiles byte-identical.
+    /// Runs at every boot (cheap no-op once done) as the backstop for the
+    /// updater's rename step — if BOTH files exist the NEW one wins (it is
+    /// the app-written current config) and the legacy file is left alone:
+    /// this migration never merges and never deletes user data it didn't
+    /// successfully move. Pure same-volume rename first; on a locked source
+    /// (AV/indexer pass) fall back to read + atomic save + delete-old-only-
+    /// after-the-new-file-landed, so a failure can never lose profiles.
+    pub fn migrate_legacy_name(app_data_dir: &std::path::Path) {
+        let new = Self::resolve_path(app_data_dir);
+        let old = Self::legacy_path(app_data_dir);
+        if !old.is_file() || new.is_file() {
+            return; // already migrated (or never existed) — never clobber newer
+        }
+        if std::fs::rename(&old, &new).is_ok() {
+            tracing::info!("api config: renamed api_config.json → api.json (profiles untouched)");
+            return;
+        }
+        let cfg = Self::load(&old);
+        cfg.save(&new);
+        if new.is_file() {
+            let _ = std::fs::remove_file(&old);
+            tracing::info!("api config: migrated api_config.json → api.json via copy (rename was locked)");
+        }
     }
 
     /// Load from disk, falling back to default (empty config, Local source)
     /// on any error (missing file, malformed JSON, IO). Persistence is
-    /// best-effort: a corrupt `api_config.json` must never block app launch -
+    /// best-effort: a corrupt `api.json` must never block app launch -
     /// the user just sees an empty profile list and re-enters their configs.
     /// Mirrors `ThemeSettings::load`.
     pub fn load(path: &std::path::Path) -> Self {
@@ -374,12 +410,93 @@ mod tests {
 
     #[test]
     fn load_missing_file_returns_default() {
-        // Graceful degradation: a missing api_config.json at boot → empty
+        // Graceful degradation: a missing api.json at boot → empty
         // default config, no panic. This is the common case until the user
         // authors their first profile.
-        let bogus = std::path::Path::new("/this/does/not/exist/api_config.json");
+        let bogus = std::path::Path::new("/this/does/not/exist/api.json");
         let c = ApiConfig::load(bogus);
         assert!(c.profiles.is_empty());
         assert_eq!(c.model_source, ModelSource::Local);
+    }
+
+    // ── migrate_legacy_name (the 2026-08-20 api_config.json → api.json
+    //    rename): profiles must ride across untouched, exactly once, and the
+    //    new file must never be clobbered. ─────────────────────────────────
+
+    /// A realistic legacy config body (pre-rename shape — exercises the
+    /// #[serde(default)] arms too).
+    fn legacy_body() -> String {
+        serde_json::to_string_pretty(&serde_json::json!({
+            "profiles": [{
+                "id": "zai", "name": "Z.AI personal",
+                "endpoint": "https://api.z.ai/api/coding/paas/v4",
+                "model": "glm-4.6", "api_key": "sk-legacy-secret"
+            }],
+            "active_profile_id": "zai",
+            "model_source": "api"
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn migrate_moves_legacy_file_with_profiles_intact() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("api_config.json"), legacy_body()).unwrap();
+
+        ApiConfig::migrate_legacy_name(tmp.path());
+
+        assert!(!tmp.path().join("api_config.json").exists());
+        let cfg = ApiConfig::load(&ApiConfig::resolve_path(tmp.path()));
+        assert_eq!(cfg.profiles.len(), 1);
+        assert_eq!(cfg.profiles[0].api_key, "sk-legacy-secret");
+        assert_eq!(cfg.active_profile_id.as_deref(), Some("zai"));
+        assert_eq!(cfg.model_source, ModelSource::Api);
+    }
+
+    #[test]
+    fn migrate_is_a_noop_without_the_legacy_file() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        ApiConfig::migrate_legacy_name(tmp.path());
+        assert!(!tmp.path().join("api.json").exists());
+    }
+
+    #[test]
+    fn migrate_never_clobbers_an_existing_new_file() {
+        // Both present (e.g. a restored backup after the app already saved
+        // api.json): the NEW file wins byte-for-byte; the legacy file is
+        // left untouched — the migration never deletes user data it didn't
+        // successfully move.
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("api_config.json"), legacy_body()).unwrap();
+        let current = r#"{"profiles":[{"id":"live","name":"Live","endpoint":"e","model":"m","api_key":"k2"}],"active_profile_id":"live","model_source":"local"}"#;
+        std::fs::write(tmp.path().join("api.json"), current).unwrap();
+
+        ApiConfig::migrate_legacy_name(tmp.path());
+
+        assert_eq!(std::fs::read_to_string(tmp.path().join("api.json")).unwrap(), current);
+        assert!(tmp.path().join("api_config.json").exists());
+        // And it stays stable on repeated boots.
+        ApiConfig::migrate_legacy_name(tmp.path());
+        assert_eq!(std::fs::read_to_string(tmp.path().join("api.json")).unwrap(), current);
+    }
+
+    #[test]
+    fn save_writes_atomic_tmp_sibling_next_to_api_json() {
+        // The atomic-save temp is `api.json.tmp` (with_extension replaces the
+        // LAST extension) — same-directory rename, same pattern as theme.rs.
+        // Pins the rename didn't disturb the save mechanics.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = ApiConfig::resolve_path(tmp.path());
+        let mut cfg = ApiConfig::default();
+        cfg.upsert(ApiProfile {
+            id: "z".into(), name: "Z".into(), endpoint: "e".into(),
+            model: "m".into(), api_key: "k".into(),
+            temperature: None, max_context: None,
+        });
+        cfg.save(&path);
+        assert!(path.is_file());
+        assert!(!tmp.path().join("api.json.tmp").exists(), "tmp must be renamed away");
+        let back = ApiConfig::load(&path);
+        assert_eq!(back.profiles.len(), 1);
     }
 }

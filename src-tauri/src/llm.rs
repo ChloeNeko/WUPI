@@ -71,6 +71,7 @@ pub trait GenerationClient: Send + Sync {
         context_size: u32,
         on_chunk: ChunkFn,
         cancel: CancelToken,
+        max_tokens: Option<u32>,
     ) -> StreamFuture;
 
     fn is_ready(&self) -> bool {
@@ -116,6 +117,7 @@ impl GenerationClient for EchoBackend {
         _context_size: u32,
         on_chunk: ChunkFn,
         _cancel: CancelToken,
+        _max_tokens: Option<u32>,
     ) -> StreamFuture {
         Box::pin(async move {
             let reply = "(echo backend) Wupi's model isn't loaded yet.";
@@ -322,6 +324,7 @@ impl GenerationClient for HttpBackend {
         _context_size: u32,
         on_chunk: ChunkFn,
         cancel: CancelToken,
+        max_tokens: Option<u32>,
     ) -> StreamFuture {
         let url = self.completions_url();
         let model = self.profile.model.clone();
@@ -394,13 +397,37 @@ impl GenerationClient for HttpBackend {
             let temp_val = crate::settings::API_TEMP as f64;
             let temp_r = (temp_val * 100.0).round() / 100.0;
             let topp_r = ((crate::settings::API_TOP_P as f64) * 100.0).round() / 100.0;
-            let body = serde_json::json!({
+            let mut body = serde_json::json!({
                 "model": model,
                 "messages": wire_messages,
                 "stream": true,
                 "temperature": temp_r,
                 "top_p": topp_r,
             });
+            // (2026-08-21 narrator length cap) Only serialized when Some — a
+            // literal `"max_tokens": null` is a 400 on strict providers (the
+            // same class as the top_p precision bug above). The Fable narrator
+            // passes Some(API_NARRATOR_MAX_TOKENS); the creator + slice paths
+            // stay uncapped.
+            if let Some(mt) = max_tokens {
+                body["max_tokens"] = serde_json::json!(mt);
+            }
+            // (2026-08-21 Chloe ruling) GLM thinking is ALWAYS disabled on
+            // the wire. z.ai counts generated reasoning tokens against
+            // max_tokens, and GLM defaults to thinking ON when the request
+            // is silent — on real narrative prompts the reasoning phase
+            // alone exceeded API_NARRATOR_MAX_TOKENS (800), so every turn
+            // finished `finish_reason=length` with ZERO content tokens →
+            // "narrator returned empty prose" → api_lost → full revert (the
+            // 2026-08-21 sim-test regression). Scoped to GLM/z.ai (model or
+            // endpoint match): strict OpenAI-compatible providers 400 on
+            // unknown top-level fields — the same rejection class as the
+            // min_p/top_k note above.
+            if model.to_ascii_lowercase().contains("glm")
+                || url.to_ascii_lowercase().contains("z.ai")
+            {
+                body["thinking"] = serde_json::json!({ "type": "disabled" });
+            }
 
             // (2026-08-16 audit fix) The request phase is part of the
             // first-token budget: the ABSOLUTE TTFT deadline is armed BEFORE
@@ -947,7 +974,7 @@ pub fn reload_shared_model(path: &std::path::Path, n_gpu_layers: u32) -> anyhow:
 fn set_shared_model(model_ref: &'static LlamaModel) {
     let ptr = std::ptr::NonNull::new(model_ref as *const LlamaModel as *mut LlamaModel)
         .expect("model ref is non-null");
-    let mut g = SHARED_MODEL.write().expect("SHARED_MODEL lock not poisoned at first boot");
+    let mut g = SHARED_MODEL.write().unwrap_or_else(|e| e.into_inner());
     if let Some(prior) = g.replace(SharedModelPtr(ptr)) {
         tracing::error!("set_shared_model: prior model was still resident — reclaiming it (leak prevented; investigate the caller's load ordering)");
         // SAFETY: the pointer came from the same Box::leak path in
@@ -1008,7 +1035,7 @@ impl LlamaCppBackend {
                 match init_rx.recv() {
                     Ok(Ok(())) => {
                         {
-                            let mut g = slot_clone.lock().expect("engine mutex");
+                            let mut g = slot_clone.lock().unwrap_or_else(|e| e.into_inner());
                             *g = Some(engine);
                         }
                         on_result(Ok(name));
@@ -1104,7 +1131,7 @@ impl LlamaCppBackend {
             match init_rx.recv() {
                 Ok(Ok(())) => {
                     {
-                        let mut g = slot_clone.lock().expect("engine mutex");
+                        let mut g = slot_clone.lock().unwrap_or_else(|e| e.into_inner());
                         *g = Some(engine);
                     }
                     tracing::info!("chat backend re-spawned from shared model (no file read)");
@@ -1138,12 +1165,13 @@ impl GenerationClient for LlamaCppBackend {
         _context_size: u32,
         on_chunk: ChunkFn,
         cancel: CancelToken,
+        _max_tokens: Option<u32>,
     ) -> StreamFuture {
         let engine = Arc::clone(&self.engine);
         Box::pin(async move {
             let (reply_tx, reply_rx) = std::sync::mpsc::channel::<EngineReply>();
             {
-                let guard = engine.lock().expect("engine mutex");
+                let guard = engine.lock().unwrap_or_else(|e| e.into_inner());
                 let eng = guard
                     .as_ref()
                     .ok_or_else(|| anyhow::anyhow!("model not loaded yet"))?;
@@ -1471,7 +1499,7 @@ mod tests {
         }];
 
         let result = backend
-            .stream(messages, None, None, Vec::new(), 1024, on_chunk, cancel)
+            .stream(messages, None, None, Vec::new(), 1024, on_chunk, cancel, None)
             .await
             .expect("stream should complete (not error)");
 
@@ -1569,7 +1597,7 @@ mod tests {
         }];
 
         let result = backend
-            .stream(messages, None, None, Vec::new(), 1024, on_chunk, cancel)
+            .stream(messages, None, None, Vec::new(), 1024, on_chunk, cancel, None)
             .await
             .expect("stream should complete (not error)");
 
@@ -1628,7 +1656,7 @@ mod tests {
         }];
 
         let result = backend
-            .stream(messages, None, None, Vec::new(), 1024, on_chunk, cancel)
+            .stream(messages, None, None, Vec::new(), 1024, on_chunk, cancel, None)
             .await
             .expect("stream should complete cleanly");
 
@@ -1666,7 +1694,7 @@ mod tests {
         }];
 
         let result = backend
-            .stream(messages, None, None, Vec::new(), 1024, on_chunk, cancel)
+            .stream(messages, None, None, Vec::new(), 1024, on_chunk, cancel, None)
             .await
             .expect("stream should complete");
 

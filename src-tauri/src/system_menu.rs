@@ -6,6 +6,12 @@
 //! loop is what makes sleep cheap, so we emit `canvas-pause` / `canvas-resume`
 //! to the frontend which gates `requestAnimationFrame`.
 //!
+//! TRAY LIFECYCLE (2026-08-20 Chloe ruling): the paw icon EXISTS ONLY WHILE
+//! THE APP IS ASLEEP. `power_sleep` mints it, `power_wake` retires it, and no
+//! icon is built at boot — a visible WUPI owns the taskbar and must NOT squat
+//! in the hidden-icons overflow (the launch-time build read as a permanent
+//! "ghost" between sessions and had to be raced clean at every exit).
+//!
 //! All four actions are exposed as `#[tauri::command]`s invoked from the paw
 //! dropdown in `index.html`. The tray icon's double-click and its menu "Wake"
 //! / "Quit" items route through the same power_wake / power_shutdown paths.
@@ -20,16 +26,28 @@ use tauri::{
 pub const TRAY_WAKE: &str = "wupi_wake";
 pub const TRAY_QUIT: &str = "wupi_quit";
 
+/// The tray icon's Tauri id — shared by the build guard, teardown, and the
+/// shutdown grace-delay check so the string lives in exactly one place.
+const TRAY_ID: &str = "wupi-tray";
+
 const MAIN_WINDOW: &str = "main";
 const EVT_CANVAS_PAUSE: &str = "canvas-pause";
 const EVT_CANVAS_RESUME: &str = "canvas-resume";
 
-/// Build + install the system-tray icon. Called once from `setup()`.
+/// Build + install the system-tray icon. Called from `power_sleep` — the
+/// tray exists only for the duration of a sleep (see the module header).
+///
+/// Idempotent: if the paw is already installed (e.g. a double sleep), the
+/// guard short-circuits — a second `TrayIconBuilder::with_id(TRAY_ID)` build
+/// while the first lives would error on the duplicate id.
 ///
 /// The icon reuses the paw asset bundled into the binary via
 /// `tauri::generate_context!`. The menu offers "Wake" (restore the window)
 /// and "Quit" (full shutdown); a double-click on the icon itself also wakes.
 pub fn build_tray<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
+    if app.tray_by_id(TRAY_ID).is_some() {
+        return Ok(());
+    }
     let wake = MenuItem::with_id(app, TRAY_WAKE, "Wake", true, None::<&str>)?;
     let quit = MenuItem::with_id(app, TRAY_QUIT, "Quit", true, None::<&str>)?;
     let menu = Menu::with_items(app, &[&wake, &quit])?;
@@ -41,7 +59,7 @@ pub fn build_tray<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
         .default_window_icon()
         .cloned();
 
-    let mut builder = TrayIconBuilder::with_id("wupi-tray")
+    let mut builder = TrayIconBuilder::with_id(TRAY_ID)
         .tooltip("WUPI")
         .menu(&menu)
         .on_tray_icon_event(move |tray, event| {
@@ -82,8 +100,10 @@ pub fn build_tray<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
 pub fn destroy_tray<R: Runtime>(app: &AppHandle<R>) {
     // Returns Option<TrayIcon>; dropping it finalizes the platform cleanup.
     // No error path — `remove_tray_by_id` returns None if the icon doesn't
-    // exist (already destroyed, never built), which is fine for cleanup.
-    drop(app.remove_tray_by_id("wupi-tray"));
+    // exist (already destroyed, never built — the normal case while the app
+    // is awake under the sleep-only tray lifecycle), which is fine for
+    // cleanup.
+    drop(app.remove_tray_by_id(TRAY_ID));
 }
 
 /// Full shutdown: terminate the process gracefully. We call `app.exit(0)`:
@@ -106,12 +126,23 @@ pub fn destroy_tray<R: Runtime>(app: &AppHandle<R>) {
 ///
 /// `destroy_tray` is still called explicitly first so the `NIM_DELETE` is
 /// sent deterministically while we know the loop is alive (not relying on
-/// Tauri's internal tray Drop ordering). The belt-and-suspenders
-/// `RunEvent::ExitRequested → destroy_tray` in lib.rs is idempotent (a second
-/// `remove_tray_by_id` returns None) so there's no double-free risk.
+/// Tauri's internal tray Drop ordering). When a paw is actually live (quit
+/// from sleep via the tray menu), a 250ms grace delay sits between the
+/// `NIM_DELETE` and the exit: the delete is a post to explorer.exe's UI
+/// thread, reconciled asynchronously, and exiting in the same breath raced
+/// that processing — the ghost outlived the graceful-exit fix alone
+/// (observed on Win10, 2026-08-20). The delay only runs when an icon
+/// existed; the common close-while-awake path has NO tray at all (see the
+/// module header) and pays nothing — there is nothing left to ghost. The
+/// belt-and-suspenders `RunEvent::ExitRequested → destroy_tray` in lib.rs is
+/// idempotent (a second `remove_tray_by_id` returns None) so there's no
+/// double-free risk.
 pub fn power_shutdown<R: Runtime>(app: &AppHandle<R>) {
     let _ = app.emit(EVT_CANVAS_PAUSE, ());
-    destroy_tray(app);
+    if app.tray_by_id(TRAY_ID).is_some() {
+        destroy_tray(app);
+        std::thread::sleep(std::time::Duration::from_millis(250));
+    }
     app.exit(0);
 }
 
@@ -161,20 +192,32 @@ pub const RESTART_SPAWN_SENTINEL: &str = "WUPI_RESTART_SPAWN";
 
 /// Sleep: hide the main window to the tray and pause the canvas. Engines
 /// stay warm. The window leaves the taskbar entirely (hidden, not minimized).
+/// The tray paw is BORN here (build_tray): the icon is the wake affordance,
+/// so it exists for exactly as long as the window doesn't. A build failure
+/// is logged and non-fatal, but it matters — a slept WUPI with no tray can
+/// only be woken by relaunching the exe (single-instance routes that to
+/// power_wake below).
 pub fn power_sleep<R: Runtime>(app: &AppHandle<R>) {
     let _ = app.emit(EVT_CANVAS_PAUSE, ());
     if let Some(win) = app.get_webview_window(MAIN_WINDOW) {
         let _ = win.hide();
     }
+    if let Err(e) = build_tray(app) {
+        tracing::error!(error = %format!("{e:#}"), "sleep: tray icon build failed — no wake affordance while hidden");
+    }
 }
 
-/// Wake: restore + focus the main window and resume the canvas.
+/// Wake: restore + focus the main window, resume the canvas, and RETIRE the
+/// tray paw — the window is back on the taskbar, so the overflow icon's job
+/// is done. destroy_tray is a no-op when no tray exists (waking an already
+/// awake window).
 pub fn power_wake<R: Runtime>(app: &AppHandle<R>) {
     if let Some(win) = app.get_webview_window(MAIN_WINDOW) {
         let _ = win.show();
         let _ = win.set_focus();
     }
     let _ = app.emit(EVT_CANVAS_RESUME, ());
+    destroy_tray(app);
 }
 
 

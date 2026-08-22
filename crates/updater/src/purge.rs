@@ -200,14 +200,14 @@ mod tests {
         std::fs::create_dir_all(target.join("data/_update")).unwrap();
         std::fs::write(target.join("data/_update/portable.zip"), b"ZIP").unwrap();
         std::fs::write(target.join("data/_update/portable.zip.part"), b"PART").unwrap();
-        // `data/` siblings that must survive: the result marker wupi.exe
-        // reads on boot, and user data under the preserve rule.
-        std::fs::write(target.join("data/_update_result.json"), b"{}").unwrap();
+        // A `data/` sibling that must survive: user data under the preserve
+        // rule. (The updater's result marker no longer lives here at all —
+        // it is `%TEMP%\wupi_update_result.json` since the 2026-08-20
+        // relocation; nothing updater-owned may exist in the install.)
         std::fs::write(target.join("data/user.xml"), b"<user/>").unwrap();
 
         assert!(purge_update_staging(target));
         assert!(!target.join("data/_update").exists());
-        assert!(target.join("data/_update_result.json").exists());
         assert!(target.join("data/user.xml").exists());
     }
 

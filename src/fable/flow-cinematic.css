@@ -1241,7 +1241,7 @@
        a fixed 320×480 box in the review AND the picker modal (sized up so
        the card reads taller + the rows get room to breathe). The card's
        height (driven by trait text) must NEVER stretch the image. */
-    width: 320px;
+    width: 352px;
     aspect-ratio: 2 / 3;
     height: auto;
     border-radius: 12px;
@@ -1524,7 +1524,7 @@
     width: 100%;
     box-sizing: border-box;
     padding: 0 120px 0 0;         /* clears the corner cluster on the right only */
-    margin: -12px 0 0 -50px;      /* 2026-08-20 Chloe: nudged further left (into the portrait gap) + up (toward the card's top edge) */
+    margin: -6px 0 0 -50px;       /* 2026-08-20 Chloe: nudged further left (into the portrait gap); -6 top seats the header a touch lower (was -12) */
 }
 /* The header wrapper shrink-wraps its text so the gold rule can size to it;
    the whole block (text, rule, type subheader) anchors LEFT. */
@@ -1541,7 +1541,7 @@
     overflow-wrap: anywhere;
     font-family: 'Almendra', var(--fable-font-serif);
     font-weight: 700;
-    font-size: 32px;
+    font-size: 38px;
     line-height: 1.2;
     color: var(--fable-brass);
     text-transform: uppercase;
@@ -1551,6 +1551,7 @@
        matching leading padding keeps the glyph run flush with the rule's
        left edge. */
     padding-left: 0.16em;
+    margin-left: -5px;   /* 2026-08-20 Chloe: nudge the NAME alone left a touch — the rule below stays put */
     text-align: left;
     text-shadow: 0 0 6px rgba(230, 213, 138, 0.22);   /* 2026-08-20 Chloe: subtler glow */
 }
@@ -1562,7 +1563,7 @@
     display: block;
     width: calc(40cqw + 28px);   /* 40% of the card's BORDER-box width (cqw is content-box: +2×(34 padding + 1 border)×40%) */
     max-width: 100%;
-    margin-top: 10px;
+    margin-top: -4px;   /* 2026-08-20 Chloe: name sits tight on the rule (the line-box descent eats the rest) */
     height: 1px;
     border-radius: 2px;
     background: linear-gradient(90deg,
@@ -1578,7 +1579,10 @@
    review edit), ABSOLUTELY pinned to the CARD's true top-right corner
    (2026-08-20 Chloe: the in-flow headrow seat left dead space above + right
    of the buttons). Anchors against the card root (.fable-id-card /
-   .fable-codex-review-card are position:relative). */
+   .fable-codex-review-card are position:relative). The base seat is the
+   14px inset; the ID cards override to flush 0/0 below — scoping keeps the
+   CODEX review's pencil (same corner class, codex card root) at its original
+   seat (2026-08-20 Chloe: don't touch the codex cards). */
 .fable-id-card-corner {
     position: absolute;
     top: 14px;
@@ -1587,6 +1591,10 @@
     display: flex;
     align-items: center;
     gap: 10px;
+}
+.fable-id-card .fable-id-card-corner {
+    top: 0;
+    right: 0;
 }
 
 /* License grid — PAIRED rows (2026-08-20 Chloe): RACE|GENDER, then
@@ -1615,15 +1623,38 @@
     gap: 3px;
     min-width: 0;
 }
-.fable-id-card-core dt { color: var(--fable-text-faint); font-size: 0.95rem; text-transform: uppercase; letter-spacing: 0.06em; }
-.fable-id-card-core dd { margin: 0; color: var(--fable-text); font-size: 1.25rem; text-transform: uppercase; line-height: 1.25; overflow-wrap: anywhere; }
+.fable-id-card-core dt { color: var(--fable-text-faint); font-size: 1.08rem; text-transform: uppercase; letter-spacing: 0.06em; }   /* +2px (2026-08-20 Chloe) */
+.fable-id-card-core dd { margin: 0; color: var(--fable-text); font-size: 1.375rem; text-transform: uppercase; line-height: 1.25; overflow-wrap: anywhere; }   /* +2px (2026-08-20 Chloe) */
 
-/* World/Scenario: the TYPE banner is the headrow header; a 1-col core (the
-   setting/purpose values are prose-y, so a single full-width column reads
-   cleaner than the multi-col player grid). */
-.fable-id-card--world .fable-player-review-body { align-items: center; text-align: center; }
-.fable-id-card--world .fable-id-card-core { grid-template-columns: 1fr; gap: 20px; }
-.fable-id-card--world .fable-id-card-core .fable-id-card-cell { grid-column: 1 / -1; align-items: center; }
+/* World/Scenario: the core stays a 1-col stack of FULL-WIDTH rows (2026-08-20
+   Chloe: Setting/Tone etc. are NEVER horizontal — the player paired-grid does
+   not apply here), LEFT-ALIGNED and pulled close to the portrait with the same
+   -31px nudge the header carries (2026-08-20 Chloe). Font sizes, portrait +
+   card dimensions ride the shared selectors. The header hugs the portrait like
+   the player face but keeps a small gap (~8px clear of the portrait edge). */
+.fable-id-card--world .fable-id-card-headrow { margin-left: -31px; }
+.fable-id-card--world .fable-id-card-core { grid-template-columns: 1fr; gap: 20px; margin-left: -31px; }
+.fable-id-card--world .fable-id-card-core .fable-id-card-cell { grid-column: 1 / -1; align-items: flex-start; text-align: left; }
+
+/* World/Scenario core typography + the scroll cap (2026-08-20 Chloe): the
+   Setting/Purpose/Tone labels sit 2px smaller and their white values 3px
+   smaller than the shared license sizes (player/NPC faces are untouched).
+   Each value caps at 4.5 LINES of height — overflow scrolls with NO visible
+   scrollbar + NO field chrome, and the bottom half-line fades out (the mask)
+   as the more-below hint while text remains below; id-card.js toggles
+   .is-overflow off at the scroll end so the last line reads clean. */
+.fable-id-card--world .fable-id-card-core dt { font-size: calc(1.08rem - 2px); }
+.fable-id-card--world .fable-id-card-core dd {
+    font-size: calc(1.375rem - 3px);
+    max-height: 5.625em;            /* exactly 4.5 line boxes at 1.25 line-height */
+    overflow-y: auto;
+    scrollbar-width: none;          /* Firefox: invisible scrollbar */
+}
+.fable-id-card--world .fable-id-card-core dd::-webkit-scrollbar { width: 0; height: 0; }
+.fable-id-card--world .fable-id-card-core dd.is-overflow {
+    -webkit-mask-image: linear-gradient(180deg, #000 87%, transparent 100%);
+    mask-image: linear-gradient(180deg, #000 87%, transparent 100%);
+}
 
 /* NPC: a small darker-bronze 'NPC CARD' subheader centered UNDER the name
    rule (2026-08-20 Chloe) — inside the headwrap so it tracks the header's
@@ -1638,10 +1669,16 @@
     margin: -11px 0 -18px;         /* -11 + the body's 20px column gap = 9px under the rule; -18 pulls the grid up tight under the tag */
     color: #8f7a3d;                /* darker bronze — quieter than the brass rule */
     font-weight: 600;              /* 2026-08-20 Chloe: a bit bolder — was thin at default weight */
-    font-size: 0.78rem;
+    font-size: 0.91rem;            /* +2px (2026-08-20 Chloe) */
     letter-spacing: 0.22em;
     text-transform: uppercase;
     text-align: center;
+}
+/* PLAYER + NPC only (2026-08-20 Chloe): the license grid (RACE|GENDER row)
+   sits a touch closer under the header block — the tag pulls itself + the
+   grid up. World/scenario cards keep the looser default. */
+.fable-id-card:not(.fable-id-card--world) .fable-id-card-tag {
+    margin: -15px 0 -32px;
 }
 
 /* The brass card-icon trigger — small circular brass button in the corner
@@ -2376,8 +2413,10 @@
     position: relative;
     z-index: 2;
     /* Tight modal: hugs the 1000px review card with trimmed padding so there's
-       no excess empty side/top space. Cap by viewport. */
-    width: min(1070px, 94vw);
+       no excess empty side/top space — content-box width 1000 = card + 2×16
+       padding, so the portrait sits ~16px off the modal's left edge (2026-08-20
+       Chloe: kill the centered-card left gap). Cap by viewport. */
+    width: min(1000px, 94vw);
     max-height: 90vh;
     overflow-y: auto;
     padding: 16px 16px 22px;      /* trimmed: top/sides 16 (was 28), bottom a touch more for the action row */

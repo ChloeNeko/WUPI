@@ -406,6 +406,29 @@ pub struct PlayerState {
     #[serde(default)]
     pub reputation: i32,
 
+    /// (2026-08-20 Economy) The player's upkeep tier. Default (and dormant)
+    /// is Squatter — free, renders nothing, settles nothing. Mutated only
+    /// by the `[LEDGER lifestyle]` applier; the daily settlement charges
+    /// the inverse-curve cost at the current node's prosperity (fallback
+    /// chain: pocket → player-owned tills → Starving).
+    #[serde(default)]
+    pub lifestyle: crate::economy::Lifestyle,
+
+    /// (2026-08-20 Economy) The lifestyle settlement's day-boundary stamp
+    /// (epoch-minutes — the same per-entity discipline as
+    /// `economy::Property::last_settled_minutes`). Re-stamped on every
+    /// `[LEDGER lifestyle]` change so a fresh tier never back-charges.
+    #[serde(default)]
+    pub lifestyle_settled_minutes: i64,
+
+    /// (2026-08-20 Economy) The player's paid work (capped at
+    /// `economy::MAX_JOBS` by the applier). Wages land in `wealth` at the
+    /// daily settlement (presence-free); `JOB_LAPSE_ABSENT_DAYS`
+    /// consecutive away-days end the contract. Mutated only by the
+    /// `[LEDGER job]` applier + the settlement's lapse pass.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub jobs: Vec<crate::economy::Job>,
+
     /// Live appearance deltas applied ON TOP of the SavedPlayer's authored
     /// identity during play (2026-08-04 overhaul). A stable-keyed map so the
     /// `[APPEARANCE key=value]` bracket pipeline can mutate individual traits
@@ -465,6 +488,9 @@ impl Default for PlayerState {
             stamina: Stamina::Fresh,
             wealth: 0,
             reputation: 0,
+            lifestyle: crate::economy::Lifestyle::Squatter,
+            lifestyle_settled_minutes: 0,
+            jobs: Vec::new(),
             current_appearance_deltas: HashMap::new(),
             equipment: HashMap::new(),
             belt: Vec::new(),
@@ -484,6 +510,8 @@ impl PlayerState {
         self.stamina == Stamina::Fresh
             && self.wealth == 0
             && self.reputation == 0
+            && self.lifestyle == crate::economy::Lifestyle::Squatter
+            && self.jobs.is_empty()
             && self.body.values().all(|s| *s == BodyPartState::Transparent)
             && self.injury_details.values().all(|v| v.is_empty())
             && self.current_appearance_deltas.is_empty()
@@ -520,8 +548,14 @@ impl PlayerState {
     /// follows appearance so the visible garments + readied weapons read as
     /// one cohesive look (2026-08-18: clothing IS this block — garments are
     /// equipped items; 2026-08-19: visibility, not blanket outer-only).
-    pub fn render_for_prompt(&self) -> Option<String> {
-        self.render_for_prompt_with_beneath(false)
+    /// `currency` — the world's money-unit label (`WorldSchema::
+    /// currency_label`, 2026-08-21 economy addendum). Empty = naked
+    /// integers (`wealth: 0`, `+8/day`); set = `wealth: 150 dollars`.
+    /// Always the FLAT label (never tier-split): this block is
+    /// model-facing, and the tracker must read the base unit to do
+    /// `[LEDGER]` arithmetic.
+    pub fn render_for_prompt(&self, currency: &str) -> Option<String> {
+        self.render_for_prompt_with_beneath(false, currency)
     }
 
     /// The exposure-gated variant (2026-08-19, the upskirt ruling): when
@@ -533,7 +567,7 @@ impl PlayerState {
     /// other turn is byte-identical to the ungated render (zero tokens —
     /// Prime Mandate: concealed wear earns its place only in the 100% of
     /// gated turns where the scene actually exposes it).
-    pub fn render_for_prompt_with_beneath(&self, reveal_beneath: bool) -> Option<String> {
+    pub fn render_for_prompt_with_beneath(&self, reveal_beneath: bool, currency: &str) -> Option<String> {
         if self.is_default() {
             return None;
         }
@@ -601,12 +635,35 @@ impl PlayerState {
         }
 
         // Wealth + reputation: only when non-zero. These are background
-        // facts; the narrator weaves them in, doesn't dwell.
+        // facts; the narrator weaves them in, doesn't dwell. (2026-08-21
+        // addendum) wealth renders through `money_plain` — the naked
+        // base-unit integer when no currency is known, `{n} {label}` when
+        // the tracker has set one. NEVER a hardcoded unit.
         if self.wealth != 0 {
-            lines.push(format!("wealth: {}", self.wealth));
+            lines.push(format!(
+                "wealth: {}",
+                crate::economy::money_plain(self.wealth as i64, currency)
+            ));
         }
         if self.reputation != 0 {
             lines.push(format!("reputation: {}", self.reputation));
+        }
+
+        // (2026-08-20 Economy) Lifestyle + jobs — dormant at the defaults
+        // (Squatter renders nothing; zero prompt bytes for the common case).
+        // A lifestyle line reads as an upkeep tier the narrator flavors;
+        // each job carries its node (where the wage comes from). Wages are
+        // base units (`money_plain`, same 2026-08-21 discipline).
+        if self.lifestyle != crate::economy::Lifestyle::Squatter {
+            lines.push(format!("lifestyle: {}", self.lifestyle.word()));
+        }
+        for j in &self.jobs {
+            lines.push(format!(
+                "job: {} @{} +{}/day",
+                j.title,
+                j.node_id,
+                crate::economy::money_plain(j.daily_wage as i64, currency)
+            ));
         }
 
         // Live appearance deltas: emitted LAST (loudest signal) so the model
@@ -1224,24 +1281,25 @@ pub(crate) fn keyword_present(lower: &str, kw: &str) -> bool {
 /// direction (speech tail can't trigger referees). Every keyword referee
 /// (combat / recovery / skill checks / suspicious-action) + scene-pacing
 /// score on the STRIPPED text.
+///
+/// (2026-08-20 P3) ANY quote flavor closes an open span. The old
+/// same-flavor (or `”`-only) closer left MIXED pairs (`“sure"`) running to
+/// end-of-text as "unterminated" — routine LLM/player output — silently
+/// swallowing every action keyword after the quote. Over-closing a nested
+/// different-flavor quote (`“She said "run" loudly”`) only re-leaks a
+/// speech fragment, the milder failure either way.
 pub(crate) fn strip_dialogue(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut in_quote = false;
-    let mut quote_char: Option<char> = None;
     for c in text.chars() {
         match c {
             '"' | '“' | '”' => {
-                if in_quote && quote_char == Some(c) || (in_quote && c == '”') {
-                    // Closing quote: end the span with one space.
+                if in_quote {
+                    // Closing quote — any flavor (see the doc above).
                     in_quote = false;
-                    quote_char = None;
                     out.push(' ');
-                } else if !in_quote {
-                    in_quote = true;
-                    quote_char = Some(c);
                 } else {
-                    // A different quote flavor inside a span: literal speech
-                    // punctuation, drop it (it's still dialogue).
+                    in_quote = true;
                 }
             }
             _ => {
@@ -2222,7 +2280,7 @@ mod tests {
     #[test]
     fn player_state_render_none_when_default() {
         let s = fresh_state();
-        assert_eq!(s.render_for_prompt(), None);
+        assert_eq!(s.render_for_prompt(""), None);
     }
 
     #[test]
@@ -2230,7 +2288,7 @@ mod tests {
         let mut s = fresh_state();
         s.body.insert(BodyPart::LeftUpperArm, BodyPartState::Orange);
         s.stamina = Stamina::Winded;
-        let rendered = s.render_for_prompt().expect("non-default renders");
+        let rendered = s.render_for_prompt("").expect("non-default renders");
         assert!(rendered.contains("stamina: Winded"));
         assert!(rendered.contains("injuries: Left Upper Arm (Medium Injury)"));
         // No amputated line when none amputated.
@@ -2242,7 +2300,7 @@ mod tests {
         let mut s = fresh_state();
         s.body.insert(BodyPart::LeftHand, BodyPartState::Black);
         s.body.insert(BodyPart::RightUpperLeg, BodyPartState::Red);
-        let rendered = s.render_for_prompt().expect("non-default renders");
+        let rendered = s.render_for_prompt("").expect("non-default renders");
         // Injuries line excludes the amputated part.
         assert!(rendered.contains("injuries: Right Upper Leg (Heavy Injury)"));
         assert!(!rendered.contains("Left Hand (Amputated)"));
@@ -2255,7 +2313,7 @@ mod tests {
         // Stamina change alone (no injuries) is still non-default → renders.
         let mut s = fresh_state();
         s.stamina = Stamina::Exhausted;
-        let rendered = s.render_for_prompt().expect("non-default renders");
+        let rendered = s.render_for_prompt("").expect("non-default renders");
         assert_eq!(rendered, "stamina: Exhausted");
     }
 
@@ -2683,11 +2741,57 @@ mod tests {
         let mut s = fresh_state();
         s.body.insert(BodyPart::Neck, BodyPartState::Yellow);
         s.injury_details.insert(BodyPart::Neck, vec!["Bruise".to_string()]);
-        let rendered = s.render_for_prompt().unwrap();
+        let rendered = s.render_for_prompt("").unwrap();
         assert!(
             rendered.contains("Neck (Minor Injury): Bruise"),
             "expected the descriptor in the injuries line, got: {rendered}"
         );
+    }
+
+    // --- economy fields (2026-08-20) ---
+
+    #[test]
+    fn economy_defaults_are_dormant_and_back_compatible() {
+        // Fresh default: Squatter + no jobs → still is_default (the empty
+        // world-state render contract holds for pre-economy games).
+        assert!(PlayerState::default().is_default());
+        // A pre-economy save JSON (no lifestyle/jobs keys) loads at the
+        // dormant defaults.
+        let legacy = r#"{
+            "body": {}, "injury_details": {}, "stamina": "Fresh",
+            "wealth": 0, "reputation": 0,
+            "current_appearance_deltas": {}, "equipment": {}, "belt": [], "pack": []
+        }"#;
+        let parsed: PlayerState = serde_json::from_str(legacy).expect("legacy save loads");
+        assert_eq!(parsed.lifestyle, crate::economy::Lifestyle::Squatter);
+        assert!(parsed.jobs.is_empty());
+        assert!(parsed.is_default());
+    }
+
+    #[test]
+    fn lifestyle_and_jobs_render_when_set() {
+        let mut s = fresh_state();
+        s.wealth = 12;
+        s.lifestyle = crate::economy::Lifestyle::Comfortable;
+        s.jobs.push(crate::economy::Job {
+            title: "Apprentice".into(),
+            node_id: "iron-forge".into(),
+            daily_wage: 8,
+            last_settled_minutes: 0,
+            absent_days: 0,
+        });
+        let rendered = s.render_for_prompt("").unwrap();
+        assert!(rendered.contains("wealth: 12"), "naked integer when no currency known: {rendered}");
+        assert!(rendered.contains("lifestyle: comfortable"), "tier renders when ≠ Squatter: {rendered}");
+        assert!(rendered.contains("job: Apprentice @iron-forge +8/day"), "naked wage, no hardcoded unit: {rendered}");
+        // (2026-08-21 addendum) A known currency labels wealth + wages.
+        let rendered = s.render_for_prompt("dollars").unwrap();
+        assert!(rendered.contains("wealth: 12 dollars"), "{rendered}");
+        assert!(rendered.contains("job: Apprentice @iron-forge +8 dollars/day"), "{rendered}");
+        // Squatter stays silent.
+        s.lifestyle = crate::economy::Lifestyle::Squatter;
+        let rendered = s.render_for_prompt("").unwrap();
+        assert!(!rendered.contains("lifestyle:"), "Squatter renders nothing");
     }
 
     #[test]

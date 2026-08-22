@@ -534,7 +534,11 @@ impl Condition {
 /// never written by the LLM. The inputs are:
 ///
 /// - `wounds`: the set of (body part → wound tier) the Referee has applied.
-///   The dominant signal — injuries nearly always override buffs.
+///   The baseline is the POINTS SYSTEM's `wound_grade` (2026-08-20 audit
+///   unification ruling — the old worst-single-wound ladder read a lone
+///   amputation as Critical while the vitals line read it Excellent); the
+///   multi-severe Downed escalation + the tag nudges below then apply on
+///   top. Injuries nearly always override buffs.
 /// - `buffs_count` / `debuffs_count`: how many active qualitative tags are
 ///   currently on the body. These nudge the derived condition by ±1 tier
 ///   (a body with three debuffs and one scrape reads as `Wounded`, not
@@ -550,52 +554,39 @@ pub fn derive_condition(
     buffs_count: usize,
     debuffs_count: usize,
 ) -> Condition {
-    // Start from the wound baseline. We treat the body's WORST wound as the
-    // dominant signal (a critical head wound makes you Critical regardless
-    // of healthy limbs). BodyPartState's existing rank (0..=5) maps cleanly
-    // onto Condition's reverse-ordered rank.
-    let worst_wound_rank = wounds
-        .values()
-        .map(|s| *s as u8)
-        .max()
-        .unwrap_or(0);
-
-    // Map wound rank → Condition rank. Wound ranks are 0=Healthy → 5=Amputated
-    // (BodyPartState enum ordinals); Condition ranks are 0=Downed → 5=Unscathed.
-    // The mapping is intentionally NOT 1:1 because the semantics differ:
-    // - 0 wounds (Healthy everywhere) → Unscathed (rank 5).
-    // - 1+ Yellow (Minor) → Haggard (rank 4).
-    // - Orange (Medium) on a single part → Wounded (rank 3).
-    // - Red (Heavy) on any part → Battered (rank 2).
-    // - Purple (Critical) on any part → Critical (rank 1).
-    // - Amputated alone is Critical (shock); Amputated + another severe wound
-    //   is Downed (rank 0).
-    let has_amputated = wounds.values().any(|s| *s == BodyPartState::Black);
-    // `has_medium` and `has_minor` are computed for documentation + future
-    // tuning (per-part severity interactions); the v1 mapping uses only the
-    // worst-wound rank below. Kept so a later pass can read them without
-    // re-scanning the map.
-    let _has_medium = wounds.values().any(|s| *s == BodyPartState::Orange);
-    let _has_minor = wounds.values().any(|s| *s == BodyPartState::Yellow);
-    let severe_count = wounds
-        .values()
-        .filter(|s| matches!(**s, BodyPartState::Red | BodyPartState::Purple | BodyPartState::Black))
-        .count();
-
-    let mut condition = match worst_wound_rank {
-        0 => Condition::Unscathed,
-        1 => Condition::Haggard,           // Yellow only
-        2 => Condition::Wounded,           // Orange
-        3 => Condition::Battered,          // Red
-        4 => Condition::Critical,          // Purple
-        _ => Condition::Critical,          // Amputated alone → Critical (shock)
+    // (2026-08-20 audit unification ruling) The wound baseline IS the points
+    // system's `wound_grade` — ONE taxonomy answers a body everywhere now
+    // (vitals line, skill DCs, lethality, this label). The old worst-single-
+    // wound ladder was the split the audit flagged: a lone amputated limb
+    // read Critical here while the points system read it Excellent.
+    // Band-for-band: Excellent→Unscathed, Good→Haggard, Fair→Wounded,
+    // Poor→Battered, Critical→Critical; Deceased maps to Downed (the
+    // nearest label this enum has to death). wound_grade never returns
+    // Infected/Sick (illness applies only in derive_health_tier) — those
+    // arms are unreachable completeness.
+    let grade = wound_grade(wounds);
+    let mut condition = match grade {
+        HealthTier::Excellent => Condition::Unscathed,
+        HealthTier::Good => Condition::Haggard,
+        HealthTier::Fair => Condition::Wounded,
+        HealthTier::Poor => Condition::Battered,
+        HealthTier::Infected | HealthTier::Sick | HealthTier::Critical => Condition::Critical,
+        HealthTier::Deceased => Condition::Downed,
     };
-    // Multiple severe wounds escalate to Downed — the body can't sustain them.
+    // Acute shock stacking on TOP of the grade (kept from the pre-unification
+    // ladder — the points bands saturate at 24+ but don't model collapse):
+    // three-or-more severe wounds, or an amputation joined by ANY other
+    // severe wound, is Downed — the body can't sustain the load.
     // (2026-08-16 yellow W1) `has_amputated && severe_count >= 2` — the old
     // `has_amputated && (has_critical || has_heavy)` missed DOUBLE amputation
     // (Black+Black): the second Black IS a severe wound, but the body stayed
     // Critical — a *smaller* lethality penalty than Black+Red, contradicting
-    // the mapping's own doc above.
+    // the escalation's own doc.
+    let has_amputated = wounds.values().any(|s| *s == BodyPartState::Black);
+    let severe_count = wounds
+        .values()
+        .filter(|s| matches!(**s, BodyPartState::Red | BodyPartState::Purple | BodyPartState::Black))
+        .count();
     if severe_count >= 3 || (has_amputated && severe_count >= 2) {
         condition = Condition::Downed;
     }
@@ -709,6 +700,9 @@ const SICK_STEMS: &[&str] = &[
     "sick", "nausea", "nauseous", "queas", "vomit", "fever", "dizzy",
     "migraine", "poison", "toxic", "toxin", "venom", "diseas", "plague",
     "pestilence", "unwell", "ailing", "ailment", "malaise", "lethargic",
+    // (2026-08-20 Economy) The settlement's unpayable-lifestyle tag —
+    // "Starving" derives Sick through the same illness cascade.
+    "starv",
 ];
 const INFECTED_STEMS: &[&str] = &[
     "infect", "sepsis", "septic", "fester", "gangren", "abscess",
@@ -727,15 +721,21 @@ pub(crate) const CORE_PARTS: [BodyPart; 3] = [BodyPart::Head, BodyPart::Neck, Bo
 
 /// Per-part point contribution to the overall health tier (non-core parts
 /// only; core parts never score). Each grade doubles, so mixed wound loads
-/// stay honest across the bands. Black (amputated) scores ZERO — a missing
-/// limb is not bleeding.
+/// stay honest across the bands. Black (amputated) = 16 — the doubling
+/// ladder COMPLETED (2026-08-20 audit unification ruling): strictly above
+/// Purple's 8, so a lone amputation reads Fair (never Excellent over a
+/// severed limb, never Critical for a stable amputee) and, because Black
+/// never heals, it is a PERMANENT tier floor. The earlier Black=0 ("a
+/// missing limb is not bleeding") was the taxonomy split: the vitals line
+/// said Excellent while the lethality side said Critical for the same body.
 fn health_points(state: BodyPartState) -> u32 {
     match state {
         BodyPartState::Yellow => 1,
         BodyPartState::Orange => 2,
         BodyPartState::Red => 4,
         BodyPartState::Purple => 8,
-        BodyPartState::Transparent | BodyPartState::Black => 0,
+        BodyPartState::Black => 16,
+        BodyPartState::Transparent => 0,
     }
 }
 
@@ -750,8 +750,8 @@ fn health_points(state: BodyPartState) -> u32 {
 ///   black → **Deceased** (a destroyed core part is death; it outranks even
 ///   the illness labels — the dead are not "Sick"). Core parts contribute
 ///   NO points.
-/// - **Non-core points:** Yellow=1, Orange=2, Red=4, Purple=8 per part;
-///   Transparent/Black score 0. Bands: 0-7 Excellent, 8-11 Good, 12-17
+/// - **Non-core points:** Yellow=1, Orange=2, Red=4, Purple=8, Black=16 per
+///   part; Transparent scores 0. Bands: 0-7 Excellent, 8-11 Good, 12-17
 ///   Fair, 18-23 Poor, 24+ Critical (3 purples or 6 reds = 24).
 /// - **Composition:** the WORSE of the core floor and the points band wins
 ///   (a yellow head + 12 points reads Fair — Chloe's worked example).
@@ -1073,8 +1073,12 @@ pub fn upsert_tag(tags: &mut Vec<StatusTag>, tag: StatusTag, cap: usize) -> bool
     // (2026-08-16 audit LOW) Case-insensitive label match — the byte-exact
     // compare let "Feverish" + "feverish" stack as two debuffs toward the
     // 16-tag cap AND the M1 condition count (compounding the same drift).
+    // (2026-08-20 P3) Unicode-aware fold: `eq_ignore_ascii_case` is ASCII-
+    // only, so accented/CJK labels ("Enfeitiçado" vs "enfeitiçado") slipped
+    // the dedupe entirely. `to_lowercase` folds the full Unicode range; the
+    // allocation is nothing at 16-tag scale.
     if let Some(existing) = tags.iter_mut().find(|t| {
-        t.kind == tag.kind && t.label.trim().eq_ignore_ascii_case(tag.label.trim())
+        t.kind == tag.kind && t.label.trim().to_lowercase() == tag.label.trim().to_lowercase()
     }) {
         if existing.expires_at == 0 {
             return false;
@@ -1806,6 +1810,23 @@ mod tests {
         );
     }
 
+    /// (2026-08-20 Economy) The settlement's permanent pure-Debuff
+    /// "Starving" tag derives Sick (the `starv` stem) — a Buff naming
+    /// starvation does not.
+    #[test]
+    fn starving_tag_derives_sick() {
+        assert_eq!(
+            derive_health_tier(&HashMap::new(), &[debuff("Starving", 0)], 100),
+            HealthTier::Sick,
+            "permanent (expires_at 0) Starving reads through the illness cascade"
+        );
+        assert_eq!(
+            derive_health_tier(&HashMap::new(), &[tag("Starvation Resisted", "", 500)], 100),
+            HealthTier::Excellent,
+            "a Buff naming starvation is not suffering it"
+        );
+    }
+
     #[test]
     fn health_dc_mod_wound_grade_outranks_sick_label() {
         // (2026-08-20) DCs keep wound priority at Poor+: a fever never
@@ -1890,9 +1911,12 @@ mod tests {
         // An Unscathed body with 2+ debuffs drops to Haggard.
         let wounds = HashMap::new();
         assert_eq!(derive_condition(&wounds, 0, 2), Condition::Haggard);
-        // A Haggard body with 2+ debuffs drops to Wounded.
+        // A Haggard-grade body with 2+ debuffs drops to Wounded. (2026-08-20
+        // unification rebased the fixture: a single Yellow now grades
+        // Unscathed under the points system — 1 point, Excellent band — so
+        // the Haggard-grade body needs Good-band points. A lone Purple = 8.)
         let mut wounds = HashMap::new();
-        wounds.insert(BodyPart::LeftHand, BodyPartState::Yellow);
+        wounds.insert(BodyPart::LeftHand, BodyPartState::Purple);
         assert_eq!(derive_condition(&wounds, 0, 2), Condition::Wounded);
     }
 

@@ -341,6 +341,12 @@ pub struct SimCard {
     /// The `<inventory>` sibling (npc cards; optional on players).
     #[serde(default)]
     pub inventory: CardInventory,
+    /// (2026-08-20 Economy) The `<properties>` sibling — authored property
+    /// seeds (pipe-kv lines, `economy::parse_property_lines`). ALL subtypes
+    /// may carry it; seeding at session entry forces the owner by card kind
+    /// (npc → the card's NPC, scenario/world → authored or Unowned).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub properties: Vec<crate::economy::AuthoredProperty>,
     // ── legacy model (system cards + pre-v2 Fable cards) ─────────────────
     pub core_persona: String,
     pub traits: String,
@@ -612,6 +618,17 @@ impl SimCard {
             xml.push_str(&format!("\n<inventory><![CDATA[\n{}]]></inventory>\n", cdata_body(&body)));
         }
 
+        // (2026-08-20 Economy) The authored <properties> sibling — ALL
+        // subtypes (an npc card's forge, a world card's town treasuries).
+        // Omitted entirely when empty.
+        if !self.properties.is_empty() {
+            let body = crate::economy::render_property_lines(&self.properties);
+            xml.push_str(&format!(
+                "\n<properties><![CDATA[\n{}]]></properties>\n",
+                cdata_body(&body)
+            ));
+        }
+
         xml
     }
 
@@ -748,6 +765,7 @@ pub fn fallback() -> SimCard {
         world: CardWorld::default(),
         location: None,
         inventory: CardInventory::default(),
+        properties: Vec::new(),
         core_persona: String::new(),
         traits: String::new(),
         appearance: String::new(),
@@ -1004,6 +1022,11 @@ fn parse(xml: &str) -> anyhow::Result<SimCard> {
     let sibling_inventory = sibling_text(tail, &["inventory"])
         .map(|t| parse_inventory_lines(&t))
         .unwrap_or_default();
+    // (2026-08-20 Economy) The authored <properties> sibling (v2 only —
+    // the inventory pattern; legacy cards never carried one).
+    let sibling_properties = sibling_text(tail, &["properties"])
+        .map(|t| crate::economy::parse_property_lines(&t))
+        .unwrap_or_default();
     let intro = extract_sibling_intro(tail);
 
     let introductions = first_child(root, "introductions")
@@ -1171,6 +1194,11 @@ fn parse(xml: &str) -> anyhow::Result<SimCard> {
     } else {
         CardInventory::default()
     };
+    let properties = if format_v2 {
+        sibling_properties
+    } else {
+        Vec::new()
+    };
     let mut custom_tags = custom_tags;
     let mut effective_location = location;
 
@@ -1269,6 +1297,7 @@ fn parse(xml: &str) -> anyhow::Result<SimCard> {
         world,
         location: effective_location,
         inventory,
+        properties,
         core_persona,
         traits,
         appearance,
@@ -1940,6 +1969,7 @@ A remote frontier tavern.
             world: CardWorld::default(),
             location: None,
             inventory: CardInventory::default(),
+            properties: Vec::new(),
             core_persona: "cp".into(),
             traits: "t".into(),
             appearance: "a".into(),
@@ -2435,6 +2465,52 @@ Alignment: Chaotic Good
         let back = parse(&card.serialize_v2()).expect("round-trips");
         assert_eq!(back.identity.extra, card.identity.extra);
         assert!(back.serialize_v2().contains("Alignment: Chaotic Good"));
+    }
+
+    #[test]
+    fn v2_properties_sibling_roundtrip() {
+        // (2026-08-20 Economy) The authored <properties> sibling parses on
+        // v2 cards and survives serialize_v2 byte-faithfully (all subtypes).
+        let xml = r#"<sim_card>
+  <metadata>
+  <type>simulation</type>
+  <subtype>npc</subtype>
+  <id>bors</id>
+  </metadata>
+  <identity><![CDATA[
+Name: Bors
+  ]]></identity>
+</sim_card>
+
+<properties><![CDATA[
+id: forge | node: iron-forge | kind: business | revenue: 8 | upkeep: 3
+id: manor | node: hill | kind: estate | owner: bors | revenue: 2 | upkeep: 9 | price: 250
+]]></properties>"#;
+        let card = parse(xml).expect("parses");
+        assert_eq!(card.properties.len(), 2);
+        assert_eq!(card.properties[0].id, "forge");
+        assert_eq!(card.properties[0].node, "iron-forge");
+        assert!(card.properties[0].owner.is_none());
+        assert_eq!(card.properties[1].owner.as_deref(), Some("bors"));
+        assert_eq!(card.properties[1].price, Some(250));
+        let out = card.serialize_v2();
+        assert!(out.contains("<properties>"), "emitted: {out}");
+        let back = parse(&out).expect("round-trips");
+        assert_eq!(back.properties, card.properties);
+        // A card with NO properties emits NO sibling.
+        let bare = parse(r#"<sim_card>
+  <metadata>
+  <type>simulation</type>
+  <subtype>npc</subtype>
+  <id>bors</id>
+  </metadata>
+  <identity><![CDATA[
+Name: Bors
+  ]]></identity>
+</sim_card>"#)
+        .expect("parses");
+        assert!(bare.properties.is_empty());
+        assert!(!bare.serialize_v2().contains("<properties>"));
     }
 
     #[test]

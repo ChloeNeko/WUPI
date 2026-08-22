@@ -9,6 +9,8 @@ import {
   codexEntriesToCompound,
   slugify,
   escapeXml,
+  normalizeProperties,
+  renderPropertyLines,
 } from '../src/fable/screens/card-serialize.js';
 
 let passed = 0;
@@ -188,6 +190,12 @@ test('serializeSimCard: emits metadata + world sibling + location + intro', () =
   assert.ok(!xml.includes('<locations>'));
   assert.ok(!xml.includes('<node '));
   assert.equal(intro, 'You arrive at dusk.');
+  // (2026-08-20) The PURPOSE persists as a Premise line in <plot> — it used
+  // to fold into <setting> (setting wins, purpose lost on disk) — and
+  // <setting> carries the setting ALONE.
+  assert.ok(xml.includes('<setting><![CDATA[\na dying village\n  ]]></setting>'), `setting alone: ${xml}`);
+  assert.ok(xml.includes('Premise: survive the bog'), `purpose premise: ${xml}`);
+  assert.ok(!xml.includes('Premise: a dying village'));
 });
 
 test('serializeSimCard: omits <world>/<location> when no anchors', () => {
@@ -254,6 +262,10 @@ test('serializeSimCard: world branch emits subtype + setting + world sibling', (
   assert.ok(xml.includes('<type>simulation</type>'), 'type is simulation (the rename)');
   assert.ok(xml.includes('<subtype>world</subtype>'), 'subtype carried');
   assert.ok(xml.includes('<setting>'), 'world → <setting>');
+  // (2026-08-20) the purpose rides <plot> as a Premise line (never folded
+  // into <setting>).
+  assert.ok(xml.includes('Premise: a cursed fen'), `world purpose persists: ${xml}`);
+  assert.ok(xml.includes('Premise: a cursed fen') && !xml.includes('<setting><![CDATA[\na cursed fen'), 'setting is the setting, not the purpose');
   // The date anchor rides the <world> sibling — NOT a <start> block.
   assert.ok(xml.includes('Date: 3rd of Harvest, Year 1247'));
   assert.ok(xml.includes('Tone: grim'));
@@ -491,6 +503,70 @@ test('codexEntriesToCompound: clean titles pass through unchanged', () => {
     out,
     '---\ntitle: The Sunken Temple\ntags: geography, ruins\n---\n\nDrowned long ago.'
   );
+});
+
+// ── (2026-08-20 audit) authored <properties> — the Creator emission path ────
+test('normalizeProperties: cleans, clamps, and drops incomplete entries', () => {
+  const out = normalizeProperties([
+    { id: 'Forge!', node: 'Iron Forge', kind: 'BUSINESS', revenue: 8.7, upkeep: '3', owner: 'liam', price: 250 },
+    { node: 'no-id' },                        // dropped (Rust skips these too)
+    { id: 'x', revenue: -50 },                // dropped (no node)
+    { id: 'shrine', node: 'hill', kind: 'cathedral' }, // unknown kind → business
+  ]);
+  assert.equal(out.length, 2);
+  assert.deepEqual(out[0], {
+    id: 'forge', node: 'Iron Forge', kind: 'business', revenue: 8, upkeep: 3, owner: 'liam', price: 250,
+  });
+  assert.deepEqual(out[1], {
+    id: 'shrine', node: 'hill', kind: 'business', revenue: 0, upkeep: 0,
+  });
+  // Non-array / absent input normalizes to empty (GLM junk never crashes).
+  assert.deepEqual(normalizeProperties(null), []);
+  assert.deepEqual(normalizeProperties('nope'), []);
+});
+
+test('renderPropertyLines: emits the Rust pipe-kv grammar', () => {
+  const out = renderPropertyLines([
+    { id: 'forge', node: 'iron-forge', kind: 'business', revenue: 8, upkeep: 3, owner: 'liam', price: 250 },
+    { id: 'manor', node: 'hill', kind: 'estate', revenue: 2, upkeep: 9 },
+  ]);
+  assert.equal(out, [
+    'id: forge | node: iron-forge | kind: business | owner: liam | revenue: 8 | upkeep: 3 | price: 250',
+    'id: manor | node: hill | kind: estate | revenue: 2 | upkeep: 9',
+  ].join('\n'));
+  assert.equal(renderPropertyLines(undefined), '', 'absent → empty (sibling omitted)');
+});
+
+test('serializeSimCard: emits the <properties> sibling for every subtype', () => {
+  const { xml } = serializeSimCard({
+    card_type: 'world', name: 'Greywater',
+    date: 'March 15', time: '09:00', weather: 'clear', tone: 'grim', location: 'the town square',
+    properties: [
+      { id: 'forge', node: 'iron-forge', revenue: 8, upkeep: 3, owner: 'liam' },
+    ],
+  });
+  assert.ok(
+    xml.includes('<properties><![CDATA[\nid: forge | node: iron-forge | kind: business | owner: liam | revenue: 8 | upkeep: 3\n]]></properties>'),
+    `properties sibling emitted: ${xml}`
+  );
+  // The sibling sits AFTER </sim_card> (mutable world-state seed, never cached).
+  assert.ok(xml.indexOf('<properties>') > xml.indexOf('</sim_card>'));
+  // No properties → no sibling at all (the format rule).
+  const bare = serializeSimCard({ card_type: 'world', name: 'X', location: 'y' });
+  assert.ok(!bare.xml.includes('<properties>'), 'sibling omitted when empty');
+});
+
+test('serializePlayer: carries authored holdings on the DTO', () => {
+  const { player } = serializePlayer({
+    name: 'Kael',
+    properties: [{ id: 'forge', node: 'Iron Forge', revenue: 8, upkeep: 3, price: 250 }],
+  });
+  assert.deepEqual(player.properties, [
+    { id: 'forge', node: 'Iron Forge', kind: 'business', revenue: 8, upkeep: 3, price: 250 },
+  ]);
+  // Absent → the field stays off the DTO (Rust keeps properties = None).
+  const bare = serializePlayer({ name: 'Nyx' });
+  assert.ok(!('properties' in bare.player));
 });
 
 // ── summary ────────────────────────────────────────────────────────────────

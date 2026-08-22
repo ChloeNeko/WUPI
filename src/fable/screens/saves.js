@@ -1,8 +1,10 @@
 // =============================================================
-// SCREEN: SAVES — the save-slot list (Load Game flow, step 2).
+// SAVES POPUP — the centered save-slot list (2026-08-20 Chloe
+// ruling: the saves SCREEN page is retired — clicking LOAD on a
+// card modal opens this popup over it instead of navigating to a
+// new page; the card modal re-emerges when the popup closes).
 //
-// Reached after picking a world (screens/worlds.js) + clicking LOAD on its
-// modal. Reads SaveMeta for that world from fable_list_saves:
+// Lists SaveMeta for one world from fable_list_saves:
 //   { save_id, name, summary, timestamp, turn_count, is_autosave }
 //
 // The per-turn AUTOSAVE is promoted to a one-click "Resume Latest" button at
@@ -10,17 +12,21 @@
 // reuses the autosave, which is exactly what CONTINUE on the title screen
 // resumes too.) The list below shows the MANUAL saves only (most-recent
 // first; the backend sorts by timestamp desc). Each manual row is Load +
-// Delete; the autosave button is resume-only (deleting it is pointless — the
-// next turn writes a fresh one).
+// Delete (armed two-click confirm); the autosave button is resume-only
+// (deleting it is pointless — the next turn writes a fresh one).
 //
-// Load → onSelect(save) → resumeSave. Delete → fable_delete_save → re-render.
+// AESTHETIC: the raw-XML editor modal's chrome (fable.js openXmlEditorModal)
+// — black panel, brass-dim border, uppercase brass title, red-tinted ✕ —
+// with the rows keeping their existing .fable-save-* look. Esc / backdrop
+// click / ✕ all close. Load → onSelect(save) → resumeSave (fable.js).
 // =============================================================
 
 import { listSaves, deleteSave } from '../engine/saves-io.js';
 
 function esc(s) {
   return String(s || '')
-    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
 }
 
 function fmtTime(ms) {
@@ -31,52 +37,93 @@ function fmtTime(ms) {
   } catch (_) { return ''; }
 }
 
-export function buildSaves(handlers) {
-  const root = document.createElement('section');
-  root.className = 'fable-screen fable-saves-screen';
-  root.dataset.fableScreen = 'saves';
-  root.hidden = true;
-  root.innerHTML = `
-    <header class="fable-screen-header">
-      <button class="fable-back-btn" data-act="back">‹ Back</button>
-      <h2 class="fable-screen-title" data-title>Saves</h2>
-      <!-- (2026-08-15 audit fix) inline error surface: the saves screen has no
-           toast of its own, and a swallowed delete failure must be visible. -->
-      <p class="fable-saves-status" data-status hidden></p>
-    </header>
-    <div class="fable-saves-list" data-host></div>
-  `;
-  root.querySelector('[data-act="back"]').addEventListener('click', () => handlers.back());
-  return root;
+// Open the popup on `host` (the worlds screen — the card modal stays open
+// behind it). opts:
+//   cardId   — the partition whose saves are listed (+ deletes)
+//   cardName — shown in the popup title ("<Name> — Saves")
+//   onSelect — receives the chosen SaveMeta
+export function openSavesModal(host, opts) {
+  if (!host) return;
+  // One popup at a time (the raw-editor pattern: a leftover can only exist
+  // if a close was interrupted, so a plain replace is enough).
+  host.querySelectorAll('.fable-saves-popup-overlay').forEach((el) => el.remove());
+
+  const overlay = document.createElement('div');
+  overlay.className = 'fable-saves-popup-overlay';
+  overlay.innerHTML = `
+    <div class="fable-saves-popup-backdrop" aria-hidden="true"></div>
+    <div class="fable-saves-popup" role="dialog" aria-modal="true" aria-label="Saves">
+      <div class="fable-saves-popup-head">
+        <span class="fable-saves-popup-title"></span>
+        <button type="button" class="fable-saves-popup-close" aria-label="Close saves">✕</button>
+      </div>
+      <div class="fable-saves-popup-body" data-host></div>
+      <!-- Inline error surface: a swallowed delete failure must be visible
+           (the popup has no toast of its own). -->
+      <p class="fable-saves-popup-status" data-status hidden></p>
+    </div>`;
+  host.appendChild(overlay);
+  overlay.querySelector('.fable-saves-popup-title').textContent =
+    opts.cardName ? `${opts.cardName} — Saves` : 'Saves';
+
+  const onBackdrop = (e) => {
+    if (e.target === overlay || e.target.classList.contains('fable-saves-popup-backdrop')) close();
+  };
+  // Esc on the document (capture + stopPropagation so the card modal
+  // underneath doesn't ALSO close — the raw-editor discipline; the worlds
+  // modal's own Esc handler defers while this overlay exists).
+  const onEsc = (e) => {
+    if (e.key === 'Escape') { e.stopPropagation(); close(); }
+  };
+  function close() {
+    overlay.removeEventListener('click', onBackdrop);
+    document.removeEventListener('keydown', onEsc, { capture: true });
+    overlay.remove();
+  }
+  overlay.addEventListener('click', onBackdrop);
+  document.addEventListener('keydown', onEsc, { capture: true });
+  overlay.querySelector('.fable-saves-popup-close').addEventListener('click', close);
+
+  renderSavesList(overlay, opts, close);
 }
 
-// Render the list for a world. `cardName` is shown in the header title so the
-// user knows which world's saves they're browsing; `cardId` scopes the list +
-// delete calls. `onSelect` receives the chosen SaveMeta.
-export async function renderSaves(root, cardId, onSelect, cardName) {
-  const titleEl = root.querySelector('[data-title]');
-  if (titleEl) titleEl.textContent = cardName ? `${cardName} — Saves` : 'Saves';
-  const host = root.querySelector('[data-host]');
-  // (2026-08-20 audit) Generation token (the worlds grid's _renderGen
-  // pattern): a re-render can race an in-flight `listSaves` (delete's
-  // re-fire, a quick Back → worlds → other world → saves) — the stale
-  // completion abandons before appending, or both loads' rows land.
-  root._renderGen = (root._renderGen || 0) + 1;
-  const gen = root._renderGen;
+// Remove any popup living on `host` (renderWorlds calls this on every screen
+// entry — a popup left behind by a resumed game must not cover the grid).
+export function closeSavesModal(host) {
+  if (!host) return;
+  host.querySelectorAll('.fable-saves-popup-overlay').forEach((el) => el.remove());
+}
+
+// Render the list into an open popup. Same shape as the retired screen's
+// renderer: Resume Latest (autosave) on top, manual rows beneath, armed
+// two-click delete, generation token against re-render races. `close` is the
+// popup's own teardown (listener-clean) — the select paths use it so the
+// document Esc handler never outlives the overlay.
+async function renderSavesList(overlay, opts, close) {
+  const host = overlay.querySelector('[data-host]');
+  overlay._renderGen = (overlay._renderGen || 0) + 1;
+  const gen = overlay._renderGen;
   host.innerHTML = '';
   let saves = [];
   try {
-    saves = await listSaves(cardId);
+    saves = await listSaves(opts.cardId);
   } catch (err) {
-    if (gen !== root._renderGen) return;
+    if (gen !== overlay._renderGen) return;
     host.innerHTML = `<div class="fable-saves-empty">Couldn't load saves: ${esc(err)}</div>`;
     return;
   }
-  if (gen !== root._renderGen) return;
+  if (gen !== overlay._renderGen) return;
+
+  const showStatus = (text) => {
+    const el = overlay.querySelector('[data-status]');
+    if (!el) return;
+    el.textContent = text;
+    el.hidden = !text;
+  };
+
   // The autosave is the per-turn checkpoint = the world's latest state. Promote
-  // it to a one-click Resume Latest button at the top; the list below shows the
-  // manual saves only. (Resume Latest reuses the autosave, the same slot
-  // CONTINUE on the title screen resumes.)
+  // it to a one-click Resume Latest button at the top; the list below shows
+  // the manual saves only.
   const autosave = saves.find((s) => s.is_autosave) || null;
   const manuals = saves.filter((s) => !s.is_autosave);
 
@@ -91,7 +138,7 @@ export async function renderSaves(root, cardId, onSelect, cardName) {
       </span>
       <span class="fable-save-resume-latest-meta">${autosave.turn_count ? autosave.turn_count + ' turns · ' : ''}${fmtTime(autosave.timestamp)}</span>
     `;
-    resume.addEventListener('click', () => onSelect(autosave));
+    resume.addEventListener('click', () => { close(); opts.onSelect(autosave); });
     host.appendChild(resume);
   }
 
@@ -107,11 +154,11 @@ export async function renderSaves(root, cardId, onSelect, cardName) {
     return;
   }
 
-  // (2026-08-15 audit fix) delete is destructive + was one unrecoverable click
-  // with errors swallowed. Armed two-click confirm (native confirm() is dead
-  // in wry): first click arms ("Sure?" + danger styling stays), second click
-  // within 5s executes. Only ONE armed button at a time — arming another
-  // disarms the previous. Failures surface on the inline status line.
+  // Delete is destructive + must not be one unrecoverable click with errors
+  // swallowed. Armed two-click confirm (native confirm() is dead in wry):
+  // first click arms ("Sure?" + danger styling stays), second click within 5s
+  // executes. Only ONE armed button at a time — arming another disarms the
+  // previous. Failures surface on the inline status line.
   let armedBtn = null;
   let armTimer = 0;
   const disarm = () => {
@@ -121,12 +168,6 @@ export async function renderSaves(root, cardId, onSelect, cardName) {
       armedBtn.textContent = 'Delete';
       armedBtn = null;
     }
-  };
-  const showStatus = (text) => {
-    const el = root.querySelector('[data-status]');
-    if (!el) return;
-    el.textContent = text;
-    el.hidden = !text;
   };
 
   for (const save of manuals) {
@@ -143,7 +184,10 @@ export async function renderSaves(root, cardId, onSelect, cardName) {
         <button class="fable-save-btn danger" data-act="del">Delete</button>
       </div>
     `;
-    row.querySelector('[data-act="load"]').addEventListener('click', () => onSelect(save));
+    row.querySelector('[data-act="load"]').addEventListener('click', () => {
+      close();
+      opts.onSelect(save);
+    });
     row.querySelector('[data-act="del"]').addEventListener('click', async (e) => {
       const btn = e.currentTarget;
       if (btn !== armedBtn) disarm();
@@ -157,15 +201,14 @@ export async function renderSaves(root, cardId, onSelect, cardName) {
       }
       disarm();
       try {
-        await deleteSave(cardId, save.save_id);
+        await deleteSave(opts.cardId, save.save_id);
         showStatus('');
       } catch (err) {
-        // (2026-08-16 yellow J8) showStatus renders via textContent — the
-        // caller-side esc() double-escaped (a `&` in the backend error showed
-        // as literal `&amp;`).
+        // showStatus renders via textContent — no esc() here (a `&` in the
+        // backend error must not double-escape).
         showStatus(`Delete failed: ${err}`);
       }
-      renderSaves(root, cardId, onSelect, cardName);
+      renderSavesList(overlay, opts, close);
     });
     host.appendChild(row);
   }

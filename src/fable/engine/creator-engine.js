@@ -248,6 +248,33 @@ export function buildIdCard(kind, d) {
   return null; // codex is not an ID card
 }
 
+// (2026-08-20 audit) Authored holdings — draft.properties (the Creator's
+// optional starting-holdings field; worlds.js parseSimDraft parses the
+// `<properties>` sibling back into it on load). One row per property,
+// label = the id.
+function holdingsRows(d) {
+  if (!Array.isArray(d.properties)) return [];
+  const rows = [];
+  for (const p of d.properties) {
+    if (!p || typeof p !== 'object') continue;
+    const id = toText(p.id).trim();
+    const node = toText(p.node).trim();
+    if (!id || !node) continue;
+    const rev = Math.max(0, Math.floor(Number(p.revenue) || 0));
+    const up = Math.max(0, Math.floor(Number(p.upkeep) || 0));
+    const bits = [`@ ${node}`, toText(p.kind).trim() || 'business', `${rev}/day revenue`, `${up}/day upkeep`];
+    const owner = toText(p.owner).trim();
+    if (owner) bits.push(`owner ${owner}`);
+    const price = Math.floor(Number(p.price));
+    // (2026-08-21 currency addendum) No hardcoded unit — the world's
+    // currency is learned in play, so the authored preview shows the naked
+    // base-unit number.
+    if (Number.isFinite(price) && price > 0) bits.push(`price ${price}`);
+    rows.push([id, bits.join(', ')]);
+  }
+  return rows;
+}
+
 // Player + NPC share the license face; the only difference is the subheader
 // tag (PLAYER CARD / NPC CARD) under the name rule. The face is the six
 // license rows in paired rows; skin/body/hair moved into the extra
@@ -287,6 +314,7 @@ function playerIdCard(d, isNpc) {
       idRow('Accessories', inv.accessories != null ? inv.accessories : d.accessories),
       idRow('Stored', inv.stored != null ? inv.stored : d.gear),
     ].filter(Boolean)],
+    ['Holdings', holdingsRows(d)],
     // The OPT-IN persona block (2026-08-19) — absent entirely when the
     // player declined the final wizard question.
     ['Persona', [
@@ -331,6 +359,7 @@ function worldIdCard(d, tag) {
   if (tag === 'SCENARIO CARD') {
     extra.push(['Scenario', [idRow('Premise', d.directive), idRow('Trigger', d.trigger_condition), idRow('Objective', d.primary_objective), idRow('Actors', d.participating_actors), idRow('Hazards', d.environmental_hazards), idRow('Outcomes', d.outcomes)].filter(Boolean)]);
   }
+  extra.push(['Holdings', holdingsRows(d)]);
   extra.push(['Custom tags', customTagRows(d)]);
   // The intro the SIM Wizard gathered (mandatory question). Absent → dropped.
   // 2026-08-20 Chloe: bare paragraph row (no "Text" label).

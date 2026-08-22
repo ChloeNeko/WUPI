@@ -250,8 +250,12 @@ fn is_denied(rel_str: &str) -> bool {
     {
         return true;
     }
-    // API config (creds — user edits via the dedicated IPC).
-    if rel_str == "data/api_config.json" || rel_str == "data/theme.json" {
+    // API config (creds — user edits via the dedicated IPC). Covers the
+    // 2026-08-20 rename: `api_config.json` → `api.json`.
+    if rel_str == "data/api_config.json"
+        || rel_str == "data/api.json"
+        || rel_str == "data/theme.json"
+    {
         return true;
     }
     // Build artifacts + VCS + deps.
@@ -617,7 +621,17 @@ pub fn sanitize_stem(filename: &str) -> Option<String> {
     // compares against the capped active id). Collapse dash runs first so
     // both sides agree with `slugify_card_stem` (audit #3).
     let collapsed = crate::collapse_dash_runs(&mapped);
-    let stem = crate::cap_slug_chars(collapsed.trim_matches('-').to_owned());
+    let mut stem = crate::cap_slug_chars(collapsed.trim_matches('-').to_owned());
+    // (2026-08-20 audit P2-6) Reserved-name suffix, same as
+    // `slugify_card_stem` on the IPC side: a stem landing on a Windows
+    // reserved base name ("con", "nul", "com1"…) gets "-card" so the tool
+    // path, the active-card delete guard, and the memory-purge key all
+    // agree with the id the CREATE paths minted for that card — a
+    // `filename: "con"` delete used to sanitize to a key that could
+    // neither resolve the real card nor match its partition.
+    if crate::WINDOWS_RESERVED_STEMS.contains(&stem.as_str()) {
+        stem.push_str("-card");
+    }
     if stem.is_empty() { None } else { Some(stem) }
 }
 
@@ -661,6 +675,7 @@ impl Tool for FileRead {
             || lower.ends_with(".dll")
             || lower.ends_with(".safetensors")
             || lower == "data/api_config.json"
+            || lower == "data/api.json"
         {
             return Err(ToolError::new(format!(
                 "refused: {rel:?} is a binary or credential file (text reads only)"
@@ -1207,6 +1222,7 @@ mod tests {
         assert!(!is_writable(Path::new("memory/memory.sqlite-wal")));
         assert!(!is_writable(Path::new("data/wupi.sim")));
         assert!(!is_writable(Path::new("data/api_config.json")));
+        assert!(!is_writable(Path::new("data/api.json")));
         assert!(!is_writable(Path::new("data/theme.json")));
         assert!(!is_writable(Path::new("target/debug/wupi.exe")));
         assert!(!is_writable(Path::new(".git/HEAD")));

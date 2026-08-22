@@ -168,6 +168,10 @@ async function openModal(root, meta) {
     }
   };
   const onEsc = (e) => {
+    // Do NOT steal Esc while a higher overlay (the raw-XML editor, z-47) is
+    // open above this modal — this capture-phase stopPropagation would kill
+    // the editor's bubble-phase Esc (same fix worlds.js carries).
+    if (document.querySelector('.fable-raw-editor-overlay')) return;
     if (e.key === 'Escape') { e.stopPropagation(); closeModal(root); }
   };
   overlay.addEventListener('click', onBackdropClick);
@@ -261,8 +265,13 @@ async function openModal(root, meta) {
     if (root._handlers.onSelect) root._handlers.onSelect(full);
   }));
   card.querySelector('[data-modal-edit]').addEventListener('click', consumeOnce(() => {
-    closeModal(root);
+    // (2026-08-20 Chloe) KEEP the card modal open behind the raw-XML editor —
+    // the editor overlay (z-47) covers it while active; the card re-emerges
+    // when it closes. Release the action latch so the card's buttons are live
+    // again the moment the editor is gone (the old closeModal did that
+    // implicitly; the editor guards its own double-open).
     if (root._handlers.onEdit) root._handlers.onEdit(full);
+    root._actionConsumed = false;
   }));
   card.querySelector('[data-modal-delete]').addEventListener('click', () => {
     confirmDelete(root, full);

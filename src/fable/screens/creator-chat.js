@@ -1095,26 +1095,26 @@ export function renderCreatorChat(root, config) {
         trace(`saved player id=${meta.id}`);
         if (onCreated) onCreated({ playerId: meta.id, draft: state.draft });
       } else if (creatorKind === 'sim') {
-        const { xml, intro } = serializeSimCard(state.draft);
+        // (2026-08-20 rename ruling) Edit runs PIN the loaded card's id: a
+        // rename is a display-name-only change. The id — and everything
+        // keyed off it (folder, saves/, .codex, memory partition, .lnk
+        // target) — survives; the backend keeps the existing folder for a
+        // known id (renamingId contract). The old flow re-minted the id
+        // from the new name and DELETED the old card afterward, destroying
+        // the campaign's saves + codex + memories on every rename.
+        const pinnedId = (config.seedDraft && config.seedDraft.id) ? config.seedDraft.id : null;
+        const { xml, intro } = serializeSimCard(state.draft, { pinnedId });
         const stem = slugify(state.draft.name || '') || 'unknown';
-        trace(`serializeSimCard → stem=${stem} xml=${xml.length}b intro=${intro ? intro.length + 'b' : 'none'}`);
+        trace(`serializeSimCard → stem=${stem} id=${pinnedId || '(fresh)'} xml=${xml.length}b intro=${intro ? intro.length + 'b' : 'none'}`);
         // `<intro>` is embedded AFTER </sim_card> in the XML itself
         // (2026-08-13), so fable_write_card carries it — no separate .intro
         // sibling-file write.
-        const meta = await invoke('fable_write_card', { stem, xml });
+        const meta = await invoke('fable_write_card', { stem, xml, renamingId: pinnedId });
         mintedIds.add(meta.id);
-        // (2026-08-15 audit fix) Rename-on-edit cleanup: a card edit under a
-        // NEW name writes a NEW folder (cards have no rename path); the OLD
-        // card would linger in the worlds list + hold its saves/memory. The
-        // duplicate guard already proved the new slug is fresh — reap the
-        // seeded card after the successful write.
-        if (config.seedDraft && config.seedDraft.id && config.seedDraft.id !== meta.id) {
-          try {
-            await invoke('fable_card_delete', { cardId: config.seedDraft.id });
-            trace(`reaped pre-rename card id=${config.seedDraft.id}`);
-          } catch (e) {
-            console.warn('[creator-chat] old card reap failed (orphaned):', e);
-          }
+        if (pinnedId && meta.id !== pinnedId) {
+          // Defensive trace only — with the pinned id + the backend contract
+          // this indicates a parse drift, NEVER a reason to delete anything.
+          trace(`note: written id=${meta.id} differs from pinned=${pinnedId}`);
         }
         if (state.portraitBytes) {
           await invoke('fable_card_portrait_write', {

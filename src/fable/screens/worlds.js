@@ -15,7 +15,9 @@
 //     player chooses/creates a player, the game launches straight into
 //     this world (flowAfterPlayer in fable.js — no SIM pair re-pick, no
 //     Codex step).
-//   • LOAD    → the saves list for this card (screens/saves.js). The per-turn
+//   • LOAD    → the centered saves POPUP for this card (screens/saves.js,
+//     2026-08-20 Chloe: the saves screen page is retired — LOAD never
+//     navigates away; the popup layers over this card modal). The per-turn
 //     autosave is promoted to a one-click "Resume Latest" button at the top;
 //     the list below shows the manual saves (most-recent first; the backend
 //     already sorts by timestamp desc). The autosave IS the latest world state.
@@ -43,6 +45,7 @@ import { bytesToBase64 } from './wizard-engine.js';
 import { open as openDialog } from '@tauri-apps/plugin-dialog';
 import { buildIdCard } from '../engine/creator-engine.js';
 import { renderIdCard, wireIdCard } from './id-card.js';
+import { closeSavesModal } from './saves.js';
 
 function esc(s) {
   return String(s || '')
@@ -119,6 +122,9 @@ export async function renderWorlds(root, handlers) {
   const gen = root._renderGen;
   host.innerHTML = '';
   closeModal(root);
+  // A saves popup left over from a resumed game (the popup outlives the
+  // screen swap inside the hidden worlds screen) must not cover the grid.
+  closeSavesModal(root);
   let cards = [];
   try {
     cards = await invoke('fable_cards_list');
@@ -146,7 +152,8 @@ export async function renderWorlds(root, handlers) {
       ? `<div class="fable-player-mini-portrait"><img class="fable-player-mini-portrait-img" src="${esc(convertFileSrc(card.portrait_url))}" alt="" onerror="this.parentNode.classList.add('fable-player-mini-portrait--placeholder')"></div>`
       : `<div class="fable-player-mini-portrait fable-player-mini-portrait--placeholder" aria-hidden="true"></div>`;
     // A centered TYPE label (NPC/WORLD/SCENARIO CARD) sits in its own row
-    // ABOVE the portrait; the name stays below the divider (2026-08-13).
+    // ABOVE the portrait; the name stays below the divider (2026-08-21 Chloe:
+    // NPC cards show theirs too — every subtype gets its label uniformly).
     const typeLabel = subtypeLabel(card.subtype);
     tile.innerHTML = `
       ${typeLabel ? `<div class="fable-player-mini-type">${esc(typeLabel)}</div>` : ''}
@@ -191,8 +198,9 @@ async function openModal(root, meta) {
     // (2026-08-15 audit fix) Do NOT steal Esc while a higher overlay is open:
     // this handler runs on CAPTURE, so a stopPropagation here killed the raw
     // editor's bubble-phase Esc listener (fable.js) — the first Esc closed
-    // the worlds modal UNDER the editor instead of the editor itself.
-    if (document.querySelector('.fable-raw-editor-overlay')) return;
+    // the worlds modal UNDER the editor instead of the editor itself. The
+    // saves popup (2026-08-20) layers the same way.
+    if (document.querySelector('.fable-raw-editor-overlay, .fable-saves-popup-overlay')) return;
     if (e.key === 'Escape') { e.stopPropagation(); closeModal(root); }
   };
   overlay.addEventListener('click', onBackdropClick);
@@ -274,16 +282,21 @@ async function openModal(root, meta) {
     if (root._handlers.onNewGame) root._handlers.onNewGame(meta);
   }));
   card.querySelector('[data-modal-resume]').addEventListener('click', consumeOnce(() => {
-    closeModal(root);
+    // (2026-08-20 Chloe) LOAD opens the centered saves POPUP over the card
+    // modal (the saves screen page is retired — LOAD never navigates away).
+    // Keep the card modal open behind it + release the action latch the same
+    // way EDIT does, so the card's buttons are live again once the popup
+    // closes and the card re-emerges.
     if (root._handlers.onResume) root._handlers.onResume(meta);
+    root._actionConsumed = false;
   }));
   card.querySelector('[data-modal-edit]').addEventListener('click', consumeOnce(() => {
-    // (2026-08-15 audit fix) CLOSE the modal before opening the raw editor
-    // (same ordering as player-picker's EDIT): leaving it open latched
-    // _actionConsumed under the editor, so a later NEW/LOAD no-opped until
-    // the modal was reopened.
-    closeModal(root);
+    // (2026-08-20 Chloe) KEEP the card modal open behind the raw-XML editor
+    // (z-47 covers it while active; the card re-emerges on close). The old
+    // closeModal existed only to release the action latch — release it here
+    // instead so the card's buttons are live again once the editor is gone.
     if (root._handlers.onEdit) root._handlers.onEdit(meta);
+    root._actionConsumed = false;
   }));
   card.querySelector('[data-modal-delete]').addEventListener('click', () => {
     confirmDelete(root, meta);
@@ -453,30 +466,9 @@ function parseSimDraft(xmlText, subtype) {
         const gm = plot.match(/^Goal:\s*([\s\S]*)$/);
         if (gm && gm[1].trim()) out.goal = gm[1].trim();
       }
-      // The tail siblings: world anchors + location + inventory.
-      if (tail.trim()) {
-        const tdoc = new DOMParser().parseFromString(`<wupi_siblings>${tail}</wupi_siblings>`, 'text/xml');
-        if (!tdoc.querySelector('parsererror')) {
-          const tq = (sel) => {
-            const el = tdoc.querySelector(sel);
-            return el ? el.textContent.trim() : '';
-          };
-          const wm = labeled(tq('world'));
-          if (wm.date) out.date = wm.date;
-          if (wm.time) out.time = wm.time;
-          if (wm.weather) out.weather = wm.weather;
-          if (wm.tone) out.tone = wm.tone;
-          out.location = tq('location');
-          const im = labeled(tq('inventory'));
-          if (im.clothing) out.clothing = listVal(im.clothing);
-          if (im.equipped) out.equipped = listVal(im.equipped);
-          if (im.accessories) out.accessories = listVal(im.accessories);
-          if (im.stored) out.stored = listVal(im.stored);
-        }
-      }
-      return out;
-    }
-
+      // The tail siblings are read by the COMMON block below (both card
+      // generations carry them).
+    } else {
     // ── legacy format ──
     out.name = q('identity > name') || q('name');
     out.setting = q('setting');
@@ -539,6 +531,65 @@ function parseSimDraft(xmlText, subtype) {
       const gm = q('plot').match(/^Goal:\s*([\s\S]*)$/);
       if (gm && gm[1].trim()) out.goal = gm[1].trim();
     }
+    }
+
+    // ── tail siblings — BOTH generations (v2 world-state seeds + the intro;
+    // legacy cards carry the same `<intro>` sibling). The FULL `<intro>` text
+    // is the modal's Intro section (2026-08-20 Chloe: the intro never cuts
+    // off — the 240-char `opening_scene_preview` list blurb is only the
+    // unreadable-card fallback in buildModalModel).
+    if (tail.trim()) {
+      const tdoc = new DOMParser().parseFromString(`<wupi_siblings>${tail}</wupi_siblings>`, 'text/xml');
+      if (!tdoc.querySelector('parsererror')) {
+        const tq = (sel) => {
+          const el = tdoc.querySelector(sel);
+          return el ? el.textContent.trim() : '';
+        };
+        const wm = labeled(tq('world'));
+        if (wm.date) out.date = wm.date;
+        if (wm.time) out.time = wm.time;
+        if (wm.weather) out.weather = wm.weather;
+        if (wm.tone) out.tone = wm.tone;
+        const loc = tq('location');
+        if (loc) out.location = loc;
+        const intro = tq('intro');
+        if (intro) out.intro = intro;
+        const im = labeled(tq('inventory'));
+        if (im.clothing) out.clothing = listVal(im.clothing);
+        if (im.equipped) out.equipped = listVal(im.equipped);
+        if (im.accessories) out.accessories = listVal(im.accessories);
+        if (im.stored) out.stored = listVal(im.stored);
+        // (2026-08-20 audit) The authored `<properties>` sibling — parsed
+        // back so the draft round-trips (the modal face renders it; any
+        // future edit run re-emits it instead of silently dropping the
+        // authored holdings). Mirrors Rust economy::parse_property_lines:
+        // lines missing an id or node are skipped.
+        const propText = tq('properties');
+        if (propText) {
+          const props = [];
+          for (const raw of propText.split(/\r?\n/)) {
+            const line = raw.trim();
+            if (!line) continue;
+            const entry = {};
+            for (const part of line.split('|')) {
+              const idx = part.indexOf(':');
+              if (idx === -1) continue;
+              const k = part.slice(0, idx).trim().toLowerCase();
+              const v = part.slice(idx + 1).trim();
+              if (!v) continue;
+              if (k === 'revenue' || k === 'upkeep' || k === 'price') {
+                const n = Math.floor(Number(v));
+                if (Number.isFinite(n) && n >= 0) entry[k] = n;
+              } else if (k === 'id' || k === 'node' || k === 'kind' || k === 'owner') {
+                entry[k] = v;
+              }
+            }
+            if (entry.id && entry.node) props.push(entry);
+          }
+          if (props.length) out.properties = props;
+        }
+      }
+    }
   } catch (_) { /* best-effort — meta fallback */ }
   return out;
 }
@@ -555,12 +606,15 @@ async function buildModalModel(meta) {
   } catch (_) { /* unreadable card — meta-only draft */ }
   const model = buildIdCard('sim', draft);
   if (!model) return null;
-  const sessRows = [];
-  if (meta.player_name) sessRows.push(['Player', meta.player_name]);
-  sessRows.push(['Saves', meta.has_saves ? 'Has saved games' : 'No saves yet']);
-  model.extra.push(['Session', sessRows]);
-  if (meta.opening_scene_preview) {
-    model.extra.push(['Opening scene', [['Preview', String(meta.opening_scene_preview)]]]);
+  // (2026-08-20 Chloe) The Session section (bound player + "No saves yet")
+  // is REMOVED from the sim card modal — save state lives in the Load menu,
+  // not on the ID card.
+  // INTRO (2026-08-20 Chloe): the section is titled "Intro" with NO sub-label
+  // — a bare paragraph, never "Opening scene"/"Preview". The full `<intro>`
+  // sibling arrives via parseSimDraft (buildIdCard appends the section); the
+  // 240-char list preview is ONLY the unreadable-card fallback.
+  if (!model.extra.some(([t]) => t === 'Intro') && meta.opening_scene_preview) {
+    model.extra.push(['Intro', [['', String(meta.opening_scene_preview)]]]);
   }
   return model;
 }

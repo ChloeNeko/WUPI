@@ -91,9 +91,17 @@ impl WorldClock {
     /// Render the current clock as a compact prompt line. Returns `None`
     /// when the clock is unset (so `render_for_prompt` can skip the block
     /// entirely — zero tokens for a fresh game). The format is deliberately
-    /// human-readable ("Day 3, 14:00") so the narrator can emit coherent
+    /// human-readable ("Day 3, 2:30 PM") so the narrator can emit coherent
     /// `[TIME ...]` progressions: it sees the current time, advances it by
     /// the scene's elapsed time, emits the new value.
+    ///
+    /// (2026-08-21 AM/PM fix) The time-of-day renders as 12-HOUR + meridiem,
+    /// never bare 24-hour: the Liam playtest had GLM read `clock: 10:00` as
+    /// 10 PM in an evening-coded scene and run "4 more hours to 2 AM"
+    /// arithmetic off the wrong half of the day. The meridiem makes the
+    /// half-of-day a visible fact. The `[TIME]` bracket grammar stays
+    /// 24-hour (its teaching line says so) and `parse_in_world_time` accepts
+    /// BOTH forms, so emissions parse regardless of which the model mirrors.
     ///
     /// The conversion back from epoch-minutes to "Day N, HH:MM" mirrors the
     /// forward parse in `bracket_parser::parse_in_world_time`: 1 day = 1440
@@ -104,24 +112,35 @@ impl WorldClock {
         }
         let day = self.current_minutes / 1440 + 1;
         let rem = self.current_minutes % 1440;
-        let h24 = rem / 60;
+        let (h12, meridiem) = to_12h(rem / 60);
         let m = rem % 60;
-        Some(format!("Day {day}, {h24:02}:{m:02}"))
+        Some(format!("Day {day}, {h12:02}:{m:02} {meridiem}"))
     }
 
-    /// Render the time-of-day ONLY ("14:00"), suppressing the "Day N" prefix.
-    /// Used when a rich calendar label (`WorldSchema.calendar`) is set: the
-    /// day/date is carried by the `date:` line, so the `clock:` line shows just
-    /// the time-of-day to avoid a redundant day counter. Returns `None` when
-    /// the clock is unset.
+    /// Render the time-of-day ONLY ("2:30 PM"), suppressing the "Day N"
+    /// prefix. Used when a rich calendar label (`WorldSchema.calendar`) is
+    /// set: the day/date is carried by the `date:` line, so the `clock:` line
+    /// shows just the time-of-day to avoid a redundant day counter. Returns
+    /// `None` when the clock is unset. 12-hour + meridiem for the same
+    /// 2026-08-21 half-of-day-ambiguity reason as `render_clock_line`.
     pub fn render_time_of_day(&self) -> Option<String> {
         if !self.is_set() {
             return None;
         }
         let rem = self.current_minutes % 1440;
-        let h24 = rem / 60;
+        let (h12, meridiem) = to_12h(rem / 60);
         let m = rem % 60;
-        Some(format!("{h24:02}:{m:02}"))
+        Some(format!("{h12:02}:{m:02} {meridiem}"))
+    }
+}
+
+/// 24-hour → (12-hour, "AM"|"PM"). Hour 0 → 12 AM, hour 12 → 12 PM.
+fn to_12h(h24: i64) -> (i64, &'static str) {
+    match h24 {
+        0 => (12, "AM"),
+        1..=11 => (h24, "AM"),
+        12 => (12, "PM"),
+        _ => (h24 - 12, "PM"),
     }
 }
 
@@ -190,7 +209,7 @@ impl Weather {
 /// start); the player's `current_node` advances via `[TRAVEL]`. (Component 4
 /// may add NPC movement between nodes on the World Progression tick — that
 /// will require NPC-position state, NOT a mutation of the graph itself.)
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Node {
     /// Stable identifier ("tavern", "cellar", "market_square"). Bare slug,
     /// NOT "node.tavern" — the `node.` prefix is a narrator convention only
@@ -234,6 +253,39 @@ pub struct Node {
     /// 0 = never designated → sorts FIRST in `select_stale_sites`.
     #[serde(default)]
     pub last_evolved_minutes: i64,
+
+    /// (2026-08-20 Economy) The node's prosperity percent (25–200, 100 =
+    /// normal). Single-source on the Node: property revenue scales ∝ it,
+    /// the lifestyle cost curve is its inverse. Rust-owned — only the
+    /// `[LEDGER prosperity]` applier writes it (clamped there) + the
+    /// `load_split` post-migration clamp. A bare `#[serde(default)]` would
+    /// zero old saves, hence the `default_prosperity` fn.
+    #[serde(default = "default_prosperity")]
+    pub prosperity: u8,
+}
+
+/// The serde default for [`Node::prosperity`] — see that field (a plain
+/// `#[serde(default)]` would deserialize missing prosperity as 0, wrecking
+/// the revenue/lifestyle curves for every pre-economy save).
+fn default_prosperity() -> u8 {
+    crate::economy::PROSPERITY_DEFAULT
+}
+
+/// Manual `Default` so `Node { ..Default::default() }` construction sites
+/// (node minting, seeds, tests) get the 100-percent default instead of a
+/// raw `u8` zero — 0 is outside the legal [25, 200] band.
+impl Default for Node {
+    fn default() -> Self {
+        Node {
+            id: String::default(),
+            name: String::default(),
+            neighbors: Vec::default(),
+            setting: String::default(),
+            seeds: Vec::default(),
+            last_evolved_minutes: 0,
+            prosperity: crate::economy::PROSPERITY_DEFAULT,
+        }
+    }
 }
 
 /// The spatial travel graph (Rust-authoritative — same line as `world_clock` /
@@ -270,7 +322,12 @@ pub struct TravelGraph {
 /// `TravelGraph::resolve_node_id` to fuzzy-match `[TRAVEL Market Square]` →
 /// `market_square`. Keeps `_` and `-` (valid id chars); everything else that
 /// isn't alphanumeric collapses into the underscore stream.
-fn slugify(s: &str) -> String {
+// (2026-08-20 audit) pub(crate): the authored-property seed normalizes its
+// node ids through this SAME slug so an authored "Iron Forge" lands on
+// `iron_forge` — the id a later [TRAVEL]/[DISCOVER] mint of that name
+// produces — instead of a verbatim string that never matches the graph
+// (till gate + prosperity reads broke forever on the mismatch).
+pub(crate) fn slugify(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut prev_under = false;
     for c in s.trim().chars() {
@@ -395,6 +452,69 @@ impl TravelGraph {
         None
     }
 
+    /// Best normalized-Levenshtein match of the raw + slug forms against
+    /// every node's id + slugified name — the shared engine of the
+    /// [`resolve_or_mint_node`] typo guard and the [`resolve_existing_node`]
+    /// twin guard (2026-08-20 audit P2-1 extracted it so both arms compare
+    /// identically).
+    fn best_similarity_match(&self, raw: &str, slug: &str) -> Option<(f32, String)> {
+        let mut best: Option<(f32, String)> = None;
+        for n in &self.nodes {
+            let slug_name = slugify(&n.name);
+            for (a, b) in [
+                (raw, n.id.as_str()),
+                (raw, n.name.as_str()),
+                (slug, n.id.as_str()),
+                (slug, slug_name.as_str()),
+            ] {
+                if b.is_empty() {
+                    continue;
+                }
+                let s = similarity(a, b);
+                if best.as_ref().map(|(bs, _)| s > *bs).unwrap_or(true) {
+                    best = Some((s, n.id.clone()));
+                }
+            }
+        }
+        best
+    }
+
+    /// (2026-08-20 audit P2-1) The FULL non-minting resolution chain, shared
+    /// by [TRAVEL] (pre-mint) and now [DISCOVER] (pre-upsert):
+    /// [`resolve_node_id`] (exact / normalized slug / diegetic name), then
+    /// the ≥0.75 typo guard, then the strict fragment alias. A discovery
+    /// whose emitted surface matches an existing node by ANY travel-
+    /// resolution arm ("market square" / "market_square" against the
+    /// authored kebab id `market-square` — equal word counts sit UNDER the
+    /// fragment alias's strict-subset test) is the documented re-discovery
+    /// no-op, never a ghost twin.
+    pub fn resolve_existing_node(&self, raw: &str) -> Option<String> {
+        let raw_trimmed = raw.trim();
+        if raw_trimmed.is_empty() {
+            return None;
+        }
+        if let Some(id) = self.resolve_node_id(raw_trimmed) {
+            return Some(id);
+        }
+        let slug = slugify(raw_trimmed);
+        if slug.is_empty() {
+            return None;
+        }
+        if let Some((score, id)) = self
+            .best_similarity_match(raw_trimmed, &slug)
+            .filter(|(s, _)| *s >= 0.75)
+        {
+            tracing::info!(
+                emitted = %raw_trimmed,
+                resolved = %id,
+                similarity = score,
+                "twin guard: near-match resolved to the existing node"
+            );
+            return Some(id);
+        }
+        self.resolve_fragment_alias(&slug)
+    }
+
     /// True if the current node's `setting` (lowercased) is "indoor" — gates
     /// whether the global `weather:` line renders. Returns `false` when there
     /// is no current node or the setting is empty / outdoor / unrecognized
@@ -428,8 +548,9 @@ impl TravelGraph {
         // `<world_state>` render: hub nodes accumulate neighbors across a
         // whole campaign, inflating every turn's tracker prompt. Cap the
         // listed exits with a `(+N more)` marker (same shape as the
-        // carry-back caps).
-        const EXITS_RENDER_CAP: usize = 8;
+        // carry-back caps). (2026-08-21 evening follow-up to the 8192
+        // ruling: 8 → 12.)
+        const EXITS_RENDER_CAP: usize = 12;
         let exits_str = if exits.is_empty() {
             "none".to_string()
         } else if exits.len() > EXITS_RENDER_CAP {
@@ -569,25 +690,10 @@ impl TravelGraph {
             return None;
         }
         // Typo guard: best similarity ≥0.75 across (raw|slug) × (id|name).
-        let mut best: Option<(f32, String)> = None;
-        for n in &self.nodes {
-            let slug_name = slugify(&n.name);
-            for (a, b) in [
-                (raw_trimmed, n.id.as_str()),
-                (raw_trimmed, n.name.as_str()),
-                (slug.as_str(), n.id.as_str()),
-                (slug.as_str(), slug_name.as_str()),
-            ] {
-                if b.is_empty() {
-                    continue;
-                }
-                let s = similarity(a, b);
-                if best.as_ref().map(|(bs, _)| s > *bs).unwrap_or(true) {
-                    best = Some((s, n.id.clone()));
-                }
-            }
-        }
-        if let Some((score, id)) = best.filter(|(s, _)| *s >= 0.75) {
+        if let Some((score, id)) = self
+            .best_similarity_match(raw_trimmed, &slug)
+            .filter(|(s, _)| *s >= 0.75)
+        {
             tracing::info!(
                 raw = %raw_trimmed,
                 resolved = %id,
@@ -962,12 +1068,13 @@ impl NpcRegistry {
     /// (rendered from `WorldSchema::presences`) narrows to who's on-camera.
     /// Format: `Mara [mara_the_innkeep], Corin [bard_corin]`.
     ///
-    /// (#48) HARD-CAPPED at the first 16 entries + a `(+N more)` marker:
+    /// (#48) HARD-CAPPED at the first 20 entries + a `(+N more)` marker:
     /// `npc_registry` grows via `[NPC_REGISTER]` with no ceiling, and this
     /// line rides EVERY tracker + narrator prompt — uncapped it re-grew the
-    /// overflow the bounded carry-back was built to prevent.
+    /// overflow the bounded carry-back was built to prevent. (2026-08-21
+    /// evening follow-up to the 8192 ruling: 16 → 20.)
     pub fn render_line(&self) -> Option<String> {
-        const CAST_PROMPT_CAP: usize = 16;
+        const CAST_PROMPT_CAP: usize = 20;
         if self.entries.is_empty() {
             return None;
         }
@@ -1095,14 +1202,16 @@ pub struct Presence {
 /// real cure; this TTL is the defensive net beneath it.
 pub const PRESENCE_GRACE_RESET: u32 = 4;
 
-/// (2026-08-18 Dedicated-NPC interior state) Render + growth caps for the
+/// (2026-08-18 Dedicated-NPC interior state; cap raised 6→12→16 on the
+/// 2026-08-21 Chloe 8192-context rulings) Render + growth caps for the
 /// per-NPC interior. The `minds:` line is PRESENT-only and HARD-CAPPED like
 /// `present:` — a crowded tavern full of schemers must not blow the
 /// always-on prompt budget (Prime Mandate: state is unbounded, prompt
-/// lines never are). The cap-6 selection is importance-ranked (core →
-/// reaper-protected → ambient) — see the render block in
-/// `render_for_prompt`.
-pub const NPC_MINDS_PROMPT_CAP: usize = 6;
+/// lines never are). The cap matches the presence cap (16) so every
+/// on-camera NPC's interior renders; the selection past 16 stays
+/// importance-ranked (core → reaper-protected → ambient) — see the render
+/// block in `render_for_prompt`.
+pub const NPC_MINDS_PROMPT_CAP: usize = 16;
 /// Total char cap for one `minds:` entry (name + body) — the render-side
 /// backstop for hand-edited saves that bypass the parse-time caps.
 pub const NPC_MINDS_ENTRY_CHAR_CAP: usize = 200;
@@ -1262,15 +1371,21 @@ impl NpcInterior {
 /// (2026-08-16 audit LOW) Shared growth caps for the typed referee-owned
 /// collections — the bracket appliers (lib.rs) + `merge_patch`'s
 /// full-replace defense (`enforce_typed_caps`) agree on one set of numbers.
-pub const MAX_TRACKED_RELATIONSHIPS: usize = 48;
-pub const MAX_STORED_TASKS: usize = 20;
-pub const MAX_STORED_RUMORS: usize = 20;
-pub const MAX_TRAVEL_NODES: usize = 96;
+/// (2026-08-21 evening follow-up to the 8192 ruling: raised across the
+/// board — these are STORAGE bounds, and neither prompt path renders them
+/// wholesale: the tracker lean render caps its lines, `to_json_prompt`
+/// trims to its own char budget, so the raised ceilings only mean longer
+/// campaigns stop hitting the walls.)
+pub const MAX_TRACKED_RELATIONSHIPS: usize = 64;
+pub const MAX_STORED_TASKS: usize = 24;
+pub const MAX_STORED_RUMORS: usize = 32;
+pub const MAX_TRAVEL_NODES: usize = 128;
 /// (2026-08-16 yellow W3) The dynamic-cast registry cap — module scope so
 /// `NpcRegistry::upsert_entry` AND `merge_patch`'s full-replace arm share one
 /// number (the raw-editor JSON tab installs whole registries; the applier's
-/// refuse-at-cap discipline now backstops it).
-pub const MAX_NPC_REGISTRY: usize = 96;
+/// refuse-at-cap discipline now backstops it). (2026-08-21 evening: 96 →
+/// 128 — the reaper still bounds `named` growth; the cast line renders 20.)
+pub const MAX_NPC_REGISTRY: usize = 128;
 /// (2026-08-19 Referee QoL) Open `[PROMISE]` cap — FIFO like the tasks; a
 /// long campaign can't accumulate an unbounded obligations list on the
 /// npc.json slice + the `owed:` render.
@@ -1625,6 +1740,22 @@ pub struct WorldSchema {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tone: Option<String>,
 
+    /// (2026-08-21 economy addendum) The world's money-unit label — context
+    /// text learned in play, NEVER hardcoded (no default "gold": a sci-fi
+    /// card mixing "credits" with an assumed "g" is the exact bug this
+    /// field kills). Empty = unknown: every money render is the NAKED
+    /// base-unit integer (`wealth: 0`, `+8/day`). The tracker sets it via
+    /// `[LEDGER currency <label>]` the first time narration names the
+    /// world's currency ("dollars", "beli"), or as a 2-3 tier slash spec
+    /// (`gold/silver/copper` — highest first, wealth stays the LOWEST unit
+    /// and only `economy::format_money` splits it at the render stage:
+    /// 1254 → `12g 5s 4c`). Rust-owned like `weather`/`tone`: the
+    /// schema-delta path has no arm for it. `String` (not `Option`) per
+    /// the addendum — `""` is the dormant default; skip-serializing keeps
+    /// pre-addendum saves byte-identical.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub currency_label: String,
+
     /// Custom extensions (2026-08-13): a flat key→value string map seeded from
     /// the card's `<custom_tags>` (sim) + the SavedPlayer's `custom_tags`
     /// (player attach) — any extra stat / faction standing / curse / currency /
@@ -1662,6 +1793,32 @@ pub struct WorldSchema {
     /// automatically (the save split is remove-based).
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub site_maps: HashMap<String, crate::site_map::SiteMap>,
+
+    /// (2026-08-20 Economy) Owned income-bearing properties with their own
+    /// treasuries, keyed by property id (BTreeMap — deterministic key order
+    /// in saves, the `ledger:` render, and the caps trim). Rust is the SOLE
+    /// authority — `apply_delta` has no field for it and `merge_patch` has
+    /// no arm (the unknown-field refusal is the immunity, the `site_maps`/
+    /// `promises` pattern). Writers: the `[LEDGER]` bracket applier, the
+    /// daily settlement (`economy::settle_daily_economy`), the card/player
+    /// authored seeds at `enter_fable_session`, and the FIFO trim in
+    /// `enforce_typed_caps` (`economy::MAX_PROPERTIES`). Rides world.json
+    /// automatically (the save split is remove-based). Dormant when empty
+    /// (no `ledger:` line, zero tokens).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub properties: BTreeMap<String, crate::economy::Property>,
+
+    /// (2026-08-20 audit) First-insert order of `properties` — the TRUE FIFO
+    /// eviction key for the `MAX_PROPERTIES` cap trim (the `entity_order`
+    /// pattern). The pre-audit trim dropped `properties.keys().take(overflow)`
+    /// — ALPHABETICALLY-first ids on the BTreeMap, not oldest — so a
+    /// hand-edited over-cap install could silently delete the player's
+    /// flagship "Annex" while keeping newer holdings. Re-inserting an
+    /// existing id does not refresh its slot. Empty for legacy saves →
+    /// backfilled deterministically (BTreeMap key order) on first
+    /// enforcement; pruned of dead ids at the same reconcile.
+    #[serde(default, skip_serializing_if = "std::collections::VecDeque::is_empty")]
+    pub property_order: std::collections::VecDeque<String>,
 
     /// Entity keys flagged immutable (the `[CORE]`-style lock; closes the §5
     /// "deliberately permissive at v1" NPC-drift hole). A key in this set can
@@ -2231,6 +2388,7 @@ impl WorldSchema {
             && self.rumors.is_empty()
             && !self.npc_registry.is_set()
             && self.presences.is_empty()
+            && self.properties.is_empty()
             && self.calendar.as_deref().filter(|s| !s.is_empty()).is_none()
             && self.custom_tags.is_empty();
         if empty {
@@ -2311,7 +2469,26 @@ impl WorldSchema {
         // commands (without seeing the exits, the Tracker would guess at node
         // ids). `None` when no current node is set (dormant — zero tokens,
         // mirroring `WorldClock` / `Weather` before their first command).
-        if let Some(travel_line) = self.travel_graph.render_line() {
+        if let Some(mut travel_line) = self.travel_graph.render_line() {
+            // (2026-08-20 Economy) Location-line prosperity marker — the
+            // narrator reads the town's fortunes WHERE it stands (≤50 hard
+            // times / ≥150 booming), so prose colors itself without a
+            // separate prompt line.
+            if let Some(cur) = self.travel_graph.current_node.as_deref() {
+                if let Some(prosperity) = self
+                    .travel_graph
+                    .nodes
+                    .iter()
+                    .find(|n| n.id == cur)
+                    .map(|n| n.prosperity)
+                {
+                    if prosperity <= 50 {
+                        travel_line.push_str(" — hard times");
+                    } else if prosperity >= 150 {
+                        travel_line.push_str(" — booming");
+                    }
+                }
+            }
             out.push_str("location: ");
             out.push_str(&travel_line);
             out.push('\n');
@@ -2348,11 +2525,12 @@ impl WorldSchema {
         // registry — zero tokens). Format:
         //   `present: Mara (standing by the bar, arms crossed), Corin (tuning a lute)`
         if !self.presences.is_empty() {
-            // (#48) HARD-CAPPED at the first 12 + a `(+N more)` marker —
-            // presence is bounded by the [PRESENCE]-per-turn rebuild + the
-            // 4-turn age-out in practice, but a burst turn (a crowded tavern)
-            // must not blow the always-on prompt line.
-            const PRESENCE_PROMPT_CAP: usize = 12;
+        // (#48) HARD-CAPPED at the first 16 + a `(+N more)` marker —
+        // presence is bounded by the [PRESENCE]-per-turn rebuild + the
+        // 4-turn age-out in practice, but a burst turn (a crowded tavern)
+        // must not blow the always-on prompt line. (2026-08-21 evening
+        // follow-up to the 8192 ruling: 12 → 16.)
+            const PRESENCE_PROMPT_CAP: usize = 16;
             let shown = self.presences.len().min(PRESENCE_PROMPT_CAP);
             let mut parts: Vec<String> = self.presences[..shown]
                 .iter()
@@ -2380,14 +2558,15 @@ impl WorldSchema {
         // scheming never leaks into the scene. This is what lets the API
         // narrator play the lie: it reads that Mara is suspicious, intends
         // to get the player out, and carries the stolen ring, and writes
-        // prose that conceals exactly that. HARD-CAPPED at the 6
-        // highest-priority interior-bearing present NPCs + `(+N more)`
-        // (crowded-tavern guard, mirrors `present:`'s #48 cap); flattened
+        // prose that conceals exactly that. HARD-CAPPED at the
+        // `NPC_MINDS_PROMPT_CAP` highest-priority interior-bearing present
+        // NPCs + `(+N more)` (crowded-tavern guard, mirrors `present:`'s
+        // #48 cap — the caps move together); flattened
         // at the join so a hand-edited save can't forge extra prompt
         // lines. Dormant when no present NPC has interior state (zero
         // tokens, always).
         //
-        // (2026-08-18 audit) The cap-6 selection is IMPORTANCE-RANKED,
+        // (2026-08-18 audit) The capped selection is IMPORTANCE-RANKED,
         // never positional: `core` cast first, then reaper-protected
         // interiors (the Bonded/Nemesis relationship bands, open tasks,
         // item-holders — the same derived signals `npc_is_reaper_protected`
@@ -2500,12 +2679,16 @@ impl WorldSchema {
         // PRESENT NPCs (seeded from an npc card's `<inventory>` sibling +
         // mutated by `[NPC_ITEM]` in play). Same scene-scoped whitelist as
         // `present:`/`minds:`: an off-camera NPC's items never render. Capped
-        // at 6 present rack-holders + `(+N more)`; flattened at the join.
+        // at 6 present rack-holders + `(+N more)`; per-NPC names capped at 6
+        // + `(+N more)` (the `wearing:` PER_NPC discipline — a hoarder's
+        // 16-slot rack renders as a summary, never a shopping list; the
+        // state keeps every item). Flattened at the join.
         // Dormant when no present NPC carries items (zero tokens, always) —
         // the narrator sees clothing/held items turn 1 without re-reading the
         // card.
         if !self.presences.is_empty() && !self.npc_interior.is_empty() {
             const HOLDING_PROMPT_CAP: usize = 6;
+            const PER_NPC_HELD_CAP: usize = 6;
             let mut parts: Vec<String> = Vec::new();
             let mut hidden = 0usize;
             for p in &self.presences {
@@ -2515,9 +2698,10 @@ impl WorldSchema {
                 if interior.items.is_empty() {
                     continue;
                 }
-                let names: Vec<String> = interior
+                let shown: Vec<String> = interior
                     .items
                     .iter()
+                    .take(PER_NPC_HELD_CAP)
                     .map(|it| {
                         if it.qty > 1 {
                             format!("{} ×{}", it.name, it.qty)
@@ -2526,7 +2710,13 @@ impl WorldSchema {
                         }
                     })
                     .collect();
-                let entry = format!("{}({})", p.name, names.join(", "));
+                let extra = interior.items.len().saturating_sub(PER_NPC_HELD_CAP);
+                let list = if extra > 0 {
+                    format!("{}, (+{extra} more)", shown.join(", "))
+                } else {
+                    shown.join(", ")
+                };
+                let entry = format!("{}({})", p.name, list);
                 if parts.len() < HOLDING_PROMPT_CAP {
                     parts.push(entry);
                 } else {
@@ -2547,27 +2737,36 @@ impl WorldSchema {
         // off-screen creditor is not narrator news until they return). The
         // label comes from the volatility-scaled frustration curve; v1
         // renders the band only — NO automatic relationship mutation.
-        // Dormant when empty (zero tokens, always). Capped at 4 givers.
+        // Dormant when empty (zero tokens, always). Capped at 8 rendered
+        // promises (== MAX_PROMISES; see the const's note).
         if !self.promises.is_empty() && !self.presences.is_empty() {
-            const OWED_PROMPT_CAP: usize = 4;
+            // (2026-08-21 evening follow-up to the 8192 ruling: 4 → 8 ==
+            // MAX_PROMISES — every open promise held by a present giver
+            // renders; the cap is the FIFO storage bound, nothing lower.)
+            const OWED_PROMPT_CAP: usize = 8;
             let mut parts: Vec<String> = Vec::new();
-            for p in &self.presences {
-                if parts.len() >= OWED_PROMPT_CAP {
-                    break;
+            // (2026-08-20 audit P2-2) ALL open promises per giver, not just
+            // the first: the [PROMISE] applier dedupes on (npc_id,
+            // description), so one giver can legitimately hold several
+            // distinct obligations — the old `.find()` silently hid every
+            // one past the first. The 4-part cap now bounds rendered
+            // promises (was givers), same ceiling either way.
+            'giver: for p in &self.presences {
+                for promise in self.promises.iter().filter(|pr| pr.npc_id == p.npc_id) {
+                    if parts.len() >= OWED_PROMPT_CAP {
+                        break 'giver;
+                    }
+                    let vol = self.relationships.get(&p.npc_id).map(|r| r.volatility);
+                    let band = crate::offscreen_task::frustration_band(
+                        crate::offscreen_task::promise_frustration(
+                            promise.accepted_at_minutes,
+                            promise.deadline_minutes,
+                            self.world_clock.current_minutes,
+                            vol,
+                        ),
+                    );
+                    parts.push(format!("{} — \"{}\" — {}", p.name, promise.description, band));
                 }
-                let Some(promise) = self.promises.iter().find(|pr| pr.npc_id == p.npc_id) else {
-                    continue;
-                };
-                let vol = self.relationships.get(&p.npc_id).map(|r| r.volatility);
-                let band = crate::offscreen_task::frustration_band(
-                    crate::offscreen_task::promise_frustration(
-                        promise.accepted_at_minutes,
-                        promise.deadline_minutes,
-                        self.world_clock.current_minutes,
-                        vol,
-                    ),
-                );
-                parts.push(format!("{} — \"{}\" — {}", p.name, promise.description, band));
             }
             if !parts.is_empty() {
                 out.push_str("owed: ");
@@ -2578,10 +2777,11 @@ impl WorldSchema {
         // (2026-08-19 Referee QoL) The `bonds:` line — PRESENT NPCs whose
         // relationship tier is LOUD (≥ Friendly on the affinity track or
         // ≤ Rival on the grudge track); the quiet middle
-        // (Stranger/Acquaintance) stays silent. Cap 6, existing tier
+        // (Stranger/Acquaintance) stays silent. Cap 10 (2026-08-21 evening
+        // follow-up to the 8192 ruling: 6 → 10), existing tier
         // glosses. Dormant when empty (zero tokens, always).
         if !self.relationships.is_empty() && !self.presences.is_empty() {
-            const BONDS_PROMPT_CAP: usize = 6;
+            const BONDS_PROMPT_CAP: usize = 10;
             let mut parts: Vec<String> = Vec::new();
             for p in &self.presences {
                 if parts.len() >= BONDS_PROMPT_CAP {
@@ -2601,6 +2801,30 @@ impl WorldSchema {
                 out.push('\n');
             }
         }
+        // (2026-08-20 Economy) The `ledger:` line — the owned-property
+        // read (till, net/day, deficit marker, NPC-owner marker), capped +
+        // flattened by `economy::render_ledger_line`. Dormant when no
+        // properties exist (zero tokens, always — most cards carry none).
+        // Jobs + lifestyle ride the `player_state:` block instead.
+        if !self.properties.is_empty() {
+            if let Some(ledger_line) = crate::economy::render_ledger_line(self) {
+                out.push_str("ledger: ");
+                out.push_str(&Self::flatten_inline(&ledger_line));
+                out.push('\n');
+            }
+        }
+        // (2026-08-21 economy addendum) The Rust-owned price ladder — the
+        // anti-price-hallucination anchor. Deterministic values only
+        // (lifestyle curve × current node prosperity); dormant while the
+        // economy is (a fresh game still renders empty — the zero-token
+        // invariant). Both the tracker (this skeleton) and the API narrator
+        // (the turn tail carries this same world_state) price everyday
+        // items against it instead of inventing sums. See
+        // `economy::render_economy_anchor`.
+        if let Some(anchor) = crate::economy::render_economy_anchor(self) {
+            out.push_str(&anchor);
+            out.push('\n');
+        }
         // Rumors at the current node (Component 4, 2026-07-28): the fourth
         // "where/when" anchor + the node-based knowledge model. The narrator
         // sees ONLY the rumors the current node has heard — "the tavern has
@@ -2612,11 +2836,12 @@ impl WorldSchema {
         // game, or for a node the rumor hasn't reached yet — the player can
         // travel away from a rumor and have it vanish from this line).
         if let Some(cur_id) = self.travel_graph.current_node.as_deref() {
-            // (#48) HARD-CAPPED at the first 6 heard rumors + a `(+N more)`
+            // (#48) HARD-CAPPED at the first 10 heard rumors + a `(+N more)`
             // marker — rumor texts are full prose phrases (heavy), the list
             // grows monotonically via propagation, and this line rides every
-            // prompt.
-            const RUMORS_PROMPT_CAP: usize = 6;
+            // prompt. (2026-08-21 evening follow-up to the 8192 ruling:
+            // 6 → 10.)
+            const RUMORS_PROMPT_CAP: usize = 10;
             let all_heard: Vec<&str> = self
                 .rumors
                 .iter()
@@ -2641,9 +2866,10 @@ impl WorldSchema {
             out.push_str(&Self::flatten_inline(self.summary.trim()));
             out.push('\n');
         }
-        // Cap recent events shown in chat at the last 5: older events live
+        // Cap recent events shown in chat at the last 6: older events live
         // in the persisted schema + memory retrieval, not the chat prompt.
-        let show_events = self.recent_events.len().saturating_sub(5);
+        // (2026-08-21 evening follow-up to the 8192 ruling: 5 → 6.)
+        let show_events = self.recent_events.len().saturating_sub(6);
         if !self.recent_events[show_events..].is_empty() {
             out.push_str("recent_events:\n");
             for ev in &self.recent_events[show_events..] {
@@ -2703,7 +2929,8 @@ impl WorldSchema {
             out.push('\n');
         }
         if !self.player_state.pack.is_empty() {
-            const PACK_PROMPT_CAP: usize = 12;
+            // (2026-08-21 evening follow-up to the 8192 ruling: 12 → 16.)
+            const PACK_PROMPT_CAP: usize = 16;
             let shown: Vec<String> = self
                 .player_state
                 .pack
@@ -2732,7 +2959,8 @@ impl WorldSchema {
         // re-grow the prompt; entries beyond the cap are summarized as
         // `(+N more)`. Empty map → no line (zero tokens for a fresh game).
         if !self.custom_tags.is_empty() {
-            const CUSTOM_PROMPT_CAP: usize = 12;
+            // (2026-08-21 evening follow-up to the 8192 ruling: 12 → 16.)
+            const CUSTOM_PROMPT_CAP: usize = 16;
             let shown: Vec<String> = self
                 .custom_tags
                 .iter()
@@ -2751,7 +2979,7 @@ impl WorldSchema {
         // LAST in the world-state block so it's the loudest signal — the
         // player's injuries + fatigue are the most turn-relevant facts.
         // Returns None when fully default, so a fresh game adds zero tokens.
-        if let Some(player_block) = self.player_state.render_for_prompt_with_beneath(reveal_beneath) {
+        if let Some(player_block) = self.player_state.render_for_prompt_with_beneath(reveal_beneath, &self.currency_label) {
             out.push_str("player_state:\n");
             for line in player_block.lines() {
                 out.push_str("  ");
@@ -2789,7 +3017,7 @@ impl WorldSchema {
     /// marker string so one giant blob can't eat the budget (the model may
     /// still overwrite or null-delete the key).
     pub fn to_json_prompt(&self) -> String {
-        const EVENTS_PROMPT_CAP: usize = 5;
+        const EVENTS_PROMPT_CAP: usize = 6;
         const ENTITY_VALUE_PROMPT_CHARS: usize = 400;
         // (2026-08-16 yellow S4) The per-field legal maxima (500 entities ×
         // 400-char values + summary + events) compose to ~25× CTX_SCHEMA —
@@ -2893,6 +3121,27 @@ impl WorldSchema {
     /// (deterministic); a travel graph over the node cap is a hard error
     /// (refusing an authored hub beats silently dropping it — checked at
     /// the install arm, not here).
+    /// (2026-08-20 audit) Bring `property_order` back in step with
+    /// `properties`: prune ids whose property died (seizure, cap trim,
+    /// hand-edited removal), append properties the order vec has never seen
+    /// (legacy saves backfill in deterministic BTreeMap key order; live
+    /// inserts push in arrival order at the applier/seed sites). Idempotent;
+    /// pure bookkeeping — no mutation of `properties` itself.
+    pub fn reconcile_property_order(&mut self) {
+        if !self.property_order.is_empty() || !self.properties.is_empty() {
+            // Owned copy — the retain closure then borrows nothing of self.
+            let live: Vec<String> = self.properties.keys().cloned().collect();
+            self.property_order.retain(|id| live.iter().any(|l| l == id));
+        }
+        if self.property_order.len() < self.properties.len() {
+            for key in self.properties.keys() {
+                if !self.property_order.iter().any(|o| o.as_str() == key.as_str()) {
+                    self.property_order.push_back(key.clone());
+                }
+            }
+        }
+    }
+
     pub fn enforce_typed_caps(&mut self) {
         let tag_cap = crate::settings::FABLE_STATUS_TAG_CAP;
         if self.status_tags.len() > tag_cap {
@@ -2979,6 +3228,34 @@ impl WorldSchema {
         if self.promises.len() > MAX_PROMISES {
             let overflow = self.promises.len() - MAX_PROMISES;
             self.promises.drain(..overflow);
+        }
+        // (2026-08-20 Economy; 2026-08-20 audit rework) Property cap — TRUE
+        // FIFO by `property_order` (first-insert), not BTreeMap key order
+        // (the old `keys().take(overflow)` dropped alphabetically-first ids,
+        // which only matched "oldest" when insertion order was alphabetical
+        // — the original test passed by accident). Reaching here means a
+        // hand-edited install (the bracket applier refuses at the same
+        // ceiling), so the order vec is reconciled first: legacy saves
+        // backfill deterministically (key order), dead ids prune, unseen
+        // ids append.
+        if self.properties.len() > crate::economy::MAX_PROPERTIES {
+            self.reconcile_property_order();
+            let overflow = self.properties.len() - crate::economy::MAX_PROPERTIES;
+            let dropped: Vec<String> = self
+                .property_order
+                .iter()
+                .take(overflow)
+                .cloned()
+                .collect();
+            for id in &dropped {
+                self.properties.remove(id);
+                self.property_order.retain(|o| o != id);
+            }
+            tracing::warn!(
+                cap = crate::economy::MAX_PROPERTIES,
+                dropped = ?dropped,
+                "property cap truncation: first-inserted entries fell (FIFO)"
+            );
         }
         // (2026-08-19 Hidden site maps) LRU eviction at the map cap — never
         // the current node's map. A WHILE, not one call: a hand-edited
@@ -3505,6 +3782,14 @@ fn type_name_of_value(v: &serde_json::Value) -> &'static str {
             );
         }
         schema.migrate_legacy_outfit();
+        // (2026-08-20 Economy) Clamp every node's prosperity into the legal
+        // [25, 200] band — old saves deserialize missing values at the 100
+        // serde default, but a hand-edited 0/255 must not reach the
+        // revenue/lifestyle curves (the bracket apply clamps the same way).
+        for node in &mut schema.travel_graph.nodes {
+            node.prosperity =
+                node.prosperity.clamp(crate::economy::PROSPERITY_MIN, crate::economy::PROSPERITY_MAX);
+        }
 
         Ok(schema)
     }
@@ -4340,15 +4625,15 @@ mod tests {
         // Day 2, 14:00 = 1440 + 14*60 = 2280 minutes.
         schema.world_clock.current_minutes = 2280;
         schema.world_clock.last_tick_minutes = 2280;
-        // No calendar yet → legacy render.
+        // No calendar yet → legacy render. (2026-08-21 AM/PM: 14:00 → 2:00 PM.)
         let legacy = schema.render_for_prompt();
-        assert!(legacy.contains("clock: Day 2, 14:00"));
+        assert!(legacy.contains("clock: Day 2, 2:00 PM"));
         assert!(!legacy.contains("date:"));
         // With a calendar → date: + time-of-day clock:.
         schema.calendar = Some("3rd of Harvest, Year 1247".into());
         let labeled = schema.render_for_prompt();
         assert!(labeled.contains("date: 3rd of Harvest, Year 1247"));
-        assert!(labeled.contains("clock: 14:00"));
+        assert!(labeled.contains("clock: 2:00 PM"));
         assert!(!labeled.contains("Day 2"), "Day N suppressed when calendar is set");
     }
 
@@ -4695,8 +4980,9 @@ mod tests {
     #[test]
     fn world_clock_render_line_format() {
         // Day 3, 14:30 → (3-1)*1440 + 14*60 + 30 = 3720 + 30 = 3750 minutes.
+        // (2026-08-21 AM/PM: 14:30 renders as 2:30 PM.)
         let clock = WorldClock { current_minutes: 3750, last_tick_minutes: 0 };
-        assert_eq!(clock.render_clock_line().as_deref(), Some("Day 3, 14:30"));
+        assert_eq!(clock.render_clock_line().as_deref(), Some("Day 3, 2:30 PM"));
     }
 
     #[test]
@@ -4715,7 +5001,7 @@ mod tests {
         // 2880 minutes = Day 3, 00:00 (Day 1 starts at minute 0).
         schema.world_clock = WorldClock { current_minutes: 2880, last_tick_minutes: 0 };
         let rendered = schema.render_for_prompt();
-        assert!(rendered.contains("clock: Day 3, 00:00"));
+        assert!(rendered.contains("clock: Day 3, 12:00 AM"));
     }
 
     #[test]
@@ -5290,6 +5576,59 @@ mod tests {
             g2.resolve_fragment_alias("market"),
             None,
             "ambiguous containment declines — the guard only blocks high-confidence dupes"
+        );
+    }
+
+    /// (2026-08-20 audit P2-1) The DISCOVER twin guard runs the FULL chain
+    /// (`resolve_existing_node`), not just the fragment alias: a separator
+    /// variant of an authored id ("market square" / "market_square" vs the
+    /// kebab `market-square`) has EQUAL word counts, so the strict-subset
+    /// alias test passes it through — only the exact/slug/name + ≥0.75 typo
+    /// arms catch it. Old behavior: a ghost twin; new: re-discovery no-op.
+    #[test]
+    fn resolve_existing_node_catches_separator_variant_twins() {
+        let g = TravelGraph {
+            nodes: vec![
+                // (a) The name arm: the diegetic name matches the emitted text.
+                Node {
+                    id: "greywater-village".to_string(),
+                    name: "Greywater Village".to_string(),
+                    neighbors: vec![],
+                    setting: String::new(), ..Default::default()
+                },
+                // (b) The P2-1 seam: kebab id, NO name — "market square" vs
+                // "market-square" is 1 substitution (similarity ≈ 0.92).
+                Node {
+                    id: "market-square".to_string(),
+                    name: String::new(),
+                    neighbors: vec![],
+                    setting: String::new(), ..Default::default()
+                },
+            ],
+            current_node: None,
+        };
+        assert_eq!(
+            g.resolve_existing_node("Greywater Village"),
+            Some("greywater-village".to_string())
+        );
+        assert_eq!(
+            g.resolve_existing_node("market square"),
+            Some("market-square".to_string()),
+            "the space/kebab/underscore variants are ONE place — no twin"
+        );
+        assert_eq!(
+            g.resolve_existing_node("market_square"),
+            Some("market-square".to_string())
+        );
+        assert_eq!(
+            g.resolve_existing_node("market-square"),
+            Some("market-square".to_string())
+        );
+        // A genuinely new place resolves to nothing — the discovery proceeds.
+        assert_eq!(
+            g.resolve_existing_node("abandoned windmill"),
+            None,
+            "unknown place stays discoverable"
         );
     }
 
@@ -6011,8 +6350,12 @@ mod tests {
             rendered.lines().any(|l| l.starts_with("minds: ") && l.contains("recalls:")),
             "archived interior renders the stub"
         );
-        // Prompt cap: 8 present interior-bearing NPCs → 6 shown + marker.
-        s.presences = (0..8)
+        // Prompt cap: cap+2 present interior-bearing NPCs → the cap shown +
+        // marker (was 8→6 in the cap-6 era; the 2026-08-21 raises kept
+        // missing this fixture — now derived from the const so it can't
+        // rot again).
+        let crowded = NPC_MINDS_PROMPT_CAP + 2;
+        s.presences = (0..crowded)
             .map(|i| Presence {
                 npc_id: format!("npc_{i}"),
                 name: format!("N{i}"),
@@ -6021,7 +6364,7 @@ mod tests {
             })
             .collect();
         s.npc_interior.clear();
-        for i in 0..8 {
+        for i in 0..crowded {
             s.npc_interior.insert(
                 format!("npc_{i}"),
                 NpcInterior {
@@ -6055,10 +6398,13 @@ mod tests {
         use crate::relationship::{RelationshipState, RelationshipTier};
 
         let mut s = WorldSchema::default();
-        // 7 ambient named + 1 core + 1 bonded — the two principals LAST in
-        // presences order (the adversarial arrangement: a positional
-        // first-6 selection would drop exactly them).
-        let mut entries: Vec<NpcEntry> = (0..7)
+        // cap+1 ambient named + 1 core + 1 bonded (derived from the const,
+        // same anti-rot discipline as the sibling cap test — the scene is
+        // deliberately over-cap so the marker fires) — the two
+        // principals LAST in presences order (the adversarial arrangement: a
+        // positional first-N selection would drop exactly them).
+        let ambient_count = NPC_MINDS_PROMPT_CAP + 1;
+        let mut entries: Vec<NpcEntry> = (0..ambient_count)
             .map(|i| NpcEntry {
                 id: format!("amb{i}"),
                 name: format!("Amb{i}"),
@@ -6091,7 +6437,7 @@ mod tests {
                 volatility: 1.0,
             },
         );
-        let mut presences: Vec<Presence> = (0..7)
+        let mut presences: Vec<Presence> = (0..ambient_count)
             .map(|i| Presence {
                 npc_id: format!("amb{i}"),
                 name: format!("Amb{i}"),
@@ -6108,9 +6454,16 @@ mod tests {
             });
         }
         s.presences = presences;
-        for id in [
-            "amb0", "amb1", "amb2", "amb3", "amb4", "amb5", "amb6", "villain_mara", "spouse",
-        ] {
+        for i in 0..ambient_count {
+            s.npc_interior.insert(
+                format!("amb{i}"),
+                NpcInterior {
+                    mood: Some("wary".into()),
+                    ..NpcInterior::default()
+                },
+            );
+        }
+        for id in ["villain_mara", "spouse"] {
             s.npc_interior.insert(
                 id.into(),
                 NpcInterior {
@@ -6137,6 +6490,11 @@ mod tests {
         assert!(
             minds_line.contains("(+3 more)"),
             "the 3 overflow slots are ambient: {minds_line}"
+        );
+        let tail = format!("Amb{}", ambient_count - 1);
+        assert!(
+            !minds_line.contains(&tail),
+            "the tail-most ambient entries take the cut: {minds_line}"
         );
         assert!(!minds_line.contains("Amb4"), "an ambient NPC took the cut: {minds_line}");
         let core_pos = minds_line.find("Mara [").expect("core entry present");
@@ -6593,7 +6951,8 @@ mod tests {
     }
 
     /// (2026-08-19) merge_patch has no arm for site_maps — the unknown-field
-    /// refusal is the immunity. Same for promises.
+    /// refusal is the immunity. Same for promises. (2026-08-20) Same for
+    /// the economy's properties.
     #[test]
     fn merge_patch_refuses_site_maps_and_promises() {
         let mut schema = WorldSchema::default();
@@ -6604,6 +6963,10 @@ mod tests {
         let err = schema
             .merge_patch(serde_json::json!({ "promises": [] }))
             .expect_err("promises patch must be refused");
+        assert!(err.contains("unknown top-level field"), "error should explain: {err}");
+        let err = schema
+            .merge_patch(serde_json::json!({ "properties": {} }))
+            .expect_err("properties patch must be refused");
         assert!(err.contains("unknown top-level field"), "error should explain: {err}");
     }
 
@@ -6632,19 +6995,42 @@ mod tests {
             deadline_minutes: 2_000,
             accepted_at_minutes: 1_000,
         }];
+        // (2026-08-20 Economy) Properties ride the WORLD slice by omission
+        // (never removed into the player/npc partitions).
+        s.properties.insert(
+            "forge".into(),
+            crate::economy::Property {
+                node_id: "warren".into(),
+                treasury_balance: 40,
+                daily_revenue: 6,
+                daily_upkeep: 2,
+                ..Default::default()
+            },
+        );
         s.save_split(&world_p, &player_p, &npc_p).expect("save_split");
         let world_json: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&world_p).expect("world file"))
                 .expect("world json");
         assert!(world_json.get("site_maps").is_some(), "site maps ride the world slice");
         assert!(world_json.get("promises").is_none(), "promises never ride the world slice");
+        assert!(world_json.get("properties").is_some(), "properties ride the world slice");
+        let player_json: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&player_p).expect("player file"))
+                .expect("player json");
+        assert!(player_json.get("properties").is_none(), "properties never ride the player slice");
         let npc_json: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&npc_p).expect("npc file"))
                 .expect("npc json");
         assert!(npc_json.get("promises").is_some(), "promises ride the npc slice");
+        assert!(npc_json.get("properties").is_none(), "properties never ride the npc slice");
         let loaded = WorldSchema::load_split(&world_p, &player_p, &npc_p).expect("load_split");
         assert!(loaded.site_maps.contains_key("warren"), "site maps round-trip");
         assert_eq!(loaded.promises.len(), 1, "promises round-trip");
+        assert_eq!(
+            loaded.properties.get("forge").map(|p| p.treasury_balance),
+            Some(40),
+            "properties round-trip"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -6742,6 +7128,188 @@ mod tests {
         s.enforce_typed_caps();
         assert_eq!(s.promises.len(), MAX_PROMISES, "capped at MAX_PROMISES");
         assert_eq!(s.promises[0].description, "obligation 3", "FIFO — oldest dropped");
+    }
+
+    /// (2026-08-20 Economy; audit rework same day) enforce_typed_caps:
+    /// property cap drops FIRST-INSERTED entries (true FIFO via
+    /// `property_order`), NOT alphabetically-first BTreeMap keys. The ids
+    /// are inserted in REVERSE alphabetical order so the two orderings
+    /// disagree — the old key-order trim passed only because the original
+    /// test's ids happened to be alphabetical.
+    #[test]
+    fn enforce_typed_caps_drops_oldest_properties() {
+        let mut s = WorldSchema::default();
+        let n = crate::economy::MAX_PROPERTIES + 3;
+        for i in 0..n {
+            // "z00" inserted FIRST … "a00" inserted LAST: key order is the
+            // exact reverse of insertion order.
+            let id = format!("{:c}{:02}", (b'z' - (i as u8)), i);
+            s.properties.insert(
+                id.clone(),
+                crate::economy::Property { node_id: "town".into(), ..Default::default() },
+            );
+            s.property_order.push_back(id);
+        }
+        s.enforce_typed_caps();
+        assert_eq!(s.properties.len(), crate::economy::MAX_PROPERTIES, "capped");
+        assert!(!s.properties.contains_key("z00"), "FIRST-INSERTED dropped");
+        assert!(!s.properties.contains_key("y01"), "second-inserted dropped");
+        assert!(!s.properties.contains_key("x02"), "third-inserted dropped");
+        // "p10" is the LAST inserted AND the alphabetically-first key — the
+        // old key-order trim dropped exactly this one.
+        assert!(s.properties.contains_key("p10"), "last-inserted survives");
+        // The order vec carries no dead ids after the trim.
+        assert_eq!(s.property_order.len(), s.properties.len());
+        for id in &s.property_order {
+            assert!(s.properties.contains_key(id), "no dead ids in property_order");
+        }
+    }
+
+    /// (2026-08-20 audit) A legacy save (empty `property_order`) backfills
+    /// deterministically in BTreeMap key order, and dead order ids prune.
+    #[test]
+    fn property_order_backfills_and_prunes() {
+        let mut s = WorldSchema::default();
+        for id in ["b", "a", "c"] {
+            s.properties
+                .insert(id.into(), crate::economy::Property::default());
+        }
+        s.property_order.push_back("ghost".into());
+        s.reconcile_property_order();
+        assert_eq!(
+            s.property_order.iter().map(String::as_str).collect::<Vec<_>>(),
+            vec!["b", "a", "c"],
+            "dead id pruned, unseen ids appended in key order"
+        );
+    }
+
+    /// (2026-08-20 Economy) The `ledger:` render — dormant when no properties
+    /// (the fresh-game zero-token contract), live + capped when they exist,
+    /// and the location-line prosperity marker.
+    #[test]
+    fn render_carries_ledger_line_and_prosperity_marker() {
+        // Dormant: a fresh schema renders nothing (empty check includes
+        // properties).
+        assert_eq!(WorldSchema::default().render_for_prompt(), "");
+        let mut s = WorldSchema::default();
+        s.world_clock.current_minutes = 1_500;
+        s.travel_graph.nodes.push(Node {
+            id: "town".into(),
+            name: "Town".into(),
+            prosperity: 40,
+            ..Default::default()
+        });
+        s.travel_graph.current_node = Some("town".into());
+        s.properties.insert(
+            "forge".into(),
+            crate::economy::Property {
+                node_id: "town".into(),
+                daily_revenue: 6,
+                daily_upkeep: 2,
+                treasury_balance: 40,
+                owner: crate::economy::Owner::Npc("liam".into()),
+                ..Default::default()
+            },
+        );
+        let rendered = s.render_for_prompt();
+        assert!(rendered.contains("ledger: forge@town +0/day till 40 (owner liam)"),
+            "ledger line renders (revenue scales at 40%% prosperity: floor(6×40/100)−2 = 0): {rendered}");
+        assert!(rendered.contains("location: "), "location line renders");
+        assert!(rendered.contains("— hard times"), "≤50 prosperity marker: {rendered}");
+        // Boom marker at ≥150; no marker mid-band.
+        s.travel_graph.nodes[0].prosperity = 175;
+        let rendered = s.render_for_prompt();
+        assert!(rendered.contains("— booming"), "≥150 prosperity marker");
+        s.travel_graph.nodes[0].prosperity = 100;
+        let rendered = s.render_for_prompt();
+        assert!(!rendered.contains("— hard times") && !rendered.contains("— booming"),
+            "mid-band carries no marker");
+    }
+
+    /// (2026-08-20 Economy) load_split clamps hand-edited prosperity into
+    /// the legal band; missing prosperity deserializes at the 100 default.
+    #[test]
+    fn load_split_clamps_and_defaults_prosperity() {
+        let dir = std::env::temp_dir().join(format!("wupi-prosperity-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let world_p = dir.join("world.json");
+        std::fs::write(
+            &world_p,
+            serde_json::json!({
+                "travel_graph": {
+                    "nodes": [
+                        { "id": "low", "name": "Low", "prosperity": 0 },
+                        { "id": "high", "name": "High", "prosperity": 255 },
+                        { "id": "legacy", "name": "Legacy" }
+                    ],
+                    "current_node": "low"
+                }
+            })
+            .to_string(),
+        )
+        .expect("write world");
+        let loaded = WorldSchema::load_split(&world_p, &dir.join("player.json"), &dir.join("npc.json"))
+            .expect("load_split");
+        let get = |id: &str| {
+            loaded
+                .travel_graph
+                .nodes
+                .iter()
+                .find(|n| n.id == id)
+                .unwrap()
+                .prosperity
+        };
+        assert_eq!(get("low"), crate::economy::PROSPERITY_MIN, "0 clamps up to 25");
+        assert_eq!(get("high"), crate::economy::PROSPERITY_MAX, "255 clamps down to 200");
+        assert_eq!(get("legacy"), crate::economy::PROSPERITY_DEFAULT, "missing defaults to 100");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// (2026-08-21 economy addendum) The currency label persists through the
+    /// split (world slice), defaults to "" for pre-addendum saves, and the
+    /// `<economy_anchor>` price ladder renders inside `<world_state>`.
+    #[test]
+    fn currency_label_persists_and_anchor_renders() {
+        let dir = std::env::temp_dir().join(format!("wupi-currency-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let mut s = WorldSchema::default();
+        assert_eq!(s.currency_label, "", "fresh world: no currency assumed");
+        s.currency_label = "gold/silver/copper".into();
+        s.save_split(
+            &dir.join("world.json"),
+            &dir.join("player.json"),
+            &dir.join("npc.json"),
+        )
+        .expect("save_split");
+        let loaded = WorldSchema::load_split(
+            &dir.join("world.json"),
+            &dir.join("player.json"),
+            &dir.join("npc.json"),
+        )
+        .expect("load_split");
+        assert_eq!(loaded.currency_label, "gold/silver/copper");
+        // A world file WITHOUT the key (every pre-addendum save) loads "".
+        let bare = dir.join("bare");
+        std::fs::create_dir_all(&bare).expect("temp dir");
+        std::fs::write(
+            &bare.join("world.json"),
+            serde_json::json!({}).to_string(),
+        )
+        .expect("write world");
+        let legacy = WorldSchema::load_split(
+            &bare.join("world.json"),
+            &bare.join("player.json"),
+            &bare.join("npc.json"),
+        )
+        .expect("load_split");
+        assert_eq!(legacy.currency_label, "", "legacy save stays unit-free");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&bare);
+        // The anchor rides the world_state render (both tracker skeleton +
+        // narrator tail consume it).
+        let rendered = loaded.render_for_prompt();
+        assert!(rendered.contains("<economy_anchor>"), "{rendered}");
+        assert!(rendered.contains("base units of gold/silver/copper"), "{rendered}");
     }
 
     /// NpcRegistry dormant contract: empty registry is_set()==false, renders

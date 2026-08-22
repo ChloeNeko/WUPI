@@ -102,18 +102,20 @@ const config = JSON.parse(readFileSync(configPath, 'utf8'));
 
 // ---- WUPI API profile import ------------------------------------------------
 // Precedence: env vars > a real (non-placeholder) key in config.json > the
-// CONNECTED profile from WUPI's own api_config.json (read-only borrow — the
+// CONNECTED profile from WUPI's own api.json (read-only borrow — the
 // battle then uses exactly the endpoint + key the app uses). Candidates cover
-// the dev builds (target/{debug,release}/data) and the portable data dir.
+// the dev builds (target/{debug,release}/data) and the portable data dir,
+// in the new name first, then the pre-rename api_config.json (2026-08-20).
 function findWupiApiConfig() {
   const root = config.wupiRoot || join(HERE, '..', '..');
+  const dirs = [
+    join(root, 'src-tauri', 'target', 'debug', 'data'),
+    join(root, 'src-tauri', 'target', 'release', 'data'),
+    join(root, 'data'),
+  ];
   const candidates = config.apiConfigPath
     ? [resolve(config.apiConfigPath)]
-    : [
-        join(root, 'src-tauri', 'target', 'debug', 'data', 'api_config.json'),
-        join(root, 'src-tauri', 'target', 'release', 'data', 'api_config.json'),
-        join(root, 'data', 'api_config.json'),
-      ];
+    : dirs.flatMap((d) => [join(d, 'api.json'), join(d, 'api_config.json')]);
   for (const p of candidates) if (existsSync(p)) return p;
   return candidates; // for the error message
 }
@@ -147,7 +149,7 @@ if (!envKey && !cfgKeyReal) {
     endpoint = envEndpoint || b.profile.endpoint || endpoint;
     apiKey = b.profile.api_key;
   } else if (b.error) {
-    console.error(`Found WUPI api_config.json at ${b.path} but could not parse it: ${b.error}`);
+    console.error(`Found WUPI api config at ${b.path} but could not parse it: ${b.error}`);
   }
 }
 if (!DRY && (!endpoint || !apiKey || String(apiKey).startsWith('PASTE'))) {
@@ -155,9 +157,9 @@ if (!DRY && (!endpoint || !apiKey || String(apiKey).startsWith('PASTE'))) {
   console.error('  1. WUPI_BATTLE_KEY env var');
   console.error('  2. config.json apiKey (currently placeholder)' + (cfgKeyReal ? '' : ' — placeholder'));
   const searched = borrowed ? null : (Array.isArray(findWupiApiConfig()) ? findWupiApiConfig() : null);
-  console.error('  3. WUPI api_config.json candidates:');
+  console.error('  3. WUPI api.json / api_config.json candidates:');
   for (const p of searched || []) console.error(`     - ${p}`);
-  console.error('Connect the API inside WUPI (it persists api_config.json next to the running exe), or paste a key into config.json.');
+  console.error('Connect the API inside WUPI (it persists api.json next to the running exe), or paste a key into config.json.');
   process.exit(1);
 }
 const maskKey = (k) => (k && k.length > 12 ? `${k.slice(0, 5)}…${k.slice(-4)}` : '••••');

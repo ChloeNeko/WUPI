@@ -85,25 +85,28 @@ use crate::llm::{shared_backend, shared_model, CancelToken, ChunkFn};
 /// FABLE_MAX_TOKENS restored 512→1024 and the LOCAL window 6→8 (the
 /// shortcut amputations reversed).
 ///
-/// **2026-08-08 override: CTX_FABLE set to 3072.** The local model's Fable
+/// **2026-08-08 override: CTX_FABLE set to 3072. 2026-08-21 Chloe ruling —
+/// FINAL: 8192 (E4B; same-day interims at 4096).** The local model's Fable
 /// role is now TRACKING ONLY (bracket commands + schema state) — the API
 /// narrates
 /// exclusively (§3A override). The tracker window is 2 messages (1 turn)
 /// — it relies on the schema delta + Rust state, not re-read
-/// history. 3072 fits the fixed overhead (AGENT ~386 + bracket protocol ~477 =
-/// ~860 tok) + world_state + the 1-turn window + the 256-token tracker
-/// generation reserve (TRACKER_MAX_TOKENS; the sniper is the primary stop).
-/// The prior 4096 was for the deleted local-narrator path; 2048 was too tight
-/// (the fixed overhead alone ate nearly half the budget).
+/// history. 3072 fit the 2026-08-08 teaching set, but the 2026-08-18→21 verb
+/// growth (NPC interior + site + economy) pushed real campaigns against the
+/// derived tracker char budget from turn ~22 (the Cinderfen economy playtest).
+/// 8192 + the raised world-state visibility caps are one ruling: track MORE
+/// stuff; extremely long roleplays must never approach the ceiling.
 ///
-/// **VRAM cost (2026-08-17 E4B figures):** the Q8_0 KV cache at n_ctx=3072
+/// **VRAM cost (2026-08-17 E4B figures, extrapolated 2026-08-21):** the Q8_0
+/// KV cache at n_ctx=3072
 /// is ~70 MiB (the E4B runs 2 KV-heads, a 512-token sliding window on 5 of
 /// every 6 layers, + 18 shared-KV layers — read the exact MiB off the boot
-/// telemetry). Under the §2B
+/// telemetry); at 8192 it scales worst-case linearly to ~190 MiB (sublinear
+/// in practice — the SWA layers don't grow). Under the §2B
 /// swap-lock + the 2026-08-08 local-model turn lock, only ONE of {chat, schema,
 /// fable} is resident + decoding at a time, so worst case is weights (~5.8 GB)
-/// + one KV (~50-100 MiB) + embed (34 MiB, always resident) + compute buffer
-/// (~530 MiB) ≈ ~6.5 GB of 12 GB → ~5.5 GB headroom. Stable.
+/// + one KV (~70-190 MiB) + embed (34 MiB, always resident) + compute buffer
+/// (~530 MiB) ≈ ~6.6 GB of 12 GB → ~5.4 GB headroom. Stable.
 ///
 /// The front-truncation guard below protects against overflow on the rare
 /// turn where the prompt exceeds `FABLE_CTX - reserve` (reserve is mode-aware:
@@ -138,8 +141,9 @@ const FABLE_MAX_TOKENS: i32 = 1024;
 /// itself 5× in T52, killing runaway prose inside ~100ms before KV damage. The
 /// sniper is the true "cut Gemma off" lever; this wall is the backstop behind
 /// it, sized to give the model enough room to finish a full bracket set without
-/// artificial mid-word decapitation.
-const TRACKER_MAX_TOKENS: i32 = 256;
+/// artificial mid-word decapitation. pub(crate): settings.rs derives
+/// TRACKER_PROMPT_CHAR_BUDGET from this + CTX_FABLE.
+pub(crate) const TRACKER_MAX_TOKENS: i32 = 256;
 
 // ---------------------------------------------------------------------------
 // The Rust Sniper — early-stop for tracker rambling (2026-08-10)
@@ -1303,13 +1307,16 @@ mod tests {
     /// Constants are sane (compile-time sanity check).
     #[test]
     fn constants_are_sane() {
-        // 2026-08-10: CTX_FABLE set to 3072 (tracking-only; the API narrates).
-        // The tracker window is 2 messages (1 turn) — it relies on the schema
-        // delta + Rust state, not re-read history. 3072 fits the
-        // fixed overhead (~860 tok) + world_state + the 2-msg window + the
-        // 256-token tracker generation reserve (TRACKER_MAX_TOKENS, raised
+        // 2026-08-21: CTX_FABLE = 8192 (Chloe ruling — FINAL, E4B; was 3072
+        // since 2026-08-08 with a same-day interim at 4096). The tracker
+        // window is 2 messages (1 turn) — it relies on
+        // the schema delta + Rust state, not re-read history. 8192 + the
+        // raised world-state visibility caps give tracking durable headroom
+        // (the 2026-08-21 Cinderfen playtest
+        // hit the derived char budget from turn ~22 at 3072) + the 256-token
+        // tracker generation reserve (TRACKER_MAX_TOKENS, raised
         // 150→256 post-T52 to end mid-bracket decapitation on multi-item turns).
-        assert!(FABLE_CTX >= 3072, "tracker context must fit system + window + gen reserve + thinking");
+        assert!(FABLE_CTX >= 8192, "tracker context must fit system + window + gen reserve + thinking");
         assert!(FABLE_BATCH >= 256, "batch must fit a chunk");
         assert!(FABLE_MAX_TOKENS >= 256, "max tokens must allow a meaty beat");
     }

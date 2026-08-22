@@ -331,6 +331,7 @@ export function buildLeftDrawer() {
       <button type="button" class="hud-dock-btn" data-dock="calendar"
               aria-label="Calendar">
         <span class="hud-dock-icon">${CALENDAR_SVG}</span>
+        <span class="hud-dock-day" data-dock-day aria-hidden="true"></span>
       </button>
       <button type="button" class="hud-dock-btn" data-dock="weather"
               aria-label="Weather">
@@ -683,8 +684,8 @@ export function setPaperdollGender(g) {
 
 // Header row (gold Cinzel serif). 2026-08-06: repurposed from the old
 // "DAY 14 • AUTUMN EQUINOX" date stamp to the PLAYER'S NAME — the protagonist's
-// identity is the load-bearing top label now (the date moved to the Calendar
-// tooltip). Text-only (no HTML); the CSS .astrolabe-header uppercases it.
+// identity is the load-bearing top label now (the date lives on the Calendar
+// click-card). Text-only (no HTML); the CSS .astrolabe-header uppercases it.
 export function setScrubberHeader(text) {
   if (!drawerEl) return;
   const el = drawerEl.querySelector('[data-astrolabe-header]');
@@ -820,30 +821,31 @@ export function setScrubberMinutes(minutes) {
 // ===========================================================================
 // A horizontal flex row of 3 icon clusters below the time scrubber. Each
 // cluster is a <button> (keyboard-focusable) wrapping an inline-SVG line-art
-// icon + a .hud-tooltip badge. Hovering/focusing the cluster fades the tooltip
-// in; all three tooltips share the exact same dark, gold-bordered badge style.
+// icon. CLICKING a cluster opens its slide-up info card (§3) with the full
+// readout — the 2026-08-20 hover-tooltip ban retired the old .hud-tooltip
+// badges (stale docs used to describe them here); the click cards are the
+// sanctioned surface.
 //
 // Data sources (verified against schema.rs + lib.rs):
 //   • Calendar → schema.calendar (the authored [DATE]-rewritten free-form
 //     label — seeded from the card's <world> Date sibling at fresh start)
-//     rendered as the headline, with the DERIVED day/season as the sub-line.
-//     (2026-08-20: the card used to ignore schema.calendar entirely — the
-//     authored date NEVER showed here. The day number under the dock icon
-//     stays derived from world_clock epoch-minutes; no season field exists,
-//     so the sub-line's season stays the 120-day quarter heuristic.)
+//     rendered as the card's headline. (2026-08-20: the card used to ignore
+//     schema.calendar entirely — the authored date NEVER showed here. No
+//     derived day number or season heuristic renders anywhere — the date
+//     label alone carries the day.)
 //   • Weather  → weather.condition (a free-form diegetic phrase). The backend
 //     has NO forecast/next/later fields — the spec's "Current › Next › Later"
-//     sequence can't be sourced, so the tooltip shows the single live
+//     sequence can't be sourced, so the card shows the single live
 //     condition (or "Fair" when dormant).
 //   • Location → travel_graph.current_node (a node id) resolved to the node's
 //     diegetic .name via travel_graph.nodes. The backend's travel graph is a
 //     FLAT adjacency list — there is NO region/city/inn hierarchy, so the
-//     tooltip shows the node's name + its indoor/outdoor setting (or
+//     card shows the node's name + its indoor/outdoor setting (or
 //     "Undiscovered" when dormant).
 //
 // Each cluster's icon SWAPS to a condition-appropriate line-art SVG when the
 // live data resolves (sun for clear, cloud for overcast, etc.) so the HUD
-// reads the state at a glance, not just on hover.
+// reads the state at a glance; the click card carries the text.
 // ===========================================================================
 
 // Maps a free-form weather condition phrase to a line-art glyph key. Pure.
@@ -878,7 +880,8 @@ function clockTime12h(clock) {
 //   { playerName, cardName, clock, weather, node, calendar }
 //   clock: the raw world_clock object (epoch minutes) — may be null (dormant)
 //   weather: the condition string ('' = dormant)
-//   calendar: the authored schema.calendar label ('' = derived Day N only)
+//   calendar: the authored schema.calendar label ('' = dormant — no derived
+//   "Day N" fallback exists anywhere, 2026-08-20 ruling)
 //   node: { name, setting } or null (no current location)
 //
 // Caches the snapshot in `lastSnap` so the slide-up info cards (§3) can render
@@ -891,9 +894,16 @@ function renderStatusRow(snap) {
   const { weather, node } = snap;
 
   // ── Calendar ──────────────────────────────────────────────────────
-  // (2026-08-20) The day-number badge on the icon is GONE (the derived
-  // "Day N" counter is retired app-wide — the calendar date label carries
-  // the day). The icon swaps nothing; the click card renders the label.
+  // (2026-08-21, Chloe) The day number is BACK on the icon — now parsed from
+  // the AUTHORED calendar label ("March 15, 2026" → 15), never a clock-derived
+  // "Day N" counter (that stays retired app-wide). No parseable day in the
+  // label → the badge hides (is-empty) rather than inventing a number.
+  const dayEl = drawerEl.querySelector('[data-dock-day]');
+  if (dayEl) {
+    const dayNum = calendarDayFromLabel(snap.calendar);
+    dayEl.textContent = dayNum;
+    dayEl.classList.toggle('is-empty', !dayNum);
+  }
 
   // ── Weather (condition → icon swap) ───────────────────────────────
   const wKey = classifyWeather(weather);
@@ -909,6 +919,35 @@ function renderStatusRow(snap) {
   // If a card is currently open, refresh its body so a narrator turn's
   // world-state change reflects live (clock advanced, weather drifted, etc.).
   if (activeCardDock) renderInfoCardBody(activeCardDock);
+}
+
+// Parse the day-of-month out of the authored calendar label for the icon
+// badge. Free-form labels carry the day in one of three shapes (checked in
+// order): "March 15" / "June 21, 1542" (month name + number), "15th of
+// Harvest" / "3rd of Harvestmonth" (ordinal before "of"), and the explicit
+// "Day 12" counter form. Returns the bare number string ('15') or '' when
+// the label carries no parseable day (the badge hides — a number is never
+// invented). Pure.
+function calendarDayFromLabel(label) {
+  const s = String(label || '').trim();
+  if (!s) return '';
+  const take = (m) => {
+    const n = parseInt(m[1], 10);
+    return (n >= 1 && n <= 31) ? String(n) : '';
+  };
+  // Month name (full or 3+ letter prefix) followed by the day number.
+  let m = s.match(/\b(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sept?(?:ember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\.?\s+(\d{1,2})\b/i);
+  if (m) return take(m);
+  // ISO "2026-03-15" — the day rides the LAST group.
+  m = s.match(/\b\d{4}-\d{2}-(\d{1,2})\b/);
+  if (m) return take(m);
+  // Ordinal (or bare) day immediately before "of" — "15th of Harvest".
+  m = s.match(/\b(\d{1,2})(?:st|nd|rd|th)?\s+of\b/i);
+  if (m) return take(m);
+  // The explicit counter form — "Day 12".
+  m = s.match(/\bday\s+(\d{1,2})\b/i);
+  if (m) return take(m);
+  return '';
 }
 
 // Card body text contains user-authored content (weather condition, node name),

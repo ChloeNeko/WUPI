@@ -41,7 +41,8 @@
 // layered on later without changing the publish flow. Compare to the old
 // NSIS flow which required keys/wupi.key + keys/wupi.key.pw.
 
-const { readFileSync, existsSync, mkdirSync, rmSync, readdirSync, copyFileSync, cpSync, writeFileSync, statSync } = require('fs');
+const { readFileSync, existsSync, mkdirSync, rmSync, readdirSync, copyFileSync, cpSync, writeFileSync, statSync, openSync, readSync, closeSync } = require('fs');
+const { createHash } = require('crypto');
 const { join, basename } = require('path');
 const { spawnSync } = require('child_process');
 
@@ -605,8 +606,8 @@ for (const f of readdirSync(distDir)) {
   }
 }
 // data/ subdir: engine-shipped identity content only. The user's runtime
-// data/ additions (theme.json, api_config.json, docs/) are created on first
-// run and preserved across updates by the updater's preserve rule (§8C).
+// data/ additions (theme.json, api.json, docs/) are created on first run and
+// preserved across updates by the updater's preserve rule (§8C).
 cpSync(srcDataDir, join(stageWupiDir, 'data'), { recursive: true });
 
 // apps/fable/cards/: starter scenario cards. Each card lives in a per-card
@@ -1008,6 +1009,7 @@ console.log(`[release] staged portable layout at ${stageWupiDir} (DLLs in bin/, 
 const AdmZip = require('adm-zip');
 const zipName = `WUPI.zip`;
 const zipPath = join(stageRoot, zipName);
+let zipSha256 = null;
 if (!dryRun) {
   console.log(`[release] zipping → ${zipName}…`);
   try {
@@ -1030,6 +1032,25 @@ if (!dryRun) {
   }
   const zipSize = statSync(zipPath).size;
   console.log(`[release] zip ready: ${zipName} (${(zipSize / 1024 / 1024).toFixed(1)} MB)`);
+
+  // (2026-08-21) Producer side of the updater's sha256 hard gate
+  // (updater.rs verify_download_sha256): hash the STAGED zip and pin the
+  // digest into latest.json, so the updater refuses any download whose
+  // bytes differ. Streamed in 1 MB chunks — same shape as the Rust side; a
+  // GB-scale zip must never load whole into RAM.
+  const hasher = createHash('sha256');
+  const fd = openSync(zipPath, 'r');
+  try {
+    const buf = Buffer.alloc(1024 * 1024);
+    let n;
+    while ((n = readSync(fd, buf, 0, buf.length, null)) > 0) {
+      hasher.update(buf.subarray(0, n));
+    }
+  } finally {
+    closeSync(fd);
+  }
+  zipSha256 = hasher.digest('hex');
+  console.log(`[release] zip sha256: ${zipSha256}`);
 }
 
 if (dryRun) {
@@ -1132,6 +1153,9 @@ console.log(`[release] GitHub Release ${tag} published.`);
 // the old Tauri manifest (the Rust Manifest struct ignores signature). The
 // `signature` field is omitted — the portable updater doesn't verify
 // minisig for the beta (HTTPS + GitHub release auth is the trust boundary).
+// The `sha256` digest (computed over the staged zip in Step 4.5) arms the
+// updater's post-download integrity gate — WITHOUT it the app-side gate
+// warns + proceeds with no verification at all.
 // ──────────────────────────────────────────────────────────────────────────
 console.log('[release] publishing latest.json to gh-pages via GitHub API…');
 const pubDate = new Date().toISOString();
@@ -1142,6 +1166,7 @@ const manifest = {
   platforms: {
     'windows-x86_64': {
       url: assetUrl,
+      sha256: zipSha256,
     },
   },
 };

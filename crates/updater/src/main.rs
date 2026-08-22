@@ -29,14 +29,33 @@
 //! 4. **Purge legacy dead paths** (`purge.rs`) — the compile-time removal
 //!    list (dead pre-reorg state folders, retired engine files). Best-effort;
 //!    a locked path never fails the update.
-//! 5. Clean up + RELAUNCH the new `<target>/wupi.exe` (retried +
-//!    alive-verified — see `spawn_wupi_robust`), write a result marker
-//!    carrying the relaunch outcome, and exit. Cleanup owns both sides: the
+//! 5. RELAUNCH the new `<target>/wupi.exe` (retried + alive-verified —
+//!    see `spawn_wupi_robust`) under the USER-TAKEOVER GUARD (2026-08-20):
+//!    an EMPTY marker file is touched FIRST, and if any wupi.exe/fable.exe
+//!    booted from the install in the meantime (consuming it — the boot gate
+//!    deletes it), the relaunch CANCELS — never resurrect an app the user
+//!    already launched or deliberately closed. A vanished marker is
+//!    ATTRIBUTED before cancelling (2026-08-21): this binary's own spawned
+//!    children run the same boot gate, so a child that boots far enough to
+//!    consume the marker and then dies inside the alive-grace window is
+//!    indistinguishable from a user launch by the marker alone — the guard
+//!    cancels only when a wupi.exe/fable.exe is actually still alive
+//!    (`any_wupi_process_alive`); otherwise it re-arms the marker and the
+//!    retry ladder continues. The marker is presence-only:
+//!    no outcome payload, nothing surfaced (2026-08-20 Chloe ruling — update
+//!    failures are diagnosed via crash logs + this binary's %TEMP% log, never
+//!    a UI notice). THEN clean up and exit. Cleanup owns both sides: the
 //!    `%TEMP%` staging dir (best-effort here; the next update's residue
 //!    sweep backstops it) and the download's `data/_update/` folder
 //!    (`purge::purge_update_staging` in main — COMPLETE removal, retried
 //!    across AV/indexer lock windows, on EVERY exit path so a failed
-//!    extract/copy can't strand the 2–4 GB zip).
+//!    extract/copy can't strand the 2–4 GB zip). The purge runs AFTER the
+//!    relaunch (2026-08-20): its lock-retry ladder used to sit between
+//!    "apply done" and "WUPI is back" — dead time the user stared at —
+//!    and nothing in the new boot reads `data/_update/` (the marker lives
+//!    in `%TEMP%`, `wupi_update_result.json` — NEVER inside the install,
+//!    per the 2026-08-20 Chloe ruling: no updater file may exist in the
+//!    user's folder).
 //!
 //! ## Why it runs from %TEMP% — and why it self-deletes
 //!
@@ -59,13 +78,14 @@
 //!
 //! If anything fails BEFORE the copy phase touches the target (bad args, wait
 //! error, staging/extract failure, missing `wupi.exe` in payload), the live
-//! install is pristine — we spawn the still-intact old `wupi.exe`, write a
-//! failure result marker, and exit. The user boots back into the old version
-//! and sees the error. A failure DURING the copy phase (disk full, hardware)
-//! leaves a version-MIXED install — but with per-file copy-to-temp + rename
-//! (#40) every file is complete (never truncated), and the updater does NOT
-//! relaunch a mixed install: the user re-launches via the shortcut once the
-//! disk issue is resolved; the failure marker + log explain what happened.
+//! install is pristine — we spawn the still-intact old `wupi.exe` and exit.
+//! The user boots back into the old version. A failure DURING the copy phase
+//! (disk full, hardware) leaves a version-MIXED install — but with per-file
+//! copy-to-temp + rename (#40) every file is complete (never truncated), and
+//! the updater does NOT relaunch a mixed install: the user re-launches via
+//! the shortcut once the disk issue is resolved. NO update outcome is ever
+//! surfaced in the UI (2026-08-20 Chloe ruling): this binary's `%TEMP%` log
+//! is the apply-side forensic trail, and a crashed app leaves crash logs.
 //!
 //! A relaunch that fails EVERY retry (2026-08-18 fix — observed live on the
 //! 0.23.3 → 0.23.5 update: the apply completed, but a single immediate
@@ -73,8 +93,8 @@
 //! the transient handles holding new executable content — both cleanup
 //! removes failed on the same locks that second, and the relaunch vanished
 //! silently: no boot log line, no panic file, no WER) leaves the update
-//! APPLIED and the marker reports `relaunched: false`, so the next manual
-//! boot tells the user exactly what happened instead of looking dead.
+//! APPLIED with no app running — the user launches manually; the %TEMP% log
+//! records what happened.
 //!
 //! The copy phase carries the SAME resilience (2026-08-18, second
 //! relaunch-killer — observed live on the 0.24.1 → 0.24.2 hop): a transient
@@ -122,26 +142,20 @@ fn main() {
 
     let result = run(&args);
 
-    // The download staging is consumed — remove `data/_update` COMPLETELY,
-    // on every exit path, retried across AV/indexer lock windows
-    // (`purge::purge_update_staging`). The old one-shot delete lived in
-    // run()'s success path only: extract/copy failures returned early and
-    // stranded the 2–4 GB zip forever, and even on success a lock race
-    // (observed live, 0.23.3→0.23.5) left the folder behind — nothing on
-    // the wupi.exe side ever sweeps it. Before the relaunch, so the new
-    // wupi.exe boots into a clean tree.
-    purge::purge_update_staging(&args.target_dir);
-
-    let (ok, error, install_touched) = match &result {
+    // (2026-08-20 no-surfacing ruling) The error STRING no longer rides out
+    // of this match — it's already in the %TEMP% updater log above, and no
+    // marker/result channel consumes it anymore. Only the relaunch decision
+    // flags survive.
+    let (ok, install_touched) = match &result {
         Ok(()) => {
             log("update applied successfully");
-            (true, None, false)
+            (true, false)
         }
         Err(e) => {
             log(format!("update FAILED: {e}"));
             // `run` marks copy-phase failures: the install may be a mix of
             // old + new files. See the relaunch decision below.
-            (false, Some(e.clone()), e.install_touched)
+            (false, e.install_touched)
         }
     };
 
@@ -151,27 +165,34 @@ fn main() {
     // is complete, but a version-mixed install can fail to start (missing
     // exports etc.) — auto-booting it hid the failure behind a crash loop.
     // The user relaunches via the shortcut once the disk issue is resolved;
-    // the failure marker + log explain what happened.
+    // the %TEMP% updater log explains what happened.
     //
-    // The relaunch runs BEFORE the marker write so the marker can carry the
-    // relaunch OUTCOME (`relaunched`). The spawned app reads the marker
-    // seconds later (frontend boot gate), well after the ~2.5s alive-check
-    // below resolves — and a missing toast is cosmetic, a lying one is not.
-    let relaunched: Option<bool> = if !install_touched {
-        Some(spawn_wupi_robust(&args.target_dir))
+    // (2026-08-20 USER-TAKEOVER GUARD) An EMPTY marker file is touched before
+    // the relaunch attempt: any wupi.exe booted from this install consumes
+    // (deletes) it at its boot gate, which is the signal `spawn_wupi_robust`
+    // polls between attempts — if the user already launched WUPI (and
+    // possibly closed it again), the relaunch cancels instead of spawning a
+    // duplicate or resurrecting a closed app. Presence-only by design: NO
+    // update outcome is ever surfaced to the UI (2026-08-20 Chloe ruling —
+    // a crashed update leaves crash logs; the %TEMP% updater log is the
+    // apply-side forensic trail).
+    touch_result_marker();
+    if !install_touched {
+        spawn_wupi_robust(&args.target_dir);
     } else {
         log("skipping relaunch: the copy phase failed (install possibly version-mixed)");
-        None
-    };
+    }
 
-    // Record the outcome for the relaunched wupi.exe to surface on its boot.
-    write_result(
-        &args.target_dir,
-        ok,
-        Some(&args.version),
-        error.as_ref().map(|e| e.message.as_str()),
-        relaunched,
-    );
+    // The download staging is consumed — remove `data/_update` COMPLETELY,
+    // on every exit path, retried across AV/indexer lock windows
+    // (`purge::purge_update_staging`). (2026-08-20) This now runs AFTER the
+    // relaunch: the purge's retry ladder (up to ~30s of sleeps on a locked
+    // zip) used to be dead time between "apply done" and "WUPI is back" — the
+    // minute-dark window that invited the user to launch manually in the
+    // first place. Safe to defer: nothing in wupi.exe's boot reads
+    // `data/_update/` (the result marker lives in `%TEMP%` —
+    // `wupi_update_result.json` — not in the install).
+    purge::purge_update_staging(&args.target_dir);
 
     // Sweep stale %TEMP% residue left by PRIOR updates (a pre-0.19 updater
     // never self-deleted its temp copy). Our own live files are excluded;
@@ -221,14 +242,16 @@ fn run(args: &Args) -> Result<(), RunError> {
     //    second; the 30s timeout is a generous pathological-case ceiling.
     wait_for_exit(args.pid, 30_000);
 
-    // 2. Stage to %TEMP% + verify the payload is complete. Target untouched.
+    // 2. Stage to %TEMP% + verify the payload is complete. Target untouched
+    //    by writes (the identical-file check READS the live install only).
+    //    Unchanged + preserved entries never stage — see stage.rs.
     let staging = std::env::temp_dir().join(format!("wupi_stage_{}", args.pid));
     if staging.exists() {
         let _ = std::fs::remove_dir_all(&staging);
     }
     std::fs::create_dir_all(&staging).map_err(|e| format!("create staging: {e}"))?;
-    let n = stage::extract_to_staging(&args.zip, &staging)?;
-    log(format!("staged {n} entries to {}", staging.display()));
+    let n = stage::extract_to_staging(&args.zip, &staging, &args.target_dir)?;
+    log(format!("staged {n} entr(y/ies) to {}", staging.display()));
 
     // 3. Copy into the live install (preserve rule applied). All locks released.
     //    A failure here has already replaced SOME files — flag it so main
@@ -247,6 +270,18 @@ fn run(args: &Args) -> Result<(), RunError> {
     let purged = purge::purge_legacy(&args.target_dir);
     if purged > 0 {
         log(format!("purged {purged} legacy path(s)"));
+    }
+
+    // 3.6. Rename retired USER-FILE names (§8C `USER_FILE_RENAMES`). A pure
+    //     same-volume rename — the file's content (API profiles) rides along
+    //     byte-identical; no read, no rewrite, no working file (any updater
+    //     bookkeeping must live in %TEMP%, never the install — and none is
+    //     needed: the rename is its own completion signal). Idempotent +
+    //     best-effort; a failed rename never fails the update (the app-side
+    //     boot migration backstops it).
+    let renamed = migrate_user_files(&args.target_dir);
+    if renamed > 0 {
+        log(format!("renamed {renamed} user file(s)"));
     }
 
     // 4. Clean up the %TEMP% staging dir. Best-effort: a locked dir defers
@@ -290,6 +325,58 @@ fn wait_for_exit(_pid: u32, _timeout_ms: u32) {
     std::thread::sleep(std::time::Duration::from_millis(100));
 }
 
+/// The marker path in `%TEMP%` — an EMPTY file touched before the relaunch so
+/// any manual wupi.exe/fable.exe boot consumes it (the boot gate deletes it on
+/// read): the user-takeover signal honored by `spawn_wupi_robust`. (2026-08-20
+/// Chloe rulings) The marker NEVER lives inside the install — `%TEMP%` is the
+/// updater's side of the fence — and NEVER carries content: presence-only, no
+/// outcome is surfaced anywhere. Fixed name (not pid-keyed) because the
+/// relaunched/manual wupi.exe is a different process that cannot know the old
+/// pid — a fixed path is the only discoverable rendezvous.
+fn result_marker_path() -> std::path::PathBuf {
+    std::env::temp_dir().join("wupi_update_result.json")
+}
+
+/// One-shot user-file RENAMES applied during an update — the rename sibling
+/// of `purge_legacy`'s delete list (2026-08-20 Chloe ruling: retire the
+/// `api_config.json` filename → `api.json`, content untouched). (from, to)
+/// pairs, forward-slash, relative to the install root.
+///
+/// NEVER destructive: a pure same-volume `fs::rename` (API profiles ride
+/// along byte-identical — no parse, no rewrite), skipped when the source is
+/// gone (idempotent); when BOTH exist the NEW file wins (it is the
+/// app-written current config) and the old is LEFT — the updater never
+/// deletes user data; the app-side boot migration
+/// (`ApiConfig::migrate_legacy_name` in src-tauri) owns reconciliation. No
+/// marker/ledger file: the rename is its own completion signal, and any
+/// updater working file must live in `%TEMP%`, never the install.
+const USER_FILE_RENAMES: &[(&str, &str)] = &[("data/api_config.json", "data/api.json")];
+
+/// Apply every [`USER_FILE_RENAMES`] entry under `target`. Returns the
+/// number of files actually renamed. Best-effort by design — a locked source
+/// logs and moves on (the app-side boot migration retries every boot until
+/// it lands).
+fn migrate_user_files(target: &Path) -> usize {
+    let mut renamed = 0usize;
+    for (from, to) in USER_FILE_RENAMES {
+        let src = target.join(from);
+        let dst = target.join(to);
+        if !src.is_file() || dst.is_file() {
+            continue;
+        }
+        match std::fs::rename(&src, &dst) {
+            Ok(()) => {
+                log(format!("renamed user file {from} → {to}"));
+                renamed += 1;
+            }
+            Err(e) => log(format!(
+                "user-file rename {from} → {to} failed ({e}) — the app-side boot migration will retry"
+            )),
+        }
+    }
+    renamed
+}
+
 /// Spawn the (now-current) `wupi.exe` in the target dir as a detached process
 /// with no console window, so this updater can exit without taking the new app
 /// down with it — RETRIED with backoff and VERIFIED alive (2026-08-18 fix).
@@ -306,7 +393,23 @@ fn wait_for_exit(_pid: u32, _timeout_ms: u32) {
 /// race into a wait. The alive-check catches the mirror case — a spawn that
 /// SUCCEEDS but whose child dies in the loader before executing any code.
 ///
-/// Returns whether a living wupi.exe was produced.
+/// (2026-08-20 USER-TAKEOVER GUARD) Between attempts the pre-written result
+/// marker is polled: if it vanished, a wupi.exe or fable.exe booted from this
+/// install since `main` wrote it. That consumer is ATTRIBUTED (2026-08-21
+/// fix): this loop's own children also run the boot gate that eats the
+/// marker, so a vanished marker alone can't mean "user" — a child that
+/// boots far enough to consume it, then dies inside the grace window
+/// (transient GPU/loader hiccup — exactly what the ladder exists for), used
+/// to cancel every remaining retry and leave WUPI not running. Attribution
+/// is by liveness: every child this loop spawned is already dead by the
+/// time an attempt > 1 runs (any survivor returned early), so a living
+/// wupi.exe/fable.exe can only be the USER's — cancel (spawning now would
+/// die at the single-instance mutex or resurrect an app the user
+/// deliberately closed). No live instance ⇒ the consumer was our own dead
+/// child — re-arm the marker and keep retrying.
+///
+/// Returns whether a living wupi.exe was produced — or already existed via
+/// a user takeover.
 fn spawn_wupi_robust(target_dir: &Path) -> bool {
     /// Backoff between attempts (secs). Six attempts spanning ~45s total:
     /// long enough to outlast any realistic scan window, short enough that a
@@ -318,7 +421,16 @@ fn spawn_wupi_robust(target_dir: &Path) -> bool {
     const ALIVE_GRACE_MS: u64 = 2_500;
 
     let exe = target_dir.join(exe_basename());
+    let marker = result_marker_path();
     for attempt in 1..=(BACKOFF_SECS.len() + 1) {
+        if attempt > 1 && !marker.exists() {
+            if any_wupi_process_alive() {
+                log("result marker consumed — the user already launched WUPI; relaunch cancelled");
+                return true;
+            }
+            log("result marker was consumed by our own deceased child (booted, then died in the grace window) — re-arming marker, retrying");
+            touch_result_marker();
+        }
         #[cfg(windows)]
         let spawned = {
             use std::os::windows::process::CommandExt;
@@ -372,29 +484,72 @@ fn spawn_wupi_robust(target_dir: &Path) -> bool {
     false
 }
 
-/// Write `<target>/data/_update_result.json` for the relaunched wupi.exe to
-/// read on its next boot (so it can show "Updated to vX.Y.Z" or surface the
-/// error). `relaunched`: `Some(bool)` = a relaunch was attempted + how it
-/// ended; `None` = skipped by the copy-phase-failure policy. Best-effort — a
-/// failure here just means the user won't see the toast.
-fn write_result(
-    target_dir: &Path,
-    ok: bool,
-    version: Option<&str>,
-    error: Option<&str>,
-    relaunched: Option<bool>,
-) {
-    let data_dir = target_dir.join("data");
-    let _ = std::fs::create_dir_all(&data_dir);
-    let body = serde_json::json!({
-        "ok": ok,
-        "version": version,
-        "error": error,
-        "relaunched": relaunched,
-    });
-    if let Ok(s) = serde_json::to_string_pretty(&body) {
-        let _ = std::fs::write(data_dir.join("_update_result.json"), s);
+/// True when any `wupi.exe` / `fable.exe` process is running system-wide
+/// (matched by image NAME — both launcher exes share the single-instance
+/// mutex, so ANY live copy means a WUPI the updater must not spawn
+/// alongside). The takeover guard's attribution probe: consulted only when
+/// the result marker vanished between attempts AND every child this loop
+/// spawned is known dead, so a hit can only be a USER-launched instance.
+/// A snapshot failure returns false (no evidence of a user — keep the
+/// retry ladder alive rather than strand the app).
+#[cfg(windows)]
+fn any_wupi_process_alive() -> bool {
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
+        TH32CS_SNAPPROCESS,
+    };
+    unsafe {
+        let snap = match CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) {
+            Ok(h) => h,
+            Err(_) => return false,
+        };
+        let mut entry = PROCESSENTRY32W {
+            dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
+            ..Default::default()
+        };
+        let mut found = false;
+        if Process32FirstW(snap, &mut entry).is_ok() {
+            loop {
+                let end = entry
+                    .szExeFile
+                    .iter()
+                    .position(|c| *c == 0)
+                    .unwrap_or(entry.szExeFile.len());
+                let name = String::from_utf16_lossy(&entry.szExeFile[..end]).to_ascii_lowercase();
+                if name == "wupi.exe" || name == "fable.exe" {
+                    found = true;
+                    break;
+                }
+                if Process32NextW(snap, &mut entry).is_err() {
+                    break;
+                }
+            }
+        }
+        let _ = CloseHandle(snap);
+        found
     }
+}
+
+/// Non-Windows stub: no probe, so a vanished marker reads as the old
+/// takeover signal. The shipping target is Windows-only.
+#[cfg(not(windows))]
+fn any_wupi_process_alive() -> bool {
+    false
+}
+
+/// Touch an EMPTY `%TEMP%\wupi_update_result.json` right before the relaunch
+/// loop — the user-takeover signal `spawn_wupi_robust` polls (a wupi.exe boot
+/// from this install deletes it; vanished + a live wupi.exe/fable.exe = the
+/// user took over, vanished + none alive = our own deceased child — see the
+/// attribution in `spawn_wupi_robust`). Also re-armed by that attribution
+/// when a consumed marker is traced to our own child. Presence-only: no
+/// outcome payload, nothing for the UI to surface —
+/// update failures are diagnosed via crash logs + this binary's `%TEMP%` log
+/// (2026-08-20 Chloe ruling: no failure surfacing at all). Best-effort — a
+/// failed touch just means the takeover guard runs blind for this hop.
+fn touch_result_marker() {
+    let _ = std::fs::write(result_marker_path(), b"");
 }
 
 /// The exe basename on this platform (`wupi.exe` on Windows).
@@ -467,20 +622,24 @@ fn self_delete_temp_copy() {
 fn self_delete_temp_copy() {}
 
 /// Delete leftover `%TEMP%` residue from PRIOR updates: any `wupi_updater_*.exe`
-/// / `wupi_updater_*.log` file and any `wupi_stage_*` directory other than OUR
-/// own live ones (our temp exe is removed by `self_delete_temp_copy` at exit;
-/// our log is deliberately left for a LATER sweep — it is the forensic trail
-/// if this run's relaunch fails). Updates applied by a pre-0.19 updater leave
-/// their temp copy behind — this sweep runs on every update so `%TEMP%`
-/// converges without any boot-time wiring. Scoped to WUPI's namespace only;
-/// best-effort (locked files are skipped, never fatal).
+/// / `wupi_updater_*.log` file, the shared `wupi_update_result.json` marker,
+/// and any `wupi_stage_*` directory other than OUR own live ones (our temp exe
+/// is removed by `self_delete_temp_copy` at exit; our log is deliberately left
+/// for a LATER sweep — it is the forensic trail if this run's relaunch fails).
+/// Updates applied by a pre-0.19 updater leave their temp copy behind — this
+/// sweep runs on every update so `%TEMP%` converges without any boot-time
+/// wiring. Scoped to WUPI's namespace only; best-effort (locked files are
+/// skipped, never fatal).
 ///
 /// **Age floor (#70):** only entries older than 10 minutes (by mtime) are
 /// swept. During the exit→relaunch window a manual relaunch can re-detect
 /// the update and spawn updater B while updater A is still mid-copy — B's
 /// sweep used to `remove_dir_all` A's LIVE staging dir. A live update never
 /// takes 10 minutes (the PID wait + copy are minutes at worst); genuine
-/// residue from prior boots is always older than the floor.
+/// residue from prior boots is always older than the floor. The floor also
+/// protects OUR OWN just-written result marker (written seconds before this
+/// sweep — it must survive until the next wupi.exe boot consumes it); only a
+/// marker orphaned by a prior run (>10 min, never consumed) is swept.
 fn sweep_temp_residue() {
     /// Minimum age (secs) before a namespace entry is considered residue.
     const RESIDUE_AGE_SECS: u64 = 10 * 60;
@@ -501,7 +660,8 @@ fn sweep_temp_residue() {
         };
         let ours = (name.starts_with("wupi_updater_")
             && (name.ends_with(".exe") || name.ends_with(".log")))
-            || name.starts_with("wupi_stage_");
+            || name.starts_with("wupi_stage_")
+            || name == "wupi_update_result.json";
         if !ours {
             continue;
         }
@@ -557,5 +717,53 @@ pub(crate) fn log(msg: impl AsRef<str>) {
         .open(&path)
     {
         let _ = writeln!(f, "{}", msg.as_ref());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    /// The happy path: `data/api_config.json` becomes `data/api.json` with
+    /// its bytes EXACTLY preserved (profiles ride along untouched).
+    #[test]
+    fn renames_legacy_api_config_preserving_bytes() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::create_dir_all(tmp.path().join("data")).unwrap();
+        let body = br#"{"profiles":[{"id":"z","name":"Z.AI","endpoint":"https://api.z.ai","model":"glm-4.6","api_key":"sk-secret"}]}"#;
+        std::fs::write(tmp.path().join("data/api_config.json"), body).unwrap();
+
+        assert_eq!(migrate_user_files(tmp.path()), 1);
+        assert!(!tmp.path().join("data/api_config.json").exists());
+        assert_eq!(
+            std::fs::read(tmp.path().join("data/api.json")).unwrap(),
+            body.to_vec()
+        );
+    }
+
+    /// Idempotent (second run is a no-op) and never clobbers: when BOTH files
+    /// exist the NEW one wins byte-for-byte and the old is left untouched —
+    /// the updater never deletes user data.
+    #[test]
+    fn rename_is_idempotent_and_never_clobbers() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::create_dir_all(tmp.path().join("data")).unwrap();
+        std::fs::write(tmp.path().join("data/api_config.json"), b"OLD").unwrap();
+        assert_eq!(migrate_user_files(tmp.path()), 1);
+        // Already migrated: source gone → zero renames.
+        assert_eq!(migrate_user_files(tmp.path()), 0);
+
+        std::fs::write(tmp.path().join("data/api_config.json"), b"OLD-AGAIN").unwrap();
+        assert_eq!(migrate_user_files(tmp.path()), 0);
+        assert_eq!(std::fs::read(tmp.path().join("data/api.json")).unwrap(), b"OLD".to_vec());
+        assert_eq!(
+            std::fs::read(tmp.path().join("data/api_config.json")).unwrap(),
+            b"OLD-AGAIN".to_vec()
+        );
+
+        // Absent both → clean no-op.
+        let empty = TempDir::new().unwrap();
+        assert_eq!(migrate_user_files(empty.path()), 0);
     }
 }

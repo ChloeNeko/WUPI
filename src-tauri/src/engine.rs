@@ -51,9 +51,10 @@ use std::time::Duration;
 
 /// Fraction of `n_ctx` reserved against prompt growth + generation when
 /// deciding whether to truncate the prompt before prefill (engine.rs
-/// `generate`). With the floor below, the chat engine's 2048-token context
-/// (`CTX_LOCAL_WITH_API`) yields a 512-token reserve: enough headroom for a
-/// long reply plus the next turn's user message without NoKvCacheSlot.
+/// `generate`). The floor applies when `n_ctx/4` would leave less; at the
+/// chat engine's context (`CTX_LOCAL_WITH_API` = 8192 since the 2026-08-21
+/// Chloe ruling) the n_ctx/4 share is 2048 — this 512 floor is the
+/// backstop for smaller contexts (schema at 2048 → 512).
 const GENERATION_RESERVE_FLOOR_TOKENS: usize = 512;
 
 /// Minimum tokens we insist on being able to generate after prefilling. Below

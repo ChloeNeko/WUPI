@@ -75,15 +75,15 @@
 
 /* --- Body chrome state (auto-hide while a game runs) --- */
 /* Per §7B the quick menu is OS chrome ONLY — it never shows inside the
-   Fable app. (2026-08-20, Chloe) The top-edge chrome PEEK is RETIRED —
-   the blurred glass top bar is COMPLETELY removed from Fable: no hover
-   zone, no peek class, nothing can slide it back. The bar translates
-   fully off-screen + pointer-events:none (its z:9999 would otherwise sit
-   above the fable app, z:4000 — the hit-test guard matches the dock's).
-   The dock is translated fully off-screen + pointer-events:none the same
-   way. */
+   Fable app. The top bar is the sole chrome the peek re-reveals (hover
+   the absolute top edge — fable/engine/chrome.js, the PRISM twin). The
+   dock is translated fully off-screen + pointer-events:none so it can't
+   be hovered or clicked even if its z:9998 would otherwise sit above the
+   fable app (z:4000). The peek rule deliberately does NOT restore the
+   dock — only .top-bar. */
 body.fable-active .top-bar { transform: translateY(-48px); pointer-events: none; transition: transform 320ms cubic-bezier(0.2,0.8,0.2,1); }
 body.fable-active .dock-trigger-area { transform: translateY(112px); pointer-events: none; transition: transform 320ms cubic-bezier(0.2,0.8,0.2,1); }
+body.fable-active.fable-chrome-peek .top-bar { transform: translateY(0); pointer-events: auto; }
 
 /* --- Window shell --- */
 .app-window.fable-app {
@@ -873,8 +873,10 @@ body.fable-active .dock-trigger-area { transform: translateY(112px); pointer-eve
 .fable-card-empty-hint { margin-top: 10px; font-size: 15px; }
 
 /* --- Save picker --- */
-.fable-saves-screen { background: var(--fable-void); }
-.fable-saves-list { flex: 1; overflow-y: auto; padding: 20px 28px; display: flex; flex-direction: column; gap: 12px; }
+/* (2026-08-20) .fable-saves-screen + .fable-saves-list RETIRED — the saves
+   screen page is gone; LOAD on a card modal opens the centered saves popup
+   (.fable-saves-popup-*, near the raw-editor styles) instead. The
+   .fable-save-* row styles stay — the popup reuses them. */
 /* The one-click "Resume Latest" button (the per-turn autosave promoted to the
    top of the list — the world's latest state). Reads as the primary action:
    richer brass fill + brass border + emboss, brighter than a normal save row. */
@@ -1096,8 +1098,8 @@ body.fable-active .dock-trigger-area { transform: translateY(112px); pointer-eve
     font-size: 17px;
     font-family: inherit;
     line-height: 1.5;
-    max-height: 77px;     /* caps auto-grow at 2 lines (2026-08-14 per Chloe, was 160px). Backstop for the live-metric cap in stage.js::inputMaxHeightPx. */
-    overflow: hidden;     /* default: no scroll handle, no 3rd-line peek. autoGrow flips to `auto` only once content exceeds 2 lines (so the cursor can still reach the hidden lines). */
+    max-height: 105px;    /* caps auto-grow at 3 lines (2026-08-21 per Chloe, was 77px/2 lines). Backstop for the live-metric cap in stage.js::autoGrow. */
+    overflow: hidden;     /* default: no scroll handle, no 4th-line peek. autoGrow flips to `auto` only once content exceeds 3 lines (line-locked internal scroll — the cut always lands on a line boundary). */
     backdrop-filter: blur(8px);
     box-shadow:
         inset 0 1px 0 rgba(232, 201, 138, 0.14),   /* top inner sheen */
@@ -1120,19 +1122,23 @@ body.fable-active .dock-trigger-area { transform: translateY(112px); pointer-eve
 }
 
 /* --- Typing indicator (subtype-aware reprise, 2026-08-19) --- */
-/* A small label pinned just above the input row while a turn is in flight:
+/* A small label pinned directly above the input row while a turn is in flight:
    "(Name) is currently typing..." for npc-subtype cards, "Narrator is
    currently thinking..." for scenario/world cards (the text is computed by
    stage.js::typingLabel at show time). Hidden by default; the stage toggles
    `.is-visible` from setGenerating (the onTurnStart/onTurnEnd hooks) — it
    covers the whole turn, tracker stage included. Small, soft glow,
-   low-contrast until active. */
+   low-contrast until active.
+   (2026-08-21) The element now lives INSIDE the .fable-input-row form and
+   anchors bottom:100% against it — it rides the form's top edge (directly
+   above the field) whether the textarea is at rest or auto-grown to 2 lines.
+   The old bottom:96px hardcode against the stage root sat a fixed ~1 inch
+   above the field and drifted on auto-grow. */
 .fable-typing-indicator {
     position: absolute;
     left: 0;
     right: 0;
-    bottom: 96px;   /* just above the input row (70px at rest, 93px auto-grown to 2 lines — clears both) */
-    z-index: 24;    /* under the input row (25) + the edge drawers (30/40) */
+    bottom: 100%;   /* the form's top edge — always directly above the input field */
     display: flex;
     justify-content: center;
     padding: 0 max(40px, 12vw);   /* tracks the input row's side padding */
@@ -2860,6 +2866,24 @@ body.fable-active .dock-trigger-area { transform: translateY(112px); pointer-eve
     transform: translateY(0);
     pointer-events: auto;
 }
+/* (2026-08-21, Chloe) Calendar DAY-OF-MONTH badge on the dock icon — the
+   authored label's parsed day ("March 15, 2026" → 15), never a clock-derived
+   "Day N" counter (that stays retired). Centered on the calendar rect's date
+   area; hidden entirely when the label carries no parseable day. */
+.hud-dock-day {
+    position: absolute;
+    top: 58%;
+    left: 50%;
+    transform: translate(-50%, -50%);
+    font-family: var(--fable-font-serif, 'Cinzel', serif);
+    font-size: 0.95rem;
+    font-weight: 700;
+    color: var(--fable-brass-bright, #E6D58A);
+    text-shadow: 0 1px 2px rgba(0, 0, 0, 0.8);
+    pointer-events: none;            /* never block the icon click */
+    z-index: 2;                      /* above the SVG icon (z:auto) */
+}
+.hud-dock-day.is-empty { display: none; }
 /* Card body typography — Cinzel brass headline, optional dim/tag subtext. */
 .info-card-headline {
     font-family: var(--fable-font-serif, 'Cinzel', serif);
@@ -3008,12 +3032,19 @@ body.fable-active .dock-trigger-area { transform: translateY(112px); pointer-eve
        bold white) · ✎ edit (right). The name slot is filled by the player /
        card renderers from their IPC reads; other tabs leave it empty.
        (2026-08-20, Chloe) When a NAME is set the label HIDES — the name is
-       the whole header ("just have it show NAME only"). */
+       the whole header ("just have it show NAME only").
+       (2026-08-21, Chloe) With a name set, the name pins ALL THE WAY LEFT
+       (top-left corner) and the ✎ ALL THE WAY RIGHT — the centered layout
+       read as broken. */
     display: grid; grid-template-columns: 1fr auto 1fr;
     align-items: center;
     margin-bottom: 10px;
 }
 .fable-tab-drop__head.has-name .fable-tab-drop__title { display: none; }
+.fable-tab-drop__head.has-name .fable-tab-drop__name {
+    grid-column: 1 / 3;
+    text-align: left;
+}
 .fable-tab-drop__title {
     font-size: 12px; font-weight: 600; letter-spacing: 0.08em;
     text-transform: uppercase; color: var(--fable-brass);
@@ -3035,12 +3066,12 @@ body.fable-active .dock-trigger-area { transform: translateY(112px); pointer-eve
 }
 .fable-tab-drop__edit:hover { color: var(--fable-text); border-color: var(--fable-brass); }
 .fable-tab-drop__body { display: flex; flex-direction: column; gap: 6px; }
-/* (2026-08-20, Chloe) Every dropdown row is CENTERED + INDIVIDUALLY LINED:
-   the label sits on its own centered line, the value directly beneath it
-   (same colors as before — label dim, value carries the severity class). */
+/* (2026-08-20, Chloe) Every dropdown row is INDIVIDUALLY LINED: the label
+   sits on its own line, the value directly beneath it (label dim, value
+   carries the severity class). (2026-08-21, Chloe) LEFT-ALIGNED throughout. */
 .fable-drop-row {
-    display: flex; flex-direction: column; align-items: center;
-    gap: 1px; text-align: center;
+    display: flex; flex-direction: column; align-items: flex-start;
+    gap: 1px; text-align: left;
     padding: 5px 0;
     border-bottom: 1px solid rgba(255,255,255,0.03);
     font-size: 13.5px; color: var(--fable-text-dim);
@@ -3050,6 +3081,9 @@ body.fable-active .dock-trigger-area { transform: translateY(112px); pointer-eve
 .fable-drop-val.bad { color: #f4a0a0; }
 .fable-drop-val.warn { color: #fbbf24; }
 .fable-drop-val.good { color: #86efac; }
+/* (2026-08-21, Chloe) MONEY-row LABEL gold — the Wealth label in the Player
+   tab's Vitals + the Sim tab's Inventory; the value stays the default white. */
+.fable-drop-row .lbl-gold { color: var(--fable-brass); }
 /* (2026-08-20) Overall HEALTH tier colors — the vitals line above stamina.
    Sick / Infected read DARK green (an abnormal state, not a grade); the
    grade ladder runs light green → yellow → orange → red → purple. */
@@ -3065,11 +3099,11 @@ body.fable-active .dock-trigger-area { transform: translateY(112px); pointer-eve
 .fable-drop-muted { color: var(--fable-text-faint); font-style: italic; font-size: 13px; }
 /* (2026-08-20) STACKED row — label ABOVE value — for the long-prose fields
    (persona lines, clothing lists, custom tags): a side-by-side row put a
-   paragraph hard against its label. Centered with the plain rows. */
+   paragraph hard against its label. Left-aligned with the plain rows. */
 .fable-drop-stack {
     padding: 5px 0;
     border-bottom: 1px solid rgba(255,255,255,0.03);
-    text-align: center;
+    text-align: left;
 }
 .fable-drop-stack:last-child { border-bottom: none; }
 .fable-drop-stack-label {
@@ -3086,58 +3120,40 @@ body.fable-active .dock-trigger-area { transform: translateY(112px); pointer-eve
 .fable-drop-section {
     margin-top: 8px; font-size: 11px; text-transform: uppercase;
     letter-spacing: 0.08em; color: var(--fable-text-faint);
-    text-align: center;
+    text-align: left;
 }
-.fable-drop-empty { padding: 16px 4px; color: var(--fable-text-faint); font-style: italic; text-align: center; }
-.fable-drop-error { color: #f4a0a0; padding: 8px 0; text-align: center; }
-/* (2026-08-20) The World tab's two editable rows (Date / Time): the value
-   reads as editable — brass underline hint + pointer — and swaps to a
-   centered input on click (see tab-rail.js beginInlineEdit). */
-.fable-drop-val--edit {
-    color: var(--fable-brass-bright);
-    border-bottom: 1px dotted var(--fable-brass);
-    cursor: pointer;
-    padding: 0 4px;
-}
-.fable-drop-edit-input {
-    width: 90%; max-width: 220px;
-    background: rgba(0, 0, 0, 0.45);
-    border: 1px solid var(--fable-brass);
-    border-radius: 5px;
-    color: var(--fable-text);
-    font-size: 13px; font-weight: 500;
-    text-align: center;
-    padding: 3px 8px;
-    outline: none;
-}
+.fable-drop-empty { padding: 16px 4px; color: var(--fable-text-faint); font-style: italic; text-align: left; }
+.fable-drop-error { color: #f4a0a0; padding: 8px 0; text-align: left; }
+/* (2026-08-21, Chloe) The World tab's inline click-to-edit Date/Time rows are
+   RETIRED (with their CSS) — the ✎ raw editor is the ONLY edit surface. */
 
 /* Read-only prose/list/title blocks (Card / World / Codex / NPC tabs).
    The dropdowns are visual-aid references — these render tracked state as
    plain text (no inputs). Empty fields are omitted upstream in tab-rail.js.
-   (2026-08-20, Chloe) ALL tab text is centered. */
+   (2026-08-21, Chloe) ALL tab text is LEFT-ALIGNED. */
 .fable-drop-prose {
     padding: 1px 0 5px;
     color: var(--fable-text); font-size: 13px; line-height: 1.5;
     white-space: pre-wrap; overflow-wrap: break-word;
-    text-align: center;
+    text-align: left;
 }
 .fable-drop-list {
     display: flex; flex-direction: column; gap: 3px; padding: 1px 0 5px;
-    align-items: center;
+    align-items: flex-start;
 }
 .fable-drop-list-item {
     position: relative;
     color: var(--fable-text); font-size: 13px; line-height: 1.45;
-    text-align: center;
+    text-align: left;
 }
 .fable-drop-list-item::before {
     content: '•'; color: var(--fable-brass); margin-right: 5px;
 }
 .fable-drop-title {
     font-size: 13px; font-weight: 600; color: var(--fable-text);
-    text-align: center;
+    text-align: left;
 }
-.fable-drop-tags { font-size: 11px; color: var(--fable-text-faint); font-style: italic; text-align: center; }
+.fable-drop-tags { font-size: 11px; color: var(--fable-text-faint); font-style: italic; text-align: left; }
 
 /* Read-only card containers (Codex entries + NPC cards). The input-flavored
    rules that used to live here were retired with the read-only conversion
@@ -3147,7 +3163,7 @@ body.fable-active .dock-trigger-area { transform: translateY(112px); pointer-eve
     display: flex; flex-direction: column; gap: 5px;
     padding: 9px; background: rgba(255,255,255,0.03);
     border: 1px solid var(--fable-glass-line); border-radius: 7px;
-    text-align: center;
+    text-align: left;
 }
 .fable-npc-list { display: flex; flex-direction: column; gap: 8px; margin-bottom: 8px; }
 .fable-npc-card {
@@ -3155,7 +3171,7 @@ body.fable-active .dock-trigger-area { transform: translateY(112px); pointer-eve
     padding: 8px; background: rgba(255,255,255,0.03);
     border: 1px solid var(--fable-glass-line); border-left: 3px solid var(--fable-brass);
     border-radius: 6px;
-    text-align: center;
+    text-align: left;
 }
 
 /* Player tab — character-sheet blocks (identity, appearance, inventory,
@@ -3163,7 +3179,7 @@ body.fable-active .dock-trigger-area { transform: translateY(112px); pointer-eve
    section is omitted upstream in tab-rail.js when empty. */
 .fable-drop-injury-detail {
     color: var(--fable-text-faint); font-size: 11.5px; font-style: italic;
-    padding: 0 0 4px; line-height: 1.4; text-align: center;
+    padding: 0 0 4px; line-height: 1.4; text-align: left;
 }
 .fable-drop-tier { font-weight: 600; font-size: 12px; text-transform: capitalize; color: var(--fable-brass-bright); }
 .fable-drop-tier.bad { color: #f4a0a0; }
@@ -3245,6 +3261,72 @@ body.fable-active .dock-trigger-area { transform: translateY(112px); pointer-eve
     25% { transform: translateX(-4px); }
     75% { transform: translateX(4px); }
 }
+
+/* --- Saves popup (centered modal over the worlds card modal) ----------------
+   2026-08-20 Chloe: clicking LOAD on a card opens this popup instead of
+   navigating to the retired saves screen. Chrome mirrors the raw-XML editor
+   modal (black panel, brass-dim border, uppercase brass title, red-tinted
+   ✕); the rows keep the .fable-save-* look. z-index 50 — above the card
+   modal, its confirm, + the raw editor (47); below toasts. */
+.fable-saves-popup-overlay {
+    position: absolute; inset: 0; z-index: 50;
+    display: flex; align-items: center; justify-content: center;
+    padding: 5vh 24px;
+}
+.fable-saves-popup-backdrop {
+    position: absolute; inset: 0;
+    background: rgba(2, 4, 10, 0.85);
+    backdrop-filter: blur(8px);
+    -webkit-backdrop-filter: blur(8px);
+}
+.fable-saves-popup {
+    position: relative; z-index: 2;
+    display: flex; flex-direction: column;
+    width: min(680px, 92vw);
+    max-height: 80vh;
+    overflow: hidden;               /* the body scrolls, not the panel */
+    background: rgb(10, 10, 10);
+    border: 1px solid var(--fable-brass-dim);
+    border-radius: 14px;
+    box-shadow: 0 24px 60px rgba(0,0,0,0.7), var(--fable-emboss);
+}
+.fable-saves-popup-head {
+    display: flex; align-items: center; justify-content: space-between;
+    gap: 16px;
+    padding: 14px 18px;
+    border-bottom: 1px solid var(--fable-glass-line);
+}
+.fable-saves-popup-title {
+    font-size: 13px; font-weight: 600; letter-spacing: 0.06em;
+    text-transform: uppercase; color: var(--fable-brass);
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.fable-saves-popup-close {
+    flex: 0 0 auto;
+    width: 34px; height: 34px;
+    display: inline-flex; align-items: center; justify-content: center;
+    background: transparent;
+    border: 1px solid rgba(244, 160, 160, 0.4);
+    border-radius: 7px;
+    color: #f4a0a0;
+    font-size: 16px; cursor: pointer;
+    transition: color 160ms ease, border-color 160ms ease, background 160ms ease;
+}
+.fable-saves-popup-close:hover { background: rgba(244, 160, 160, 0.14); border-color: #f4a0a0; }
+.fable-saves-popup-body {
+    min-height: 0;
+    overflow-y: auto;
+    padding: 18px;
+    display: flex; flex-direction: column; gap: 12px;
+}
+.fable-saves-popup .fable-saves-empty { padding: 48px 16px; }
+.fable-saves-popup-status {
+    margin: 0;
+    padding: 8px 18px 12px;
+    color: #f4a0a0;
+    font-size: 13px;
+}
+.fable-saves-popup-status[hidden] { display: none; }
 /* .fable-raw-editor-status rule removed 2026-08-12 per Chloe — the bottom
    status bar (Loading... / Saved. / Save failed / Invalid) is gone from every
    raw editor (Player JSON / World / NPC / Sim / Codex). The textarea now fills
@@ -5077,6 +5159,20 @@ body.fable-active .dock-trigger-area { transform: translateY(112px); pointer-eve
     margin: 20px auto;            /* 20px/side → 40px gap between archive beats */
     animation: none;              /* history spawns in place — no slide-in on feed rebuild */
     transform: none;              /* centered to the screen — no ±48px stagger (latest 2 keep theirs) */
+}
+/* (2026-08-21) Spawn-in-place transition kill — the margin sibling of the
+   animation:none rule above. The base .fable-mes transitions margin 1s for
+   the LIVE recent→history aging morph; on a FEED REBUILD the fresh nodes'
+   archive margins (base 10px → 20px) transitioned over the 1s AFTER
+   beats.js's bottom pin whenever a post-rebuild synchronous layout force
+   (e.g. the composer focus() at turn end) computed the untagged base style
+   before this observer delivered the tag — the growth accumulated below
+   the pinned scrollTop and the viewport landed ~2 beats above the bottom
+   on every edit/reroll/rewind rebuild. vn-interactions.js tags every
+   history beat that was NOT a live recent-flip .vn-spawn; this kills the
+   transition so the archive spawns at its final geometry. */
+.fable-mes.vn-spawn {
+    transition: none;
 }
 /* The history→recent seam (2026-08-20 per Chloe): the gap where the last
    archive beat meets the first recent beat must read TIGHTER than the

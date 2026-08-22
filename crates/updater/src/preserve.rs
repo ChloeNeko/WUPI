@@ -48,6 +48,8 @@ mod tests {
         assert!(is_preserved(Path::new("data/user.xml")));
         assert!(is_preserved(Path::new("data/theme.json")));
         assert!(is_preserved(Path::new("data/api_config.json")));
+        // The 2026-08-20 rename target — user creds, equally preserved.
+        assert!(is_preserved(Path::new("data/api.json")));
         assert!(is_preserved(Path::new("data/docs/lore.md")));
     }
 

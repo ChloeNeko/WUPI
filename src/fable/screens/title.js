@@ -145,9 +145,9 @@ export function buildTitle(handlers) {
       // stacked overlays crossfade, and the title briefly shows through in the
       // gap between their midpoints (the black → menu → black flicker). So
       // 'new' + 'load' run their handlers directly.
-      // CONTINUE is left to its own handler too — it internally routes
-      // through enterStageViaTransition (which already fades), so a title-level
-      // fade here would double-fade.
+      // CONTINUE is left to its own handler too — resumeSave wraps the stage
+      // entry in the same black cinematic (viaTransition, 2026-08-21), so a
+      // title-level fade here would double-fade.
       // EXIT is the only one wrapped: it jumps (closes the app) with no
       // transition of its own, so the 2s fade-to-black → close gives it the
       // same hand-off as the other buttons.

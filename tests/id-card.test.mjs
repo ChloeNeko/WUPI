@@ -205,6 +205,26 @@ test('buildIdCard: empty/unknown draft is safe', () => {
   assert.equal(buildIdCard('unknown', { name: 'x' }), null);
 });
 
+// ── (2026-08-20 audit) authored holdings — the Holdings extra ───────────────
+test('buildIdCard: authored holdings render as a Holdings section, dropped when empty', () => {
+  const props = [
+    { id: 'forge', node: 'iron-forge', kind: 'business', revenue: 8, upkeep: 3, owner: 'liam', price: 250 },
+    { id: 'manor', node: 'hill', revenue: 2, upkeep: 9 },
+  ];
+  const player = buildIdCard('player', { name: 'Kael', properties: props });
+  const sections = byTitle(player);
+  assert.ok(sections.Holdings, 'player face carries Holdings');
+  assert.equal(sections.Holdings[0][0], 'forge');
+  assert.ok(sections.Holdings[0][1].includes('@ iron-forge'));
+  assert.ok(sections.Holdings[0][1].includes('owner liam'));
+  assert.equal(sections.Holdings[1][0], 'manor');
+  const world = buildIdCard('sim', { card_type: 'world', name: 'Greywater', properties: props });
+  assert.ok(byTitle(world).Holdings, 'world face carries Holdings');
+  // No properties → no Holdings section at all (hide-when-untracked).
+  const bare = buildIdCard('player', { name: 'Bare' });
+  assert.ok(!byTitle(bare).Holdings);
+});
+
 // ── summary ────────────────────────────────────────────────────────────────
 console.log('\n%s passed, %s failed', passed, failed);
 process.exit(failed === 0 ? 0 : 1);

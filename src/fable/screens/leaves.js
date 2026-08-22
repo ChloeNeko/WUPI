@@ -190,10 +190,10 @@ export function createWindLeaves(host) {
 
   reducedMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
   document.addEventListener('visibilitychange', onVisibility);
-  window.addEventListener('resize', () => {
-    // No per-leaf resize math needed: trajectories are baked at spawn
-    // from the live host size, so resizes only affect FUTURE leaves.
-  });
+  // (2026-08-20 P3) No resize listener: trajectories are baked at spawn from
+  // the live host size, so resizes only affect FUTURE leaves. The old no-op
+  // anonymous listener here was unremovable in destroy() (a slow leak of
+  // dead closures per wind-leaves instance).
 
   // Reduced motion: don't spawn any leaves at all.
   if (!reducedMotion) start();

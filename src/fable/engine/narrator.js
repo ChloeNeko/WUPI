@@ -41,9 +41,17 @@ let onSchemaPop = null;    // hook: (count) => void — the schema-ring-buffer
                            // the schema layer.
 let onApiLost = null;      // hook: (message) => void — fires on the `api_lost`
                            // event (2026-08-07 override): the API narrator died
-                           // mid-session and there's no local fallback. stage.js
+                           // mid-session and there is no local fallback. stage.js
                            // wires this to lock the composer with the red "API
                            // LOST CONNECTION" state + surface a retry affordance.
+let onTrackerSkipped = null; // hook: () => void — fires on the `tracker_skipped`
+                           // event (2026-08-21): the local tracker pass was
+                           // skipped for being over budget even after the
+                           // tail-drop + core-tier degrade — world-state
+                           // tracking is OFF this turn. De-duped to once per
+                           // session (the backend emits every occurrence; one
+                           // warning chip is enough).
+let trackerSkipWarned = false;
 let rerolling = false;     // true when the current turn is a swipeable-variant
                            // reroll (the last beat is being streamed over in
                            // place). Set in sendFableTurn({reroll:true}), read
@@ -139,6 +147,7 @@ export function initNarrator(hooks = {}) {
   npcPretty = hooks.npcPretty || null;
   onSchemaPop = hooks.onSchemaPop || null;
   onApiLost = hooks.onApiLost || null;
+  onTrackerSkipped = hooks.onTrackerSkipped || null;
   onSchemaPatch = hooks.onSchemaPatch || null;
   onRestoreEditor = hooks.onRestoreEditor || null;
   if (typeof hooks.cardName === 'string') cardName = hooks.cardName;
@@ -308,6 +317,7 @@ export function resetNarrator() {
   uncommittedUserBeat = null;
   turnInputText = '';
   revertRestoreText = null;
+  trackerSkipWarned = false;
   clearSliceState();
   // (2026-08-16 audit M3c) Invalidate every in-flight turn/slice: their
   // channel closures + backstops compare against the epoch and self-ignore
@@ -467,6 +477,15 @@ function handleEvent(msg) {
       break;
     case 'cancelled':
       onCancelled();
+      break;
+    case 'tracker_skipped':
+      // (2026-08-21) The backend's tracker pass died on the prompt budget —
+      // the turn still narrates, but tracking is frozen this turn. Surface
+      // once per session; the log carries the per-turn detail.
+      if (!trackerSkipWarned) {
+        trackerSkipWarned = true;
+        if (onTrackerSkipped) onTrackerSkipped();
+      }
       break;
     case 'done':
       onDone(msg.final_text, msg.reasoning, msg.cancelled);

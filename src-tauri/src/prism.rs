@@ -668,8 +668,10 @@ fn steering_injections(nsfw: bool, furry: bool, user_prompt: &str) -> (Vec<&'sta
 ///   from prompt content, never duplicated against an authored tag.
 /// - `negative_prompt` from `params` is IGNORED — the request always carries
 ///   [`scene_art::PRISM_NEGATIVE_BLOCK`] + the toggle negatives.
-/// - `width`/`height`/`seed` pass through (clamped as before): size is the
-///   composer's bucket presets, seed is Fork & Edit's primitive.
+/// - `width`/`height` pass through clamped to `[64, PRISM_DIM_MAX]` (the
+///   IPC is not trusted — Fork hands stored dims back verbatim, and a
+///   hand-edited row used to reach the allocator raw); seed passes through:
+///   size is the composer's bucket presets, seed is Fork & Edit's primitive.
 pub fn build_request(
     p: &GenerateParams,
     model_path: PathBuf,
@@ -720,8 +722,12 @@ pub fn build_request(
         seed: p.seed,
         cfg_scale: scene_art::PRISM_LOCKED_CFG,
         steps: scene_art::PRISM_LOCKED_STEPS.max(1) as u32,
-        width: p.width.max(64) as u32,
-        height: p.height.max(64) as u32,
+        // (2026-08-20 audit P2-4) Clamped BOTH ways: the 64 floor predates,
+        // the 2048 ceiling is new — a hand-edited gallery row / crafted IPC
+        // payload with huge dims used to sail into the ggml allocator (OOM →
+        // one-strike latch) and wrap the hires ×1.5 i32 cast.
+        width: p.width.clamp(64, scene_art::PRISM_DIM_MAX) as u32,
+        height: p.height.clamp(64, scene_art::PRISM_DIM_MAX) as u32,
         sampling_method: scene_art::DPMPP2M_DISCRIMINANT,
         model_path,
         dest,
