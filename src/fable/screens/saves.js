@@ -4,11 +4,11 @@
 // card modal opens this popup over it instead of navigating to a
 // new page; the card modal re-emerges when the popup closes).
 //
-// Lists SaveMeta for one world from fable_list_saves:
-//   { save_id, name, summary, timestamp, turn_count, is_autosave }
+// Lists SaveMeta for one playthrough session from fable_list_saves:
+//   { save_id, session_id, name, summary, timestamp, turn_count, is_autosave }
 //
 // The per-turn AUTOSAVE is promoted to a one-click "Resume Latest" button at
-// the top of the list — it IS the world's latest state. (Resume Latest
+// the top of the list — it IS the session's latest state. (Resume Latest
 // reuses the autosave, which is exactly what CONTINUE on the title screen
 // resumes too.) The list below shows the MANUAL saves only (most-recent
 // first; the backend sorts by timestamp desc). Each manual row is Load +
@@ -40,6 +40,7 @@ function fmtTime(ms) {
 // Open the popup on `host` (the worlds screen — the card modal stays open
 // behind it). opts:
 //   cardId   — the partition whose saves are listed (+ deletes)
+//   sessionId — (2026-08-22) the playthrough whose slots are listed
 //   cardName — shown in the popup title ("<Name> — Saves")
 //   onSelect — receives the chosen SaveMeta
 export function openSavesModal(host, opts) {
@@ -106,7 +107,7 @@ async function renderSavesList(overlay, opts, close) {
   host.innerHTML = '';
   let saves = [];
   try {
-    saves = await listSaves(opts.cardId);
+    saves = await listSaves(opts.cardId, opts.sessionId);
   } catch (err) {
     if (gen !== overlay._renderGen) return;
     host.innerHTML = `<div class="fable-saves-empty">Couldn't load saves: ${esc(err)}</div>`;
@@ -148,8 +149,8 @@ async function renderSavesList(overlay, opts, close) {
     const empty = document.createElement('div');
     empty.className = 'fable-saves-empty';
     empty.innerHTML = autosave
-      ? `<p>No manual saves yet for this world.</p>`
-      : `<p>No saved fable yet for this world.</p>`;
+      ? `<p>No manual saves yet for this session.</p>`
+      : `<p>No saved fable yet for this session.</p>`;
     host.appendChild(empty);
     return;
   }
@@ -201,7 +202,7 @@ async function renderSavesList(overlay, opts, close) {
       }
       disarm();
       try {
-        await deleteSave(opts.cardId, save.save_id);
+        await deleteSave(opts.cardId, opts.sessionId, save.save_id);
         showStatus('');
       } catch (err) {
         // showStatus renders via textContent — no esc() here (a `&` in the

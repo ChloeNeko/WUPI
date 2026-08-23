@@ -1,8 +1,11 @@
 // =============================================================
 // PANEL: CODEX — the read-only world reference.
-// Renders WorldSchema.summary + recent_events. The "ground truth"
+// Renders WorldSchema.summary + tracked entities. The "ground truth"
 // the narrator + Wupi reason over. This is the default panel when
 // no focus keyword matches — a recap of where the story stands.
+// (2026-08-22, Chloe) recent_events RETIRED from the UI — equip/injury
+// bookkeeping read as noise here; the models get live state through
+// <world_state>, the player gets the turn-notice bubbles instead.
 // =============================================================
 
 function esc(s) {
@@ -13,7 +16,6 @@ function prose(s) { return esc(s).replace(/\n/g, '<br>'); }
 
 export function renderCodex(entities, schema) {
   const summary = (schema && schema.summary) || '';
-  const events = (schema && Array.isArray(schema.recent_events)) ? schema.recent_events : [];
   const entityCount = Object.keys(entities || {}).length;
 
   const head = `<div class="panel-head">
@@ -26,13 +28,6 @@ export function renderCodex(entities, schema) {
     body += `<section class="codex-section">
       <h3>Summary</h3>
       <p class="codex-prose">${prose(summary)}</p>
-    </section>`;
-  }
-  if (events.length) {
-    const list = events.map((e) => `<li>${esc(e)}</li>`).join('');
-    body += `<section class="codex-section">
-      <h3>Recent Events</h3>
-      <ul class="codex-events">${list}</ul>
     </section>`;
   }
   if (entityCount) {

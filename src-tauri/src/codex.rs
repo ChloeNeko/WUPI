@@ -94,29 +94,217 @@ pub(crate) async fn seed_wupi_codex<E: Embedder>(
     seed_compound_codex(engine, path, card_id, WUPI_SYSTEM_NAMESPACE).await
 }
 
-/// Origin tag for per-card lore seeded from a roleplay card's own `.codex`
-/// (`cards/<card_id>/<card_id>.codex`). Distinct from the global Fable
-/// playbook (`wupi_system`) so per-card lore is queryable/auditable apart
-/// from the shared reference. The render pipeline treats all codex entries
-/// the same regardless of namespace (codex frame, lower dense floor).
+/// Origin tag for per-card lore seeded from the UNIVERSAL codex library
+/// (`apps/fable/data/codex/<name>.codex`, 2026-08-22 decoupling). Distinct
+/// from the global Fable playbook (`wupi_system`) so per-card lore is
+/// queryable/auditable apart from the shared reference. The render pipeline
+/// treats all codex entries the same regardless of namespace (codex frame,
+/// lower dense floor).
 pub(crate) const FABLE_CARD_NAMESPACE: &str = "fable_card";
 
-/// Seed a roleplay card's authored `.codex` into the card's OWN memory
-/// partition (keyed by `card_id`). Mirrors [`seed_wupi_codex`] over the
-/// generic [`seed_compound_codex`], pinning the per-card namespace.
+/// One linked codex source: the library display name (the `<linked_codices>`
+/// entry + the `metadata_json` "source" tag) + the resolved library file.
+#[derive(Clone)]
+pub(crate) struct LinkedCodex {
+    pub name: String,
+    pub path: std::path::PathBuf,
+}
+
+/// (2026-08-22 Codex decoupling) Seed a card's LINKED universal codex files
+/// into the card's own memory partition.
 ///
-/// Called from `enter_fable_session` on game start so the card's lore is
-/// live for `search_fable_visible` (which already queries `active_card_id`
-/// as a partition). Idempotent: a re-entry with an unchanged `.codex` does
-/// zero writes (title-keyed, hash-detected reconcile); edits to the file
-/// propagate on the next `fable_start`. Missing file → empty report
-/// (graceful; most cards ship without a `.codex`).
-pub(crate) async fn seed_fable_card_codex<E: Embedder>(
+/// **Priority contract:** `links` arrives in `<linked_codices>` order —
+/// index 0 is TOP priority. When two files define the same entry title, the
+/// higher-priority definition wins and the lower one is dropped at the
+/// merge (before any row is written) — see [`merge_linked_entries`].
+///
+/// **Source-scoped reconcile** (the multi-file landmine fix): rows are
+/// keyed by `(source, title)` — each linked file reconciles only against
+/// its OWN prior rows. Under the old single-file title-keyed reconcile, a
+/// second file's seed purged the first file's entries as orphans. Rows
+/// whose `source` tag matches NO linked file (unlinked codex, or legacy
+/// source-less rows seeded from the retired per-card `.codex` sibling)
+/// purge — unlinking a codex removes its lore from the partition.
+///
+/// A linked file that is MISSING/unreadable contributes zero entries, so
+/// its stored rows purge (the file was deleted or renamed in the library —
+/// correct unlink semantics). The one exception is the seed-vs-delete race
+/// window: a file that parsed fine but VANISHED before the write loop
+/// aborts ITS slice only (no insert, no purge of its rows), mirroring the
+/// single-file guard.
+///
+/// Idempotent: unchanged links do zero writes. Called from
+/// `enter_fable_session` and (live, mid-session) from the codex-link IPC.
+pub(crate) async fn seed_linked_codices<E: Embedder>(
     engine: &MemoryEngine<E>,
-    path: &Path,
+    links: &[LinkedCodex],
     card_id: &str,
 ) -> anyhow::Result<ReconcileReport> {
-    seed_compound_codex(engine, path, card_id, FABLE_CARD_NAMESPACE).await
+    let mut report = ReconcileReport::default();
+
+    // 1) Parse + per-file pipeline (dedupe, then oversize split — the same
+    //    load-bearing order as the single-file seeder).
+    let mut per_file: Vec<(String, Vec<ParsedEntry>)> = Vec::with_capacity(links.len());
+    for link in links {
+        let entries = match parse_compound_file(&link.path) {
+            Ok(e) => e,
+            Err(err) => {
+                tracing::warn!(
+                    file = %link.path.display(),
+                    error = %format!("{err}"),
+                    "linked codex unreadable; its stored entries will purge"
+                );
+                Vec::new()
+            }
+        };
+        per_file.push((link.name.clone(), expand_oversize_entries(dedupe_duplicate_titles(entries))));
+    }
+
+    // 2) Cross-file priority merge — index 0 wins same-title collisions.
+    let (merged, dropped) = merge_linked_entries(per_file);
+    if dropped > 0 {
+        tracing::info!(
+            card_id,
+            dropped,
+            "linked codex merge: lower-priority same-title entries dropped (index 0 = top priority)"
+        );
+    }
+
+    // 3) Group stored rows by (source, title).
+    let existing = engine.list_codex_entries(card_id).await?;
+    let mut existing_by_key: HashMap<(String, String), Vec<(MemoryId, Option<String>)>> =
+        HashMap::new();
+    for (id, metadata_json) in existing {
+        let title = extract_metadata_field(metadata_json.as_deref(), "title").unwrap_or_default();
+        let source = extract_metadata_field(metadata_json.as_deref(), "source").unwrap_or_default();
+        existing_by_key
+            .entry((source, title))
+            .or_default()
+            .push((id, extract_metadata_field(metadata_json.as_deref(), "hash")));
+    }
+
+    // 4) Seed-vs-delete race guard, per source: a file that parsed but
+    //    vanished before the write loop aborts its slice — its merged
+    //    entries are skipped AND its stored rows are left untouched.
+    let mut live: Vec<(String, ParsedEntry)> = Vec::with_capacity(merged.len());
+    for (source, src) in merged {
+        if let Some(link) = links.iter().find(|l| l.name == source) {
+            if !link.path.exists() {
+                tracing::info!(
+                    card_id,
+                    source = %source,
+                    "linked codex vanished mid-seed (deleted from library?); aborting its slice"
+                );
+                existing_by_key.retain(|(s, _), _| s != &source);
+                continue;
+            }
+        }
+        live.push((source, src));
+    }
+
+    // 5) Reconcile each merged entry against its source's own rows
+    //    (keep-one / hash-update / zombie-heal — the single-file semantics,
+    //    scoped by source).
+    let mut consumed: HashSet<(String, String)> = HashSet::new();
+    for (source, src) in &live {
+        let had_rows;
+        let mut kept_one = false;
+        let mut delete_failed = false;
+        match existing_by_key.remove(&(source.clone(), src.title.clone())) {
+            Some(rows) => {
+                had_rows = true;
+                for (id, hash) in rows {
+                    let hash_matches = hash
+                        .as_deref()
+                        .and_then(|s| s.parse::<u64>().ok())
+                        .map(|h| h == src.hash)
+                        .unwrap_or(false);
+                    if hash_matches && !kept_one {
+                        kept_one = true;
+                    } else if let Err(e) = engine.delete_memory(id).await {
+                        tracing::warn!(
+                            title = %src.title,
+                            source = %source,
+                            error = %format!("{e}"),
+                            "linked codex update: failed to delete old entry; skipping"
+                        );
+                        delete_failed = true;
+                    }
+                }
+            }
+            None => {
+                had_rows = false;
+            }
+        }
+        if kept_one {
+            report.unchanged += 1;
+            consumed.insert((source.clone(), src.title.clone()));
+            continue;
+        }
+        if delete_failed {
+            continue;
+        }
+        match insert_entry(engine, src, card_id, FABLE_CARD_NAMESPACE, Some(source.as_str())).await {
+            Ok(()) => {
+                if had_rows {
+                    report.updated += 1;
+                } else {
+                    report.seeded += 1;
+                }
+                consumed.insert((source.clone(), src.title.clone()));
+            }
+            Err(e) => tracing::warn!(
+                title = %src.title,
+                source = %source,
+                error = %format!("{e}"),
+                "linked codex insert failed"
+            ),
+        }
+    }
+
+    // 6) Purge everything unconsumed: rows from unlinked sources (incl.
+    //    legacy source-less rows), and stale titles within a linked source.
+    for ((source, title), rows) in &existing_by_key {
+        if !consumed.contains(&(source.clone(), title.clone())) {
+            for (id, _) in rows {
+                match engine.delete_memory(*id).await {
+                    Ok(()) => report.purged += 1,
+                    Err(e) => tracing::warn!(
+                        source = %source,
+                        title = %title,
+                        error = %format!("{e}"),
+                        "linked codex orphan purge failed"
+                    ),
+                }
+            }
+        }
+    }
+    Ok(report)
+}
+
+/// The PURE cross-file priority merge. Input: per-file entry lists in
+/// `<linked_codices>` order (each ALREADY through the per-file pipeline —
+/// dedupe + oversize split). Output: `(source, entry)` pairs in stable
+/// order + the count of lower-priority same-title entries dropped. A title
+/// claimed by an earlier (higher-priority) file is final — the loser never
+/// reaches a row write, so "index 0 wins" is enforced at the context-
+/// embedding phase exactly once, here.
+pub(crate) fn merge_linked_entries(
+    per_file: Vec<(String, Vec<ParsedEntry>)>,
+) -> (Vec<(String, ParsedEntry)>, usize) {
+    let mut merged: Vec<(String, ParsedEntry)> = Vec::new();
+    let mut seen_titles: HashSet<String> = HashSet::new();
+    let mut dropped = 0usize;
+    for (source, entries) in per_file {
+        for src in entries {
+            if seen_titles.insert(src.title.clone()) {
+                merged.push((source.clone(), src));
+            } else {
+                dropped += 1;
+            }
+        }
+    }
+    (merged, dropped)
 }
 
 /// Parse the compound file, reconcile against the entries already stored in
@@ -260,7 +448,7 @@ async fn seed_compound_codex<E: Embedder>(
         if delete_failed {
             continue;
         }
-        match insert_entry(engine, src, card_id, namespace).await {
+        match insert_entry(engine, src, card_id, namespace, None).await {
             Ok(()) => {
                 if had_rows {
                     report.updated += 1;
@@ -391,12 +579,14 @@ pub(crate) fn expand_oversize_entries(sources: Vec<ParsedEntry>) -> Vec<ParsedEn
 /// Insert one parsed entry via `add_codex_entry`, building its `metadata_json`.
 /// Salience is flat 1.0 (matches episodic; salience weighting is deferred per
 /// the salience-landmine). `namespace` flows into the metadata so the entry's
-/// origin is queryable for future filtering.
+/// origin is queryable; `source` (when present) names the linked library file
+/// (the multi-codex reconcile key).
 async fn insert_entry(
     engine: &MemoryEngine<impl Embedder>,
     src: &ParsedEntry,
     card_id: &str,
     namespace: &str,
+    source: Option<&str>,
 ) -> anyhow::Result<()> {
     // Defensive sanity log: `expand_oversize_entries` splits oversize bodies
     // pre-embed (pre-reconcile), so the seed path never reaches here with a body
@@ -412,7 +602,7 @@ async fn insert_entry(
         );
     }
 
-    let metadata = build_metadata_json(&src.title, &src.tags, src.hash, namespace);
+    let metadata = build_metadata_json(&src.title, &src.tags, src.hash, namespace, source);
     engine
         .add_codex_entry(src.body.clone(), card_id, 1.0, metadata)
         .await
@@ -443,7 +633,10 @@ async fn insert_entry(
 /// body + fences), so whitespace-only edits to front-matter still register as
 /// a change. The split point is the next `---` fence at the start of a line
 /// preceded by a blank line.
-fn parse_compound_file(path: &Path) -> anyhow::Result<Vec<ParsedEntry>> {
+///
+/// (2026-08-22) Pub(crate): lib.rs's library-listing IPC counts entries per
+/// library file. A missing file is NOT an error (empty Vec).
+pub(crate) fn parse_compound_file(path: &Path) -> anyhow::Result<Vec<ParsedEntry>> {
     let bytes = match std::fs::read(path) {
         Ok(b) => b,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -780,7 +973,18 @@ pub fn parse_front_matter(front: Option<&str>, fallback_stem: &str) -> (String, 
 /// Build the `metadata_json` string for a codex entry. Hand-rolled JSON
 /// construction (the structure is fixed and small; a serde round-trip would be
 /// overkill). All values are JSON-escaped via [`escape_json_string`].
-fn build_metadata_json(title: &str, tags: &[String], hash: u64, namespace: &str) -> String {
+/// `source` (2026-08-22 multi-codex) names the linked library file the entry
+/// seeded from — `None` on the single-file wupi-playbook path; appended AFTER
+/// `tags`, which is safe for `extract_metadata_field` (the needle requires
+/// the `:` after the key — a tag element named "source" is followed by `,`/`]`,
+/// never `:`).
+fn build_metadata_json(
+    title: &str,
+    tags: &[String],
+    hash: u64,
+    namespace: &str,
+    source: Option<&str>,
+) -> String {
     let title_escaped = escape_json_string(title);
     let tags_array = tags
         .iter()
@@ -797,12 +1001,16 @@ fn build_metadata_json(title: &str, tags: &[String], hash: u64, namespace: &str)
     // "hash"-tagged entry's hash never matched → delete+reinsert every
     // seed). All string values are escaped, so a title CONTAINING those
     // words can't collide — only raw tag elements can.
+    let source_field = source
+        .map(|s| format!(",\"source\":\"{}\"", escape_json_string(s)))
+        .unwrap_or_default();
     format!(
-        "{{\"kind\":\"codex\",\"namespace\":\"{}\",\"title\":\"{}\",\"hash\":\"{}\",\"tags\":[{}]}}",
+        "{{\"kind\":\"codex\",\"namespace\":\"{}\",\"title\":\"{}\",\"hash\":\"{}\",\"tags\":[{}]{}",
         escape_json_string(namespace),
         title_escaped,
         hash,
-        tags_array
+        tags_array,
+        source_field,
     )
 }
 
@@ -872,11 +1080,204 @@ fn extract_metadata_field(metadata_json: Option<&str>, key: &str) -> Option<Stri
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::memory_embedder::{StubEmbedder, EMBED_DIM};
+
+    // ── (2026-08-22) engine-backed multi-codex seeding ────────────────────
+    // Real MemoryEngine + StubEmbedder over a tempfile DB (the memory.rs
+    // retention-mod pattern): pins the source-scoped reconcile — no
+    // cross-file purges, index-0 priority on title collisions, unlink
+    // purges only the unlinked source's rows, legacy source-less rows
+    // purge on the first linked seed.
+
+    fn linked(name: &str, dir: &Path) -> LinkedCodex {
+        LinkedCodex { name: name.to_owned(), path: dir.join(format!("{name}.codex")) }
+    }
+
+    fn open_stub_engine(dir: &Path) -> MemoryEngine<StubEmbedder> {
+        MemoryEngine::open(&dir.join("memory.sqlite"), StubEmbedder { dim: EMBED_DIM })
+            .expect("open engine")
+    }
+
+    #[tokio::test]
+    async fn linked_codices_seed_priority_merge_and_source_scoped_reconcile() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = open_stub_engine(dir.path());
+        let write = |name: &str, text: &str| {
+            std::fs::write(dir.path().join(format!("{name}.codex")), text).unwrap()
+        };
+        write(
+            "High",
+            "---\ntitle: Dragons\ntags: myth\n---\n\nCanonical dragons.\n\n---\ntitle: Unique\ntags: myth\n---\n\nOnly in high.\n",
+        );
+        write(
+            "Low",
+            "---\ntitle: Dragons\ntags: myth\n---\n\nApocryphal dragons.\n\n---\ntitle: Extra\ntags: myth\n---\n\nLow extra.\n",
+        );
+        let card = "multi-codex-card";
+
+        // Seed both, High first (index 0 = top priority).
+        let links = vec![linked("High", dir.path()), linked("Low", dir.path())];
+        let report = seed_linked_codices(&engine, &links, card).await.unwrap();
+        assert_eq!(report.seeded, 3, "Dragons resolves to High's definition + the two non-collisions");
+
+        let stored: Vec<(String, String)> = engine
+            .list_codex_entries(card)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|(_, m)| {
+                let source = extract_metadata_field(m.as_deref(), "source").unwrap_or_default();
+                let title = extract_metadata_field(m.as_deref(), "title").unwrap_or_default();
+                (source, title)
+            })
+            .collect();
+        assert!(stored.contains(&("High".into(), "Dragons".into())), "the HIGH-priority Dragons wins");
+        assert!(!stored.contains(&("Low".into(), "Dragons".into())), "the loser never reaches a row");
+        assert!(stored.contains(&("High".into(), "Unique".into())));
+        assert!(stored.contains(&("Low".into(), "Extra".into())), "the second file's non-collisions survive (source scoping)");
+
+        // Idempotent re-seed: zero writes.
+        let again = seed_linked_codices(&engine, &links, card).await.unwrap();
+        assert_eq!(again.unchanged, 3);
+        assert_eq!(again.seeded + again.updated + again.purged, 0);
+
+        // Unlink Low: ONLY Low's rows purge; High's survive untouched.
+        let only_high = vec![links[0].clone()];
+        let unlinked = seed_linked_codices(&engine, &only_high, card).await.unwrap();
+        assert_eq!(unlinked.purged, 1, "the unlinked source's rows purge");
+        assert_eq!(unlinked.unchanged, 2, "the still-linked source's rows are untouched");
+        let after: Vec<(String, String)> = engine
+            .list_codex_entries(card)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|(_, m)| {
+                let source = extract_metadata_field(m.as_deref(), "source").unwrap_or_default();
+                let title = extract_metadata_field(m.as_deref(), "title").unwrap_or_default();
+                (source, title)
+            })
+            .collect();
+        assert!(after.iter().all(|(s, _)| s == "High"), "only High's rows remain");
+        assert_eq!(after.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn legacy_sourceless_codex_rows_purge_on_first_linked_seed() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = open_stub_engine(dir.path());
+        let card = "legacy-card";
+        // A pre-2026-08-22 row: the old single-file metadata shape (no source).
+        engine
+            .add_codex_entry(
+                "legacy lore".to_owned(),
+                card,
+                1.0,
+                build_metadata_json("Legacy Lore", &[], 7, FABLE_CARD_NAMESPACE, None),
+            )
+            .await
+            .unwrap();
+        std::fs::write(
+            dir.path().join("Fresh.codex"),
+            "---\ntitle: Fresh Lore\ntags: a\n---\n\nFresh body.\n",
+        )
+        .unwrap();
+        let links = vec![linked("Fresh", dir.path())];
+        let report = seed_linked_codices(&engine, &links, card).await.unwrap();
+        assert_eq!(report.seeded, 1);
+        assert_eq!(report.purged, 1, "the legacy source-less row purges (its .codex moved to the library)");
+        let remaining = engine.list_codex_entries(card).await.unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(
+            extract_metadata_field(remaining[0].1.as_deref(), "title").as_deref(),
+            Some("Fresh Lore")
+        );
+    }
+
+    // (2026-08-22 unlink-all fix) The EMPTY links list is the
+    // unlink-everything signal: every stored row lands unconsumed in the
+    // reconcile and purges. Pins the contract both call sites rely on —
+    // `enter_fable_session` + `fable_codex_link_set` seed even on empty
+    // (the old non-empty gates left a fully-unlinked card's rows surfacing
+    // in <retrieved_memory> forever).
+    #[tokio::test]
+    async fn empty_links_purge_all_stored_codex_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = open_stub_engine(dir.path());
+        let card = "unlink-all-card";
+        std::fs::write(
+            dir.path().join("Only.codex"),
+            "---\ntitle: Only Lore\ntags: a\n---\n\nBody.\n",
+        )
+        .unwrap();
+        let seeded = seed_linked_codices(&engine, &[linked("Only", dir.path())], card)
+            .await
+            .unwrap();
+        assert_eq!(seeded.seeded, 1);
+
+        // Unlink EVERYTHING: the empty list purges every stored lore row.
+        let purged = seed_linked_codices(&engine, &[], card).await.unwrap();
+        assert_eq!(purged.purged, 1, "unlink-all purges the stored lore rows");
+        assert_eq!(purged.seeded + purged.updated + purged.unchanged, 0);
+        assert!(
+            engine.list_codex_entries(card).await.unwrap().is_empty(),
+            "the partition carries zero codex rows after unlink-all"
+        );
+    }
 
     /// 2026-08-15 audit fix: duplicate source titles are deterministically
     /// disambiguated — same input, same output (idempotent re-seeds), and
     /// the fallback-stem collision (two front-matter blocks omitting
     /// `title:`) is covered too.
+    #[test]
+    // ── (2026-08-22 Codex decoupling) multi-file merge + source metadata ──
+
+    #[test]
+    fn merge_linked_entries_index_zero_wins_collisions() {
+        let mk = |title: &str, body: &str| ParsedEntry {
+            title: title.into(),
+            tags: vec![],
+            body: body.into(),
+            hash: 0,
+        };
+        let per_file = vec![
+            ("High Priority".to_string(), vec![mk("Dragons", "canonical lore"), mk("Unique", "only here")]),
+            ("Low Priority".to_string(), vec![mk("Dragons", "apocryphal take"), mk("Extra", "fine to keep")]),
+        ];
+        let (merged, dropped) = merge_linked_entries(per_file);
+        assert_eq!(dropped, 1, "the lower-priority same-title entry is dropped");
+        let rendered: Vec<(&str, &str, &str)> = merged
+            .iter()
+            .map(|(s, e)| (s.as_str(), e.title.as_str(), e.body.as_str()))
+            .collect();
+        assert_eq!(
+            rendered,
+            vec![
+                ("High Priority", "Dragons", "canonical lore"),
+                ("High Priority", "Unique", "only here"),
+                ("Low Priority", "Extra", "fine to keep"),
+            ],
+            "priority order preserved, index-0 definition of a collision wins, non-collisions all survive"
+        );
+    }
+
+    #[test]
+    fn metadata_source_field_round_trips_and_survives_tag_named_source() {
+        let with_source = build_metadata_json("Title", &["lore", "source"], 42, FABLE_CARD_NAMESPACE, Some("My Codex"));
+        assert_eq!(extract_metadata_field(Some(&with_source), "source").as_deref(), Some("My Codex"));
+        assert_eq!(extract_metadata_field(Some(&with_source), "title").as_deref(), Some("Title"));
+        assert_eq!(extract_metadata_field(Some(&with_source), "hash").as_deref(), Some("42"));
+        // A tag element literally named "source" must not shadow the real key.
+        assert_eq!(
+            extract_metadata_field(Some(&with_source), "source").as_deref(),
+            Some("My Codex"),
+            "tag elements follow ],/, — never : — so the key-position needle skips them"
+        );
+        // The single-file path emits no source field at all.
+        let without = build_metadata_json("Title", &[], 7, WUPI_SYSTEM_NAMESPACE, None);
+        assert_eq!(extract_metadata_field(Some(&without), "source"), None);
+        assert!(without.ends_with("]}"), "no trailing source field");
+    }
+
     #[test]
     fn dedupe_duplicate_titles_renames_deterministically() {
         let mk = |title: &str, body: &str| ParsedEntry {
@@ -1030,7 +1431,7 @@ mod tests {
     #[test]
     fn build_metadata_json_round_trips_through_extract() {
         let tags = vec!["a".to_string(), "b".to_string()];
-        let meta = build_metadata_json("Elves", &tags, 12345, WUPI_SYSTEM_NAMESPACE);
+        let meta = build_metadata_json("Elves", &tags, 12345, WUPI_SYSTEM_NAMESPACE, None);
         assert_eq!(extract_metadata_field(Some(&meta), "title"), Some("Elves".into()));
         assert_eq!(extract_metadata_field(Some(&meta), "hash"), Some("12345".into()));
         assert!(meta.contains("\"namespace\":\"wupi_system\""));
@@ -1039,7 +1440,7 @@ mod tests {
 
     #[test]
     fn build_metadata_json_escapes_quotes_in_title() {
-        let meta = build_metadata_json("She said \"hi\"", &[], 1, WUPI_SYSTEM_NAMESPACE);
+        let meta = build_metadata_json("She said \"hi\"", &[], 1, WUPI_SYSTEM_NAMESPACE, None);
         assert_eq!(
             extract_metadata_field(Some(&meta), "title"),
             Some("She said \"hi\"".into())

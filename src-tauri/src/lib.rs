@@ -5,11 +5,13 @@ pub mod chat_format;
 pub mod codex;
 pub mod consequence;
 pub mod context_swap;
+pub mod crossroads;
 pub mod economy;
 pub mod engine;
 pub mod fable_command;
 pub mod fable_engine;
 pub mod fable_save;
+pub mod ghostwriter;
 #[cfg(windows)]
 pub mod hardware;
 pub mod json_repair;
@@ -88,21 +90,24 @@ pub fn is_fable_entry() -> bool {
 // no-arg fable.exe launch (lands on the title as usual).
 static LAUNCH_CONTEXT: std::sync::OnceLock<Option<LaunchContext>> = std::sync::OnceLock::new();
 
-/// The parsed fable.exe CLI launch target. `save_id` follows `fable_start`
-/// semantics: `None` = Continue (live session.json), `Some(id)` = a named
-/// `saves/<id>.json` slot.
+/// The parsed fable.exe CLI launch target. `session_id`/`save_id` follow
+/// `fable_start` semantics: `None` = Continue (the most-recently-played
+/// session), `Some(id)` = that session / that `saves/<id>.json` slot.
 #[derive(Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LaunchContext {
     pub card_slug: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
     pub save_id: Option<String>,
 }
 
 /// Stash the direct-launch target (called only by `src/bin/fable.rs`, before
 /// `run()`). Read once in setup() (to pick the URL) + by get_launch_context.
-pub fn set_launch_context(card_slug: String, save_id: Option<String>) {
+pub fn set_launch_context(card_slug: String, session_id: Option<String>, save_id: Option<String>) {
     let _ = LAUNCH_CONTEXT.set(Some(LaunchContext {
         card_slug,
+        session_id,
         save_id,
     }));
 }
@@ -129,19 +134,22 @@ fn get_launch_context() -> Option<LaunchContext> {
 /// rules.
 pub struct FableCli {
     pub card: String,
+    pub session: Option<String>,
     pub save: Option<String>,
 }
 
-/// Walk argv looking for `--card <slug>` and an optional `--save <save_id>`.
-/// Unknown flags are ignored (forward-compat). Returns `None` when `--card`
-/// is absent (a plain fable.exe launch → title screen, as before). An empty /
-/// separator-containing value is rejected (a card slug is a bare token), in
-/// which case the offending flag is treated as absent so the launch still
-/// succeeds — just without that override — rather than stranding the window.
-/// Expects the caller to hand it argv WITHOUT the program path (skip(1)).
+/// Walk argv looking for `--card <slug>`, an optional `--session <id>`, and
+/// an optional `--save <save_id>`. Unknown flags are ignored (forward-compat).
+/// Returns `None` when `--card` is absent (a plain fable.exe launch → title
+/// screen, as before). An empty / separator-containing value is rejected (a
+/// card slug is a bare token), in which case the offending flag is treated
+/// as absent so the launch still succeeds — just without that override —
+/// rather than stranding the window. Expects the caller to hand it argv
+/// WITHOUT the program path (skip(1)).
 pub fn parse_fable_cli(args: impl Iterator<Item = String>) -> Option<FableCli> {
     let mut tokens = args.peekable();
     let mut card: Option<String> = None;
+    let mut session: Option<String> = None;
     let mut save: Option<String> = None;
     while let Some(flag) = tokens.next() {
         let take_value = |raw: String, next: Option<String>, slot: &mut Option<String>| {
@@ -157,11 +165,12 @@ pub fn parse_fable_cli(args: impl Iterator<Item = String>) -> Option<FableCli> {
         };
         match flag.as_str() {
             "--card" => take_value(flag, tokens.next(), &mut card),
+            "--session" => take_value(flag, tokens.next(), &mut session),
             "--save" => take_value(flag, tokens.next(), &mut save),
             _ => { /* ignore unknown flags (forward-compat) */ }
         }
     }
-    card.map(|c| FableCli { card: c, save })
+    card.map(|c| FableCli { card: c, session, save })
 }
 
 /// The Memory engine's concrete embedder type, decided ONCE at startup. Using
@@ -384,6 +393,19 @@ pub struct AppState {
     /// because the tick (writer) + the fable_send consume site (reader/drain)
     /// can race.
     pub pending_tick_directives: Arc<tokio::sync::Mutex<Vec<String>>>,
+    /// (2026-08-22 tracker feedback loop) Last turn's REJECTED bracket
+    /// emissions, distilled (`distill_tracker_emit_errors` — deduped,
+    /// line/char-capped). The next tracker prompt build (fable_send Stage 1
+    /// or the edit re-track) CONSUMES the whole slot (take-and-clear) and
+    /// renders it as the `<emit_errors>` block, so the LOCAL model finally
+    /// sees its own rejects — before this, reject directives fed only the
+    /// Stage-2 API narrator, and the 2026-08-22 playtest's tracker repeated
+    /// the same illegal emissions ([NPC_ITEM player +coppers] et al.) every
+    /// turn for a whole session. Replaced (not appended) after each apply,
+    /// so a corrected tracker drops the block on the very next turn. Held
+    /// under tokio Mutex (writer = the post-apply sites, reader = the prompt
+    /// builds; they can race a cancel path).
+    pub tracker_emit_errors: Arc<tokio::sync::Mutex<Vec<String>>>,
     /// Per-game cancel token, parallel to `active_cancel`. Distinct slot so
     /// chat-stop and game-stop never cross-wire (Bug #7 pattern, §2C).
     pub active_fable_cancel: Arc<std::sync::Mutex<Option<llm::CancelToken>>>,
@@ -492,6 +514,13 @@ pub struct AppState {
     /// system card (`__wupi__`) is the default; games swap to the
     /// roleplay card's id and restore on exit.
     pub pre_fable_card_id: Arc<std::sync::Mutex<String>>,
+    /// (2026-08-22 session decoupling) The ACTIVE session id — the folder
+    /// under `apps/fable/data/saves/<CardName>/` that owns this run's
+    /// session.json, split schemas, and save slots. Minted on a fresh
+    /// `fable_start`, resolved on resume/save-load, cleared on `fable_end`.
+    /// Std mutex (short critical sections, never held across `.await` —
+    /// mirrors `active_fable_card`).
+    pub active_session_id: Arc<std::sync::Mutex<Option<String>>>,
     /// First-run GGUF download progress (see `model_downloader.rs`). Polled
     /// by `get_download_progress` and emitted as the `download-progress`
     /// event. Held under a std Mutex: short critical sections only, never
@@ -583,6 +612,7 @@ impl AppState {
             sd_autogen_disabled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             pending_player_action: Arc::new(tokio::sync::Mutex::new(None)),
             pending_tick_directives: Arc::new(tokio::sync::Mutex::new(Vec::new())),
+            tracker_emit_errors: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             active_fable_cancel: Arc::new(std::sync::Mutex::new(None)),
             fable_session_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             fable_abort_requested: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -599,6 +629,7 @@ impl AppState {
             active_player_id: Arc::new(std::sync::Mutex::new(None)),
             active_player_cache: Arc::new(std::sync::Mutex::new(None)),
             pre_fable_card_id: Arc::new(std::sync::Mutex::new(memory::WUPI_CARD_ID.to_owned())),
+            active_session_id: Arc::new(std::sync::Mutex::new(None)),
             download_progress: Arc::new(std::sync::Mutex::new(
                 model_downloader::DownloadProgress::default(),
             )),
@@ -698,12 +729,17 @@ pub fn run() {
             if let Some(cli) = parse_fable_cli(argv.iter().skip(1).cloned()) {
                 tracing::info!(
                     card = %cli.card,
+                    session = ?cli.session,
                     save = ?cli.save,
                     "second instance carried a direct launch — forwarding to the running window"
                 );
                 let _ = app.emit(
                     "direct-launch",
-                    LaunchContext { card_slug: cli.card, save_id: cli.save },
+                    LaunchContext {
+                        card_slug: cli.card,
+                        session_id: cli.session,
+                        save_id: cli.save,
+                    },
                 );
             }
         }));
@@ -819,6 +855,14 @@ pub fn run() {
             // sim card at game start. Created eagerly so the first
             // list/write never races a missing dir.
             std::fs::create_dir_all(fable_dir.join("players")).ok();
+            // (2026-08-22 session decoupling) The centralized dynamic-data
+            // roots: data/saves/<CardName>/<session_id>/ (per-playthrough
+            // isolation: manifest + session.json + split schemas + save
+            // slots) and data/codex/ (the universal lore library). Created
+            // eagerly so the first session mint / codex write never races a
+            // missing dir.
+            std::fs::create_dir_all(fable_dir.join("data").join("saves")).ok();
+            std::fs::create_dir_all(fable_dir.join("data").join("codex")).ok();
             // Prism (2026-07-31): the image-generation app's per-app state root
             // (sibling of apps/fable/). `gallery/` holds the generated PNGs
             // (timestamp-seed-named); the gallery.sqlite DB lives directly
@@ -835,6 +879,14 @@ pub fn run() {
             // window exists, so no frontend IPC can race the rewrite. Runs
             // every boot; idempotent (v2-shaped entries are only cached).
             migrate_cards_v2(app.handle());
+            // (2026-08-22 session decoupling) Move dynamic game data out of
+            // the card folders into the centralized tree: sessions (split
+            // JSONs + session.json + saves/) → data/saves/<CardName>/, the
+            // per-card `.codex` sibling → the universal data/codex/ library
+            // (+ a `<linked_codices>` link so nothing is lost). Same boot
+            // discipline: before any window, idempotent, failures log +
+            // retry next boot.
+            migrate_dynamic_data_v2(app.handle());
             tracing::info!("portable data dir: {}", data_dir.display());
 
             let state: tauri::State<AppState> = app.state();
@@ -1268,6 +1320,14 @@ pub fn run() {
             fable_regenerate_slice,
             fable_slice_stop,
             fable_continue_target,
+            // (2026-08-22) Composer turn aids: Ghost Writer (impersonate +
+            // continue one-shots; the guided swipe rides fable_send's
+            // `guidance` param) + Crossroads (the options deck). All are
+            // narrator-side API one-shots over the live session.
+            ghostwriter_impersonate,
+            ghostwriter_continue,
+            crossroads_options,
+            crossroads_expand,
             // GLM-driven creation assistant (2026-08-12): a creation-only API
             // role (§3A override). Conversational player/sim/codex authoring
             // outside the runtime game loop. Streams chunk/done.
@@ -1297,11 +1357,17 @@ pub fn run() {
             fable_card_raw_set,
             fable_json_raw_get,
             fable_json_raw_set,
-            fable_codex_get,
-            fable_codex_get_by_id,
-            fable_codex_raw_set,
+            fable_codex_library_list,
+            fable_codex_file_read,
+            fable_codex_file_write,
+            fable_codex_link_get,
+            fable_codex_link_set,
+            fable_codex_create_for_card,
             // New-creator sibling writes (explicit card_id; CREATE-time).
             fable_card_sibling_write,
+            // (2026-08-22 session decoupling) the Session Manager surface.
+            fable_sessions_list,
+            fable_session_delete,
             fable_card_portrait_write,
             fable_card_portrait_url,
             fable_card_raw_get_by_id,
@@ -4404,7 +4470,8 @@ async fn dispatch_fable_state_tool(
                 .unwrap_or_else(|e| e.into_inner())
                 .clone();
             let schema_snapshot = state.fable_schema.lock().await.clone();
-            save_schema(app, &roleplay_card_id, &schema_snapshot).await;
+            let session_id = active_session_or_err(&state)?;
+            save_schema(app, &roleplay_card_id, &session_id, &schema_snapshot).await;
             let _ = app.emit(
                 "fable-session-changed",
                 serde_json::json!({ "kind": "schema", "merged_keys": merged_keys }),
@@ -4926,16 +4993,17 @@ fn sanitize_slug(raw: &str) -> String {
 /// applier — PURE (no tauri State) so the money-moving layer carries real
 /// tests (the audit's finding: parser + settlement were pinned, but nothing
 /// exercised buy/deposit/withdraw THROUGH the applier — exactly how the
-/// buy self-refund exploit slipped through). Nine sub-forms (see
-/// `LedgerOp` — `currency` joined 2026-08-21); the FULL reject matrix lives here: unknown property/node/job
+/// buy self-refund exploit slipped through). Ten sub-forms (see
+/// `LedgerOp` — `currency` joined 2026-08-21, `wealth` 2026-08-22); the FULL reject matrix lives here: unknown property/node/job
 /// ids · not owner · wrong node (till ops AND buy are same-node only) ·
-/// insufficient funds (reject, never saturate) · caps full · malformed
+/// insufficient funds (reject, never saturate — till ops AND wealth) · caps full · malformed
 /// kind/tier/pct/currency label · the player-name guard on `found` ids +
 /// `owner=` (the NPC_REGISTER pattern).
 ///
-/// Money accounting: `wealth + Σ player-owned treasuries` moves only through
+/// Money accounting: `wealth + Σ player-owned treasuries` moves through
 /// found (mints at 0), deposit/withdraw (pocket↔till), invest (one-way into
-/// revenue), jobs, and lifestyle — **buy is a SINK**: the price is paid to
+/// revenue), jobs, lifestyle, and the wealth verb (pocket coin entering
+/// from OUTSIDE the property books — payments, loot, rewards; 2026-08-22) — **buy is a SINK**: the price is paid to
 /// the seller and LEAVES the books (no NPC purse exists in v1; crediting
 /// the property's own till handed the buyer an instant withdrawable refund —
 /// every property was free). The settlement's books pin the rest in
@@ -5007,6 +5075,7 @@ fn apply_ledger_commands(
             owner,
             currency,
             prosperity_delta,
+            wealth_delta,
         } = cmd
         {
             match op {
@@ -5476,6 +5545,39 @@ fn apply_ledger_commands(
                     s.currency_label = normalized;
                     mutated = true;
                 }
+                // (2026-08-22 wealth verb) Pocket coin ± — the tavern-scale
+                // money verb that was MISSING from v1's economy: payments,
+                // tips, loot, rewards, found coin. Every flow that never
+                // touches a property till used to have NO legal emission,
+                // so the tracker improvised [NPC_ITEM player +coppers] and
+                // silently lost every coin movement (the 2026-08-22 playtest
+                // finding). Insufficient funds REJECT, never saturate (the
+                // shared money contract — "Never invent coin").
+                LedgerOp::Wealth => {
+                    if *wealth_delta == 0 {
+                        continue; // no-op discipline (parser already drops zeros)
+                    }
+                    let current = s.player_state.wealth as i64;
+                    let target = current + *wealth_delta as i64;
+                    if target < 0 {
+                        reject_directives.push(format!(
+                            "Pocket wealth not changed — the player holds {}, the emission tried to move {}. Spend within means; found coin, payments, and rewards are [LEDGER wealth +<n>].",
+                            economy::money_plain(current, &s.currency_label),
+                            economy::money_plain((*wealth_delta as i64).unsigned_abs() as i64, &s.currency_label),
+                        ));
+                        continue;
+                    }
+                    let target = target.min(u32::MAX as i64) as u32;
+                    if target == s.player_state.wealth {
+                        continue; // no-change no-op
+                    }
+                    if undo_snapshot.is_none() {
+                        *undo_snapshot = Some(s.clone());
+                    }
+                    s.player_state.wealth = target;
+                    mutated = true;
+                    tracing::info!(delta = wealth_delta, "[LEDGER] pocket wealth moved");
+                }
             }
         }
     }
@@ -5487,7 +5589,14 @@ async fn apply_phase3_bracket_commands(
     state: &tauri::State<'_, AppState>,
     decay_presence: bool,
     narrative_window: &[session::Message],
+    notices: &mut Vec<(&'static str, String)>,
 ) -> (bool, Vec<String>) {
+    // `notices`: (kind, text) pairs for the frontend's turn-notice bubbles
+    // (2026-08-22 playtest) — automatic inventory moves (equip/auto-wear/
+    // pocket/spill) happen silently inside the tracker apply and the player
+    // had NO signal their character just equipped a shield or stowed a
+    // dagger. The caller emits them over the turn event channel; re-track
+    // callers pass a throwaway vec.
     // `decay_presence`: the TTL grace-decay runs ONCE per turn (the tracker
     // stage's call). The defensive narrator-stage call passes false — the
     // tracker already decayed this turn, and a second pass halved the grace
@@ -6503,7 +6612,7 @@ async fn apply_phase3_bracket_commands(
                 else {
                     reject_directives.push(format!(
                         "Promise giver \"{npc_id}\" is not a registered NPC. Use an npc_id from \
-                         the cast line."
+                         the cast line; a NEW named NPC is [NPC_REGISTER <id> name=<name>] first."
                     ));
                     continue;
                 };
@@ -6775,7 +6884,28 @@ async fn apply_phase3_bracket_commands(
                 // "captain-harsk"; Chloe's recommendation 2, 2026-08-17).
                 match schema::resolve_npc_surface(&registry_entries, npc_id) {
                     Some(entry) => {
-                        asserted.insert(entry.id.clone(), stance_clean.to_string());
+                        // (2026-08-22 playtest, Chloe directive) GROUNDING
+                        // gate: the tracker may only assert an NPC its own
+                        // narrative window mentions (the same bounded-
+                        // knowledge corpus fragment resolution uses). Kills
+                        // the stale re-assertion — the playtest re-asserted
+                        // Wevlan "behind the bar" every turn while the
+                        // player was in the forest, keeping the barkeep on
+                        // the `present:` line a scene away. An ungrounded
+                        // NPC is NOT dropped — their existing presence
+                        // simply rides the grace decay below.
+                        if narrative_grounded(&narrative_corpus, npc_id, &entry.id, &entry.name) {
+                            asserted.insert(entry.id.clone(), stance_clean.to_string());
+                        } else {
+                            reject_directives.push(format!(
+                                "Presence not recorded — \"{}\" is not in this turn's scene text. Assert presence only for an NPC on camera THIS beat; an off-screen NPC keeps their presence by grace.",
+                                entry.id
+                            ));
+                            tracing::debug!(
+                                npc_id = %entry.id,
+                                "[PRESENCE] rejected — not grounded in the narrative window"
+                            );
+                        }
                     }
                     None => {
                         // (2026-08-19) A surface that IS the player's name
@@ -6809,9 +6939,18 @@ async fn apply_phase3_bracket_commands(
                     .collect()
             };
             reject_directives.push(format!(
-                "Presence not recorded — \"{}\" is not a known NPC. Known NPCs: {}. Re-assert presence with a valid id or alias next turn.",
+                "Presence not recorded — \"{}\" is not a known NPC. Known NPCs: {}. {}",
                 deduped.join("\", \""),
-                if valid_ids.is_empty() { "(none registered)".to_string() } else { valid_ids.join(", ") }
+                if valid_ids.is_empty() { "(none registered)".to_string() } else { valid_ids.join(", ") },
+                // (2026-08-22 playtest audit) The old tail ("Re-emit with a
+                // valid id or alias from the cast line") was a DEAD END when
+                // the cast line was empty — a world card with no authored
+                // cast never taught the way out. Point at the register verb.
+                if valid_ids.is_empty() {
+                    "A named NPC who just appeared is registered first: [NPC_REGISTER <id> name=<name>], then [PRESENCE <id> <stance>].".to_string()
+                } else {
+                    "Re-assert presence with a valid id or alias next turn.".to_string()
+                }
             ));
             tracing::warn!(
                 unknown = ?deduped,
@@ -7008,6 +7147,20 @@ async fn apply_phase3_bracket_commands(
             }
             names
         };
+        // (2026-08-22 review) Names that LEFT an equipment slot this pass
+        // (the unequip form parks them in the pack). The NPC_ITEM gear
+        // mirror below exempts them: `[EQUIP slot=main_hand]` +
+        // `[NPC_ITEM <npc> +Iron Sword]` is the taught handoff for worn
+        // gear, and by the time the NPC_ITEM loop runs the transient pack
+        // copy makes `player_holds_item` true — the handoff used to be
+        // rejected as a "copy". The exemption CONSUMES the transient copy
+        // (the transfer completes; the player keeps nothing).
+        let mut handed_off_names: Vec<String> = Vec::new();
+        // (2026-08-22 review) Names EQUIPPED from the explicit-name form this
+        // pass — their storage draw runs as a post-pass AFTER the belt/pack
+        // loops (see the [PACK] section) so a same-turn acquire+equip pair
+        // can't duplicate the item.
+        let mut equipped_names: Vec<String> = Vec::new();
         for cmd in &equip_cmds {
             if let bracket_parser::BracketCommand::Equip {
                 slot,
@@ -7112,6 +7265,7 @@ async fn apply_phase3_bracket_commands(
                                         ..equipment::StackItem::default()
                                     },
                                 );
+                                handed_off_names.push(item.name.trim().to_lowercase());
                                 mutated = true;
                                 tracing::info!(
                                     slot = ?slot,
@@ -7119,6 +7273,10 @@ async fn apply_phase3_bracket_commands(
                                     name = %item.name,
                                     "[EQUIP] unequipped → pack"
                                 );
+                                notices.push((
+                                    "inventory",
+                                    format!("{} was moved to the pack.", item.name),
+                                ));
                             }
                             if slot_now_empty {
                                 s.player_state.equipment.remove(slot);
@@ -7153,6 +7311,10 @@ async fn apply_phase3_bracket_commands(
                                     name = %d.name,
                                     "[EQUIP] displaced occupant → pack"
                                 );
+                                notices.push((
+                                    "inventory",
+                                    format!("{} was moved to the pack.", d.name),
+                                ));
                                 equipment::stack_upsert(
                                     &mut s.player_state.pack,
                                     equipment::StackItem {
@@ -7164,8 +7326,24 @@ async fn apply_phase3_bracket_commands(
                                     },
                                 );
                             }
+                            // (2026-08-22 playtest) Equipping PULLS the item
+                            // from storage when a matching unit exists there —
+                            // the tracker's equip/shuffle cycles used to mint a
+                            // fresh copy every swap ([EQUIP bow] displaces the
+                            // dagger → pack +1; the next [EQUIP dagger] never
+                            // consumed it — "it doubled my Dagger"). One unit,
+                            // belt before pack (quick-access is the draw
+                            // source); stack_remove on an absent name is a
+                            // no-op, so equipping narratively-new gear is
+                            // untouched. (2026-08-22 review) The consumption
+                            // runs as a POST-PASS after the belt/pack loops —
+                            // this loop applies FIRST, so a same-turn
+                            // `[PACK +Shield]` + `[EQUIP Shield]` used to land
+                            // the shield equipped AND still in the pack.
+                            equipped_names.push(name.to_string());
                             mutated = true;
                             tracing::info!(slot = ?slot, layer = ?worn_layer, name = %name, "[EQUIP] equipped");
+                            notices.push(("inventory", format!("{} was equipped.", name)));
                         }
                     }
                 }
@@ -7182,9 +7360,11 @@ async fn apply_phase3_bracket_commands(
             if let bracket_parser::BracketCommand::Belt {
                 item_name,
                 qty,
+                qty_given,
                 item_stats,
                 remove,
                 item_tags,
+                asserted,
             } = cmd
             {
                 // (2026-08-17 E4B follow-up) One-word fragment resolution.
@@ -7211,18 +7391,35 @@ async fn apply_phase3_bracket_commands(
                         undo_snapshot.get_or_insert(pre_schema);
                         mutated = true;
                         tracing::info!(name = %item_name, "[BELT] removed");
+                        notices.push((
+                            "inventory",
+                            format!("{} was removed from the belt.", item_name),
+                        ));
                     }
                 } else {
-                    equipment::stack_upsert(
-                        &mut s.player_state.belt,
-                        equipment::StackItem {
-                            name: item_name.to_string(),
-                            qty: *qty,
-                            weight: 0.0, // belt items are weightless (quick-access)
-                            stats: item_stats.clone(),
-                            tags: item_tags.clone(),
-                        },
-                    );
+                    let belt_item = equipment::StackItem {
+                        name: item_name.to_string(),
+                        qty: *qty,
+                        weight: 0.0, // belt items are weightless (quick-access)
+                        stats: item_stats.clone(),
+                        tags: item_tags.clone(),
+                    };
+                    // (2026-08-22 playtest) The bare restatement form REPLACES
+                    // the count (`stack_restate`) — but ONLY when the emission
+                    // carried an explicit qty token; a bare `[BELT Rope]` with
+                    // the parser-defaulted qty=1 is an EXISTENCE assertion and
+                    // keeps the stored count (replace would collapse a
+                    // `Rope ×50` stack to ×1 — 2026-08-22 review). Only an
+                    // explicit `+` add stacks (`stack_upsert` sums — correct
+                    // for a genuine re-acquisition). Re-asserted belt lines
+                    // used to sum every turn ([BELT name="Iron Dagger"
+                    // (qty=1)] ×N turns → "Iron Dagger ×3" on a rack that
+                    // holds one dagger).
+                    if *asserted {
+                        equipment::stack_restate(&mut s.player_state.belt, belt_item, *qty_given);
+                    } else {
+                        equipment::stack_upsert(&mut s.player_state.belt, belt_item);
+                    }
                     // FIFO eviction: if this added a new entry past the cap,
                     // drop the oldest (index 0) so the rack stays at BELT_MAX.
                     // (#27 2026-08-15) Overflow = SPILL, not destruction: the
@@ -7233,6 +7430,10 @@ async fn apply_phase3_bracket_commands(
                     while s.player_state.belt.len() > equipment::BELT_MAX {
                         let evicted = s.player_state.belt.remove(0);
                         tracing::info!(name = %evicted.name, "[BELT] rack full — spilling oldest to the pack");
+                        notices.push((
+                            "inventory",
+                            format!("{} was moved from the belt to the pack.", evicted.name),
+                        ));
                         let note = format!("stashed {} in the pack (belt full)", evicted.name);
                         let capped: String = if note.chars().count() > EVENT_NOTE_MAX {
                             note.chars().take(EVENT_NOTE_MAX).collect()
@@ -7248,6 +7449,17 @@ async fn apply_phase3_bracket_commands(
                         undo_snapshot.get_or_insert(pre_schema);
                         mutated = true;
                         tracing::info!(name = %item_name, qty, "[BELT] added");
+                        // Restatements of KNOWN items are silent (nothing
+                        // really moved); a genuine add is player-visible —
+                        // including a first sighting that arrived in the
+                        // bare form (an acquisition is an acquisition; the
+                        // restate path pushes new names too).
+                        let was_new = !pre_list
+                            .iter()
+                            .any(|i| i.name.trim().eq_ignore_ascii_case(item_name.trim()));
+                        if !*asserted || was_new {
+                            notices.push(("inventory", format!("{} was pocketed.", item_name)));
+                        }
                     }
                 }
             }
@@ -7264,10 +7476,12 @@ async fn apply_phase3_bracket_commands(
             if let bracket_parser::BracketCommand::Pack {
                 item_name,
                 qty,
+                qty_given,
                 weight,
                 item_stats,
                 remove,
                 item_tags,
+                asserted,
             } = cmd
             {
                 // (2026-08-17 E4B follow-up) Same fragment resolution as
@@ -7294,6 +7508,10 @@ async fn apply_phase3_bracket_commands(
                         undo_snapshot.get_or_insert(pre_schema);
                         mutated = true;
                         tracing::info!(name = %item_name, "[PACK] removed");
+                        notices.push((
+                            "inventory",
+                            format!("{} was removed from the pack.", item_name),
+                        ));
                     }
                 } else {
                     // (2026-08-19 clothes-on-person fix, Chloe ruling: the
@@ -7324,8 +7542,21 @@ async fn apply_phase3_bracket_commands(
                     // swaps. force=false — both layers holding a garment the
                     // new one doesn't outrank = a genuine spare (stays
                     // packed, `equippable` tag ensured above).
+                    // (2026-08-22 playtest) HANDS NEVER AUTO-WEAR mid-game:
+                    // the 2026-08-19 ruling covers GARMENTS (boots on bare
+                    // feet, a cloak over a shirt). A packed shield/dagger
+                    // silently claiming OffHand/MainHand displaced the wielded
+                    // sword and the narrator then treated the shield as drawn
+                    // ("blocked with a shield" the character never took off
+                    // his back). Weapons + shields equip ONLY via an explicit
+                    // [EQUIP].
                     let wear_slot = if is_new_stack {
-                        equipment::route_legacy_to_slot(&item_name.to_lowercase())
+                        equipment::route_legacy_to_slot(&item_name.to_lowercase()).filter(|slot| {
+                            !matches!(
+                                slot,
+                                equipment::EquipSlot::MainHand | equipment::EquipSlot::OffHand
+                            )
+                        })
                     } else {
                         None
                     };
@@ -7355,6 +7586,10 @@ async fn apply_phase3_bracket_commands(
                                 name = %d.name,
                                 "[PACK] auto-wear displaced occupant → pack"
                             );
+                            notices.push((
+                                "inventory",
+                                format!("{} was moved to the pack.", d.name),
+                            ));
                             equipment::stack_upsert(
                                 &mut s.player_state.pack,
                                 equipment::StackItem {
@@ -7382,24 +7617,64 @@ async fn apply_phase3_bracket_commands(
                         undo_snapshot.get_or_insert(pre_schema);
                         mutated = true;
                         tracing::info!(name = %item_name, slot = ?slot, layer = ?layer, "[PACK] auto-wore garment");
+                        notices.push(("inventory", format!("{} was equipped.", item_name)));
                     } else {
-                        equipment::stack_upsert(
-                            &mut s.player_state.pack,
-                            equipment::StackItem {
-                                name: item_name.to_string(),
-                                qty: *qty,
-                                weight: *weight,
-                                stats: item_stats.clone(),
-                                tags,
-                            },
-                        );
+                        let pack_item = equipment::StackItem {
+                            name: item_name.to_string(),
+                            qty: *qty,
+                            weight: *weight,
+                            stats: item_stats.clone(),
+                            tags,
+                        };
+                        // (2026-08-22 playtest) Same restate/add split as the
+                        // belt: the bare restatement form REPLACES the count
+                        // (the model reads `pack: Field Points ×12` off the
+                        // world-state and re-emits it as
+                        // `[PACK name="Field Points" (qty=13)]` — cumulative
+                        // intent; stacking it multiplied inventories across
+                        // turns). A qty-LESS bare form is existence-only (the
+                        // defaulted 1 must not collapse the stack). An
+                        // explicit `+` add still stacks.
+                        if *asserted {
+                            equipment::stack_restate(&mut s.player_state.pack, pack_item, *qty_given);
+                        } else {
+                            equipment::stack_upsert(&mut s.player_state.pack, pack_item);
+                        }
                         if s.player_state.pack != pre_list {
                             undo_snapshot.get_or_insert(pre_schema);
                             mutated = true;
                             tracing::info!(name = %item_name, qty, weight, "[PACK] added");
+                            // Same gate as [BELT]: silent only when restating a
+                            // KNOWN item — a first sighting in the bare form is
+                            // still an acquisition the player must see.
+                            let was_new = !pre_list
+                                .iter()
+                                .any(|i| i.name.trim().eq_ignore_ascii_case(item_name.trim()));
+                            if !*asserted || was_new {
+                                notices.push((
+                                    "inventory",
+                                    if *qty > 1 {
+                                        format!("{} ×{} was added to the pack.", item_name, qty)
+                                    } else {
+                                        format!("{} was added to the pack.", item_name)
+                                    },
+                                ));
+                            }
                         }
                     }
                 }
+            }
+        }
+        // (2026-08-22 review) POST-PASS storage draw for equips: the EQUIP
+        // loop runs BEFORE the belt/pack loops, so consuming storage inline
+        // missed any unit the SAME turn added (`[PACK +Shield]` +
+        // `[EQUIP Shield]` → equipped AND still packed). Names collected
+        // above now draw one unit each — belt before pack (quick-access is
+        // the draw source); stack_remove on an absent name is a no-op, so
+        // narratively-new gear is untouched.
+        for name in &equipped_names {
+            if !equipment::stack_remove(&mut s.player_state.belt, name, 1) {
+                equipment::stack_remove(&mut s.player_state.pack, name, 1);
             }
         }
         // (2026-08-18 Dedicated-NPC interior state) [NPC_ITEM] — an NPC's
@@ -7420,10 +7695,74 @@ async fn apply_phase3_bracket_commands(
                 item_tags,
             } = cmd
             {
-                let Some(entry) = schema::resolve_npc_surface(&s.npc_registry.entries, npc_id)
-                else {
+                // (2026-08-22 playtest audit) `player` (or the player's own
+                // name) routes to the player's PACK — the tracker's natural
+                // improvisation for "the barkeep hands me a tin badge"
+                // ([NPC_ITEM player +tin badge]) used to reject against the
+                // NPC registry and silently drop the item. A GENUINE registry
+                // entry still wins (resolve first), so an NPC actually named
+                // "Player" is never shadowed.
+                let entry_opt = schema::resolve_npc_surface(&s.npc_registry.entries, npc_id);
+                let Some(entry) = entry_opt else {
+                    if npc_item_targets_player(npc_id, &player_slug) {
+                        // Pack semantics, the [PACK] discipline in miniature:
+                        // adds fragment-resolve through the narrative window +
+                        // the existing pack names, then upsert; removals match
+                        // stored names only. No auto-wear here — this is the
+                        // forgiveness path, not the taught form ([PACK] owns
+                        // the player's racks).
+                        let pack_names: Vec<String> =
+                            s.player_state.pack.iter().map(|i| i.name.clone()).collect();
+                        let corpus: &[&str] = if *remove { &[] } else { &narrative_corpus };
+                        let resolved = equipment::resolve_item_fragment(
+                            item_name,
+                            corpus,
+                            &pack_names,
+                        );
+                        let item_name: &str = resolved.as_deref().unwrap_or(item_name);
+                        let pre_schema = s.clone();
+                        let pre_list = s.player_state.pack.clone();
+                        if *remove {
+                            let existed =
+                                equipment::stack_remove(&mut s.player_state.pack, item_name, 0);
+                            if existed {
+                                undo_snapshot.get_or_insert(pre_schema);
+                                mutated = true;
+                                tracing::info!(name = %item_name, "[NPC_ITEM player] removed from pack");
+                                notices.push((
+                                    "inventory",
+                                    format!("{} was removed from the pack.", item_name),
+                                ));
+                            }
+                        } else {
+                            equipment::stack_upsert(
+                                &mut s.player_state.pack,
+                                equipment::StackItem {
+                                    name: item_name.to_string(),
+                                    qty: *qty,
+                                    weight: 1.0,
+                                    stats: None,
+                                    tags: item_tags.clone(),
+                                },
+                            );
+                            if s.player_state.pack != pre_list {
+                                undo_snapshot.get_or_insert(pre_schema);
+                                mutated = true;
+                                tracing::info!(name = %item_name, qty, "[NPC_ITEM player] added to pack");
+                                notices.push((
+                                    "inventory",
+                                    format!("{} was added to the pack.", item_name),
+                                ));
+                            }
+                        }
+                        continue;
+                    }
+                    tracing::warn!(
+                        npc_id = %npc_id,
+                        "[NPC_ITEM] rejected — unknown npc_id"
+                    );
                     reject_directives.push(format!(
-                        "NPC item change not recorded — \"{}\" is not a known NPC. Re-emit with a valid id or alias from the cast line.",
+                        "NPC item change not recorded — \"{}\" is not a known NPC. Re-emit with an id from the cast line; a NEW named NPC is [NPC_REGISTER <id> name=<name>] first; the player's own items are [PACK].",
                         echo_id(npc_id, 40)
                     ));
                     continue;
@@ -7448,6 +7787,67 @@ async fn apply_phase3_bracket_commands(
                 let resolved =
                     equipment::resolve_item_fragment(item_name, item_corpus, &npc_names);
                 let item_name: &str = resolved.as_deref().unwrap_or(item_name);
+                // (2026-08-22 playtest, Chloe directive) Two mirror guards on
+                // ADDS — the playtest's tracker hallucination classes:
+                // (a) PEOPLE AS ITEMS ("[NPC_ITEM wevlan +Ferenc Illes]" —
+                //     a quest person pocketed as an object);
+                // (b) THE GEAR MIRROR — a dozen `[NPC_ITEM wevlan +…]` lines
+                //     copying the player's whole kit with NO paired removal,
+                //     leaving wevlan *wearing* the player's helmet/gloves/
+                //     greaves/boots (loop order means a real transfer's
+                //     `[PACK -x]` has already applied by now — a name still
+                //     in the player's racks here is a copy, not a move).
+                // Both reject with a teaching directive (they ride the
+                // narrator's <directives> + the tracker_emit_errors loop).
+                if !*remove {
+                    if item_name_is_a_person(&s.npc_registry.entries, item_name) {
+                        reject_directives.push(format!(
+                            "Item not recorded — \"{item_name}\" is a person, not an object. People are never items; a person's state tracks through [PRESENCE]/[MOOD]/[INTENT]."
+                        ));
+                        tracing::debug!(name = %item_name, "[NPC_ITEM] rejected — a person is not an item");
+                        continue;
+                    }
+                    if player_holds_item(&s.player_state, item_name) {
+                        // (2026-08-22 review) The equipped-handoff transient:
+                        // the taught unequip form (`[EQUIP slot=main_hand]`)
+                        // parks the item in the PACK, so `player_holds_item`
+                        // is still true here — a perfectly-formed handoff was
+                        // rejected as a copy. A name that left a slot this
+                        // pass is exempt: consume the transient pack copy
+                        // (completing the transfer) instead of rejecting.
+                        let key = item_name.trim().to_lowercase();
+                        if let Some(pos) = handed_off_names.iter().position(|n| *n == key) {
+                            handed_off_names.swap_remove(pos);
+                            equipment::stack_remove(&mut s.player_state.pack, item_name, 1);
+                            tracing::info!(
+                                name = %item_name,
+                                "[NPC_ITEM] equipped-handoff — transient pack copy consumed"
+                            );
+                        } else {
+                            // Coaching must stay non-destructive when the name
+                            // could be a SEPARATE copy (pack stacks: "Torch",
+                            // "Iron Dagger" — two people can each hold one).
+                            // Body/belt slots hold the player's unique copy —
+                            // there the paired-removal teaching is exact.
+                            let pack_held = s
+                                .player_state
+                                .pack
+                                .iter()
+                                .any(|i| i.name.trim().to_lowercase() == key);
+                            reject_directives.push(if pack_held {
+                                format!(
+                                    "Item not recorded — the player also holds a \"{item_name}\". If this is a TRANSFER of the player's copy: emit the paired removal first ([PACK -{item_name}]), then [NPC_ITEM {id} +{item_name}]. If the NPC acquired its own separate {item_name}: give it a distinguishing name (e.g. \"{id}'s {item_name}\") — NEVER remove the player's copy to describe the NPC's acquisition."
+                                )
+                            } else {
+                                format!(
+                                    "Item not recorded — the player still holds \"{item_name}\". A transfer MOVES it: emit the paired removal first ([PACK -{item_name}] or [BELT -{item_name}]), then [NPC_ITEM {id} +{item_name}]."
+                                )
+                            });
+                            tracing::debug!(name = %item_name, "[NPC_ITEM] rejected — the player still holds it (unmoved mirror)");
+                            continue;
+                        }
+                    }
+                }
                 let pre_schema = s.clone();
                 let interior = s.npc_interior.entry(id.clone()).or_default();
                 let pre_items = interior.items.clone();
@@ -7541,8 +7941,12 @@ async fn apply_phase3_bracket_commands(
             if let bracket_parser::BracketCommand::Mood { npc_id, mood } = cmd {
                 let Some(entry) = schema::resolve_npc_surface(&s.npc_registry.entries, npc_id)
                 else {
+                    tracing::warn!(
+                        npc_id = %npc_id,
+                        "[MOOD] rejected — unknown npc_id"
+                    );
                     reject_directives.push(format!(
-                        "Mood not recorded — \"{}\" is not a known NPC. Re-emit with a valid id or alias from the cast line.",
+                        "Mood not recorded — \"{}\" is not a known NPC. Re-emit with an id from the cast line; a NEW named NPC is [NPC_REGISTER <id> name=<name>] first.",
                         echo_id(npc_id, 40)
                     ));
                     continue;
@@ -7577,8 +7981,12 @@ async fn apply_phase3_bracket_commands(
             if let bracket_parser::BracketCommand::Intent { npc_id, intent } = cmd {
                 let Some(entry) = schema::resolve_npc_surface(&s.npc_registry.entries, npc_id)
                 else {
+                    tracing::warn!(
+                        npc_id = %npc_id,
+                        "[INTENT] rejected — unknown npc_id"
+                    );
                     reject_directives.push(format!(
-                        "Intent not recorded — \"{}\" is not a known NPC. Re-emit with a valid id or alias from the cast line.",
+                        "Intent not recorded — \"{}\" is not a known NPC. Re-emit with an id from the cast line; a NEW named NPC is [NPC_REGISTER <id> name=<name>] first.",
                         echo_id(npc_id, 40)
                     ));
                     continue;
@@ -7612,6 +8020,82 @@ async fn apply_phase3_bracket_commands(
     }
 
     (mutated, reject_directives)
+}
+
+/// (2026-08-22 playtest audit) Does this `[NPC_ITEM]` id target the PLAYER?
+/// Literal "player" (case-insensitive — the tracker's default when it
+/// improvises "[NPC_ITEM player +tin badge]") or the active player's
+/// slugged name ("[NPC_ITEM lacey +badge]" with Lacey attached). Pure so
+/// the gate is unit-testable (the pack-routing itself mirrors [PACK]
+/// inside the schema-lock loop).
+fn npc_item_targets_player(npc_id: &str, player_slug: &str) -> bool {
+    npc_id.trim().eq_ignore_ascii_case("player")
+        || (!player_slug.is_empty() && sanitize_slug(npc_id) == player_slug)
+}
+
+/// (2026-08-22 playtest, Chloe directive — the mirror guard) Does the player
+/// currently hold an item with this exact name (case-insensitive)? Covers the
+/// equipment map (both layers), the belt rack, and the pack. The apply loop
+/// order (EQUIP → BELT → PACK → NPC_ITEM) means a TAUGHT transfer's paired
+/// removal (`[PACK -ring]` + `[NPC_ITEM mara +ring]`) has already applied by
+/// the time the NPC loop runs — so a name still in the player's racks here is
+/// a COPY, not a move (the playtest's gear dump: 12 `[NPC_ITEM wevlan +…]`
+/// lines mirroring the player's whole kit, wevlan left *wearing* the player's
+/// helmet/gloves/greaves/boots). Pure so the gate is unit-testable.
+fn player_holds_item(ps: &player_state::PlayerState, name: &str) -> bool {
+    let key = name.trim().to_lowercase();
+    if key.is_empty() {
+        return false;
+    }
+    let held_by = |n: &str| n.trim().to_lowercase() == key;
+    ps.equipment
+        .values()
+        .flat_map(|layers| [&layers.outer, &layers.inner].into_iter().flatten())
+        .any(|it| held_by(&it.name))
+        || ps.belt.iter().any(|i| held_by(&i.name))
+        || ps.pack.iter().any(|i| held_by(&i.name))
+}
+
+/// (2026-08-22 playtest, Chloe directive — the person guard) Is this "item"
+/// name actually a REGISTERED NPC's name or id ("[NPC_ITEM wevlan +Ferenc
+/// Illes]" — the tracker pocketed a person)? Pure so the gate is
+/// unit-testable.
+fn item_name_is_a_person(entries: &[schema::NpcEntry], item_name: &str) -> bool {
+    let key = item_name.trim().to_lowercase();
+    if key.is_empty() {
+        return false;
+    }
+    entries.iter().any(|e| {
+        e.name.trim().to_lowercase() == key || e.id.trim().to_lowercase() == key
+    })
+}
+
+/// (2026-08-22 playtest, Chloe directive — presence grounding) Bounded-
+/// knowledge gate for `[PRESENCE]`: the tracker may only assert an NPC its
+/// OWN narrative window (player action + preceding beat) actually mentions —
+/// the same corpus bound fragment resolution uses. Checks the emitted surface
+/// form, the canonical id (dash- and space-separated), and the registry
+/// display name, case-insensitive substring. An EMPTY corpus fails OPEN (a
+/// degenerate window never rejects). Kills the stale re-assertion (the
+/// playtest re-asserted Wevlan "behind the bar" every turn while the player
+/// was in the forest — the `present:` line then showed the barkeep on camera
+/// in the woods). Pure so the gate is unit-testable.
+fn narrative_grounded(corpus: &[&str], surface: &str, id: &str, name: &str) -> bool {
+    if corpus.is_empty() {
+        return true;
+    }
+    let probes = [
+        surface.trim().to_lowercase(),
+        id.trim().to_lowercase(),
+        id.trim().to_lowercase().replace('-', " "),
+        name.trim().to_lowercase(),
+    ];
+    corpus.iter().any(|text| {
+        let t = text.to_lowercase();
+        probes
+            .iter()
+            .any(|p| !p.is_empty() && t.contains(p.as_str()))
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -9277,11 +9761,12 @@ fn fable_cards_list(app: tauri::AppHandle) -> Result<Vec<FableCardMeta>, String>
         if card.card_type != "simulation" {
             continue;
         }
-        // Best-effort: has the user got any saves for this card? A dir-read
-        // error degrades to false (the launcher still lets them start fresh).
+        // Best-effort: has the user got any saves for this card (any
+        // session)? A dir-read error degrades to false (the launcher still
+        // lets them start fresh).
         let fable_root = resolve_apps_dir(&app).join("fable");
-        let has_saves = fable_save::list_saves(&fable_root, &card.id)
-            .map(|list| !list.is_empty())
+        let has_saves = fable_save::list_sessions(&fable_root, &card.id)
+            .map(|sessions| sessions.iter().any(|s| s.save_count > 0))
             .unwrap_or(false);
         let mut meta = card_to_meta(&card, has_saves);
         // The launcher blurb: the in-file `<intro>` sibling (canonical,
@@ -9762,20 +10247,11 @@ fn write_atomic(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
     std::fs::rename(&tmp_path, path)
 }
 
-/// Transient starting gameplay conditions threaded from the Player Wizard
-/// draft into the per-run `PlayerState` at game attach (2026-08-13). NOT
-/// persisted on the `SavedPlayer` identity (the §6C identity-only lock is
-/// preserved) — held only long enough to seed the new run. Built by the
-/// frontend from the draft's optional `wealth` / `reputation` / `fame`
-/// fields (leading-integer parse). `Option<T>` IPC args are optional in
-/// Tauri, so resume/legacy invokes that omit it default to `None`.
-#[derive(Debug, Clone, serde::Deserialize, Default)]
-pub struct PlayerStartingConditions {
-    #[serde(default)]
-    pub wealth: Option<u32>,
-    #[serde(default)]
-    pub reputation: Option<i32>,
-}
+// (2026-08-22 Chloe ruling) The transient `PlayerStartingConditions` IPC
+// path is RETIRED: wizard-mentioned money routes into the character's
+// inventory ONLY (a stored coin entry); wealth / currency / fame /
+// popularity / reputation are NEVER authored on cards — they are live
+// tracker state, learned in play.
 
 /// Start a game: load the roleplay card, spawn the FableEngine (loads
 /// WUPI.gguf as its own isolated context), swap `active_card_id` to the
@@ -9793,14 +10269,14 @@ pub struct PlayerStartingConditions {
 #[tauri::command]
 async fn fable_start(
     card_id: String,
+    session_id: Option<String>,
     save_id: Option<String>,
     fresh: Option<bool>,
     player_id: Option<String>,
-    player_starting_conditions: Option<PlayerStartingConditions>,
     app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
 ) -> Result<FableLoadResult, String> {
-    tracing::info!(card_id = %card_id, ?save_id, ?fresh, ?player_id, "fable_start: spawning FableEngine");
+    tracing::info!(card_id = %card_id, ?session_id, ?save_id, ?fresh, ?player_id, "fable_start: spawning FableEngine");
     require_api_for_fable(&state)?;
     let card_id_arg = card_id.clone();
 
@@ -9847,7 +10323,7 @@ async fn fable_start(
         .ok_or_else(|| "no WUPI.gguf found: cannot start game".to_string())?;
 
     // 4. Hand off to the shared enter helper.
-    enter_fable_session(card, save_id, fresh.unwrap_or(false), player_id, player_starting_conditions, model_path, card_id_arg, &app, &state).await
+    enter_fable_session(card, session_id, save_id, fresh.unwrap_or(false), player_id, model_path, card_id_arg, &app, &state).await
 }
 
 /// The cold-start anchor bootstrap (2026-08-10): derive starting clock + weather
@@ -9990,187 +10466,27 @@ fn seed_properties_into(
     }
 }
 
-async fn enter_fable_session(
-    mut card: sim_card::SimCard,
-    save_id: Option<String>,
-    fresh: bool,
-    player_id: Option<String>,
-    player_starting_conditions: Option<PlayerStartingConditions>,
-    model_path: std::path::PathBuf,
-    card_id_for_meta: String,
+/// (2026-08-21 resume-attach fix) Attach — or clear — the session's
+/// SavedPlayer. Extracted verbatim from `enter_fable_session` so every
+/// install path shares ONE attach authority: fresh starts (`fable_start`'s
+/// explicit player_id, the New Game flow), save-slot resumes + session.json
+/// resumes (the binding persisted on `Conversation::attached_player_id`),
+/// and mid-game save switches (`fable_load_save`). Installs/clears the
+/// `<player>` KV-cache block, overrides the card's `player_name` anchor,
+/// seeds the typed inventory + authored properties on FRESH runs only, and
+/// finally stores the authoritative `active_player_id` (Some or None — never
+/// a stale prior id).
+#[allow(clippy::too_many_arguments)]
+fn attach_saved_player(
     app: &tauri::AppHandle,
-    state: &tauri::State<'_, AppState>,
-) -> Result<FableLoadResult, String> {
-    // NOTE: the FableEngine is NO LONGER eagerly spawned here. Under the
-    // v0.6.4 VRAM swap-lock (see `context_swap.rs` + AGENTS.md §7B
-    // correction), only ONE `WUPI.gguf` context may be resident at a time.
-    // Keeping a resident FableEngine while no turn is in flight would hold
-    // ~50-100MB of Q8_0 KV idle for the whole game session — VRAM the chat
-    // engine (Wupi-as-game-manager) needs when the user asks her a question.
-    //
-    // Instead the engine is spawned LAZILY on the first `fable_send` under
-    // the Fable lease (which evicts any resident chat/schema context
-    // first). Between turns the FableEngine stays resident (back-to-back
-    // same-role reuse — no re-spawn churn during play); it's only torn
-    // down when the user asks Wupi something (chat acquires → evicts
-    // fable) or on `fable_end`. The `model_path` arg is retained for the
-    // lazy spawn in `fable_send`; it's stashed on AppState below.
-    //
-    // The prior eager-spawn block (which OOM'd the 4th context on 12GB,
-    // the 2026-07-26 freeze root cause) is gone.
-    {
-        if let Ok(mut g) = state.pending_model_path.lock() {
-            // Stash for the lazy spawn. If a chat model path was already
-            // stashed (the normal case — boot resolved it), preserve it:
-            // the FableEngine reuses `shared_model()` anyway, so the path
-            // is only a defensive fallback for API-only-with-no-local.
-            if g.is_none() {
-                *g = Some(model_path);
-            }
-        }
-    }
-
-    // (The active_card_id swap is deliberately NOT here — see the swap
-    // block just above the state installs below. Swapping before the
-    // fallible save load leaked the roleplay id on error, and the next
-    // fable_end then persisted default/empty state under it, wiping the
-    // card's live world.)
-
-    // Per-card codex seeding (Phase D). The card's authored `.codex`
-    // (`cards/<id>/<id>.codex`) is reconciled into the card's OWN memory
-    // partition (keyed by `card.id`), which `search_fable_visible` already
-    // queries as `active_card_id`. Best-effort + detached: a seed failure
-    // never blocks game entry. Idempotent (title-keyed, hash-detected), so a
-    // re-entry with an unchanged `.codex` is a no-op; edits propagate on the
-    // next `fable_start`. Most cards ship without a `.codex` → the path
-    // doesn't exist → nothing to seed.
-    if let Some(memory_engine) = state.memory.get() {
-        let me = Arc::clone(memory_engine);
-        let cards_root = resolve_fable_cards_dir(app);
-        let card_id_owned = card.id.clone();
-        tokio::spawn(async move {
-            if let Some(root) = cards_root {
-                let path = resolve_card_file(&root, &card_id_owned, "codex");
-                if path.exists() {
-                    match codex::seed_fable_card_codex(&me, &path, &card_id_owned).await {
-                        Ok(r) => tracing::info!(
-                            card_id = %card_id_owned,
-                            seeded = r.seeded,
-                            updated = r.updated,
-                            purged = r.purged,
-                            unchanged = r.unchanged,
-                            "per-card codex seeded"
-                        ),
-                        Err(e) => tracing::warn!(
-                            card_id = %card_id_owned,
-                            error = %format!("{e:#}"),
-                            "per-card codex seed failed"
-                        ),
-                    }
-                }
-            }
-        });
-    }
-
-    // (RETIRED 2026-08-21 — the Cinderfen playtest's observed-once slug-rename
-    // bug) The 2026-08-15 "P1" legacy migration that used to live here did a
-    // raw `fs::rename(cards/<name.to_lowercase()>, cards/<card.id>)`. On
-    // Windows (case-insensitive FS) the lowercased display name MATCHED the
-    // 2026-08-19 display-named card folder, and `legacy_id != card.id` is
-    // true for every multi-word name (spaces vs dashes) — so the first
-    // `fable_start` after the folder existed renamed
-    // `Stranded in Cinderfen/` to `stranded-in-cinderfen/` with the display
-    // `.sim`/`.codex` still inside (a directory rename moves nothing), the
-    // namesake walker went blind (empty card list), and every by-id write
-    // fell back to slug-stemmed split JSONs. One-shot per card — which is
-    // exactly why it did not reproduce on retry. Genuine pre-normalization
-    // legacy folders are handled by the boot migration (`migrate_cards_v2`,
-    // display-stemmed); this block predates the display-folder redesign and
-    // is deleted, not gated.
-
-    // Resolve initial state. Priority: explicit save_id → fresh → fallback.
-    let fable_root = resolve_apps_dir(app).join("fable");
-    let (mut prior_schema, mut prior_session, resumed_save_label) = if let Some(sid) = save_id.as_deref() {
-        let fable_root_clone = fable_root.clone();
-        let cid = card.id.clone();
-        let sid_owned = sid.to_owned();
-        let save = tokio::task::spawn_blocking(move || {
-            fable_save::load_save(&fable_root_clone, &cid, &sid_owned)
-        })
-        .await
-        .map_err(|e| format!("load save join: {e}"))?
-        .map_err(|e| format!("failed to load save '{sid}': {e}"))?;
-        (save.schema, save.session, Some(save.name))
-    } else if fresh {
-        (schema::WorldSchema::default(), session::Conversation::new(), None)
-    } else {
-        // (2026-08-15 audit fix) A corrupt/partial split file must FAIL the
-        // resume, not silently reset the world: the old swallow-to-default
-        // loaded a default schema under the live session, and the next
-        // autosave/fable_end persisted it — wiping the card's world.
-        // First-run (no files yet) still resolves to defaults inside
-        // load_split's NotFound skip.
-        let s = load_schema(app, &card.id).await
-            .map_err(|e| format!("card state file is corrupt (world.json/player.json/npc.json): {e} — refusing to resume with a reset world; restore from a save slot or fix the file"))?;
-        // (2026-08-16 audit fix) Symmetric refusal for a corrupt session.json:
-        // the old swallow-to-empty reset the campaign PROSE (the schema two
-        // lines up got the hardened refusal, the conversation didn't), and the
-        // next autosave persisted the empty session over the file — silent
-        // history loss.
-        let c = load_session(app, &card.id).await
-            .map_err(|e| format!("card session file is corrupt (session.json): {e} — refusing to resume with an empty conversation; restore from a save slot or fix the file"))?;
-        (s, c, None)
-    };
-    // (2026-08-18 clothing-as-inventory ruling) The explicit-save branch
-    // installs a save slot's schema directly (bypassing load_split), so run
-    // the one-shot legacy `outfit` delta → typed inventory migration on
-    // whatever resolved. Idempotent — the resume branch already migrated
-    // through load_split.
-    prior_schema.migrate_legacy_outfit();
-    // (2026-08-16, Chloe ruling + audit #2) Seed the card's `<intro>` as
-    // session message 0 (an assistant beat) whenever we're entering a card
-    // with an EMPTY conversation (fresh New Game, or a first entry with no
-    // session.json yet). The intro used to be a DOM-only render: feed
-    // data-indexes ran +1 vs the backend session for the whole early game
-    // (delete/edit/swipe hit the wrong message), and the beat VANISHED on
-    // the first feed rebuild + every resume because it lived in no session.
-    // As a real session message it survives rebuilds/resumes/saves for free.
-    // It is the BEGINNING message, never a persistent prompt fixture: it
-    // rides the same WINDOW_API_FABLE = 16 slice as every other beat, so
-    // the narrator's context drops it naturally once 16 messages (8 turns)
-    // have gone through — exactly the Fable chat-history limit. A save-slot
-    // resume NEVER seeds (the save's session snapshot is authoritative).
-    {
-        if save_id.is_none() && prior_session.messages.is_empty() {
-            let intro_text = if !card.intro.trim().is_empty() {
-                Some(card.intro.clone())
-            } else {
-                resolve_fable_cards_dir(app).and_then(|root| load_card_intro(&root, &card.id))
-            };
-            if let Some(intro) = intro_text.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-                prior_session
-                    .add_message(session::Role::Assistant, intro.to_owned());
-            }
-        }
-    }
-    // (#77) The install paths bypass `Conversation::load`, so run the same
-    // defensive normalize it does: clamp active_idx + reconcile variant/raw
-    // lengths on every message (a hand-edited or skewed save can't confuse
-    // the accessors). No-op on already-clean sessions.
-    for m in &mut prior_session.messages {
-        m.normalize_variants();
-    }
-    // Saved Player attachment (2026-08-02): when a saved player id was
-    // passed (the New Game flow's Pair 2), load it + override the card's
-    // `player_name` anchor with the saved player's name. The narrator
-    // reads `card.player_name` as the identity anchor (the `<active_
-    // Player attach (2026-08-19 v2): the identity becomes the `<player>`
-    // KV-cache block (narrator system prompt, every turn) + the `<inventory>`
-    // sibling seeds the typed inventory on FRESH runs. Runs for ALL three
-    // branches (fresh/resume/save); a None player_id clears the cache (the
-    // card's own player_name stands + no <player> block renders).
+    state: &AppState,
+    card: &mut sim_card::SimCard,
+    prior_schema: &mut schema::WorldSchema,
+    player_id: Option<&str>,
+    fresh: bool,
+) {
     *state.active_player_cache.lock().unwrap_or_else(|e| e.into_inner()) = None;
-    if let Some(pid) = player_id.as_deref() {
+    if let Some(pid) = player_id {
         // (2026-08-19) Walker resolution — the player folder is display-named
         // ("Alex"); the slug id can never be joined directly.
         let players_root = resolve_fable_players_dir(app);
@@ -10222,25 +10538,11 @@ async fn enter_fable_session(
                 if let Some(authored) = sp.properties.as_ref().filter(|v| !v.is_empty()) {
                     let stamp = prior_schema.world_clock.current_minutes;
                     seed_properties_into(
-                        &mut prior_schema,
+                        prior_schema,
                         authored,
                         Some(economy::Owner::Player),
                         stamp,
                     );
-                }
-            }
-            // Transient starting gameplay conditions (2026-08-13): the Player
-            // Wizard's optional wealth/reputation/fame seed the per-run
-            // PlayerState. NOT persisted on the SavedPlayer identity (the §6C
-            // identity-only lock is preserved) — these are gameplay numbers
-            // that belong to the run, threaded here only because the player
-            // just authored them. Loaded players send no conditions → defaults.
-            if let Some(conds) = &player_starting_conditions {
-                if let Some(w) = conds.wealth {
-                    prior_schema.player_state.wealth = w;
-                }
-                if let Some(r) = conds.reputation {
-                    prior_schema.player_state.reputation = r;
                 }
             }
             tracing::info!(player_id = pid, player_name = %card.player_name.as_deref().unwrap_or("?"), "attached saved player");
@@ -10255,7 +10557,312 @@ async fn enter_fable_session(
     // chat UI can resolve the player portrait via fable_active_card_get.
     // Placed after the attach block so it always stores the authoritative id
     // (Some or None) — never leaves a stale id from a prior session.
-    *state.active_player_id.lock().unwrap_or_else(|e| e.into_inner()) = player_id.clone();
+    *state.active_player_id.lock().unwrap_or_else(|e| e.into_inner()) = player_id.map(str::to_owned);
+}
+
+async fn enter_fable_session(
+    mut card: sim_card::SimCard,
+    session_id: Option<String>,
+    save_id: Option<String>,
+    fresh: bool,
+    player_id: Option<String>,
+    model_path: std::path::PathBuf,
+    card_id_for_meta: String,
+    app: &tauri::AppHandle,
+    state: &tauri::State<'_, AppState>,
+) -> Result<FableLoadResult, String> {
+    // NOTE: the FableEngine is NO LONGER eagerly spawned here. Under the
+    // v0.6.4 VRAM swap-lock (see `context_swap.rs` + AGENTS.md §7B
+    // correction), only ONE `WUPI.gguf` context may be resident at a time.
+    // Keeping a resident FableEngine while no turn is in flight would hold
+    // ~50-100MB of Q8_0 KV idle for the whole game session — VRAM the chat
+    // engine (Wupi-as-game-manager) needs when the user asks her a question.
+    //
+    // Instead the engine is spawned LAZILY on the first `fable_send` under
+    // the Fable lease (which evicts any resident chat/schema context
+    // first). Between turns the FableEngine stays resident (back-to-back
+    // same-role reuse — no re-spawn churn during play); it's only torn
+    // down when the user asks Wupi something (chat acquires → evicts
+    // fable) or on `fable_end`. The `model_path` arg is retained for the
+    // lazy spawn in `fable_send`; it's stashed on AppState below.
+    //
+    // The prior eager-spawn block (which OOM'd the 4th context on 12GB,
+    // the 2026-07-26 freeze root cause) is gone.
+    {
+        if let Ok(mut g) = state.pending_model_path.lock() {
+            // Stash for the lazy spawn. If a chat model path was already
+            // stashed (the normal case — boot resolved it), preserve it:
+            // the FableEngine reuses `shared_model()` anyway, so the path
+            // is only a defensive fallback for API-only-with-no-local.
+            if g.is_none() {
+                *g = Some(model_path);
+            }
+        }
+    }
+
+    // (The active_card_id swap is deliberately NOT here — see the swap
+    // block just above the state installs below. Swapping before the
+    // fallible save load leaked the roleplay id on error, and the next
+    // fable_end then persisted default/empty state under it, wiping the
+    // card's live world.)
+
+    // (2026-08-22 Codex decoupling) Linked universal codex seeding. The
+    // card's `<linked_codices>` list (priority order, index 0 = top)
+    // resolves through the library walker into `data/codex/*.codex`; the
+    // merged entries seed into the card's OWN memory partition under a
+    // source-scoped reconcile (a second file never purges the first's
+    // rows; unlinked + legacy rows purge; same-title collisions resolve
+    // toward index 0). Best-effort + detached: a seed failure never blocks
+    // game entry. A linked name whose file is gone drops out here — its
+    // stored rows purge in the reconcile (unlink semantics).
+    // (2026-08-22 unlink-all fix) The seed runs EVEN WITH ZERO links: an
+    // empty list is the unlink-everything signal — every stored lore row
+    // in the card's partition lands unconsumed in the reconcile and
+    // purges. The old non-empty gates skipped the seed entirely, so a
+    // fully-unlinked card's rows kept surfacing in <retrieved_memory>
+    // forever (violating "unlink = lore removal"); for a never-linked
+    // card the empty seed is a one-query no-op.
+    if let Some(memory_engine) = state.memory.get() {
+        let me = Arc::clone(memory_engine);
+        let codex_dir = resolve_fable_root(app).map(|r| r.join("data").join("codex"));
+        let links: Vec<codex::LinkedCodex> = card
+            .linked_codices
+            .iter()
+            .filter_map(|name| {
+                codex_dir
+                    .as_ref()
+                    .and_then(|dir| resolve_codex_file(dir, name))
+                    .map(|path| codex::LinkedCodex { name: name.clone(), path })
+            })
+            .collect();
+        let card_id_owned = card.id.clone();
+        tokio::spawn(async move {
+            match codex::seed_linked_codices(&me, &links, &card_id_owned).await {
+                Ok(r) => tracing::info!(
+                    card_id = %card_id_owned,
+                    files = links.len(),
+                    seeded = r.seeded,
+                    updated = r.updated,
+                    purged = r.purged,
+                    unchanged = r.unchanged,
+                    "linked codices seeded"
+                ),
+                Err(e) => tracing::warn!(
+                    card_id = %card_id_owned,
+                    error = %format!("{e:#}"),
+                    "linked codex seed failed"
+                ),
+            }
+        });
+    }
+
+    // (RETIRED 2026-08-21 — the Cinderfen playtest's observed-once slug-rename
+    // bug) The 2026-08-15 "P1" legacy migration that used to live here did a
+    // raw `fs::rename(cards/<name.to_lowercase()>, cards/<card.id>)`. On
+    // Windows (case-insensitive FS) the lowercased display name MATCHED the
+    // 2026-08-19 display-named card folder, and `legacy_id != card.id` is
+    // true for every multi-word name (spaces vs dashes) — so the first
+    // `fable_start` after the folder existed renamed
+    // `Stranded in Cinderfen/` to `stranded-in-cinderfen/` with the display
+    // `.sim`/`.codex` still inside (a directory rename moves nothing), the
+    // namesake walker went blind (empty card list), and every by-id write
+    // fell back to slug-stemmed split JSONs. One-shot per card — which is
+    // exactly why it did not reproduce on retry. Genuine pre-normalization
+    // legacy folders are handled by the boot migration (`migrate_cards_v2`,
+    // display-stemmed); this block predates the display-folder redesign and
+    // is deleted, not gated.
+
+    // Resolve initial state. Priority: explicit save_id → fresh → fallback.
+    // (2026-08-21 resume-attach fix) The SavedPlayer binding rides the
+    // conversation (`Conversation::attached_player_id`), so capture whatever
+    // the resolved source carries — a resume re-attaches the campaign's
+    // player instead of silently falling back to the card default (the
+    // v2-identity regression: the `<player>` cache block was process-only).
+    let mut stored_player_id: Option<String> = None;
+    // (2026-08-22 desync fix) A save-slot entry restores the snapshot's undo
+    // ring; captured here, installed after the state swap below.
+    let mut restored_history: Vec<fable_save::HistorySnap> = Vec::new();
+    let fable_root = resolve_apps_dir(app).join("fable");
+    // (2026-08-22 session decoupling) Resolve or MINT the session folder
+    // FIRST — every persistence call below keys off it.
+    //   fresh + no session  → mint a new isolated playthrough folder.
+    //   explicit session    → use it verbatim (fresh + Some = reset-in-place
+    //                         of that playthrough).
+    //   bare save_id        → legacy payload (old .lnk): find the owning
+    //                         session by walking the card's sessions.
+    //   nothing + !fresh    → resume the most-recently-played session (the
+    //                         .lnk `--card` direct boot; Continue passes an
+    //                         explicit target).
+    let session_id: String = if fresh && session_id.as_deref().map_or(true, |s| s.trim().is_empty()) {
+        let manifest = fable_save::create_session(&fable_root, &card, None)
+            .map_err(|e| format!("failed to create session folder: {e}"))?;
+        tracing::info!(
+            session_id = %manifest.session_id,
+            name = %manifest.name,
+            "fable_start: minted new session"
+        );
+        manifest.session_id
+    } else if let Some(sid) = session_id.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        sid.to_owned()
+    } else if let Some(sid) = save_id.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        find_session_owning_save(&fable_root, &card.id, sid)
+            .ok_or_else(|| format!("no session owns save '{sid}'"))?
+    } else {
+        fable_save::list_sessions(&fable_root, &card.id)
+            .map_err(|e| format!("session listing failed: {e}"))?
+            .into_iter()
+            .next()
+            .map(|s| s.session_id)
+            .ok_or_else(|| "this card has no sessions yet — start a new session first".to_string())?
+    };
+    let (mut prior_schema, mut prior_session, resumed_save_label) = if let Some(sid) = save_id.as_deref() {
+        let fable_root_clone = fable_root.clone();
+        let cid = card.id.clone();
+        let sid_owned = sid.to_owned();
+        let session_owned = session_id.clone();
+        let save = tokio::task::spawn_blocking(move || {
+            fable_save::load_save(&fable_root_clone, &cid, &session_owned, &sid_owned)
+        })
+        .await
+        .map_err(|e| format!("load save join: {e}"))?
+        .map_err(|e| format!("failed to load save '{sid}': {e}"))?;
+        stored_player_id = save.session.attached_player_id.clone();
+        restored_history = save.history.clone();
+        (save.schema, save.session, Some(save.name))
+    } else if fresh {
+        (schema::WorldSchema::default(), session::Conversation::new(), None)
+    } else {
+        // (2026-08-15 audit fix) A corrupt/partial split file must FAIL the
+        // resume, not silently reset the world: the old swallow-to-default
+        // loaded a default schema under the live session, and the next
+        // autosave/fable_end persisted it — wiping the card's world.
+        // First-run (no files yet) still resolves to defaults inside
+        // load_split's NotFound skip.
+        let s = load_schema(app, &card.id, &session_id).await
+            .map_err(|e| format!("session state file is corrupt (world.json/player.json/npc.json): {e} — refusing to resume with a reset world; restore from a save slot or fix the file"))?;
+        // (2026-08-16 audit fix) Symmetric refusal for a corrupt session.json:
+        // the old swallow-to-empty reset the campaign PROSE (the schema two
+        // lines up got the hardened refusal, the conversation didn't), and the
+        // next autosave persisted the empty session over the file — silent
+        // history loss.
+        let c = load_session(app, &card.id, &session_id).await
+            .map_err(|e| format!("session conversation file is corrupt (session.json): {e} — refusing to resume with an empty conversation; restore from a save slot or fix the file"))?;
+        stored_player_id = c.attached_player_id.clone();
+        (s, c, None)
+    };
+    // (2026-08-18 clothing-as-inventory ruling) The explicit-save branch
+    // installs a save slot's schema directly (bypassing load_split), so run
+    // the one-shot legacy `outfit` delta → typed inventory migration on
+    // whatever resolved. Idempotent — the resume branch already migrated
+    // through load_split.
+    prior_schema.migrate_legacy_outfit();
+    // (2026-08-16, Chloe ruling + audit #2) Seed the card's `<intro>` as
+    // session message 0 (an assistant beat) whenever we're entering a card
+    // with an EMPTY conversation (fresh New Game, or a first entry with no
+    // session.json yet). The intro used to be a DOM-only render: feed
+    // data-indexes ran +1 vs the backend session for the whole early game
+    // (delete/edit/swipe hit the wrong message), and the beat VANISHED on
+    // the first feed rebuild + every resume because it lived in no session.
+    // As a real session message it survives rebuilds/resumes/saves for free.
+    // It is the BEGINNING message, never a persistent prompt fixture: it
+    // rides the same WINDOW_API_FABLE = 16 slice as every other beat, so
+    // the narrator's context drops it naturally once 16 messages (8 turns)
+    // have gone through — exactly the Fable chat-history limit. A save-slot
+    // resume NEVER seeds (the save's session snapshot is authoritative).
+    {
+        if save_id.is_none() && prior_session.messages.is_empty() {
+            // (2026-08-22 intro variants) A card may carry SEVERAL `<intro>`
+            // siblings (imported SillyTavern first_mes + alternate_greetings).
+            // ALL of them seed message 0 as swipeable variants: the player
+            // picks an opening with the existing ‹ 1/N › beat control right
+            // at game start, before the first turn (the trailing-beat swipe
+            // guard locks the choice once the world starts moving). content
+            // mirrors variant 0 (the denormalized invariant); raw_outputs
+            // carry the authored text (an authored intro has no distinct
+            // model raw — the honest value IS the text); variant_schemas
+            // stays EMPTY, so a swipe installs no schema (these openings were
+            // never tracked — the graceful no-op path by design).
+            let mut intro_variants: Vec<String> = card
+                .intro_variants
+                .iter()
+                .map(|s| s.trim().to_owned())
+                .filter(|s| !s.is_empty())
+                .collect();
+            if intro_variants.is_empty() {
+                let fallback = if !card.intro.trim().is_empty() {
+                    Some(card.intro.clone())
+                } else {
+                    resolve_fable_cards_dir(app).and_then(|root| load_card_intro(&root, &card.id))
+                };
+                intro_variants = fallback
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(|s| vec![s.to_owned()])
+                    .unwrap_or_default();
+            }
+            // NO dedupe here, deliberately: session variant indexes must
+            // stay 1:1 with the card's `<intro>` siblings (in-game edits
+            // write through BY INDEX — `write_intro_variant_to_card`). The
+            // import path dedupes before a card is ever written; a
+            // hand-edited card with duplicate intros simply shows them as
+            // duplicate variants.
+            if !intro_variants.is_empty() {
+                prior_session.add_message(session::Role::Assistant, intro_variants[0].clone());
+                // `add_message` hands back a shared `&Message`; the variant
+                // install below needs the tail by value.
+                let msg = prior_session
+                    .messages
+                    .last_mut()
+                    .expect("intro beat just added");
+                // Authored card content, not a tracked turn: edits write
+                // through to the card's `<intro>` variant + rerolls append
+                // to the card's list (the live-sync contract).
+                msg.is_intro = true;
+                if intro_variants.len() > 1 {
+                    msg.raw_output = intro_variants[0].clone();
+                    msg.variants = intro_variants;
+                    msg.raw_outputs = msg.variants.clone();
+                    msg.active_idx = 0;
+                }
+            }
+        }
+    }
+    // (#77) The install paths bypass `Conversation::load`, so run the same
+    // defensive normalize it does: clamp active_idx + reconcile variant/raw
+    // lengths on every message (a hand-edited or skewed save can't confuse
+    // the accessors). No-op on already-clean sessions.
+    for m in &mut prior_session.messages {
+        m.normalize_variants();
+    }
+    // Saved Player attachment (2026-08-02): when a saved player id was
+    // passed (the New Game flow's Pair 2), load it + override the card's
+    // `player_name` anchor with the saved player's name. The narrator
+    // reads `card.player_name` as the identity anchor.
+    // (2026-08-19 v2) The identity becomes the `<player>` KV-cache block
+    // (narrator system prompt, every turn) + the `<inventory>` sibling
+    // seeds the typed inventory on FRESH runs. Runs for ALL three branches
+    // (fresh/resume/save); a None player_id clears the cache (the card's
+    // own player_name stands + no <player> block renders).
+    // (2026-08-21 resume-attach fix) The id resolved here is the EXPLICIT
+    // arg (New Game) or — on any resume — the binding persisted on the
+    // conversation, and it is stamped back onto the live session so every
+    // subsequent session.json + save-slot write carries it. The attach
+    // itself lives in `attach_saved_player` (the single authority, shared
+    // with `fable_load_save`).
+    let effective_player_id = player_id
+        .clone()
+        .or(stored_player_id)
+        .filter(|pid| !pid.trim().is_empty());
+    prior_session.attached_player_id = effective_player_id.clone();
+    attach_saved_player(
+        app,
+        &state,
+        &mut card,
+        &mut prior_schema,
+        effective_player_id.as_deref(),
+        fresh,
+    );
     // Fable Phase 4 Component 3 (2026-07-28): seed the travel graph from the
     // card's `<locations>` block IF the resolved schema has no graph yet.
     // This is the load-bearing fix for Components 3 + 4 being dead in live
@@ -10672,8 +11279,26 @@ async fn enter_fable_session(
         *pre = active.clone();
         *active = card.id.clone();
     }
+    // (2026-08-22) The session id installs alongside — every mid-game
+    // persistence path (autosave, split files, session.json, save slots)
+    // keys off it.
+    *state.active_session_id.lock().unwrap_or_else(|e| e.into_inner()) = Some(session_id.clone());
     *state.fable_schema.lock().await = prior_schema;
     clear_fable_history(&state).await;
+    // (2026-08-22 desync fix) A save-slot entry restores the snapshot's undo
+    // ring oldest-first — a loaded timeline rolls back within its own
+    // history, exactly as it did when saved.
+    if !restored_history.is_empty() {
+        let mut hist = state.fable_schema_history.lock().await;
+        let depth = restored_history.len();
+        for snap in restored_history {
+            hist.push_back((snap.tag, snap.schema));
+        }
+        tracing::info!(
+            depth,
+            "save-slot entry: restored schema-history ring from the snapshot"
+        );
+    }
     let messages: Vec<FableLoadMessage> = prior_session
         .messages
         .iter()
@@ -10713,6 +11338,20 @@ async fn enter_fable_session(
     }
     state.failed_progression_queue.lock().await.clear();
     state.failed_translation_queue.lock().await.clear();
+    // (2026-08-22 tracker feedback loop) Same stale-timeline rule: the prior
+    // session's rejected emissions never teach this one's tracker.
+    state.tracker_emit_errors.lock().await.clear();
+    // (2026-08-22 desync fix) A save-slot entry OVERWRITES the session
+    // folder's live schemas + conversation with the loaded snapshot
+    // IMMEDIATELY — the loaded timeline becomes the session's on-disk
+    // state, so a force-quit right after loading can never resurrect the
+    // pre-load timeline from stale split files/session.json.
+    if save_id.is_some() {
+        let schema_snapshot = state.fable_schema.lock().await.clone();
+        let session_snapshot = state.fable_session.lock().await.clone();
+        save_schema(app, &card.id, &session_id, &schema_snapshot).await;
+        save_session(app, &card.id, &session_id, &session_snapshot).await;
+    }
     // (2026-08-20, Chloe — the recent_events carryover) FRESH resets the
     // DISK tracking too, not just memory. The old fresh branch installed a
     // default schema but left the prior campaign's split files (world.json /
@@ -10723,25 +11362,30 @@ async fn enter_fable_session(
     // "new" session. A fresh start now rewrites the split files + the
     // autosave slot with the just-seeded state IMMEDIATELY, so a new session
     // resets the world/npc/player tracking on disk from the first instant.
+    // (2026-08-22) The rewrite lands in the freshly MINTED session folder —
+    // other playthroughs of the same card are untouched by design.
     // Manual save slots are deliberately untouched (user checkpoints).
     if fresh {
         let schema_snapshot = state.fable_schema.lock().await.clone();
         let session_snapshot = state.fable_session.lock().await.clone();
-        save_schema(app, &card.id, &schema_snapshot).await;
-        save_session(app, &card.id, &session_snapshot).await;
+        save_schema(app, &card.id, &session_id, &schema_snapshot).await;
+        save_session(app, &card.id, &session_id, &session_snapshot).await;
         let fable_root = resolve_apps_dir(app).join("fable");
         let card_for_save = card.clone();
         let session_clone = session_snapshot;
         let schema_clone = schema_snapshot;
+        let session_id_clone = session_id.clone();
         tokio::spawn(async move {
             let result = tokio::task::spawn_blocking(move || {
                 fable_save::write_save(
                     &fable_root,
                     &card_for_save,
+                    &session_id_clone,
                     fable_save::AUTOSAVE_ID,
                     "Autosave",
                     &session_clone,
                     &schema_clone,
+                    &[],
                 )
             })
             .await;
@@ -10765,11 +11409,12 @@ async fn enter_fable_session(
     // block.
     *state.active_fable_card.lock().unwrap_or_else(|e| e.into_inner()) = Some(card);
 
-    tracing::info!(?resumed_save_label, "game started: narrator engine live, memory scoped to card, state loaded");
+    tracing::info!(?resumed_save_label, session_id = %session_id, "game started: narrator engine live, memory scoped to card, state loaded");
     Ok(FableLoadResult {
         meta: fable_save::SaveMeta {
             save_id: resumed_save_label.clone().unwrap_or_default(),
             card_id: card_id_for_meta,
+            session_id,
             name: resumed_save_label.unwrap_or_else(|| "Current".to_string()),
             summary: String::new(),
             timestamp: current_unix_ms_i64(),
@@ -10799,6 +11444,24 @@ fn fable_turn_in_flight(state: &AppState) -> bool {
     retrack.is_some()
 }
 
+/// Resolve a bare save_id (no session context — a legacy `.lnk` or an old
+/// frontend payload) to the session folder that owns it: walk the card's
+/// sessions, first hit wins (save ids are ms-stamped; cross-session
+/// collisions are practically impossible).
+fn find_session_owning_save(
+    fable_root: &std::path::Path,
+    card_id: &str,
+    save_id: &str,
+) -> Option<String> {
+    let sessions = fable_save::list_sessions(fable_root, card_id).ok()?;
+    sessions
+        .iter()
+        .find(|s| {
+            fable_save::resolve_save_path(fable_root, card_id, &s.session_id, save_id).exists()
+        })
+        .map(|s| s.session_id.clone())
+}
+
 /// The title-screen CONTINUE button's resume target. Scans every New Game
 /// world's saves dir + returns the single most-recent save of ANY kind
 /// (autosave OR manual). `None` (→ JSON null) when no qualifying save exists,
@@ -10814,45 +11477,111 @@ fn fable_turn_in_flight(state: &AppState) -> bool {
 /// the title sits BEFORE card selection, so CONTINUE must look across all New
 /// Game worlds for "your last save, anywhere."
 ///
-/// Returns a `SaveMeta` (lightweight — no session/schema payload). The
-/// frontend stashes it + resumes via `fable_start(card_id, save_id)` only when
-/// the user actually clicks CONTINUE.
+/// Returns a `SaveMeta` (lightweight — no session/schema payload; carries
+/// the owning `session_id` since 2026-08-22). The frontend stashes it +
+/// resumes via `fable_start(card_id, session_id, save_id)` only when the
+/// user actually clicks CONTINUE.
 #[tauri::command]
 fn fable_continue_target(app: tauri::AppHandle) -> Result<Option<fable_save::SaveMeta>, String> {
     let fable_root = resolve_apps_dir(&app).join("fable");
     Ok(most_recent_continue_target(&fable_root))
 }
 
-/// Pure core of `fable_continue_target`: walks `saves/<card_id>/` for every
-/// card, returning the globally-most-recent `SaveMeta` of
-/// any slot type (autosave + manual). Extracted so the contract (New Game
-/// worlds only; autosaves count) is unit-testable with a tempdir.
+/// Pure core of `fable_continue_target`: walks every card × every session's
+/// `saves/` tree, returning the globally-most-recent `SaveMeta` of any slot
+/// type (autosave + manual). Extracted so the contract (New Game worlds
+/// only; autosaves count) is unit-testable with a tempdir.
 fn most_recent_continue_target(fable_root: &std::path::Path) -> Option<fable_save::SaveMeta> {
-    // 2026-08-01 layout: saves live inside each card's folder at
-    // `cards/<card_id>/saves/`. Walk the cards tree, and for each card folder
-    // that has a `saves/` subdir, list its slots.
+    // 2026-08-22 layout: saves live inside each session folder at
+    // `data/saves/<CardName>/<session_id>/saves/`. Walk the cards tree for
+    // folder names, then each card's sessions.
     let cards_dir = fable_root.join("cards");
     let Ok(entries) = std::fs::read_dir(&cards_dir) else {
         return None;
     };
     let mut best: Option<fable_save::SaveMeta> = None;
     for entry in entries.flatten() {
-        // Each card has its own folder: cards/<card_id>/. Skip stray files.
+        // Each card has its own folder: cards/<CardName>/. Skip stray files.
         if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
             continue;
         }
-        let card_id = entry.file_name().to_string_lossy().to_string();
-        if let Ok(saves) = fable_save::list_saves(fable_root, &card_id) {
-            for s in saves {
-                // list_saves is newest-first per-card; track the global newest.
-                // Autosaves ARE eligible (see the command doc above).
-                if best.as_ref().map_or(true, |b| s.timestamp > b.timestamp) {
-                    best = Some(s);
+        let card_folder = entry.file_name().to_string_lossy().to_string();
+        let sessions_dir = fable_root.join("data").join("saves").join(&card_folder);
+        let Ok(session_entries) = std::fs::read_dir(&sessions_dir) else {
+            continue;
+        };
+        for session_entry in session_entries.flatten() {
+            if !session_entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                continue;
+            }
+            let session_id = session_entry.file_name().to_string_lossy().to_string();
+            let saves_dir = sessions_dir.join(&session_id).join("saves");
+            let Ok(save_entries) = std::fs::read_dir(&saves_dir) else {
+                continue;
+            };
+            for save_entry in save_entries.flatten() {
+                let path = save_entry.path();
+                if path.extension().and_then(|x| x.to_str()) != Some("json") {
+                    continue;
+                }
+                let save_id = path.file_stem().and_then(|s| s.to_str()).unwrap_or("").to_owned();
+                if let Some(meta) = read_save_meta_at(&path, &card_folder, &session_id, &save_id) {
+                    // Track the global newest. Autosaves ARE eligible (see
+                    // the command doc above).
+                    if best.as_ref().map_or(true, |b| meta.timestamp > b.timestamp) {
+                        best = Some(meta);
+                    }
                 }
             }
         }
     }
     best
+}
+
+/// Read one save file's `SaveMeta` from an explicit path (the Continue walk
+/// knows card/session/save ids from the directory shape; the payload's
+/// internal ids may lag a hand-move). Header-prefix first, full-parse
+/// fallback — the `list_saves` discipline.
+fn read_save_meta_at(
+    path: &std::path::Path,
+    card_id: &str,
+    session_id: &str,
+    save_id: &str,
+) -> Option<fable_save::SaveMeta> {
+    // Reuse the private header reader through a tiny shim: list_saves
+    // resolves paths itself, so read directly here.
+    let bytes_meta = std::fs::metadata(path).ok()?;
+    let modified = bytes_meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+    let (name, summary, timestamp, is_autosave, turn_count) =
+        match fable_save::read_save_header_public(path) {
+            Some(h) => h,
+            None => {
+                let Ok(bytes) = std::fs::read(path) else { return None };
+                let Ok(save) = serde_json::from_slice::<fable_save::SaveFile>(&bytes) else {
+                    return None;
+                };
+                let mut session = save.session;
+                session.hydrate_schema_refs();
+                (save.name, save.summary, save.timestamp, save.is_autosave, session.messages.len())
+            }
+        };
+    Some(fable_save::SaveMeta {
+        save_id: save_id.to_owned(),
+        card_id: card_id.to_owned(),
+        session_id: session_id.to_owned(),
+        name,
+        summary,
+        // A zero timestamp in the payload falls back to the file mtime so a
+        // hand-edited save still sorts sanely.
+        timestamp: if timestamp == 0 { modified } else { timestamp },
+        is_autosave,
+        turn_count,
+    })
 }
 
 /// Render the narrator prompt in the Gemma4 `<|turn>` protocol: system +
@@ -10958,12 +11687,20 @@ pub(crate) fn cap_assistant_prose(
 /// Chars, not tokens (no tokenizer access at the prompt layer; the engine's
 /// token-level backstop remains as the final guard — a hard error in tracker
 /// mode since the same fix). Pure + unit-tested.
+///
+/// (2026-08-22 re-track hardening) The budget is a PARAM, not a read of
+/// `settings::TRACKER_PROMPT_CHAR_BUDGET`: the edit/reroll re-track pass
+/// generates against `TRACKER_RETRACK_MAX_TOKENS` (512 — double the live
+/// turn's wall), so its prompt budget is the correspondingly tighter
+/// `settings::TRACKER_RETRACK_PROMPT_CHAR_BUDGET`. The pair must move
+/// together or this guard blesses a prompt the engine then refuses.
 pub(crate) fn build_tracker_prompt_bounded(
     system_prompt: &str,
     window: &[session::Message],
+    budget: usize,
 ) -> Result<String, usize> {
     let full = build_narrator_prompt(system_prompt, window);
-    if full.chars().count() <= settings::TRACKER_PROMPT_CHAR_BUDGET {
+    if full.chars().count() <= budget {
         return Ok(full);
     }
     // Attempt 2: keep only the trailing user action(s) — the trigger. Drops
@@ -10979,9 +11716,9 @@ pub(crate) fn build_tracker_prompt_bounded(
     trimmed.reverse();
     let slim = build_narrator_prompt(system_prompt, &trimmed);
     let count = slim.chars().count();
-    if count <= settings::TRACKER_PROMPT_CHAR_BUDGET {
+    if count <= budget {
         tracing::warn!(
-            budget = settings::TRACKER_PROMPT_CHAR_BUDGET,
+            budget,
             full_chars = full.chars().count(),
             slim_chars = count,
             "tracker prompt over char budget; re-rendered without the preceding assistant beat"
@@ -11041,6 +11778,30 @@ fn assemble_narrator_skeleton(
     out
 }
 
+/// (2026-08-22 tracker feedback loop) Distill a turn's reject directives
+/// into the bounded `<emit_errors>` set: dedupe (case-insensitive — the
+/// tracker repeats the same illegal emission verbatim within a turn),
+/// cap each line's CHARS (UTF-8-safe — anti-pattern #6 discipline), cap the
+/// line COUNT. The reject strings themselves are the payload — they already
+/// teach the correct form; this only bounds them. Pure + unit-tested.
+pub(crate) fn distill_tracker_emit_errors(rejects: &[String]) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    let mut out: Vec<String> = Vec::new();
+    for r in rejects {
+        let line: String = r
+            .chars()
+            .take(settings::TRACKER_EMIT_ERROR_LINE_CHARS)
+            .collect();
+        if seen.insert(line.to_lowercase()) {
+            out.push(line);
+            if out.len() >= settings::TRACKER_EMIT_ERROR_MAX_LINES {
+                break;
+            }
+        }
+    }
+    out
+}
+
 /// Tracker system prompt. The tracker reads the **agent** section of the
 /// authored `.prompt` file (its mechanical job), the live per-turn state
 /// blocks (assembled by `assemble_narrator_skeleton`), and the
@@ -11078,6 +11839,7 @@ fn build_narrator_system_prompt(
     world_state: Option<&str>,
     pacing: schema::ScenePacing,
     player_action: Option<&str>,
+    emit_errors: &[String],
 ) -> String {
     let mut out = String::with_capacity(2048);
 
@@ -11180,7 +11942,7 @@ fn build_narrator_system_prompt(
     // currency/job/lifestyle forms fold into the second line, all forms
     // incl. the owner= kv kept.)
     out.push_str("- [LEDGER found <id> node=<n> kind=<business|estate|settlement> revenue=<r> upkeep=<u> (owner=<npc_id>)] — a property enters play where the player stands or a listed exit leads.\n");
-    out.push_str("- [LEDGER deposit|withdraw|invest <amount> <id>] / [LEDGER buy <id>] — pocket↔till + purchase, standing at its node; invest raises revenue. [LEDGER lifestyle <squatter|modest|comfortable|aristocratic>] / [LEDGER job <title> node=<n> wage=<w>] / [LEDGER job -<title>] / [LEDGER prosperity <node_id> <pct>] — upkeep tier, work taken or left, or a location's fortunes (25-200). [LEDGER currency <name>] — emit ONCE when narration first names the money unit (dollars, or tiers highest-first gold/silver/copper); all amounts are the lowest unit, the engine formats them.\n");
+    out.push_str("- [LEDGER deposit|withdraw|invest <amount> <id>] / [LEDGER buy <id>] — pocket↔till + purchase, standing at its node; invest raises revenue. [LEDGER wealth +<n>|-<n>] — pocket coin gained or spent (payments, tips, loot, rewards; spend only what the wealth line holds). [LEDGER lifestyle <squatter|modest|comfortable|aristocratic>] / [LEDGER job <title> node=<n> wage=<w>] / [LEDGER job -<title>] / [LEDGER prosperity <node_id> <pct>] — upkeep tier, work taken or left, or a location's fortunes (25-200). [LEDGER currency <name>] — emit ONCE when narration first names the money unit (dollars, or tiers highest-first gold/silver/copper); all amounts are the lowest unit, the engine formats them.\n");
     out.push_str("Tags (EQUIP/BELT/PACK): consumable, equippable, pocketable — see <item_rules> above.\n");
     // NOTE (#26c, 2026-08-15): `CharacterTurn` / `Object` / `Fx` are
     // LEGACY-RECOGNIZED only — the parser + streaming filter still accept +
@@ -11188,6 +11950,22 @@ fn build_narrator_system_prompt(
     // deliberately NOT taught here: their emissions are notification-only and
     // the API-mode scene-event filter drops them (the narrator's prose covers
     // them). Do NOT re-add them to the taught list.
+
+    // (2026-08-22 tracker feedback loop) Last turn's REJECTED emissions —
+    // the tracker's only channel back from the applier. Retrieved-when-
+    // relevant by construction: an empty slot renders NOTHING (zero echo on
+    // healthy turns — the Prime Mandate holds), and the caller-side distill
+    // caps the worst case (settings::TRACKER_EMIT_ERROR_*). Rendered LAST so
+    // the correction is the freshest thing before the window.
+    if !emit_errors.is_empty() {
+        out.push_str("<emit_errors>\nLast turn the engine rejected these emissions — fix the id or the form this turn:\n");
+        for e in emit_errors {
+            out.push_str("- ");
+            out.push_str(e);
+            out.push('\n');
+        }
+        out.push_str("Valid ids ride the cast / site / ledger lines of <world_state>; a NEW named NPC is [NPC_REGISTER <id> name=<name>] first; the player's own items are [PACK].\n</emit_errors>\n");
+    }
 
     out
 }
@@ -11257,11 +12035,16 @@ fn build_api_narrator_system_prompt(
 /// The directive deliberately does NOT echo the offending line back —
 /// re-injecting the attractor phrase is a logit-echo vector (Prime
 /// Mandate); the model can see the repetition in its own history window.
+/// (2026-08-22 Ghost Writer) `direction` — an OPTIONAL player steer riding
+/// a guided reroll (the `guidance` param of `fable_send`). Rendered LAST:
+/// on a guided turn the player's fresh instruction is the closest thing to
+/// generation, ahead of every mechanical block.
 fn build_narrator_turn_tail(
     player_action: Option<&str>,
     world_state: Option<&str>,
     pacing: schema::ScenePacing,
     loop_directive: Option<&str>,
+    direction: Option<&str>,
 ) -> String {
     let mut out = String::with_capacity(2048);
     if let Some(pa) = player_action.map(str::trim).filter(|s| !s.is_empty()) {
@@ -11283,6 +12066,10 @@ fn build_narrator_turn_tail(
         out.push_str("<repeat_guard>\n");
         out.push_str(ld);
         out.push_str("\n</repeat_guard>\n");
+    }
+    if let Some(dir) = direction.map(str::trim).filter(|s| !s.is_empty()) {
+        out.push_str(dir.trim_end());
+        out.push('\n');
     }
     out
 }
@@ -11553,14 +12340,19 @@ fn build_creator_assistant_system_prompt(creator_kind: &str) -> String {
              false (an absent persona with no marker means you never asked — an \
              invalid draft).\n\
              OPTIONAL FIELDS — surface only if the player raises them or they fit \
-             naturally: distinguishing_marks, weakness, wealth (a starting amount), \
-             reputation or fame (a starting standing).\n\
-             CUSTOM EXTENSIONS — if the player mentions any extra stat, currency, \
-             faction standing, curse, or attribute that does not fit a field above \
-             (e.g. \"start me with 200 gold and -20 rep with the guards\"), route it \
-             into custom_tags as a flat {key: value} string map (e.g. \
-             {\"starting_currency\":\"200 gold\",\"guard_reputation\":\"-20\"}). Never \
-             duplicate a core or optional field as a custom tag.\n\n",
+             naturally: distinguishing_marks, weakness.\n\
+             MONEY (2026-08-22 Chloe ruling): if the player mentions starting money \
+             (\"3 gold\", \"five dollars\"), route it into inventory.stored as ONE \
+             short coin entry (\"3 gold\", \"coin pouch (5 dollars)\"). Carried coin \
+             is an inventory item, nothing more. NEVER capture wealth, currency, \
+             fame, popularity, or reputation as draft fields or custom tags — \
+             those are live tracker state, learned in play; they NEVER appear on \
+             a player card.\n\
+             CUSTOM EXTENSIONS — if the player mentions a genuine static trait \
+             that does not fit a field above (a curse, a blessing, an unusual \
+             attribute), route it into custom_tags as a flat {key: value} string \
+             map. Never duplicate a core or optional field as a custom tag; money \
+             and standings never ride custom tags.\n\n",
         ),
         "sim" => out.push_str(
             "TURN 1 IS A TYPE ROUTER. First decide card_type — one of \"npc\" \
@@ -11596,8 +12388,13 @@ fn build_creator_assistant_system_prompt(creator_kind: &str) -> String {
              WORLD BRANCH (card_type \"world\"): directive (the world's purpose), setting \
              (the world's identity) — all mandatory.\n\
              SHARED (all branches): custom_tags = optional flat {key:value} string map \
-             for anything that doesn't fit a field above (currency, faction standing, \
-             curse, custom attribute). PROPERTIES (optional, all branches — surface \
+             for a genuine static trait that doesn't fit a field above (a curse, a \
+             blessing, a custom attribute). MONEY (2026-08-22 Chloe ruling): starting \
+             coin for an npc routes into the inventory's stored array as ONE short \
+             entry (\"50 gold\") — carried coin is an inventory item, nothing more. \
+             NEVER capture wealth, currency, fame, popularity, or reputation \
+             anywhere on the card — those are live tracker state, learned in play. \
+             PROPERTIES (optional, all branches — surface \
              only if raised): draft.properties, an array of {id, node, kind, revenue, \
              upkeep, owner?, price?} — authored holdings that seed the world's economy \
              at play start. id/node are short slugs (node = the property's place), kind \
@@ -11617,7 +12414,10 @@ fn build_creator_assistant_system_prompt(creator_kind: &str) -> String {
              missing intro with no intro_answered marker means you never asked — \
              that draft is invalid). An imported card's first_mes / \
              alternate_greetings (in the <import> block) count as an agreed intro — \
-             confirm + carry them into draft.intro rather than rewriting.\n\n",
+             the import seeds draft.intro + draft.intro_variants mechanically with \
+             them; confirm + keep them (draft.intro may be polished if the player \
+             asks; draft.intro_variants carries every alternate opening verbatim \
+             and must never be dropped or rewritten).\n\n",
         ),
         "codex" => out.push_str(
             "entries (array of objects each {title, tags:[short keywords], body}). One \
@@ -11882,7 +12682,7 @@ const STAGE2: LeanCaps = LeanCaps {
 /// budget arithmetic: fixed overhead (AGENT prose ~3.4k + bracket list
 /// ~4.0k + wrappers ~180) + the worst pinned window (~1.95k at the raised
 /// TRACKER_ASSISTANT_CHAR_CAP) + 18,000 ≈ 27.7k against the derived
-/// TRACKER_PROMPT_CHAR_BUDGET (~28.6k) — the pin guards the remainder
+/// TRACKER_PROMPT_CHAR_BUDGET (~27.6k at the 512-token wall) — the pin guards the remainder
 /// against authored-prose growth (Prime Directive: shrink the prompt, never
 /// raise the context). A real campaign's world state renders ~1-3k (the
 /// 2026-08-21 Liam playtest: ~790); the count-cap composition (every line
@@ -12465,6 +13265,11 @@ async fn fable_send(
     // left a user tail): here the assistant message STAYS, stashed into
     // variants, and we regenerate from the user turn BEFORE it.
     reroll: Option<bool>,
+    // (2026-08-22 Ghost Writer) An optional player steer for a GUIDED
+    // reroll (the composer's ghost Swipe with a typed nudge). Sanitized to
+    // a capped non-empty string and rendered as a `<direction>` block LAST
+    // in the narrator turn tail — see `ghostwriter::swipe_direction`.
+    guidance: Option<String>,
 ) -> Result<(), String> {
     tracing::info!(?text, regenerate, reroll, "fable_send");
     // `regenerate: Some(true)` is set by the frontend after a rewind-and-edit
@@ -12550,6 +13355,11 @@ async fn fable_send(
         .load(std::sync::atomic::Ordering::SeqCst);
     let regenerate = regenerate.unwrap_or(false);
     let reroll = reroll.unwrap_or(false);
+    // (2026-08-22 Ghost Writer) The guided-reroll steer: trim + char-cap;
+    // absent/blank means an ordinary unguided turn.
+    let guidance: Option<String> = guidance
+        .map(|g| ghostwriter::cap_nudge(&g))
+        .filter(|g| !g.is_empty());
 
     // (2026-08-16 audit LOW) Reroll/regenerate contract checks HOISTED to the
     // top: they used to run AFTER the referee block — an invalid reroll paid
@@ -12671,6 +13481,18 @@ async fn fable_send(
     // back, and the re-fired tick duplicated them.
     let directives_at_turn_start: Vec<String> =
         state.pending_tick_directives.lock().await.clone();
+
+    // (2026-08-22) TURN NOTICES — player-facing bubbles for the silent state
+    // changes a turn makes (referee injuries, automatic equips/stows/spills).
+    // FN-SCOPED ON PURPOSE: the referee block below pushes the injury notice
+    // here, the tracker-stage bracket apply appends the inventory ones, and
+    // the whole set is flushed ONLY when the turn COMMITS (the session
+    // install at the tail) — a cancelled / errored / reverted turn never
+    // leaves a bubble claiming an injury or equip its revert just undid.
+    // (The hoist also fixes a compile break in the first cut of this
+    // feature: the vec used to be declared inside the schema-lock block and
+    // die with it while the tracker stage still referenced it.)
+    let mut turn_notices: Vec<(&'static str, String)> = Vec::new();
 
     let (world_state, pacing, mut turn_directives, referee_undo) = {
         let mut s = state.fable_schema.lock().await;
@@ -12836,7 +13658,7 @@ async fn fable_send(
             combined
         };
         let combat_directive: Option<String> = if let Some(outcome) =
-            player_state::referee_evaluate_with_tier(
+            player_state::referee_evaluate_live(
                 &text,
                 &s.player_state,
                 attacker_tier,
@@ -12857,6 +13679,17 @@ async fn fable_send(
                 attacker_tier = ?attacker_tier,
                 "referee fired on combat/exertion keyword"
             );
+            // (2026-08-22 playtest) The injury was assigned with ZERO
+            // player-facing signal — the friend "never found out he was even
+            // injured" until the prose happened to mention a limp. The
+            // turn-notice bubble says it — BUFFERED into `turn_notices` and
+            // flushed only at turn COMMIT: a cancelled/reverted turn must
+            // not leave a bubble claiming an injury its schema revert just
+            // undid (2026-08-22 Chloe ruling).
+            turn_notices.push((
+                "injury",
+                player_state::referee_notice_text(&outcome),
+            ));
             if undo_snapshot.is_none() {
                 undo_snapshot = Some(s.clone());
             }
@@ -12979,7 +13812,7 @@ async fn fable_send(
                 ));
             }
             if let Some((part, new_state)) = &r.healed {
-                if matches!(new_state, player_state::BodyPartState::Transparent) {
+                if matches!(new_state, player_state::BodyPartState::Healthy) {
                     line.push_str(&format!("; the {} is fully healed", part.id()));
                 } else {
                     line.push_str(&format!(
@@ -13129,12 +13962,19 @@ async fn fable_send(
     // still performed — the API narrator consumes it (10091-ish call site)
     // and `codex_was_injected` gates archival echo-skip on it — it just never
     // enters the tracker's context budget.
+    // (2026-08-22 tracker feedback loop) CONSUME the reject-feedback slot
+    // (take-and-clear): last turn's rejected emissions render as the
+    // `<emit_errors>` block in THIS tracker prompt, then the slot stays
+    // empty until this turn's apply repopulates it — a corrected tracker
+    // drops the block on the very next turn (zero echo when healthy).
+    let tracker_emit_errors = std::mem::take(&mut *state.tracker_emit_errors.lock().await);
     let system_prompt = build_narrator_system_prompt(
         fable_prompts,
         &card,
         world_state.as_deref(),
         pacing,
         player_action.as_deref(),
+        &tracker_emit_errors,
     );
 
     // Append the user turn to the per-card game conversation, then window the
@@ -13295,7 +14135,18 @@ async fn fable_send(
                         .filter(|m| m.role == session::Role::Assistant)
                         .and_then(|m| m.base_schema.clone())
                 };
-                if let Some(b) = base_opt {
+                if let Some(mut b) = base_opt {
+                    // (2026-08-22 re-track hardening) The moment still
+                    // happened — only its prose is being re-rolled. Keep the
+                    // Rust-owned clock/calendar anchors OFF the revert so a
+                    // re-emission that omits [TIME]/[DATE] can't rewind the
+                    // world (the 2026-08-22 playtest rollback); both brackets
+                    // are absolute-set, so a faithful re-emission over the
+                    // preserved anchors is an idempotent no-op.
+                    {
+                        let live = state.fable_schema.lock().await;
+                        b.retain_revert_safe_anchors(&live);
+                    }
                     *state.fable_schema.lock().await = b;
                 }
             }
@@ -13371,7 +14222,7 @@ async fn fable_send(
         // headless prompt — the front-drain's silent bracket-protocol chop
         // hid for 19 turns last time).
         let tracker_prompt_opt: Option<String> =
-            match build_tracker_prompt_bounded(&system_prompt, &tracker_window) {
+            match build_tracker_prompt_bounded(&system_prompt, &tracker_window, settings::TRACKER_PROMPT_CHAR_BUDGET) {
                 Ok(p) => Some(p),
                 Err(rendered) => {
                     // (2026-08-21 Chloe ruling: NO degrade tier) The
@@ -13492,9 +14343,22 @@ async fn fable_send(
                     // hard facts, and the narrator has already seen the legal
                     // `location:` line + exits in `<world_state>`.
                     let (_, travel_rejects) =
-                        apply_phase3_bracket_commands(&tracker_parsed, &state, true, &tracker_window)
+                        apply_phase3_bracket_commands(&tracker_parsed, &state, true, &tracker_window, &mut turn_notices)
                             .await;
-                    turn_directives.extend(travel_rejects);
+                    // (2026-08-22) The apply's auto-inventory notices (equips,
+                    // stows, spills) COLLECT into the fn-scoped
+                    // `turn_notices` — they flush at turn COMMIT (see the
+                    // flush site at the session install), never here: a
+                    // cancelled turn reverts these very mutations.
+                    turn_directives.extend(travel_rejects.clone());
+                    // (2026-08-22 tracker feedback loop) The tracker sees its
+                    // own rejects NEXT turn (distilled + capped) — the
+                    // narrator keeps its copies above. Before this the local
+                    // model never learned an emission was illegal and
+                    // repeated it every turn (the 2026-08-22 playtest's
+                    // [NPC_ITEM player +coppers] loop).
+                    *state.tracker_emit_errors.lock().await =
+                        distill_tracker_emit_errors(&travel_rejects);
                     tick_armed =
                         apply_time_command_and_maybe_tick(&tracker_parsed, &state).await;
                 } else {
@@ -13618,11 +14482,13 @@ async fn fable_send(
                 )
             })
         });
+        let swipe_direction_block = guidance.as_deref().map(ghostwriter::swipe_direction);
         let narrator_turn_tail = build_narrator_turn_tail(
             player_action.as_deref(),
             narrator_world_state.as_deref(),
             pacing,
             repeat_guard.as_deref(),
+            swipe_direction_block.as_deref(),
         );
         // ---- Stage 2: NARRATOR (API, or LOCAL in dev with no API) ----
         // The launch gate + the top-of-fable_send guard guarantee an active
@@ -14202,6 +15068,7 @@ async fn fable_send(
         );
     } else {
         let post_tracker_schema = state.fable_schema.lock().await.clone();
+        let mut reroll_intro_beat = false;
         {
             let mut gs = state.fable_session.lock().await;
             if reroll {
@@ -14209,6 +15076,7 @@ async fn fable_send(
                 // push_variant_with_schema seeds variant 0 from the current content
                 // on the first reroll + appends the new variant + its schema.
                 if let Some(m) = gs.messages.last_mut() {
+                    reroll_intro_beat = m.is_intro;
                     m.push_variant_with_schema(
                         parsed.prose.clone(),
                         reply.raw_output.clone(),
@@ -14233,6 +15101,22 @@ async fn fable_send(
             }
         }
 
+        // (2026-08-22 intro variants) A reroll of the OPENING beat creates a
+        // new card `<intro>` variant too — the in-game-authored opening set
+        // grows with every roll ("creating new variants" persists into the
+        // card). BEST-EFFORT by design: the roll already lives in the
+        // session; discarding it because a card write hiccupped would throw
+        // away a good beat (the strict contract belongs to the EDIT path,
+        // where the user's explicit ask is the card write).
+        if reroll_intro_beat {
+            if let Err(e) = write_intro_variant_to_card(&app, &card.id, None, &parsed.prose) {
+                tracing::warn!(
+                    error = %e,
+                    "intro reroll: appending the new opening to the card failed (the session keeps the roll)"
+                );
+            }
+        }
+
         // Auto-save (best-effort, fire-and-forget). Every narrator turn writes
         // the reserved `autosave` slot so the player never loses more than one
         // turn to a crash / quit. The save is small JSON (a few KB) and runs on
@@ -14246,6 +15130,24 @@ async fn fable_send(
     }
     // (P2-7) end session-swapped tail guard: the loaded save owns the slot —
     // no commit, no autosave.
+
+    // (2026-08-22 Chloe ruling) COMMIT-FLUSH of the buffered turn notices
+    // (referee injuries + auto-inventory moves). Every revert path above —
+    // soft cancel, abort, dev error, api_lost, empty prose, the mid-tail
+    // session swap — has already returned WITHOUT reaching this line, so a
+    // bubble only ever pops for a turn that actually landed: the beat is
+    // installed, the schema mutations are persistent, and the autosave
+    // captured them. A swapped-mid-tail turn drops its notices with the
+    // commit (the loaded save owns the world now).
+    if !session_swapped_mid_tail {
+        for (kind, text) in turn_notices.drain(..) {
+            let _ = on_event.send(serde_json::json!({
+                "type": "turn_notice",
+                "kind": kind,
+                "text": text,
+            }));
+        }
+    }
 
     // (2026-08-15 audit fix) The done event's send failure must NOT eat the
     // armed world tick: a dead channel means the frontend is gone, but the
@@ -14998,12 +15900,17 @@ async fn fable_end(
             .map_err(|e| format!("game engine shutdown join: {e}"))?;
     }
 
-    // 2. Per-card persistence. Best-effort: a failure logs a warning but
-    //    doesn't block fable_end — the in-memory state is cleared regardless;
-    //    the user just loses the resume point on a disk error, not the running
-    //    game. Save session + schema under the roleplay id
-    //    (apps/fable/{sessions,schemas}/<card_id>.json).
+    // 2. Per-session persistence (2026-08-22: the session folder under
+    //    data/saves/<CardName>/<session_id>/, not the card folder).
+    //    Best-effort: a failure logs a warning but doesn't block fable_end —
+    //    the in-memory state is cleared regardless; the user just loses the
+    //    resume point on a disk error, not the running game.
     let roleplay_card_id = state.active_card_id.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let active_session = state
+        .active_session_id
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
     // Belt-and-braces: only persist per-card state when a game is actually
     // active. A leaked active_card_id (e.g. a failed enter_fable_session)
     // must never pair with default/empty snapshots here — that combination
@@ -15015,11 +15922,15 @@ async fn fable_end(
         .unwrap_or_else(|e| e.into_inner())
         .is_some();
     if game_active && roleplay_card_id != memory::WUPI_CARD_ID {
-        let schema_snapshot = state.fable_schema.lock().await.clone();
-        let session_snapshot = state.fable_session.lock().await.clone();
-        save_schema(&app, &roleplay_card_id, &schema_snapshot).await;
-        save_session(&app, &roleplay_card_id, &session_snapshot).await;
-        tracing::info!(card_id = %roleplay_card_id, "per-card state saved");
+        if let Some(session_id) = active_session.as_deref() {
+            let schema_snapshot = state.fable_schema.lock().await.clone();
+            let session_snapshot = state.fable_session.lock().await.clone();
+            save_schema(&app, &roleplay_card_id, session_id, &schema_snapshot).await;
+            save_session(&app, &roleplay_card_id, session_id, &session_snapshot).await;
+            tracing::info!(card_id = %roleplay_card_id, session_id = %session_id, "per-session state saved");
+        } else {
+            tracing::warn!(card_id = %roleplay_card_id, "fable_end: no active session id — skipping session persistence");
+        }
     }
 
     // 3. Restore the pre-game card id + clear the game-scoped state.
@@ -15033,6 +15944,7 @@ async fn fable_end(
     *state.active_fable_card.lock().unwrap_or_else(|e| e.into_inner()) = None;
     *state.active_player_id.lock().unwrap_or_else(|e| e.into_inner()) = None;
     *state.active_player_cache.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    *state.active_session_id.lock().unwrap_or_else(|e| e.into_inner()) = None;
 
     // 4. Clear any leftover game cancel token.
     // (2026-08-16 audit LOW) BOTH fable-side slots: the in-flight guard at
@@ -15067,6 +15979,9 @@ async fn fable_end(
     }
     state.failed_progression_queue.lock().await.clear();
     state.failed_translation_queue.lock().await.clear();
+    // (2026-08-22 tracker feedback loop) Reject feedback is one-shot per
+    // timeline too — a dead session's rejects never reach a new one.
+    state.tracker_emit_errors.lock().await.clear();
     // (2026-08-16 audit fix #11) An armed manual player_action (Consume/
     // Equip from the Soul Gem panel) is a tactile intent of THIS game — it
     // must never fire as a hard fact in a different card's first turn.
@@ -15451,22 +16366,24 @@ async fn prism_gallery_delete(
     Ok(())
 }
 
-/// List all save slots for a card. Used by the Load Game screen. Most-recent
-/// first (sorted in `fable_save::list_saves`). Returns an empty Vec when the
-/// card has no saves dir yet (fresh install / never saved).
+/// List all save slots for one session of a card (2026-08-22: saves are
+/// session-scoped — `fable_sessions_list` enumerates the folders). Used by
+/// the Load Game popup. Most-recent first (sorted in `fable_save::list_saves`).
+/// Returns an empty Vec when the session has no saves dir yet.
 #[tauri::command]
 fn fable_list_saves(
     card_id: String,
+    session_id: String,
     app: tauri::AppHandle,
 ) -> Result<Vec<fable_save::SaveMeta>, String> {
     let fable_root = resolve_apps_dir(&app).join("fable");
-    fable_save::list_saves(&fable_root, &card_id)
-        .map_err(|e| format!("list saves for '{card_id}': {e}"))
+    fable_save::list_saves(&fable_root, &card_id, &session_id)
+        .map_err(|e| format!("list saves for '{card_id}/{session_id}': {e}"))
 }
 
 /// Read the canonical PlayerState for the active Fable game (Seam #7).
 /// Returns it as a JSON value the frontend's mannequin/stats panel renders
-/// directly: `{ body: { head: "Transparent", left_bicep: "Orange", ... },
+/// directly: `{ body: { head: "Healthy", left_bicep: "Orange", ... },
 /// stamina: "Winded", health: "Fair", wealth: 12, reputation: -3 }`. Body
 /// part keys are the 16 stable `id()` strings ("head", "left_bicep", …);
 /// values are the `BodyPartState` variants serialized as their PascalCase
@@ -15598,10 +16515,39 @@ fn fable_active_card_get(
         let npc_names: Vec<serde_json::Value> = c.cast.iter().map(|n| {
             serde_json::json!({ "id": n.id, "name": n.name })
         }).collect();
+        // (2026-08-22) The header name is the ATTACHED SavedPlayer's name,
+        // walker-resolved from `active_player_id` — the single authority for
+        // every attach path (fresh start, session resume, save-slot swap).
+        // The in-memory card anchor only reflects the attach when the card
+        // object itself was the mutation target; reads that re-resolve the
+        // card (or a session whose card never carried `<player_name>`, which
+        // v2 cards never do) fell back to "" and the user beats read "You".
+        let attached_player_name = state
+            .active_player_id
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_deref()
+            .and_then(|pid| {
+                let players_root = resolve_fable_players_dir(&app);
+                resolve_player_folder(&players_root, pid)
+                    .and_then(|folder| {
+                        let stem = folder
+                            .file_name()
+                            .and_then(|n| n.to_str())
+                            .unwrap_or("Player")
+                            .to_owned();
+                        load_player_at(&folder.join(format!("{stem}.player")))
+                            .or_else(|| load_player_at(&folder.join(format!("{stem}.json"))))
+                    })
+                    .map(|sp| sp.name.trim().to_owned())
+                    .filter(|n| !n.is_empty())
+            });
         serde_json::json!({
             "name": c.name,
             "subtype": c.subtype.clone(),
-            "player_name": c.player_name.clone().unwrap_or_default(),
+            "player_name": attached_player_name
+                .or_else(|| c.player_name.clone())
+                .unwrap_or_default(),
             "card_id": c.id,
             "card_portrait_url": card_portrait_url,
             "player_portrait_url": player_portrait_url,
@@ -15684,12 +16630,14 @@ async fn fable_schema_set(
         let mut s = state.fable_schema.lock().await;
         *s = new_schema;
     }
-    // Persist the edited schema per-card (best-effort, mirrors the autosave
+    // Persist the edited schema per-session (best-effort, mirrors the autosave
     // contract — a disk error is logged, not surfaced, since the in-memory
     // state already holds the edit).
     let roleplay_card_id = state.active_card_id.lock().unwrap_or_else(|e| e.into_inner()).clone();
     let schema_snapshot = state.fable_schema.lock().await.clone();
-    save_schema(&app, &roleplay_card_id, &schema_snapshot).await;
+    if let Ok(session_id) = active_session_or_err(&state) {
+        save_schema(&app, &roleplay_card_id, &session_id, &schema_snapshot).await;
+    }
     tracing::info!(card_id = %roleplay_card_id, "fable_schema_set: manual edit applied + persisted");
     Ok(())
 }
@@ -15940,9 +16888,15 @@ fn fable_player_raw_set(id: String, xml: String, app: tauri::AppHandle) -> Resul
     Ok(())
 }
 
-/// Read the raw text of one of the active card's JSON files (`world` /
-/// `player` / `npc`). `kind` is one of those three strings. The raw editor's
-/// load path for the World / Player / NPC tabs. NotFound → empty string.
+/// Read the raw text of one of the ACTIVE SESSION's split JSON files
+/// (`world` / `player` / `npc`). `kind` is one of those three strings. The raw
+/// editor's load path for the World / NPC tabs. (2026-08-22 session
+/// decoupling) The splits live at `data/saves/<CardName>/<session_id>/
+/// <kind>.json` — the SAME root `fable_json_raw_set` persists through via
+/// `save_schema`, NOT the retired card-folder path (this getter kept reading
+/// `cards/<Name>/<Name>.<kind>.json` after the move, so every read was
+/// NotFound and the tabs always opened empty). NotFound → empty string (the
+/// only live window is between session mint and the entry-time schema write).
 #[tauri::command]
 fn fable_json_raw_get(
     kind: String,
@@ -15950,19 +16904,21 @@ fn fable_json_raw_get(
     app: tauri::AppHandle,
 ) -> Result<String, String> {
     let card_id = active_roleplay_card_id(&state)?;
-    let ext = match kind.as_str() {
+    let session_id = active_session_or_err(&state)?;
+    let file = match kind.as_str() {
         "world" => "world.json",
         "player" => "player.json",
         "npc" => "npc.json",
         _ => return Err(format!("unknown kind '{kind}' (world|player|npc)")),
     };
-    let cards_root = resolve_fable_cards_dir(&app)
-        .ok_or_else(|| "no apps/fable/cards/ dir resolved".to_string())?;
-    let path = resolve_card_file(&cards_root, &card_id, ext);
+    let fable_root = resolve_fable_root(&app)
+        .ok_or_else(|| "no apps/fable/ dir resolved".to_string())?;
+    let path =
+        fable_save::resolve_session_root(&fable_root, &card_id, &session_id).join(file);
     match std::fs::read_to_string(&path) {
         Ok(t) => Ok(t),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
-        Err(e) => Err(format!("read {ext}: {e}")),
+        Err(e) => Err(format!("read {file}: {e}")),
     }
 }
 
@@ -16118,7 +17074,8 @@ async fn fable_json_raw_set(
         *s = new_schema;
     }
     // Persist the recomposed schema to the three split files + return.
-    save_schema(&app, &card_id, &state.fable_schema.lock().await.clone()).await;
+    let session_id = active_session_or_err(&state)?;
+    save_schema(&app, &card_id, &session_id, &state.fable_schema.lock().await.clone()).await;
     // (2026-08-21) ALSO refresh the reserved autosave slot. A save-slot resume
     // installs the save's embedded schema wholesale (the save is authoritative),
     // so a manual raw edit that only touched the live schema + the split files
@@ -16132,11 +17089,9 @@ async fn fable_json_raw_set(
     Ok(())
 }
 
-/// Read the active card's `.codex` text (raw, for the raw editor) + as parsed
-/// entries (for the prose dropdown). One IPC serves both: the dropdown reads
-/// `entries`, the editor reads `raw`. `raw` is the file's verbatim text
-/// (empty string when no `.codex` exists yet — a fresh card). `entries` is the
-/// parsed `{title, tags, body}` list (empty Vec when none).
+/// Read a codex file's text (raw, for the raw editor) + as parsed entries
+/// (for the prose view). One IPC serves both: the prose view reads
+/// `entries`, the editor reads `raw`. `raw` is the file's verbatim text.
 #[derive(serde::Serialize)]
 struct FableCodexRead {
     raw: String,
@@ -16148,21 +17103,95 @@ struct FableCodexEntry {
     tags: Vec<String>,
     body: String,
 }
+
+// ── (2026-08-22 Codex decoupling) the UNIVERSAL library surface ─────────────
+// Codex files live in `apps/fable/data/codex/<Name>.codex` — shared across
+// cards, linked per-card via the `<linked_codices>` sibling (priority
+// order). All name→path resolution is WALKER-based (enumerate + stem match,
+// case-insensitive): a hostile name resolves to nothing, the card-folder
+// discipline.
+
+/// `apps/fable/data/codex/` — the universal codex library root.
+fn resolve_codex_dir(app: &tauri::AppHandle) -> Option<std::path::PathBuf> {
+    resolve_fable_root(app).map(|r| r.join("data").join("codex"))
+}
+
+/// Walker-resolve a library name to its `.codex` file. Case-insensitive
+/// stem match against ENUMERATED files only — never a raw path join.
+pub(crate) fn resolve_codex_file(codex_dir: &std::path::Path, name: &str) -> Option<std::path::PathBuf> {
+    let cleaned = name.trim().strip_suffix(".codex").unwrap_or(name.trim());
+    if cleaned.is_empty() {
+        return None;
+    }
+    let entries = std::fs::read_dir(codex_dir).ok()?;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path
+            .extension()
+            .and_then(|x| x.to_str())
+            .map(|x| x.eq_ignore_ascii_case("codex"))
+            != Some(true)
+        {
+            continue;
+        }
+        if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+            if stem.eq_ignore_ascii_case(cleaned) {
+                return Some(path);
+            }
+        }
+    }
+    None
+}
+
+/// A library row: display name (file stem) + parsed entry count.
+#[derive(serde::Serialize)]
+struct CodexLibraryItem {
+    name: String,
+    entry_count: usize,
+}
+
+/// List the universal codex library, name-sorted.
 #[tauri::command]
-fn fable_codex_get(
-    state: tauri::State<'_, AppState>,
-    app: tauri::AppHandle,
-) -> Result<FableCodexRead, String> {
-    let card_id = active_roleplay_card_id(&state)?;
-    let cards_root = resolve_fable_cards_dir(&app)
-        .ok_or_else(|| "no apps/fable/cards/ dir resolved".to_string())?;
-    let path = resolve_card_file(&cards_root, &card_id, "codex");
-    let raw = match std::fs::read_to_string(&path) {
-        Ok(t) => t,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
-        Err(e) => return Err(format!("read codex: {e}")),
-    };
-    let entries = codex::parse_compound_text(&raw, &card_id)
+fn fable_codex_library_list(app: tauri::AppHandle) -> Result<Vec<CodexLibraryItem>, String> {
+    let dir = resolve_codex_dir(&app)
+        .ok_or_else(|| "no apps/fable/data/codex/ dir resolved".to_string())?;
+    let mut out = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(&dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path
+                .extension()
+                .and_then(|x| x.to_str())
+                .map(|x| x.eq_ignore_ascii_case("codex"))
+                != Some(true)
+            {
+                continue;
+            }
+            let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+                continue;
+            };
+            let count = codex::parse_compound_file(&path)
+                .map(|entries| entries.len())
+                .unwrap_or(0);
+            out.push(CodexLibraryItem {
+                name: stem.to_owned(),
+                entry_count: count,
+            });
+        }
+    }
+    out.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+    Ok(out)
+}
+
+/// Read one library codex by name (walker-resolved — unknown name → Err).
+#[tauri::command]
+fn fable_codex_file_read(name: String, app: tauri::AppHandle) -> Result<FableCodexRead, String> {
+    let dir = resolve_codex_dir(&app)
+        .ok_or_else(|| "no apps/fable/data/codex/ dir resolved".to_string())?;
+    let path = resolve_codex_file(&dir, &name)
+        .ok_or_else(|| format!("no codex named '{name}' in the library"))?;
+    let raw = std::fs::read_to_string(&path).map_err(|e| format!("read codex: {e}"))?;
+    let entries = codex::parse_compound_text(&raw, &name)
         .into_iter()
         .map(|e| FableCodexEntry {
             title: e.title,
@@ -16173,60 +17202,154 @@ fn fable_codex_get(
     Ok(FableCodexRead { raw, entries })
 }
 
-/// Read an EXPLICIT card's `.codex` by id (no active-game requirement). Mirrors
-/// `fable_codex_get` for the New Game flow, where codex presence is detected
-/// before any game is active (no seated card → `active_roleplay_card_id` would
-/// fail). Same `FableCodexRead` shape (raw + entries); NotFound → empty raw +
-/// empty entries (i.e. "no codex").
+/// Atomically write one library codex by name (walker-resolved — the name
+/// must already exist in the library; creation goes through the Creator's
+/// `fable_codex_create_for_card`). No structural validation — `.codex` is
+/// freeform authored prose; the parser is tolerant (entries without `---`
+/// fences parse as one body-only entry).
 #[tauri::command]
-fn fable_codex_get_by_id(card_id: String, app: tauri::AppHandle) -> Result<FableCodexRead, String> {
-    let cards_root = resolve_fable_cards_dir(&app)
-        .ok_or_else(|| "no apps/fable/cards/ dir resolved".to_string())?;
-    let path = resolve_card_file(&cards_root, &card_id, "codex");
-    let raw = match std::fs::read_to_string(&path) {
-        Ok(t) => t,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
-        Err(e) => return Err(format!("read codex: {e}")),
-    };
-    let entries = codex::parse_compound_text(&raw, &card_id)
-        .into_iter()
-        .map(|e| FableCodexEntry {
-            title: e.title,
-            tags: e.tags,
-            body: e.body,
-        })
-        .collect();
-    Ok(FableCodexRead { raw, entries })
-}
-
-/// Atomically write the active card's `.codex` text (the raw editor's save
-/// path for the Codex tab). No structural validation — `.codex` is freeform
-/// authored prose; the parser is tolerant (entries without `---` fences parse
-/// as one body-only entry). Created on first write.
-#[tauri::command]
-fn fable_codex_raw_set(
-    text: String,
-    state: tauri::State<'_, AppState>,
-    app: tauri::AppHandle,
-) -> Result<(), String> {
-    let card_id = active_roleplay_card_id(&state)?;
-    let cards_root = resolve_fable_cards_dir(&app)
-        .ok_or_else(|| "no apps/fable/cards/ dir resolved".to_string())?;
-    let card_dir = resolve_card_dir(&cards_root, &card_id);
-    std::fs::create_dir_all(&card_dir).map_err(|e| format!("mkdir card folder: {e}"))?;
-    let path = resolve_card_file(&cards_root, &card_id, "codex");
+fn fable_codex_file_write(name: String, text: String, app: tauri::AppHandle) -> Result<(), String> {
+    let dir = resolve_codex_dir(&app)
+        .ok_or_else(|| "no apps/fable/data/codex/ dir resolved".to_string())?;
+    let path = resolve_codex_file(&dir, &name)
+        .ok_or_else(|| format!("no codex named '{name}' in the library"))?;
     write_atomic(&path, text.as_bytes()).map_err(|e| format!("write codex: {e}"))?;
-    tracing::info!(card_id = %card_id, "fable_codex_raw_set: .codex written");
+    tracing::info!(name = %name, "fable_codex_file_write: library codex written");
     Ok(())
 }
 
-/// Write a sibling text file (`.intro` or `.codex`) under an EXPLICIT card_id's
-/// folder. Used by the new Creators (NPC/World/Scenario) at CREATE time, when
-/// no card is active yet (so the `active_roleplay_card_id`-keyed raw-file IPCs
-/// don't apply). `ext` MUST be "intro" or "codex" (the only text siblings this
-/// exposes; the `.sim` is written by `fable_write_card`, the JSON state files
-/// by their own IPCs). Atomic write (temp+fsync+rename). Empty text is allowed
-/// (writes an empty file / no-op for the intro). Created on first write.
+/// The `<linked_codices>` list of an explicit card, in priority order.
+#[tauri::command]
+fn fable_codex_link_get(card_id: String, app: tauri::AppHandle) -> Result<Vec<String>, String> {
+    let cards_root = resolve_fable_cards_dir(&app)
+        .ok_or_else(|| "no apps/fable/cards/ dir resolved".to_string())?;
+    let path = resolve_card_file(&cards_root, &card_id, "sim");
+    let xml = std::fs::read_to_string(&path).map_err(|e| format!("read card: {e}"))?;
+    let card = sim_card::parse_from_xml_str(&xml).map_err(|e| format!("parse card: {e}"))?;
+    Ok(card.linked_codices)
+}
+
+/// Replace a card's `<linked_codices>` list (priority order — index 0 = top
+/// priority). Names are validated against the library (unknown name → Err);
+/// the `.sim` rewrite goes through `sim_card::with_linked_codices` (the
+/// canonical re-serialize for v2 cards, the verbatim-preserving tail-splice
+/// for legacy-verbatim cards). An EMPTY list is valid — it's the
+/// unlink-everything signal. When the card is the ACTIVE game's card, a
+/// live re-seed fires on every change INCLUDING the empty list (the priority
+/// merge + source-scoped reconcile make link changes effective immediately,
+/// mid-session; zero links leaves every stored row unconsumed → purged).
+#[tauri::command]
+async fn fable_codex_link_set(
+    card_id: String,
+    codices: Vec<String>,
+    state: tauri::State<'_, AppState>,
+    app: tauri::AppHandle,
+) -> Result<(), String> {
+    let cards_root = resolve_fable_cards_dir(&app)
+        .ok_or_else(|| "no apps/fable/cards/ dir resolved".to_string())?;
+    let codex_dir = resolve_codex_dir(&app)
+        .ok_or_else(|| "no apps/fable/data/codex/ dir resolved".to_string())?;
+    // Validate every name against the library (canonicalized through
+    // clean_codex_names + the walker).
+    let cleaned = sim_card::clean_codex_names(&codices);
+    for name in &cleaned {
+        if resolve_codex_file(&codex_dir, name).is_none() {
+            return Err(format!("no codex named '{name}' in the library"));
+        }
+    }
+    let path = resolve_card_file(&cards_root, &card_id, "sim");
+    let xml = std::fs::read_to_string(&path).map_err(|e| format!("read card: {e}"))?;
+    let out_xml = sim_card::with_linked_codices(&xml, &cleaned)
+        .map_err(|e| format!("linked_codices rewrite: {e:#}"))?;
+    write_atomic(&path, out_xml.as_bytes()).map_err(|e| format!("write card: {e}"))?;
+    tracing::info!(card_id = %card_id, links = cleaned.len(), "fable_codex_link_set: links written");
+
+    // Live re-seed when this card is the active game. Runs on the EMPTY
+    // list too (2026-08-22 unlink-all fix): the source-scoped reconcile
+    // purges every stored lore row when the last link is removed — the old
+    // `!cleaned.is_empty()` gate skipped the seed entirely, so a
+    // fully-unlinked card's rows kept surfacing in <retrieved_memory>
+    // forever.
+    let active_card = state
+        .active_fable_card
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    if let Some(card) = active_card {
+        if card.id == card_id {
+            if let Some(memory_engine) = state.memory.get() {
+                let me = Arc::clone(memory_engine);
+                let links: Vec<codex::LinkedCodex> = cleaned
+                    .iter()
+                    .filter_map(|name| {
+                        resolve_codex_file(&codex_dir, name)
+                            .map(|path| codex::LinkedCodex { name: name.clone(), path })
+                    })
+                    .collect();
+                let card_id_owned = card_id.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = codex::seed_linked_codices(&me, &links, &card_id_owned).await {
+                        tracing::warn!(
+                            card_id = %card_id_owned,
+                            error = %format!("{e:#}"),
+                            "live codex re-seed after link_set failed"
+                        );
+                    }
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The Creator CODEX wizard's persist step (2026-08-22): write the authored
+/// compound text into the UNIVERSAL library under the card's display name
+/// (`data/codex/<CardDisplayName>.codex` — card folders are unique, so the
+/// namesake codex is one-per-card; a re-run on the same card overwrites its
+/// own codex, the old sibling-write behavior) and auto-link it to the card
+/// (appended at LOWEST priority when links already exist — an existing
+/// higher-priority stack keeps its order).
+#[tauri::command]
+fn fable_codex_create_for_card(
+    card_id: String,
+    text: String,
+    app: tauri::AppHandle,
+) -> Result<String, String> {
+    let cards_root = resolve_fable_cards_dir(&app)
+        .ok_or_else(|| "no apps/fable/cards/ dir resolved".to_string())?;
+    let codex_dir = resolve_codex_dir(&app)
+        .ok_or_else(|| "no apps/fable/data/codex/ dir resolved".to_string())?;
+    std::fs::create_dir_all(&codex_dir).map_err(|e| format!("mkdir codex library: {e}"))?;
+    // The card's display folder name is the codex's library name.
+    let name = resolve_card_folder(&cards_root, &card_id)
+        .and_then(|p| p.file_name().and_then(|n| n.to_str()).map(str::to_owned))
+        .unwrap_or_else(|| crate::safe_display_stem(&card_id, "Codex"));
+    let path = codex_dir.join(format!("{}.codex", crate::safe_display_stem(&name, "Codex")));
+    write_atomic(&path, text.as_bytes()).map_err(|e| format!("write codex: {e}"))?;
+    // Auto-link (append when absent).
+    let sim_path = resolve_card_file(&cards_root, &card_id, "sim");
+    let xml = std::fs::read_to_string(&sim_path).map_err(|e| format!("read card: {e}"))?;
+    if let Ok(card) = sim_card::parse_from_xml_str(&xml) {
+        if !card.linked_codices.iter().any(|n| n.eq_ignore_ascii_case(&name)) {
+            let mut links = card.linked_codices.clone();
+            links.push(name.clone());
+            if let Ok(out_xml) = sim_card::with_linked_codices(&xml, &links) {
+                let _ = write_atomic(&sim_path, out_xml.as_bytes());
+            }
+        }
+    }
+    tracing::info!(card_id = %card_id, codex = %name, "fable_codex_create_for_card: library codex written + linked");
+    Ok(name)
+}
+
+/// Write a sibling text file (`.intro`) under an EXPLICIT card_id's folder.
+/// Used by the new Creators (NPC/World/Scenario) at CREATE time, when no
+/// card is active yet. (2026-08-22: ext `codex` is RETIRED — codex files
+/// are universal library members now; the Creator writes them via
+/// `fable_codex_create_for_card`.) `ext` MUST be "intro" (the only text
+/// sibling this exposes; the `.sim` is written by `fable_write_card`, the
+/// JSON state files by their own IPCs). Atomic write (temp+fsync+rename).
+/// Empty text is allowed. Created on first write.
 #[tauri::command]
 fn fable_card_sibling_write(
     card_id: String,
@@ -16234,8 +17357,10 @@ fn fable_card_sibling_write(
     text: String,
     app: tauri::AppHandle,
 ) -> Result<(), String> {
-    if ext != "intro" && ext != "codex" {
-        return Err(format!("unsupported sibling ext '{ext}': only intro/codex"));
+    if ext != "intro" {
+        return Err(format!(
+            "unsupported sibling ext '{ext}': only intro (codex files are universal library members — fable_codex_create_for_card)"
+        ));
     }
     let cards_root = resolve_fable_cards_dir(&app)
         .ok_or_else(|| "no apps/fable/cards/ dir resolved".to_string())?;
@@ -16245,6 +17370,45 @@ fn fable_card_sibling_write(
     write_atomic(&path, text.as_bytes()).map_err(|e| format!("write {ext}: {e}"))?;
     tracing::info!(card_id = %card_id, ext = %ext, "fable_card_sibling_write: sibling written");
     Ok(())
+}
+
+// ── (2026-08-22 session decoupling) the Session Manager surface ─────────────
+
+/// List a card's playthrough sessions (most-recently-played first). See
+/// `fable_save::list_sessions` for the derived fields.
+#[tauri::command]
+fn fable_sessions_list(
+    card_id: String,
+    app: tauri::AppHandle,
+) -> Result<Vec<fable_save::SessionMeta>, String> {
+    let fable_root = resolve_apps_dir(&app).join("fable");
+    fable_save::list_sessions(&fable_root, &card_id)
+        .map_err(|e| format!("list sessions for '{card_id}': {e}"))
+}
+
+/// Delete a whole session folder (all its saves + live state). Refuses the
+/// ACTIVE session (an in-game delete would orphant the running game's
+/// persistence). Idempotent on disk.
+#[tauri::command]
+fn fable_session_delete(
+    card_id: String,
+    session_id: String,
+    state: tauri::State<'_, AppState>,
+    app: tauri::AppHandle,
+) -> Result<(), String> {
+    {
+        let active = state
+            .active_session_id
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        if active.as_deref() == Some(session_id.as_str()) {
+            return Err("cannot delete the session that is currently running".into());
+        }
+    }
+    let fable_root = resolve_apps_dir(&app).join("fable");
+    fable_save::delete_session(&fable_root, &card_id, &session_id)
+        .map_err(|e| format!("delete session '{session_id}': {e}"))
 }
 
 /// Set/replace a card's `<intro>` block — the Fable opening narrator beat that
@@ -16272,7 +17436,12 @@ fn fable_card_set_intro(card_id: String, text: String, app: tauri::AppHandle) ->
     // same gate `fable_write_card` uses).
     let mut card = sim_card::parse_from_xml_str(&existing)
         .map_err(|e| format!("existing card failed to parse for set_intro: {e}"))?;
-    card.intro = text.trim().to_owned();
+    // (2026-08-22 intro variants) Setting the intro REPLACES the whole set:
+    // the variants list is what serialize_v2 emits now, so a stale list here
+    // would silently discard the edit. Empty text strips every variant.
+    let trimmed = text.trim().to_owned();
+    card.intro_variants = if trimmed.is_empty() { Vec::new() } else { vec![trimmed.clone()] };
+    card.intro = trimmed;
     let out = card.serialize_v2();
     sim_card::parse_from_xml_str(&out).map_err(|e| format!("set_intro rebuild invalid: {e}"))?;
     write_atomic(&path, out.as_bytes()).map_err(|e| format!("write card (set_intro): {e}"))?;
@@ -16642,14 +17811,16 @@ async fn fable_background_active_set(
             tracing::info!(filename = %name, "fable_background_active_set: selected");
         }
     }
-    // Persist the edited schema per-card (best-effort, mirrors fable_schema_set).
+    // Persist the edited schema per-session (best-effort, mirrors fable_schema_set).
     let roleplay_card_id = state
         .active_card_id
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .clone();
     let schema_snapshot = state.fable_schema.lock().await.clone();
-    save_schema(&app, &roleplay_card_id, &schema_snapshot).await;
+    if let Ok(session_id) = active_session_or_err(&state) {
+        save_schema(&app, &roleplay_card_id, &session_id, &schema_snapshot).await;
+    }
     Ok(())
 }
 
@@ -16991,8 +18162,8 @@ async fn fable_card_delete(
         return Err(format!("no card with id '{card_id}'"));
     }
     // Reap the DESKTOP shortcut (if any) BEFORE remove_dir_all — the in-folder
-    // .lnk + portrait.ico + saves tree are all caught by remove_dir_all below,
-    // but a `Launch <Name>.lnk` exported to the Desktop lives outside the card
+    // .lnk + portrait.ico are all caught by remove_dir_all below, but a
+    // `Launch <Name>.lnk` exported to the Desktop lives outside the card
     // folder. Best-effort: a NotFound / unresolvable Desktop is not fatal.
     let lnk_name = format!("Launch {}.lnk", card_shortcut_label(&sim_path, &card_id));
     if let Some(desk) = shortcut::desktop_dir() {
@@ -17001,6 +18172,20 @@ async fn fable_card_delete(
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => tracing::warn!(card_id = %card_id, err = %e, "desktop shortcut cleanup failed (continuing)"),
+        }
+    }
+    // (2026-08-22 session decoupling) The card's SESSION TREE dies with the
+    // card (every playthrough's saves + live state, keyed by the display
+    // folder name under data/saves/). The card's linked CODEX FILES are
+    // universal library members — they survive for other cards.
+    if let Some(fable_root) = resolve_fable_root(&app) {
+        if let Some(folder_name) = card_dir.file_name().and_then(|n| n.to_str()) {
+            let sessions_tree = fable_root.join("data").join("saves").join(folder_name);
+            if sessions_tree.is_dir() {
+                if let Err(e) = std::fs::remove_dir_all(&sessions_tree) {
+                    tracing::warn!(card_id = %card_id, err = %e, "card delete: session tree removal failed (continuing)");
+                }
+            }
         }
     }
     // (2026-08-15 audit fix) The memory partition key is the card's PARSED
@@ -17199,10 +18384,21 @@ async fn fable_save_now(
         let guard = state.active_fable_card.lock().unwrap_or_else(|e| e.into_inner());
         guard.clone().ok_or_else(|| "no active game: call fable_start first".to_string())?
     };
-    let (session, schema) = {
+    let session_id = active_session_or_err(&state)?;
+    // (2026-08-22 desync fix) The undo ring rides the snapshot — a manual
+    // save captures the tracker timeline exactly as it stands, rollbacks
+    // included.
+    let (session, schema, history) = {
         let session = state.fable_session.lock().await.clone();
         let schema = state.fable_schema.lock().await.clone();
-        (session, schema)
+        let history: Vec<(usize, schema::WorldSchema)> = state
+            .fable_schema_history
+            .lock()
+            .await
+            .iter()
+            .cloned()
+            .collect();
+        (session, schema, history)
     };
     let fable_root = resolve_apps_dir(&app).join("fable");
     let save_id_arg = save_id.clone();
@@ -17210,24 +18406,29 @@ async fn fable_save_now(
     let card_clone = card.clone();
     let session_clone = session.clone();
     let schema_clone = schema.clone();
+    let history_clone = history.clone();
+    let session_id_clone = session_id.clone();
     let fable_root_clone = fable_root.clone();
     let saved = tokio::task::spawn_blocking(move || {
         fable_save::write_save(
             &fable_root_clone,
             &card_clone,
+            &session_id_clone,
             &save_id_arg,
             &name_arg,
             &session_clone,
             &schema_clone,
+            &history_clone,
         )
     })
     .await
     .map_err(|e| format!("save join: {e}"))?
     .map_err(|e| format!("save write: {e}"))?;
-    tracing::info!(save_id = %saved.save_id, card_id = %saved.card_id, "game saved");
+    tracing::info!(save_id = %saved.save_id, card_id = %saved.card_id, session_id = %saved.session_id, "game saved");
     Ok(fable_save::SaveMeta {
         save_id: saved.save_id,
         card_id: saved.card_id,
+        session_id: saved.session_id,
         name: saved.name,
         summary: saved.summary,
         timestamp: saved.timestamp,
@@ -17273,12 +18474,14 @@ async fn fable_load_save(
         let guard = state.active_fable_card.lock().unwrap_or_else(|e| e.into_inner());
         guard.clone().ok_or_else(|| "no active game: call fable_start first".to_string())?
     };
+    let session_id = active_session_or_err(&state)?;
     let fable_root = resolve_apps_dir(&app).join("fable");
     let fable_root_clone = fable_root.clone();
     let cid = card.id.clone();
     let sid = save_id.clone();
+    let session_clone_for_load = session_id.clone();
     let save = tokio::task::spawn_blocking(move || {
-        fable_save::load_save(&fable_root_clone, &cid, &sid)
+        fable_save::load_save(&fable_root_clone, &cid, &session_clone_for_load, &sid)
     })
     .await
     .map_err(|e| format!("load join: {e}"))?
@@ -17294,6 +18497,7 @@ async fn fable_load_save(
     let meta = fable_save::SaveMeta {
         save_id: save.save_id,
         card_id: save.card_id,
+        session_id,
         name: save.name,
         summary: save.summary,
         timestamp: save.timestamp,
@@ -17325,7 +18529,55 @@ async fn fable_load_save(
     let mut loaded_schema = save.schema;
     loaded_schema.migrate_legacy_outfit();
     *state.fable_schema.lock().await = loaded_schema;
+    // (2026-08-21 resume-attach fix) Re-attach the SAVE's bound player: a
+    // slot switch can cross timelines run with different SavedPlayers — the
+    // loaded save's binding is authoritative, not whatever the previous
+    // timeline attached. fresh=false by construction (a resumed campaign's
+    // inventory + ledger are authoritative).
+    {
+        let loaded_player_id = state
+            .fable_session
+            .lock()
+            .await
+            .attached_player_id
+            .clone();
+        let mut schema_guard = state.fable_schema.lock().await;
+        let mut card_guard = state
+            .active_fable_card
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some(card) = card_guard.as_mut() {
+            attach_saved_player(
+                &app,
+                &state,
+                card,
+                &mut schema_guard,
+                loaded_player_id.as_deref(),
+                false,
+            );
+        }
+    }
     clear_fable_history(&state).await;
+    // (2026-08-22 desync fix) The loaded snapshot's undo ring restores here
+    // too — the warm swap keeps the exact-tracker-timeline guarantee the
+    // cold `fable_start` save-branch provides.
+    if !save.history.is_empty() {
+        let mut hist = state.fable_schema_history.lock().await;
+        for snap in &save.history {
+            hist.push_back((snap.tag, snap.schema.clone()));
+        }
+    }
+    // (2026-08-22 desync fix) The warm swap ALSO overwrites the session
+    // folder's live schemas + conversation on disk — the loaded timeline is
+    // authoritative from this instant, even if the process dies before the
+    // next turn-boundary autosave.
+    {
+        let schema_snapshot = state.fable_schema.lock().await.clone();
+        let session_snapshot = state.fable_session.lock().await.clone();
+        let sid = meta.session_id.clone();
+        save_schema(&app, &meta.card_id, &sid, &schema_snapshot).await;
+        save_session(&app, &meta.card_id, &sid, &session_snapshot).await;
+    }
     // (2026-08-15 audit fix) Drain the game-scoped directive/failed queues:
     // they are one-shot facts of the PREVIOUS timeline (a rewind to an older
     // save makes them future events that already happened — false for the
@@ -17334,6 +18586,8 @@ async fn fable_load_save(
     state.pending_tick_directives.lock().await.clear();
     state.failed_progression_queue.lock().await.clear();
     state.failed_translation_queue.lock().await.clear();
+    // (2026-08-22 tracker feedback loop) Same session-boundary rule.
+    state.tracker_emit_errors.lock().await.clear();
     // (2026-08-16 audit fix #11) Same session-boundary rule as fable_end: an
     // armed manual player_action belongs to the PREVIOUS timeline.
     *state.pending_player_action.lock().await = None;
@@ -17393,15 +18647,17 @@ struct FableLoadMessage {
     reasoning: String,
 }
 
-/// Delete a save slot. Idempotent (Ok if the save is already gone).
+/// Delete a save slot (2026-08-22: session-scoped). Idempotent (Ok if the
+/// save is already gone).
 #[tauri::command]
 fn fable_delete_save(
     card_id: String,
+    session_id: String,
     save_id: String,
     app: tauri::AppHandle,
 ) -> Result<(), String> {
     let fable_root = resolve_apps_dir(&app).join("fable");
-    fable_save::delete_save(&fable_root, &card_id, &save_id)
+    fable_save::delete_save(&fable_root, &card_id, &session_id, &save_id)
         .map_err(|e| format!("delete save '{save_id}': {e}"))
 }
 
@@ -17608,22 +18864,33 @@ fn active_fable_card_id(state: &AppState) -> Result<String, String> {
         .ok_or_else(|| "no active fable card: call fable_start first".to_string())
 }
 
-/// Persist `fable_session` to `cards/<card_id>/session.json`. Used by the
-/// three mutation commands. Unlike the best-effort autosave in `fable_send`,
+/// (2026-08-22) The active session id — every mid-game persistence path
+/// keys off it. Errors when no game/session is live.
+fn active_session_or_err(state: &AppState) -> Result<String, String> {
+    state
+        .active_session_id
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+        .ok_or_else(|| "no active session: call fable_start first".to_string())
+}
+
+/// Persist `fable_session` to the ACTIVE SESSION's `session.json` (2026-08-22:
+/// `data/saves/<CardName>/<session_id>/session.json`). Used by the three
+/// mutation commands. Unlike the best-effort autosave in `fable_send`,
 /// failures here are surfaced to the caller (the user explicitly initiated
 /// the mutation — silent data loss would be a bug). MUST route through the
-/// same `resolve_fable_cards_dir` root as `save_session`/`load_session` —
-/// passing the fable root here previously wrote to `<fable_root>/<card_id>/
-/// session.json` (outside `cards/`), so edits/swipes/rewinds silently
-/// vanished across restart.
+/// same session resolver as `save_session`/`load_session`.
 async fn persist_fable_session(
     app: &tauri::AppHandle,
     state: &AppState,
     card_id: &str,
 ) -> Result<(), String> {
-    let cards_root = resolve_fable_cards_dir(app)
-        .ok_or_else(|| "persist_fable_session: no apps/fable/cards/ dir resolved".to_string())?;
-    let path = resolve_session_path(&cards_root, card_id);
+    let session_id = active_session_or_err(state)?;
+    let fable_root = resolve_fable_root(app)
+        .ok_or_else(|| "persist_fable_session: no apps/fable/ dir resolved".to_string())?;
+    let path = fable_save::resolve_session_root(&fable_root, card_id, &session_id)
+        .join("session.json");
     // Snapshot under the lock, drop the guard, then do the blocking write.
     // Atomic save (temp+fsync+rename) lives in `Conversation::save`.
     let snapshot = {
@@ -17659,13 +18926,27 @@ async fn spawn_reserved_autosave(app: &tauri::AppHandle, state: &AppState) {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .clone();
+    let session_id = state
+        .active_session_id
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
     let session = state.fable_session.lock().await.clone();
     let schema = state.fable_schema.lock().await.clone();
+    // (2026-08-22 desync fix) The ring rides the autosave too — the reserved
+    // slot is the Continue checkpoint and must restore the exact timeline.
+    let history: Vec<(usize, schema::WorldSchema)> = state
+        .fable_schema_history
+        .lock()
+        .await
+        .iter()
+        .cloned()
+        .collect();
     let fable_root = resolve_apps_dir(app).join("fable");
     tokio::spawn(async move {
-        let Some(card) = card else { return };
+        let (Some(card), Some(session_id)) = (card, session_id) else { return };
         let result = tokio::task::spawn_blocking(move || {
-            fable_save::write_save(&fable_root, &card, fable_save::AUTOSAVE_ID, "Autosave", &session, &schema)
+            fable_save::write_save(&fable_root, &card, &session_id, fable_save::AUTOSAVE_ID, "Autosave", &session, &schema, &history)
         })
         .await;
         match result {
@@ -17694,14 +18975,14 @@ async fn edit_message(
     app: tauri::AppHandle,
 ) -> Result<EditResponse, String> {
     let card_id = active_fable_card_id(&state)?;
-    let is_assistant = {
-        let mut gs = state.fable_session.lock().await;
-        // (2026-08-16 bug 14) Refuse a non-trailing ASSISTANT edit UP FRONT.
-        // The prose overwrite used to commit at ANY index and only the
-        // (detached) retrack skipped non-trailing beats afterwards — a
-        // mid-history assistant edit permanently diverged prose from world
-        // state with no retrack and no autosave. User beats keep the pure
-        // prose swap at any index (their regen path is rewind-and-edit).
+    // (2026-08-22 intro variants) The intro beat is AUTHORED card content:
+    // its edit first writes through to the card's `<intro>` variant (STRICT
+    // — the session never drifts from the card it mirrors), then the session
+    // edit applies, and NO schema re-track runs (the opening is not a
+    // tracked turn — nothing has happened in the world yet when it's
+    // editable; the trailing-beat guard makes mid-history unreachable).
+    let (is_assistant, is_intro, intro_active_idx) = {
+        let gs = state.fable_session.lock().await;
         {
             let len = gs.messages.len();
             if let Some(m) = gs.messages.get(index) {
@@ -17712,15 +18993,22 @@ async fn edit_message(
                 }
             }
         }
-        apply_edit(&mut gs, index, new_text)?;
         gs.messages
             .get(index)
-            .map(|m| m.role == session::Role::Assistant)
-            .unwrap_or(false)
+            .map(|m| (m.role == session::Role::Assistant, m.is_intro, m.active_idx))
+            .ok_or_else(|| format!("edit_message: index {index} out of bounds (len {})", gs.messages.len()))?
     };
+    if is_intro {
+        write_intro_variant_to_card(&app, &card_id, Some(intro_active_idx), &new_text)?;
+    }
+    {
+        let mut gs = state.fable_session.lock().await;
+        apply_edit(&mut gs, index, new_text)?;
+    }
     // Edit re-track (best-effort: a tracker failure never fails the edit —
     // the prose stands, the pre-edit schema is restored, a warn is logged).
-    if is_assistant {
+    // NEVER for the intro beat — authored openings carry no tracked world.
+    if is_assistant && !is_intro {
         retrack_edited_assistant_message(index, &state, &app).await;
     }
     let messages = {
@@ -17841,7 +19129,19 @@ async fn retrack_edited_assistant_message(
         return;
     };
     push_fable_history_snapshot(state, displaced.clone()).await;
-    *state.fable_schema.lock().await = revert_target;
+    {
+        let mut s = state.fable_schema.lock().await;
+        *s = revert_target;
+        // (2026-08-22 re-track hardening) The edited turn still HAPPENED —
+        // the edit changes its prose, not the fact that time flowed. Keep
+        // the Rust-owned clock/calendar anchors off the base revert: the
+        // 2026-08-22 playtest's re-track hit its token wall mid-bracket,
+        // never re-emitted [TIME]/[LEDGER currency], and the revert silently
+        // rewound the clock + dropped the economy awake-state for the rest
+        // of the session. Both brackets are absolute-set → a faithful
+        // re-emission over preserved anchors is an idempotent no-op.
+        s.retain_revert_safe_anchors(&displaced);
+    }
     // (2026-08-16 audit fix #10, retrack sibling) Directive snapshot before
     // the tracker pass: the retrack's inline world tick can push directives,
     // and a failed retrack reverts the schema — the pushed directives must
@@ -17883,12 +19183,17 @@ async fn retrack_edited_assistant_message(
         .fable_prompts
         .get()
         .expect("fable_prompts is set in setup()");
+    // (2026-08-22 tracker feedback loop) Same consume-once slot as
+    // fable_send's tracker stage: pending rejects from the last apply ride
+    // this re-track's prompt too.
+    let tracker_emit_errors = std::mem::take(&mut *state.tracker_emit_errors.lock().await);
     let system_prompt = build_narrator_system_prompt(
         fable_prompts,
         &card,
         world_state.as_deref(),
         pacing,
         player_action.as_deref(),
+        &tracker_emit_errors,
     );
     // (2026-08-16 tracker-budget fix) Same bounded render as fable_send:
     // over-budget → tail-drop re-render; still over → fail the pass loudly
@@ -17896,21 +19201,24 @@ async fn retrack_edited_assistant_message(
     // tier — the core-tier strip is GONE; full teaching + full world-state
     // or a loud skip.) On Err the retrack takes the existing failure path:
     // restore the pre-edit schema, prose edit stands.
-    let tracker_prompt: String = match build_tracker_prompt_bounded(&system_prompt, &tracker_window)
-    {
-        Ok(p) => p,
-        Err(rendered) => {
-            tracing::error!(
-                budget = settings::TRACKER_PROMPT_CHAR_BUDGET,
-                rendered,
-                "⚠ EDIT RE-TRACK tracker prompt over budget even after the tail-drop \
-                 re-render — skipping the tracker pass. Prompt-bloat regression: \
-                 shrink the prompt per the Prime Directive, never raise the context."
-            );
-            *state.fable_schema.lock().await = displaced;
-            return;
-        }
-    };
+    // (2026-08-22 re-track hardening) The RE-TRACK budget — tighter than the
+    // live turn's because this pass generates against 512 tokens, not 256.
+    let tracker_prompt: String =
+        match build_tracker_prompt_bounded(&system_prompt, &tracker_window, settings::TRACKER_RETRACK_PROMPT_CHAR_BUDGET)
+        {
+            Ok(p) => p,
+            Err(rendered) => {
+                tracing::error!(
+                    budget = settings::TRACKER_RETRACK_PROMPT_CHAR_BUDGET,
+                    rendered,
+                    "⚠ EDIT RE-TRACK tracker prompt over budget even after the tail-drop \
+                     re-render — skipping the tracker pass. Prompt-bloat regression: \
+                     shrink the prompt per the Prime Directive, never raise the context."
+                );
+                *state.fable_schema.lock().await = displaced;
+                return;
+            }
+        };
 
     // Fresh cancel token in the RESERVED retrack slot (2026-08-15 audit fix):
     // this pass runs detached + can overlap a Stage-2 narrator stream, so the
@@ -17935,12 +19243,16 @@ async fn retrack_edited_assistant_message(
         let _model_guard = state.local_model_lock.lock().await;
         let (_lease, engine) = acquire_fable_engine_leased(state, app).await?;
         let noop_chunk: llm::ChunkFn = Arc::new(|_: &str| {});
+        // (2026-08-22 re-track hardening) TrackerRetrack mode: the identical
+        // deterministic profile + sniper + hard-refusal, but a 512-token wall
+        // — the re-track re-emits a FULL beat's bracket set and the 256 wall
+        // decapitated it mid-[ASSET] in the 2026-08-22 playtest.
         let reply_rx = engine
             .request_turn(
                 tracker_prompt,
                 noop_chunk,
                 cancel.clone(),
-                fable_engine::FableTurnMode::Tracker,
+                fable_engine::FableTurnMode::TrackerRetrack,
             )
             .map_err(|e| format!("tracker request_turn: {e}"))?;
         let reply = tokio::task::spawn_blocking(move || reply_rx.recv())
@@ -17959,9 +19271,15 @@ async fn retrack_edited_assistant_message(
             tracing::info!("edit re-track: tracker produced no bracket commands");
         } else {
             tracing::info!(count = parsed.commands.len(), "edit re-track: applying brackets");
-            // Travel rejects are ignored — there is no narrator stage here
-            // to carry them as directives.
-            let _ = apply_phase3_bracket_commands(&parsed, state, true, &tracker_window).await;
+            // Travel rejects are ignored by the NARRATOR here (there is no
+            // stage 2 in a re-track) — but they feed the tracker feedback
+            // slot like any live turn (2026-08-22). Notices are dropped: a
+            // re-track is an edit repair, not a live turn the player watches.
+            let mut retrack_notices: Vec<(&'static str, String)> = Vec::new();
+            let (_, retrack_rejects) =
+                apply_phase3_bracket_commands(&parsed, state, true, &tracker_window, &mut retrack_notices).await;
+            *state.tracker_emit_errors.lock().await =
+                distill_tracker_emit_errors(&retrack_rejects);
             tick_armed = apply_time_command_and_maybe_tick(&parsed, state).await;
         }
         Ok(())
@@ -18139,6 +19457,30 @@ async fn reroll_last_turn(
     Ok(EditResponse { messages, schema_pop_count: 0 })
 }
 
+/// (2026-08-22 intro variants) The live-sync card write behind Fable's
+/// in-game intro editing: rewrite ONE `<intro>` variant of a card's `.sim`
+/// (or append a new one — `index: None` / out-of-range) through the pure
+/// `sim_card::with_intro_variant` core. Strict by design — an error fails
+/// the caller's edit so the session never drifts from the card it mirrors.
+fn write_intro_variant_to_card(
+    app: &tauri::AppHandle,
+    card_id: &str,
+    index: Option<usize>,
+    text: &str,
+) -> Result<(), String> {
+    let cards_root = resolve_fable_cards_dir(app)
+        .ok_or_else(|| "no apps/fable/cards/ dir resolved".to_string())?;
+    let path = resolve_card_file(&cards_root, card_id, "sim");
+    let existing = std::fs::read_to_string(&path)
+        .map_err(|e| format!("read card for intro variant write: {e}"))?;
+    let out = sim_card::with_intro_variant(&existing, index, text)
+        .map_err(|e| format!("intro variant write: {e}"))?;
+    write_atomic(&path, out.as_bytes())
+        .map_err(|e| format!("write card (intro variant): {e}"))?;
+    tracing::info!(card_id = %card_id, ?index, len = text.trim().len(), "intro variant written to .sim (live sync)");
+    Ok(())
+}
+
 /// Swipe to a different variant of an assistant message (the ‹ 1/N › UX,
 /// 2026-07-29). Swaps the active `content`/`raw_output` with the sibling at
 /// `variant_idx`, persists, returns the new message list + schema_pop_count
@@ -18205,6 +19547,393 @@ async fn swipe_variant(
     Ok(EditResponse { messages, schema_pop_count: 0 })
 }
 
+// =============================================================
+// (2026-08-22) COMPOSER TURN AIDS — Ghost Writer + Crossroads.
+//
+// Narrator-side API one-shots behind the composer's two aid icons. All are
+// API-only (narration-adjacent generation; the local model never sees
+// them), take NO local-model lock and NO cancel slot: they are read-only
+// over the session/schema except `ghostwriter_continue`, which lands
+// through the edit path (apply_edit + the assistant-edit re-track) and so
+// re-verifies session identity before mutating. `fable_turn_in_flight`
+// refuses entry while a real narrator turn or re-track runs; the reverse
+// overlap (an aid in flight while a turn starts) is closed by the
+// identity re-check + the frontend's `generating` lock.
+// =============================================================
+
+/// The trailing `window_len` messages of the live session as OpenAI-shaped
+/// `ApiMessage`s — the history slice every turn-aid one-shot shares. The
+/// system message is each caller's concern (the aids differ in what
+/// identity they want the model to wear). Pure read under a brief lock.
+async fn guided_window(
+    state: &tauri::State<'_, AppState>,
+    window_len: usize,
+) -> Vec<session::ApiMessage> {
+    let window: Vec<session::Message> = {
+        let gs = state.fable_session.lock().await;
+        let start = gs.messages.len().saturating_sub(window_len);
+        gs.messages[start..].to_vec()
+    };
+    window
+        .iter()
+        .map(|m| session::ApiMessage {
+            role: match m.role {
+                session::Role::Assistant => "assistant".into(),
+                session::Role::User => "user".into(),
+                session::Role::System => "system".into(),
+            },
+            content: m.content.clone(),
+            raw_output: String::new(),
+        })
+        .collect()
+}
+
+/// Clean a one-shot reply the way the slice path does: strip any channel
+/// marker residue, strip bracket-shaped leakage, trim. Returns `None` when
+/// nothing survives (the caller surfaces a clean error instead of an empty
+/// result).
+fn clean_guided_reply(raw: &str) -> Option<String> {
+    let cleaned = schema::extract_reply_channel(raw);
+    let parsed = bracket_parser::parse(&cleaned);
+    let text = stream_filter::strip_bracket_shaped(&parsed.prose).trim().to_string();
+    if text.is_empty() { None } else { Some(text) }
+}
+
+/// Ghost Writer IMPERSONATE: write the player's next message in the
+/// player's own voice. The optional nudge is whatever the player typed in
+/// the composer (blank = write from the scene alone). The result returns
+/// to the frontend for the composer box — it is never sent by this
+/// command, never enters the session.
+#[tauri::command]
+async fn ghostwriter_impersonate(
+    nudge: Option<String>,
+    state: tauri::State<'_, AppState>,
+) -> Result<String, String> {
+    require_api_for_fable(&state)?;
+    if fable_turn_in_flight(&state) {
+        return Err("a narrator turn is already in flight".into());
+    }
+    let card = {
+        let guard = state.active_fable_card.lock().unwrap_or_else(|e| e.into_inner());
+        guard.clone().ok_or_else(|| "no active game card: call fable_start first".to_string())?
+    };
+    let player_block: Option<String> = state
+        .active_player_cache
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+
+    // System = the ghostwriter directive + the identity cache blocks (the
+    // player's own `<player>` block IS the voice source) + the live world
+    // state. NOT the authored narrator prose — the ghostwriter writes as
+    // the player, not the storyteller.
+    let mut system = ghostwriter::impersonate_system_prompt();
+    if let Some(block) = player_block.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        system.push_str("\n\n");
+        system.push_str(block);
+    }
+    system.push_str("\n\n");
+    system.push_str(card.render_cache_block().trim());
+    if let Some(ws) = guided_world_state(&state).await {
+        system.push_str("\n\n<world_state>\n");
+        system.push_str(&ws);
+        system.push_str("\n</world_state>");
+    }
+
+    let window = guided_window(&state, settings::WINDOW_GUIDED).await;
+    let mut api_msgs: Vec<session::ApiMessage> =
+        Vec::with_capacity(window.len() + 2);
+    api_msgs.push(session::ApiMessage {
+        role: "system".into(),
+        content: system.trim().to_string(),
+        raw_output: String::new(),
+    });
+    api_msgs.extend(window);
+    api_msgs.push(session::ApiMessage {
+        role: "system".into(),
+        content: ghostwriter::impersonate_task(nudge.as_deref()),
+        raw_output: String::new(),
+    });
+
+    let reply = guided_api_call(&state, api_msgs, settings::GHOST_IMPERSONATE_MAX_TOKENS, "ghostwriter").await?;
+    clean_guided_reply(&reply)
+        .ok_or_else(|| "the ghostwriter returned an empty message".to_string())
+}
+
+/// Ghost Writer CONTINUE: extend the trailing beat from where it ends,
+/// steered by the player's typed direction. Two phases:
+///   1. an API-only one-shot over the narrator cache + the full narrator
+///      window (the trailing beat is its final history message) + the live
+///      world state + the continue directive;
+///   2. the edit path: `apply_edit` appends the cleaned continuation to the
+///      beat, then `retrack_edited_assistant_message` re-runs the local
+///      tracker so world state absorbs what the continuation asserts.
+/// Session identity is captured at entry and re-verified in the apply
+/// scope: the HTTP wait holds no turn slot, so a turn/load/end that
+/// interleaves must be refused, never spliced.
+#[tauri::command]
+async fn ghostwriter_continue(
+    nudge: String,
+    state: tauri::State<'_, AppState>,
+    app: tauri::AppHandle,
+) -> Result<EditResponse, String> {
+    require_api_for_fable(&state)?;
+    if fable_turn_in_flight(&state) {
+        return Err("a narrator turn is already in flight".into());
+    }
+    let card_id = active_fable_card_id(&state)?;
+    let nudge = ghostwriter::cap_nudge(&nudge);
+    if nudge.is_empty() {
+        return Err("ghostwriter_continue requires a player direction".into());
+    }
+
+    // Identity + the beat being extended, under one session lock.
+    let (generation_at_entry, last_index, last_id, existing_text) = {
+        let gs = state.fable_session.lock().await;
+        let Some(index) = gs.messages.len().checked_sub(1) else {
+            return Err("nothing to continue: the session has no beats".into());
+        };
+        let msg = gs
+            .messages
+            .get(index)
+            .ok_or_else(|| "nothing to continue".to_string())?;
+        if msg.role != session::Role::Assistant {
+            return Err("the last message is not a narrator beat".into());
+        }
+        if msg.is_intro {
+            return Err("the opening beat is authored card content and cannot be continued".into());
+        }
+        (
+            state.fable_session_generation.load(std::sync::atomic::Ordering::SeqCst),
+            index,
+            msg.id.clone(),
+            msg.content.clone(),
+        )
+    };
+
+    // Phase 1: generate the continuation. The full narrator cache (authored
+    // voice + <player> + <sim_card>) — a continuation IS narration.
+    let card = {
+        let guard = state.active_fable_card.lock().unwrap_or_else(|e| e.into_inner());
+        guard.clone().ok_or_else(|| "no active game card".to_string())?
+    };
+    let player_block: Option<String> = state
+        .active_player_cache
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    let fable_prompts = state
+        .fable_prompts
+        .get()
+        .expect("fable_prompts is set in setup()");
+    let narrator_system = build_api_narrator_system_prompt(
+        fable_prompts,
+        &card,
+        player_block.as_deref(),
+    );
+    let window = guided_window(&state, settings::WINDOW_API_FABLE).await;
+    let world_state = guided_world_state(&state).await;
+    let mut tail = String::new();
+    if let Some(ws) = world_state.as_deref() {
+        tail.push_str("<world_state>\n");
+        tail.push_str(ws);
+        tail.push_str("\n</world_state>\n\n");
+    }
+    // (2026-08-22) The beat's closing lines ride the directive: the model
+    // anchors on the exact stopping point + the empty line that marks where
+    // its new paragraph begins (the seam `merge_continuation` splices on).
+    tail.push_str(&ghostwriter::continue_directive(
+        &nudge,
+        &ghostwriter::beat_tail(&existing_text, settings::GHOST_CONTINUE_TAIL_LINES),
+    ));
+
+    let mut api_msgs: Vec<session::ApiMessage> =
+        Vec::with_capacity(window.len() + 2);
+    api_msgs.push(session::ApiMessage {
+        role: "system".into(),
+        content: narrator_system.trim().to_string(),
+        raw_output: String::new(),
+    });
+    api_msgs.extend(window);
+    api_msgs.push(session::ApiMessage {
+        role: "system".into(),
+        content: tail.trim().to_string(),
+        raw_output: String::new(),
+    });
+
+    let reply = guided_api_call(&state, api_msgs, settings::GHOST_CONTINUE_MAX_TOKENS, "narrator").await?;
+    let continuation = clean_guided_reply(&reply)
+        .ok_or_else(|| "the narrator returned an empty continuation".to_string())?;
+    let merged = ghostwriter::merge_continuation(&existing_text, &continuation);
+
+    // Phase 2: apply + re-track. The re-verification + the edit share one
+    // session-lock scope so nothing can interleave between the check and
+    // the write; the re-track (which manages its own cancel slot + locks)
+    // runs after the scope drops.
+    {
+        let mut gs = state.fable_session.lock().await;
+        let still_tail = gs
+            .messages
+            .get(last_index)
+            .map(|m| m.id == last_id && m.role == session::Role::Assistant)
+            .unwrap_or(false)
+            && gs.messages.len() == last_index + 1;
+        if !still_tail
+            || fable_turn_in_flight(&state)
+            || state.fable_session_generation.load(std::sync::atomic::Ordering::SeqCst)
+                != generation_at_entry
+        {
+            return Err("the scene moved on while the narrator wrote; try again".into());
+        }
+        apply_edit(&mut gs, last_index, merged)?;
+    }
+    retrack_edited_assistant_message(last_index, &state, &app).await;
+    let messages = {
+        let gs = state.fable_session.lock().await;
+        project_messages(&gs)
+    };
+    persist_fable_session(&app, &state, &card_id).await?;
+    Ok(EditResponse { messages, schema_pop_count: 0 })
+}
+
+/// Crossroads OPTIONS: one category draw. Returns the parsed option list
+/// (never empty on Ok — an unusable reply is an Err so the UI can surface
+/// it on the deck).
+#[tauri::command]
+async fn crossroads_options(
+    category: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<Vec<crossroads::CrossroadsOption>, String> {
+    let category = crossroads::CrossroadsCategory::from_wire(&category)
+        .ok_or_else(|| format!("crossroads_options: unknown category {category:?}"))?;
+    require_api_for_fable(&state)?;
+    if fable_turn_in_flight(&state) {
+        return Err("a narrator turn is already in flight".into());
+    }
+    let api_msgs = guided_crossroads_messages(&state, category, None).await?;
+    let reply = guided_api_call(&state, api_msgs, settings::CROSSROADS_OPTIONS_MAX_TOKENS, "crossroads").await?;
+    let options = crossroads::parse_options(&reply);
+    if options.is_empty() {
+        return Err("the deck came back empty; draw again".into());
+    }
+    Ok(options)
+}
+
+/// Crossroads EXPAND: write the chosen fork out in full as the text the
+/// player will send. Same context shape as the draw; the chosen option
+/// rides the task. Returns the text for the composer box (never
+/// auto-sent).
+#[tauri::command]
+async fn crossroads_expand(
+    category: String,
+    emoji: String,
+    title: String,
+    summary: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<String, String> {
+    let category = crossroads::CrossroadsCategory::from_wire(&category)
+        .ok_or_else(|| format!("crossroads_expand: unknown category {category:?}"))?;
+    let option = crossroads::option_from_wire(&emoji, &title, &summary)
+        .ok_or_else(|| "crossroads_expand: the chosen option is incomplete".to_string())?;
+    require_api_for_fable(&state)?;
+    if fable_turn_in_flight(&state) {
+        return Err("a narrator turn is already in flight".into());
+    }
+    let api_msgs = guided_crossroads_messages(&state, category, Some(&option)).await?;
+    let reply = guided_api_call(&state, api_msgs, settings::CROSSROADS_EXPAND_MAX_TOKENS, "crossroads").await?;
+    clean_guided_reply(&reply)
+        .ok_or_else(|| "the fork came back empty; try again".to_string())
+}
+
+/// Assemble the message list shared by both Crossroads calls: system =
+/// the crossroads directive + `<player>` + `<sim_card>` + `<world_state>`
+/// (the identity cache grounds the draw in THIS story), then the
+/// [`settings::WINDOW_GUIDED`] window, then the stage's task message
+/// (draw or expand) as the trailing system message.
+async fn guided_crossroads_messages(
+    state: &tauri::State<'_, AppState>,
+    category: crossroads::CrossroadsCategory,
+    chosen: Option<&crossroads::CrossroadsOption>,
+) -> Result<Vec<session::ApiMessage>, String> {
+    let card = {
+        let guard = state.active_fable_card.lock().unwrap_or_else(|e| e.into_inner());
+        guard.clone().ok_or_else(|| "no active game card: call fable_start first".to_string())?
+    };
+    let player_block: Option<String> = state
+        .active_player_cache
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+
+    let mut system = crossroads::options_system_prompt(category);
+    if let Some(block) = player_block.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        system.push_str("\n\n");
+        system.push_str(block);
+    }
+    system.push_str("\n\n");
+    system.push_str(card.render_cache_block().trim());
+    if let Some(ws) = guided_world_state(state).await {
+        system.push_str("\n\n<world_state>\n");
+        system.push_str(&ws);
+        system.push_str("\n</world_state>");
+    }
+
+    let window = guided_window(state, settings::WINDOW_GUIDED).await;
+    let mut api_msgs: Vec<session::ApiMessage> =
+        Vec::with_capacity(window.len() + 2);
+    api_msgs.push(session::ApiMessage {
+        role: "system".into(),
+        content: system.trim().to_string(),
+        raw_output: String::new(),
+    });
+    api_msgs.extend(window);
+    let task = match chosen {
+        Some(option) => crossroads::expand_task(category, option),
+        None => crossroads::options_task(),
+    };
+    api_msgs.push(session::ApiMessage {
+        role: "system".into(),
+        content: task,
+        raw_output: String::new(),
+    });
+    Ok(api_msgs)
+}
+
+/// The live `<world_state>` render for the turn aids (no turn directives,
+/// no exposure reveal — those are per-turn narrator concerns; the aids
+/// want the plain authoritative state).
+async fn guided_world_state(state: &tauri::State<'_, AppState>) -> Option<String> {
+    let s = state.fable_schema.lock().await;
+    let rendered = render_fable_world_state(&s, &[], false);
+    if rendered.trim().is_empty() { None } else { Some(rendered) }
+}
+
+/// One narrator-side API one-shot: resolve the active profile (the guards
+/// above guarantee one), stream over the cached HTTP backend with a noop
+/// chunk sink (the aids render busy states, not live text), and return the
+/// full reply content. `who` names the caller in the error prefix
+/// (narrator / ghostwriter / crossroads) so the notice names the aid that
+/// failed. Errors surface verbatim to the frontend.
+async fn guided_api_call(
+    state: &tauri::State<'_, AppState>,
+    messages: Vec<session::ApiMessage>,
+    max_tokens: u32,
+    who: &str,
+) -> Result<String, String> {
+    let profile = {
+        let cfg = state.api_config.lock().unwrap_or_else(|e| e.into_inner());
+        cfg.active_profile().cloned()
+    };
+    let profile = profile.ok_or_else(|| "No active API profile.".to_string())?;
+    let http = http_backend_cached(state, &profile);
+    let cancel: llm::CancelToken = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let noop_chunk: llm::ChunkFn = Arc::new(|_: &str| {});
+    let out = http
+        .stream(messages, None, None, Vec::new(), settings::CTX_API, noop_chunk, cancel, Some(max_tokens))
+        .await
+        .map_err(|e| format!("the {who} API call failed: {e}"))?;
+    Ok(out.content)
+}
 /// Branch the timeline: edit a user message from N turns ago. Truncates the
 /// conversation right after the target index (dropping every subsequent
 /// AI/user turn), overwrites the target with `new_text`, persists, returns
@@ -18680,6 +20409,32 @@ pub(crate) fn migrate_card_folder_contents(old: &std::path::Path, new: &std::pat
     }
     // Everything movable has moved; drop the husk (its .sim/.lnk remain).
     let _ = std::fs::remove_dir_all(old);
+    // (2026-08-22 session decoupling) The card's SESSION TREE is keyed by
+    // the display folder name — it follows the rename too (the sessions
+    // live OUTSIDE the card folder now). The card's linked codex files are
+    // universal library members and stay put.
+    if old.parent() == new.parent() {
+        if let (Some(parent), Some(old_name), Some(new_name)) =
+            (old.parent(), old.file_name(), new.file_name())
+        {
+            let fable_root = parent.parent(); // <fable>/cards/<Card> → <fable>
+            if let Some(fable_root) = fable_root {
+                let old_sessions = fable_root.join("data").join("saves").join(old_name);
+                let new_sessions = fable_root.join("data").join("saves").join(new_name);
+                if old_sessions.is_dir() {
+                    if new_sessions.exists() {
+                        tracing::warn!(
+                            from = %old_sessions.display(),
+                            to = %new_sessions.display(),
+                            "card folder migration: session tree name collision — leaving the old tree in place"
+                        );
+                    } else if let Err(e) = std::fs::rename(&old_sessions, &new_sessions) {
+                        tracing::warn!(err = %e, "card folder migration: session tree rename failed");
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// The ONE-SHOT boot migration to the v2 card/player format (Chloe ruling
@@ -18825,6 +20580,275 @@ fn migrate_sim_cards_v2(cards_root: &std::path::Path, app: &tauri::AppHandle) {
             tracing::warn!(card_id = %card.id, err = %e, "v2 migration: shortcut refresh failed (non-fatal)");
         }
     }
+}
+
+/// (2026-08-22 session decoupling) One-shot-per-card boot migration: move
+/// all DYNAMIC game data out of the card folders into the centralized tree.
+///
+/// For every simulation card folder that still carries in-folder dynamic
+/// state (the pre-2026-08-22 layout — split JSONs, `session.json`,
+/// `saves/`): mint a session under `data/saves/<CardName>/<session_id>/`,
+/// move the files in, write the manifest ("Session 1"). The card's
+/// `.codex` sibling moves to the universal `data/codex/` library
+/// (collision-relieved) AND is `<linked_codices>`-linked to the card, so
+/// every install's lore survives the decoupling verbatim.
+///
+/// Same boot discipline as `migrate_cards_v2`: runs BEFORE any window
+/// exists (no frontend IPC can race it), idempotent (a migrated card
+/// folder holds none of the trigger files → every step no-ops), failures
+/// log + retry next boot. Runs AFTER `migrate_cards_v2` so folder names
+/// are final.
+pub(crate) fn migrate_dynamic_data_v2(app: &tauri::AppHandle) {
+    let Some(fable_root) = resolve_fable_root(app) else { return };
+    migrate_dynamic_data_in(&fable_root);
+}
+
+/// The pure core of the dynamic-data migration (takes the fable root
+/// directly so tests can drive it over a tempdir).
+fn migrate_dynamic_data_in(fable_root: &std::path::Path) {
+    let cards_root = fable_root.join("cards");
+    let saves_root = fable_root.join("data").join("saves");
+    let codex_root = fable_root.join("data").join("codex");
+    if std::fs::create_dir_all(&saves_root).is_err() || std::fs::create_dir_all(&codex_root).is_err() {
+        tracing::warn!("dynamic-data migration: could not create the data/saves + data/codex roots");
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(&cards_root) else { return };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+            continue;
+        }
+        let Some(folder_name) = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(str::to_owned)
+        else {
+            continue;
+        };
+        let sim_path = path.join(format!("{folder_name}.sim"));
+        let Ok(xml) = std::fs::read_to_string(&sim_path) else { continue };
+        let Ok(card) = sim_card::parse_from_xml_str(&xml) else {
+            tracing::warn!(folder = %folder_name, "dynamic-data migration: unparsable .sim — skipping folder");
+            continue;
+        };
+        if card.card_type != "simulation" {
+            continue;
+        }
+
+        // 1) Session data → data/saves/<CardName>/<session_id>/.
+        // (2026-08-22 review) PARTIAL-FAILURE SAFETY: per-file renames can
+        // fail (a locked file on Windows) and the migration retries next
+        // boot — always MINTING then would split one campaign across two
+        // session folders (its live state in one, its save slots in the
+        // other). A `.migration-pending` marker in the session dir makes the
+        // re-run ADOPT the interrupted session instead of minting a new one;
+        // the marker is removed only once the card folder carries no trigger
+        // files left to move.
+        let has_dynamic = path.join("session.json").is_file()
+            || path.join("world.json").is_file()
+            || path.join("player.json").is_file()
+            || path.join("npc.json").is_file()
+            || path.join("saves").is_dir();
+        if has_dynamic {
+            let card_saves_root = saves_root.join(&folder_name);
+            if let Err(e) = std::fs::create_dir_all(&card_saves_root) {
+                tracing::warn!(folder = %folder_name, err = %e, "dynamic-data migration: session root create failed (skipping)");
+                continue;
+            }
+            let session_dir = match find_pending_migration_session(&card_saves_root) {
+                Some(adopt) => {
+                    tracing::info!(
+                        folder = %folder_name,
+                        session = %adopt.display(),
+                        "dynamic-data migration: adopting an interrupted session migration"
+                    );
+                    adopt
+                }
+                None => {
+                    let session_id = fable_save::mint_session_id();
+                    let dir = card_saves_root.join(&session_id);
+                    if let Err(e) = std::fs::create_dir_all(&dir) {
+                        tracing::warn!(folder = %folder_name, err = %e, "dynamic-data migration: session dir create failed (skipping)");
+                        continue;
+                    }
+                    if let Err(e) = std::fs::write(dir.join(MIGRATION_PENDING_MARKER), b"") {
+                        tracing::warn!(err = %e, "dynamic-data migration: marker write failed (non-fatal)");
+                    }
+                    dir
+                }
+            };
+            let mut moved_any = false;
+            for name in ["session.json", "world.json", "player.json", "npc.json"] {
+                let from = path.join(name);
+                if from.exists() {
+                    match std::fs::rename(&from, session_dir.join(name)) {
+                        Ok(()) => moved_any = true,
+                        Err(e) => tracing::warn!(file = name, err = %e, "dynamic-data migration: file move failed"),
+                    }
+                }
+            }
+            let saves_dir = path.join("saves");
+            if saves_dir.is_dir() {
+                match std::fs::rename(&saves_dir, session_dir.join("saves")) {
+                    Ok(()) => moved_any = true,
+                    Err(e) => tracing::warn!(err = %e, "dynamic-data migration: saves/ move failed"),
+                }
+            }
+            let leftovers = path.join("session.json").is_file()
+                || path.join("world.json").is_file()
+                || path.join("player.json").is_file()
+                || path.join("npc.json").is_file()
+                || path.join("saves").is_dir();
+            if moved_any && !leftovers {
+                let _ = std::fs::remove_file(session_dir.join(MIGRATION_PENDING_MARKER));
+            }
+            if moved_any {
+                // (adoption path) the manifest only mints when absent — an
+                // adopted session keeps its original "Session 1" identity.
+                let session_id = session_dir
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("")
+                    .to_owned();
+                if !session_dir.join("manifest.json").is_file() {
+                    let manifest = fable_save::SessionManifest {
+                        session_id: session_id.clone(),
+                        card_id: card.id.clone(),
+                        name: "Session 1".to_owned(),
+                        created_at: std::fs::metadata(session_dir.join("session.json"))
+                            .and_then(|m| m.modified())
+                            .ok()
+                            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                            .map(|d| d.as_millis() as i64)
+                            .unwrap_or(0),
+                    };
+                    if let Err(e) = fable_save::write_manifest(&session_dir, &manifest) {
+                        tracing::warn!(err = %e, "dynamic-data migration: manifest write failed (non-fatal)");
+                    }
+                }
+                tracing::info!(
+                    card_id = %card.id,
+                    session_id = %session_id,
+                    "dynamic-data migration: session moved into the centralized saves tree"
+                );
+            }
+        }
+
+        // 2) The `.codex` sibling → the universal library + a link.
+        // (2026-08-22 review) LINK FIRST, MOVE SECOND. The old order renamed
+        // the `.codex` into the library before rewriting the `.sim` — a
+        // link-write failure left the lore file in the library with no card
+        // pointing at it (the trigger `codex_src.is_file()` went permanently
+        // false, so it never retried), and the empty-links reconcile then
+        // purged the card's seeded rows on the next session entry. Writing
+        // the link first keeps the trigger alive until the move commits; a
+        // failed move rolls the `.sim` back so the pair stays atomic.
+        let codex_src = path.join(format!("{folder_name}.codex"));
+        if codex_src.is_file() {
+            let planned = plan_codex_library_name(&codex_src, &codex_root, &folder_name);
+            let mut links = card.linked_codices.clone();
+            if !links.iter().any(|n| n.eq_ignore_ascii_case(&planned)) {
+                links.push(planned.clone());
+            }
+            let link_write = sim_card::with_linked_codices(&xml, &links)
+                .map_err(|e| format!("{e:#}"))
+                .and_then(|out_xml| {
+                    write_atomic(&sim_path, out_xml.as_bytes()).map_err(|e| format!("{e}"))
+                });
+            match link_write {
+                Ok(()) => {
+                    match move_codex_to_library_as(&codex_src, &codex_root, &planned) {
+                        Ok(()) => {
+                            tracing::info!(
+                                card_id = %card.id,
+                                codex = %planned,
+                                "dynamic-data migration: .codex moved to the universal library + linked"
+                            );
+                        }
+                        Err(e) => {
+                            tracing::warn!(err = %e, "dynamic-data migration: .codex library move failed — rolling the .sim link back (retry next boot)");
+                            if let Err(rb) = write_atomic(&sim_path, xml.as_bytes()) {
+                                tracing::warn!(err = %rb, "dynamic-data migration: .sim link rollback failed (manual relink needed)");
+                            }
+                        }
+                    }
+                }
+                Err(e) => tracing::warn!(err = %e, "dynamic-data migration: linked_codices rewrite failed (retry next boot)"),
+            }
+        }
+    }
+}
+
+/// (2026-08-22 review) Marker file stamped into a freshly minted migration
+/// session dir and removed only when the card folder no longer carries any
+/// dynamic-data trigger file — a re-run that finds it ADOPTS that session
+/// instead of minting another (a partial migration must never split one
+/// campaign across two session folders).
+const MIGRATION_PENDING_MARKER: &str = ".migration-pending";
+
+/// Find a session dir under `card_saves_root` still carrying the
+/// `.migration-pending` marker (an interrupted migration). Newest wins by
+/// directory-name sort — session ids are `session_<unix_ms>`, so a lexical
+/// sort is a chronological sort.
+fn find_pending_migration_session(card_saves_root: &std::path::Path) -> Option<std::path::PathBuf> {
+    let mut pending: Vec<std::path::PathBuf> = std::fs::read_dir(card_saves_root)
+        .ok()?
+        .flatten()
+        .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+        .map(|e| e.path())
+        .filter(|p| p.join(MIGRATION_PENDING_MARKER).is_file())
+        .collect();
+    pending.sort();
+    pending.pop()
+}
+
+/// Plan the collision-free library stem for a `.codex` being moved into the
+/// universal library (extension-aware — library members are `<stem>.codex`
+/// files, so `unique_display_stem`'s bare-stem existence check can't see
+/// them). Boot-time + pre-window: the plan-then-rename window has no other
+/// writer, and the dest-exists guard in `move_codex_to_library_as` is the
+/// backstop regardless.
+fn plan_codex_library_name(
+    src: &std::path::Path,
+    codex_root: &std::path::Path,
+    fallback_name: &str,
+) -> String {
+    let stem = src
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or(fallback_name);
+    let base = safe_display_stem(stem, "Codex");
+    let mut candidate = base.clone();
+    let mut n = 1usize;
+    // No early cap exit with an occupied candidate: the old `n < 100` bound
+    // could fall through to a rename against an existing dest (which fails
+    // on Windows — the migration never converged). The 10k break is
+    // unreachable and backs onto the dest-exists guard below.
+    while codex_root.join(format!("{candidate}.codex")).exists() {
+        n += 1;
+        candidate = format!("{base} {n}");
+        if n > 10_000 {
+            break;
+        }
+    }
+    candidate
+}
+
+/// Move one `.codex` file into the universal library under an
+/// ALREADY-PLANNED stem (see `plan_codex_library_name`). The caller writes
+/// the card's `<linked_codices>` FIRST — a link-write failure must leave
+/// the `.codex` in the card folder so the migration retries next boot.
+fn move_codex_to_library_as(
+    src: &std::path::Path,
+    codex_root: &std::path::Path,
+    lib_name: &str,
+) -> Result<(), String> {
+    let dest = codex_root.join(format!("{lib_name}.codex"));
+    if dest.exists() {
+        return Err(format!("collision: {} already exists", dest.display()));
+    }
+    std::fs::rename(src, &dest).map_err(|e| format!("rename: {e}"))
 }
 
 fn migrate_players_v2(players_root: &std::path::Path) {
@@ -19554,16 +21578,17 @@ fn current_unix_ms_i64() -> i64 {
 async fn save_session(
     app: &tauri::AppHandle,
     card_id: &str,
+    session_id: &str,
     conv: &session::Conversation,
 ) {
-    let Some(cards_root) = resolve_fable_cards_dir(app) else {
-        tracing::warn!("save_session: no apps/fable/cards/ dir resolved");
+    let Some(fable_root) = resolve_fable_root(app) else {
+        tracing::warn!("save_session: no apps/fable/ dir resolved");
         return;
     };
-    // Ensure the per-card folder exists (a fresh card may have no folder yet).
-    let card_dir = resolve_card_dir(&cards_root, card_id);
-    let _ = std::fs::create_dir_all(&card_dir);
-    let path = resolve_session_path(&cards_root, card_id);
+    // Ensure the session folder exists (a fresh session may have no folder yet).
+    let session_dir = fable_save::resolve_session_root(&fable_root, card_id, session_id);
+    let _ = std::fs::create_dir_all(&session_dir);
+    let path = session_dir.join("session.json");
     // Clone so the closure owns its data (spawn_blocking needs 'static). The
     // Conversation is a Vec of small messages: cheap to clone relative to a
     // disk fsync.
@@ -19576,9 +21601,9 @@ async fn save_session(
     .await;
 }
 
-/// Load a card-scoped session. Returns a fresh empty `Conversation` when no
-/// saved file exists (the `Conversation::load` NotFound path already does
-/// this: we just route through it). Symmetric to `save_session`.
+/// Load a session-scoped conversation. Returns a fresh empty `Conversation`
+/// when no saved file exists (the `Conversation::load` NotFound path already
+/// does this: we just route through it). Symmetric to `save_session`.
 /// (2026-08-16 audit fix #12) Result-shaped like `load_schema`: a corrupt
 /// session.json is an ERR (the caller refuses the resume — the old Option
 /// shape swallowed it to an empty conversation, and the next autosave
@@ -19587,10 +21612,11 @@ async fn save_session(
 async fn load_session(
     app: &tauri::AppHandle,
     card_id: &str,
+    session_id: &str,
 ) -> Result<session::Conversation, String> {
-    let cards_root = resolve_fable_cards_dir(app)
-        .ok_or_else(|| "no apps/fable/cards/ dir resolved".to_string())?;
-    let path = resolve_session_path(&cards_root, card_id);
+    let fable_root = resolve_fable_root(app)
+        .ok_or_else(|| "no apps/fable/ dir resolved".to_string())?;
+    let path = fable_save::resolve_session_root(&fable_root, card_id, session_id).join("session.json");
     let path_cloned = path.clone();
     tokio::task::spawn_blocking(move || session::Conversation::load(&path_cloned))
         .await
@@ -19602,26 +21628,30 @@ async fn load_session(
 /// `save_session`: `WorldSchema::save_split` is atomic (temp + fsync + rename)
 /// but synchronous, so `spawn_blocking` keeps the async runtime free.
 ///
-/// **2026-08-01 folder layout:** the schema now persists as three sibling
-/// files inside the card's folder — `world.json` + `player.json` + `npc.json`
-/// — via `WorldSchema::save_split` (the in-memory struct stays one piece; the
-/// disk form splits so the Player / World / NPC tabs each own a file). Only
-/// the active game's schema persists (Wupi-assistant's schema stays ephemeral).
+/// **Layout:** the schema persists as three sibling files inside the
+/// SESSION folder — `world.json` + `player.json` + `npc.json` — via
+/// `WorldSchema::save_split` (the in-memory struct stays one piece; the disk
+/// form splits so the Player / World / NPC tabs each own a file; 2026-08-22
+/// the files moved from the card folder into the session folder). Only the
+/// active game's schema persists (Wupi-assistant's schema stays ephemeral).
 async fn save_schema(
     app: &tauri::AppHandle,
     card_id: &str,
+    session_id: &str,
     schema: &schema::WorldSchema,
 ) {
-    let cards_root = match resolve_fable_cards_dir(app) {
+    let fable_root = match resolve_fable_root(app) {
         Some(d) => d,
         None => {
-            tracing::warn!("save_schema: no apps/fable/cards/ dir resolved");
+            tracing::warn!("save_schema: no apps/fable/ dir resolved");
             return;
         }
     };
-    let world_path = resolve_card_file(&cards_root, card_id, "world.json");
-    let player_path = resolve_card_file(&cards_root, card_id, "player.json");
-    let npc_path = resolve_card_file(&cards_root, card_id, "npc.json");
+    let session_dir = fable_save::resolve_session_root(&fable_root, card_id, session_id);
+    let _ = std::fs::create_dir_all(&session_dir);
+    let world_path = session_dir.join("world.json");
+    let player_path = session_dir.join("player.json");
+    let npc_path = session_dir.join("npc.json");
     let schema = schema.clone();
     let _ = tokio::task::spawn_blocking(move || {
         if let Err(e) = schema.save_split(&world_path, &player_path, &npc_path) {
@@ -19631,7 +21661,7 @@ async fn save_schema(
     .await;
 }
 
-/// Load a card-scoped world schema. Returns a fresh default `WorldSchema`
+/// Load a session-scoped world schema. Returns a fresh default `WorldSchema`
 /// when no saved files exist (the `WorldSchema::load_split` NotFound path
 /// handles a missing slice as its `#[serde(default)]`). Symmetric to
 /// `save_schema`.
@@ -19644,12 +21674,14 @@ async fn save_schema(
 async fn load_schema(
     app: &tauri::AppHandle,
     card_id: &str,
+    session_id: &str,
 ) -> Result<schema::WorldSchema, String> {
-    let cards_root = resolve_fable_cards_dir(app)
-        .ok_or_else(|| "no apps/fable/cards/ dir resolved".to_string())?;
-    let world_path = resolve_card_file(&cards_root, card_id, "world.json");
-    let player_path = resolve_card_file(&cards_root, card_id, "player.json");
-    let npc_path = resolve_card_file(&cards_root, card_id, "npc.json");
+    let fable_root = resolve_fable_root(app)
+        .ok_or_else(|| "no apps/fable/ dir resolved".to_string())?;
+    let session_dir = fable_save::resolve_session_root(&fable_root, card_id, session_id);
+    let world_path = session_dir.join("world.json");
+    let player_path = session_dir.join("player.json");
+    let npc_path = session_dir.join("npc.json");
     tokio::task::spawn_blocking(move || {
         schema::WorldSchema::load_split(&world_path, &player_path, &npc_path)
     })
@@ -19658,14 +21690,12 @@ async fn load_schema(
     .map_err(|e| format!("load_split: {e}"))
 }
 
-/// `<cards_root>/<card_id>/session.json`. The per-card folder layout
-/// (2026-08-01): each card owns its session as a sibling of its `.sim` /
-/// `.codex` / `world.json`. Only roleplay game sessions persist today;
-/// Wupi-assistant chat stays ephemeral per §5. The card_id is the folder name:
-/// roleplay card ids are filesystem-safe (lowercased, derived from
-/// `<metadata><id>` in `sim_card.rs`).
-fn resolve_session_path(cards_root: &std::path::Path, card_id: &str) -> std::path::PathBuf {
-    resolve_card_dir(cards_root, card_id).join("session.json")
+/// `apps/fable/` — the fable data root (the parent of `cards/`; hosts the
+/// 2026-08-22 centralized `data/saves` + `data/codex` trees). Session-scoped
+/// resolution goes through this + `fable_save::resolve_session_root`.
+fn resolve_fable_root(app: &tauri::AppHandle) -> Option<std::path::PathBuf> {
+    resolve_fable_cards_dir(app)
+        .and_then(|cards| cards.parent().map(std::path::Path::to_path_buf))
 }
 
 #[cfg(test)]
@@ -19695,6 +21725,7 @@ mod tests {
             owner: String::new(),
             currency: String::new(),
             prosperity_delta: 0,
+            wealth_delta: 0,
         }
     }
 
@@ -19794,6 +21825,205 @@ mod tests {
         );
         assert_eq!(s.properties["forge"].treasury_balance, 40);
         assert_eq!(s.player_state.wealth, 250);
+    }
+
+    /// (2026-08-22 wealth verb) Pocket coin ± — the tavern-scale money verb.
+    /// Gains land, spends land, a spend beyond the purse REJECTS (never
+    /// saturates — the shared "Never invent coin" contract), and a no-change
+    /// emission is a no-op.
+    #[test]
+    fn ledger_wealth_moves_and_rejects_shortfalls() {
+        let mut s = economy_schema();
+        s.player_state.wealth = 30;
+        // Gain.
+        let mut cmd = ledger_cmd(bracket_parser::LedgerOp::Wealth, "");
+        if let bracket_parser::BracketCommand::Ledger { wealth_delta, .. } = &mut cmd {
+            *wealth_delta = 12;
+        }
+        let rejects = apply_one(&mut s, cmd, "");
+        assert!(rejects.is_empty(), "{rejects:?}");
+        assert_eq!(s.player_state.wealth, 42);
+        // Spend to exactly zero.
+        let mut cmd = ledger_cmd(bracket_parser::LedgerOp::Wealth, "");
+        if let bracket_parser::BracketCommand::Ledger { wealth_delta, .. } = &mut cmd {
+            *wealth_delta = -42;
+        }
+        let rejects = apply_one(&mut s, cmd, "");
+        assert!(rejects.is_empty(), "{rejects:?}");
+        assert_eq!(s.player_state.wealth, 0);
+        // Overspend → reject, wealth untouched.
+        s.player_state.wealth = 5;
+        let mut cmd = ledger_cmd(bracket_parser::LedgerOp::Wealth, "");
+        if let bracket_parser::BracketCommand::Ledger { wealth_delta, .. } = &mut cmd {
+            *wealth_delta = -30;
+        }
+        let rejects = apply_one(&mut s, cmd, "");
+        assert!(
+            rejects.iter().any(|r| r.contains("Pocket wealth not changed")),
+            "{rejects:?}"
+        );
+        assert_eq!(s.player_state.wealth, 5);
+        // The reject teaches the correct form.
+        assert!(
+            rejects.iter().any(|r| r.contains("[LEDGER wealth +<n>]")),
+            "{rejects:?}"
+        );
+        // Zero delta → no-op, no reject.
+        let mut cmd = ledger_cmd(bracket_parser::LedgerOp::Wealth, "");
+        if let bracket_parser::BracketCommand::Ledger { wealth_delta, .. } = &mut cmd {
+            *wealth_delta = 0;
+        }
+        let rejects = apply_one(&mut s, cmd, "");
+        assert!(rejects.is_empty(), "{rejects:?}");
+        assert_eq!(s.player_state.wealth, 5);
+        // No-change re-emission (+0 from 5... parser drops zeros, but the
+        // applier guards the shape anyway): 5 stays 5 with no snapshot.
+        let mut cmd = ledger_cmd(bracket_parser::LedgerOp::Wealth, "");
+        if let bracket_parser::BracketCommand::Ledger { wealth_delta, .. } = &mut cmd {
+            *wealth_delta = -5;
+        }
+        s.player_state.wealth = 5;
+        let mut rejects = Vec::new();
+        let mut snap = None;
+        apply_ledger_commands(&mut s, &[&cmd], "", &mut rejects, &mut snap);
+        assert!(rejects.is_empty(), "{rejects:?}");
+        assert!(snap.is_none(), "a no-change emission takes no undo snapshot");
+    }
+
+    /// (2026-08-22 tracker feedback loop) The distill: dedupes
+    /// case-insensitively, caps lines, caps per-line chars UTF-8-safely.
+    #[test]
+    fn distill_tracker_emit_errors_dedupes_and_caps() {
+        let rejects: Vec<String> = vec![
+            "NPC item change not recorded — \"player\" is not a known NPC.".into(),
+            "npc ITEM CHANGE NOT RECORDED — \"player\" is not a known NPC.".into(), // dup, case-folded
+            "酱和文字 mixed-width line that runs long ".to_string()
+                + &"x".repeat(settings::TRACKER_EMIT_ERROR_LINE_CHARS + 20),
+        ]
+        .into_iter()
+        .chain(
+            (0..settings::TRACKER_EMIT_ERROR_MAX_LINES)
+                .map(|i| format!("distinct reject {i}")),
+        )
+        .collect();
+        let distilled = distill_tracker_emit_errors(&rejects);
+        assert_eq!(
+            distilled.len(),
+            settings::TRACKER_EMIT_ERROR_MAX_LINES,
+            "line cap holds"
+        );
+        // The dedupe folded the pair.
+        assert_eq!(
+            distilled.iter().filter(|l| l.contains("NPC item change")).count(),
+            1,
+            "{distilled:?}"
+        );
+        // The mixed-width line truncated at CHAR count, not bytes (its byte
+        // length exceeds the cap; its char count equals it).
+        let long = distilled.iter().find(|l| l.contains('酱')).expect("kept");
+        assert_eq!(
+            long.chars().count(),
+            settings::TRACKER_EMIT_ERROR_LINE_CHARS,
+            "UTF-8-safe truncation"
+        );
+    }
+
+    /// (2026-08-22 playtest audit) The [NPC_ITEM] player gate: literal
+    /// "player" (any case) + the slugged player name; never a slug-less
+    /// empty player, never an unrelated id.
+    #[test]
+    fn npc_item_targets_player_gate() {
+        assert!(npc_item_targets_player("player", ""));
+        assert!(npc_item_targets_player(" Player ", ""));
+        assert!(npc_item_targets_player("PLAYER", ""));
+        assert!(npc_item_targets_player("Lacey", "lacey"));
+        assert!(npc_item_targets_player("lacey!", "lacey"));
+        assert!(!npc_item_targets_player("lacey", ""));
+        assert!(!npc_item_targets_player("mara", "lacey"));
+    }
+
+    /// (2026-08-22 playtest, Chloe directive) The gear-mirror guard: an item
+    /// still in the player's racks (equipment either layer / belt / pack) at
+    /// NPC_ITEM-apply time is a COPY, not a transfer (loop order means a
+    /// taught transfer's paired removal already applied).
+    #[test]
+    fn player_holds_item_gate() {
+        let mut ps = player_state::PlayerState::default();
+        assert!(!player_holds_item(&ps, "Iron Dagger"), "empty state holds nothing");
+        // Equipped (outer layer of MainHand — the playtest's mirror shape).
+        ps.equipment.insert(
+            equipment::EquipSlot::MainHand,
+            equipment::SlotLayers {
+                outer: Some(equipment::EquippedItem {
+                    name: "Iron Sword".into(),
+                    stats: None,
+                    tags: Vec::new(),
+                }),
+                inner: None,
+            },
+        );
+        assert!(player_holds_item(&ps, "iron sword"), "equipped items count, case-insensitive");
+        assert!(!player_holds_item(&ps, "Iron Dagger"));
+        // Belt + pack.
+        ps.belt.push(equipment::StackItem {
+            name: "Iron Dagger".into(),
+            ..Default::default()
+        });
+        assert!(player_holds_item(&ps, "IRON DAGGER"));
+        ps.pack.push(equipment::StackItem {
+            name: "Field Points".into(),
+            qty: 12,
+            ..Default::default()
+        });
+        assert!(player_holds_item(&ps, "Field Points"));
+        assert!(!player_holds_item(&ps, ""), "empty name never matches");
+    }
+
+    /// (2026-08-22 playtest, Chloe directive) The person guard: a registered
+    /// NPC's name or id is never an item ("[NPC_ITEM wevlan +Ferenc Illes]").
+    #[test]
+    fn item_name_is_a_person_gate() {
+        let mut e = schema::NpcEntry::default();
+        e.id = "ferenc-illes".into();
+        e.name = "Ferenc Illes".into();
+        let entries = vec![e];
+        assert!(item_name_is_a_person(&entries, "Ferenc Illes"));
+        assert!(item_name_is_a_person(&entries, "  ferenc illes "));
+        assert!(item_name_is_a_person(&entries, "ferenc-illes"));
+        assert!(!item_name_is_a_person(&entries, "Ferenc's Letter"));
+        assert!(!item_name_is_a_person(&entries, ""));
+    }
+
+    /// (2026-08-22 playtest, Chloe directive) Presence grounding: an NPC the
+    /// tracker's own window never mentioned is not assertible; the surface
+    /// form, canonical id (dash/space), and registry name all ground; an
+    /// empty corpus fails OPEN.
+    #[test]
+    fn narrative_grounded_gate() {
+        let action = "I crouch behind cover, bow drawn toward the clicking";
+        let beat = "Wevlan nods and polishes a tankard behind the bar";
+        let forest = ["the trees rustle; something clicks in the brush"];
+        // Named in the window (either message, any case) → grounded.
+        assert!(narrative_grounded(&[action, beat], "wevlan", "wevlan", "Wevlan"));
+        assert!(narrative_grounded(&[beat], "Wevlan", "wevlan", "Wevlan"));
+        // Dash-slug id vs prose spacing.
+        assert!(narrative_grounded(
+            &["I ask Captain Harsk about the raids"],
+            "harsk",
+            "captain-harsk",
+            "Captain Harsk"
+        ));
+        // Alias surface used by the player ("Harsk") grounds the full entry.
+        assert!(narrative_grounded(
+            &["I ask Harsk about the raids"],
+            "harsk",
+            "captain-harsk",
+            "Captain Harsk"
+        ));
+        // The playtest's stale re-assertion: Wevlan not in the forest window.
+        assert!(!narrative_grounded(&forest, "wevlan", "wevlan", "Wevlan"));
+        // Degenerate window fails open.
+        assert!(narrative_grounded(&[], "wevlan", "wevlan", "Wevlan"));
     }
 
     /// (2026-08-21 Cinderfen playtest) A buy naming the NODE resolves to the
@@ -20547,6 +22777,8 @@ mod tests {
             world: Default::default(),
             location: None,
             inventory: Default::default(),
+            properties: Vec::new(),
+            linked_codices: Vec::new(),
             core_persona: String::new(),
             traits: String::new(),
             appearance: String::new(),
@@ -20556,6 +22788,7 @@ mod tests {
             technical_rules: String::new(),
             introductions: Vec::new(),
             intro: String::new(),
+            intro_variants: Vec::new(),
             setting: Some("A test place.".into()),
             plot: None,
             tone: None,
@@ -20569,6 +22802,97 @@ mod tests {
         }
     }
 
+    /// Materialize the card folder + one session save in the 2026-08-22
+    /// layout (`cards/<Card>/` + `data/saves/<Card>/<session>/saves/`) the
+    /// Continue walker reads.
+    fn seed_continue_save(
+        root: &std::path::Path,
+        card: &sim_card::SimCard,
+        save_id: &str,
+        name: &str,
+    ) {
+        std::fs::create_dir_all(root.join("cards").join(&card.id)).unwrap();
+        fable_save::write_save(
+            root, card, "session_1", save_id, name,
+            &session::Conversation::new(), &schema::WorldSchema::default(), &[],
+        ).unwrap();
+    }
+
+    // ── (2026-08-22 session decoupling) the dynamic-data boot migration ────
+    // Pins: sessions (split JSONs + session.json + saves/) move into
+    // data/saves/<CardName>/<session_id>/, the .codex sibling moves into the
+    // universal library + is <linked_codices>-linked, and the whole thing is
+    // IDEMPOTENT (a second run is a no-op).
+
+    #[test]
+    fn migrate_dynamic_data_moves_sessions_and_codex_idempotently() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fable = tmp.path();
+        let card_dir = fable.join("cards").join("One Piece");
+        std::fs::create_dir_all(card_dir.join("saves")).unwrap();
+        let sim_xml = "<sim_card>\n  <metadata><id>one-piece</id><type>simulation</type></metadata>\n  <identity><name>One Piece</name></identity>\n</sim_card>\n";
+        std::fs::write(card_dir.join("One Piece.sim"), sim_xml).unwrap();
+        std::fs::write(card_dir.join("session.json"), "{}").unwrap();
+        std::fs::write(card_dir.join("world.json"), "{}").unwrap();
+        std::fs::write(card_dir.join("player.json"), "{}").unwrap();
+        std::fs::write(card_dir.join("npc.json"), "{}").unwrap();
+        std::fs::write(
+            card_dir.join("saves").join("autosave.json"),
+            r#"{"card_id":"one-piece","save_id":"autosave","name":"Auto","summary":"s","timestamp":5,"is_autosave":true,"session":{},"schema":{}}"#,
+        ).unwrap();
+        std::fs::write(
+            card_dir.join("One Piece.codex"),
+            "---\ntitle: Lore\ntags: myth\n---\n\nThe seas are endless.\n",
+        ).unwrap();
+
+        migrate_dynamic_data_in(fable);
+
+        // The session landed under data/saves/One Piece/<session_*>/ with ALL
+        // its files + a manifest.
+        let sessions_root = fable.join("data").join("saves").join("One Piece");
+        let session_dirs: Vec<std::path::PathBuf> = std::fs::read_dir(&sessions_root)
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.is_dir())
+            .collect();
+        assert_eq!(session_dirs.len(), 1, "one session minted");
+        let session_dir = &session_dirs[0];
+        for name in ["session.json", "world.json", "player.json", "npc.json", "manifest.json"] {
+            assert!(session_dir.join(name).is_file(), "{name} moved into the session folder");
+        }
+        assert!(session_dir.join("saves").join("autosave.json").is_file(), "saves/ moved with it");
+        // The card folder is STATIC now.
+        for name in ["session.json", "world.json", "player.json", "npc.json"] {
+            assert!(!card_dir.join(name).exists(), "{name} left the card folder");
+        }
+        assert!(!card_dir.join("saves").exists(), "saves/ left the card folder");
+
+        // The .codex moved into the universal library + the card links it.
+        assert!(
+            fable.join("data").join("codex").join("One Piece.codex").is_file(),
+            "the .codex sibling moved into the universal library"
+        );
+        assert!(!card_dir.join("One Piece.codex").exists());
+        let sim_after = std::fs::read_to_string(card_dir.join("One Piece.sim")).unwrap();
+        assert!(sim_after.contains("<linked_codices>"), "the link block was written");
+        assert!(sim_after.contains("One Piece"));
+        let parsed = sim_card::parse_from_xml_str(&sim_after).unwrap();
+        assert_eq!(parsed.linked_codices, vec!["One Piece".to_owned()]);
+
+        // Idempotent: a second run is a NO-OP (no second session, no dupes).
+        migrate_dynamic_data_in(fable);
+        let session_dirs_after: Vec<_> = std::fs::read_dir(&sessions_root)
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.is_dir())
+            .collect();
+        assert_eq!(session_dirs_after.len(), 1, "the second run mints nothing");
+        let sim_twice = std::fs::read_to_string(card_dir.join("One Piece.sim")).unwrap();
+        assert_eq!(sim_twice.matches("<linked_codices>").count(), 1, "no duplicate link blocks");
+    }
+
     #[test]
     fn continue_target_picks_most_recent_save_across_worlds() {
         let tmp = tempfile::tempdir().unwrap();
@@ -20576,19 +22900,14 @@ mod tests {
         // should win regardless of which card it came from.
         let older = fake_card_for_continue("older_world");
         let newer = fake_card_for_continue("newer_world");
-        fable_save::write_save(
-            tmp.path(), &older, "save_a", "A",
-            &session::Conversation::new(), &schema::WorldSchema::default(),
-        ).unwrap();
+        seed_continue_save(tmp.path(), &older, "save_a", "A");
         std::thread::sleep(std::time::Duration::from_millis(20));
-        fable_save::write_save(
-            tmp.path(), &newer, "save_b", "B",
-            &session::Conversation::new(), &schema::WorldSchema::default(),
-        ).unwrap();
+        seed_continue_save(tmp.path(), &newer, "save_b", "B");
 
         let target = most_recent_continue_target(tmp.path()).expect("a target exists");
         assert_eq!(target.card_id, "newer_world");
         assert_eq!(target.save_id, "save_b");
+        assert_eq!(target.session_id, "session_1", "the owning session rides the target");
     }
 
     #[test]
@@ -20597,15 +22916,9 @@ mod tests {
         // turn checkpoint), not skip it for an older manual save.
         let tmp = tempfile::tempdir().unwrap();
         let card = fake_card_for_continue("world_with_auto");
-        fable_save::write_save(
-            tmp.path(), &card, "save_manual", "Manual",
-            &session::Conversation::new(), &schema::WorldSchema::default(),
-        ).unwrap();
+        seed_continue_save(tmp.path(), &card, "save_manual", "Manual");
         std::thread::sleep(std::time::Duration::from_millis(20));
-        fable_save::write_save(
-            tmp.path(), &card, fable_save::AUTOSAVE_ID, "Autosave",
-            &session::Conversation::new(), &schema::WorldSchema::default(),
-        ).unwrap();
+        seed_continue_save(tmp.path(), &card, fable_save::AUTOSAVE_ID, "Autosave");
 
         let target = most_recent_continue_target(tmp.path()).expect("a target exists");
         assert_eq!(target.save_id, fable_save::AUTOSAVE_ID);
@@ -20666,6 +22979,8 @@ mod tests {
             world: crate::sim_card::CardWorld::default(),
             location: None,
             inventory: crate::sim_card::CardInventory::default(),
+            properties: Vec::new(),
+            linked_codices: Vec::new(),
             core_persona: String::new(),
             traits: String::new(),
             appearance: String::new(),
@@ -20675,6 +22990,7 @@ mod tests {
             technical_rules: String::new(),
             introductions: Vec::new(),
             intro: String::new(),
+            intro_variants: Vec::new(),
             setting: Some("A test.".to_owned()),
             plot: None,
             tone: Some("atmospheric".to_owned()),
@@ -20702,11 +23018,16 @@ mod tests {
             Some("gold: 100"),
             pacing,
             None,
+            &[],
         );
         assert!(
             !tracker_prompt.contains("<retrieved_knowledge>"),
             "tracker prompt must NEVER render <retrieved_knowledge> (retrieval diet — \
              the schema is its memory; the block belongs to the 16k API narrator)"
+        );
+        assert!(
+            !tracker_prompt.contains("<emit_errors>"),
+            "an empty reject slot renders NO feedback block (zero echo on healthy turns)"
         );
         assert!(
             !tracker_prompt.contains("Bracket Commands Reference"),
@@ -20749,7 +23070,7 @@ mod tests {
         // The trailing turn tail: player_action → world_state → scene_pacing
         // (the old skeleton order, after the history now). ALWAYS non-empty
         // (scene_pacing renders every turn).
-        let tail = build_narrator_turn_tail(Some("opened the chest"), Some("gold: 100"), pacing, None);
+        let tail = build_narrator_turn_tail(Some("opened the chest"), Some("gold: 100"), pacing, None, None);
         let pa = tail.find("<player_action").expect("player_action");
         let ws = tail.find("<world_state>").expect("world_state tag");
         let sp = tail.find("<scene_pacing").expect("scene_pacing tag");
@@ -20757,9 +23078,15 @@ mod tests {
         assert!(ws < sp, "world_state precedes scene_pacing");
         assert!(!tail.contains("<retrieved_knowledge>"));
         // Even with no action + no world state, the pacing block renders.
-        let bare = build_narrator_turn_tail(None, None, pacing, None);
+        let bare = build_narrator_turn_tail(None, None, pacing, None, None);
         assert!(bare.contains("<scene_pacing"));
         assert!(!bare.contains("<world_state>"));
+        // (2026-08-22 Ghost Writer) A guided direction renders LAST, under
+        // every mechanical block.
+        let guided = build_narrator_turn_tail(None, None, pacing, None, Some("<direction>\nX\n</direction>\n"));
+        let sp2 = guided.find("<scene_pacing").expect("scene_pacing tag");
+        let dir = guided.find("<direction>").expect("direction tag");
+        assert!(sp2 < dir, "the player's direction is the last thing the narrator reads");
     }
 
     /// (2026-08-16 tracker-budget fix, P1.4; 2026-08-21 no-degrade rewrite)
@@ -20829,15 +23156,35 @@ mod tests {
         ];
 
         // PIN 1 — THE MAXED WORLD must fit the FULL render (no tier below
-        // exists; overflow would mean the loud skip in production).
+        // exists; overflow would mean the loud skip in production). The
+        // emit_errors payload is the WORST-CASE block (max lines, max line
+        // chars) so the pin counts its bounded cost honestly.
+        let max_emit_errors = distill_tracker_emit_errors(
+            &(0..settings::TRACKER_EMIT_ERROR_MAX_LINES + 4)
+                .map(|i| {
+                    let unique = format!("reject marker {i} — ");
+                    unique + &"x".repeat(settings::TRACKER_EMIT_ERROR_LINE_CHARS + 40)
+                })
+                .collect::<Vec<String>>(),
+        );
+        assert_eq!(
+            max_emit_errors.len(),
+            settings::TRACKER_EMIT_ERROR_MAX_LINES,
+            "the distill cap holds"
+        );
         let full_system = build_narrator_system_prompt(
             &prompts,
             &fake_tracker_card(),
             Some(&world_state),
             pacing,
             None,
+            &max_emit_errors,
         );
-        let full_prompt = match build_tracker_prompt_bounded(&full_system, &window) {
+        let full_prompt = match build_tracker_prompt_bounded(
+            &full_system,
+            &window,
+            settings::TRACKER_PROMPT_CHAR_BUDGET,
+        ) {
             Ok(p) => p,
             Err(chars) => panic!(
                 "MAXED-world tracker prompt over budget even after the tail-drop: \
@@ -20862,6 +23209,10 @@ mod tests {
             full_prompt.contains("[ROOM"),
             "the site verb teaching must survive the maxed-world render"
         );
+        assert!(
+            full_prompt.contains("<emit_errors>"),
+            "the reject-feedback block must survive the maxed-world render"
+        );
 
         // PIN 2 — the realistic case: a Liam-shaped world state (real
         // playtest shape — one npc card, seeded wardrobe, no site map, no
@@ -20885,8 +23236,13 @@ mod tests {
             Some(&realistic_state),
             pacing,
             None,
+            &[],
         );
-        match build_tracker_prompt_bounded(&realistic_system, &realistic_window) {
+        match build_tracker_prompt_bounded(
+            &realistic_system,
+            &realistic_window,
+            settings::TRACKER_PROMPT_CHAR_BUDGET,
+        ) {
             Ok(p) => {
                 assert!(
                     p.chars().count() <= settings::TRACKER_PROMPT_CHAR_BUDGET,
@@ -21083,8 +23439,12 @@ mod tests {
         ];
         let full = build_narrator_prompt(&system, &window);
         assert!(full.chars().count() > settings::TRACKER_PROMPT_CHAR_BUDGET);
-        let bounded =
-            build_tracker_prompt_bounded(&system, &window).expect("tail-drop must recover");
+        let bounded = build_tracker_prompt_bounded(
+            &system,
+            &window,
+            settings::TRACKER_PROMPT_CHAR_BUDGET,
+        )
+        .expect("tail-drop must recover");
         assert!(bounded.chars().count() <= settings::TRACKER_PROMPT_CHAR_BUDGET);
         assert!(
             !bounded.contains("ASSISTANT-BEAT-MARKER"),
@@ -21095,7 +23455,40 @@ mod tests {
         // Unfixable: the system prompt ALONE busts the budget → Err (the
         // caller skips the tracker pass loudly instead of decoding headless).
         let fat_system = "s".repeat(settings::TRACKER_PROMPT_CHAR_BUDGET + 1);
-        assert!(build_tracker_prompt_bounded(&fat_system, &window).is_err());
+        assert!(
+            build_tracker_prompt_bounded(&fat_system, &window, settings::TRACKER_PROMPT_CHAR_BUDGET)
+                .is_err()
+        );
+        // (2026-08-22) The re-track budget is TIGHTER than the live budget
+        // (its generation wall is double) — a render sized to fit the LIVE
+        // budget untouched must still tail-drop under the re-track budget,
+        // never decode against a 512-token reserve it overruns.
+        let mid_system =
+            "s".repeat(settings::TRACKER_RETRACK_PROMPT_CHAR_BUDGET - 4_000);
+        let live_ok = build_tracker_prompt_bounded(
+            &mid_system,
+            &window,
+            settings::TRACKER_PROMPT_CHAR_BUDGET,
+        )
+        .expect("fits the live budget untouched");
+        assert!(
+            live_ok.contains("ASSISTANT-BEAT-MARKER"),
+            "no tail-drop is needed under the live budget"
+        );
+        let retrack = build_tracker_prompt_bounded(
+            &mid_system,
+            &window,
+            settings::TRACKER_RETRACK_PROMPT_CHAR_BUDGET,
+        )
+        .expect("the re-track tail-drop recovers where the live budget never fired");
+        assert!(
+            retrack.chars().count() <= settings::TRACKER_RETRACK_PROMPT_CHAR_BUDGET
+        );
+        assert!(
+            !retrack.contains("ASSISTANT-BEAT-MARKER"),
+            "the tighter re-track budget drops the beat first"
+        );
+        assert!(retrack.contains(&"u".repeat(100)), "the user action survives");
     }
 
     /// P1.4 sibling: the lean tracker world-state render — injury prose is
@@ -21686,6 +24079,8 @@ mod tests {
             world: Default::default(),
             location: None,
             inventory: Default::default(),
+            properties: Vec::new(),
+            linked_codices: Vec::new(),
             core_persona: "x".repeat(2_000),
             traits: String::new(),
             appearance: String::new(),
@@ -21695,6 +24090,7 @@ mod tests {
             technical_rules: String::new(),
             introductions: Vec::new(),
             intro: String::new(),
+            intro_variants: Vec::new(),
             setting: Some("s".repeat(2_000)),
             plot: Some("p".repeat(1_000)),
             tone: Some("grim atmospheric long-winded".to_owned()),
@@ -22324,6 +24720,13 @@ mod tests {
         assert!(player.contains("Do not emit ready until every core field"));
         assert!(player.contains("never blank out a field already set"));
         assert!(player.contains("\"action\":\"ready\""));
+        // (2026-08-22 Chloe ruling) Money is inventory-only; standings are
+        // live tracker state. Pinned so a lean-prompt pass can't resurrect
+        // wealth/reputation/fame fields or the custom-tag currency routing.
+        assert!(player.contains("MONEY (2026-08-22 Chloe ruling)"));
+        assert!(player.contains("inventory.stored as ONE"));
+        assert!(!player.contains("wealth (a starting amount)"));
+        assert!(!player.contains("starting_currency"));
 
         let sim = build_creator_assistant_system_prompt("sim");
         // Type Router + the 3 branches + universal anchors (incl. tone) + the
@@ -22350,6 +24753,10 @@ mod tests {
         assert!(sim.contains("THE INTRO QUESTION"));
         assert!(sim.contains("whether they want an INTRO"));
         assert!(sim.contains("the INTRO question has been answered"));
+        // (2026-08-22 Chloe ruling) Same money law on the sim side — NPC coin
+        // rides the inventory's stored array; standings never touch the card.
+        assert!(sim.contains("MONEY (2026-08-22 Chloe ruling)"));
+        assert!(sim.contains("stored array as ONE"));
 
         let codex = build_creator_assistant_system_prompt("codex");
         assert!(codex.contains("entries"));

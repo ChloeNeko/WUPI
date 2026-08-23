@@ -735,7 +735,7 @@ fn health_points(state: BodyPartState) -> u32 {
         BodyPartState::Red => 4,
         BodyPartState::Purple => 8,
         BodyPartState::Black => 16,
-        BodyPartState::Transparent => 0,
+        BodyPartState::Healthy => 0,
     }
 }
 
@@ -751,7 +751,7 @@ fn health_points(state: BodyPartState) -> u32 {
 ///   the illness labels — the dead are not "Sick"). Core parts contribute
 ///   NO points.
 /// - **Non-core points:** Yellow=1, Orange=2, Red=4, Purple=8, Black=16 per
-///   part; Transparent scores 0. Bands: 0-7 Excellent, 8-11 Good, 12-17
+///   part; Healthy scores 0. Bands: 0-7 Excellent, 8-11 Good, 12-17
 ///   Fair, 18-23 Poor, 24+ Critical (3 purples or 6 reds = 24).
 /// - **Composition:** the WORSE of the core floor and the points band wins
 ///   (a yellow head + 12 points reads Fair — Chloe's worked example).
@@ -761,7 +761,7 @@ fn wound_grade(wounds: &HashMap<BodyPart, BodyPartState>) -> HealthTier {
     let mut core_rank: u8 = 4;
     for part in CORE_PARTS {
         let rank = match wounds.get(&part) {
-            None | Some(BodyPartState::Transparent) => 4,
+            None | Some(BodyPartState::Healthy) => 4,
             Some(BodyPartState::Yellow) => 3,
             Some(BodyPartState::Orange) => 2,
             Some(BodyPartState::Red) => 1,

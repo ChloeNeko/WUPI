@@ -369,8 +369,25 @@ export function serializeSimCard(f, opts = {}) {
 
   // The opening beat lives as the SIBLING `<intro>` AFTER `</sim_card>` —
   // kept out of the cached root (prime directive). ONE write persists both.
-  if (intro) {
-    xml += `\n<intro><![CDATA[\n${intro}\n]]></intro>\n`;
+  // (2026-08-22 intro variants) ONE `<intro>` PER VARIANT: the primary
+  // (draft.intro — the review card's opening; GLM may have polished the
+  // import's first_mes) first, then every authored alternate from
+  // draft.intro_variants (the imported alternate_greetings, verbatim).
+  // Exact-deduped, nothing dropped — Rust seeds them onto session message 0
+  // as swipeable variants so the player picks an opening at game start.
+  const introVariants = [];
+  const seenIntro = new Set();
+  const addIntroVariant = (v) => {
+    const s = text(v).trim();
+    if (s && !seenIntro.has(s)) {
+      seenIntro.add(s);
+      introVariants.push(s);
+    }
+  };
+  addIntroVariant(intro);
+  if (Array.isArray(d.intro_variants)) d.intro_variants.forEach(addIntroVariant);
+  for (const variant of introVariants) {
+    xml += `\n<intro><![CDATA[\n${variant}\n]]></intro>\n`;
   }
 
   // The npc `<inventory>` sibling: Clothing mandatory, the other lines
@@ -481,8 +498,9 @@ export function slugify(s) {
 
 // Convert the codex_entries array (from the Attach Codex slide) into the
 // compound `.codex` text format that codex::parse_compound_text reads.
-// Each entry: { title, tags (array), body }. Used by all three creators
-// on CREATE (written via fable_codex_raw_set after the card folder exists).
+// Each entry: { title, tags (array), body }. Used by the codex Creator's
+// CREATE path (2026-08-22: written into the UNIVERSAL library + auto-linked
+// via fable_codex_create_for_card once the card exists).
 export function codexEntriesToCompound(entries) {
   if (!Array.isArray(entries) || !entries.length) return '';
   // Front-matter hygiene: titles + tags are emitted into `title:`/`tags:`

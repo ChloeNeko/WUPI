@@ -2,7 +2,9 @@
 //!
 //! Money is THREE pools, deliberately never merged into one global stat:
 //!
-//! 1. `wealth` — pocket coin on `PlayerState`, fully liquid.
+//! 1. `wealth` — pocket coin on `PlayerState`, fully liquid. Moved by the
+//!    `[LEDGER wealth ±N]` verb (2026-08-22 — payments, tips, loot, rewards;
+//!    the tavern-scale flows) + wages/lifestyle at settlement.
 //! 2. Property treasuries — per-property tills on `WorldSchema.properties`,
 //!    node-liquid and owner-gated (deposit/withdraw/invest only work while
 //!    the player stands at the property's node).
@@ -392,13 +394,15 @@ pub fn format_money(amount: i64, label: &str) -> String {
 ///
 /// DORMANT while the economy is dormant (`None` — zero tokens, the
 /// fresh-game empty-render invariant): it wakes the moment ANY economy fact
-/// exists (a currency label learned, a property, a job, a lifestyle tier) —
+/// exists (a currency label learned, a property, a job, a lifestyle tier,
+/// pocket coin in the purse — the wealth verb's flows; 2026-08-22) —
 /// exactly the moment money can first appear in prose.
 pub fn render_economy_anchor(s: &WorldSchema) -> Option<String> {
     let economy_awake = !s.currency_label.trim().is_empty()
         || !s.properties.is_empty()
         || !s.player_state.jobs.is_empty()
-        || s.player_state.lifestyle != Lifestyle::Squatter;
+        || s.player_state.lifestyle != Lifestyle::Squatter
+        || s.player_state.wealth != 0;
     if !economy_awake {
         return None;
     }
@@ -863,9 +867,17 @@ mod tests {
         // tokens until money can appear).
         let s = crate::schema::WorldSchema::default();
         assert!(render_economy_anchor(&s).is_none(), "dormant while the economy is");
+        // (2026-08-22 wealth verb) Pocket coin wakes it too — money in the
+        // purse is the moment prices can first appear in prose.
+        let mut s = s;
+        s.player_state.wealth = 7;
+        assert!(
+            render_economy_anchor(&s).is_some(),
+            "pocket wealth wakes the anchor"
+        );
+        let mut s = crate::schema::WorldSchema::default();
         // Awake via a property (no label yet): unit-free framing + the
         // lifestyle ladder at prosperity 100 (no node → default).
-        let mut s = s;
         s.properties.insert("forge".into(), Property::default());
         let anchor = render_economy_anchor(&s).expect("property wakes the anchor");
         assert!(anchor.starts_with("<economy_anchor>"), "{anchor}");

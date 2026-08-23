@@ -118,7 +118,7 @@ test('serializePlayer: new fields (horn/custom_tags/inventory) emitted when pres
     name: 'Nyx', race: 'tiefling', horn: 'curled red', job: 'thief',
     equipped: ['Notched Iron Broadsword'],
     gear: ['compass', '  ', 'rope'],
-    custom_tags: { starting_currency: '200 gold', guard_reputation: '-20', blank: '' },
+    custom_tags: { curse: 'moon-bound', night_vision: 'keen', blank: '' },
   });
   assert.equal(player.horn, 'curled red');
   // job is a persona member (the final-question offer) — Occupation line.
@@ -126,7 +126,7 @@ test('serializePlayer: new fields (horn/custom_tags/inventory) emitted when pres
   // equipped rides the inventory sibling seed; legacy gear folds to stored.
   assert.deepEqual(player.inventory.equipped, ['Notched Iron Broadsword']);
   assert.deepEqual(player.inventory.stored, ['compass', 'rope']);
-  assert.deepEqual(player.custom_tags, { starting_currency: '200 gold', guard_reputation: '-20' }); // blank value dropped
+  assert.deepEqual(player.custom_tags, { curse: 'moon-bound', night_vision: 'keen' }); // blank value dropped
 });
 
 test('serializePlayer: new optional fields omitted when absent', () => {
@@ -151,8 +151,9 @@ test('serializePlayer: the opt-in persona block (final wizard question)', () => 
   assert.ok(!('persona' in bare));
 });
 
-test('serializePlayer: wealth/reputation/fame are NEVER serialized (transient)', () => {
-  // These seed PlayerState at attach, never the SavedPlayer identity (§6C).
+test('serializePlayer: wealth/reputation/fame are NEVER serialized (2026-08-22 ruling)', () => {
+  // Money is inventory-only; standings are live tracker state — neither ever
+  // touches the SavedPlayer identity (§6C), and no attach-time seeding exists.
   const { player } = serializePlayer({ name: 'A', wealth: '200 gold', reputation: '-20', fame: 'known' });
   assert.ok(!('wealth' in player));
   assert.ok(!('reputation' in player));
@@ -252,6 +253,55 @@ test('serializeSimCard: embeds <intro> as a sibling AFTER </sim_card>', () => {
   // No <intro> emitted when the draft carries none.
   const { xml: xml2 } = serializeSimCard({ name: 'X', directive: 'd' });
   assert.ok(!xml2.includes('<intro>'));
+});
+
+// ── intro variants (2026-08-22) ─────────────────────────────────────────────
+// One <intro> sibling per opening: the primary (draft.intro) first, then the
+// authored alternates (draft.intro_variants) — Rust parses them in file order
+// and seeds session message 0 as swipeable variants (the ‹ 1/N › chooser).
+test('serializeSimCard: intro_variants emit one <intro> sibling each, primary first', () => {
+  const { xml } = serializeSimCard({
+    name: 'Variants', directive: 'd',
+    intro: 'First opening.',
+    intro_variants: ['First opening.', 'Second opening.', 'Third opening.'],
+  });
+  const matches = Array.from(xml.matchAll(/<intro>/g));
+  assert.equal(matches.length, 3, `three <intro> siblings: ${xml}`);
+  const first = xml.indexOf('First opening.');
+  const second = xml.indexOf('Second opening.');
+  const third = xml.indexOf('Third opening.');
+  assert.ok(first > -1 && second > first && third > second, 'file order preserved');
+  assert.ok(xml.indexOf('<intro>') > xml.indexOf('</sim_card>'), 'siblings sit after the root');
+});
+
+test('serializeSimCard: a GLM-polished primary keeps the authored variant, deduped', () => {
+  // draft.intro was polished away from variants[0] — the polished text leads,
+  // the authored original survives as an alternate, exact dupes collapse.
+  const { xml } = serializeSimCard({
+    name: 'Variants', directive: 'd',
+    intro: 'Polished opening.',
+    intro_variants: ['Original opening.', 'Polished opening.', 'Alternate.'],
+  });
+  const matches = Array.from(xml.matchAll(/<intro>/g));
+  assert.equal(matches.length, 3, `polished + original + alternate: ${xml}`);
+  assert.ok(xml.indexOf('Polished opening.') < xml.indexOf('Original opening.'), 'primary leads');
+  assert.ok(xml.includes('Alternate.'));
+});
+
+test('serializeSimCard: no intro_variants → the single <intro> shape is unchanged', () => {
+  const { xml } = serializeSimCard({
+    name: 'Solo', directive: 'd', intro: 'The only opening.',
+  });
+  assert.equal(Array.from(xml.matchAll(/<intro>/g)).length, 1);
+  // Non-string entries in intro_variants coerce harmlessly (text() law —
+  // numbers become text; null/blank drop, exact dupes collapse).
+  const { xml: xml2 } = serializeSimCard({
+    name: 'Junk', directive: 'd', intro: 'Kept.',
+    intro_variants: [null, '  ', 'Kept.', 42, 'Real alternate.'],
+  });
+  const matches2 = Array.from(xml2.matchAll(/<intro>/g));
+  assert.equal(matches2.length, 3, `null/blank/dupe dropped, 42 coerced: ${xml2}`);
+  assert.ok(xml2.includes('Real alternate.'));
 });
 
 test('serializeSimCard: world branch emits subtype + setting + world sibling', () => {

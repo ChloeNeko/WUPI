@@ -280,6 +280,16 @@ async function openModal(root, meta) {
   wireIdCard(card);
 }
 
+// Re-run a player's modal open after an out-of-band change (the raw-XML
+// editor's save, 2026-08-22): reset the open-guard latch + rebuild with a
+// FRESH fable_player_get so the card shows the edited player. The modal
+// never visibly drops — openModal re-shows it instantly + generation-
+// invalidates the pending hide.
+export function refreshPlayerModal(root, meta) {
+  closeModal(root);
+  openModal(root, meta);
+}
+
 function closeModal(root) {
   const overlay = root.querySelector('[data-modal]');
   if (!overlay) return;

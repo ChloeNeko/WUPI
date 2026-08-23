@@ -82,6 +82,18 @@ pub struct Message {
     /// — same contract as `base_schema_ref`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub variant_schema_refs: Vec<usize>,
+    /// (2026-08-22 intro variants) TRUE only on the session's seeded opening
+    /// beat (message 0, from the card's `<intro>` siblings). Marks the beat
+    /// as AUTHORED card content rather than a tracked narrator turn: an edit
+    /// writes through to the card's `<intro>` variant (no schema re-track),
+    /// and a reroll's fresh variant appends to the card's list.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub is_intro: bool,
+}
+
+/// Serde skip helper — see `Message::is_intro`.
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 impl Message {
@@ -215,6 +227,17 @@ impl Message {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Conversation {
     pub messages: Vec<Message>,
+    /// (2026-08-21 resume-attach fix) The SavedPlayer bound to this
+    /// conversation (the slug id from the New Game flow's Pair 2). Stamped
+    /// at attach time in `attach_saved_player`'s caller and read back by
+    /// every resume path — the 2026-08-19 v2 identity move put the player
+    /// identity into the in-memory `<player>` cache block (NOT schema
+    /// entities), so without this field a resumed save/session silently
+    /// dropped the player back to the card default. `#[serde(default)]`
+    /// keeps every pre-field save loadable (they resume unattached, exactly
+    /// as before). Absent when None so legacy files stay byte-comparable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attached_player_id: Option<String>,
     /// (2026-08-16 audit H3) WIRE-ONLY deduplicated schema pool written by
     /// the save path (`pool_session_schemas`) + resolved into the per-message
     /// inline fields by `hydrate_schema_refs` immediately after load. Always
@@ -229,6 +252,7 @@ impl Conversation {
     pub fn new() -> Self {
         Self {
             messages: Vec::new(),
+            attached_player_id: None,
             schema_pool: Vec::new(),
         }
     }
@@ -260,6 +284,7 @@ impl Conversation {
             variant_schemas: Vec::new(),
             base_schema_ref: None,
             variant_schema_refs: Vec::new(),
+            is_intro: false,
         };
         self.messages.push(msg);
         self.messages.last().expect("just pushed")
@@ -288,6 +313,7 @@ impl Conversation {
             variant_schemas: Vec::new(),
             base_schema_ref: None,
             variant_schema_refs: Vec::new(),
+            is_intro: false,
         };
         self.messages.push(msg);
         self.messages.last().expect("just pushed")
@@ -747,6 +773,41 @@ mod tests {
         c
     }
 
+    /// (2026-08-21 resume-attach fix) The SavedPlayer binding rides the
+    /// conversation: it must round-trip through session.json (the pool
+    /// transform touches only messages + schema_pool, never session-level
+    /// keys) — and a legacy file with no field parses to None (pre-fix
+    /// saves resume unattached, not broken).
+    #[test]
+    fn attached_player_id_round_trips_through_save_load() {
+        let path = unique_test_path("attach_rt");
+        let mut c = sample_conv();
+        c.attached_player_id = Some("alex".into());
+        c.save(&path).expect("save with binding");
+        let loaded = Conversation::load(&path).expect("load with binding");
+        assert_eq!(loaded.attached_player_id.as_deref(), Some("alex"));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn attached_player_id_absent_parses_to_none() {
+        let path = unique_test_path("attach_legacy");
+        // A None binding saves WITHOUT the key (skip_serializing_if) — the
+        // exact wire shape every pre-2026-08-21 session.json/save slot
+        // already has on disk, so this doubles as the back-compat pin.
+        let c = sample_conv();
+        c.save(&path).expect("save without binding");
+        let text = std::fs::read_to_string(&path).expect("read back");
+        assert!(
+            !text.contains("attached_player_id"),
+            "None binding must omit the key"
+        );
+        let loaded = Conversation::load(&path).expect("legacy shape parses");
+        assert_eq!(loaded.attached_player_id, None);
+        assert_eq!(loaded.messages.len(), 1);
+        let _ = std::fs::remove_file(&path);
+    }
+
     /// `remove_at` (2026-08-11): the missing structural primitive the
     /// `fable_message_delete` tool needs. Shifts subsequent messages down + is
     /// bounds-checked. Mirrors the bounds-error shape the lib.rs appliers emit.
@@ -1074,6 +1135,7 @@ mod tests {
             variant_schemas: Vec::new(),
             base_schema_ref: None,
             variant_schema_refs: Vec::new(),
+            is_intro: false,
         }
     }
 
@@ -1239,6 +1301,7 @@ mod tests {
             variant_schemas: Vec::new(),
             base_schema_ref: None,
             variant_schema_refs: Vec::new(),
+            is_intro: false,
         };
         m.normalize_variants();
         assert_eq!(m.active_idx, 0, "clamped to 0");

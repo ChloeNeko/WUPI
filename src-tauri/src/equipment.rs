@@ -366,6 +366,54 @@ pub fn stack_upsert(items: &mut Vec<StackItem>, item: StackItem) -> bool {
     }
 }
 
+/// (2026-08-22 playtest) Restate a stack item: the tracker's BARE form
+/// (`[PACK name="Field Points" (qty=13)]`, no `+`) is a full-list
+/// RESTATEMENT read back off the world-state's `pack: … ×12` line — the
+/// model is asserting "the stack is now N", not "add N more". On an
+/// EXISTING name with `replace_qty` this REPLACES the qty (taking the max
+/// per-unit weight, filling absent stats, unioning tags — the same
+/// monotonic merges as [`stack_upsert`]); with `replace_qty == false` (a
+/// bare emission that carried NO qty token — the parser's defaulted 1 is
+/// "no count given", not "the stack is now 1") the stored count is KEPT and
+/// only the stat/weight/tag merges run. On a name the list doesn't know it
+/// pushes a new entry (a first sighting is an acquisition regardless of
+/// form). Without this, every restatement STACKED (`stack_upsert` sums),
+/// and the read-back loop multiplied inventories ("Field Points ×12" →
+/// ×25 → ×38 — the playtest's "it doubled my Dagger and quadrupled some
+/// other items"); conversely a qty-less restatement with unconditional
+/// replace collapsed a `Rope ×50` stack to ×1 (2026-08-22 review). Returns
+/// true if the list changed.
+pub fn stack_restate(items: &mut Vec<StackItem>, item: StackItem, replace_qty: bool) -> bool {
+    let key = item.name.trim().to_lowercase();
+    if let Some(existing) = items
+        .iter_mut()
+        .find(|i| i.name.trim().to_lowercase() == key)
+    {
+        let mut changed = replace_qty && existing.qty != item.qty;
+        if replace_qty {
+            existing.qty = item.qty;
+        }
+        if item.weight > existing.weight {
+            existing.weight = item.weight;
+            changed = true;
+        }
+        if existing.stats.is_none() && item.stats.is_some() {
+            existing.stats = item.stats;
+            changed = true;
+        }
+        for t in &item.tags {
+            if !existing.tags.contains(t) {
+                existing.tags.push(*t);
+                changed = true;
+            }
+        }
+        changed
+    } else {
+        items.push(item);
+        true
+    }
+}
+
 /// Remove up to `qty` of a named item from a stack list. If `qty` covers the
 /// whole stack (or the caller passes the removal form), the entry is dropped.
 /// Returns true if anything was removed. qty=0 means "remove the whole entry"
@@ -403,6 +451,14 @@ const PHRASE_STOPWORDS: &[&str] = &[
     "those", "here", "there", "all", "any", "both", "each", "few", "more",
     "most", "other", "some", "such", "no", "not", "only", "own", "same", "too",
     "very", "just", "like", "one",
+    // (2026-08-21) Preposition gap — "he grabbed a cookie across from me"
+    // absorbed "across" into the stored name ("cookie across"). The list
+    // had "past"/"from" but none of these; all pure function words, never
+    // name material.
+    "across", "toward", "towards", "against", "around", "behind", "beside",
+    "besides", "between", "beyond", "through", "throughout", "upon", "along",
+    "among", "amid", "within", "without", "inside", "outside", "during",
+    "despite", "except", "via", "per", "about",
 ];
 
 /// How many narrative words may follow the fragment into the resolved name
@@ -1744,6 +1800,37 @@ mod tests {
     }
 
     #[test]
+    fn stack_restate_replaces_only_with_explicit_qty() {
+        // (2026-08-22 review pin) The bare restatement contract: an explicit
+        // qty REPLACES the count (the read-back loop's "the stack is now N");
+        // a qty-LESS bare emission (parser-defaulted qty=1, replace_qty=false)
+        // is existence-only — it must NOT collapse an existing stack to 1.
+        let mut items = vec![StackItem { name: "Rope".into(), qty: 50, weight: 0.5, stats: None, ..Default::default() }];
+        // Qty-less assertion: count preserved, no phantom change.
+        assert!(!stack_restate(
+            &mut items,
+            StackItem { name: "rope".into(), qty: 1, weight: 0.5, stats: None, ..Default::default() },
+            false,
+        ));
+        assert_eq!(items[0].qty, 50, "a qty-less bare restatement keeps the stored count");
+        // Explicit qty: replace semantics.
+        assert!(stack_restate(
+            &mut items,
+            StackItem { name: "Rope".into(), qty: 13, weight: 0.5, stats: None, ..Default::default() },
+            true,
+        ));
+        assert_eq!(items[0].qty, 13);
+        // First sighting is an acquisition regardless of form/flag.
+        assert!(stack_restate(
+            &mut items,
+            StackItem { name: "Torch".into(), qty: 1, weight: 0.5, stats: None, ..Default::default() },
+            false,
+        ));
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[1].name, "Torch");
+    }
+
+    #[test]
     fn stack_remove_partial_decrements() {
         let mut items = vec![StackItem { name: "Arrow".into(), qty: 10, weight: 0.1, stats: None, ..Default::default() }];
         assert!(stack_remove(&mut items, "Arrow", 3));
@@ -2099,6 +2186,17 @@ mod tests {
             resolve_item_fragment("hard", &[inn], &none),
             Some("hard biscuit".to_string())
         );
+    }
+
+    #[test]
+    fn fragment_never_absorbs_prepositions() {
+        // (2026-08-21) "he grabbed a cookie across from me" used to absorb
+        // "across" into the stored name ("cookie across") — prepositions
+        // are function words, never name material. With "across" stopworded
+        // the one-word fragment stays verbatim (None = no expansion).
+        let none: Vec<String> = Vec::new();
+        let text = "He grabbed a cookie across from me.";
+        assert_eq!(resolve_item_fragment("cookie", &[text], &none), None);
     }
 
     #[test]

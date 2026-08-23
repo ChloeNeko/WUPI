@@ -46,6 +46,7 @@ import { open as openDialog } from '@tauri-apps/plugin-dialog';
 import { buildIdCard } from '../engine/creator-engine.js';
 import { renderIdCard, wireIdCard } from './id-card.js';
 import { closeSavesModal } from './saves.js';
+import { closeSessionsModal } from './sessions.js';
 
 function esc(s) {
   return String(s || '')
@@ -122,9 +123,10 @@ export async function renderWorlds(root, handlers) {
   const gen = root._renderGen;
   host.innerHTML = '';
   closeModal(root);
-  // A saves popup left over from a resumed game (the popup outlives the
-  // screen swap inside the hidden worlds screen) must not cover the grid.
+  // A sessions/saves popup left over from a resumed game (the popup outlives
+  // the screen swap inside the hidden worlds screen) must not cover the grid.
   closeSavesModal(root);
+  closeSessionsModal(root);
   let cards = [];
   try {
     cards = await invoke('fable_cards_list');
@@ -199,8 +201,9 @@ async function openModal(root, meta) {
     // this handler runs on CAPTURE, so a stopPropagation here killed the raw
     // editor's bubble-phase Esc listener (fable.js) — the first Esc closed
     // the worlds modal UNDER the editor instead of the editor itself. The
-    // saves popup (2026-08-20) layers the same way.
-    if (document.querySelector('.fable-raw-editor-overlay, .fable-saves-popup-overlay')) return;
+    // saves popup (2026-08-20) + sessions popup (2026-08-22) layer the same
+    // way.
+    if (document.querySelector('.fable-raw-editor-overlay, .fable-saves-popup-overlay, .fable-sessions-popup-overlay')) return;
     if (e.key === 'Escape') { e.stopPropagation(); closeModal(root); }
   };
   overlay.addEventListener('click', onBackdropClick);
@@ -301,6 +304,16 @@ async function openModal(root, meta) {
   card.querySelector('[data-modal-delete]').addEventListener('click', () => {
     confirmDelete(root, meta);
   });
+}
+
+// Re-run a card's modal open after an out-of-band change (the raw-XML
+// editor's save, 2026-08-22): reset the open-guard latch + rebuild with a
+// FRESH raw-XML fetch so the review card shows the edited card, not the
+// pre-edit snapshot it was rendered with. The modal never visibly drops —
+// openModal re-shows it instantly + generation-invalidates the pending hide.
+export function refreshCardModal(root, meta) {
+  closeModal(root);
+  openModal(root, meta);
 }
 
 function closeModal(root) {
@@ -552,8 +565,17 @@ function parseSimDraft(xmlText, subtype) {
         if (wm.tone) out.tone = wm.tone;
         const loc = tq('location');
         if (loc) out.location = loc;
-        const intro = tq('intro');
-        if (intro) out.intro = intro;
+        // (2026-08-22 intro variants) EVERY `<intro>` sibling in file order:
+        // the first is the default opening (out.intro — the modal's Intro
+        // section), the rest ride as out.intro_variants so an EDIT run
+        // re-emits them instead of silently dropping the alternates.
+        const introList = Array.from(tdoc.querySelectorAll('intro, introduction'))
+          .map((el) => el.textContent.trim())
+          .filter(Boolean);
+        if (introList.length) {
+          out.intro = introList[0];
+          if (introList.length > 1) out.intro_variants = introList;
+        }
         const im = labeled(tq('inventory'));
         if (im.clothing) out.clothing = listVal(im.clothing);
         if (im.equipped) out.equipped = listVal(im.equipped);

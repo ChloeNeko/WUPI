@@ -38,22 +38,81 @@ import * as narrator from './narrator.js';
 // for the .sim/.player tabs; JSON.parse otherwise).
 // (2026-08-21, Chloe) The PLAYER tab edits the identity file — the attached
 // SavedPlayer's .player XML (fable_player_raw_get/set, same parse-gated path
-// as the player-picker's editor) — NOT the per-card player.json gameplay
-// state. The attached id is resolved at read time and stashed for save.
+// as the player-picker's editor). (2026-08-22, Chloe) The tab now carries
+// BOTH halves of the attached player in ONE text field: the `.player` XML on
+// top, the active session's player.json — the `{ "player_state": … }`
+// gameplay slice the same fable_json_raw_get/set pair owns — just underneath,
+// behind a `===== player.json =====` divider line. The divider is the save
+// split boundary; the `check` override validates each half in its own format
+// (XML sniff above the divider, JSON.parse below) so the validation lock, the
+// green ✓, and ↻ all keep working on the combined text. The attached id and
+// the as-loaded halves are resolved at read time and stashed for save.
+// (2026-08-22 codex decoupling) The CODEX tab edits one UNIVERSAL library
+// file (fable_codex_file_read/write, name-keyed) — the target name is
+// handed to openRawEditor by the tab-rail link manager (the first linked
+// codex as its default).
 let playerRawId = null;
+let playerLoadedXml = '';
+let playerLoadedJson = '';   // '' = the open offered no JSON half (missing file / read failure)
+let codexFileName = null;
 const FILE_FOR = {
   card:   { title: 'Sim Card (.sim)',   isXml: true,  read: () => invoke('fable_card_raw_get'), save: (t) => invoke('fable_card_raw_set', { xml: t }) },
-  codex:  { title: 'Codex (.codex)',     isXml: false, read: async () => (await invoke('fable_codex_get')).raw, save: (t) => invoke('fable_codex_raw_set', { text: t }) },
+  codex:  {
+    // Compound text (front-matter + `---` fences + prose bodies) — NEVER
+    // JSON, so the default JSON.parse gate would leave ✓ permanently
+    // disabled for every non-empty file. No client-side structural check:
+    // the backend's compound parse on save is authoritative (the codex
+    // format has no client-cheap well-formedness invariant).
+    title: 'Codex (.codex)', isXml: false, check: () => true,
+    read: async () => (await invoke('fable_codex_file_read', { name: codexFileName })).raw,
+    save: (t) => invoke('fable_codex_file_write', { name: codexFileName, text: t }),
+  },
   world:  { title: 'World (world.json)', isXml: false, read: () => invoke('fable_json_raw_get', { kind: 'world' }),  save: (t) => invoke('fable_json_raw_set', { kind: 'world',  json: t }) },
   player: {
-    title: 'Player (.player)', isXml: true,
+    title: 'Player (.player + player.json)', isXml: true,
+    // The combined-format gate: each half validates in its own format (see
+    // playerRawTextLooksValid) — this override replaces the whole-text sniff,
+    // which the appended JSON would otherwise break.
+    check: (text) => playerRawTextLooksValid(text),
     read: async () => {
       const p = await invoke('fable_active_player_get');
       if (!p || !p.id) throw new Error('No player attached to this game.');
       playerRawId = p.id;
-      return invoke('fable_player_raw_get', { id: playerRawId });
+      const xml = await invoke('fable_player_raw_get', { id: playerRawId });
+      // The player.json half — the ACTIVE SESSION's gameplay slice. A
+      // not-yet-written file returns '' (fresh session); a failed read
+      // degrades to the XML-only view so the tab stays usable (the JSON
+      // half simply isn't offered for editing that open).
+      let json = '';
+      try {
+        json = await invoke('fable_json_raw_get', { kind: 'player' });
+      } catch (err) {
+        console.warn('[fable] raw editor player.json read failed', err);
+      }
+      playerLoadedXml = xml;
+      playerLoadedJson = json;
+      return combinePlayerRawText(xml, json);
     },
-    save: (t) => invoke('fable_player_raw_set', { id: playerRawId, xml: t }),
+    save: async (t) => {
+      const { xml, json } = splitPlayerRawText(t);
+      if (json === null) {
+        // No divider — the whole text is the .player XML (the pre-2026-08-22
+        // shape: no JSON half was offered this open).
+        await invoke('fable_player_raw_set', { id: playerRawId, xml: t });
+        return;
+      }
+      // Each half writes ONLY when it changed since the open — an XML-only
+      // edit must not round-trip the open-time player_state snapshot back
+      // over the LIVE schema (fable_json_raw_set overwrites player_state
+      // wholesale; the stale-open rollback class the narrator-in-flight
+      // guard only partially covers).
+      if (xml.trim() !== playerLoadedXml.trim()) {
+        await invoke('fable_player_raw_set', { id: playerRawId, xml });
+      }
+      if (json.trim() !== playerLoadedJson.trim()) {
+        await invoke('fable_json_raw_set', { kind: 'player', json });
+      }
+    },
   },
   npc:    { title: 'NPC (npc.json)',     isXml: false, read: () => invoke('fable_json_raw_get', { kind: 'npc' }),     save: (t) => invoke('fable_json_raw_set', { kind: 'npc',     json: t }) },
 };
@@ -111,13 +170,23 @@ export function buildRawEditor() {
 // Open the editor for a file kind. Loads the current file text as both the
 // textarea content AND the initial last-good. `onSaved` (optional) lets the
 // caller refresh its dropdown view after a save (e.g. the tab rail re-reads).
-export async function openRawEditor(kind, onSaved) {
+// `opts.codexName` (codex kind, 2026-08-22) selects WHICH universal library
+// file the editor targets — required before a codex open (no default file
+// exists anymore).
+export async function openRawEditor(kind, onSaved, opts = {}) {
   const file = FILE_FOR[kind];
   if (!file || !overlayEl) return;
+  if (kind === 'codex') {
+    const name = (opts && opts.codexName && String(opts.codexName).trim()) || null;
+    if (!name) return; // no library file selected — nothing to edit
+    codexFileName = name;
+  }
   saveEpoch++;               // invalidate any save still resolving from a prior session
   current = file;
   onSavedCb = onSaved || null;
-  titleEl.textContent = file.title;
+  titleEl.textContent = kind === 'codex' && codexFileName
+    ? `Codex — ${codexFileName}`
+    : file.title;
   textareaEl.value = '';
   overlayEl.hidden = false;
   try {
@@ -125,21 +194,27 @@ export async function openRawEditor(kind, onSaved) {
     // card/codex reads can return empty for a fresh file; that's valid (the
     // editor starts blank for a new file). JSON tabs return '' too.
     textareaEl.value = text || '';
+    textareaEl.placeholder = '';   // clear any prior open's load-failure message
     lastGood = text || '';
     revalidate();
     setTimeout(() => textareaEl.focus(), 30);
   } catch (err) {
     console.warn('[fable] raw editor load failed', err);
-    // (2026-08-16 audit LOW) Close + reset on a failed read. The old path
-    // left an EMPTY open modal carrying the PREVIOUS session's `lastGood`
-    // + validity — a stale-true ✓ enabled a save that would overwrite the
-    // real file with nothing.
-    overlayEl.hidden = true;
-    current = null;
-    onSavedCb = null;
-    isValid = true;
+    // (2026-08-22 Chloe) A failed read used to close the modal SILENTLY —
+    // the ✎ read as dead ("nothing happens but the drawer closes"). Keep
+    // the popup OPEN with the failure visible: the title carries the
+    // error, the textarea shows it as the placeholder (never as value — a
+    // value would re-validate valid + re-enable ✓), and ✓ stays disabled
+    // so the empty text can never overwrite the real file. ✕ / Esc /
+    // backdrop close normally.
+    const msg = String(err && err.message ? err.message : err);
+    current = null;           // ✓ can never save over a file that failed to load
     lastGood = '';
-    saveBtn.disabled = false;
+    isValid = true;
+    saveBtn.disabled = true;
+    titleEl.textContent = `${file.title} — load failed`;
+    textareaEl.value = '';
+    textareaEl.placeholder = msg;
   }
 }
 
@@ -228,6 +303,7 @@ function closeModal() {
   current = null;
   onSavedCb = null;
   textareaEl.value = '';
+  textareaEl.placeholder = '';
   lastGood = '';
   textareaEl.classList.remove('invalid');
   saveBtn.disabled = false;
@@ -245,7 +321,11 @@ function revalidate() {
     setValid(true);
     return;
   }
-  if (current && current.isXml) {
+  if (current && typeof current.check === 'function') {
+    // A kind-specific gate (the codex compound-text editor) overrides the
+    // XML/JSON sniff entirely.
+    setValid(current.check(text));
+  } else if (current && current.isXml) {
     setValid(xmlLooksValid(text));
   } else {
     try { JSON.parse(text); setValid(true); }
@@ -274,6 +354,63 @@ function xmlLooksValid(text) {
   const closes = (stripped.match(/<\/[a-zA-Z_][^>]*>/g) || []).length;
   const selfClosed = (stripped.match(/<[a-zA-Z_][^>]*?\/>/g) || []).length;
   return opens === closes + selfClosed || (opens === 0 && selfClosed > 0);
+}
+
+// ── the PLAYER tab's combined format (2026-08-22) ────────────────────────
+// One text field, two halves: the `.player` XML on top, the session's
+// player.json underneath, separated by a divider line. The divider is a
+// whole line of `=` around `player.json` — matched tolerantly (any equals
+// count) so a hand-typed `=== player.json ===` still splits; the canonical
+// form is what read-side assembly writes.
+const PLAYER_JSON_DIVIDER = '===== player.json =====';
+const PLAYER_JSON_DIVIDER_RE = /^[=\s]*player\.json[=\s]*$/i;
+
+// Split the combined text at the FIRST divider line. `{ xml, json }` — json
+// is null when no divider is present (XML-only mode). Exported for the Node
+// suite (tests/raw-editor-player.test.mjs).
+export function splitPlayerRawText(text) {
+  const lines = String(text).split('\n');
+  const idx = lines.findIndex((l) => PLAYER_JSON_DIVIDER_RE.test(l.trim()));
+  if (idx === -1) return { xml: text, json: null };
+  return {
+    // trimEnd/trimStart drop the blank line(s) the read-side assembly puts
+    // around the divider (XML-only mode above stays verbatim).
+    xml: lines.slice(0, idx).join('\n').trimEnd(),
+    json: lines.slice(idx + 1).join('\n').trimStart(),
+  };
+}
+
+// Assemble the combined text on read. An empty JSON half yields the XML
+// untouched (no divider) — saving then writes the .player XML only and never
+// touches the session state.
+export function combinePlayerRawText(xml, json) {
+  const j = String(json || '').trim();
+  if (!j) return String(xml || '');
+  return `${String(xml || '').trimEnd()}\n\n${PLAYER_JSON_DIVIDER}\n\n${j}`;
+}
+
+// The combined-format validity gate: the XML half passes the same sniff the
+// .sim tab uses; when a divider is present, the JSON half below it must
+// JSON.parse (the json checker, scoped to its section — an empty half after
+// a divider is invalid: fix it or ↻). No divider = XML-only, as before.
+export function playerRawTextLooksValid(text) {
+  const { xml, json } = splitPlayerRawText(text);
+  if (!xmlLooksValid(xml)) return false;
+  if (json !== null) {
+    try { JSON.parse(json); return true; } catch (_) { return false; }
+  }
+  // XML-only mode still guards its own hazard: trailing non-XML text (e.g.
+  // the JSON half with its divider line deleted) — the tag-count sniff
+  // balances straight through it, but the backend parse rejects it and the
+  // save would silently drop the JSON half. Only whitespace may follow the
+  // final close tag (comments stripped first, mirroring the sniff).
+  const noComments = xml.replace(/<!--[\s\S]*?-->/g, '');
+  const lastClose = noComments.lastIndexOf('</');
+  if (lastClose !== -1) {
+    const after = noComments.slice(noComments.indexOf('>', lastClose) + 1);
+    if (after.trim() !== '') return false;
+  }
+  return true;
 }
 
 // Hard reset (called from teardownStage on stage exit so a close mid-edit

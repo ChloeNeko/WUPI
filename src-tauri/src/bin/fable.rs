@@ -13,14 +13,15 @@
 // ripple, so double-clicking fable.exe lands straight on the Fable title
 // screen with no bootup / loading screen / ripple.
 //
-// DIRECT LAUNCH: optional CLI args `--card <slug> [--save <save_id>]` boot
-// straight into a specific card+save, skipping the title entirely. Parsed
-// here (std::env::args) by the SHARED `wupi_lib::parse_fable_cli` (also the
-// single-instance forwarder's parser, 2026-08-20 — one rule set, no drift)
-// + stashed via set_launch_context() before run(); setup() appends
-// `?direct=1` to the URL + the frontend drives the rest. `--save` defaults
-// to None = Continue (live session.json). This is also the arg shape a
-// generated desktop shortcut (shortcut.rs) bakes into the .lnk.
+// DIRECT LAUNCH: optional CLI args `--card <slug> [--session <id>] [--save
+// <save_id>]` boot straight into a specific card+session/save, skipping the
+// title entirely. Parsed here (std::env::args) by the SHARED
+// `wupi_lib::parse_fable_cli` (also the single-instance forwarder's parser,
+// 2026-08-20 — one rule set, no drift) + stashed via set_launch_context()
+// before run(); setup() appends `?direct=1` to the URL + the frontend drives
+// the rest. `--save` defaults to None = Continue (the most-recently-played
+// session's live state). This is also the arg shape a generated desktop
+// shortcut (shortcut.rs) bakes into the .lnk.
 //
 // Single-instance: both exes share the identifier `com.wupi.desktop`, so they
 // are mutually exclusive (can't run wupi.exe + fable.exe at once). Launching
@@ -39,11 +40,12 @@ fn main() {
     // Flag this process as the fable launcher BEFORE run() so setup() picks the
     // `wupi.html#fable` window URL.
     wupi_lib::set_fable_entry();
-    // DIRECT LAUNCH: parse `--card`/`--save` + stash for setup()/get_launch_context.
-    // The parser lives in the lib (wupi_lib::parse_fable_cli) so the
-    // single-instance forwarder reads argv with the SAME rules.
+    // DIRECT LAUNCH: parse `--card`/`--session`/`--save` + stash for
+    // setup()/get_launch_context. The parser lives in the lib
+    // (wupi_lib::parse_fable_cli) so the single-instance forwarder reads
+    // argv with the SAME rules.
     if let Some(cli) = wupi_lib::parse_fable_cli(std::env::args().skip(1)) {
-        wupi_lib::set_launch_context(cli.card, cli.save);
+        wupi_lib::set_launch_context(cli.card, cli.session, cli.save);
     }
     wupi_lib::run();
 }

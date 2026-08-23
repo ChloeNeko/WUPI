@@ -126,10 +126,9 @@ export function buildReviewSections(kind, d) {
         row('Occupation', persona.occupation != null ? persona.occupation : d.job),
         row('History', d.backstory),
       ].filter(Boolean)],
-      // Starting conditions are TRANSIENT (seed PlayerState at attach, never
-      // persisted on the SavedPlayer) but surface here so the player sees
-      // what was captured. Absent on edited/loaded players → section dropped.
-      ['Starting conditions', [row('Wealth', d.wealth), row('Reputation', d.reputation || d.fame)].filter(Boolean)],
+      // (2026-08-22 Chloe ruling) NO wealth/currency/fame/popularity/reputation
+      // section — money is inventory-only; standings are live tracker state
+      // that never appears on a card (even from a legacy draft carrying them).
       ['Custom tags', customRows],
     ].filter(([, rows]) => rows.length);
   }
@@ -280,8 +279,7 @@ function holdingsRows(d) {
 // license rows in paired rows; skin/body/hair moved into the extra
 // disclosure as the leading Appearance section, so the popup carries:
 // Appearance, Distinctive, the v2 Inventory seed, the opt-in Persona block,
-// transient Starting conditions, Custom tags, and (NPC) the world anchors +
-// intro.
+// Custom tags, and (NPC) the world anchors + intro.
 function playerIdCard(d, isNpc) {
   const title = toText(d.name);
   const core = [
@@ -329,10 +327,8 @@ function playerIdCard(d, isNpc) {
       idRow('Occupation', pGet('occupation', 'job')),
       idRow('Backstory', d.backstory),
     ].filter(Boolean)],
-    // Starting conditions are TRANSIENT (seed PlayerState at attach, never
-    // persisted on the SavedPlayer) but surface here so the player sees what
-    // was captured. Absent on edited/loaded players → section dropped.
-    ['Starting conditions', [idRow('Wealth', d.wealth), idRow('Reputation', d.reputation || d.fame)].filter(Boolean)],
+    // (2026-08-22 Chloe ruling) NO wealth/reputation rows — money is
+    // inventory-only; standings are live tracker state, never card fields.
     ['Custom tags', customTagRows(d)],
     // The intro the SIM Wizard gathered for an NPC card (mandatory question —
     // 2026-08-15). Player cards never carry one → dropped.
@@ -526,16 +522,37 @@ function decodeLatin1(bytes) {
 }
 
 // PNG = 8-byte signature + (length:u32be, type:4, data, crc:u32be) chunks.
-// Walk the tEXt/iTXt chunks keyed `chara` (SillyTavern's V2 convention) or
-// `ccv3` (the V3 convention — some V3 cards carry ONLY ccv3). Returns the
+// Walk the text chunks keyed `chara` (SillyTavern's V2 convention) or `ccv3`
+// (the V3 convention — some V3 cards carry ONLY ccv3). LIBERAL BY DESIGN
+// (2026-08-22, "The Fire Rises" incident): keyword matching is
+// case-insensitive, the signature may sit past leading junk (some site
+// downloads prepend bytes), zTXt (the compressed-text chunk some embedders
+// use) is collected alongside tEXt/iTXt, and DUPLICATE keywords are KEPT —
+// re-export tools APPEND a fresh `chara` instead of replacing, so one PNG
+// can carry several different cards (that exact file holds two, 344KB +
+// 66KB). Selection lives in readCharaCard/pickBestCandidate. Returns the
 // candidates in file order: {keyword, text} for values decodable in place,
-// {keyword, compressed} for iTXt with the compression flag set (a zlib
-// stream — needs async inflation, see readCharaChunk). Pure.
-function walkCharaCandidates(u8) {
+// {keyword, compressed} for zTXt or iTXt-with-compression (zlib streams —
+// async inflation, see readCharaChunk). Pure.
+function findPngSignature(u8) {
   const SIG = [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
-  if (u8.length < 8) return [];
-  for (let i = 0; i < 8; i++) if (u8[i] !== SIG[i]) return [];
-  let off = 8;
+  // A real PNG header sits right up front; anything past 4KB of junk is not
+  // a PNG worth rescuing.
+  const limit = Math.min(u8.length - 8, 4096);
+  for (let i = 0; i <= limit; i++) {
+    let ok = true;
+    for (let j = 0; j < 8; j++) {
+      if (u8[i + j] !== SIG[j]) { ok = false; break; }
+    }
+    if (ok) return i;
+  }
+  return -1;
+}
+
+function walkCharaCandidates(u8) {
+  const start = findPngSignature(u8);
+  if (start < 0) return [];
+  let off = start + 8;
   const dv = new DataView(u8.buffer, u8.byteOffset, u8.byteLength);
   const out = [];
   while (off + 8 <= u8.length) {
@@ -544,17 +561,22 @@ function walkCharaCandidates(u8) {
     const dataStart = off + 8;
     const dataEnd = dataStart + len;
     if (dataEnd > u8.length) return out; // truncated
-    if (type === 'tEXt' || type === 'iTXt') {
+    if (type === 'tEXt' || type === 'iTXt' || type === 'zTXt') {
       const chunk = u8.subarray(dataStart, dataEnd);
       let nul = -1;
       for (let i = 0; i < chunk.length; i++) {
         if (chunk[i] === 0) { nul = i; break; }
       }
       if (nul > 0) {
-        const keyword = decodeLatin1(chunk.subarray(0, nul));
+        const keyword = decodeLatin1(chunk.subarray(0, nul)).toLowerCase();
         if (keyword === 'chara' || keyword === 'ccv3') {
           if (type === 'tEXt') {
             out.push({ keyword, text: decodeLatin1(chunk.subarray(nul + 1)) });
+          } else if (type === 'zTXt') {
+            // zTXt: keyword\0 compressionMethod(1) zlib-stream. Method 0
+            // (RFC-1950 zlib) is the only defined value; anything else is
+            // unverifiable → skip the candidate.
+            if (chunk[nul + 1] === 0) out.push({ keyword, compressed: chunk.subarray(nul + 2) });
           } else {
             // iTXt: keyword\0 compressionFlag(1) compressionMethod(1)
             // langTag\0 translatedKey\0 text(utf-8).
@@ -576,19 +598,20 @@ function walkCharaCandidates(u8) {
   return out;
 }
 
-// The sync accessor (pure, unit-tested): the first uncompressed `chara`
-// value, else the first uncompressed `ccv3`. Compressed iTXt candidates are
-// skipped — only the async readCharaChunk can inflate them.
+// The sync accessor (pure, unit-tested): the LAST uncompressed `chara`
+// value, else the LAST uncompressed `ccv3`. Compressed zTXt/iTXt candidates
+// are skipped — only the async readCharaChunk can inflate them.
 export function findCharaChunk(u8) {
-  const cands = walkCharaCandidates(u8);
-  const pick = (kw) => cands.find((c) => c.keyword === kw && c.text != null);
-  const hit = pick('chara') || pick('ccv3');
+  let hit = null;
+  for (const c of walkCharaCandidates(u8)) {
+    if (c.text != null && (c.keyword === 'chara' || (c.keyword === 'ccv3' && !hit))) hit = c;
+  }
   return hit ? hit.text : null;
 }
 
-// Inflate a zlib stream (PNG iTXt compressionMethod 0 = RFC-1950 zlib).
-// DecompressionStream('deflate') IS the zlib-wrapped flavor ('deflate-raw'
-// is raw). Shipped by WebView2 + Node ≥18 alike.
+// Inflate a zlib stream (PNG zTXt/iTXt compressionMethod 0 = RFC-1950
+// zlib). DecompressionStream('deflate') IS the zlib-wrapped flavor
+// ('deflate-raw' is raw). Shipped by WebView2 + Node ≥18 alike.
 async function inflateZlib(bytes) {
   if (typeof DecompressionStream === 'undefined') {
     throw new Error('this PNG stores its character data compressed, which this runtime cannot inflate');
@@ -598,24 +621,129 @@ async function inflateZlib(bytes) {
   return new Uint8Array(buf);
 }
 
-// The full import path (async): `chara` first, then `ccv3`; inflates
-// compressed iTXt payloads; a candidate that fails to inflate falls through
-// to the next one rather than aborting the import. Returns null when no
+// Decode one walked candidate to its text (inflating a zlib stream when
+// needed). Returns null when the payload cannot be decoded — never throws.
+async function decodeCharaCandidate(c) {
+  if (!c) return null;
+  if (c.text != null) return c.text;
+  try {
+    return new TextDecoder('utf-8').decode(await inflateZlib(c.compressed));
+  } catch (_) {
+    return null;
+  }
+}
+
+// Parse a chunk's payload text into a JSON object. ST embeds
+// base64(UTF-8 JSON); some writers store raw JSON text — try the spec form
+// first, fall back to raw. Returns the parsed object or null.
+export function parseCharaText(text) {
+  if (typeof text !== 'string' || !text.trim()) return null;
+  try {
+    return JSON.parse(base64ToUtf8(text));
+  } catch (_) { /* not base64 JSON — try raw */ }
+  try {
+    const obj = JSON.parse(text);
+    return obj && typeof obj === 'object' && !Array.isArray(obj) ? obj : null;
+  } catch (_) {
+    return null;
+  }
+}
+
+// Normalize a name for the file-stem ↔ card-name match: lowercase, collapse
+// every non-alphanumeric run to one space, trim.
+function normalizeNameForMatch(s) {
+  return String(s || '').toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
+}
+
+// Does a card name plausibly correspond to the file's base name? Either
+// containment direction counts ("The Fire Rises" ↔ "The Fire Rises - The
+// Second American Civil War"). Stems shorter than 4 normalized chars are
+// too weak a signal to rank on.
+function nameMatchesStem(name, stem) {
+  const n = normalizeNameForMatch(name);
+  const t = normalizeNameForMatch(stem);
+  // A BLANK name must not match: `t.includes('')` is always true, so a
+  // nameless embedded card would win the +100 stem score against ANY file.
+  if (!n || !t || t.length < 4) return false;
+  return n === t || n.includes(t) || t.includes(n);
+}
+
+// Rank the PARSED candidates and pick the card the file actually carries.
+// Score = name-match-to-file-stem (×100) + keyword rank (`chara` 2 > `ccv3`
+// 1 — the shipped precedence). Ties resolve to the LATER candidate in file
+// order: an appending re-export's most recent embed is the current card.
+function pickBestCandidate(parsed, stem) {
+  const kwRank = (k) => (k === 'chara' ? 2 : 1);
+  let best = null;
+  let bestScore = -1;
+  for (const p of parsed) {
+    const score = (nameMatchesStem(p.norm.name, stem) ? 100 : 0) + kwRank(p.keyword);
+    if (score >= bestScore) { best = p; bestScore = score; }
+  }
+  return best;
+}
+
+// The robust PNG card reader (2026-08-22): decode EVERY walked candidate,
+// keep the ones that parse into a content-bearing character card, and pick
+// the best (see pickBestCandidate). Returns { json, charData } or null when
+// the PNG holds no usable card. `stem` is the file's base name without
+// extension — the name-match signal; pass '' when unknown.
+export async function readCharaCard(u8, stem = '') {
+  const parsed = [];
+  for (const c of walkCharaCandidates(u8)) {
+    const json = parseCharaText(await decodeCharaCandidate(c));
+    if (!json) continue;
+    const norm = normalizeCharJson(json);
+    if (!norm || !charDataHasContent(norm)) continue;
+    parsed.push({ json, norm, keyword: c.keyword });
+  }
+  const best = pickBestCandidate(parsed, stem);
+  return best ? { json: best.json, charData: best.norm } : null;
+}
+
+// The chunk-text import path (async): `chara` first, then `ccv3`; inflates
+// compressed zTXt/iTXt payloads; a candidate that fails to decode falls
+// through to the next one rather than aborting the import. Within a keyword
+// the LAST decodable candidate wins (same policy as readCharaCard, minus
+// the parsing — this returns the raw payload text). Returns null when no
 // usable candidate exists.
 export async function readCharaChunk(u8) {
-  const cands = walkCharaCandidates(u8);
-  const tryKeys = async (kw) => {
-    for (const c of cands) {
-      if (c.keyword !== kw) continue;
-      try {
-        return c.text != null ? c.text : new TextDecoder('utf-8').decode(await inflateZlib(c.compressed));
-      } catch (_) { /* fall through to the next candidate */ }
-    }
-    return null;
-  };
-  const chara = await tryKeys('chara');
-  if (chara != null) return chara;
-  return tryKeys('ccv3');
+  const decoded = [];
+  for (const c of walkCharaCandidates(u8)) {
+    const text = await decodeCharaCandidate(c);
+    if (text != null) decoded.push({ keyword: c.keyword, text });
+  }
+  let hit = null;
+  for (const c of decoded) {
+    if (c.keyword === 'chara' || (c.keyword === 'ccv3' && !hit)) hit = c;
+  }
+  return hit ? hit.text : null;
+}
+
+// A file path's base name without extension (both separators; used as the
+// name-match stem for PNG imports). Pure.
+export function fileBaseStem(p) {
+  const s = String(p || '').replace(/\\/g, '/');
+  const base = s.slice(s.lastIndexOf('/') + 1);
+  const dot = base.lastIndexOf('.');
+  return dot > 0 ? base.slice(0, dot) : base;
+}
+
+// (2026-08-22 intro variants) An import's greeting list: first_mes (the
+// default opening) + every alternate_greeting (player-selectable alternates
+// at game start), trimmed + exact-deduped. Pure — computed off the
+// normalized charData, so the PNG and JSON import paths share ONE
+// implementation. The serializer writes one `<intro>` sibling per entry;
+// Rust seeds them onto session message 0 as swipeable variants.
+export function collectIntroVariants(charData) {
+  if (!charData || typeof charData !== 'object') return [];
+  return [
+    charData.first_mes,
+    ...(Array.isArray(charData.alternate_greetings) ? charData.alternate_greetings : []),
+  ]
+    .map((s) => (s == null ? '' : String(s)).trim())
+    .filter(Boolean)
+    .filter((s, i, arr) => arr.indexOf(s) === i);
 }
 
 export function base64ToUtf8(b64) {
@@ -746,6 +874,75 @@ export function charDataHasContent(c) {
     || (Array.isArray(c.alternate_greetings) && c.alternate_greetings.length)
     || c.character_book
   );
+}
+
+// --- Import payload clamp (2026-08-22, "The Fire Rises" incident) -----------
+//
+// The creator turn's API payload is budgeted server-side (max_ctx × 4 chars,
+// oldest-non-system-first truncation in llm.rs). A big imported card — a
+// 250KB simulator card with a 100-entry embedded lorebook — blew that budget
+// and the truncator silently DROPPED the whole <import> message: GLM received
+// no character data at all, answered with an interview question instead of a
+// draft, and the import bounced back to the picker as "failed". The clamp
+// keeps the payload under budget BY CONSTRUCTION, losing as little as
+// possible: the embedded character_book is the bulk AND has its own dedicated
+// full-fidelity path (the CODEX step re-reads the source file and
+// batch-converts the whole book), so entries trim first with an explicit
+// note; long prose fields clamp last, tail-marked. Small imports pass
+// through untouched (identity — same object reference).
+export const IMPORT_PAYLOAD_CHAR_BUDGET = 32000;
+
+const IMPORT_CLAMP_TAIL = ' […] (trimmed to fit the import payload — the full text stays in the source file)';
+
+export function clampImportCharData(charData, budget = IMPORT_PAYLOAD_CHAR_BUDGET) {
+  if (!charData || typeof charData !== 'object') return charData;
+  const size = (c) => JSON.stringify(c).length;
+  if (size(charData) <= budget) return charData;
+  const target = budget - 256; // headroom so the clamp note itself fits
+  const out = { ...charData };
+  const notes = [];
+  // 1) Trim the embedded lorebook from the END (deepest lore first).
+  const book = out.character_book;
+  if (book && typeof book === 'object' && book.entries && typeof book.entries === 'object') {
+    const isArr = Array.isArray(book.entries);
+    const keys = isArr ? book.entries.map((_, i) => i) : Object.keys(book.entries);
+    if (keys.length) {
+      const entriesKeeping = (n) => {
+        if (isArr) return book.entries.slice(0, n);
+        const e = {};
+        for (const k of keys.slice(0, n)) e[k] = book.entries[k];
+        return e;
+      };
+      let n = keys.length;
+      while (n > 0 && size({ ...out, character_book: { ...book, entries: entriesKeeping(n) } }) > target) n--;
+      if (n < keys.length) {
+        notes.push(`the embedded lorebook was trimmed to ${n} of ${keys.length} entries (the CODEX step imports it in full from the file)`);
+        out.character_book = { ...book, entries: entriesKeeping(n) };
+      }
+    }
+  }
+  // 2) Long prose fields clamp to a tail-marked prefix.
+  for (const key of ['description', 'first_mes', 'mes_example', 'scenario', 'creator_notes', 'personality']) {
+    if (size(out) <= target) break;
+    const v = out[key];
+    if (typeof v === 'string' && v.length > 600) {
+      out[key] = v.slice(0, 600) + IMPORT_CLAMP_TAIL;
+      notes.push(`${key} was truncated`);
+    }
+  }
+  // 3) Alternate greetings drop from the end (the first survives).
+  if (size(out) > target && Array.isArray(out.alternate_greetings) && out.alternate_greetings.length > 1) {
+    const greets = out.alternate_greetings.slice();
+    while (greets.length > 1 && size({ ...out, alternate_greetings: greets }) > target) greets.pop();
+    if (greets.length < out.alternate_greetings.length) {
+      notes.push(`${out.alternate_greetings.length - greets.length} alternate greetings were dropped`);
+      out.alternate_greetings = greets;
+    }
+  }
+  if (notes.length) {
+    out.note = `Import payload clamp: ${notes.join('; ')}. Nothing omitted here is lost — it lives on in the source file.`;
+  }
+  return out;
 }
 
 // Chunk extracted entries into conversion batches by cumulative char size so

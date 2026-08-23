@@ -61,6 +61,13 @@ import { initFX, playFX, clearFX, clearAllFX } from '../fx/effects.js';
 // (they're reserved for the weather re-add). No-op at runtime.
 void playFX; void clearFX;
 import { saveNow } from '../engine/saves-io.js';
+// COMPOSER TURN AIDS (2026-08-22): Ghost Writer (the ghost icon's Swipe /
+// Continue / Impersonate menu) + Crossroads (the octagon icon's options
+// deck). Both mount transient UI inside the stage + route their one-shots
+// through narrator / their own invokes; wired below the composer block,
+// torn down in teardownStage.
+import * as ghost from '../engine/ghost-writer.js';
+import * as crossroads from '../engine/crossroads.js';
 // Background Library (2026-08-11): the 4th WUPI-drawer foot button. Owns the
 // gallery modal + the dormant .fable-stage-bg paint layer. Global to Fable
 // (one marker file, not per-card). Self-contained: builds + caches its own
@@ -189,10 +196,11 @@ export function buildStage() {
       <!-- Typing indicator (re-instated 2026-08-19, subtype-aware): a small
            label pinned directly above the input row while a turn is in flight.
            npc-subtype cards read "(Name) is currently typing..."; scenario/world
-           cards read "Narrator is currently thinking...". Toggled via the
-           .is-visible class from setGenerating (the onTurnStart/onTurnEnd
-           hooks) — it covers the WHOLE turn, including the silent tracker
-           stage before the first chunk streams. (2026-08-21) Mounted INSIDE
+           cards read "Narrator is currently thinking...". Shown via
+           showTypingIndicator (the narrator's onNarratorActive hook — first
+           REAL stream output) + hidden by setGenerating(false) at turn end;
+           it NEVER shows over the silent Stage-1 tracker decode (2026-08-22).
+           (2026-08-21) Mounted INSIDE
            the input-row form + anchored bottom:100% in CSS, so it rides the
            form's top edge — directly above the field whether the box is at
            rest (54px) or auto-grown to 2 lines. -->
@@ -206,6 +214,21 @@ export function buildStage() {
       <div class="fable-input-group">
         <div class="fable-input-box">
           <textarea class="fable-input" data-input rows="1" placeholder="Type a message..."></textarea>
+        </div>
+        <!-- TURN AIDS (2026-08-22): two small icons directly right of the
+             input text — the GHOST (Ghost Writer: guided swipe / continue /
+             impersonate) then the OCTAGON-X (Crossroads: the options deck).
+             Flex siblings of the box (not overlays): the field shrinks a
+             hair, its centered placeholder + text layout stay untouched,
+             and long text can never run under the icons. Both menus anchor
+             to this cluster. -->
+        <div class="fable-input-aids" data-input-aids>
+          <button class="fable-aid-icon" data-ghost-aid type="button" aria-label="Ghost Writer">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3a7 7 0 0 0-7 7v10l2.4-2 2.3 2 2.3-2 2.3 2 2.3-2 2.4 2V10a7 7 0 0 0-7-7z" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/><circle cx="9.6" cy="10.6" r="1.05" fill="currentColor"/><circle cx="14.4" cy="10.6" r="1.05" fill="currentColor"/></svg>
+          </button>
+          <button class="fable-aid-icon" data-crossroads-aid type="button" aria-label="Crossroads">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8.2 3h7.6L21 8.2v7.6L15.8 21H8.2L3 15.8V8.2L8.2 3z" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/><path d="M8.2 8.2l7.6 7.6M15.8 8.2l-7.6 7.6" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>
+          </button>
         </div>
       </div>
     </form>
@@ -587,6 +610,11 @@ export async function wireStage(root, hooks) {
     onTurnStart: () => {
       setGenerating(true);
     },
+    // (2026-08-22) The indicator shows only once the narrator actually
+    // streams — never over the silent Stage-1 tracker decode.
+    onNarratorActive: () => {
+      showTypingIndicator();
+    },
     onTurnEnd: (info) => {
       setGenerating(false);
       // (2026-08-16 audit fix #5) A REVERTED turn (soft cancel / api_lost /
@@ -795,6 +823,43 @@ export async function wireStage(root, hooks) {
   });
   on(input, 'input', () => autoGrow(input));
   setGenerating(false);
+
+  // TURN AIDS (2026-08-22): wire the ghost + octagon icons. Both menus are
+  // mutually exclusive (each icon closes the other's surface first) and
+  // both go inert while a turn is in flight, an aid is running, or the
+  // API lock holds. `isBusy` also covers the deck so a ghost action can't
+  // fire under an open draw.
+  const aidsCluster = root.querySelector('[data-input-aids]');
+  const ghostAidBtn = root.querySelector('[data-ghost-aid]');
+  const crossroadsAidBtn = root.querySelector('[data-crossroads-aid]');
+  const aidBusy = () =>
+    narrator.isGenerating() || composerLocked || crossroads.isCrossroadsDeckOpen();
+  ghost.wireGhostWriter({
+    icon: ghostAidBtn,
+    anchor: aidsCluster,
+    inputRow: inputForm,
+    getInput: () => input,
+    isBusy: aidBusy,
+    onSwipe: (nudge) => { narrator.rerollLastTurn(nudge); },
+    onContinue: (nudge) => { narrator.ghostContinue(nudge); },
+    onInputChanged: () => autoGrow(input),
+  });
+  crossroads.wireCrossroads({
+    icon: crossroadsAidBtn,
+    anchor: aidsCluster,
+    root,
+    getInput: () => input,
+    isBusy: aidBusy,
+    onInputChanged: () => autoGrow(input),
+  });
+  on(ghostAidBtn, 'click', () => {
+    crossroads.closeCrossroadsMenu();
+    ghost.handleGhostIconClick();
+  });
+  on(crossroadsAidBtn, 'click', () => {
+    ghost.closeMenu();
+    crossroads.handleCrossroadsIconClick();
+  });
 
   // Per-beat UX controls (edit / delete / ‹ › variant nav) live in the
   // HOVER TOOLRAIL (`.fable-mes-drawer` v2, engine/beats.js) — the gold
@@ -1243,6 +1308,7 @@ function ensureInputMirror(el, m) {
   }
   const cs = m.cs;
   inputMirrorEl.style.font = cs.font;
+  inputMirrorEl.style.lineHeight = cs.lineHeight;   // the font shorthand carries NO line-height — without this the mirror measures at `normal` while the field renders 26px lines
   inputMirrorEl.style.letterSpacing = cs.letterSpacing;
   inputMirrorEl.style.paddingTop = cs.paddingTop;
   inputMirrorEl.style.paddingBottom = cs.paddingBottom;
@@ -1262,9 +1328,13 @@ function autoGrow(el) {
   const max = Math.ceil(m.lineHeight * INPUT_MAX_LINES + m.padTop + m.padBottom + m.borderY);
   const mirror = ensureInputMirror(el, m);
   // Full content height + the caret line's content-space top, both off-screen.
-  mirror.textContent = el.value;
+  // The trailing '\u200b' makes a TRAILING newline count as a line: a div
+  // collapses a block-final '\n' in pre-wrap, so a bare Shift+Enter (empty
+  // new line) measured as zero height and the box didn't grow until text
+  // arrived on that line (2026-08-22).
+  mirror.textContent = el.value + '\u200b';
   const full = Math.ceil(mirror.scrollHeight + m.borderY);
-  mirror.innerHTML = escText(el.value.slice(0, el.selectionStart)) + '<span data-mk></span>';
+  mirror.innerHTML = escText(el.value.slice(0, el.selectionStart)) + '<span data-mk>\u200b</span>';
   const marker = mirror.querySelector('[data-mk]');
   const caretTop = marker ? (marker.offsetTop - m.padTop) : 0;
   el.style.height = Math.min(Math.max(full, base), max) + 'px';
@@ -1324,22 +1394,30 @@ function typingLabel() {
 // to-stop affordance (wired above in wireStage) works: pressing Enter on an
 // empty field while generating stops the turn. The placeholder flips to hint
 // the stop affordance so the user learns the gesture.
+// Show the typing indicator. Fired from the narrator's onNarratorActive
+// hook (first REAL narrator output — stream chunk / character_turn line),
+// NOT at turn start: Stage 1 is the hidden local tracker, which runs
+// silently for seconds before the narrator streams; showing the indicator
+// over it made the tracker read as the narrator typing again after its
+// message was done (2026-08-22 Chloe ruling — kill that). Idempotent +
+// cheap (classList.add + a label write), so firing per-chunk is fine.
+function showTypingIndicator() {
+  if (!stageRoot) return;
+  const indicator = stageRoot.querySelector('[data-typing-indicator]');
+  if (!indicator) return;
+  const label = stageRoot.querySelector('[data-typing-text]');
+  if (label) label.textContent = typingLabel();
+  indicator.classList.add('is-visible');
+}
+
 function setGenerating(on) {
   const input = stageRoot && stageRoot.querySelector('[data-input]');
   if (!input) return;
-  // The typing indicator: label text is computed at SHOW time (the card
-  // identity is cached by then; a mid-teardown call just hides). Shown for
-  // the WHOLE turn — the tracker stage before the first chunk has no other
-  // in-flight signal.
-  const indicator = stageRoot.querySelector('[data-typing-indicator]');
-  if (indicator) {
-    if (on) {
-      const label = stageRoot.querySelector('[data-typing-text]');
-      if (label) label.textContent = typingLabel();
-      indicator.classList.add('is-visible');
-    } else {
-      indicator.classList.remove('is-visible');
-    }
+  // The typing indicator: hidden here on turn END only — its SHOW path is
+  // showTypingIndicator via onNarratorActive (see above).
+  if (!on) {
+    const indicator = stageRoot.querySelector('[data-typing-indicator]');
+    if (indicator) indicator.classList.remove('is-visible');
   }
   if (on) {
     // Idempotent stash: reroll / rewind-edit fire onTurnStart, then
@@ -1500,11 +1578,21 @@ async function onStageApiChanged() {
 function onVariantArrowKey(e) {
   // Plain arrows only — never hijack a modified key.
   if (e.ctrlKey || e.metaKey || e.altKey || e.shiftKey) return;
-  // Caret territory: an editable focus keeps its arrows (composer, inline
-  // editor, drawer chat, modal inputs).
+  // Caret territory: an editable focus keeps its arrows — EXCEPT the stage
+  // composer (textarea[data-input]), where the arrows stay hotkeys whenever
+  // the caret sits at the matching boundary (← at position 0, → at the end):
+  // moving through typed text still works, but a selected chat no longer
+  // kills the variant swipes.
   const el = document.activeElement;
   if (el && (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA' || el.tagName === 'SELECT'
-    || el.isContentEditable)) return;
+    || el.isContentEditable)) {
+    const isComposer = el.tagName === 'TEXTAREA' && el.hasAttribute('data-input');
+    const atStart = el.selectionStart === 0 && el.selectionEnd === 0;
+    const atEnd = el.selectionStart === el.value.length && el.selectionEnd === el.value.length;
+    if (!isComposer
+      || (e.key === 'ArrowLeft' && !atStart)
+      || (e.key === 'ArrowRight' && !atEnd)) return;
+  }
   // The stage must be the visible screen — a stale bound listener (the
   // teardown race window) must never swipe a hidden feed.
   if (!stageRoot || stageRoot.hidden) return;
@@ -1837,6 +1925,10 @@ export function teardownStage() {
   composerLocked = false;
   pendingTurnText = '';
   lastSentTurnText = '';
+  // (2026-08-22) Composer turn aids: drop any open menu/notice/deck so a
+  // re-entry starts clean (their transient listeners go with them).
+  ghost.teardownGhostWriter();
+  crossroads.teardownCrossroads();
   // Clear the toast timer so it can't fire into a torn-down element after
   // close (was a residual-state gap — harmless but not clean).
   if (toastTimer) { clearTimeout(toastTimer); toastTimer = null; }

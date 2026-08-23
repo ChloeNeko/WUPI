@@ -24,19 +24,19 @@ import {
   batchLorebookEntries,
   padCodexEntryTags,
   normalizeLoreImportEntries,
+  readCharaCard,
+  parseCharaText,
+  clampImportCharData,
+  fileBaseStem,
+  collectIntroVariants,
 } from '../src/fable/engine/creator-engine.js';
 
-let passed = 0;
-let failed = 0;
+// Collected + run by the async-aware runner at the bottom of the file
+// (several walker/clamp tests are async — a synchronous runner let their
+// assertions die un-awaited before process.exit: vacuous passes).
+const tests = [];
 function test(name, fn) {
-  try {
-    fn();
-    console.log('  ok   %s', name);
-    passed++;
-  } catch (e) {
-    console.error('  FAIL %s\n       %s', name, e.message);
-    failed++;
-  }
+  tests.push({ name, fn });
 }
 
 // ── parseEnvelope ──────────────────────────────────────────────────────────
@@ -107,7 +107,7 @@ test('buildReviewSections: player drops empty rows', () => {
   assert.deepEqual(identity[1], [['Name', 'Kael'], ['Gender', 'male']]);
 });
 
-test('buildReviewSections: player surfaces horn, inventory, persona, custom tags, starting conditions', () => {
+test('buildReviewSections: player surfaces horn, inventory, persona, custom tags — never wealth/reputation', () => {
   const secs = buildReviewSections('player', {
     name: 'Nyx', race: 'tiefling', horn: 'curled',
     gear: ['compass', 'rope'], equipped: ['dagger'],
@@ -126,7 +126,10 @@ test('buildReviewSections: player surfaces horn, inventory, persona, custom tags
   // (2026-08-20) Custom-tag KEYS render prettified — no underscores.
   assert.ok(byName['Custom tags'].find(([l]) => l === 'Curse'));
   assert.ok(byName['Custom tags'].find(([l]) => l === 'Guard Reputation'));
-  assert.deepEqual(byName['Starting conditions'], [['Wealth', '200 gold'], ['Reputation', '-20']]);
+  // (2026-08-22 Chloe ruling) Money is inventory-only; standings are live
+  // tracker state — the Starting conditions section is GONE, even when a
+  // legacy draft still carries wealth/reputation fields.
+  assert.ok(!('Starting conditions' in byName));
 });
 
 test('buildReviewSections: sim (no card_type) includes world anchors (incl. tone), never locations/cast', () => {
@@ -289,6 +292,148 @@ test('readCharaChunk: inflates zlib-compressed iTXt', async () => {
   assert.equal(findCharaChunk(u8), null);
   // The async reader inflates it.
   assert.equal(await readCharaChunk(u8), b64);
+});
+
+// ── readCharaCard (robust PNG card selection, 2026-08-22) ──────────────────
+// The Fire Rises incident: re-export tools APPEND a fresh `chara` chunk
+// instead of replacing, so one PNG can carry several different cards. These
+// builders mirror the minimal-PNG shape used above.
+const PNG_SIG = [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
+const PNG_IEND = [0, 0, 0, 0, 0x49, 0x45, 0x4e, 0x44, 0, 0, 0, 0];
+const b64Of = (obj) => Buffer.from(JSON.stringify(obj), 'utf-8').toString('base64');
+
+function textChunkBytes(type, data) {
+  return [0, 0, 0, data.length, ...Array.from(type, (c) => c.charCodeAt(0)), ...data, 0, 0, 0, 0];
+}
+
+function textChunk(keyword, value) {
+  const data = [...Array.from(keyword, (c) => c.charCodeAt(0)), 0, ...Array.from(Buffer.from(value, 'latin1'))];
+  return textChunkBytes('tEXt', data);
+}
+
+test('readCharaCard: duplicate chara chunks — the most recent embed wins', async () => {
+  const a = b64Of({ name: 'Old Card', description: 'x' });
+  const b = b64Of({ name: 'New Card', description: 'y' });
+  const u8 = new Uint8Array([...PNG_SIG, ...textChunk('chara', a), ...textChunk('chara', b), ...PNG_IEND]);
+  const card = await readCharaCard(u8, '');
+  assert.ok(card, 'a card is found');
+  assert.equal(card.charData.name, 'New Card');
+});
+
+test('readCharaCard: a card named like the FILE outranks recency', async () => {
+  const a = b64Of({ name: 'The Fire Rises - Civil War', description: 'the real one' });
+  const b = b64Of({ name: 'Totally Different', description: 'y' });
+  const u8 = new Uint8Array([...PNG_SIG, ...textChunk('chara', a), ...textChunk('chara', b), ...PNG_IEND]);
+  const card = await readCharaCard(u8, fileBaseStem('C:/Users/x/Downloads/The Fire Rises.png'));
+  assert.equal(card.charData.name, 'The Fire Rises - Civil War');
+});
+
+test('readCharaCard: a NAMELESS appended card never wins the stem match', async () => {
+  // (2026-08-22 review pin) `nameMatchesStem` used `t.includes(n)` with an
+  // empty normalized name — `includes('')` is always true, so a nameless
+  // (but content-bearing) appended chunk scored the full +100 stem match
+  // against ANY file and beat the correctly file-named card.
+  const a = b64Of({ name: 'The Fire Rises', description: 'the real one' });
+  const b = b64Of({ description: 'a nameless husk with content' });
+  const u8 = new Uint8Array([...PNG_SIG, ...textChunk('chara', a), ...textChunk('chara', b), ...PNG_IEND]);
+  const card = await readCharaCard(u8, fileBaseStem('C:/Users/x/Downloads/The Fire Rises.png'));
+  assert.equal(card.charData.name, 'The Fire Rises');
+});
+
+test('readCharaCard: an unparseable first chunk falls through to the next', async () => {
+  const u8 = new Uint8Array([
+    ...PNG_SIG,
+    ...textChunk('chara', '!!!not-base64-or-json!!!'),
+    ...textChunk('chara', b64Of({ name: 'Good', description: 'x' })),
+    ...PNG_IEND,
+  ]);
+  const card = await readCharaCard(u8, '');
+  assert.equal(card.charData.name, 'Good');
+});
+
+test('readCharaCard: junk bytes before the PNG signature still parse', async () => {
+  const u8 = new Uint8Array([1, 2, 3, 0, ...PNG_SIG, ...textChunk('chara', b64Of({ name: 'Junked', description: 'x' })), ...PNG_IEND]);
+  const card = await readCharaCard(u8, '');
+  assert.equal(card.charData.name, 'Junked');
+});
+
+test('readCharaCard: case-varied keyword (Chara) still matches', async () => {
+  const u8 = new Uint8Array([...PNG_SIG, ...textChunk('Chara', b64Of({ name: 'Cased', description: 'x' })), ...PNG_IEND]);
+  const card = await readCharaCard(u8, '');
+  assert.equal(card.charData.name, 'Cased');
+});
+
+test('readCharaCard: a PNG with no chara chunks → null', async () => {
+  const u8 = new Uint8Array([...PNG_SIG, ...PNG_IEND]);
+  assert.equal(await readCharaCard(u8, ''), null);
+});
+
+test('readCharaChunk: inflates a zTXt chara chunk (the compressed-text chunk)', async () => {
+  const b64 = b64Of({ name: 'Ztxtd', description: 'z' });
+  const zipped = Array.from(zlib.deflateSync(Buffer.from(b64, 'latin1')));
+  // zTXt layout: keyword\0 compressionMethod(0 = zlib) data.
+  const data = [...Array.from('chara', (c) => c.charCodeAt(0)), 0, 0, ...zipped];
+  const u8 = new Uint8Array([...PNG_SIG, ...textChunkBytes('zTXt', data), ...PNG_IEND]);
+  assert.equal(findCharaChunk(u8), null, 'the sync walker skips compressed zTXt');
+  assert.equal(await readCharaChunk(u8), b64);
+  const card = await readCharaCard(u8, '');
+  assert.equal(card.charData.name, 'Ztxtd');
+});
+
+test('parseCharaText: raw JSON payload (not base64) parses; garbage → null', () => {
+  const obj = parseCharaText('{"name":"Raw","description":"d"}');
+  assert.equal(obj.name, 'Raw');
+  assert.equal(parseCharaText('not json at all'), null);
+  assert.equal(parseCharaText(''), null);
+});
+
+test('fileBaseStem: windows + posix paths, dotted + bare names', () => {
+  assert.equal(fileBaseStem('C:\\Users\\Chloe\\Downloads\\The Fire Rises.png'), 'The Fire Rises');
+  assert.equal(fileBaseStem('/home/x/cards/the-fire-rises.PNG'), 'the-fire-rises');
+  assert.equal(fileBaseStem('plainname'), 'plainname');
+});
+
+// ── collectIntroVariants (2026-08-22 intro variants) ───────────────────────
+test('collectIntroVariants: first_mes + alternate_greetings, trimmed + deduped', () => {
+  const out = collectIntroVariants({
+    first_mes: '  You wake in ash.  ',
+    alternate_greetings: ['The city burns.', '', 'You wake in ash.', null, 'A radio crackles.'],
+  });
+  assert.deepEqual(out, ['You wake in ash.', 'The city burns.', 'A radio crackles.']);
+});
+
+test('collectIntroVariants: null charData / no greetings → []', () => {
+  assert.deepEqual(collectIntroVariants(null), []);
+  assert.deepEqual(collectIntroVariants({ name: 'X' }), []);
+  assert.deepEqual(collectIntroVariants({ alternate_greetings: 'not-an-array' }), []);
+});
+
+// ── clampImportCharData (2026-08-22 payload budget) ────────────────────────
+test('clampImportCharData: a small payload passes through untouched (identity)', () => {
+  const c = { spec: 'chara_card_v2', name: 'Small', description: 'd' };
+  assert.equal(clampImportCharData(c), c);
+  assert.equal(clampImportCharData(null), null);
+});
+
+test('clampImportCharData: a huge embedded lorebook trims to budget with a note', () => {
+  const entries = [];
+  for (let i = 0; i < 60; i++) entries.push({ keys: [`k${i}`], content: 'x'.repeat(900) });
+  const c = { spec: 'chara_card_v2', name: 'Big', description: 'd', character_book: { entries } };
+  const out = clampImportCharData(c, 20000);
+  assert.ok(JSON.stringify(out).length <= 20000, 'clamped payload fits the budget');
+  assert.ok(out.character_book.entries.length > 0 && out.character_book.entries.length < 60, 'entries were trimmed but not wiped');
+  assert.match(out.note, /lorebook was trimmed/);
+  assert.equal(out.name, 'Big', 'identity fields survive');
+  assert.equal(c.character_book.entries.length, 60, 'the INPUT is not mutated');
+});
+
+test('clampImportCharData: no book → long prose clamps with a tail marker', () => {
+  const c = { spec: 'plain', name: 'Prosy', description: 'y'.repeat(40000), first_mes: 'z'.repeat(20000) };
+  const out = clampImportCharData(c, 5000);
+  assert.ok(JSON.stringify(out).length <= 5000, 'clamped payload fits the budget');
+  assert.ok(out.description.length < 1000, 'description was clamped');
+  assert.match(out.note, /description was truncated/);
+  assert.equal(c.description.length, 40000, 'input untouched');
 });
 
 // ── base64ToUtf8 ───────────────────────────────────────────────────────────
@@ -629,6 +774,21 @@ test('creatorRetryAllowed: attempts 1..MAX retry, beyond exhausts', () => {
   assert.equal(creatorRetryAllowed(99), false);
 });
 
-// ── summary ────────────────────────────────────────────────────────────────
+// ── run + summary ──────────────────────────────────────────────────────────
+// Async-aware runner (2026-08-22): the walker tests await readCharaChunk /
+// readCharaCard — under the old synchronous test() their assertions never
+// ran before process.exit (vacuous passes).
+let passed = 0;
+let failed = 0;
+for (const t of tests) {
+  try {
+    await t.fn();
+    console.log('  ok   %s', t.name);
+    passed++;
+  } catch (e) {
+    console.error('  FAIL %s\n       %s', t.name, e.message);
+    failed++;
+  }
+}
 console.log('\n%s passed, %s failed', passed, failed);
 process.exit(failed === 0 ? 0 : 1);

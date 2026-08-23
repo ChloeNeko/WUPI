@@ -2,12 +2,15 @@
 // SILLYTAVERN IMPORTER — feeds the GLM conversational creators from a
 // SillyTavern V2/V3 PNG or a plain character/lorebook JSON.
 //
-// PNG PATH: SillyTavern embeds the character JSON in a `tEXt`/`iTXt` chunk
-// keyed `chara` (base64-encoded UTF-8 JSON, possibly zlib-compressed). We
-// walk the PNG chunks client-side (the bytes are already in the webview
-// after the dialog read), find the chunk, decode, JSON.parse. The PNG bytes
-// ALSO become the auto-filled portrait (saved on CREATE even without a
-// re-crop; the review slot crops on click).
+// PNG PATH: SillyTavern embeds the character JSON in a `tEXt`/`zTXt`/`iTXt`
+// chunk keyed `chara` (base64-encoded UTF-8 JSON, possibly zlib-compressed).
+// We walk the PNG chunks client-side (the bytes are already in the webview
+// after the dialog read), decode EVERY candidate, and pick the card the file
+// actually carries — re-export tools append fresh `chara` chunks instead of
+// replacing, so one PNG can hold several different cards (see
+// engine/creator-engine.js readCharaCard). The PNG bytes ALSO become the
+// auto-filled portrait (saved on CREATE even without a re-crop; the review
+// slot crops on click).
 //
 // JSON PATH: a standalone lorebook ({ entries }) is recognized FIRST and
 // returns as `lorebook` (the codex import converts it — see creator-engine);
@@ -25,8 +28,9 @@
 import { open as openDialog } from '@tauri-apps/plugin-dialog';
 import { invoke } from '@tauri-apps/api/core';
 import {
-  readCharaChunk,
-  base64ToUtf8,
+  readCharaCard,
+  fileBaseStem,
+  collectIntroVariants,
   normalizeCharJson,
   extractStandaloneLorebook,
   charDataHasContent,
@@ -55,11 +59,11 @@ async function readJsonFile(srcPath) {
 }
 
 // --- PNG chunk walker + JSON normalize ------------------------------------
-// The pure parse primitives (findCharaChunk, base64ToUtf8, normalizeCharJson,
-// extractStandaloneLorebook, charDataHasContent) live in
-// engine/creator-engine.js so they're unit-testable + shared with the
-// codex-import path. This module keeps only the Tauri-coupled I/O
-// (readImageAsDataUrl / readJsonFile) + the import entry point.
+// The pure parse primitives (readCharaCard + the walker/normalize/lorebook
+// helpers) live in engine/creator-engine.js so they're unit-testable +
+// shared with the codex-import path. This module keeps only the
+// Tauri-coupled I/O (readImageAsDataUrl / readJsonFile) + the import entry
+// point.
 
 // --- The public entry: parseImportFile ------------------------------------
 // Open the picker, parse the .png/.json to a normalized charData object
@@ -106,19 +110,18 @@ export async function parseImportFile(screenEl) {
     if (!dataUrl) throw new Error('could not read PNG');
     const res = await fetch(dataUrl);
     const u8 = new Uint8Array(await res.arrayBuffer());
-    const b64 = await readCharaChunk(u8);
-    if (!b64) throw new Error('no SillyTavern character data found in this PNG');
-    // (2026-08-15 audit fix) Some ST card writers store the chara chunk as
-    // RAW JSON text, not base64 — a strict base64 decode failed the whole
-    // import. Try base64 first (the spec form), fall back to raw JSON.
-    let json;
-    try {
-      json = JSON.parse(base64ToUtf8(b64));
-    } catch (_) {
-      json = JSON.parse(b64);
-    }
-    charData = normalizeCharJson(json);
-    if (!charDataHasContent(charData)) throw new Error('no character or lorebook content found in this PNG');
+    // (2026-08-22) Robust card extraction: re-exported PNGs can carry
+    // SEVERAL `chara` chunks (embedding tools APPEND, never replace — one
+    // real-world file holds two different cards, 344KB + 66KB).
+    // readCharaCard decodes every candidate (tEXt/zTXt/iTXt, base64 or raw
+    // JSON, any keyword case) and picks the card the file actually carries:
+    // a name match against the file's stem, else the most recent embed.
+    // The old first-`chara`-only walk handed GLM the WRONG card — and its
+    // 250KB payload was then silently dropped by the API budget truncation,
+    // so the import "didn't work" at all.
+    const card = await readCharaCard(u8, fileBaseStem(srcPath));
+    if (!card) throw new Error('no SillyTavern character data found in this PNG');
+    charData = card.charData;
     portraitDataUrl = dataUrl; // uncropped preview — the review slot crops on click
     portraitExt = 'png';
     // Keep the raw PNG bytes as the save fallback (see jsdoc above).
@@ -137,7 +140,7 @@ export async function parseImportFile(screenEl) {
     // the character normalizer.
     const lore = extractStandaloneLorebook(json);
     if (lore) {
-      return { charData: null, portraitDataUrl: null, portraitExt: null, portraitBytes: null, introText: '', lorebook: lore };
+      return { charData: null, portraitDataUrl: null, portraitExt: null, portraitBytes: null, introText: '', introVariants: [], lorebook: lore };
     }
     charData = normalizeCharJson(json);
     if (!charDataHasContent(charData)) throw new Error('no character or lorebook content found in that file');
@@ -145,19 +148,16 @@ export async function parseImportFile(screenEl) {
     throw new Error('select a .png or .json file');
   }
   // Mechanically capture the SillyTavern greetings (first_mes + alternate_
-  // greetings) as the opening-beat text — NOT left to GLM's refinement, so the
-  // authored greetings survive verbatim. The flow carries this into the SIM
-  // card's `<intro>` (via the serializer's draft.intro), where Rust reads it as
-  // the Fable opening beat. One greeting per line (matches wupi.sim's shape).
-  const introText = charData
-    ? [
-        charData.first_mes,
-        ...(Array.isArray(charData.alternate_greetings) ? charData.alternate_greetings : []),
-      ]
-        .map((s) => (s == null ? '' : String(s)).trim())
-        .filter(Boolean)
-        .join('\n')
-    : '';
-  return { charData, portraitDataUrl, portraitExt, portraitBytes, introText, lorebook: null };
+  // greetings) as the opening-beat VARIANTS (2026-08-22) — NOT left to GLM's
+  // refinement, so the authored greetings survive verbatim. The flow carries
+  // the list into the SIM card's `<intro>` siblings (one per greeting via the
+  // serializer's draft.intro_variants), where Rust seeds them onto session
+  // message 0 as swipeable variants — the player picks an opening via the
+  // ‹ 1/N › beat control right at game start. Computed from charData, so the
+  // PNG and JSON import paths share ONE implementation. `introText` (the
+  // newline-joined form) is kept for shape compatibility.
+  const introVariants = collectIntroVariants(charData);
+  const introText = introVariants.join('\n');
+  return { charData, portraitDataUrl, portraitExt, portraitBytes, introText, introVariants, lorebook: null };
 }
 

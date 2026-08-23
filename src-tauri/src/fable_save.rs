@@ -1,24 +1,31 @@
-//! Multi-slot save files for the Fable app.
+//! Multi-slot save files + session folders for the Fable app.
 //!
-//! ## Layout
-//! Saves live at `<exe_dir>/apps/fable/cards/<card_id>/saves/<save_id>.json`
-//! (a sibling INSIDE the per-card folder, §6B). One file per save = atomic
-//! write + trivial listing by directory walk (no separate index manifest
-//! that can desync). `<save_id>` is either the reserved `autosave` sentinel
-//! or a `save_<unix_ms>` stamp for named slots.
+//! ## Layout (2026-08-22 session decoupling)
+//! Dynamic game data NO LONGER lives inside the card folder — cards under
+//! `apps/fable/cards/<CardName>/` are STATIC assets only (`.sim`, portraits,
+//! `.lnk`). Every playthrough owns an isolated session folder:
 //!
-//! ## Why per-card subdir
-//! A single flat `saves/` dir would interleave saves from different scenarios;
-//! the per-card subdir scopes the Load Game list to the active card and
-//! lets the UI show only relevant saves. The dir is created lazily on first
-//! save (idempotent `create_dir_all`).
+//! `apps/fable/data/saves/<CardName>/<session_id>/`
+//!   manifest.json                       session identity (id/name/created)
+//!   session.json                        the live conversation for this run
+//!   world.json / player.json / npc.json the run's floating schemas
+//!   saves/<save_id>.json                autosave + manual atomic snapshots
 //!
-//! ## Save payload
+//! `<session_id>` is `session_<unix_ms>` (slug-sanitized). `<CardName>` is
+//! the RESOLVED card folder name (display-named — resolved through the same
+//! walker+cache as the card itself, never joined from the slug id raw).
+//!
+//! ## Save payload — the atomic compound snapshot
 //! Each save bundles (1) the roleplay session (full message history), (2)
-//! the world-state schema, (3) a human label + timestamp, (4) the card_id
-//! it belongs to (so a moved/orphaned save is self-identifying). The
-//! `summary` field is a short label for the UI (derived from the most
-//! recent user message or schema summary, NOT model-generated).
+//! the world-state schema, (3) the schema-history RING BUFFER (the undo
+//! snapshots, oldest-first — 2026-08-22 desync fix: a loaded snapshot now
+//! restores the exact tracker timeline, rollbacks included), (4) a human
+//! label + timestamp, (5) the card_id + session_id it belongs to (a moved/
+//! orphaned save is self-identifying). Loading a snapshot overwrites the
+//! active session's live schemas with the stored ones so the tracker
+//! perfectly matches the story's timeline. The `summary` field is a short
+//! UI label derived mechanically (last user message or schema summary, NOT
+//! model-generated).
 //!
 //! ## Efficiency (Prime Directive §1B)
 //! Save payloads grow with campaign length — the per-message world schemas
@@ -41,6 +48,37 @@ use crate::sim_card::SimCard;
 /// every turn end; it's the "Continue" option on the launcher.
 pub const AUTOSAVE_ID: &str = "autosave";
 
+/// The session folder's identity file (one per playthrough).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct SessionManifest {
+    pub session_id: String,
+    pub card_id: String,
+    pub name: String,
+    pub created_at: i64,
+}
+
+/// A session's list-row projection (the Session Manager UI shape).
+/// `last_played` + `save_count` are DERIVED at list time (file mtimes /
+/// directory walks) — the manifest is never rewritten during play.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct SessionMeta {
+    pub session_id: String,
+    pub card_id: String,
+    pub name: String,
+    pub created_at: i64,
+    pub last_played: i64,
+    pub save_count: usize,
+}
+
+/// One undo-ring snapshot inside a save — the serialized form of a
+/// `fable_schema_history` entry. Tag = session message count at push time
+/// (see `push_fable_history_snapshot`).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct HistorySnap {
+    pub tag: usize,
+    pub schema: WorldSchema,
+}
+
 /// Metadata for the Load Game list. Returned by `list_saves`. Excludes the
 /// heavy session/schema payloads (the UI fetches those via `load_save`
 /// only when the user actually picks one).
@@ -48,6 +86,10 @@ pub const AUTOSAVE_ID: &str = "autosave";
 pub struct SaveMeta {
     pub save_id: String,
     pub card_id: String,
+    /// (2026-08-22) The session this slot lives in — self-identifying for
+    /// the Continue walk (which spans cards × sessions).
+    #[serde(default)]
+    pub session_id: String,
     pub name: String,
     pub summary: String,
     pub timestamp: i64,
@@ -61,6 +103,11 @@ pub struct SaveMeta {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SaveFile {
     pub card_id: String,
+    /// (2026-08-22) The owning session — the folder the slot lives in.
+    /// Default-empty for pre-session saves (the migration moves them into a
+    /// session folder, so the FILENAME location is authoritative anyway).
+    #[serde(default)]
+    pub session_id: String,
     pub save_id: String,
     pub name: String,
     pub summary: String,
@@ -74,6 +121,11 @@ pub struct SaveFile {
     pub turn_count: usize,
     pub session: Conversation,
     pub schema: WorldSchema,
+    /// (2026-08-22 desync fix) The schema-history ring buffer at save time,
+    /// oldest-first. Empty on pre-field saves (legacy behavior: a loaded
+    /// snapshot starts with an empty undo ring).
+    #[serde(default)]
+    pub history: Vec<HistorySnap>,
 }
 
 /// The metadata-only projection `list_saves` extracts from a save's HEADER
@@ -92,31 +144,188 @@ struct SaveHeader {
     turn_count: usize,
 }
 
-/// Resolve `<cards>/<card folder>/saves/` — the per-card saves subdir inside
-/// the card's own folder (2026-08-01 layout: each card owns its `.sim`,
-/// `.codex`, world/player/npc JSON, AND its save slots as siblings). The
-/// subdir isolates each scenario's saves so the Load Game list shows only the
-/// relevant ones.
-///
-/// (2026-08-19) The card folder is DISPLAY-named ("One Piece"), so it can
-/// never be joined from the slug id — resolve via the crate's folder
-/// resolver (walker + cache), falling back to a display-stem join under the
-/// cards root (covers un-migrated slug folders too: a slug passes through
-/// `safe_display_stem` unchanged). Takes `fable_root` (= `apps/fable/`) for
-/// signature continuity with the many call sites.
-pub fn resolve_saves_dir(fable_root: &Path, card_id: &str) -> PathBuf {
+// ── session folder resolution ──────────────────────────────────────────────
+
+/// Resolve `apps/fable/data/saves/<CardName>/` — the card's session-tree
+/// root. The `<CardName>` half reuses the display-name folder resolver (the
+/// SAME authority the card itself resolves through — walker + cache), so a
+/// slug id can never forge a path the walker didn't enumerate. Fallback
+/// mirrors `resolve_card_dir`: a display-stem join (covers un-migrated slug
+/// folders).
+pub fn resolve_sessions_root(fable_root: &Path, card_id: &str) -> PathBuf {
     let cards_root = fable_root.join("cards");
+    let data_saves = fable_root.join("data").join("saves");
     if let Some(folder) = crate::resolve_card_folder(&cards_root, card_id) {
-        return folder.join("saves");
+        if let Some(name) = folder.file_name().and_then(|n| n.to_str()) {
+            return data_saves.join(name);
+        }
     }
-    cards_root.join(crate::safe_display_stem(card_id, "Card")).join("saves")
+    data_saves.join(crate::safe_display_stem(card_id, "Card"))
+}
+
+/// Resolve a single session's folder. The `<session_id>` half is
+/// slug-sanitized (same guard class as save ids — `fable_session_delete`
+/// is a destructive consumer of this path).
+pub fn resolve_session_root(fable_root: &Path, card_id: &str, session_id: &str) -> PathBuf {
+    resolve_sessions_root(fable_root, card_id).join(clean_save_segment(session_id))
+}
+
+/// Resolve `<session>/saves/` — the per-session save slots.
+pub fn resolve_saves_dir(fable_root: &Path, card_id: &str, session_id: &str) -> PathBuf {
+    resolve_session_root(fable_root, card_id, session_id).join("saves")
+}
+
+/// Mint a fresh session id: `session_<unix_ms>` (collision with an existing
+/// sibling is practically impossible — ms resolution at creation time).
+pub fn mint_session_id() -> String {
+    format!("session_{}", current_unix_ms())
+}
+
+/// Create a new session folder + manifest for a card. The display name
+/// defaults to "Session N" (N = existing session count + 1). Idempotent at
+/// the CALLER level (a new id is minted per call — this fn always creates a
+/// NEW session).
+pub fn create_session(
+    fable_root: &Path,
+    card: &SimCard,
+    name_hint: Option<&str>,
+) -> std::io::Result<SessionManifest> {
+    let sessions_root = resolve_sessions_root(fable_root, &card.id);
+    std::fs::create_dir_all(&sessions_root)?;
+    let existing = std::fs::read_dir(&sessions_root)
+        .map(|rd| rd.flatten().filter(|e| e.path().is_dir()).count())
+        .unwrap_or(0);
+    let name = name_hint
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.chars().take(60).collect::<String>())
+        .unwrap_or_else(|| format!("Session {}", existing + 1));
+    let manifest = SessionManifest {
+        session_id: mint_session_id(),
+        card_id: card.id.clone(),
+        name,
+        created_at: current_unix_ms(),
+    };
+    let dir = sessions_root.join(&manifest.session_id);
+    std::fs::create_dir_all(&dir)?;
+    write_manifest(&dir, &manifest)?;
+    Ok(manifest)
+}
+
+/// Write a session's manifest atomically (temp + rename, the save-slot
+/// pattern).
+pub fn write_manifest(session_dir: &Path, manifest: &SessionManifest) -> std::io::Result<()> {
+    let json = serde_json::to_string_pretty(manifest)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+    let final_path = session_dir.join("manifest.json");
+    let tmp_path = final_path.with_extension(format!("json.{}", unique_tmp_suffix()));
+    let write_result: std::io::Result<()> = (|| {
+        use std::io::Write;
+        let mut f = std::fs::File::create(&tmp_path)?;
+        f.write_all(json.as_bytes())?;
+        f.sync_all()?;
+        atomic_rename(&tmp_path, &final_path)
+    })();
+    if write_result.is_err() {
+        let _ = std::fs::remove_file(&tmp_path);
+    }
+    write_result
+}
+
+/// Read a session folder's manifest. `None` when absent/corrupt (the session
+/// still lists — the folder name stands in as the id, the name falls back).
+fn read_manifest(session_dir: &Path) -> Option<SessionManifest> {
+    let bytes = std::fs::read(session_dir.join("manifest.json")).ok()?;
+    serde_json::from_slice(&bytes).ok()
+}
+
+/// List a card's sessions, most-recently-played first. `last_played` = the
+/// newest mtime among the session's save slots + session.json (derived —
+/// manifests are never rewritten during play); `save_count` = slots present.
+pub fn list_sessions(fable_root: &Path, card_id: &str) -> std::io::Result<Vec<SessionMeta>> {
+    let sessions_root = resolve_sessions_root(fable_root, card_id);
+    if !sessions_root.is_dir() {
+        return Ok(Vec::new());
+    }
+    let mut out = Vec::new();
+    for entry in std::fs::read_dir(&sessions_root)?.flatten() {
+        let dir = entry.path();
+        if !dir.is_dir() {
+            continue;
+        }
+        let session_id = dir
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(str::to_owned)
+            .unwrap_or_default();
+        if session_id.is_empty() {
+            continue;
+        }
+        let manifest = read_manifest(&dir);
+        let name = manifest
+            .as_ref()
+            .map(|m| m.name.clone())
+            .unwrap_or_else(|| session_id.clone());
+        let created_at = manifest.as_ref().map(|m| m.created_at).unwrap_or_else(|| {
+            entry
+                .metadata()
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_millis() as i64)
+                .unwrap_or(0)
+        });
+        // Derived freshness: newest save mtime, else session.json mtime,
+        // else the folder's own mtime.
+        let mut last_played = created_at;
+        let mut save_count = 0usize;
+        if let Ok(rd) = std::fs::read_dir(dir.join("saves")) {
+            for save_entry in rd.flatten() {
+                let p = save_entry.path();
+                if p.extension().and_then(|x| x.to_str()) != Some("json") {
+                    continue;
+                }
+                save_count += 1;
+                if let Ok(modified) = save_entry.metadata().and_then(|m| m.modified()) {
+                    if let Ok(d) = modified.duration_since(std::time::UNIX_EPOCH) {
+                        last_played = last_played.max(d.as_millis() as i64);
+                    }
+                }
+            }
+        }
+        if let Ok(modified) = std::fs::metadata(dir.join("session.json")).and_then(|m| m.modified()) {
+            if let Ok(d) = modified.duration_since(std::time::UNIX_EPOCH) {
+                last_played = last_played.max(d.as_millis() as i64);
+            }
+        }
+        out.push(SessionMeta {
+            session_id,
+            card_id: card_id.to_owned(),
+            name,
+            created_at,
+            last_played,
+            save_count,
+        });
+    }
+    out.sort_by(|a, b| b.last_played.cmp(&a.last_played));
+    Ok(out)
+}
+
+/// Delete a whole session folder (recursive). Idempotent.
+pub fn delete_session(fable_root: &Path, card_id: &str, session_id: &str) -> std::io::Result<()> {
+    let dir = resolve_session_root(fable_root, card_id, session_id);
+    if dir.is_dir() {
+        std::fs::remove_dir_all(&dir)?;
+    }
+    Ok(())
 }
 
 /// Bare slug-segment sanitizer (separators / parent refs / drive prefixes
-/// → `-`, trimmed, empty → `__unknown__`). SAVE-SLOT ids only (2026-08-19:
-/// the card half resolves through the folder resolver above, which builds
-/// paths exclusively from enumerated directories — the destructive-consumer
-/// traversal guard for the card half is structural now).
+/// → `-`, trimmed, empty → `__unknown__`). SAVE-SLOT + SESSION ids only
+/// (2026-08-19: the card half resolves through the folder resolver, which
+/// builds paths exclusively from enumerated directories — the
+/// destructive-consumer traversal guard for the card half is structural
+/// now).
 fn clean_save_segment(id: &str) -> String {
     let s: String = id
         .chars()
@@ -127,12 +336,17 @@ fn clean_save_segment(id: &str) -> String {
 }
 
 /// Resolve a single save file's path.
-pub fn resolve_save_path(fable_root: &Path, card_id: &str, save_id: &str) -> PathBuf {
+pub fn resolve_save_path(
+    fable_root: &Path,
+    card_id: &str,
+    session_id: &str,
+    save_id: &str,
+) -> PathBuf {
     // (P2 hardening) The save-id half is slug-sanitized: separators, parent
     // refs, or drive prefixes in a caller-supplied slot id can never escape
     // the saves tree (fable_delete_save is a destructive consumer). The card
     // half resolves through the walker (see `resolve_saves_dir`).
-    resolve_saves_dir(fable_root, card_id)
+    resolve_saves_dir(fable_root, card_id, session_id)
         .join(format!("{}.json", clean_save_segment(save_id)))
 }
 
@@ -141,15 +355,17 @@ pub fn resolve_save_path(fable_root: &Path, card_id: &str, save_id: &str) -> Pat
 pub fn write_save(
     fable_root: &Path,
     card: &SimCard,
+    session_id: &str,
     save_id: &str,
     name: &str,
     session: &Conversation,
     schema: &WorldSchema,
+    history: &[(usize, WorldSchema)],
 ) -> std::io::Result<SaveFile> {
-    // (2026-08-19) The mkdir targets the SAME directory the write does —
-    // both halves go through `resolve_saves_dir` (the folder resolver), so
-    // they cannot disagree.
-    let dir = resolve_saves_dir(fable_root, &card.id);
+    // The mkdir targets the SAME directory the write does — both halves go
+    // through `resolve_saves_dir` (the folder resolver), so they cannot
+    // disagree.
+    let dir = resolve_saves_dir(fable_root, &card.id, session_id);
     std::fs::create_dir_all(&dir)?;
 
     let is_autosave = save_id == AUTOSAVE_ID;
@@ -157,6 +373,7 @@ pub fn write_save(
     let summary = derive_summary(session, schema);
     let save = SaveFile {
         card_id: card.id.clone(),
+        session_id: session_id.to_owned(),
         save_id: save_id.to_owned(),
         name: name.to_owned(),
         summary,
@@ -165,9 +382,13 @@ pub fn write_save(
         turn_count: session.messages.len(),
         session: session.clone(),
         schema: schema.clone(),
+        history: history
+            .iter()
+            .map(|(tag, schema)| HistorySnap { tag: *tag, schema: schema.clone() })
+            .collect(),
     };
 
-    let final_path = resolve_save_path(fable_root, &card.id, save_id);
+    let final_path = resolve_save_path(fable_root, &card.id, session_id, save_id);
     // (2026-08-15 audit fix) Byte-stable saves: `to_value` routing first —
     // serde_json's Map is BTreeMap-backed (no preserve_order feature), so
     // HashMap-keyed subtrees (schema entities, custom_tags, …) serialize in
@@ -191,17 +412,23 @@ pub fn write_save(
     // correct via the fallback — which is why the existing tests passed).
     // Hand-assembling the outer object pins the wire order: header fields
     // first, then the (already sorted + pooled) session/schema payloads.
-    // Key order is irrelevant to deserialization — load_save + legacy
-    // readers are unaffected. Determinism is preserved (every input to this
-    // composition is itself deterministic).
+    // (`"session_id":` does NOT match the `"session":` prefix-cut needle —
+    // the needle's closing quote breaks at the `_`.) Key order is
+    // irrelevant to deserialization — load_save + legacy readers are
+    // unaffected. Determinism is preserved (every input to this composition
+    // is itself deterministic).
     let session_json = serde_json::to_string_pretty(&value.get("session").cloned().unwrap_or(serde_json::Value::Null))
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
     let schema_json = serde_json::to_string_pretty(&value.get("schema").cloned().unwrap_or(serde_json::Value::Null))
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+    let history_json = serde_json::to_string_pretty(&value.get("history").cloned().unwrap_or(serde_json::Value::Null))
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
     let quoted = |s: &str| serde_json::to_string(s);
     let json = format!(
-        "{{\n  \"card_id\": {},\n  \"save_id\": {},\n  \"name\": {},\n  \"summary\": {},\n  \"timestamp\": {},\n  \"is_autosave\": {},\n  \"turn_count\": {},\n  \"session\": {},\n  \"schema\": {}\n}}",
+        "{{\n  \"card_id\": {},\n  \"session_id\": {},\n  \"save_id\": {},\n  \"name\": {},\n  \"summary\": {},\n  \"timestamp\": {},\n  \"is_autosave\": {},\n  \"turn_count\": {},\n  \"session\": {},\n  \"schema\": {},\n  \"history\": {}\n}}",
         quoted(&save.card_id)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?,
+        quoted(&save.session_id)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?,
         quoted(&save.save_id)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?,
@@ -214,6 +441,7 @@ pub fn write_save(
         save.turn_count,
         session_json,
         schema_json,
+        history_json,
     );
 
     // Atomic write pattern (matches session.rs / schema.rs): write temp +
@@ -267,8 +495,12 @@ pub(crate) fn unique_tmp_suffix() -> String {
 /// dominant cost of the Load list AND the title screen's Continue walk
 /// (every card × every slot). Falls back to a full parse when the prefix
 /// doesn't yield (pre-`turn_count` saves, truncated prefix, odd hand-edits).
-pub fn list_saves(fable_root: &Path, card_id: &str) -> std::io::Result<Vec<SaveMeta>> {
-    let dir = resolve_saves_dir(fable_root, card_id);
+pub fn list_saves(
+    fable_root: &Path,
+    card_id: &str,
+    session_id: &str,
+) -> std::io::Result<Vec<SaveMeta>> {
+    let dir = resolve_saves_dir(fable_root, card_id, session_id);
     if !dir.is_dir() {
         return Ok(Vec::new());
     }
@@ -311,6 +543,7 @@ pub fn list_saves(fable_root: &Path, card_id: &str) -> std::io::Result<Vec<SaveM
         out.push(SaveMeta {
             save_id: stem_id.unwrap_or_else(|| card_id.to_owned()),
             card_id: card_id.to_owned(),
+            session_id: session_id.to_owned(),
             name,
             summary,
             timestamp,
@@ -369,13 +602,21 @@ fn read_save_header(path: &Path) -> Option<(String, String, i64, bool, usize)> {
     ))
 }
 
+/// Public wrapper over the private header-prefix reader — lib.rs's
+/// cross-session Continue walk reads individual save paths whose
+/// card/session ids come from the DIRECTORY shape, not the payload.
+pub fn read_save_header_public(path: &Path) -> Option<(String, String, i64, bool, usize)> {
+    read_save_header(path)
+}
+
 /// Load a single save file. Returns Err if the file is missing or corrupt.
 pub fn load_save(
     fable_root: &Path,
     card_id: &str,
+    session_id: &str,
     save_id: &str,
 ) -> std::io::Result<SaveFile> {
-    let path = resolve_save_path(fable_root, card_id, save_id);
+    let path = resolve_save_path(fable_root, card_id, session_id, save_id);
     let bytes = std::fs::read(&path)?;
     let mut save: SaveFile = serde_json::from_slice(&bytes)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
@@ -383,12 +624,22 @@ pub fn load_save(
     // per-message inline fields — the same hydrate `Conversation::load`
     // runs, for the save-slot path.
     save.session.hydrate_schema_refs();
+    // The FILENAME location is authoritative for session identity (the
+    // migration moves pre-session saves without rewriting payloads).
+    if save.session_id.is_empty() {
+        save.session_id = session_id.to_owned();
+    }
     Ok(save)
 }
 
 /// Delete a save slot. Idempotent (returns Ok if already gone).
-pub fn delete_save(fable_root: &Path, card_id: &str, save_id: &str) -> std::io::Result<()> {
-    let path = resolve_save_path(fable_root, card_id, save_id);
+pub fn delete_save(
+    fable_root: &Path,
+    card_id: &str,
+    session_id: &str,
+    save_id: &str,
+) -> std::io::Result<()> {
+    let path = resolve_save_path(fable_root, card_id, session_id, save_id);
     if path.exists() {
         std::fs::remove_file(&path)?;
     }
@@ -451,6 +702,10 @@ mod tests {
     use crate::session::Role;
     use tempfile::tempdir;
 
+    /// The session id every test slot lives under (path-shape tests assert
+    /// the layout explicitly).
+    const SID: &str = "session_1";
+
     fn fake_card() -> SimCard {
         SimCard {
             id: "test_card".into(),
@@ -463,6 +718,8 @@ mod tests {
             world: Default::default(),
             location: None,
             inventory: Default::default(),
+            properties: Vec::new(),
+            linked_codices: Vec::new(),
             core_persona: String::new(),
             traits: String::new(),
             appearance: String::new(),
@@ -472,6 +729,7 @@ mod tests {
             technical_rules: String::new(),
             introductions: Vec::new(),
             intro: String::new(),
+            intro_variants: Vec::new(),
             setting: Some("A test place.".into()),
             plot: None,
             tone: None,
@@ -504,15 +762,183 @@ mod tests {
             ..Default::default()
         };
 
-        let saved =
-            write_save(tmp.path(), &card, "save_1", "First Save", &session, &schema).unwrap();
+        let saved = write_save(
+            tmp.path(),
+            &card,
+            SID,
+            "save_1",
+            "First Save",
+            &session,
+            &schema,
+            &[],
+        )
+        .unwrap();
         assert_eq!(saved.card_id, "test_card");
+        assert_eq!(saved.session_id, SID);
         assert_eq!(saved.save_id, "save_1");
         assert!(!saved.is_autosave);
 
-        let loaded = load_save(tmp.path(), "test_card", "save_1").unwrap();
+        // (2026-08-22) Session-scoped layout: the slot lives under
+        // data/saves/<CardFolder>/<session>/saves/, never in the card folder.
+        let slot = resolve_save_path(tmp.path(), "test_card", SID, "save_1");
+        assert!(
+            slot.starts_with(tmp.path().join("data").join("saves")),
+            "save slots live under the centralized data tree, got {}",
+            slot.display()
+        );
+        assert!(!tmp.path().join("cards").join("test_card").join("saves").exists());
+
+        let loaded = load_save(tmp.path(), "test_card", SID, "save_1").unwrap();
         assert_eq!(loaded.session.messages.len(), 2);
         assert_eq!(loaded.schema.summary, "Tester opened the door.");
+    }
+
+    /// (2026-08-22 desync fix) The undo-ring history rides the compound
+    /// snapshot oldest-first and restores verbatim; a save written with an
+    /// empty ring loads empty (legacy behavior).
+    #[test]
+    fn save_history_ring_round_trips() {
+        let tmp = tempdir().unwrap();
+        let card = fake_card();
+        let session = session_with("I camp for the night.");
+        let mut s1 = WorldSchema::default();
+        s1.summary = "before the fight".into();
+        let mut s2 = WorldSchema::default();
+        s2.summary = "after the fight".into();
+        let history = vec![(2usize, s1.clone()), (4usize, s2.clone())];
+        write_save(
+            tmp.path(),
+            &card,
+            SID,
+            "save_hist",
+            "History",
+            &session,
+            &s2,
+            &history,
+        )
+        .unwrap();
+        let loaded = load_save(tmp.path(), "test_card", SID, "save_hist").unwrap();
+        assert_eq!(loaded.history.len(), 2);
+        assert_eq!(loaded.history[0].tag, 2);
+        assert_eq!(loaded.history[0].schema.summary, "before the fight");
+        assert_eq!(loaded.history[1].tag, 4);
+        assert_eq!(loaded.history[1].schema.summary, "after the fight");
+
+        let empty = load_save(tmp.path(), "test_card", SID, "save_1").ok();
+        assert!(empty.is_none(), "sanity: unrelated slot absent");
+    }
+
+    /// A legacy save payload (no session_id, no history) written into a
+    /// session folder still loads — serde defaults + the filename-location
+    /// backfill.
+    #[test]
+    fn legacy_sessionless_save_loads_with_defaults() {
+        let tmp = tempdir().unwrap();
+        let dir = resolve_saves_dir(tmp.path(), "test_card", SID);
+        std::fs::create_dir_all(&dir).unwrap();
+        let save_value = serde_json::json!({
+            "card_id": "test_card",
+            "save_id": "save_old",
+            "name": "Old",
+            "summary": "old action",
+            "timestamp": 123i64,
+            "is_autosave": false,
+            "session": serde_json::to_value(session_with("old action")).unwrap(),
+            "schema": serde_json::to_value(WorldSchema::default()).unwrap(),
+        });
+        std::fs::write(
+            dir.join("save_old.json"),
+            serde_json::to_vec_pretty(&save_value).unwrap(),
+        )
+        .unwrap();
+        let loaded = load_save(tmp.path(), "test_card", SID, "save_old").unwrap();
+        assert_eq!(loaded.session_id, SID, "filename location backfills session identity");
+        assert!(loaded.history.is_empty(), "no ring on legacy saves");
+    }
+
+    #[test]
+    fn sessions_create_list_delete_lifecycle() {
+        let tmp = tempdir().unwrap();
+        let card = fake_card();
+        assert!(list_sessions(tmp.path(), "test_card").unwrap().is_empty());
+
+        let first = create_session(tmp.path(), &card, None).unwrap();
+        assert_eq!(first.name, "Session 1", "auto-naming counts existing sessions");
+        let second = create_session(tmp.path(), &card, Some("  Named Run  ")).unwrap();
+        assert_eq!(second.name, "Named Run");
+
+        // A save in the second session drives last_played + save_count.
+        write_save(
+            tmp.path(),
+            &card,
+            &second.session_id,
+            AUTOSAVE_ID,
+            "Auto",
+            &session_with("playing"),
+            &WorldSchema::default(),
+            &[],
+        )
+        .unwrap();
+
+        let list = list_sessions(tmp.path(), "test_card").unwrap();
+        assert_eq!(list.len(), 2);
+        assert_eq!(list[0].session_id, second.session_id, "most-recently-played first");
+        assert_eq!(list[0].name, "Named Run");
+        assert_eq!(list[0].save_count, 1);
+        assert_eq!(list[1].name, "Session 1");
+
+        delete_session(tmp.path(), "test_card", &second.session_id).unwrap();
+        delete_session(tmp.path(), "test_card", &second.session_id).unwrap(); // idempotent
+        let after = list_sessions(tmp.path(), "test_card").unwrap();
+        assert_eq!(after.len(), 1);
+        assert_eq!(after[0].session_id, first.session_id);
+    }
+
+    /// (2026-08-22 resume-attach fix) The SavedPlayer binding lives on the
+    /// conversation and must survive the save-slot wire (hand-composed
+    /// header + pooled session payload). A save written WITHOUT a binding
+    /// (every pre-fix slot on disk) must load back as None, never error.
+    #[test]
+    fn save_slot_preserves_attached_player_id() {
+        let tmp = tempdir().unwrap();
+        let card = fake_card();
+        let mut bound = session_with("I am Alex.");
+        bound.attached_player_id = Some("alex".into());
+        write_save(
+            tmp.path(),
+            &card,
+            SID,
+            "save_bound",
+            "Bound",
+            &bound,
+            &WorldSchema::default(),
+            &[],
+        )
+        .unwrap();
+        let loaded = load_save(tmp.path(), "test_card", SID, "save_bound").unwrap();
+        assert_eq!(
+            loaded.session.attached_player_id.as_deref(),
+            Some("alex"),
+            "binding must round-trip through the pooled save wire"
+        );
+
+        let unbound = session_with("card default player");
+        write_save(
+            tmp.path(),
+            &card,
+            SID,
+            "save_unbound",
+            "Unbound",
+            &unbound,
+            &WorldSchema::default(),
+            &[],
+        )
+        .unwrap();
+        let loaded = load_save(tmp.path(), "test_card", SID, "save_unbound").unwrap();
+        assert_eq!(
+            loaded.session.attached_player_id, None,
+            "pre-fix saves resume unattached, not broken"
+        );
     }
 
     #[test]
@@ -524,33 +950,38 @@ mod tests {
         write_save(
             tmp.path(),
             &card,
+            SID,
             "save_older",
             "Older",
             &session_with("older action"),
             &WorldSchema::default(),
+            &[],
         )
         .unwrap();
         std::thread::sleep(std::time::Duration::from_millis(20));
         write_save(
             tmp.path(),
             &card,
+            SID,
             "save_newer",
             "Newer",
             &session_with("newer action"),
             &WorldSchema::default(),
+            &[],
         )
         .unwrap();
 
-        let list = list_saves(tmp.path(), "test_card").unwrap();
+        let list = list_saves(tmp.path(), "test_card", SID).unwrap();
         assert_eq!(list.len(), 2);
         assert_eq!(list[0].save_id, "save_newer");
         assert_eq!(list[1].save_id, "save_older");
+        assert_eq!(list[0].session_id, SID, "meta carries the owning session");
     }
 
     #[test]
     fn list_saves_empty_when_no_dir() {
         let tmp = tempdir().unwrap();
-        let list = list_saves(tmp.path(), "no_such_card").unwrap();
+        let list = list_saves(tmp.path(), "no_such_card", SID).unwrap();
         assert!(list.is_empty());
     }
 
@@ -561,13 +992,15 @@ mod tests {
         write_save(
             tmp.path(),
             &card,
+            SID,
             AUTOSAVE_ID,
             "Auto",
             &session_with("auto"),
             &WorldSchema::default(),
+            &[],
         )
         .unwrap();
-        let list = list_saves(tmp.path(), "test_card").unwrap();
+        let list = list_saves(tmp.path(), "test_card", SID).unwrap();
         assert_eq!(list.len(), 1);
         assert!(list[0].is_autosave);
     }
@@ -579,15 +1012,17 @@ mod tests {
         write_save(
             tmp.path(),
             &card,
+            SID,
             "save_x",
             "X",
             &session_with("x"),
             &WorldSchema::default(),
+            &[],
         )
         .unwrap();
-        delete_save(tmp.path(), "test_card", "save_x").unwrap();
+        delete_save(tmp.path(), "test_card", SID, "save_x").unwrap();
         // Second delete should not error.
-        delete_save(tmp.path(), "test_card", "save_x").unwrap();
+        delete_save(tmp.path(), "test_card", SID, "save_x").unwrap();
     }
 
     #[test]
@@ -662,10 +1097,10 @@ mod tests {
         let card = fake_card();
         let session = campaign_session();
         let schema = schema_with("after turn 2"); // the live final state
-        write_save(tmp.path(), &card, "save_1", "Pooled", &session, &schema).unwrap();
+        write_save(tmp.path(), &card, SID, "save_1", "Pooled", &session, &schema, &[]).unwrap();
 
         let raw = std::fs::read_to_string(
-            resolve_save_path(tmp.path(), "test_card", "save_1"),
+            resolve_save_path(tmp.path(), "test_card", SID, "save_1"),
         )
         .unwrap();
         // Wire shape: pooled refs, no inline schemas on messages.
@@ -680,7 +1115,7 @@ mod tests {
         assert_eq!(raw.matches("\"summary\":").count(), 6);
 
         // Round-trip: full fidelity through the pool.
-        let loaded = load_save(tmp.path(), "test_card", "save_1").unwrap();
+        let loaded = load_save(tmp.path(), "test_card", SID, "save_1").unwrap();
         assert_eq!(loaded.session.messages.len(), 4);
         assert!(loaded.session.schema_pool.is_empty(), "hydrated away");
         let a1 = &loaded.session.messages[1];
@@ -702,13 +1137,15 @@ mod tests {
         write_save(
             tmp.path(),
             &card,
+            SID,
             "save_big",
             "Big",
             &campaign_session(),
             &schema_with("live"),
+            &[],
         )
         .unwrap();
-        let list = list_saves(tmp.path(), "test_card").unwrap();
+        let list = list_saves(tmp.path(), "test_card", SID).unwrap();
         assert_eq!(list.len(), 1);
         assert_eq!(list[0].turn_count, 4, "turn_count from the header prefix");
         assert_eq!(list[0].summary, "turn 2");
@@ -732,13 +1169,15 @@ mod tests {
         write_save(
             tmp.path(),
             &card,
+            SID,
             "save_hdr",
             "Header",
             &session_with("header action"),
             &big,
+            &[],
         )
         .unwrap();
-        let path = resolve_save_path(tmp.path(), "test_card", "save_hdr");
+        let path = resolve_save_path(tmp.path(), "test_card", SID, "save_hdr");
         let (name, summary, timestamp, is_autosave, turn_count) =
             read_save_header(&path).expect("header prefix parse must succeed on the current format");
         assert_eq!(name, "Header");
@@ -768,7 +1207,7 @@ mod tests {
     #[test]
     fn legacy_inline_save_still_lists_and_loads() {
         let tmp = tempdir().unwrap();
-        let dir = resolve_saves_dir(tmp.path(), "test_card");
+        let dir = resolve_saves_dir(tmp.path(), "test_card", SID);
         std::fs::create_dir_all(&dir).unwrap();
         let mut session = Conversation::new();
         session.add_message(Role::User, "legacy action".into());
@@ -799,13 +1238,13 @@ mod tests {
         std::fs::write(&path, serde_json::to_vec_pretty(&save_value).unwrap()).unwrap();
 
         // Listing falls back to a full parse + hydrates for the count.
-        let list = list_saves(tmp.path(), "test_card").unwrap();
+        let list = list_saves(tmp.path(), "test_card", SID).unwrap();
         assert_eq!(list.len(), 1);
         assert_eq!(list[0].turn_count, 2);
         assert_eq!(list[0].summary, "legacy action");
 
         // Loading hydrates the inline (pool-less) shape unchanged.
-        let loaded = load_save(tmp.path(), "test_card", "save_legacy").unwrap();
+        let loaded = load_save(tmp.path(), "test_card", SID, "save_legacy").unwrap();
         assert_eq!(
             loaded.session.messages[1].base_schema.as_ref().unwrap().summary,
             "legacy world"

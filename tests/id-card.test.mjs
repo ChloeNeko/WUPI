@@ -52,7 +52,9 @@ test('buildIdCard: player = NAME header + six license rows (race/gender, age/eye
   assert.ok(!('Physique' in e));
   // v2: clothing rides the Inventory extra (the mutable sibling seed).
   assert.deepEqual(e.Inventory, [['Clothing', 'tunic, boots']]);
-  assert.deepEqual(e['Starting conditions'], [['Wealth', '50 gold']]);
+  // (2026-08-22 Chloe ruling) wealth never renders on the card — money is
+  // inventory-only, standings are live tracker state.
+  assert.ok(!('Starting conditions' in e));
 });
 
 test('buildIdCard: player face holds the six license rows only — skin/body land in the Appearance extra', () => {

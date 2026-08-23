@@ -55,7 +55,12 @@ pub const THINKING_ENABLED: bool = false;
 /// (Fable: `api_lost` + autosave + early return; there is NO local narration
 /// fallback). Once the first token arrives the deadline is released — a
 /// working stream is never killed mid-flight, even if slow.
-pub const API_FIRST_TOKEN_TIMEOUT_MS: u64 = 10_000;
+/// (2026-08-21 Chloe ruling, 10s → 30s) NanoGPT's glm-latest TTFT tail
+/// regularly rides 9-10s on healthy turns; the Liam session dropped two
+/// narrations at exactly the 10s line — provider queue variance, not dead
+/// connections. 30s keeps the drop for genuinely hung providers while
+/// clearing their normal congestion band.
+pub const API_FIRST_TOKEN_TIMEOUT_MS: u64 = 30_000;
 
 /// (2026-08-15 audit fix) Idle guard BETWEEN chunks once the stream is alive
 /// (post-first-token), in milliseconds. Replaces the old reqwest 300s TOTAL
@@ -129,6 +134,21 @@ pub const WINDOW_LOCAL_CHAT: usize = 8;
 
 /// API-connected Fable visible window (8 turns).
 pub const WINDOW_API_FABLE: usize = 16;
+
+/// (2026-08-22 Ghost Writer + Crossroads) History window for the composer's
+/// narrator-side one-shots (impersonation + the options deck). 8 messages =
+/// 4 full exchanges: enough to carry the player's voice + the live scene
+/// without paying the full 16-message narrator window on a helper call.
+/// The Ghost Writer continue path deliberately uses the FULL
+/// [`WINDOW_API_FABLE`] instead — a continuation IS a narrator beat and
+/// needs every line of context it can get.
+pub const WINDOW_GUIDED: usize = 8;
+
+/// (2026-08-22 Ghost Writer + Crossroads) Char cap on the composer nudge
+/// (the typed steer Swipe / Continue / Impersonate / a Crossroads choice
+/// rides into its directive). Chars, not bytes (anti-pattern #6). The
+/// composer itself allows 4000; a nudge is a direction, not a turn.
+pub const GUIDED_NUDGE_CHAR_CAP: usize = 500;
 
 /// The Fable TRACKER window (2026-08-10). The tracker scans ONE turn: the
 /// player's just-typed action + the immediately preceding narrator response
@@ -230,6 +250,39 @@ pub const API_TOP_P: f32 = 0.95;
 /// outputs and slice spans are short by construction.
 pub const API_NARRATOR_MAX_TOKENS: u32 = 800;
 
+/// (2026-08-22 Ghost Writer) `max_tokens` for the impersonation one-shot:
+/// the model writes the player's NEXT message in the player's voice. A
+/// player action runs a paragraph or three; 500 is generous headroom while
+/// keeping a runaway short.
+pub const GHOST_IMPERSONATE_MAX_TOKENS: u32 = 500;
+
+/// (2026-08-22 Ghost Writer) `max_tokens` for the continue one-shot. The
+/// continuation extends an existing beat, it never replaces one: it should
+/// read as the back half of the same beat, so half a narrator ceiling.
+pub const GHOST_CONTINUE_MAX_TOKENS: u32 = 400;
+
+/// (2026-08-22 Ghost Writer) Lines of the trailing beat quoted into the
+/// continue directive (Chloe's "2 line grab"): the closing anchor the
+/// continuation picks up from, followed by the empty line that marks the
+/// new paragraph. Beats keep a paragraph per line, so 2 lines is the
+/// final paragraph plus its predecessor.
+pub const GHOST_CONTINUE_TAIL_LINES: usize = 2;
+
+/// (2026-08-22 Crossroads) `max_tokens` for the options-deck one-shot: 6
+/// options, each an emoji + a 1-3 word title + a 2-3 sentence summary,
+/// returned as one JSON array. ~120-150 tokens per option + syntax leaves
+/// deep headroom under 1100.
+pub const CROSSROADS_OPTIONS_MAX_TOKENS: u32 = 1100;
+
+/// (2026-08-22 Crossroads) Options per deck draw. The task prompt asks for
+/// exactly this many; `parse_options` truncates to it defensively.
+pub const CROSSROADS_OPTION_COUNT: usize = 6;
+
+/// (2026-08-22 Crossroads) `max_tokens` for the expand one-shot: the chosen
+/// fork written out in full as the text the player will send. 1-3
+/// paragraphs.
+pub const CROSSROADS_EXPAND_MAX_TOKENS: u32 = 500;
+
 // ---------------------------------------------------------------------------
 // World-sim growth caps
 // ---------------------------------------------------------------------------
@@ -283,6 +336,31 @@ pub const TRACKER_PROMPT_CHARS_PER_TOKEN: f32 = 3.6;
 pub const TRACKER_PROMPT_CHAR_BUDGET: usize = ((CTX_FABLE as f32
     - crate::fable_engine::TRACKER_MAX_TOKENS as f32)
     * TRACKER_PROMPT_CHARS_PER_TOKEN) as usize;
+
+/// (2026-08-22 re-track hardening) The SAME derivation as
+/// [`TRACKER_PROMPT_CHAR_BUDGET`], but for the edit/reroll RE-TRACK pass
+/// (`FableTurnMode::TrackerRetrack`): CTX_FABLE − TRACKER_RETRACK_MAX_TOKENS
+/// (512) × chars-per-token. The re-track's generation wall is DOUBLE the
+/// live turn's (a re-track re-emits a full beat's bracket set), so its
+/// prompt budget is correspondingly TIGHTER — the pair must move together
+/// or the engine's over-budget REFUSAL fires on a prompt the lib.rs guard
+/// just blessed.
+pub const TRACKER_RETRACK_PROMPT_CHAR_BUDGET: usize = ((CTX_FABLE as f32
+    - crate::fable_engine::TRACKER_RETRACK_MAX_TOKENS as f32)
+    * TRACKER_PROMPT_CHARS_PER_TOKEN) as usize;
+
+/// (2026-08-22 tracker feedback loop) Caps on the `<emit_errors>` block —
+/// last turn's REJECTED bracket emissions, folded into the tracker's next
+/// system prompt so the local model sees its own rejects (the Stage-2
+/// narrator was the only consumer before; the tracker repeated the same
+/// illegal emissions every turn of the 2026-08-22 playtest). The block is
+/// retrieved-when-relevant by construction (empty slot → no block), but its
+/// worst case must stay bounded: 6 lines × 140 chars ≈ 840 chars + frame —
+/// counted inside the tracker budget pins.
+pub const TRACKER_EMIT_ERROR_MAX_LINES: usize = 6;
+/// Per-line char cap for the `<emit_errors>` block (UTF-8-safe truncation —
+/// chars, not bytes).
+pub const TRACKER_EMIT_ERROR_LINE_CHARS: usize = 140;
 
 /// (2026-08-18 Dedicated-NPC reaper — Chloe's 3-tier / Garbage-Collector
 /// ruling) In-world days a `named` (discovered, non-authored) NPC's interior

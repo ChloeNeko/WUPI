@@ -44,15 +44,17 @@ import './flow-cinematic.css';
 import { buildTitle } from './screens/title.js';
 import { buildStage, wireStage, teardownStage, toast, bottomWarning } from './screens/stage.js';
 import { buildNewGameSplit } from './screens/newgame-split.js';
-import { buildPlayerPicker, renderPlayerPicker } from './screens/player-picker.js';
+import { buildPlayerPicker, renderPlayerPicker, refreshPlayerModal } from './screens/player-picker.js';
 import { buildCreatorChat, renderCreatorChat, abortCreatorTurn } from './screens/creator-chat.js';
 import { createEmbers } from './screens/embers.js';
 import { parseImportFile } from './screens/st-import.js';
 import { extractLorebookEntries } from './engine/creator-engine.js';
 import { playBurnTransition, playReverseSpawn } from './engine/burn-transition.js';
 import { tileCaptionHTML } from './engine/tile-caption.js';
-import { buildWorlds, renderWorlds } from './screens/worlds.js';
+import { buildWorlds, renderWorlds, refreshCardModal } from './screens/worlds.js';
 import { openSavesModal } from './screens/saves.js';
+import { openSessionsModal } from './screens/sessions.js';
+import { listSaves } from './engine/saves-io.js';
 import {
   startThemeMusic, stopThemeMusic, fadeOutThemeMusic,
   pauseThemeMusic, resumeThemeMusic,
@@ -370,7 +372,7 @@ let engineStarted = false;
 // stage the moment the load finishes. Cold-resume from the title (no game
 // running yet), so fable_start is the entry — NOT fable_load_save (that
 // requires an already-running game).
-async function resumeSave(cardId, saveId, opts = {}) {
+async function resumeSave(cardId, sessionId, saveId, opts = {}) {
   // Guarded: a rapid double-click on a save row could fire two fable_start
   // calls. The withFlowBusy wrapper drops the second; the first clears the
   // flag via enterStageViaTransition (the final step below).
@@ -390,7 +392,14 @@ async function resumeSave(cardId, saveId, opts = {}) {
   let openingScene = null;
   let loadMessages = null;
   try {
-    const result = await invoke('fable_start', { cardId, saveId });
+    // (2026-08-22 session decoupling) The owning session rides the resume —
+    // the backend resolves a missing session id (latest session / bare-save
+    // legacy search), but every UI path knows it.
+    const result = await invoke('fable_start', {
+      cardId,
+      sessionId: sessionId ?? null,
+      saveId: saveId ?? null,
+    });
     engineStarted = true;
     if (result && result.intro) openingScene = result.intro;
     if (result && Array.isArray(result.messages) && result.messages.length) {
@@ -446,7 +455,8 @@ function onContinueClicked() {
   // resumeSave sets the busy flag itself (it's also called from the saves
   // screen); no separate wrap needed here. `viaTransition` gives the
   // title-Continue entry the same black cinematic as New Game (2026-08-21).
-  resumeSave(target.card_id, target.save_id, { viaTransition: true });
+  // (2026-08-22) The target carries its owning session.
+  resumeSave(target.card_id, target.session_id || null, target.save_id, { viaTransition: true });
 }
 
 // LOAD button handler: show the world picker (the "Load Game" grid) +
@@ -511,8 +521,10 @@ function onLoadClicked() {
 //     the game launches straight into this world (flowAfterPlayer; no SIM
 //     pair, no Codex pair). The
 //     music keeps playing (it's the same New Game ambience the flow uses).
-//   • onResume  → the saves list for this card (most-recent first; backend
-//     sorts by timestamp desc). ‹ Back from saves returns to the worlds grid.
+//   • onResume  → the SESSION MANAGER for this card (2026-08-22): lists the
+//     card's playthrough sessions from the centralized saves tree; each row
+//     continues (newest save) or opens its saves popup; NEW SESSION starts
+//     the new-game flow preset to this card.
 //   • onEdit    → a centered raw-XML editor over the worlds screen, loaded
 //     via fable_card_raw_get_by_id, saved via fable_card_raw_set_by_id (the
 //     _by_id variants take an explicit card_id — no active game required,
@@ -520,7 +532,7 @@ function onLoadClicked() {
 function worldHandlers() {
   return {
     onNewGame: (card) => beginNewGameFromCard(card),
-    onResume: (card) => openWorldSaves(card),
+    onResume: (card) => openWorldSessions(card),
     onEdit: (card) => openCardRawEditor(card),
   };
 }
@@ -549,15 +561,78 @@ function beginNewGameFromCard(card) {
   });
 }
 
-// RESUME from the Load menu → the centered saves POPUP over the card modal
-// (2026-08-20 Chloe: the saves screen page is retired — LOAD never navigates
-// away; the card modal re-emerges when the popup closes). Selecting a save
-// feeds resumeSave exactly as before.
-function openWorldSaves(card) {
-  openSavesModal(screens.worlds, {
+// RESUME/LOAD from the Load menu → the centered SESSION MANAGER popup over
+// the card modal (2026-08-22 session decoupling: LOAD never navigates away;
+// it lists this card's playthroughs). Each session row CONTINUEs (resumes
+// its newest save incl. autosave) or opens its saves popup; NEW SESSION
+// routes to the new-game flow preset to this card (which mints the session
+// server-side on launch).
+function openWorldSessions(card) {
+  openSessionsModal(screens.worlds, {
     cardId: card.id,
     cardName: card.name,
-    onSelect: (save) => resumeSave(card.id, save.save_id),
+    // Continue = the session's newest save (incl. autosave — the list is
+    // newest-first). A saveless session resumes its live state (null id).
+    onContinue: (session) => {
+      listSaves(card.id, session.session_id)
+        .then((rows) => resumeSave(card.id, session.session_id, rows[0] ? rows[0].save_id : null))
+        .catch(() => resumeSave(card.id, session.session_id, null));
+    },
+    onOpenSaves: (session) => openWorldSaves(card, session),
+    onNewSession: () => beginNewGameFromCard(card),
+  });
+}
+
+// (2026-08-22 Chloe ruling) The IN-GAME drawer Load: the SAME centered
+// Session Manager popup, hosted on the STAGE — the game stays up behind
+// it. Picking a session/save resumes through the standard resumeSave
+// funnel (endFableSession stops live generation + retries, then fable_start
+// swaps the timeline + re-enters the stage). NEW SESSION exits to the
+// title's new-game flow preset to this card (the player picker must run —
+// a new playthrough needs its player pair).
+function openStageSessions(card) {
+  openSessionsModal(screens.stage, {
+    cardId: card.id,
+    cardName: card.name,
+    onContinue: (session) => {
+      listSaves(card.id, session.session_id)
+        .then((rows) => resumeSave(card.id, session.session_id, rows[0] ? rows[0].save_id : null))
+        .catch(() => resumeSave(card.id, session.session_id, null));
+    },
+    onOpenSaves: (session) => {
+      openSavesModal(screens.stage, {
+        cardId: card.id,
+        sessionId: session.session_id,
+        cardName: card.name,
+        onSelect: (save) => resumeSave(card.id, session.session_id, save.save_id),
+      });
+    },
+    onNewSession: () => {
+      void withShellBusy(async () => {
+        try {
+          await returnToTitle();
+          beginNewGameFromCard(card);
+        } catch (e) {
+          console.error('[fable] New Session flow failed — recovering to the title', e);
+          try {
+            stopFlowAmbiance();
+            showScreen('title');
+          } catch (_) { /* last resort: leave whatever is visible */ }
+        }
+      });
+    },
+  });
+}
+
+// The per-SESSION saves popup (opened from the Session Manager's SAVES row
+// action). Same centered popup as before, scoped to one playthrough;
+// selecting a save feeds resumeSave with the owning session.
+function openWorldSaves(card, session) {
+  openSavesModal(screens.worlds, {
+    cardId: card.id,
+    sessionId: session.session_id,
+    cardName: card.name,
+    onSelect: (save) => resumeSave(card.id, session.session_id, save.save_id),
   });
 }
 
@@ -582,6 +657,16 @@ function openCardRawEditor(card) {
     rootTag: 'sim_card',
     load: () => invoke('fable_card_raw_get_by_id', { cardId: card.id }),
     save: (text) => invoke('fable_card_raw_set_by_id', { cardId: card.id, xml: text }),
+    // (2026-08-22) The save must be VISIBLE: re-render the grid under the
+    // CURRENT handlers (both the Load menu + the new-game sim picker host
+    // this editor — root._handlers is whichever context opened it) + re-emerge
+    // this card's modal with the edited XML re-parsed. The old no-hook path
+    // left the stale pre-edit card modal on screen after the editor closed,
+    // reading as "the save didn't happen".
+    onSaved: () => {
+      renderWorlds(worlds, worlds._handlers);
+      refreshCardModal(worlds, card);
+    },
   });
 }
 
@@ -597,7 +682,15 @@ function openPlayerRawEditor(player) {
     rootTag: 'player',
     load: () => invoke('fable_player_raw_get', { id: player.id }),
     save: (text) => invoke('fable_player_raw_set', { id: player.id, xml: text }),
-    onSaved: () => renderPlayerPickerStep(),
+    // (2026-08-22) The picker re-render alone closed the card modal BEHIND the
+    // still-floating editor (the reported "saves but exits the player card
+    // UI"). The editor now closes itself on save; this hook refreshes the
+    // grid (a renamed player's tile updates) + re-emerges the edited player's
+    // card modal fresh — same end state as the sim editor's save.
+    onSaved: () => {
+      renderPlayerPickerStep();
+      refreshPlayerModal(picker, player);
+    },
   });
 }
 
@@ -608,7 +701,8 @@ function openPlayerRawEditor(player) {
 //   rootTag — the expected root element ('sim_card' | 'player')
 //   load()  — Promise<string> of the current file text
 //   save(text) — Promise persisting it (server-side validation gate)
-//   onSaved() — optional post-save hook (e.g. re-render the picker)
+//   onSaved() — optional post-save hook, run AFTER the editor has closed
+//               (e.g. re-render the underlying grid + card modal)
 function openXmlEditorModal(host, opts) {
   // If one's already open, close it first (defensive against a double-open).
   const existing = host.querySelector('.fable-world-raw-overlay');
@@ -683,6 +777,15 @@ function openXmlEditorModal(host, opts) {
       await opts.save(textarea.value);
       lastGood = textarea.value;
       validate();
+      // Save-and-close (2026-08-22): a successful ✓ closes the editor. The
+      // old stay-open gave zero feedback — the sim editor sat there over its
+      // stale card modal reading as "stuck/didn't save", and the player
+      // editor floated over a picker the onSaved hook had just re-rendered.
+      // onSaved runs AFTER the overlay is gone so its re-render never fights
+      // the editor for the screen. A FAILED save keeps the editor open (the
+      // user's text is untouched; failures log silently per the 2026-08-12
+      // ruling).
+      close();
       if (opts.onSaved) opts.onSaved();
     } catch (err) {
       // Status bar removed 2026-08-12 per Chloe — save failures log silently.
@@ -906,12 +1009,13 @@ function exitLoadToTitle() {
 // reverse-spawn + burned on click. buildFlowPairTiles generalizes the old
 // Player-pair-only builders so all pickers share one code path.
 
-// Build an arbitrary pair of flow tiles (+ optional IMPORT mini tile) into the
-// newgame-split host. `pair` is [{caption, act, onClick} x2]; `importTile` is
-// {caption, onClick} | null. Tiles ship opacity:0 for the reverse-spawn. Any
-// prior IMPORT mini tile is stripped first (re-entry / picker switch), unless
-// a fresh one is appended.
-function buildFlowPairTiles({ pair, importTile = null }) {
+// Build an arbitrary pair of flow tiles (+ optional mini tiles: IMPORT /
+// SKIP) into the newgame-split host. `pair` is [{caption, act, onClick} x2];
+// `importTile`/`skipTile` are {caption, onClick} | null (2026-08-22: the
+// codex pair carries BOTH — IMPORT + SKIP side-by-side under the pair).
+// Tiles ship opacity:0 for the reverse-spawn. Any prior mini tiles are
+// stripped first (re-entry / picker switch), unless fresh ones are appended.
+function buildFlowPairTiles({ pair, importTile = null, skipTile = null }) {
   // Clear any leftover cinematic launch fade so a re-shown picker isn't invisible
   // (launchGame stamps .is-launching on the screen it faded; it persists on disk
   // across the stage swap + a later New Game entry re-shows this host).
@@ -921,8 +1025,9 @@ function buildFlowPairTiles({ pair, importTile = null }) {
     if (tiles[i]) tiles[i].addEventListener('click', (e) => p.onClick(e.currentTarget));
   });
   tiles.forEach((t) => { t.style.opacity = '0'; });
-  if (importTile) {
-    buildFlowImportTile(importTile);
+  const miniTiles = [importTile, skipTile].filter(Boolean);
+  if (miniTiles.length) {
+    buildFlowMiniTiles(miniTiles);
   } else {
     const host = screens['newgame-split'].querySelector('.fable-newgame-tiles');
     if (host) host.querySelectorAll('.fable-newgame-tile-mini').forEach((el) => el.remove());
@@ -930,22 +1035,28 @@ function buildFlowPairTiles({ pair, importTile = null }) {
   return tiles;
 }
 
-// Build the IMPORT mini tile — a smaller silver slab centered below the pair.
-// Clicking it runs `onClick` (each picker wires its own import handler).
-function buildFlowImportTile({ caption, onClick }) {
+// Build the mini tile ROW — smaller silver slabs centered below the pair
+// (IMPORT and, on the codex pair, SKIP — side-by-side in one centered row
+// container, .fable-newgame-tile-mini-row). Each runs its own onClick.
+function buildFlowMiniTiles(defs) {
   const split = screens['newgame-split'];
   const host = split.querySelector('.fable-newgame-tiles');
-  // Strip any prior mini tile (re-entry / picker switch rebuilds it).
-  host.querySelectorAll('.fable-newgame-tile-mini').forEach((el) => el.remove());
-  const tile = document.createElement('button');
-  tile.className = 'fable-newgame-tile fable-newgame-tile-mini fable-flow-spawn';
-  tile.type = 'button';
-  tile.dataset.act = 'import';
-  tile.innerHTML = `<span class="fable-newgame-tile-caption">${tileCaptionHTML(caption)}</span>`;
-  tile.style.opacity = '0';
-  tile.addEventListener('click', (e) => onClick(e.currentTarget));
-  host.appendChild(tile);
-  return tile;
+  // Strip any prior mini row (re-entry / picker switch rebuilds it).
+  host.querySelectorAll('.fable-newgame-tile-mini-row').forEach((el) => el.remove());
+  const row = document.createElement('div');
+  row.className = 'fable-newgame-tile-mini-row';
+  for (const def of defs) {
+    const tile = document.createElement('button');
+    tile.className = 'fable-newgame-tile fable-newgame-tile-mini fable-flow-spawn';
+    tile.type = 'button';
+    tile.dataset.act = 'mini';
+    tile.innerHTML = `<span class="fable-newgame-tile-caption">${tileCaptionHTML(def.caption)}</span>`;
+    tile.style.opacity = '0';
+    tile.addEventListener('click', (e) => def.onClick(e.currentTarget));
+    row.appendChild(tile);
+  }
+  host.appendChild(row);
+  return Array.from(row.querySelectorAll('.fable-newgame-tile-mini'));
 }
 
 // The Player pair (Create / Load) + IMPORT — slide 1 of the flow.
@@ -1123,13 +1234,11 @@ function flowAfterPlayer() {
 }
 
 // Route after a player is chosen (Load). (Loaded players have no draft;
-// flowState.playerDraft stays null → no transient starting conditions are
-// seeded at launch.)
+// flowState.playerDraft stays null → nothing extra rides the launch.)
 function advanceAfterPlayer(playerId) {
   flowState.selectedPlayerId = playerId;
-  // (P2 fix) Clear any CREATEd player's draft: after CREATE → back → LOAD,
-  // the stale draft made the LOADED player inherit the CREATED one's
-  // wealth/reputation via buildStartingConditions.
+  // Clear any CREATEd player's draft: after CREATE → back → LOAD, the stale
+  // draft must not bleed into the loaded player's card.
   flowState.playerDraft = null;
   flowAfterPlayer();
 }
@@ -1142,13 +1251,25 @@ function advanceAfterPlayer(playerId) {
 // carries THAT import's greetings into the card's <intro> (passed directly by
 // flowImportSim — the only source since 2026-08-18). On CREATE →
 // advanceFromSim (the content-aware skip matrix).
-function flowCreateSim(presetImport = null, presetIntro = null) {
+function flowCreateSim(presetImport = null, presetIntro = null, presetPortrait = null, presetIntroVariants = null) {
   showScreen('creator-chat');
   setFlowStep('creator-chat');
   renderCreatorChat(screens['creator-chat'], {
     creatorKind: 'sim',
     presetImportData: presetImport,
     presetIntro,
+    // (2026-08-22 intro variants) The import's greeting list (first_mes +
+    // alternate_greetings): the serializer writes one `<intro>` sibling per
+    // entry, and Rust seeds them onto session message 0 as swipeable
+    // variants — the player picks an opening at game start.
+    presetIntroVariants,
+    // (2026-08-22) The IMPORT tile's PNG rides along exactly like the player
+    // wizard's: the source image pre-fills the review slot and saves on
+    // CREATE even without a re-crop. It used to be dropped here — a sim
+    // import silently lost its portrait.
+    presetPortraitDataUrl: presetPortrait && presetPortrait.dataUrl,
+    presetPortraitExt: presetPortrait && presetPortrait.ext,
+    presetPortraitBytes: presetPortrait && presetPortrait.bytes,
     onCreated: ({ cardId, draft }) => {
       flowState.selectedCardId = cardId;
       flowState.simDraft = draft;
@@ -1226,7 +1347,7 @@ function renderSimPickerStep() {
       };
       advanceFromSim(card.id);
     },
-    onResume: (card) => openWorldSaves(card),
+    onResume: (card) => openWorldSessions(card),
     onEdit: (card) => openCardRawEditor(card),
   });
 }
@@ -1260,49 +1381,154 @@ async function flowImportSim(selectedBtn) {
     rejectedBtns: rejected,
     onComplete: () => {
       setFlowBusy(false);
-      flowCreateSim(result.charData, result.introText || null);
+      // (2026-08-22) The imported PNG's portrait rides into the SIM wizard —
+      // the exact source image, auto-saved on CREATE (same contract as the
+      // player import). The greeting list rides as intro variants; the PRIMARY
+      // seeds from the FIRST greeting (variant 0), never `introText` — that
+      // joined blob would serialize as its own sibling (exact-dedupe can't
+      // collapse a mash) and the player's opening swipe would read every
+      // greeting concatenated.
+      flowCreateSim(
+        result.charData,
+        (Array.isArray(result.introVariants) && result.introVariants[0]) || result.introText || null,
+        {
+          dataUrl: result.portraitDataUrl,
+          ext: result.portraitExt,
+          bytes: result.portraitBytes,
+        },
+        Array.isArray(result.introVariants) ? result.introVariants : null,
+      );
     },
   });
 }
 
-// --- Content detection + the skip matrix ---------------------------------
-// Best-effort: a card "has" a codex when its .codex sibling is non-empty.
-// Runs before any active game exists, so it uses the by-id variant.
-async function detectHasCodex(cardId) {
-  try {
-    const r = await invoke('fable_codex_get_by_id', { cardId });
-    return !!(r && r.raw && r.raw.trim());
-  } catch (_) { return false; }
-}
-
-// Route after a sim card is established (NEW / LOAD / IMPORT). Skips the
-// Codex picker when a codex already exists — a loaded world with lore
-// launches immediately. The intro question is the SIM Wizard's job now (asked
-// in-chat before its draft can complete), so there is no intro picker to skip.
+// --- Route after the sim step → the CODEX pair (2026-08-22 rework) --------
+// The pair ALWAYS shows now (CREATE CODEX / LINK CODEX + IMPORT + SKIP mini
+// tiles): codexes are universal library members linked per-card, so a card
+// that already has links still gets the choice (LINK pre-selects them; SKIP
+// leaves them untouched). The intro question is the SIM Wizard's job (asked
+// in-chat before its draft can complete), so there is no intro picker.
 async function advanceFromSim(cardId) {
-  const hasCodex = await detectHasCodex(cardId);
-  if (hasCodex) {
-    launchGame(cardId);
-  } else {
-    flowCodexPair(cardId, { afterCodex: () => launchGame(cardId) });
-  }
+  flowCodexPair(cardId, { afterCodex: () => launchGame(cardId) });
 }
 
-// --- Codex pair: CREATE SIM CODEX / CONTINUE WITHOUT CODEX / IMPORT ------
-// The LAST picker slide: any codex choice (create / skip / import) ends in
-// `afterCodex` — normally launchGame.
+// --- Codex pair: CREATE CODEX / LINK CODEX / IMPORT / SKIP -----------------
+// The LAST picker slide: any codex choice (create / link / import / skip)
+// ends in `afterCodex` — normally launchGame.
 function flowCodexPair(cardId, { afterCodex } = {}) {
   const done = afterCodex || (() => launchGame(cardId));
   buildFlowPairTiles({
     pair: [
-      { caption: 'CREATE SIM CODEX', act: 'create-codex', onClick: (b) => burnPairTile(b, () => flowCreateCodex(cardId, null, done)) },
-      { caption: 'CONTINUE WITHOUT CODEX', act: 'no-codex', onClick: (b) => burnPairTile(b, done) },
+      { caption: 'CREATE CODEX', act: 'create-codex', onClick: (b) => burnPairTile(b, () => flowCreateCodex(cardId, null, done)) },
+      { caption: 'LINK CODEX', act: 'link-codex', onClick: (b) => burnPairTile(b, () => openCodexLinkPopup(cardId, done)) },
     ],
     importTile: { caption: 'IMPORT', onClick: (b) => flowImportCodexPair(b, cardId, done) },
+    skipTile: { caption: 'SKIP', onClick: (b) => burnPairTile(b, done) },
   });
   showScreen('newgame-split');
   setFlowStep('codex-pair');
   spawnFlowTiles();
+}
+
+// LINK CODEX → a centered multi-select popup over the flow screen listing
+// the universal codex library (`apps/fable/data/codex/`). Clicking a row
+// TOGGLES it (any number may be selected); LOAD writes the selection as the
+// card's `<linked_codices>` (priority = the row order — the first selected
+// row is top priority) and enters the game. Rows are draggable-free: the
+// full ordering UI lives in the right-drawer Codex tab (mid-game); this
+// picker's order follows the library list.
+async function openCodexLinkPopup(cardId, done) {
+  const host = screens['newgame-split'];
+  // One popup at a time.
+  document.querySelectorAll('.fable-codex-link-overlay').forEach((n) => n.remove());
+  let library = [];
+  let linked = [];
+  try {
+    [library, linked] = await Promise.all([
+      invoke('fable_codex_library_list'),
+      invoke('fable_codex_link_get', { cardId }),
+    ]);
+  } catch (e) {
+    bottomWarning(`Could not read the codex library: ${e.message || e}`);
+    // (2026-08-22 review) The LINK tile already burned the picker before the
+    // popup opened — without rebuilding, the failure strands a blank slide.
+    flowCodexPair(cardId, { afterCodex: done });
+    return;
+  }
+  // Selection state: linked codices first (priority order), then the rest
+  // in library order; toggling moves a name in/out of the selection list.
+  const selected = new Set((linked || []).map(String));
+  const overlay = document.createElement('div');
+  overlay.className = 'fable-codex-link-overlay';
+  // Completed = the selection was written (LOAD) — only then may close()
+  // leave the burned picker behind. Esc / ✕ / backdrop rebuild the pair so
+  // the player lands back on live tiles, not an empty slide.
+  let completed = false;
+  const escGuard = (ev) => {
+    if (ev.key === 'Escape') { ev.stopPropagation(); close(); }
+  };
+  const close = () => {
+    document.removeEventListener('keydown', escGuard, true);
+    overlay.remove();
+    if (!completed) flowCodexPair(cardId, { afterCodex: done });
+  };
+  overlay.innerHTML = `
+    <div class="fable-codex-link-modal" role="dialog" aria-label="Link codex files">
+      <div class="fable-codex-link-head">
+        <span class="fable-codex-link-title">LINK CODEX</span>
+        <button class="fable-codex-link-close" type="button" aria-label="Close">✕</button>
+      </div>
+      <div class="fable-codex-link-body"></div>
+      <div class="fable-codex-link-foot">
+        <span class="fable-codex-link-hint">First selected = top priority</span>
+        <button class="fable-codex-link-load" type="button">LOAD</button>
+      </div>
+    </div>`;
+  const body = overlay.querySelector('.fable-codex-link-body');
+  const renderRows = () => {
+    body.innerHTML = '';
+    if (!library.length) {
+      body.innerHTML = '<div class="fable-codex-link-empty">No codex files in the library yet — CREATE one or IMPORT a lorebook first.</div>';
+      return;
+    }
+    // Selection order = insertion order of `selected` (a Set preserves it).
+    const order = [...selected, ...library.map((l) => l.name).filter((n) => !selected.has(n))];
+    for (const name of order) {
+      const item = library.find((l) => String(l.name) === name);
+      const row = document.createElement('button');
+      row.type = 'button';
+      row.className = 'fable-codex-link-row' + (selected.has(name) ? ' is-selected' : '');
+      row.innerHTML = `
+        <span class="fable-codex-link-row-check"></span>
+        <span class="fable-codex-link-row-name"></span>
+        <span class="fable-codex-link-row-count">${item ? item.entry_count : 0} entries</span>`;
+      row.querySelector('.fable-codex-link-row-name').textContent = name;
+      row.addEventListener('click', () => {
+        if (selected.has(name)) selected.delete(name);
+        else selected.add(name);
+        renderRows();
+      });
+      body.appendChild(row);
+    }
+  };
+  renderRows();
+  overlay.querySelector('.fable-codex-link-close').addEventListener('click', close);
+  overlay.addEventListener('click', (ev) => { if (ev.target === overlay) close(); });
+  overlay.querySelector('.fable-codex-link-load').addEventListener('click', async (ev) => {
+    const btn = ev.currentTarget;
+    btn.disabled = true;
+    try {
+      await invoke('fable_codex_link_set', { cardId, codices: [...selected] });
+      completed = true;
+      close();
+      done();
+    } catch (e) {
+      btn.disabled = false;
+      bottomWarning(`Link failed: ${e.message || e}`);
+    }
+  });
+  document.addEventListener('keydown', escGuard, true);
+  host.appendChild(overlay);
 }
 
 function flowCreateCodex(cardId, presetImport, afterCodex, presetLorebook = null) {
@@ -1425,30 +1651,6 @@ function flowBack(onBack) {
   }
 }
 
-// Start a fresh game from a card (+ optional saved player): stop the
-// Extract TRANSIENT starting gameplay conditions (wealth/reputation/fame)
-// from the Player Wizard draft. These seed `PlayerState` at attach — they
-// are NOT persisted on the SavedPlayer identity (§6C identity-only lock).
-// Leading-integer parse: "200 gold" → 200, "-20" → -20, "famous" → null.
-// Returns null when neither is present (the common case → fable_start gets
-// no arg → PlayerStartingConditions defaults to None server-side).
-function buildStartingConditions(draft) {
-  if (!draft) return null;
-  const leadInt = (v) => {
-    if (v == null) return null;
-    const m = String(v).trim().match(/-?\d+/);
-    return m ? parseInt(m[0], 10) : null;
-  };
-  const wealth = leadInt(draft.wealth);
-  let reputation = leadInt(draft.reputation);
-  if (reputation == null) reputation = leadInt(draft.fame);
-  if (wealth == null && reputation == null) return null;
-  const conds = {};
-  if (wealth != null) conds.wealth = Math.max(0, wealth);                       // u32
-  if (reputation != null) conds.reputation = Math.max(-2147483648, Math.min(2147483647, reputation)); // i32
-  return conds;
-}
-
 // === The cinematic launch ===============================================
 // The terminal step for every New Game path: fade the flow UI to leave only
 // the background + music, run fable_start (the "schema captured" wait), then
@@ -1487,11 +1689,11 @@ async function launchGame(cardId) {
   try {
     const result = await invoke('fable_start', {
       cardId,
+      // (2026-08-22 session decoupling) fresh + no session id → the backend
+      // MINTS a new isolated session folder for this playthrough.
+      sessionId: null,
       fresh: true,
       playerId: flowState.selectedPlayerId,
-      // Transient starting wealth/reputation from the Player Wizard draft
-      // (null when the AI never asked → omitted → defaults). See buildStartingConditions.
-      playerStartingConditions: buildStartingConditions(flowState.playerDraft),
     });
     engineStarted = true;
     if (result && result.intro) openingScene = result.intro;
@@ -1540,35 +1742,33 @@ function enterStageViaTransition(openingScene, loadMessages, opts = {}) {
     showScreen('stage');
     try {
       if (screens.stage) {
+        // (2026-08-22 fix) The stage DOM PERSISTS across entries and its
+        // listeners are only released by teardownStage — previously every
+        // entry path arrived here through returnToTitle (which tears down),
+        // but the new IN-GAME Load popup resumes via resumeSave → here
+        // directly, so a second wireStage stacked a second set of tracked
+        // listeners on the same DOM: double-sent turns, doubled ✎ actions,
+        // double arrow-swipes from the 2nd session on. Tear down before
+        // every wire — idempotent on a fresh/never-wired stage.
+        teardownStage();
         wireStage(screens.stage, {
           cardContext: null,
           onExit: returnToTitle,
-          // (2026-08-16 audit fix #26) The drawer's Load foot button: exit to
-          // the title + open the SAME worlds→saves picker the title's LOAD
-          // opens (mid-session save-swaps go through the standard flow; the
-          // in-flight-turn guards live on the backend).
-          // (P2c, 2026-08-17 E4B shakedown) The load-flow entry is a
-          // multi-step async chain (stage teardown → title → transition →
-          // worlds grid). A failure anywhere in the middle used to leave the
-          // app SCREENLESS (0×0 drawer, no visible screen, flow-ambience
-          // stuck — only a webview reload recovered). withShellBusy drops
-          // overlapping input during the chain + the catch guarantees SOME
-          // screen is shown.
+          // (2026-08-22 Chloe ruling) The drawer's Load foot button is a
+          // CENTERED popup over the stage — the SAME Session Manager the
+          // Load menu's card-modal LOAD opens, listing THIS card's sessions
+          // + saves — NEVER an exit to the title. The old exit-to-title
+          // chain (returnToTitle → onLoadClicked) read as "Load kicked me
+          // out of the game"; picking a row resumes through the standard
+          // resumeSave funnel (which stops generation + swaps sessions).
           onLoad: () => {
             void withShellBusy(async () => {
               try {
-                await returnToTitle();
-                await onLoadClicked();
+                const res = await invoke('fable_active_card_get');
+                if (!res || !res.card_id) return;
+                openStageSessions({ id: res.card_id, name: res.name || res.card_id });
               } catch (e) {
-                console.error('[fable] Load flow failed mid-chain — recovering to a visible screen', e);
-                try {
-                  // If the worlds grid never rendered, land on the title (the
-                  // pre-flow state) + kill any half-started flow ambience.
-                  if (!(screens.worlds && !screens.worlds.hidden)) {
-                    stopFlowAmbiance();
-                    showScreen('title');
-                  }
-                } catch (_) { /* last resort: leave whatever is visible */ }
+                console.error('[fable] in-game Load popup failed', e);
               }
             });
           },
@@ -1833,8 +2033,9 @@ function openFable() {
           if (!src || src.source !== 'api' || !src.apiReady) { revealTitleAfterSplash(); return; }
           // underSplash: resumeSave → enterStageViaTransition delays the stage
           // to the 2s splash window + runs the shared entry wipe (the reveal is
-          // identical to the fable.exe title path).
-          await resumeSave(ctx.cardSlug, ctx.saveId ?? null, { underSplash: true, launchT0 });
+          // identical to the fable.exe title path). (2026-08-22) The context
+          // carries the optional owning session (`--session`).
+          await resumeSave(ctx.cardSlug, ctx.sessionId ?? null, ctx.saveId ?? null, { underSplash: true, launchT0 });
         } catch (e) {
           console.error('[fable] direct launch failed, falling back to title', e);
           // (2026-08-16 audit fix #26) resumeSave armed flowBusy before its
@@ -2291,7 +2492,7 @@ export function initFable(extHooks = {}) {
       // generation safely) → fable_start → enterStageViaTransition, and its
       // own flowBusy guard dedupes a rapid .lnk double-click.
       try {
-        await resumeSave(ctx.cardSlug, ctx.saveId ?? null);
+        await resumeSave(ctx.cardSlug, ctx.sessionId ?? null, ctx.saveId ?? null);
       } catch (err) {
         console.error('[fable] second-instance direct launch failed, returning to title', err);
         setFlowBusy(false);

@@ -1983,6 +1983,27 @@ pub struct WorldSchema {
 }
 
 impl WorldSchema {
+    /// (2026-08-22 re-track hardening) Keep the Rust-owned ANCHORS — the
+    /// world clock + the calendar label family — when a re-track path
+    /// reverts the live schema to a stored base. `world_clock` and
+    /// `calendar` are Rust-authoritative state the `[TIME]`/`[DATE]`
+    /// brackets advanced for a turn that STILL HAPPENED (an edit/reroll
+    /// changes the prose, not the fact that time flowed); the 2026-08-22
+    /// playtest caught the base revert rolling the clock back whenever the
+    /// re-track's re-emission hit its token wall and dropped the `[TIME]`
+    /// bracket — turn 2 then re-applied `09:05` against `prev=540` a
+    /// second time. Both brackets are ABSOLUTE-set (idempotent), so a
+    /// faithful re-emission over preserved anchors is a no-op — only the
+    /// dropped-bracket rollback is killed. Called on the EDIT re-track +
+    /// the successful-REROLL revert ONLY; the cancel/api_lost full-revert
+    /// paths restore the whole pre-turn world by design (there the turn
+    /// never happened).
+    pub fn retain_revert_safe_anchors(&mut self, live: &WorldSchema) {
+        self.world_clock = live.world_clock.clone();
+        self.calendar = live.calendar.clone();
+        self.calendar_synced_minutes = live.calendar_synced_minutes;
+    }
+
     /// (2026-08-15 audit fix) The ONE capped entry point for direct
     /// `recent_events` pushes (the belt-spill note, the Soul-Gem UI
     /// `event_note`). The delta path caps via `cap_recent_events`; the
@@ -4109,6 +4130,33 @@ fn temp_path_for(path: &Path) -> std::path::PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// (2026-08-22 re-track hardening) A base-schema revert KEEPS the
+    /// Rust-owned anchors (clock + calendar family) from the live world —
+    /// the moment still happened; only its prose is re-derived. Everything
+    /// else on the base wins.
+    #[test]
+    fn retain_revert_safe_anchors_keeps_clock_and_calendar() {
+        let mut base = WorldSchema::default();
+        base.world_clock.current_minutes = 540; // 09:00, pre-turn
+        base.world_clock.last_tick_minutes = 540;
+        base.calendar = Some("1st of Harvest, Year 1247".into());
+        base.calendar_synced_minutes = Some(540);
+        base.summary = "the base summary".into();
+
+        let mut live = base.clone();
+        live.world_clock.current_minutes = 545; // the turn's [TIME] applied
+        live.calendar = Some("2nd of Harvest, Year 1247".into());
+        live.calendar_synced_minutes = Some(545);
+        live.summary = "the live summary".into();
+
+        let mut restored = base.clone();
+        restored.retain_revert_safe_anchors(&live);
+        assert_eq!(restored.world_clock.current_minutes, 545, "clock survives the revert");
+        assert_eq!(restored.calendar.as_deref(), Some("2nd of Harvest, Year 1247"));
+        assert_eq!(restored.calendar_synced_minutes, Some(545));
+        assert_eq!(restored.summary, "the base summary", "everything else reverts");
+    }
 
     #[test]
     fn apply_delta_upserts_entities() {

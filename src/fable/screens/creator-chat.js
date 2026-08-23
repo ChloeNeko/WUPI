@@ -57,6 +57,7 @@ import {
   MANDATORY_LABELS,
   batchLorebookEntries,
   normalizeLoreImportEntries,
+  clampImportCharData,
 } from '../engine/creator-engine.js';
 import { bottomWarning } from './stage.js';
 import { renderIdCard, wireIdCard, PENCIL_SVG } from './id-card.js';
@@ -172,7 +173,13 @@ export function renderCreatorChat(root, config) {
   const state = {
     history: [],        // [{role:'user'|'assistant', content}] — assistant = raw envelope text
     draft: {},          // accumulating fields
-    importData: config.presetImportData || null,  // pre-seeded (IMPORT tile / codex Import)
+    // pre-seeded (IMPORT tile / codex Import). Clamped to the API payload
+    // budget (2026-08-22): a big imported card blew llm.rs's char budget and
+    // the <import> block was silently DROPPED — GLM saw nothing. The clamp
+    // trims the embedded lorebook first (the CODEX step re-imports it in
+    // full from the file), long prose last. Lorebook batch runs seed their
+    // own ≤8K-char batches below — untouched by the 32K budget.
+    importData: clampImportCharData(config.presetImportData) || null,
     portraitBytes: config.presetPortraitBytes || null,        // pre-seeded portrait bytes (IMPORT tile — saved even w/o re-crop)
     portraitExt: config.presetPortraitExt || null,        // pre-seeded portrait ext (IMPORT tile)
     portraitPreview: config.presetPortraitDataUrl || null, // pre-seeded portrait preview (IMPORT tile)
@@ -237,6 +244,15 @@ export function renderCreatorChat(root, config) {
   // turn (mergeDraft overwrites with non-empty), but the mechanically-captured
   // greetings are the floor so the authored opening survives into `<intro>`.
   if (config.presetIntro) state.draft.intro = config.presetIntro;
+  // (2026-08-22 intro variants) The import's greeting list — draft.intro is
+  // variant 0 (the default opening), the full list rides to the serializer
+  // as the alternate `<intro>` siblings. Seeded mechanically; GLM never
+  // rewrites it (the system prompt says so).
+  if (Array.isArray(config.presetIntroVariants) && config.presetIntroVariants.length) {
+    state.draft.intro_variants = config.presetIntroVariants
+      .map((s) => (s == null ? '' : String(s)).trim())
+      .filter(Boolean);
+  }
   // (2026-08-15 audit fix) ‹ mid-edit leak wrap: the edit popup + the edit
   // generation ring attach DOCUMENT-level capture keydowns; exiting the
   // screen with ‹ while either was open left them attached forever
@@ -593,9 +609,12 @@ export function renderCreatorChat(root, config) {
     // intro — the model cannot blank a field itself (mergeDraft's empty-skip),
     // so the decline is enforced mechanically. Without this, a user who
     // declined an intro still shipped the pre-seeded import greeting as the
-    // card's <intro>.
+    // card's <intro>. (2026-08-22) intro_variants ride along — the serializer
+    // emits one <intro> sibling per variant independent of draft.intro, so a
+    // decline that only dropped the primary still shipped every alternate.
     if (env.draft && env.draft.intro_answered === false) {
       delete state.draft.intro;
+      delete state.draft.intro_variants;
     }
     trace(`envelope action=${env.action || '(none)'} draftKeys=[${Object.keys(env.draft || {}).join(',')}]`);
     if (env.action === 'ready') {
@@ -1127,7 +1146,11 @@ export function renderCreatorChat(root, config) {
         if (onCreated) onCreated({ cardId: meta.id, draft: state.draft });
       } else if (creatorKind === 'codex') {
         const text = codexEntriesToCompound(state.draft.entries || []);
-        if (cardId) await invoke('fable_card_sibling_write', { cardId, ext: 'codex', text });
+        // (2026-08-22 codex decoupling) The codex lands in the UNIVERSAL
+        // library (`data/codex/<CardDisplayName>.codex`) and auto-links to
+        // the card — one IPC does both (the old per-card sibling write is
+        // retired).
+        if (cardId) await invoke('fable_codex_create_for_card', { cardId, text });
         trace(`saved codex (${text.length}b) on cardId=${cardId}`);
         if (onCreated) onCreated({ cardId, draft: state.draft });
       }

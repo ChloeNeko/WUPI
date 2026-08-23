@@ -239,9 +239,9 @@ struct ChatRequestMessage {
 /// their chain-of-thought in a SEPARATE `reasoning_content` delta field BEFORE
 /// the first `content` token. We do NOT render reasoning (the API narrator must
 /// never think, §3A) — but we DO need to know a token arrived so the TTFT
-/// deadline retires (else a long reasoning phase trips the 10s timeout →
-/// `api_lost`). The field is parsed + checked for "is the stream alive?" but
-/// its body is discarded.
+/// deadline retires (else a long reasoning phase trips the first-token
+/// timeout → `api_lost`). The field is parsed + checked for "is the stream
+/// alive?" but its body is discarded.
 #[derive(serde::Deserialize)]
 struct ChatStreamChunk {
     choices: Vec<ChatStreamChoice>,
@@ -579,7 +579,7 @@ impl GenerationClient for HttpBackend {
                             // (the API narrator never thinks, §3A) — but the
                             // arrival of a reasoning token proves the stream is
                             // alive, so retire the TTFT deadline on it. Without
-                            // this, a long reasoning phase trips the 10s
+                            // this, a long reasoning phase trips the
                             // first-token timeout → `api_lost` mid-narration.
                             // TTFT (2026-08-19): logged ONCE per stream, at the
                             // first token of EITHER kind — reasoning_content

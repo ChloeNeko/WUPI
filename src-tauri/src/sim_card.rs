@@ -347,6 +347,16 @@ pub struct SimCard {
     /// (npc → the card's NPC, scenario/world → authored or Unowned).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub properties: Vec<crate::economy::AuthoredProperty>,
+    /// (2026-08-22 Codex decoupling) The `<linked_codices>` sibling — display
+    /// names of UNIVERSAL codex files (`apps/fable/data/codex/<name>.codex`)
+    /// linked to this card, in PRIORITY order (index 0 = top priority; a
+    /// same-title collision between two linked files resolves toward the
+    /// earlier entry at the seed phase). Parsed on BOTH generations (the
+    /// sibling tail is generation-agnostic — the boot migration links
+    /// legacy-verbatim cards too, via the tail-splice in
+    /// [`with_linked_codices`]).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub linked_codices: Vec<String>,
     // ── legacy model (system cards + pre-v2 Fable cards) ─────────────────
     pub core_persona: String,
     pub traits: String,
@@ -364,8 +374,19 @@ pub struct SimCard {
     /// `<introduction>` (legacy alias) element AFTER `</sim_card>`, kept OUT
     /// of `<sim_card>` so it never inflates the cached system prompt (prime
     /// directive). The Fable opening beat / wupi.sim boot-greeting pool.
+    /// Always mirrors `intro_variants[0]` when variants exist (parse
+    /// maintains the invariant; every legacy read site keeps working).
     #[serde(default)]
     pub intro: String,
+    /// (2026-08-22 intro variants) EVERY `<intro>`/`<introduction>` sibling,
+    /// in file order — the FIRST is the default opening (mirrored into
+    /// [`intro`]), the rest are ALTERNATES (imported SillyTavern
+    /// `alternate_greetings`). `enter_fable_session` seeds them all onto
+    /// session message 0 as swipeable variants, so the player picks an
+    /// opening via the existing ‹ 1/N › beat control right at game start.
+    /// Empty ⇔ the card has no intro at all.
+    #[serde(default)]
+    pub intro_variants: Vec<String>,
     /// The world/setting premise (scenario/world cards keep this dedicated
     /// field in v2 too — Chloe's 2026-08-19 ruling).
     #[serde(default)]
@@ -594,9 +615,25 @@ impl SimCard {
             xml.push_str(&format!("\n<location><![CDATA[\n{}\n]]></location>\n", cdata_body(loc)));
         }
 
-        let intro = self.intro.trim();
-        if !intro.is_empty() {
-            xml.push_str(&format!("\n<intro><![CDATA[\n{}]]></intro>\n", cdata_body(intro)));
+        // (2026-08-22 intro variants) ONE `<intro>` sibling per variant — the
+        // first is the default opening, the rest are the player-selectable
+        // alternates (imported SillyTavern alternate_greetings). `intro` is
+        // the variant-0 mirror, so the single-intro card shape is identical
+        // to what this always emitted.
+        let intro_variants: Vec<&str> = if self.intro_variants.is_empty() {
+            // Defensive mirror discipline: a hand-built card with only
+            // `intro` set still serializes its one intro.
+            let intro = self.intro.trim();
+            if intro.is_empty() { Vec::new() } else { vec![intro] }
+        } else {
+            self.intro_variants
+                .iter()
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+                .collect()
+        };
+        for variant in intro_variants {
+            xml.push_str(&format!("\n<intro><![CDATA[\n{}]]></intro>\n", cdata_body(variant)));
         }
 
         // Inventory rides only npc cards (Chloe: clothing mandatory there,
@@ -625,6 +662,16 @@ impl SimCard {
             let body = crate::economy::render_property_lines(&self.properties);
             xml.push_str(&format!(
                 "\n<properties><![CDATA[\n{}]]></properties>\n",
+                cdata_body(&body)
+            ));
+        }
+
+        // (2026-08-22 Codex decoupling) The universal-codex link list — one
+        // display name per line, priority order. Omitted entirely when empty.
+        if !self.linked_codices.is_empty() {
+            let body = self.linked_codices.join("\n");
+            xml.push_str(&format!(
+                "\n<linked_codices><![CDATA[\n{}]]></linked_codices>\n",
                 cdata_body(&body)
             ));
         }
@@ -766,6 +813,7 @@ pub fn fallback() -> SimCard {
         location: None,
         inventory: CardInventory::default(),
         properties: Vec::new(),
+        linked_codices: Vec::new(),
         core_persona: String::new(),
         traits: String::new(),
         appearance: String::new(),
@@ -775,6 +823,7 @@ pub fn fallback() -> SimCard {
         technical_rules: String::new(),
         introductions: Vec::new(),
         intro: String::new(),
+        intro_variants: Vec::new(),
         setting: None,
         plot: None,
         tone: None,
@@ -1027,7 +1076,17 @@ fn parse(xml: &str) -> anyhow::Result<SimCard> {
     let sibling_properties = sibling_text(tail, &["properties"])
         .map(|t| crate::economy::parse_property_lines(&t))
         .unwrap_or_default();
-    let intro = extract_sibling_intro(tail);
+    // (2026-08-22 Codex decoupling) The universal-codex link list — parsed on
+    // BOTH generations (legacy-verbatim cards get the sibling written by the
+    // tail-splice path, so generation-gating here would hide their links).
+    let linked_codices = sibling_text(tail, &["linked_codices"])
+        .map(|t| parse_codex_name_lines(&t))
+        .unwrap_or_default();
+    // (2026-08-22 intro variants) ALL <intro> siblings — first mirrors into
+    // `intro` (every legacy read site keeps working), the full list seeds
+    // the opening-beat variants at session entry.
+    let intro_variants = extract_sibling_intros(tail);
+    let intro = intro_variants.first().cloned().unwrap_or_default();
 
     let introductions = first_child(root, "introductions")
         .map(|n| {
@@ -1298,6 +1357,7 @@ fn parse(xml: &str) -> anyhow::Result<SimCard> {
         location: effective_location,
         inventory,
         properties,
+        linked_codices,
         core_persona,
         traits,
         appearance,
@@ -1307,6 +1367,7 @@ fn parse(xml: &str) -> anyhow::Result<SimCard> {
         technical_rules,
         introductions,
         intro,
+        intro_variants,
         setting,
         plot,
         tone,
@@ -1495,19 +1556,308 @@ pub(crate) fn split_csv(value: &str) -> Vec<String> {
         .collect()
 }
 
+/// Parse the `<linked_codices>` sibling's name-per-line list (plain lines,
+/// not labeled — codex names are free-form display stems). Trimmed, non-empty
+/// (a defensive `.codex` suffix is stripped), case-insensitively deduped
+/// preserving order (index 0 = top priority).
+fn parse_codex_name_lines(text: &str) -> Vec<String> {
+    clean_codex_names(
+        &text
+            .lines()
+            .map(|l| l.trim())
+            .filter(|l| !l.is_empty())
+            .map(|l| l.to_owned())
+            .collect::<Vec<_>>(),
+    )
+}
+
+/// Canonicalize a caller-supplied codex-name list: trim, strip a defensive
+/// `.codex` suffix, drop empties, case-insensitively dedupe preserving order.
+pub(crate) fn clean_codex_names(names: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::with_capacity(names.len());
+    for raw in names {
+        let name = raw.trim().strip_suffix(".codex").unwrap_or(raw).trim();
+        if name.is_empty() {
+            continue;
+        }
+        if !out.iter().any(|n| n.eq_ignore_ascii_case(name)) {
+            out.push(name.to_owned());
+        }
+    }
+    out
+}
+
+const LINKED_CODEX_OPEN: &str = "<linked_codices>";
+const LINKED_CODEX_CLOSE: &str = "</linked_codices>";
+
+/// Render the sibling block exactly as `serialize_v2` emits it (CDATA, one
+/// name per line).
+fn render_linked_codices_block(names: &[String]) -> String {
+    format!("\n{LINKED_CODEX_OPEN}<![CDATA[\n{}]]></linked_codices>\n", names.join("\n"))
+}
+
+/// (2026-08-22 intro variants) Rewrite ONE `<intro>` variant of a `.sim`
+/// file — the live-sync write core behind Fable's in-game intro editing.
+/// PURE: returns the new file bytes; the caller persists (`write_atomic`).
+/// `index: Some(i < len)` REPLACES variant i (an in-game edit of the active
+/// opening); `None` (or an out-of-range index) APPENDS a new variant (an
+/// authored "save as new opening" or a reroll's fresh roll). The `intro`
+/// mirror follows variant 0. Empty/whitespace text is an error (an intro
+/// variant is never blank). Round-trips through parse → mutate →
+/// `serialize_v2` with a re-parse self-check, the `fable_card_set_intro`
+/// precedent (lazily converts a legacy card to v2 on its first variant
+/// edit). (2026-08-22 review) LEGACY-VERBATIM cards (the 2026-08-20
+/// lossless guard: authored `<cast>`/`<locations>`/`<player_name>`/
+/// `<introductions>` the v2 serializer cannot express) get a pure
+/// TAIL-SPLICE instead — `serialize_v2` would one-way delete that authored
+/// data, and this write core is now reachable from in-game intro edits +
+/// rerolls.
+pub fn with_intro_variant(xml: &str, index: Option<usize>, text: &str) -> anyhow::Result<String> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        anyhow::bail!("intro variant text is empty");
+    }
+    let mut card = parse_from_xml_str(xml)?;
+    match index {
+        Some(i) if i < card.intro_variants.len() => {
+            card.intro_variants[i] = trimmed.to_owned();
+        }
+        _ => {
+            // Append (a duplicate of an existing variant is allowed — the
+            // session seeding dedupes, and an author may genuinely want two
+            // openings that start identically).
+            card.intro_variants.push(trimmed.to_owned());
+        }
+    }
+    if let Some(first) = card.intro_variants.first() {
+        card.intro = first.clone();
+    }
+    // The 2026-08-20 unmappable-content guard (same predicate as
+    // `with_linked_codices` / the boot migration): introductions only guard
+    // when they carry MORE than the `<intro>` siblings already preserve.
+    let intro_lines: Vec<String> = card
+        .intro
+        .lines()
+        .map(|l| l.trim())
+        .filter(|l| !l.is_empty())
+        .map(|l| l.strip_prefix("- ").unwrap_or(l).trim().to_owned())
+        .collect();
+    let carries_unmappable = !card.cast.is_empty()
+        || !card.locations.is_empty()
+        || card.player_name.is_some()
+        || card.introductions != intro_lines;
+    let out = if carries_unmappable {
+        splice_intro_variants_tail(xml, &card.intro_variants)?
+    } else {
+        card.serialize_v2()
+    };
+    let reparsed = parse_from_xml_str(&out)?;
+    // (2026-08-22 review) Compare CONTENT, not just count — a serializer/
+    // parser asymmetry that permuted or mangled variant text while keeping
+    // the count would have passed the old length-only check.
+    if reparsed.intro_variants != card.intro_variants {
+        anyhow::bail!(
+            "intro variant rewrite self-check failed: wrote {} variants {:?}, re-parsed {} variants",
+            card.intro_variants.len(),
+            card.intro_variants,
+            reparsed.intro_variants.len()
+        );
+    }
+    Ok(out)
+}
+
+const INTRO_OPEN: &str = "<intro>";
+const INTRO_CLOSE: &str = "</intro>";
+const INTRO_LEGACY_OPEN: &str = "<introduction>";
+const INTRO_LEGACY_CLOSE: &str = "</introduction>";
+
+/// Render the `<intro>` sibling block exactly as `serialize_v2` emits it
+/// (one CDATA sibling per variant, in order).
+fn render_intro_variants_block(variants: &[String]) -> String {
+    let mut out = String::new();
+    for v in variants {
+        out.push_str(&format!("\n<intro><![CDATA[\n{}]]></intro>\n", cdata_body(v)));
+    }
+    out
+}
+
+/// Replace-or-remove the `<intro>`/`<introduction>` siblings in the TAIL
+/// region only (everything after `</sim_card>`) — authored bytes before,
+/// between, and after them untouched. The first removed sibling's position
+/// hosts the new block; legacy `<introduction>` forms are consolidated into
+/// plain `<intro>` siblings. Byte-level scans (machine-written CDATA
+/// blocks — `]]>` cannot occur inside a CDATA body, so a plain close-tag
+/// scan is unambiguous); the caller re-parses as the corruption backstop.
+fn splice_intro_variants_tail(xml: &str, variants: &[String]) -> anyhow::Result<String> {
+    let end = find_root_close(xml)
+        .ok_or_else(|| anyhow::anyhow!("sim_card: no </sim_card> close tag to splice after"))?;
+    let (head, tail) = xml.split_at(end);
+    let mut out_tail = String::with_capacity(tail.len());
+    let mut rest = tail;
+    let mut placed = false;
+    let mut consumed_any = false;
+    while !rest.is_empty() {
+        // Find the next intro-family sibling open tag (either spelling).
+        let next_plain = rest.find(INTRO_OPEN).map(|i| (i, INTRO_OPEN, INTRO_CLOSE));
+        let next_legacy = rest
+            .find(INTRO_LEGACY_OPEN)
+            .map(|i| (i, INTRO_LEGACY_OPEN, INTRO_LEGACY_CLOSE));
+        let Some((at, _open_tag, close_tag)) = (match (next_plain, next_legacy) {
+            (Some(a), Some(b)) => Some(if a.0 <= b.0 { a } else { b }),
+            (Some(a), None) | (None, Some(a)) => Some(a),
+            (None, None) => None,
+        })
+        else {
+            out_tail.push_str(rest);
+            break;
+        };
+        let Some(close_rel) = rest[at..].find(close_tag) else {
+            anyhow::bail!("sim_card: malformed existing intro sibling (unbalanced open/close)");
+        };
+        let span_end = at + close_rel + close_tag.len();
+        // Keep everything before the sibling (minus one trailing newline —
+        // the rendered block supplies its own leading separation, so
+        // repeated edits never accumulate blank lines).
+        let before = &rest[..at];
+        let before = before.strip_suffix('\n').unwrap_or(before);
+        out_tail.push_str(before);
+        consumed_any = true;
+        if !placed && !variants.is_empty() {
+            out_tail.push_str(&render_intro_variants_block(variants));
+            placed = true;
+        }
+        rest = &rest[span_end..];
+    }
+    if !placed && !consumed_any {
+        // No existing intro sibling at all: append the block at the tail's
+        // end (an empty variant list on a consumed tail keeps the removal —
+        // defensive; `with_intro_variant` always carries ≥1 variant).
+        let trimmed = tail.strip_suffix('\n').unwrap_or(tail);
+        out_tail = format!("{}{}", trimmed, render_intro_variants_block(variants));
+    }
+    Ok(format!("{head}{out_tail}"))
+}
+
+/// (2026-08-22 Codex decoupling) Rewrite a `.sim` file's `<linked_codices>`
+/// sibling — the universal-codex link list, priority order. PURE: returns the
+/// new file bytes; the caller persists (`write_atomic`).
+///
+/// v2/legacy-mappable cards round-trip through parse → set → `serialize_v2`
+/// (the `fable_card_set_intro` precedent). LEGACY-VERBATIM cards (the
+/// 2026-08-20 lossless guard: authored `<cast>`/`<locations>`/`<player_name>`
+/// /`<introductions>` the v2 serializer cannot express) get a pure
+/// TAIL-SPLICE instead — the existing `<linked_codices>` block in the
+/// post-`</sim_card>` region is replaced in place, or the block is appended
+/// after the last sibling; every authored byte before the splice point is
+/// untouched. The result is re-parsed + verified (`linked_codices == names`)
+/// before it is returned — a splice that would corrupt the file errors out
+/// instead of shipping.
+pub fn with_linked_codices(xml: &str, names: &[String]) -> anyhow::Result<String> {
+    let mut card = parse_from_xml_str(xml)?;
+    let cleaned = clean_codex_names(names);
+    card.linked_codices = cleaned.clone();
+
+    // The 2026-08-20 unmappable-content guard (mirrors the boot migration's
+    // predicate): introductions only guard when they carry MORE than the
+    // `<intro>` sibling already preserves.
+    let intro_lines: Vec<String> = card
+        .intro
+        .lines()
+        .map(|l| l.trim())
+        .filter(|l| !l.is_empty())
+        .map(|l| l.strip_prefix("- ").unwrap_or(l).trim().to_owned())
+        .collect();
+    let carries_unmappable = !card.cast.is_empty()
+        || !card.locations.is_empty()
+        || card.player_name.is_some()
+        || card.introductions != intro_lines;
+
+    let out = if carries_unmappable {
+        splice_linked_codices_tail(xml, &cleaned)?
+    } else {
+        card.serialize_v2()
+    };
+
+    // Self-check: the emitted file must parse and carry exactly the asked-for
+    // link list (guards the byte-splice path against structural damage).
+    let reparsed = parse_from_xml_str(&out)?;
+    if reparsed.linked_codices != cleaned {
+        anyhow::bail!(
+            "linked_codices rewrite self-check failed: wrote {:?}, re-parsed {:?}",
+            cleaned,
+            reparsed.linked_codices
+        );
+    }
+    Ok(out)
+}
+
+/// Replace-or-append the `<linked_codices>` block in the TAIL region only
+/// (everything after `</sim_card>`) — authored bytes untouched. An empty name
+/// list REMOVES the block. Byte-level: `<linked_codices>` is machine-written
+/// (CDATA names only), so the plain substring scan is unambiguous; the caller
+/// (`with_linked_codices`) re-parses the result as the corruption backstop.
+fn splice_linked_codices_tail(xml: &str, names: &[String]) -> anyhow::Result<String> {
+    let end = find_root_close(xml)
+        .ok_or_else(|| anyhow::anyhow!("sim_card: no </sim_card> close tag to splice after"))?;
+    let (head, tail) = xml.split_at(end);
+    let out_tail = match (tail.find(LINKED_CODEX_OPEN), tail.find(LINKED_CODEX_CLOSE)) {
+        (Some(open), Some(close)) if close > open => {
+            let close_end = close + LINKED_CODEX_CLOSE.len();
+            if names.is_empty() {
+                // Unlink-all: remove the block (and the newline that
+                // preceded it, keeping the tail tidy).
+                let before = &tail[..open];
+                let trimmed = before.strip_suffix('\n').unwrap_or(before);
+                format!("{}{}", trimmed, &tail[close_end..])
+            } else {
+                // (2026-08-22 review) Strip the newline before the block —
+                // `render_linked_codices_block` opens with its own `\n`, so
+                // keeping both grew one blank line per edit cycle.
+                let before = &tail[..open];
+                let trimmed = before.strip_suffix('\n').unwrap_or(before);
+                format!("{}{}{}", trimmed, render_linked_codices_block(names), &tail[close_end..])
+            }
+        }
+        (None, None) if names.is_empty() => tail.to_owned(),
+        // (2026-08-22 review) Same single-newline discipline on append.
+        (None, None) => {
+            let trimmed = tail.strip_suffix('\n').unwrap_or(tail);
+            format!("{}{}", trimmed, render_linked_codices_block(names))
+        }
+        _ => anyhow::bail!("sim_card: malformed existing <linked_codices> block (unbalanced open/close)"),
+    };
+    Ok(format!("{head}{out_tail}"))
+}
+
 // roxmltree's API is verbose; these thin wrappers keep the parser readable.
 // CDATA is already merged into `.text()` by roxmltree, so `text_content`
 // returns the full text of a node regardless of how it was wrapped.
 
-/// Read the sibling `<intro>`/`<introduction>` from the TAIL of a `.sim`
-/// file (everything after the first `</sim_card>`). The tail is wrapped in a
-/// synthetic root so whitespace + stray text between the two real roots
-/// can't break the parse. Absent / empty / unparsable tail → `String::new()`.
-fn extract_sibling_intro(tail: &str) -> String {
-    sibling_text(tail, &["intro", "introduction"])
+/// (2026-08-22 intro variants) EVERY sibling `<intro>`/`<introduction>` in
+/// the tail, in file order, trimmed + empties dropped. A card may carry
+/// several (imported SillyTavern `alternate_greetings` — the importer writes
+/// one `<intro>` per greeting); the first is the default opening, the rest
+/// are player-selectable alternates at game start. Legacy single-`<intro>`
+/// cards parse to a one-element vec — identical behavior.
+fn extract_sibling_intros(tail: &str) -> Vec<String> {
+    if tail.trim().is_empty() {
+        return Vec::new();
+    }
+    let wrapped = format!("<wupi_sim_siblings>{tail}</wupi_sim_siblings>");
+    let doc = match roxmltree::Document::parse(&wrapped) {
+        Ok(d) => d,
+        Err(e) => {
+            tracing::warn!(?e, "sim_card: unparsable post-</sim_card> tail — ignoring");
+            return Vec::new();
+        }
+    };
+    doc.root_element()
+        .children()
+        .filter(|n| n.is_element() && (n.has_tag_name("intro") || n.has_tag_name("introduction")))
+        .map(text_content)
         .map(|t| t.trim().to_owned())
         .filter(|s| !s.is_empty())
-        .unwrap_or_default()
+        .collect()
 }
 
 /// Read the trimmed text of the FIRST sibling element matching any of
@@ -1763,6 +2113,250 @@ Booted up, nya~!
         assert!(card.introductions.is_empty());
     }
 
+    // ── (2026-08-22 Codex decoupling) linked_codices sibling ──────────────
+
+    #[test]
+    fn linked_codices_sibling_round_trips_through_serialize_v2() {
+        let xml = r#"<sim_card>
+  <metadata>
+  <type>simulation</type>
+  <subtype>world</subtype>
+  <id>aldermoor</id>
+  </metadata>
+
+  <identity><![CDATA[
+Name: Aldermoor
+  ]]></identity>
+</sim_card>
+
+<world><![CDATA[
+Date: March 15
+Tone: Grim
+]]></world>
+
+<linked_codices><![CDATA[
+Aldermoor Lore
+Forgotten Realms
+]]></linked_codices>"#;
+        let card = parse(xml).expect("linked_codices sibling parses");
+        assert_eq!(card.linked_codices, vec!["Aldermoor Lore", "Forgotten Realms"]);
+        let out = card.serialize_v2();
+        assert!(out.contains("<linked_codices>"), "serialize_v2 re-emits the sibling");
+        let back = parse(&out).expect("re-serialized card parses");
+        assert_eq!(back.linked_codices, card.linked_codices);
+        // Empty list → sibling omitted entirely.
+        let mut bare = card.clone();
+        bare.linked_codices.clear();
+        assert!(!bare.serialize_v2().contains("<linked_codices>"));
+    }
+
+    #[test]
+    fn parse_codex_name_lines_strips_suffix_and_dedupes() {
+        let parsed = parse_codex_name_lines(&" Aldermoor Lore \nForgotten Realms.codex\n\naldermoor lore\n");
+        assert_eq!(parsed, vec!["Aldermoor Lore", "Forgotten Realms"]);
+    }
+
+    #[test]
+    fn with_linked_codices_splices_legacy_verbatim_card_in_place() {
+        // A legacy-verbatim card (authored <cast> the v2 serializer cannot
+        // express) — the tail-splice path must preserve every authored byte
+        // before the splice point.
+        let xml = r#"<sim_card>
+  <identity><name>Liam</name></identity>
+  <cast><npc id="liam"><name>Liam</name></npc></cast>
+</sim_card>
+
+<intro><![CDATA[
+The forge glows.
+]]></intro>";
+        let out = with_linked_codices(xml, &["Liam Lore".to_owned(), "Generic Fantasy".to_owned()])
+            .expect("splice succeeds");
+        let head_end = xml.find("</sim_card>").unwrap() + "</sim_card>".len();
+        assert!(
+            out.starts_with(&xml[..head_end]),
+            "authored head bytes untouched by the tail-splice"
+        );
+        assert!(out.contains("<intro>"), "the intro sibling survives");
+        assert!(out.contains("<cast>"), "the authored cast survives");
+        let card = parse(&out).expect("spliced card parses");
+        assert_eq!(card.linked_codices, vec!["Liam Lore", "Generic Fantasy"]);
+
+        // Second call REPLACES the block (no duplicates) and re-reads.
+        let out2 = with_linked_codices(&out, &["Only Lore".to_owned()]).expect("replace succeeds");
+        assert_eq!(out2.matches("<linked_codices>").count(), 1);
+        let card2 = parse(&out2).expect("replaced card parses");
+        assert_eq!(card2.linked_codices, vec!["Only Lore"]);
+
+        // Unlink-all removes the block entirely.
+        let out3 = with_linked_codices(&out2, &[]).expect("unlink-all succeeds");
+        assert!(!out3.contains("<linked_codices>"));
+        assert!(parse(&out3).expect("unlinked card parses").linked_codices.is_empty());
+        assert!(out3.contains("<intro>"), "siblings survive the removal");
+    }
+
+    #[test]
+    fn with_linked_codices_rewrites_v2_card_through_serialize() {
+        let xml = r#"<sim_card>
+  <metadata>
+  <type>simulation</type>
+  <subtype>world</subtype>
+  <id>one-piece</id>
+  </metadata>
+
+  <identity><![CDATA[
+Name: One Piece
+  ]]></identity>
+</sim_card>"#;
+        let out = with_linked_codices(xml, &["One Piece Lore".to_owned()]).expect("v2 rewrite");
+        let card = parse(&out).expect("rewritten card parses");
+        assert!(card.format_v2);
+        assert_eq!(card.linked_codices, vec!["One Piece Lore"]);
+    }
+
+    // (2026-08-22 intro variants) Multiple <intro> siblings parse in file
+    // order (first mirrors into `intro`), serialize back one-per-variant, and
+    // a legacy single-<intro> card is a one-element list — identical shape.
+    #[test]
+    fn intro_variants_parse_all_siblings_in_order() {
+        let xml = r#"<sim_card>
+  <metadata>
+  <type>simulation</type>
+  <subtype>scenario</subtype>
+  <id>variants</id>
+  </metadata>
+
+  <identity><![CDATA[
+Name: Variants
+  ]]></identity>
+</sim_card>
+
+<intro><![CDATA[
+First opening.
+]]></intro>
+<intro><![CDATA[
+Second opening.
+]]></intro>
+<intro><![CDATA[
+Third opening.
+]]></intro>"#;
+        let card = parse(xml).expect("multi-intro card parses");
+        assert_eq!(card.intro, "First opening.");
+        assert_eq!(
+            card.intro_variants,
+            vec!["First opening.", "Second opening.", "Third opening."]
+        );
+        // Round-trip: serialize_v2 re-emits one <intro> per variant + the
+        // re-parse sees the same list.
+        let out = card.serialize_v2();
+        let back = parse(&out).expect("re-serialized card parses");
+        assert_eq!(back.intro_variants, card.intro_variants);
+        assert_eq!(back.intro, card.intro);
+    }
+
+    #[test]
+    fn single_intro_card_parses_to_one_variant_list() {
+        let xml = r#"<sim_card>
+  <metadata>
+  <type>simulation</type>
+  <subtype>scenario</subtype>
+  <id>single</id>
+  </metadata>
+
+  <identity><![CDATA[
+Name: Single
+  ]]></identity>
+</sim_card>
+
+<intro><![CDATA[
+The only opening.
+]]></intro>"#;
+        let card = parse(xml).expect("single-intro card parses");
+        assert_eq!(card.intro, "The only opening.");
+        assert_eq!(card.intro_variants, vec!["The only opening."]);
+        // No intro at all → both stay empty (the fallback card shape).
+        let none = parse(
+            r#"<sim_card>
+  <metadata>
+  <type>simulation</type>
+  <subtype>scenario</subtype>
+  <id>none</id>
+  </metadata>
+
+  <identity><![CDATA[
+Name: None
+  ]]></identity>
+</sim_card>"#,
+        )
+        .expect("intro-less card parses");
+        assert!(none.intro.is_empty());
+        assert!(none.intro_variants.is_empty());
+    }
+
+    // (2026-08-22 intro variants) The live-sync write core: replace at an
+    // index, append on None/out-of-range, the mirror follows variant 0,
+    // empty text errors, and an intro-less card gains its first variant.
+    #[test]
+    fn with_intro_variant_replaces_appends_and_mirrors() {
+        let xml = r#"<sim_card>
+  <metadata>
+  <type>simulation</type>
+  <subtype>scenario</subtype>
+  <id>live</id>
+  </metadata>
+
+  <identity><![CDATA[
+Name: Live
+  ]]></identity>
+</sim_card>
+
+<intro><![CDATA[
+First.
+]]></intro>
+<intro><![CDATA[
+Second.
+]]></intro>"#;
+        // Replace variant 1 (an in-game edit of the active alternate).
+        let out = with_intro_variant(xml, Some(1), "Edited second.").expect("replace");
+        let card = parse(&out).expect("re-parse");
+        assert_eq!(card.intro_variants, vec!["First.", "Edited second."]);
+        assert_eq!(card.intro, "First.", "mirror still follows variant 0");
+        // Append (a new authored opening).
+        let out2 = with_intro_variant(&out, None, "Third.").expect("append");
+        let card2 = parse(&out2).expect("re-parse 2");
+        assert_eq!(card2.intro_variants.len(), 3);
+        assert_eq!(card2.intro_variants[2], "Third.");
+        // Out-of-range index appends rather than erroring.
+        let out3 = with_intro_variant(&out2, Some(9), "Fourth.").expect("oob appends");
+        let card3 = parse(&out3).expect("re-parse 3");
+        assert_eq!(card3.intro_variants.len(), 4);
+        // Editing variant 0 moves the mirror.
+        let out4 = with_intro_variant(&out3, Some(0), "New first.").expect("replace 0");
+        let card4 = parse(&out4).expect("re-parse 4");
+        assert_eq!(card4.intro, "New first.");
+        assert_eq!(card4.intro_variants[0], "New first.");
+        // Blank text is refused.
+        assert!(with_intro_variant(xml, None, "   ").is_err());
+    }
+
+    #[test]
+    fn with_intro_variant_on_introless_card_creates_first() {
+        let xml = r#"<sim_card>
+  <metadata>
+  <type>simulation</type>
+  <subtype>scenario</subtype>
+  <id>fresh</id>
+  </metadata>
+
+  <identity><![CDATA[
+Name: Fresh
+  ]]></identity>
+</sim_card>"#;
+        let out = with_intro_variant(xml, None, "The first opening.").expect("append creates");
+        let card = parse(&out).expect("re-parse");
+        assert_eq!(card.intro_variants, vec!["The first opening."]);
+        assert_eq!(card.intro, "The first opening.");
+    }
+
     #[test]
     fn render_for_prompt_emits_tagged_sections() {
         let card = parse(SAMPLE).expect("parses");
@@ -1970,6 +2564,7 @@ A remote frontier tavern.
             location: None,
             inventory: CardInventory::default(),
             properties: Vec::new(),
+            linked_codices: Vec::new(),
             core_persona: "cp".into(),
             traits: "t".into(),
             appearance: "a".into(),
@@ -1979,6 +2574,7 @@ A remote frontier tavern.
             technical_rules: "tr".into(),
             introductions: vec!["hi".into()],
             intro: String::new(),
+            intro_variants: Vec::new(),
             setting: Some("A test place.".into()),
             plot: None,
             tone: Some("grim".into()),

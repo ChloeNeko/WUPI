@@ -53,7 +53,8 @@ const TOOLTIP_DATA_ATTR = 'data-injury-tooltip';
 //           (Chloe 2026-08-10: "fix the lighter colors like yellow and orange
 //           a tad bit" — Yellow/Orange dropped further after the bloom revert.)
 //
-// `Transparent` (Healthy) is intentionally absent: a healthy part renders
+// The healthy tier (Rust `Healthy`, renamed from `Transparent`
+// 2026-08-22) is intentionally absent: a healthy part renders
 // NOTHING — no polygon, no gradient, no pointer events. "Healthy =
 // completely invisible" is satisfied trivially by omission, which is also
 // cheaper than 22 hidden polygons.
@@ -167,9 +168,11 @@ export function paintInjuryHeatmap(sectionEl, gender, bodyMap, detailsMap) {
     if (!id) continue;                  // unknown wire key → drop, never throw
     const tier = SEVERITY[tierName];
     if (!tier) continue;                // unknown tier → drop (defensive)
-    // Transparent is the only tier absent from SEVERITY, so a healthy part
-    // never reaches here. Belt-and-braces: an explicit "Transparent" tier
-    // name would also be skipped (SEVERITY.Transparent is undefined).
+    // The healthy tier is the only one absent from SEVERITY, so a healthy
+    // part never reaches here. Belt-and-braces: an explicit healthy tier
+    // name is also skipped — SEVERITY has no entry for "Healthy" (the
+    // 2026-08-22 Rust rename; pre-rename saves say "Transparent", equally
+    // absent). Healthy = invisible, under either spelling.
     // The descriptor list is read raw + defensively filtered to non-empty
     // strings so a malformed entry can't render a blank bullet.
     const rawDetails = (detailsLookup && Array.isArray(detailsLookup[wireKey]))

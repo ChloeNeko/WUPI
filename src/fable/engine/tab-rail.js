@@ -151,6 +151,12 @@ async function renderTab(key, el) {
     // just-saved raw edit immediately (no stale display).
     openRawEditor(meta.file.kind, renderActive);
   });
+  // (2026-08-22) The Codex tab is the LINK MANAGER now — its head ✎ has no
+  // single obvious target (any number of linked files); the per-row ✎
+  // buttons open the editor for a specific file. Hide the generic one.
+  if (key === 'codex') {
+    el.querySelector('[data-raw-edit]').hidden = true;
+  }
   const body = el.querySelector('[data-drop-body]');
   // Renderer hooks into the head: `setTitle` (a fallback label when the tab
   // has NO character name — the World/Codex/NPC tabs keep theirs) and
@@ -514,37 +520,113 @@ function cardTabTitle(subtype) {
   return 'Card';
 }
 
-// ── Codex tab (READ-ONLY) ───────────────────────────────────────────────
-// fable_codex_get → { raw, entries: [{title, tags, body}] }. The authored hard
-// rules of the world, shown read-only. Add/edit/delete happens via the ✎ raw
-// editor (writes the .codex) or by talking to WUPI; there is no inline form.
+// ── Codex tab — the LINK MANAGER (2026-08-22 codex decoupling) ───────────
+// Codex files are UNIVERSAL library members (`apps/fable/data/codex/`); a
+// card links any number of them in PRIORITY order (index 0 = top priority;
+// same-title collisions resolve toward the earlier link at the seed phase).
+//
+// The dropdown lists:
+//   LINKED — this card's links, in priority order, each row carrying
+//            ↑/↓ (reorder), ✎ (raw-edit THAT file), ✕ (unlink), and the
+//            parsed entry count. The ↑ on row 0 is a no-op; so is ↓ on the
+//            last row.
+//   LIBRARY — the unlinked files; clicking one links it at LOWEST priority.
+// Every mutation persists via fable_codex_link_set (which re-seeds the
+// card's memory partition live server-side) and re-renders.
 async function renderCodex(body) {
-  let read;
+  let card;
   try {
-    read = await invoke('fable_codex_get');
+    card = await invoke('fable_card_get');
   } catch (err) {
     body.innerHTML = emptyBox('No active game.');
     return;
   }
-  const entries = (read && read.entries) || [];
-  if (!entries.length) {
-    body.innerHTML = '<div class="fable-drop-empty">No codex entries for this world.</div>';
+  if (!card) {
+    body.innerHTML = emptyBox('No active game.');
     return;
   }
-  body.innerHTML = `<div class="fable-codex-list">${entries.map(codexReadCard).join('')}</div>`;
-}
-function codexReadCard(e) {
-  const title = (e.title || '').trim();
-  const tags = (e.tags || []).map((t) => String(t).trim()).filter(Boolean);
-  const tagLine = tags.length ? `<div class="fable-drop-tags">${esc(tags.join(', '))}</div>` : '';
-  const bodyText = (e.body || '').trim();
-  // Skip a fully-blank entry rather than render an empty card.
-  if (!title && !tags.length && !bodyText) return '';
-  return `<div class="fable-codex-item">
-    ${title ? `<div class="fable-drop-title">${esc(title)}</div>` : ''}
-    ${tagLine}
-    ${bodyText ? `<div class="fable-drop-prose">${esc(bodyText)}</div>` : ''}
-  </div>`;
+  let library = [];
+  let links = [];
+  // NOTE: fable_card_get's hand-built DTO keys the slug as `card_id` — there
+  // is no `id` field. Passing `card.id` here serialized as undefined → the
+  // key vanished from the IPC payload → "missing required cardid" → this
+  // catch replaced the whole tab (every ✎/link button gone with it).
+  try {
+    [library, links] = await Promise.all([
+      invoke('fable_codex_library_list'),
+      invoke('fable_codex_link_get', { cardId: card.card_id }),
+    ]);
+  } catch (err) {
+    body.innerHTML = `<div class="fable-tab-drop__error">Couldn't load the codex library: ${esc(err)}</div>`;
+    return;
+  }
+  const libCount = (name) => {
+    const item = library.find((l) => String(l.name) === name);
+    return item ? item.entry_count : 0;
+  };
+  const render = () => {
+    const linkedNames = links.map(String);
+    const unlinked = library.filter((l) => !linkedNames.includes(String(l.name)));
+    const linkedRows = linkedNames.map((name, i) => `
+      <div class="fable-codex-link-manage-row" data-name="${esc(name)}">
+        <span class="fable-codex-link-manage-priority">${i + 1}</span>
+        <span class="fable-codex-link-manage-name">${esc(name)}</span>
+        <span class="fable-codex-link-manage-count">${libCount(name)} entries</span>
+        <span class="fable-codex-link-manage-btns">
+          <button type="button" data-act="up" aria-label="Raise priority" ${i === 0 ? 'disabled' : ''}>↑</button>
+          <button type="button" data-act="down" aria-label="Lower priority" ${i === linkedNames.length - 1 ? 'disabled' : ''}>↓</button>
+          <button type="button" data-act="edit" aria-label="Edit raw file">✎</button>
+          <button type="button" data-act="unlink" aria-label="Unlink">✕</button>
+        </span>
+      </div>`).join('');
+    const libraryRows = unlinked.map((l) => `
+      <div class="fable-codex-link-manage-row is-unlinked" data-name="${esc(String(l.name))}">
+        <span class="fable-codex-link-manage-name">${esc(String(l.name))}</span>
+        <span class="fable-codex-link-manage-count">${l.entry_count} entries</span>
+        <span class="fable-codex-link-manage-btns">
+          <button type="button" data-act="link" aria-label="Link this codex">+ Link</button>
+        </span>
+      </div>`).join('');
+    body.innerHTML = `
+      <div class="fable-codex-link-manage">
+        <div class="fable-codex-link-manage-section">Linked — top priority first</div>
+        ${linkedRows || '<div class="fable-drop-empty">No codex linked — pick one below.</div>'}
+        ${unlinked.length ? `<div class="fable-codex-link-manage-section">Library</div>${libraryRows}` : ''}
+      </div>`;
+    // Wire the row actions.
+    for (const rowEl of body.querySelectorAll('.fable-codex-link-manage-row')) {
+      const name = rowEl.dataset.name;
+      rowEl.querySelectorAll('button[data-act]').forEach((btn) => {
+        btn.addEventListener('click', async () => {
+          const act = btn.dataset.act;
+          if (act === 'edit') {
+            openRawEditor('codex', renderActive, { codexName: name });
+            return;
+          }
+          const next = [...links.map(String)];
+          if (act === 'up' || act === 'down') {
+            const i = next.indexOf(name);
+            const j = act === 'up' ? i - 1 : i + 1;
+            if (i < 0 || j < 0 || j >= next.length) return;
+            [next[i], next[j]] = [next[j], next[i]];
+          } else if (act === 'unlink') {
+            const i = next.indexOf(name);
+            if (i >= 0) next.splice(i, 1);
+          } else if (act === 'link') {
+            if (!next.includes(name)) next.push(name);
+          }
+          try {
+            await invoke('fable_codex_link_set', { cardId: card.card_id, codices: next });
+            links = next;
+            render();
+          } catch (err) {
+            console.warn('[fable] codex link update failed', err);
+          }
+        });
+      });
+    }
+  };
+  render();
 }
 
 // ── World tab (READ-ONLY) ───────────────────────────────────────────────
@@ -574,8 +656,9 @@ async function renderWorld(body) {
   const rumors = (Array.isArray(schema.rumors) ? schema.rumors : [])
     .map((r) => (r && r.label ? r.label : null))
     .filter(Boolean);
-  const events = (Array.isArray(schema.recent_events) ? schema.recent_events : [])
-    .filter((e) => nonEmpty(e));
+  // (2026-08-22, Chloe) recent_events RETIRED from the UI — equip/injury
+  // bookkeeping read as noise; the models get live state through
+  // <world_state>, the player gets the turn-notice bubbles instead.
   const worldEnts = Object.entries(schema.entities || {})
     .filter(([k]) => !k.startsWith('npc.'))
     .filter(([, v]) => nonEmpty(v));
@@ -599,7 +682,6 @@ async function renderWorld(body) {
   if (ledger) parts.push(ledger);
   if (nonEmpty(schema.summary)) parts.push(proseBlock('Summary', schema.summary));
   if (rumors.length) parts.push(listBlock('Rumors', rumors));
-  if (events.length) parts.push(listBlock('Recent events', events.slice(-5)));
   if (worldEnts.length) parts.push(listBlock('Tracked details', worldEnts.map(([k, v]) => `${prettify(k)}: ${v}`)));
   body.innerHTML = parts.length ? parts.join('') : '<div class="fable-drop-empty">World state not yet established.</div>';
 }
@@ -725,8 +807,11 @@ function pascalToWords(k) {
   return String(k || '').replace(/([a-z0-9])([A-Z])/g, '$1 $2');
 }
 // BodyPartState wire (PascalCase or lowercase) → { label, cls }. The Healthy
-// (Transparent) state is the sentinel renderInjuries skips.
+// state is the sentinel renderInjuries skips. (2026-08-22 rename) the Rust
+// variant was `Transparent` → `Healthy` — new saves serialize "Healthy"
+// (lowercased here), `transparent` stays mapped for pre-rename saves.
 const INJURY_STATES = {
+  healthy:     { label: 'Healthy', cls: '' },
   transparent: { label: 'Healthy', cls: '' },
   yellow:      { label: 'Minor Injury', cls: 'warn' },
   orange:      { label: 'Medium Injury', cls: 'warn' },

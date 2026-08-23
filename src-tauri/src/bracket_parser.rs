@@ -244,26 +244,45 @@ pub enum BracketCommand {
     /// (FIFO eviction at the applier). `qty` defaults to 1. The remove form is
     /// `[BELT -name]` → `remove: true`, `qty: 0` (drop the whole stack). Named
     /// `item_name`/`item_stats`/`qty`/`remove`/`item_tags` to avoid `kind`.
+    /// (2026-08-22 playtest) `asserted: true` marks the BARE body form (no
+    /// leading `+`/`-`) — the tracker's full-list RESTATEMENT. The applier
+    /// treats a restatement of an EXISTING stack as "the count is now N"
+    /// (replace, never stack) so re-asserted inventories stay idempotent
+    /// instead of multiplying (the playtest: "Field Points ×12" restated with
+    /// qty=13 became ×25, then ×38 — "it doubled my Dagger and quadrupled
+    /// some other items").
     Belt {
         item_name: String,
         qty: u32,
+        /// True when the emission carried an EXPLICIT qty token. A bare
+        /// restatement with no qty defaults `qty` to 1 — treating that as
+        /// "the stack is now 1" collapsed `[PACK Rope]` on a `Rope ×50`
+        /// stack (2026-08-22 review). A qty-less assertion is existence-
+        /// only: the applier keeps the stored count.
+        qty_given: bool,
         item_stats: Option<String>,
         remove: bool,
         item_tags: Vec<equipment::ItemTag>,
+        asserted: bool,
     },
 
     /// Add to (or remove from) the deep-storage pack (UNBOUNDED — the
     /// encumbrance/weight system was permanently removed 2026-08-09). `qty`
     /// defaults to 1, `weight` to 1.0 lbs (retained for save-compat only). The
     /// remove form
-    /// is `[PACK -name]`. Same field-naming discipline as `Belt`.
+    /// is `[PACK -name]`. Same field-naming discipline as `Belt`, including
+    /// the `asserted` bare-restatement marker (see `Belt`).
     Pack {
         item_name: String,
         qty: u32,
+        /// See `Belt::qty_given` — a bare qty-less restatement preserves the
+        /// stored count instead of collapsing the stack to the default 1.
+        qty_given: bool,
         weight: f32,
         item_stats: Option<String>,
         remove: bool,
         item_tags: Vec<equipment::ItemTag>,
+        asserted: bool,
     },
 
     /// (2026-08-18 Dedicated-NPC interior state) Add to (or remove from) a
@@ -377,6 +396,11 @@ pub enum BracketCommand {
         /// `update`/`adjust` to prosperity and carries the SIGNED delta
         /// here. `0` = the taught absolute form (set via `amount`).
         prosperity_delta: i32,
+        /// (2026-08-22 wealth verb) `wealth` op: the SIGNED pocket-coin
+        /// delta (`[LEDGER wealth +12]` / `[LEDGER wealth -5]`). Magnitude
+        /// pre-clamped to `economy::LEDGER_AMOUNT_MAX` like every amount;
+        /// the applier owns the insufficient-funds reject.
+        wealth_delta: i32,
     },
 }
 
@@ -397,6 +421,13 @@ pub enum LedgerOp {
     /// `[LEDGER currency <label>]` / `[LEDGER currency_label=<label>]`.
     /// Pure display metadata: every amount everywhere stays the base unit.
     Currency,
+    /// (2026-08-22 wealth verb) Pocket coin gained or spent —
+    /// `[LEDGER wealth +<n>]` / `[LEDGER wealth -<n>]` (aliases: coin,
+    /// coins, money; a bare magnitude reads as a gain). The tavern-scale
+    /// money verb: payments, tips, loot, rewards — the flows that never
+    /// touch a property till. Signed delta rides the payload's
+    /// `wealth_delta`.
+    Wealth,
 }
 
 /// (2026-08-19 Hidden site maps) The `[ASSET]` mutation payload — either a
@@ -1023,6 +1054,21 @@ fn clean_stance(raw: &str) -> String {
     deduped.chars().take(PRESENCE_STANCE_MAX).collect()
 }
 
+/// (2026-08-21 name-truncation fix) The body's leading non-kv span: every
+/// whitespace token before the first `=`-bearing one — the same boundary
+/// `tokenize_kv` uses to drop bare words from the kv scan. For the taught
+/// bare-name + tail forms (`Pink Oversized Hoodie (qty=1)`, `Worn Ring
+/// qty=2`) this is the FULL multi-word name; a body with no kv token
+/// returns itself (the P1a multi-word bare rule); a body that starts in the
+/// kv zone returns "" (the caller's clean_item_name gate then drops the
+/// bracket, unchanged behavior).
+fn bare_name_before_kv(body: &str) -> String {
+    body.split_whitespace()
+        .take_while(|tok| !tok.contains('='))
+        .collect::<Vec<&str>>()
+        .join(" ")
+}
+
 /// (2026-08-16 audit LOW) Extract the item NAME from a `[BELT -…]` /
 /// `[PACK -…]` remove body. The model sometimes echoes a kv tail after the
 /// remove marker (`[BELT -health_potion qty=2]`) — the old whole-body read
@@ -1271,11 +1317,15 @@ fn parse_belt(rest: &str) -> Option<BracketCommand> {
     if rest.is_empty() {
         return None;
     }
-    // Remove form: a leading `-` then the name.
-    let (remove, body) = if let Some(stripped) = rest.strip_prefix('-') {
-        (true, stripped.trim())
+    // Remove form: a leading `-` then the name. A leading `+` is the
+    // EXPLICIT add (never a restatement); no sign at all is the bare
+    // restatement form (`asserted` — see the variant docs).
+    let (remove, body, asserted) = if let Some(stripped) = rest.strip_prefix('-') {
+        (true, stripped.trim(), false)
+    } else if let Some(stripped) = rest.strip_prefix('+') {
+        (false, stripped.trim(), false)
     } else {
-        (false, rest)
+        (false, rest, true)
     };
     // For the remove form there's no kv tail — the body is the bare name.
     if remove {
@@ -1287,9 +1337,11 @@ fn parse_belt(rest: &str) -> Option<BracketCommand> {
         return Some(BracketCommand::Belt {
             item_name: n,
             qty: 0,
+            qty_given: false,
             item_stats: None,
             remove: true,
             item_tags: Vec::new(),
+            asserted: false,
         });
     }
     // Add form: kv tail. `name=` is required; tolerate a bare leading name
@@ -1297,6 +1349,9 @@ fn parse_belt(rest: &str) -> Option<BracketCommand> {
     let kvs = tokenize_kv(body);
     let mut name = String::new();
     let mut qty: u32 = 1;
+    // (2026-08-22 review) Track qty PRESENCE — the default 1 on a bare
+    // restatement is "no count given", not "the stack is now 1".
+    let mut qty_given = false;
     let mut qty_zero_remove = false;
     let mut stats = String::new();
     let mut tags_str = String::new();
@@ -1313,6 +1368,7 @@ fn parse_belt(rest: &str) -> Option<BracketCommand> {
                     .parse::<u64>()
                     .map(|n| n.min(u32::MAX as u64) as u32)
                     .unwrap_or(1);
+                qty_given = true;
                 if qty == 0 {
                     qty_zero_remove = true;
                     qty = 1;
@@ -1323,22 +1379,16 @@ fn parse_belt(rest: &str) -> Option<BracketCommand> {
             _ => {}
         }
     }
-    // Bare-name fallback: if no `name=` key but the body has a leading bare
-    // token, treat it as the name (`[BELT health_potion qty=2]`).
-    // (P1a) When the body carries NO kv pairs at all, the WHOLE body is the
-    // name — the documented multi-word bare form (same rule as the remove
-    // form). The old first-token-only read turned the E4B's
-    // `[PACK "Worn Traveling Cloak"]` into the truncated phantom `"Worn`.
+    // Bare-name fallback: if no `name=` key, the body's leading non-kv span
+    // is the name — `[BELT health_potion qty=2]` → `health_potion`, and
+    // (P1a) a body with NO kv pairs at all is the whole multi-word name (the
+    // old first-token-only read turned the E4B's
+    // `[PACK "Worn Traveling Cloak"]` into the truncated phantom `"Worn`).
+    // (2026-08-21 name-truncation fix) The kv-tail branch used to keep only
+    // the FIRST token, so a bare multi-word name + `(qty=N)` tail collapsed
+    // to one word before the applier's fragment resolution ever ran.
     if name.is_empty() {
-        if !body.contains('=') {
-            name = body.to_string();
-        } else {
-            let first_token = body.split_whitespace().next().unwrap_or("");
-            // Only adopt if it doesn't look like a kv key (no `=`).
-            if !first_token.is_empty() && !first_token.contains('=') {
-                name = first_token.to_string();
-            }
-        }
+        name = bare_name_before_kv(body);
     }
     // (P1a) Quote-cleaned name (E4B mangled-quoting gate) — phantom
     // `"Worn`-style fragments dropped, real names edge-stripped.
@@ -1358,9 +1408,11 @@ fn parse_belt(rest: &str) -> Option<BracketCommand> {
     Some(BracketCommand::Belt {
         item_name: n,
         qty,
+        qty_given,
         item_stats,
         remove: qty_zero_remove,
         item_tags: equipment::parse_tag_list(&tags_str),
+        asserted,
     })
 }
 
@@ -1372,10 +1424,14 @@ fn parse_pack(rest: &str) -> Option<BracketCommand> {
     if rest.is_empty() {
         return None;
     }
-    let (remove, body) = if let Some(stripped) = rest.strip_prefix('-') {
-        (true, stripped.trim())
+    // Sign handling mirrors parse_belt: `-` remove, `+` explicit add, bare
+    // restatement (`asserted`).
+    let (remove, body, asserted) = if let Some(stripped) = rest.strip_prefix('-') {
+        (true, stripped.trim(), false)
+    } else if let Some(stripped) = rest.strip_prefix('+') {
+        (false, stripped.trim(), false)
     } else {
-        (false, rest)
+        (false, rest, true)
     };
     if remove {
         // (P1a) Same quote-fragment gate as the add form.
@@ -1385,15 +1441,20 @@ fn parse_pack(rest: &str) -> Option<BracketCommand> {
         return Some(BracketCommand::Pack {
             item_name: n,
             qty: 0,
+            qty_given: false,
             weight: 0.0,
             item_stats: None,
             remove: true,
             item_tags: Vec::new(),
+            asserted: false,
         });
     }
     let kvs = tokenize_kv(body);
     let mut name = String::new();
     let mut qty: u32 = 1;
+    // (2026-08-22 review) Qty PRESENCE, mirroring parse_belt — a bare
+    // restatement's default 1 must not collapse an existing stack.
+    let mut qty_given = false;
     let mut qty_zero_remove = false;
     let mut weight: f32 = 1.0;
     let mut stats = String::new();
@@ -1410,6 +1471,7 @@ fn parse_pack(rest: &str) -> Option<BracketCommand> {
                     .parse::<u64>()
                     .map(|n| n.min(u32::MAX as u64) as u32)
                     .unwrap_or(1);
+                qty_given = true;
                 if qty == 0 {
                     qty_zero_remove = true;
                     qty = 1;
@@ -1434,16 +1496,10 @@ fn parse_pack(rest: &str) -> Option<BracketCommand> {
     }
     // (P1a) Bare-name fallback mirrors parse_belt: no kv pairs at all → the
     // whole body is the name (multi-word bare form); kv tail without `name=`
-    // → first bare token.
+    // → the leading non-kv span (2026-08-21 name-truncation fix — was the
+    // first bare token alone).
     if name.is_empty() {
-        if !body.contains('=') {
-            name = body.to_string();
-        } else {
-            let first_token = body.split_whitespace().next().unwrap_or("");
-            if !first_token.is_empty() && !first_token.contains('=') {
-                name = first_token.to_string();
-            }
-        }
+        name = bare_name_before_kv(body);
     }
     // (P1a) Quote-cleaned name (E4B mangled-quoting gate).
     let n = match clean_item_name(&name) {
@@ -1462,10 +1518,12 @@ fn parse_pack(rest: &str) -> Option<BracketCommand> {
     Some(BracketCommand::Pack {
         item_name: n,
         qty,
+        qty_given,
         weight,
         item_stats,
         remove: qty_zero_remove,
         item_tags: equipment::parse_tag_list(&tags_str),
+        asserted,
     })
 }
 
@@ -1534,14 +1592,12 @@ fn parse_npc_item(rest: &str) -> Option<BracketCommand> {
         }
     }
     if name.is_empty() {
-        if !body.contains('=') {
-            name = body.to_string();
-        } else {
-            let first_token = body.split_whitespace().next().unwrap_or("");
-            if !first_token.is_empty() && !first_token.contains('=') {
-                name = first_token.to_string();
-            }
-        }
+        // (2026-08-21 name-truncation fix) The leading non-kv span, not the
+        // first bare token: the taught `+<item> (qty=N)` form truncated
+        // `+Pink Oversized Hoodie (qty=1)` to "Pink", and the applier's
+        // one-word fragment resolution then minted prose-span phantom items
+        // ("pink eyes glint") off the narrative window.
+        name = bare_name_before_kv(body);
     }
     let n = clean_item_name(&name)?;
     Some(BracketCommand::NpcItem {
@@ -2369,9 +2425,12 @@ fn json_to_belt(obj: &serde_json::Map<String, serde_json::Value>) -> Option<Brac
     Some(BracketCommand::Belt {
         item_name: name,
         qty,
+        qty_given: qty_raw.is_some(),
         item_stats,
         remove,
         item_tags,
+        // JSON dual: an explicit structured add — never a restatement.
+        asserted: false,
     })
 }
 
@@ -2435,10 +2494,13 @@ fn json_to_pack(obj: &serde_json::Map<String, serde_json::Value>) -> Option<Brac
     Some(BracketCommand::Pack {
         item_name: name,
         qty,
+        qty_given: qty_raw.is_some(),
         weight,
         item_stats,
         remove,
         item_tags,
+        // JSON dual: an explicit structured add — never a restatement.
+        asserted: false,
     })
 }
 
@@ -3725,6 +3787,7 @@ fn split_kv_positional(s: &str) -> (std::collections::HashMap<&str, &str>, Vec<&
 /// [LEDGER job <title> node=<n> wage=<w>]   [LEDGER job -<title>]
 /// [LEDGER prosperity <node_id> <pct>]
 /// [LEDGER currency <label>]   (kv alias: currency_label=<label>)
+/// [LEDGER wealth +<n>|-<n>]   (aliases: coin, coins, money)
 /// ```
 fn parse_ledger(rest: &str) -> Option<BracketCommand> {
     let rest = rest.trim();
@@ -3805,6 +3868,7 @@ fn parse_ledger(rest: &str) -> Option<BracketCommand> {
         owner: String::new(),
         currency: String::new(),
         prosperity_delta: 0,
+        wealth_delta: 0,
     };
     // (2026-08-21 economy addendum) [LEDGER currency <label>] — the kv-only
     // form (`currency_label="dollars"`) carries NO positional op word, so it
@@ -3957,6 +4021,38 @@ fn parse_ledger(rest: &str) -> Option<BracketCommand> {
                 *slot_delta = delta;
             }
             LedgerOp::Prosperity
+        }
+        // (2026-08-22 wealth verb) Pocket coin ±. Aliases cover the model's
+        // natural word choices (coin/coins/money); the SIGN always comes
+        // from the token itself (`-5` spends, `+5` gains, a bare `5` reads
+        // as a gain — the clamp_amount tolerance for the taught ± form).
+        "wealth" | "coin" | "coins" | "money" => {
+            let raw = pos.get(1).copied().unwrap_or("").trim();
+            let (sign, digits) = match raw.strip_prefix('-') {
+                Some(r) => (-1i64, r),
+                None => (1i64, raw.strip_prefix('+').unwrap_or(raw)),
+            };
+            if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+                return None;
+            }
+            // All-digit parse failure = u64 overflow = "a huge amount" —
+            // clamp, don't drop (the clamp_amount discipline).
+            let mag = digits
+                .parse::<u64>()
+                .unwrap_or(u64::MAX)
+                .min(crate::economy::LEDGER_AMOUNT_MAX as u64) as i64;
+            let delta = (sign * mag) as i32;
+            if delta == 0 {
+                return None;
+            }
+            if let BracketCommand::Ledger {
+                wealth_delta: slot,
+                ..
+            } = &mut cmd
+            {
+                *slot = delta;
+            }
+            LedgerOp::Wealth
         }
         _ => return None,
     };
@@ -4665,6 +4761,44 @@ mod tests {
         assert!(parse("[LEDGER currency]").commands.is_empty());
         assert!(parse("[LEDGER currency_label=]").commands.is_empty());
         assert!(parse("[LEDGER]").commands.is_empty());
+    }
+
+    /// (2026-08-22 wealth verb) Pocket coin ± — signed forms, the bare
+    /// magnitude (a gain), the coin/coins/money aliases, and the
+    /// drop/clamp discipline shared with every amount.
+    #[test]
+    fn ledger_grammar_wealth() {
+        for (form, want) in [
+            ("[LEDGER wealth +12]", 12),
+            ("[LEDGER wealth -5]", -5),
+            ("[LEDGER wealth 8]", 8),
+            ("[LEDGER coins +3]", 3),
+            ("[LEDGER coin -1]", -1),
+            ("[LEDGER money +40]", 40),
+            ("[LEDGER WEALTH -2]", -2),
+        ] {
+            let parsed = parse(form);
+            match &parsed.commands[0] {
+                BracketCommand::Ledger { op, wealth_delta, .. } => {
+                    assert_eq!(*op, LedgerOp::Wealth, "{form}");
+                    assert_eq!(*wealth_delta, want, "{form}");
+                }
+                other => panic!("expected Ledger, got {other:?} ({form})"),
+            }
+        }
+        // Non-numeric / zero / missing operand → drop to literal prose.
+        assert!(parse("[LEDGER wealth coppers]").commands.is_empty());
+        assert!(parse("[LEDGER wealth]").commands.is_empty());
+        assert!(parse("[LEDGER wealth +0]").commands.is_empty());
+        assert!(parse("[LEDGER wealth -0]").commands.is_empty());
+        // Astronomical magnitude clamps (the clamp_amount discipline).
+        let parsed = parse("[LEDGER wealth +99999999999999999999]");
+        match &parsed.commands[0] {
+            BracketCommand::Ledger { wealth_delta, .. } => {
+                assert_eq!(*wealth_delta, crate::economy::LEDGER_AMOUNT_MAX as i32);
+            }
+            other => panic!("expected Ledger, got {other:?}"),
+        }
     }
 
     #[test]
@@ -6154,6 +6288,28 @@ mod tests {
     }
 
     #[test]
+    fn npc_item_qty_tail_keeps_full_multi_word_name() {
+        // (2026-08-21 Liam playtest regression) The taught `+<item> (qty=N)`
+        // form truncated `+Pink Oversized Hoodie (qty=1)` to the single word
+        // "Pink"; the applier's one-word fragment resolver then minted the
+        // prose-span phantom "pink eyes glint". The leading non-kv span is
+        // the name; the paren tail parses as qty.
+        let parsed = parse("[NPC_ITEM liam +Pink Oversized Hoodie (qty=1)]");
+        assert!(matches!(
+            &parsed.commands[0],
+            BracketCommand::NpcItem { item_name, qty: 1, remove: false, .. }
+                if item_name == "Pink Oversized Hoodie"
+        ));
+        // Bare (unparenthesized) kv tail — same law, unquoted multi-word.
+        let parsed = parse("[NPC_ITEM mara +Worn Ring qty=2]");
+        assert!(matches!(
+            &parsed.commands[0],
+            BracketCommand::NpcItem { item_name, qty: 2, remove: false, .. }
+                if item_name == "Worn Ring"
+        ));
+    }
+
+    #[test]
     fn npc_item_case_insensitive_and_prefix_safe() {
         // Case-insensitive verb; NPC_ITEM never collides with NPC_REGISTER
         // (they diverge at the 4th char — neither is a prefix of the other).
@@ -6795,6 +6951,25 @@ mod tests {
     // the phantom AND the real item.
 
     #[test]
+    fn belt_and_pack_qty_tail_keep_full_multi_word_name() {
+        // (2026-08-21 name-truncation fix) A paren/bare kv tail must not
+        // collapse a bare multi-word name to its first token — same law as
+        // the NPC_ITEM regression pin.
+        let parsed = parse("[BELT Pink Oversized Hoodie (qty=1)]");
+        assert!(matches!(
+            &parsed.commands[0],
+            BracketCommand::Belt { item_name, qty: 1, remove: false, .. }
+                if item_name == "Pink Oversized Hoodie"
+        ));
+        let parsed = parse("[PACK Worn Traveling Cloak qty=1]");
+        assert!(matches!(
+            &parsed.commands[0],
+            BracketCommand::Pack { item_name, qty: 1, remove: false, .. }
+                if item_name == "Worn Traveling Cloak"
+        ));
+    }
+
+    #[test]
     fn belt_quoted_bare_body_keeps_full_name_not_first_fragment() {
         // The observed corruption: `[PACK "Worn Traveling Cloak"]` (name
         // quoted, no name= key) → old first-token read = `"Worn`.
@@ -6828,6 +7003,42 @@ mod tests {
                     "no literal quotes may persist in the name: {item_name:?}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn bare_forms_mark_asserted_and_qty_presence() {
+        // (2026-08-22 review pin) The restatement contract rides TWO flags:
+        // `asserted` (bare body — no leading +/-) and `qty_given` (an
+        // explicit qty token). `[PACK Rope]` is an existence assertion with
+        // NO count — the applier must keep a stored stack's count; only
+        // `[PACK name="Rope" (qty=2)]` carries replace semantics. The `+`
+        // add is never asserted.
+        match &parse("[PACK Rope]").commands[0] {
+            BracketCommand::Pack { item_name, qty, qty_given, asserted, remove, .. } => {
+                assert_eq!(item_name, "Rope");
+                assert!(*asserted, "bare body marks the restatement form");
+                assert!(!*qty_given, "no qty token means qty_given=false despite the defaulted qty");
+                assert_eq!(*qty, 1);
+                assert!(!*remove);
+            }
+            other => panic!("expected Pack, got {:?}", other),
+        }
+        match &parse("[BELT name=\"Rope\" qty=2]").commands[0] {
+            BracketCommand::Belt { qty, qty_given, asserted, .. } => {
+                assert!(*asserted, "name= form with no sign is still the bare restatement");
+                assert!(*qty_given, "an explicit qty token marks qty_given");
+                assert_eq!(*qty, 2);
+            }
+            other => panic!("expected Belt, got {:?}", other),
+        }
+        match &parse("[PACK +Rope (qty=3)]").commands[0] {
+            BracketCommand::Pack { qty, qty_given, asserted, .. } => {
+                assert!(!*asserted, "explicit + add is never a restatement");
+                assert!(*qty_given);
+                assert_eq!(*qty, 3);
+            }
+            other => panic!("expected Pack, got {:?}", other),
         }
     }
 

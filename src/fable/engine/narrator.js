@@ -24,6 +24,9 @@ import { invoke, Channel } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import * as beats from './beats.js';
 import { playFX, clearFX } from '../fx/effects.js';
+// (2026-08-22) Turn notices — the referee's injuries + the tracker's
+// automatic inventory moves render as top-left bubbles the moment they land.
+import { showTurnNotice } from './turn-notices.js';
 // (2026-08-16 yellow J2) hidePencil — every feed rebuild dissolves the
 // DOM selection the pencil anchors to; without this the pencil floats at a
 // stale viewport position until the next selection event.
@@ -33,6 +36,12 @@ let activeBeat = null;     // the streaming narrator/character beat for the curr
 let generating = false;
 let onTurnStart = null;    // hook: UI disables input
 let onTurnEnd = null;      // hook: UI re-enables input
+// Hook: () => void — fires on the first REAL narrator output of a turn
+// (stream chunk / character_turn line). The typing indicator must key off
+// this, NOT onTurnStart: Stage 1 (the hidden local tracker) runs silently
+// before any chunk, and showing "X is typing..." over it made the tracker
+// read as a second narrator turn (2026-08-22 Chloe ruling).
+let onNarratorActive = null;
 let npcPretty = null;      // optional fn: npcId → display name
 let onSchemaPop = null;    // hook: (count) => void — the schema-ring-buffer
                            // consumer (the parallel fable_rollback work) wires
@@ -144,6 +153,7 @@ let playerPortrait = '';
 export function initNarrator(hooks = {}) {
   onTurnStart = hooks.onTurnStart || null;
   onTurnEnd = hooks.onTurnEnd || null;
+  onNarratorActive = hooks.onNarratorActive || null;
   npcPretty = hooks.npcPretty || null;
   onSchemaPop = hooks.onSchemaPop || null;
   onApiLost = hooks.onApiLost || null;
@@ -372,6 +382,13 @@ export async function sendFableTurn(text, opts = {}) {
   if (onTurnStart) onTurnStart();
   const regenerate = !!opts.regenerate;
   const reroll = !!opts.reroll;
+  // (2026-08-22 Ghost Writer) The guided-swipe steer: a non-empty trimmed
+  // string rides fable_send's `guidance` param, rendered as a <direction>
+  // block LAST in the narrator turn tail. Only the ghost Swipe sets it; a
+  // plain reroll passes nothing (null maps to backend None).
+  const guidance = typeof opts.guidance === 'string' && opts.guidance.trim()
+    ? opts.guidance.trim()
+    : null;
   // (audit #5) Track the turn-start user bubble so every revert path can
   // remove it in lockstep with the backend's server-side pop. Regenerate
   // turns never push one (the rewind mutation owns the user tail); rerolls
@@ -414,7 +431,7 @@ export async function sendFableTurn(text, opts = {}) {
   };
 
   try {
-    await invoke('fable_send', { text, onEvent: channel, regenerate, reroll });
+    await invoke('fable_send', { text, onEvent: channel, regenerate, reroll, guidance });
     // (.finally backstop, 2026-08-15 audit fix) A backend resolve WITHOUT a
     // terminal event (done / error / api_lost / cancelled) would leave
     // `generating` latched → the composer wedges until app restart. Every
@@ -487,6 +504,13 @@ function handleEvent(msg) {
         if (onTrackerSkipped) onTrackerSkipped();
       }
       break;
+    case 'turn_notice':
+      // (2026-08-22) Silent state changes made player-visible: combat
+      // Referee injuries + automatic inventory moves (auto-wear, equip
+      // swaps, belt spills). Injuries fire pre-tracker, inventory post-
+      // apply — both stream before/around the narrator's prose.
+      showTurnNotice(msg.kind, msg.text);
+      break;
     case 'done':
       onDone(msg.final_text, msg.reasoning, msg.cancelled);
       break;
@@ -495,6 +519,7 @@ function handleEvent(msg) {
 
 function onChunk(text) {
   if (!text) return;
+  if (onNarratorActive) onNarratorActive();
   if (!activeBeat) activeBeat = beats.startNarratorBeat({ name: cardName });
   beats.appendChunk(activeBeat, text);
 }
@@ -507,6 +532,7 @@ function onSceneEvent(cmd) {
   }
   if (cmd.kind === 'character_turn') {
     // Re-class the live narrator beat as a character beat.
+    if (onNarratorActive) onNarratorActive();
     if (!activeBeat) activeBeat = beats.startNarratorBeat();
     const label = prettySpeaker(cmd.npc_id);
     // NPC portrait resolution: per-NPC portraits are deferred, so every NPC
@@ -784,7 +810,10 @@ export async function deleteMessage(index, opts = {}) {
 // varies). We do NOT rebuild the feed: `reroll_last_turn` is now a pure
 // validation gate, and the variant bookkeeping happens entirely in the
 // `sendFableTurn({ reroll: true })` call that follows.
-export async function rerollLastTurn() {
+// (2026-08-22 Ghost Writer) The optional `nudge` is the composer's typed
+// steer: it rides `guidance` into the narrator turn tail as the fresh
+// variant's <direction> block.
+export async function rerollLastTurn(nudge = '') {
   if (generating) return false;
   generating = true;
   const myEpoch = turnEpoch;
@@ -810,8 +839,41 @@ export async function rerollLastTurn() {
   // Hand off to the streaming path with reroll=true. Reset generating first
   // so sendFableTurn's `if (generating) return` guard doesn't bail.
   generating = false;
-  await sendFableTurn('', { reroll: true });
+  const guidance = typeof nudge === 'string' && nudge.trim() ? nudge.trim() : null;
+  await sendFableTurn('', { reroll: true, guidance });
   return true;
+}
+
+// (2026-08-22 Ghost Writer) CONTINUE: extend the trailing beat from where
+// it ends, steered by the player's typed direction. The backend one-shots
+// the continuation over the narrator cache, then lands through the edit
+// path (apply_edit + assistant-edit re-track) — so this wrapper mirrors
+// editMessage's shape exactly: generating lock across the whole round-trip
+// (the API call AND the local re-track), feed rebuild from the returned
+// messages[], epoch guards on every resume point.
+export async function ghostContinue(nudge) {
+  if (generating) return false;
+  generating = true;
+  const myEpoch = turnEpoch;
+  if (onTurnStart) onTurnStart();
+  try {
+    const res = await invoke('ghostwriter_continue', { nudge });
+    if (myEpoch !== turnEpoch) return false; // stage exited mid-continue (J1)
+    if (res && Array.isArray(res.messages)) {
+      hidePencil(); // the rebuild dissolves the pencil's selection (J2)
+      beats.rebuildFromMessages(res.messages);
+    }
+    if (onSchemaPop && typeof res.schema_pop_count === 'number') {
+      onSchemaPop(res.schema_pop_count);
+    }
+    return true;
+  } catch (err) {
+    if (myEpoch !== turnEpoch) return false;
+    beats.addErrorBeat(String(err));
+    return false;
+  } finally {
+    if (myEpoch === turnEpoch) finishTurn();
+  }
 }
 
 // Swipe to a different variant of an assistant message (the ‹ 1/N › UX).
@@ -968,6 +1030,7 @@ function handleSliceEvent(msg) {
   if (!msg || typeof msg !== 'object') return;
   switch (msg.type) {
     case 'chunk':
+      if (onNarratorActive) onNarratorActive();
       if (sliceSpan) beats.streamSliceChunk(sliceSpan, msg.text);
       break;
     case 'slice_done':

@@ -143,7 +143,29 @@ const FABLE_MAX_TOKENS: i32 = 1024;
 /// it, sized to give the model enough room to finish a full bracket set without
 /// artificial mid-word decapitation. pub(crate): settings.rs derives
 /// TRACKER_PROMPT_CHAR_BUDGET from this + CTX_FABLE.
-pub(crate) const TRACKER_MAX_TOKENS: i32 = 256;
+/// **Raised 256→512 on 2026-08-22 (Chloe directive, same-day Vaskar
+/// playtest):** the live wall hit `hit_max_tokens=true` on nearly EVERY turn —
+/// the E4B re-asserts the full state list (NPC racks, equipment, clock) and
+/// 256 cut it mid-bracket every time (truncated bracket tails dropped clock +
+/// travel + ledger brackets all session — the same decapitation the re-track
+/// ruling fixed at 512 that morning). Live now matches the re-track wall; the
+/// sniper stays the primary stop, and the derived prompt budget shrinks in
+/// lockstep ((CTX_FABLE − 512) × 3.6 ≈ 27,648 — still ~1.3k above the pinned
+/// 26.3k worst-case composition).
+pub(crate) const TRACKER_MAX_TOKENS: i32 = 512;
+
+/// (2026-08-22 re-track hardening) The token wall for the EDIT/REROLL
+/// re-track pass (`FableTurnMode::TrackerRetrack`). A live turn emits ONE
+/// turn's brackets (20-100 tokens, 512 is roomy), but a re-track re-derives
+/// a whole beat — the model re-emits everything it sees moved (time, site,
+/// ledger, currency...) — and the 2026-08-22 playtest log caught the 256
+/// wall cutting it mid-bracket (`hit_max_tokens` inside an `[ASSET]` line,
+/// silently dropping the tail: clock, currency label, and a travel node all
+/// rolled back). Double the wall for the re-track ONLY; the sniper stays
+/// the primary stop, and the paired
+/// `settings::TRACKER_RETRACK_PROMPT_CHAR_BUDGET` keeps the prompt-side
+/// guard in lockstep (prompt + 512 generation must fit CTX_FABLE).
+pub(crate) const TRACKER_RETRACK_MAX_TOKENS: i32 = 512;
 
 // ---------------------------------------------------------------------------
 // The Rust Sniper — early-stop for tracker rambling (2026-08-10)
@@ -179,7 +201,7 @@ pub(crate) const TRACKER_MAX_TOKENS: i32 = 256;
 // decapitation" previously blamed on the 150-token wall was this). The fix
 // is an `inside_bracket` toggle: prose counts ONLY outside brackets.
 //
-// The sniper is the PRIMARY stop. TRACKER_MAX_TOKENS (256) is the wall behind
+// The sniper is the PRIMARY stop. TRACKER_MAX_TOKENS (512) is the wall behind
 // it. Together they guarantee a tracker turn ends in seconds, not minutes.
 
 /// How many non-whitespace, non-bracket chars of prose may follow a closed
@@ -298,6 +320,11 @@ impl TrackerSniper {
 ///
 /// - **Tracker** — the Stage-1 bracket pass: deterministic sampler, hard
 ///   over-budget REFUSAL, sniper armed, `TRACKER_MAX_TOKENS` reserve.
+/// - **TrackerRetrack** — the edit/reroll re-track pass
+///   (`retrack_edited_assistant_message` + fable_send's reroll revert):
+///   the SAME deterministic profile + refusal + sniper as the tracker, with
+///   `TRACKER_RETRACK_MAX_TOKENS` (512) as its reserve — a re-track
+///   re-emits a FULL beat's bracket set, not one turn's (2026-08-22).
 /// - **Architect** — the JIT site-map generator (`maybe_run_site_architect`):
 ///   the SAME deterministic profile + refusal + sniper as the tracker (it
 ///   emits one fenced JSON object, and the sniper is fence-aware so the
@@ -308,6 +335,7 @@ impl TrackerSniper {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FableTurnMode {
     Tracker,
+    TrackerRetrack,
     Narrator,
     Architect,
 }
@@ -449,7 +477,10 @@ fn resolve_punct_biases(model: &LlamaModel) -> Vec<LlamaLogitBias> {
 /// Tracker + Architect share the DETERMINISTIC profile (both are agents
 /// emitting rigid state — brackets or one fenced JSON object).
 fn sampler_config(mode: FableTurnMode) -> SamplerConfig {
-    if matches!(mode, FableTurnMode::Tracker | FableTurnMode::Architect) {
+    if matches!(
+        mode,
+        FableTurnMode::Tracker | FableTurnMode::TrackerRetrack | FableTurnMode::Architect
+    ) {
         SamplerConfig {
             temp: crate::settings::TEMP_TRACKER,
             top_p: crate::settings::TOP_P_TRACKER,
@@ -742,7 +773,7 @@ impl FableRuntime {
         // schema. Any overflow (either mode) is a P0 prompt-bloat regression.
         //
         // Reserve is MODE-AWARE (2026-08-10 fix): the tracker needs only
-        // TRACKER_MAX_TOKENS (256 — raised from 150 post-T52) of generation
+        // TRACKER_MAX_TOKENS (512 — raised 150→256 post-T52, →512 on 2026-08-22) of generation
         // reserve, the narrator needs FABLE_MAX_TOKENS (1024). The prior bug
         // reserved 1024 for BOTH → max_prompt = 3072-1024 = 2048 → a
         // ~2500-token tracker prompt front-truncated 454-1022 tokens EVERY
@@ -751,11 +782,12 @@ impl FableRuntime {
         // 3072-256 = 2816 — the prompt fits, the bracket protocol survives,
         // the tracker sees its syntax.
         // Reserve is MODE-AWARE (2026-08-10 fix + 2026-08-19 Architect): the
-        // tracker needs only TRACKER_MAX_TOKENS (256) of generation reserve,
+        // tracker needs only TRACKER_MAX_TOKENS (512) of generation reserve,
         // the architect SITE_ARCHITECT_MAX_TOKENS (512 — one fenced site
         // JSON object), the narrator FABLE_MAX_TOKENS (1024).
         let reserve = match req.mode {
             FableTurnMode::Tracker => TRACKER_MAX_TOKENS,
+            FableTurnMode::TrackerRetrack => TRACKER_RETRACK_MAX_TOKENS,
             FableTurnMode::Architect => crate::site_map::SITE_ARCHITECT_MAX_TOKENS,
             FableTurnMode::Narrator => FABLE_MAX_TOKENS,
         };
@@ -774,7 +806,10 @@ impl FableRuntime {
             // lib.rs char-budget guard (`build_tracker_prompt_bounded`)
             // should catch this first; reaching this arm means that guard
             // was bypassed or the tokenizer defied the chars/token ratio.
-            if matches!(req.mode, FableTurnMode::Tracker | FableTurnMode::Architect) {
+            if matches!(
+                req.mode,
+                FableTurnMode::Tracker | FableTurnMode::TrackerRetrack | FableTurnMode::Architect
+            ) {
                 return Err(GenerationOutcome::GenerationErr(anyhow::anyhow!(
                     "TRACKER/ARCHITECT PROMPT OVERFLOW: {} tokens > {} max — refusing to decode a \
                                          headless prompt (the bracket protocol must never be front-chopped). \
@@ -925,7 +960,10 @@ impl FableRuntime {
         // (2026-08-19) The deterministic flag covers Tracker + Architect —
         // both are agent passes and share the profile; only the reserve
         // differs (see above).
-        let deterministic = matches!(req.mode, FableTurnMode::Tracker | FableTurnMode::Architect);
+        let deterministic = matches!(
+            req.mode,
+            FableTurnMode::Tracker | FableTurnMode::TrackerRetrack | FableTurnMode::Architect
+        );
         let mut sampler = if deterministic {
             tracing::info!("sampler: tracker profile (temp=0.2, top_p=0.9, DRY allowed_length=1)");
             LlamaSampler::chain_simple([
@@ -963,6 +1001,7 @@ impl FableRuntime {
         // the full 1024 budget. Both clamp to the remaining cache space.
         let base_cap = match req.mode {
             FableTurnMode::Tracker => TRACKER_MAX_TOKENS,
+            FableTurnMode::TrackerRetrack => TRACKER_RETRACK_MAX_TOKENS,
             FableTurnMode::Architect => crate::site_map::SITE_ARCHITECT_MAX_TOKENS,
             FableTurnMode::Narrator => FABLE_MAX_TOKENS,
         };

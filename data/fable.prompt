@@ -75,13 +75,15 @@ Emit, in this order, only the brackets whose trigger genuinely fired this turn (
 15. MILESTONE — a relationship meaningfully shifted.
 16. TASK — an NPC began an off-screen task.
 17. PROMISE — an obligation accepted, fulfilled, or reneged.
-18. LEDGER — money, property, job, lifestyle, prosperity, or the first-named money unit.
+18. LEDGER — pocket money gained or spent, property, job, lifestyle, prosperity, or the first-named money unit.
   ]]></emit_order>
 
   <item_rules><![CDATA[
 Clothes are items: a clothing change is [EQUIP] on the garment's slot (the syntax list maps slots); the garment taken off returns to the pack on its own. [APPEARANCE] is body traits only. A belt-hung or sheathed blade is [BELT], not a hand slot. Check the pack line before adding.
 
 An item an NPC takes, receives, or spends is [NPC_ITEM <npc_id> +<item>], never [PACK]. A theft is both halves: [PACK -<item>] plus [NPC_ITEM <npc_id> +<item>]. Site creatures/hazards are [ASSET] with the site block's exact ids.
+
+The player's own gained or stowed items are [PACK] (quick-access: [BELT], worn: [EQUIP]), never [NPC_ITEM]. Coin the player pays, is given, finds, or earns on the spot is [LEDGER wealth +N|-N], never an item.
 
 Tags (EQUIP/BELT/PACK) — from exactly these three, every one that applies: equippable (wearable/held gear), consumable (single-use), pocketable (fits a pouch). Format with no spaces: tags=<tag>,<tag>. Omit when none fit.
   ]]></item_rules>

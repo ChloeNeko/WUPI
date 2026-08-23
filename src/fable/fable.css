@@ -1056,22 +1056,25 @@ body.fable-active.fable-chrome-peek .top-bar { transform: translateY(0); pointer
     background: none;
     z-index: 25;
 }
-/* The input GROUP: a centered, max-width container holding the single text
-   box. The send button is GONE (2026-07-27) — generation is Enter-driven.
-   Kept as a relative-positioned wrapper so future absolutely-positioned
-   affordances resolve against it. Width bumped to 920 on 2026-08-11 to
-   track the widened bubble column (keeps the composer flush with the
-   dialogue cards). */
+/* The input GROUP: a centered, max-width FLEX ROW holding the text box +
+   the turn-aid icon cluster (2026-08-22 — Ghost Writer + Crossroads sit
+   directly right of the field as flex siblings, never overlapping text).
+   Width bumped to 920 on 2026-08-11 to track the widened bubble column,
+   then narrowed to 760 on 2026-08-12 per Chloe. */
 .fable-input-group {
     position: relative;
+    display: flex;
+    align-items: center;
+    gap: 8px;
     width: 100%;
     max-width: 760px;             /* composer narrowed 2026-08-12 per Chloe — no longer flush with the 1040px dialogue column; the input sits centered and narrower than the bubbles above it. Was 1040 (synced to .fable-mes). */
 }
-/* The text box: holds the textarea, centered inside the group. Chloe
-   2026-07-27: position: relative so the Impersonate ✎ button can anchor
-   to its right edge via absolute positioning. */
+/* The text box: holds the textarea, flexing to fill the group minus the
+   aid cluster. Chloe 2026-07-27: position: relative so absolutely-
+   positioned affordances resolve against it. */
 .fable-input-box {
-    width: 100%;
+    flex: 1 1 auto;
+    min-width: 0;
     position: relative;
 }
 .fable-input {
@@ -1097,8 +1100,8 @@ body.fable-active.fable-chrome-peek .top-bar { transform: translateY(0); pointer
     border-radius: 10px;
     font-size: 17px;
     font-family: inherit;
-    line-height: 1.5;
-    max-height: 105px;    /* caps auto-grow at 3 lines (2026-08-21 per Chloe, was 77px/2 lines). Backstop for the live-metric cap in stage.js::autoGrow. */
+    line-height: 26px;    /* whole-px (2026-08-22): 17×1.5=25.5 left fractional line boxes — the autoGrow scroll cut landed mid-line (half of line 4 peeking). 26px keeps every line boundary on a whole pixel. */
+    max-height: 106px;    /* caps auto-grow at 3 lines (2026-08-21 per Chloe, was 77px/2 lines): 3×26 + 26 padding + 2 border. Backstop for the live-metric cap in stage.js::autoGrow. */
     overflow: hidden;     /* default: no scroll handle, no 4th-line peek. autoGrow flips to `auto` only once content exceeds 3 lines (line-locked internal scroll — the cut always lands on a line boundary). */
     backdrop-filter: blur(8px);
     box-shadow:
@@ -1191,6 +1194,304 @@ body.fable-active.fable-chrome-peek .top-bar { transform: translateY(0); pointer
     50%      { opacity: 1; }
 }
 
+/* ============================================================= */
+/* COMPOSER TURN AIDS — Ghost Writer + Crossroads (2026-08-22).    */
+/* Two small icons directly right of the input text: the ghost     */
+/* (Swipe / Continue / Impersonate menu) + the octagon-X (the      */
+/* Crossroads options deck). Menus anchor above the icon cluster;  */
+/* the notice chip rides the input row's top edge (the typing      */
+/* indicator's slot, but for aid warnings/busy states).            */
+/* ============================================================= */
+
+/* The group is a FLEX ROW: the text box + the aid icon cluster as
+   siblings. The icons sit directly right of the field (attached to its
+   edge, never overlapping text); the field keeps its centered placeholder
+   + symmetric padding untouched — it just yields ~60px to the cluster.
+   (The group/box rules above carry the layout; this section owns the
+   icons, menus, notice chip, + the Crossroads deck.) */
+/* The icon cluster: the ghost left, the octagon right. position:relative
+   so both aid menus anchor against it (bottom:100%, right-aligned). */
+.fable-input-aids {
+    position: relative;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    flex: 0 0 auto;
+}
+/* One aid icon: a quiet 26px brass-line button that lights on hover.
+   Same metallic family as the drawer's foot icons, scaled to the
+   composer. aria-label only — hover tooltips are banned shell-wide. */
+.fable-aid-icon {
+    width: 26px;
+    height: 26px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 0;
+    background: none;
+    border: none;
+    border-radius: 7px;
+    color: var(--fable-text-dim);
+    cursor: pointer;
+    transition: color 140ms ease, background 140ms ease, box-shadow 140ms ease;
+}
+.fable-aid-icon svg {
+    width: 17px;
+    height: 17px;
+    display: block;
+}
+.fable-aid-icon:hover {
+    color: var(--fable-brass-bright);
+    background: rgba(197, 179, 88, 0.10);
+    box-shadow: var(--fable-emboss);
+}
+.fable-aid-icon:active { transform: translateY(1px); }
+/* API-lost lock: the aids need the narrator API, so they grey with the
+   composer itself and their clicks warn instead of acting. */
+.fable-input-row.is-api-lost .fable-aid-icon {
+    opacity: 0.35;
+    cursor: default;
+}
+
+/* The shared aid menu: a small dark-glass list that drops in directly
+   above the icon cluster (bottom:100% of the aids). Ghost + Crossroads
+   menus share this chrome; only the item set differs. */
+.fable-aid-menu {
+    position: absolute;
+    bottom: calc(100% + 10px);
+    right: 0;
+    min-width: 132px;
+    padding: 5px;
+    background: var(--fable-glass);
+    border: 1px solid var(--fable-brass-dim);
+    border-radius: 10px;
+    box-shadow: 0 10px 30px rgba(0, 0, 0, 0.55), var(--fable-emboss);
+    backdrop-filter: blur(10px);
+    -webkit-backdrop-filter: blur(10px);
+    z-index: 30;
+    animation: fableAidMenuIn 130ms ease;
+}
+@keyframes fableAidMenuIn {
+    from { opacity: 0; transform: translateY(5px); }
+    to   { opacity: 1; transform: translateY(0); }
+}
+.fable-aid-menu-item {
+    display: block;
+    width: 100%;
+    padding: 8px 12px;
+    background: none;
+    border: none;
+    border-radius: 7px;
+    color: var(--fable-text);
+    font-family: inherit;
+    font-size: 14.5px;
+    text-align: left;
+    cursor: pointer;
+    transition: background 120ms ease, color 120ms ease;
+}
+.fable-aid-menu-item:hover {
+    background: rgba(197, 179, 88, 0.14);
+    color: var(--fable-brass-bright);
+}
+
+/* The composer NOTICE chip: one small popup directly above the input bar
+   (anchored inside the input row like the typing indicator). Amber for
+   warnings with a 2.6s auto-hide; the busy variant carries a mini
+   spinning ring + stays until hidden. */
+.fable-composer-notice {
+    position: absolute;
+    left: 0;
+    right: 0;
+    bottom: 100%;
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    gap: 9px;
+    padding: 0 max(40px, 12vw);
+    pointer-events: none;
+    opacity: 0;
+    transform: translateY(4px);
+    transition: opacity 180ms ease, transform 180ms ease;
+    z-index: 26;
+}
+.fable-composer-notice.is-visible {
+    opacity: 1;
+    transform: translateY(0);
+}
+.fable-composer-notice__text {
+    font-size: 12.5px;
+    font-style: italic;
+    letter-spacing: 0.04em;
+    color: var(--fable-text-dim);
+    text-shadow: 0 0 6px var(--fable-brass-glow);
+    background: rgba(10, 8, 6, 0.72);
+    border: 1px solid var(--fable-glass-line);
+    border-radius: 999px;
+    padding: 4px 14px;
+    max-width: 86%;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+.fable-composer-notice.is-busy .fable-composer-notice__text {
+    font-style: normal;
+    color: var(--fable-brass-bright);
+}
+/* The busy variant's mini ring: the wizard ring's metallic sweep at
+   notice scale. */
+.fable-composer-notice.is-busy::before {
+    content: '';
+    width: 13px;
+    height: 13px;
+    flex: 0 0 auto;
+    border-radius: 50%;
+    background: conic-gradient(from 0deg,
+        rgba(122, 94, 44, 0) 0deg,
+        #7a5e2c 80deg,
+        var(--fable-brass) 170deg,
+        var(--fable-brass-bright) 240deg,
+        #fff3c0 275deg,
+        var(--fable-brass) 300deg,
+        rgba(122, 94, 44, 0) 360deg);
+    -webkit-mask: radial-gradient(farthest-side, transparent calc(100% - 2.4px), #000 calc(100% - 2px));
+    mask: radial-gradient(farthest-side, transparent calc(100% - 2.4px), #000 calc(100% - 2px));
+    filter: drop-shadow(0 0 4px var(--fable-brass-glow));
+    animation: creatorRingSpin 1.1s linear infinite;
+}
+
+/* --- Crossroads: the deck overlay + option bubbles --- */
+/* A centered rectangular panel over a dimmed, blurred stage — the same
+   overlay language as the saves popup. Mounts on the stage root. */
+.fable-crossroads-overlay {
+    position: absolute;
+    inset: 0;
+    z-index: 54;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    animation: fableAidMenuIn 160ms ease;
+}
+.fable-crossroads-backdrop {
+    position: absolute;
+    inset: 0;
+    background: rgba(2, 4, 10, 0.55);
+    backdrop-filter: blur(10px);
+    -webkit-backdrop-filter: blur(10px);
+}
+.fable-crossroads-panel {
+    position: relative;
+    display: flex;
+    flex-direction: column;
+    width: min(880px, 92vw);
+    max-height: 78vh;
+    background: var(--fable-glass);
+    border: 1px solid var(--fable-brass-dim);
+    border-radius: 14px;
+    box-shadow: 0 18px 50px rgba(0, 0, 0, 0.6), var(--fable-emboss-strong);
+    overflow: hidden;
+}
+.fable-crossroads-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 14px 18px 12px;
+    border-bottom: 1px solid var(--fable-glass-line);
+    flex: 0 0 auto;
+}
+.fable-crossroads-title {
+    font-family: var(--fable-font-serif);
+    font-size: 18px;
+    letter-spacing: 0.08em;
+    color: var(--fable-brass-bright);
+    text-shadow: 0 0 10px var(--fable-brass-glow);
+}
+.fable-crossroads-sub {
+    font-size: 14px;
+    letter-spacing: 0.05em;
+    color: var(--fable-text-dim);
+    text-shadow: none;
+}
+.fable-crossroads-close {
+    width: 30px;
+    height: 30px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: none;
+    border: 1px solid transparent;
+    border-radius: 8px;
+    color: var(--fable-text-dim);
+    font-size: 15px;
+    cursor: pointer;
+    transition: color 120ms ease, border-color 120ms ease;
+}
+.fable-crossroads-close:hover {
+    color: var(--fable-brass-bright);
+    border-color: var(--fable-brass-dim);
+}
+/* The body: while loading it centers the wizard generation ring (the
+   same .fable-creator-genring-* classes the creator flow uses); once the
+   draw lands it becomes the scrollable bubble grid. */
+.fable-crossroads-body {
+    flex: 1 1 auto;
+    min-height: 240px;
+    overflow-y: auto;
+    padding: 18px;
+}
+.fable-crossroads-body.is-loading {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}
+.fable-crossroads-grid {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 14px;
+}
+@media (max-width: 720px) {
+    .fable-crossroads-grid { grid-template-columns: repeat(2, 1fr); }
+}
+/* One option bubble: emoji + short brass title, summary beneath. */
+.fable-crossroads-card {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 8px;
+    padding: 14px 15px;
+    text-align: left;
+    background: var(--fable-inset);
+    border: 1px solid var(--fable-glass-line);
+    border-radius: 11px;
+    cursor: pointer;
+    font-family: inherit;
+    transition: border-color 130ms ease, box-shadow 130ms ease, transform 130ms ease;
+}
+.fable-crossroads-card:hover {
+    border-color: var(--fable-brass);
+    box-shadow: var(--fable-emboss-strong);
+    transform: translateY(-2px);
+}
+.fable-crossroads-card-head {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+.fable-crossroads-card-emoji {
+    font-size: 18px;
+    line-height: 1;
+}
+.fable-crossroads-card-title {
+    font-size: 15px;
+    font-weight: 600;
+    color: var(--fable-brass-bright);
+    letter-spacing: 0.02em;
+}
+.fable-crossroads-card-summary {
+    font-size: 13px;
+    line-height: 1.5;
+    color: var(--fable-text-dim);
+}
+
 /* API-required launch popup (2026-08-07). Body-mounted (Fable isn't open
    yet), so fixed-position. z-index 100100 sits above the dock (9998) + the
    home grid (#apps, 1000) so the popup isn't painted behind either. */
@@ -1279,11 +1580,18 @@ body.fable-active.fable-chrome-peek .top-bar { transform: translateY(0); pointer
 /* (2026-08-20 Chloe ruling) ALL text in BOTH drawers renders UPPERCASE —
    chrome labels and values alike (a display transform only; the underlying
    strings the backend receives/sends are untouched). Applies to everything
-   inside the two drawer containers: the Wupi chat, the tab rail + dropdown
-   prose, the HUD scrubber/status cards, the paperdoll tooltips. */
+   inside the two drawer containers: the tab rail + dropdown
+   prose, the HUD scrubber/status cards, the paperdoll tooltips.
+   (2026-08-22 Chloe follow-up) The Wupi CHAT is exempt — the message bodies
+   + input render normal mixed case; only the drawer chrome stays uppercase. */
 .fable-wupi-drawer,
 .fable-left-drawer {
     text-transform: uppercase;
+}
+
+.fable-wupi-msg-body,
+.fable-wupi-input {
+    text-transform: none;
 }
 
 /* =============================================================
@@ -3174,6 +3482,58 @@ body.fable-active.fable-chrome-peek .top-bar { transform: translateY(0); pointer
     text-align: left;
 }
 
+/* --- Codex tab LINK MANAGER (2026-08-22 codex decoupling) -------------------
+   The Codex dropdown is the per-card link manager: linked files in priority
+   order (numbered), each with ↑/↓/✎/✕, then the unlinked library files with
+   a + Link action. Uppercase is inherited from the drawer rule — the section
+   labels lean into it; names stay as-authored. */
+.fable-codex-link-manage { display: flex; flex-direction: column; gap: 6px; text-align: left; }
+.fable-codex-link-manage-section {
+    margin: 6px 0 2px;
+    font-size: 10.5px; font-weight: 600; letter-spacing: 0.1em;
+    text-transform: uppercase; color: var(--fable-text-faint);
+    border-bottom: 1px solid var(--fable-glass-line);
+    padding-bottom: 4px;
+}
+.fable-codex-link-manage-row {
+    display: flex; align-items: center; gap: 8px;
+    padding: 7px 9px;
+    background: rgba(255,255,255,0.03);
+    border: 1px solid var(--fable-glass-line); border-radius: 7px;
+}
+.fable-codex-link-manage-row.is-unlinked { border-style: dashed; }
+.fable-codex-link-manage-priority {
+    flex: 0 0 auto;
+    min-width: 18px; text-align: center;
+    font-size: 11px; font-weight: 600; color: var(--fable-brass);
+}
+.fable-codex-link-manage-name {
+    flex: 1 1 auto; min-width: 0;
+    font-size: 12.5px; color: var(--fable-text);
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    text-transform: none;
+}
+.fable-codex-link-manage-count {
+    flex: 0 0 auto;
+    font-size: 10.5px; color: var(--fable-text-faint); text-transform: none;
+}
+.fable-codex-link-manage-btns { flex: 0 0 auto; display: flex; gap: 5px; }
+.fable-codex-link-manage-btns button {
+    min-width: 24px; height: 24px;
+    padding: 0 6px;
+    display: inline-flex; align-items: center; justify-content: center;
+    background: transparent;
+    border: 1px solid var(--fable-glass-line); border-radius: 5px;
+    color: var(--fable-text-faint);
+    font-size: 12px; cursor: pointer;
+    transition: color 140ms ease, border-color 140ms ease, background 140ms ease;
+}
+.fable-codex-link-manage-btns button:hover:not(:disabled) {
+    color: var(--fable-brass-bright); border-color: var(--fable-brass-dim);
+    background: rgba(212, 175, 55, 0.10);
+}
+.fable-codex-link-manage-btns button:disabled { opacity: 0.3; cursor: default; }
+
 /* Player tab — character-sheet blocks (identity, appearance, inventory,
    injuries, relationships). Read-only like the rest of the dropdown; each
    section is omitted upstream in tab-rail.js when empty. */
@@ -3331,6 +3691,214 @@ body.fable-active.fable-chrome-peek .top-bar { transform: translateY(0); pointer
    status bar (Loading... / Saved. / Save failed / Invalid) is gone from every
    raw editor (Player JSON / World / NPC / Sim / Codex). The textarea now fills
    the space; save failures + invalid-JSON warnings log to console only. */
+
+/* --- Sessions popup (the Session Manager, 2026-08-22) ----------------------
+   The LOAD button's first surface: lists a card's playthrough sessions from
+   the centralized saves tree. Chrome clones the saves popup (z-50, black
+   panel, brass title, red ✕) + a footer NEW SESSION button. Rows reuse the
+   .fable-save-btn actions. */
+.fable-sessions-popup-overlay {
+    position: absolute; inset: 0; z-index: 50;
+    display: flex; align-items: center; justify-content: center;
+    padding: 5vh 24px;
+}
+.fable-sessions-popup-backdrop {
+    position: absolute; inset: 0;
+    background: rgba(2, 4, 10, 0.85);
+    backdrop-filter: blur(8px);
+    -webkit-backdrop-filter: blur(8px);
+}
+.fable-sessions-popup {
+    position: relative; z-index: 2;
+    display: flex; flex-direction: column;
+    width: min(680px, 92vw);
+    max-height: 80vh;
+    overflow: hidden;
+    background: rgb(10, 10, 10);
+    border: 1px solid var(--fable-brass-dim);
+    border-radius: 14px;
+    box-shadow: 0 24px 60px rgba(0,0,0,0.7), var(--fable-emboss);
+}
+.fable-sessions-popup-head {
+    display: flex; align-items: center; justify-content: space-between;
+    gap: 16px;
+    padding: 14px 18px;
+    border-bottom: 1px solid var(--fable-glass-line);
+}
+.fable-sessions-popup-title {
+    font-size: 13px; font-weight: 600; letter-spacing: 0.06em;
+    text-transform: uppercase; color: var(--fable-brass);
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.fable-sessions-popup-close {
+    flex: 0 0 auto;
+    width: 34px; height: 34px;
+    display: inline-flex; align-items: center; justify-content: center;
+    background: transparent;
+    border: 1px solid rgba(244, 160, 160, 0.4);
+    border-radius: 7px;
+    color: #f4a0a0;
+    font-size: 16px; cursor: pointer;
+    transition: color 160ms ease, border-color 160ms ease, background 160ms ease;
+}
+.fable-sessions-popup-close:hover { background: rgba(244, 160, 160, 0.14); border-color: #f4a0a0; }
+.fable-sessions-popup-body {
+    min-height: 0;
+    overflow-y: auto;
+    padding: 18px;
+    display: flex; flex-direction: column; gap: 12px;
+}
+.fable-sessions-popup-foot {
+    display: flex; justify-content: center;
+    padding: 12px 18px 16px;
+    border-top: 1px solid var(--fable-glass-line);
+}
+.fable-sessions-popup-new {
+    padding: 9px 22px;
+    background: rgba(212, 175, 55, 0.12);
+    border: 1px solid var(--fable-brass-dim);
+    border-radius: 8px;
+    color: var(--fable-brass-bright, #ecd9a0);
+    font-size: 13px; font-weight: 600; letter-spacing: 0.08em;
+    text-transform: uppercase; cursor: pointer;
+    transition: background 160ms ease, border-color 160ms ease;
+}
+.fable-sessions-popup-new:hover { background: rgba(212, 175, 55, 0.22); border-color: var(--fable-brass); }
+.fable-sessions-popup .fable-sessions-empty { padding: 48px 16px; text-align: center; }
+.fable-sessions-popup-status {
+    margin: 0;
+    padding: 8px 18px 12px;
+    color: #f4a0a0;
+    font-size: 13px;
+}
+.fable-sessions-popup-status[hidden] { display: none; }
+.fable-session-row {
+    display: flex; align-items: center; justify-content: space-between;
+    gap: 14px;
+    padding: 12px 14px;
+    background: rgba(255, 255, 255, 0.03);
+    border: 1px solid var(--fable-glass-line);
+    border-radius: 10px;
+}
+.fable-session-info { min-width: 0; }
+.fable-session-name {
+    font-size: 14px; font-weight: 600; color: #f2ecdc;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.fable-session-meta {
+    margin-top: 3px;
+    font-size: 12px; color: rgba(242, 236, 220, 0.55);
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.fable-session-actions { flex: 0 0 auto; display: flex; gap: 8px; }
+
+/* --- Codex LINK popup (the new-game flow's LINK CODEX picker, 2026-08-22) --
+   Centered multi-select over the newgame-split screen: rows toggle
+   selection, LOAD persists the <linked_codices> list + launches. Same chrome
+   family as the saves popup (z-50 over the flow). */
+.fable-codex-link-overlay {
+    position: absolute; inset: 0; z-index: 50;
+    display: flex; align-items: center; justify-content: center;
+    padding: 5vh 24px;
+    background: rgba(2, 4, 10, 0.85);
+    backdrop-filter: blur(8px);
+    -webkit-backdrop-filter: blur(8px);
+}
+.fable-codex-link-modal {
+    position: relative;
+    display: flex; flex-direction: column;
+    width: min(560px, 92vw);
+    max-height: 78vh;
+    overflow: hidden;
+    background: rgb(10, 10, 10);
+    border: 1px solid var(--fable-brass-dim);
+    border-radius: 14px;
+    box-shadow: 0 24px 60px rgba(0,0,0,0.7), var(--fable-emboss);
+}
+.fable-codex-link-head {
+    display: flex; align-items: center; justify-content: space-between;
+    gap: 16px;
+    padding: 14px 18px;
+    border-bottom: 1px solid var(--fable-glass-line);
+}
+.fable-codex-link-title {
+    font-size: 13px; font-weight: 600; letter-spacing: 0.06em;
+    text-transform: uppercase; color: var(--fable-brass);
+}
+.fable-codex-link-close {
+    flex: 0 0 auto;
+    width: 34px; height: 34px;
+    display: inline-flex; align-items: center; justify-content: center;
+    background: transparent;
+    border: 1px solid rgba(244, 160, 160, 0.4);
+    border-radius: 7px;
+    color: #f4a0a0;
+    font-size: 16px; cursor: pointer;
+}
+.fable-codex-link-close:hover { background: rgba(244, 160, 160, 0.14); border-color: #f4a0a0; }
+.fable-codex-link-body {
+    min-height: 0;
+    overflow-y: auto;
+    padding: 14px 18px;
+    display: flex; flex-direction: column; gap: 8px;
+}
+.fable-codex-link-empty {
+    padding: 42px 16px; text-align: center;
+    color: rgba(242, 236, 220, 0.55); font-size: 13px;
+}
+.fable-codex-link-row {
+    display: flex; align-items: center; gap: 12px;
+    padding: 11px 14px;
+    background: rgba(255, 255, 255, 0.03);
+    border: 1px solid var(--fable-glass-line);
+    border-radius: 10px;
+    cursor: pointer; text-align: left;
+    color: inherit; font: inherit;
+    transition: border-color 140ms ease, background 140ms ease;
+}
+.fable-codex-link-row:hover { background: rgba(255, 255, 255, 0.06); }
+.fable-codex-link-row.is-selected { border-color: var(--fable-brass); background: rgba(212, 175, 55, 0.10); }
+.fable-codex-link-row-check {
+    flex: 0 0 auto;
+    width: 18px; height: 18px;
+    border: 1px solid rgba(242, 236, 220, 0.4);
+    border-radius: 5px;
+}
+.fable-codex-link-row.is-selected .fable-codex-link-row-check {
+    border-color: var(--fable-brass);
+    background: var(--fable-brass);
+    box-shadow: inset 0 0 0 3px rgb(10, 10, 10);
+}
+.fable-codex-link-row-name {
+    flex: 1 1 auto; min-width: 0;
+    font-size: 14px; color: #f2ecdc;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.fable-codex-link-row-count {
+    flex: 0 0 auto;
+    font-size: 12px; color: rgba(242, 236, 220, 0.5);
+}
+.fable-codex-link-foot {
+    display: flex; align-items: center; justify-content: space-between;
+    gap: 14px;
+    padding: 12px 18px 16px;
+    border-top: 1px solid var(--fable-glass-line);
+}
+.fable-codex-link-hint {
+    font-size: 12px; color: rgba(242, 236, 220, 0.45);
+}
+.fable-codex-link-load {
+    padding: 9px 26px;
+    background: rgba(212, 175, 55, 0.12);
+    border: 1px solid var(--fable-brass-dim);
+    border-radius: 8px;
+    color: var(--fable-brass-bright, #ecd9a0);
+    font-size: 13px; font-weight: 600; letter-spacing: 0.08em;
+    text-transform: uppercase; cursor: pointer;
+    transition: background 160ms ease, border-color 160ms ease;
+}
+.fable-codex-link-load:hover { background: rgba(212, 175, 55, 0.22); border-color: var(--fable-brass); }
+.fable-codex-link-load:disabled { opacity: 0.5; cursor: default; }
 
 .fable-wupi-messages {
     flex: 1; overflow-y: auto; padding: 18px;
@@ -6327,17 +6895,23 @@ body.fable-active.fable-chrome-peek .top-bar { transform: translateY(0); pointer
     text-shadow: 0 0 28px var(--fable-brass-glow);
 }
 
-/* The IMPORT mini tile — a smaller, shorter duplicate of the pair slab,
-   pinned to the bottom-center of the host via absolute positioning so the
-   pair stays vertically centered independently. Uses the SILVER accent
-   family (not brass) so the secondary import action reads as distinct
-   from the primary New/Load pair. The host is position:relative, so this
+/* The IMPORT / SKIP mini tiles — smaller, shorter duplicates of the pair
+   slab, pinned to the bottom-center of the host via a positioned ROW
+   container (2026-08-22: the codex pair carries TWO — IMPORT + SKIP — so
+   the mini tiles flex side-by-side inside one centered row). Uses the
+   SILVER accent family (not brass) so the secondary actions read as
+   distinct from the primary pair. The host is position:relative, so the row
    anchors to the host's content box (above the bottom padding). */
-.fable-newgame-tile.fable-newgame-tile-mini {
+.fable-newgame-tile-mini-row {
     position: absolute;
     left: 50%;
     bottom: 28px;
     transform: translateX(-50%);
+    display: flex; flex-direction: row; gap: 14px;
+}
+.fable-newgame-tile.fable-newgame-tile-mini {
+    position: static;
+    transform: none;
     width: clamp(240px, 30vw, 380px);
     aspect-ratio: 4 / 1;
     flex: 0 0 auto;
@@ -6350,12 +6924,12 @@ body.fable-active.fable-chrome-peek .top-bar { transform: translateY(0); pointer
     color: var(--fable-silver-bright);         /* silver caption */
     text-shadow: 0 0 16px var(--fable-silver-glow);
 }
-/* Hover override: the mini tile's resting transform centers it
-   (translateX(-50%)), which the base .fable-newgame-tile:hover transform
-   would clobber. Re-stack both so the pop keeps the X centering, AND swap
-   the border to bright silver + the caption glow to the silver family. */
+/* Hover override: the mini tile is statically positioned inside the row
+   (the ROW owns the centering transform), so the hover pop is a plain
+   lift — and the border swaps to bright silver + the caption glow to the
+   silver family. */
 .fable-newgame-tile.fable-newgame-tile-mini:hover {
-    transform: translateX(-50%) translateY(-8px) scale(1.04);
+    transform: translateY(-8px) scale(1.04);
     border-color: var(--fable-silver-bright);
 }
 .fable-newgame-tile.fable-newgame-tile-mini:hover .fable-newgame-tile-caption {
@@ -6672,3 +7246,54 @@ body.fable-active.fable-chrome-peek .top-bar { transform: translateY(0); pointer
 }
 
 
+
+/* =============================================================
+   TURN NOTICES (2026-08-22 playtest) — top-left slide-in bubbles
+   for the silent state changes a turn makes: Combat Referee
+   injuries + automatic inventory moves (equip / auto-wear / belt
+   spill). Rides the active .fable-screen; under the drawers so an
+   open drawer covers it. No hover affordances (the app-wide ban).
+   ============================================================= */
+.fable-turn-notices {
+    position: absolute;
+    top: 64px;
+    left: 16px;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    z-index: 38;           /* above the stage feed, below the drawers (40/42) */
+    pointer-events: none;  /* the stack itself is click-through; bubbles opt in */
+    max-width: min(360px, 42vw);
+}
+.fable-turn-notice {
+    pointer-events: auto;
+    cursor: pointer;
+    padding: 9px 14px;
+    border-radius: 10px;
+    font-family: var(--fable-font-body);
+    font-size: 0.92rem;
+    line-height: 1.35;
+    color: var(--fable-text);
+    background: var(--fable-glass);
+    border: 1px solid var(--fable-brass-dim);
+    box-shadow: 0 2px 14px rgba(0, 0, 0, 0.45), 0 0 10px var(--fable-brass-dim);
+    animation: fable-turn-notice-in 280ms cubic-bezier(0.2, 0.9, 0.3, 1);
+    /* opacity: the slow fade-out (.is-out); transform: the FLIP glide
+       when a newer bubble takes the top slot / a gap closes. */
+    transition: opacity 650ms ease, transform 280ms ease;
+}
+.fable-turn-notice.is-out {
+    opacity: 0;
+    pointer-events: none;
+}
+.fable-turn-notice.is-injury {
+    color: #fca5a5;
+    border-color: rgba(244, 114, 114, 0.45);
+    box-shadow: 0 2px 14px rgba(0, 0, 0, 0.45), 0 0 12px rgba(244, 114, 114, 0.28);
+}
+@keyframes fable-turn-notice-in {
+    /* Fully off the left edge → slides in to its slot (the viewport
+       clips the overshoot; leftward overflow never spawns a scrollbar). */
+    from { opacity: 0; transform: translateX(calc(-100% - 24px)); }
+    to   { opacity: 1; transform: none; }
+}

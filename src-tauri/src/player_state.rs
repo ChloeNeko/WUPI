@@ -43,21 +43,28 @@ use crate::equipment;
 ///
 /// | Variant     | Color        | Meaning                          |
 /// |-------------|--------------|----------------------------------|
-/// | `Transparent` | transparent  | Healthy (the default)          |
-/// | `Yellow`     | yellow       | Minor Injury                    |
-/// | `Orange`     | orange       | Medium Injury                   |
-/// | `Red`        | red          | Heavy Injury                    |
-/// | `Purple`     | purple       | Critical Condition              |
-/// | `Black`      | black        | Amputated / gone / decapitated  |
+/// | `Healthy`   | transparent  | Healthy (the default)            |
+/// | `Yellow`    | yellow       | Minor Injury                    |
+/// | `Orange`    | orange       | Medium Injury                   |
+/// | `Red`       | red          | Heavy Injury                    |
+/// | `Purple`    | purple       | Critical Condition              |
+/// | `Black`     | black        | Amputated / gone / decapitated  |
 ///
-/// Serialization is PascalCase variant names verbatim (`"Transparent"`,
-/// `"Yellow"`, … — serde's default unit-variant form; no rename_all). The
-/// wire is consumed by the frontend's injury heatmap, which owns the only
-/// PascalCase→snake_case seam (injury-heatmap.js) to map them onto the CSS
-/// color classes.
+/// Serialization is PascalCase variant names verbatim (`"Healthy"`,
+/// `"Yellow"`, … — serde's default unit-variant form; no rename_all).
+/// (2026-08-22 Chloe ruling) The healthy variant was renamed from
+/// `Transparent` to `Healthy` so every surface reads healthy → wounded
+/// semantics; the WIRE keeps both spellings loadable — new writes say
+/// `"Healthy"`, pre-rename saves carrying `"Transparent"` deserialize
+/// through the serde `alias` (deserialize-only; the serializer always
+/// emits the new name). The wire is consumed by the frontend's injury
+/// heatmap, which owns the only PascalCase→snake_case seam
+/// (injury-heatmap.js) to map them onto the CSS color classes — a healthy
+/// part renders nothing there, under either spelling.
 #[derive(Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, Debug)]
 pub enum BodyPartState {
-    Transparent,
+    #[serde(rename = "Healthy", alias = "Transparent")]
+    Healthy,
     Yellow,
     Orange,
     Red,
@@ -67,16 +74,17 @@ pub enum BodyPartState {
 
 impl Default for BodyPartState {
     fn default() -> Self {
-        BodyPartState::Transparent
+        BodyPartState::Healthy
     }
 }
 
 impl BodyPartState {
     /// Human-readable label for prompt injection + UI tooltips.
-    /// "Healthy" is the prose form of `Transparent` (the user-facing word).
+    /// "Healthy" is the prose form of the default state (the user-facing
+    /// word).
     pub fn semantic(&self) -> &'static str {
         match self {
-            BodyPartState::Transparent => "Healthy",
+            BodyPartState::Healthy => "Healthy",
             BodyPartState::Yellow => "Minor Injury",
             BodyPartState::Orange => "Medium Injury",
             BodyPartState::Red => "Heavy Injury",
@@ -96,7 +104,7 @@ impl BodyPartState {
     /// (a Heavy blow shouldn't randomly become Minor). Higher = worse.
     fn rank(&self) -> u8 {
         match self {
-            BodyPartState::Transparent => 0,
+            BodyPartState::Healthy => 0,
             BodyPartState::Yellow => 1,
             BodyPartState::Orange => 2,
             BodyPartState::Red => 3,
@@ -113,8 +121,8 @@ impl BodyPartState {
     /// at the call site.
     pub fn heal_step(&self) -> Option<BodyPartState> {
         match self {
-            BodyPartState::Transparent | BodyPartState::Black => None,
-            BodyPartState::Yellow => Some(BodyPartState::Transparent),
+            BodyPartState::Healthy | BodyPartState::Black => None,
+            BodyPartState::Yellow => Some(BodyPartState::Healthy),
             BodyPartState::Orange => Some(BodyPartState::Yellow),
             BodyPartState::Red => Some(BodyPartState::Orange),
             BodyPartState::Purple => Some(BodyPartState::Red),
@@ -375,7 +383,7 @@ impl BodyPart {
 /// narrator LLM never writes here, only reads the rendered `<player_state>`
 /// block. Nested inside `WorldSchema` so it persists for free per-card.
 ///
-/// `body` defaults to all-`Transparent` (Healthy); `stamina` defaults to
+/// `body` defaults to all-`Healthy`; `stamina` defaults to
 /// `Fresh`. Wealth + reputation are numeric, Rust-owned, and never shown
 /// raw to the user (the UI renders them via semantic formatting later).
 #[derive(Clone, serde::Serialize, serde::Deserialize, Debug)]
@@ -480,7 +488,7 @@ impl Default for PlayerState {
         // has the full part list to pick from.
         let mut body = HashMap::with_capacity(22);
         for part in BodyPart::all() {
-            body.insert(*part, BodyPartState::Transparent);
+            body.insert(*part, BodyPartState::Healthy);
         }
         PlayerState {
             body,
@@ -512,7 +520,7 @@ impl PlayerState {
             && self.reputation == 0
             && self.lifestyle == crate::economy::Lifestyle::Squatter
             && self.jobs.is_empty()
-            && self.body.values().all(|s| *s == BodyPartState::Transparent)
+            && self.body.values().all(|s| *s == BodyPartState::Healthy)
             && self.injury_details.values().all(|v| v.is_empty())
             && self.current_appearance_deltas.is_empty()
             && self.equipment.is_empty()
@@ -587,7 +595,7 @@ impl PlayerState {
             .filter_map(|p| {
                 let state = self.body.get(p).copied().unwrap_or_default();
                 match state {
-                    BodyPartState::Transparent
+                    BodyPartState::Healthy
                     | BodyPartState::Black => None,
                     _ => {
                         let base = format!("{} ({})", p.display(), state.semantic());
@@ -963,7 +971,7 @@ pub struct RecoveryOutcome {
     pub stamina_recovered: bool,
     /// The worst healable injury improved one grade. `None` = no injury was
     /// healable this turn (all healthy, or only amputations). The part maps
-    /// to its NEW state; `Transparent` means fully healed (entry removed).
+    /// to its NEW state; `Healthy` means fully healed (entry removed).
     pub healed: Option<(BodyPart, BodyPartState)>,
 }
 
@@ -973,7 +981,7 @@ pub struct RecoveryOutcome {
 /// stamina tier up, plus the WORST healable injury down one grade. Worst =
 /// highest severity; ties resolve to the first part in canonical
 /// `BodyPart::all()` order (deterministic, no RNG — healing is not a gamble).
-/// Amputated parts never heal; a fully-healed (`Transparent`) part's entry
+/// Amputated parts never heal; a fully-healed (`Healthy`) part's entry
 /// + injury history are removed from the maps.
 ///
 /// Pure evaluation: reads `state`, returns the outcome; the caller applies
@@ -1032,7 +1040,7 @@ pub fn referee_evaluate_recovery(
 }
 
 /// (2026-08-15 recovery seam) Apply a recovery outcome to the canonical
-/// state. A part healed to `Transparent` is REMOVED from `body` (the map
+/// state. A part healed to `Healthy` is REMOVED from `body` (the map
 /// only carries non-healthy zones — same clean-delete the split round-trip
 /// uses) and its `injury_details` history is dropped with it.
 pub fn apply_recovery(state: &mut PlayerState, outcome: &RecoveryOutcome) {
@@ -1040,7 +1048,7 @@ pub fn apply_recovery(state: &mut PlayerState, outcome: &RecoveryOutcome) {
         state.stamina.recover();
     }
     if let Some((part, new_state)) = outcome.healed {
-        if new_state == BodyPartState::Transparent {
+        if new_state == BodyPartState::Healthy {
             state.body.remove(&part);
             state.injury_details.remove(&part);
         } else {
@@ -1161,12 +1169,12 @@ fn roll_injury_descriptor(roller: &mut Roller, tier: AttackerTier, state: BodyPa
         // amputation marker (apply_outcome REPLACES the zone's wound list
         // with it). Fall back to the semantic label so the field is never
         // empty if an unexpected path reaches here.
-        BodyPartState::Transparent | BodyPartState::Black => &[],
+        BodyPartState::Healthy | BodyPartState::Black => &[],
     };
     if table.is_empty() {
         return match state {
             BodyPartState::Black => "Severed".to_string(),
-            BodyPartState::Transparent => String::new(),
+            BodyPartState::Healthy => String::new(),
             _ => state.semantic().to_string(),
         };
     }
@@ -1413,7 +1421,7 @@ pub fn referee_evaluate_with_tier(
     let injury_count = state
         .body
         .values()
-        .filter(|s| s.can_be_injured() && **s != BodyPartState::Transparent)
+        .filter(|s| s.can_be_injured() && **s != BodyPartState::Healthy)
         .count();
     let seed = hash_text(text).wrapping_add(injury_count as u64);
     let mut roller = Roller::new(seed);
@@ -1526,6 +1534,128 @@ pub fn referee_evaluate_with_tier(
         lethal,
         directive,
     })
+}
+
+/// (2026-08-22 playtest tuning — Chloe-flagged, tables untouched) The
+/// LIVE-turn combat Referee entry point: `referee_evaluate_with_tier` wrapped
+/// with an AVOIDANCE roll + a lethality-coherence gate. The 2026-08-22
+/// Vaskar playtest showed the raw entry point's two failure shapes:
+///
+/// 1. **Every combat keyword was a guaranteed wound.** "I jump over his
+///    pole-arm attack" (a purely defensive beat) rolled a full Purple foot
+///    injury — six turns of skirmish produced six injuries ("gathering
+///    injuries like Pokémon"), and the wound load then lowered the lethality
+///    DC until two "DOWNED" directives fired back-to-back vs Soldier-tier
+///    goblins. The avoidance roll (d20 + stamina mod vs
+///    [`REFEREE_AVOID_DC`]) lets a competent, fresh fighter slip the
+///    exchange entirely — no wound, no stamina drain. A Depleted fighter
+///    still eats most exchanges (the death spiral for an exhausted body is
+///    the designed law; the fix is that reaching it now takes deliberate
+///    attrition, not three verbs).
+/// 2. **A lethal save could fire on a landed graze.** The save's condition
+///    penalty is wound-load-derived, so a battered body cleared a DC 17 with
+///    a Yellow-grade blow — "lethal blow (soldier, DC 17): the player is
+///    DOWNED" over a Minor Injury read incoherent and ended runs without
+///    mercy. The coherence gate clears the lethal flag when the landed
+///    severity is below Red — EXCEPT on an already-Downed body (any hit
+///    finishes a Downed player, the existing law, which the −20 condition
+///    penalty already makes near-certain).
+///
+/// The severity WEIGHTS + the lethality save math are the 2026-08-20 Chloe
+/// rulings and pass through untouched — a blow that lands rolls exactly as
+/// ruled.
+pub fn referee_evaluate_live(
+    text: &str,
+    state: &PlayerState,
+    attacker_tier: AttackerTier,
+    buff_tag_count: usize,
+    debuff_tag_count: usize,
+    pacing_dc_mod: i32,
+) -> Option<RefereeOutcome> {
+    // Cheap gate first — no combat keyword, no rolls at all (the wrapper must
+    // stay trigger-compatible with the raw entry point + scene pacing).
+    let lower = strip_dialogue(text).to_lowercase();
+    if !combat_triggered(&lower) {
+        return None;
+    }
+    // Avoidance roll. Seeded off the same text + injury-count discipline as
+    // the inner referee (identical text on an unchanged body = identical
+    // verdict, so regenerate re-rolls stay deterministic), offset so the
+    // defense draw is never the inner severity stream's first draw.
+    let injury_count = state
+        .body
+        .values()
+        .filter(|s| s.can_be_injured() && **s != BodyPartState::Healthy)
+        .count();
+    let seed = hash_text(text)
+        .wrapping_add(injury_count as u64)
+        .wrapping_add(0x9E37_79B9_7F4A_7C15);
+    let mut roller = Roller::new(seed);
+    let stamina_mod = match state.stamina {
+        Stamina::Fresh => 4,
+        Stamina::Active => 2,
+        Stamina::Winded => 0,
+        Stamina::Exhausted => -2,
+        Stamina::Depleted => -4,
+    };
+    let defense = roll_d20(&mut roller) as i32 + stamina_mod;
+    if defense >= REFEREE_AVOID_DC {
+        // Dodged/parried clean: no wound, no drain, no directive. The turn
+        // still narrates — the narrator just owes no injury this exchange.
+        return None;
+    }
+    let mut outcome = referee_evaluate_with_tier(
+        text,
+        state,
+        attacker_tier,
+        buff_tag_count,
+        debuff_tag_count,
+        pacing_dc_mod,
+    )?;
+    if outcome.lethal && outcome.new_state.rank() < BodyPartState::Red.rank() {
+        let derived =
+            crate::consequence::derive_condition(&state.body, buff_tag_count, debuff_tag_count);
+        if derived != crate::consequence::Condition::Downed {
+            outcome.lethal = false;
+            outcome.directive.clear();
+        }
+    }
+    Some(outcome)
+}
+
+/// The avoidance DC: d20 + stamina modifier must meet or beat this to slip a
+/// triggered exchange. **9 (2026-08-22 Chloe ruling — exact targets: Fresh
+/// ~80% / Winded ~60% / Depleted ~40% clean; the ladder steps 10 points per
+/// stamina tier: Fresh 80 / Active 70 / Winded 60 / Exhausted 50 / Depleted
+/// 40 via mods +4/+2/0/−2/−4).** The severity tables stay Chloe-ruled.
+const REFEREE_AVOID_DC: i32 = 9;
+
+/// (2026-08-22) Player-facing bubble text for a landed combat outcome — the
+/// turn-notice channel renders it top-left the moment the dice land (the
+/// playtest's player "never found out he was even injured"). Wording per
+/// Chloe's spec: severity as an adverbial phrase, amputation as the flat
+/// fact, a lethal save as the DOWNED callout.
+pub fn referee_notice_text(outcome: &RefereeOutcome) -> String {
+    if outcome.lethal {
+        return format!(
+            "{} took a lethal blow — you are DOWNED.",
+            outcome.part.display()
+        );
+    }
+    let phrase = match outcome.new_state {
+        // (2026-08-22 Chloe) The healthy arm is unreachable in practice —
+        // `referee_evaluate_with_tier` only ever selects Yellow..Black and
+        // never lowers a rank — but it now reads the RIGHT word if a future
+        // path ever lands here (the old arm said "wounded" for the healthy
+        // baseline).
+        BodyPartState::Healthy => "healthy",
+        BodyPartState::Yellow => "mildly injured",
+        BodyPartState::Orange => "moderately injured",
+        BodyPartState::Red => "heavily injured",
+        BodyPartState::Purple => "in critical condition",
+        BodyPartState::Black => "amputated",
+    };
+    format!("{} is now {}.", outcome.part.display(), phrase)
 }
 
 /// Apply a Referee outcome to a PlayerState. Mutates in place. Separate from
@@ -2149,13 +2279,25 @@ mod tests {
 
     #[test]
     fn body_part_state_default_is_transparent() {
-        assert_eq!(BodyPartState::default(), BodyPartState::Transparent);
+        assert_eq!(BodyPartState::default(), BodyPartState::Healthy);
+    }
+
+    #[test]
+    fn body_part_state_wire_renames_healthy_but_loads_legacy() {
+        // (2026-08-22 rename pin) New writes serialize "Healthy"; pre-rename
+        // saves carrying "Transparent" must keep loading (the serde alias).
+        let ser = serde_json::to_string(&BodyPartState::Healthy).unwrap();
+        assert_eq!(ser, "\"Healthy\"");
+        let legacy: BodyPartState = serde_json::from_str("\"Transparent\"").unwrap();
+        assert_eq!(legacy, BodyPartState::Healthy);
+        let modern: BodyPartState = serde_json::from_str("\"Healthy\"").unwrap();
+        assert_eq!(modern, BodyPartState::Healthy);
     }
 
     #[test]
     fn body_part_state_semantic_covers_all_variants() {
         // Catches the "added a variant, forgot semantic()" bug.
-        assert_eq!(BodyPartState::Transparent.semantic(), "Healthy");
+        assert_eq!(BodyPartState::Healthy.semantic(), "Healthy");
         assert_eq!(BodyPartState::Yellow.semantic(), "Minor Injury");
         assert_eq!(BodyPartState::Orange.semantic(), "Medium Injury");
         assert_eq!(BodyPartState::Red.semantic(), "Heavy Injury");
@@ -2165,7 +2307,7 @@ mod tests {
 
     #[test]
     fn body_part_state_can_be_injured() {
-        assert!(BodyPartState::Transparent.can_be_injured());
+        assert!(BodyPartState::Healthy.can_be_injured());
         assert!(BodyPartState::Yellow.can_be_injured());
         assert!(BodyPartState::Red.can_be_injured());
         assert!(BodyPartState::Purple.can_be_injured());
@@ -2270,7 +2412,7 @@ mod tests {
         for part in BodyPart::all() {
             assert_eq!(
                 s.body.get(part).copied().unwrap_or_default(),
-                BodyPartState::Transparent,
+                BodyPartState::Healthy,
                 "{} should be Healthy by default",
                 part.display(),
             );
@@ -2357,7 +2499,7 @@ mod tests {
         assert_eq!(s.body.get(&BodyPart::LeftUpperArm).copied().unwrap(), BodyPartState::Orange);
         assert_eq!(
             s.body.get(&BodyPart::Head).copied().unwrap_or_default(),
-            BodyPartState::Transparent,
+            BodyPartState::Healthy,
         );
     }
 
@@ -2424,6 +2566,90 @@ mod tests {
         let s = fresh_state();
         assert!(referee_evaluate("I ATTACK the dragon", &s).is_some());
         assert!(referee_evaluate("I Swing my sword", &s).is_some());
+    }
+
+    /// (2026-08-22 playtest) The LIVE referee's avoidance roll: a triggered
+    /// exchange is sometimes slipped entirely (no wound, no drain) and
+    /// sometimes lands — the raw entry point wounded on EVERY trigger, which
+    /// turned six skirmish verbs into six injuries ("gathering injuries like
+    /// Pokémon"). Over 200 distinct seeded actions both branches are a
+    /// statistical certainty at the 40-80% avoid rates.
+    #[test]
+    fn referee_live_avoidance_rolls_both_ways() {
+        let s = fresh_state();
+        assert_eq!(
+            referee_evaluate_live("I walk to the bar and order an ale.", &s,
+                AttackerTier::Soldier, 0, 0, 0),
+            None,
+            "the live wrapper keeps the raw gate: no keyword, no roll"
+        );
+        let mut avoided = false;
+        let mut landed = false;
+        for i in 0..200u32 {
+            let text = format!("I attack the goblin with my sword, sweep #{i}");
+            if referee_evaluate_live(&text, &s, AttackerTier::Soldier, 0, 0, 0).is_some() {
+                landed = true;
+            } else {
+                avoided = true;
+            }
+        }
+        assert!(avoided, "some triggered exchanges must be dodged clean");
+        assert!(landed, "some triggered exchanges must still land");
+    }
+
+    /// (2026-08-22 playtest) Lethality coherence: whatever the save rolled,
+    /// a returned lethal outcome only ever rides a Red+ wound on a
+    /// non-Downed body (the gate's exemption for already-Downed bodies is
+    /// unreachable from a fresh state by construction). Swept over 400
+    /// seeded actions at the deadliest tuning (Legendary, Combat pacing).
+    #[test]
+    fn referee_live_lethal_only_on_red_plus() {
+        let s = fresh_state();
+        for i in 0..400u32 {
+            let text = format!("I lunge at the bugbear and stab, trading blows #{i}");
+            if let Some(o) =
+                referee_evaluate_live(&text, &s, AttackerTier::Legendary, 0, 0, -1)
+            {
+                if o.lethal {
+                    assert!(
+                        o.new_state.rank() >= BodyPartState::Red.rank(),
+                        "lethal on a sub-Red wound is incoherent (got {:?})",
+                        o.new_state
+                    );
+                    assert!(!o.directive.is_empty(), "lethal keeps its directive");
+                }
+            }
+        }
+    }
+
+    /// (2026-08-22) The player-facing bubble text wording, per Chloe's spec.
+    #[test]
+    fn referee_notice_text_wording() {
+        let mk = |part: BodyPart, state: BodyPartState| {
+            let mut o = referee_evaluate("I attack the goblin", &fresh_state())
+                .expect("seeded control text fires");
+            o.part = part;
+            o.new_state = state;
+            o
+        };
+        assert_eq!(
+            referee_notice_text(&mk(BodyPart::LeftHand, BodyPartState::Black)),
+            "Left Hand is now amputated."
+        );
+        assert_eq!(
+            referee_notice_text(&mk(BodyPart::Head, BodyPartState::Orange)),
+            "Head is now moderately injured."
+        );
+        assert_eq!(
+            referee_notice_text(&mk(BodyPart::RightFoot, BodyPartState::Red)),
+            "Right Foot is now heavily injured."
+        );
+        let mut lethal = mk(BodyPart::UpperTorso, BodyPartState::Purple);
+        lethal.lethal = true;
+        assert_eq!(
+            referee_notice_text(&lethal),
+            "Upper Torso took a lethal blow — you are DOWNED."
+        );
     }
 
     /// (2026-08-16 P2b) The trailing word boundary, pinned in both
@@ -2810,7 +3036,7 @@ mod tests {
         }
         // Black yields the "Severed" marker; Healthy yields empty (no wound).
         assert_eq!(roll_injury_descriptor(&mut r, AttackerTier::Soldier, BodyPartState::Black), "Severed");
-        assert_eq!(roll_injury_descriptor(&mut r, AttackerTier::Soldier, BodyPartState::Transparent), "");
+        assert_eq!(roll_injury_descriptor(&mut r, AttackerTier::Soldier, BodyPartState::Healthy), "");
     }
 
     #[test]
@@ -3778,7 +4004,7 @@ mod tests {
         s.injury_details.insert(BodyPart::Neck, vec!["bruised in a fall".into()]);
         let out = referee_evaluate_recovery("I sleep", &s, true)
             .expect("resting with a minor wound must fire");
-        assert_eq!(out.healed, Some((BodyPart::Neck, BodyPartState::Transparent)));
+        assert_eq!(out.healed, Some((BodyPart::Neck, BodyPartState::Healthy)));
         apply_recovery(&mut s, &out);
         assert!(!s.body.contains_key(&BodyPart::Neck), "a fully healed part leaves the body map");
         assert!(!s.injury_details.contains_key(&BodyPart::Neck), "its injury history goes with it");

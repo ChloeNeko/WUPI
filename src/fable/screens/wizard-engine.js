@@ -445,9 +445,9 @@ export function renderPortraitSlide(_slide, stashed, _onChange, ctx) {
 // opens a .json picker. The parsed lorebook entries live on
 // `stashed.fields.codex_entries` (an array of {title, tags, body}). A chip
 // list shows attached entries; each is removable. The serializer converts
-// these to the compound `.codex` format + writes via fable_codex_raw_set at
-// CREATE time. `ctx.onAttachCodex` owns the pick+parse (so the ST-import
-// path can also populate this).
+// these to the compound `.codex` format + writes into the universal library
+// (+ auto-links) at CREATE time. `ctx.onAttachCodex` owns the pick+parse
+// (so the ST-import path can also populate this).
 export function renderCodexAttachSlide(_slide, stashed, _onChange, ctx) {
   if (!Array.isArray(stashed.fields.codex_entries)) stashed.fields.codex_entries = [];
   const chipsHTML = stashed.fields.codex_entries

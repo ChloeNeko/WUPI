@@ -1100,6 +1100,7 @@ export function enterEditMode(beat, opts = {}) {
     editClosers.delete(beat);
     if (editingBeat === beat) editingBeat = null;
     beat.classList.remove('editing');
+    document.removeEventListener('mousedown', onOutsideDown, true);
     if (commit) {
       const text = ta.value;
       body.innerHTML = renderMarkdown(text);
@@ -1138,4 +1139,21 @@ export function enterEditMode(beat, opts = {}) {
     if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); close(true); }
     else if (e.key === 'Escape') { e.preventDefault(); close(false); }
   });
+
+  // (2026-08-22, Chloe) A LEFT press starting OUTSIDE the beat being
+  // edited cancels the edit (same as Esc — restore the committed
+  // prose). mousedown, capture-phase at the document, so it fires
+  // before whatever control the press lands on: pressing the composer
+  // or a drawer escapes the editor instead of stranding it open.
+  // Presses that START inside the beat (the textarea itself, its ✎
+  // save-toggle, its portrait) are left alone — caret placement and
+  // drag-selections that end outside the textarea must never cancel.
+  const onOutsideDown = (e) => {
+    if (e.button !== 0) return;
+    if (!beat.isConnected) { close(false); return; }
+    const t = e.target;
+    if (t && t.nodeType === 1 && beat.contains(t)) return;
+    close(false);
+  };
+  document.addEventListener('mousedown', onOutsideDown, true);
 }
